@@ -1,4 +1,4 @@
-# tg3 — S3 поверх Telegram Bot API
+# s3gram — S3 поверх Telegram Bot API
 
 S3-совместимый HTTP gateway на Rust. Объекты режутся на чанки по 19 MiB и хранятся как документы в приватном Telegram-чате/канале. Метаданные — в локальном SQLite.
 
@@ -30,8 +30,8 @@ cargo run --release
 ## Smoke test (aws cli)
 
 ```bash
-export AWS_ACCESS_KEY_ID=tg3
-export AWS_SECRET_ACCESS_KEY=tg3secret
+export AWS_ACCESS_KEY_ID=s3gram
+export AWS_SECRET_ACCESS_KEY=s3gramsecret
 export AWS_DEFAULT_REGION=us-east-1
 
 aws --endpoint-url http://127.0.0.1:8333 s3 mb s3://demo
@@ -41,22 +41,22 @@ aws --endpoint-url http://127.0.0.1:8333 s3 cp s3://demo/readme.md ./out.md
 aws --endpoint-url http://127.0.0.1:8333 s3 rm s3://demo/readme.md
 ```
 
-Для отладки без подписи: `TG3_INSECURE=1`.
+Для отладки без подписи: `S3GRAM_INSECURE=1`.
 
 ## Snapshot индекса
 
 Экспорт метаданных в Telegram (JSON-документ в тот же чат):
 
 ```bash
-curl -X POST 'http://127.0.0.1:8333/?tg3-snapshot=export' \
+curl -X POST 'http://127.0.0.1:8333/?s3gram-snapshot=export' \
   -H "Authorization: dummy" \
-  # либо с TG3_INSECURE=1
+  # либо с S3GRAM_INSECURE=1
 ```
 
 Восстановление из `file_id` или сырого JSON:
 
 ```bash
-curl -X POST 'http://127.0.0.1:8333/?tg3-snapshot=import' \
+curl -X POST 'http://127.0.0.1:8333/?s3gram-snapshot=import' \
   -H 'Content-Type: application/json' \
   -d '{"file_id":"BQACAg..."}'
 ```

@@ -12,7 +12,7 @@ pub fn list_all_my_buckets(buckets: &[Bucket]) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Owner><ID>tg3</ID><DisplayName>tg3</DisplayName></Owner>
+  <Owner><ID>s3gram</ID><DisplayName>s3gram</DisplayName></Owner>
   <Buckets>{items}</Buckets>
 </ListAllMyBucketsResult>"#
     )

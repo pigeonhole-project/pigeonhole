@@ -13,8 +13,8 @@ pub fn authorize<B>(cfg: &Config, req: &Request<B>) -> Result<(), S3Error> {
         && req.headers().get("x-amz-content-sha256").is_none()
     {
         // Still require credentials for aws cli compatibility path — but for demo
-        // accept missing auth only if TG3_INSECURE=1
-        if std::env::var("TG3_INSECURE").ok().as_deref() == Some("1") {
+        // accept missing auth only if S3GRAM_INSECURE=1
+        if std::env::var("S3GRAM_INSECURE").ok().as_deref() == Some("1") {
             return Ok(());
         }
     }

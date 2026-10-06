@@ -19,10 +19,10 @@ impl Config {
 
         let bot_token = require("BOT_TOKEN")?;
         let chat_id = require("CHAT_ID")?;
-        let access_key = env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "tg3".into());
-        let secret_key = env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "tg3secret".into());
+        let access_key = env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "s3gram".into());
+        let secret_key = env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "s3gramsecret".into());
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8333".into());
-        let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:tg3.db".into());
+        let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:s3gram.db".into());
         let region = env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
 
         Ok(Self {

@@ -44,8 +44,8 @@ pub struct IndexSnapshot {
 impl Index {
     pub async fn connect(database_url: &str) -> Result<Self> {
         // sqlx sqlite URLs: sqlite:path or sqlite://path
-        let url = if database_url == "sqlite:tg3.db" {
-            "sqlite:tg3.db?mode=rwc".to_string()
+        let url = if database_url == "sqlite:s3gram.db" {
+            "sqlite:s3gram.db?mode=rwc".to_string()
         } else if database_url.starts_with("sqlite:") && !database_url.contains('?') {
             format!("{database_url}?mode=rwc")
         } else {

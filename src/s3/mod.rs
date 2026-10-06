@@ -56,10 +56,10 @@ async fn root(
         Method::POST => {
             // Internal: snapshot restore/export via query
             let q = req.uri().query().unwrap_or("");
-            if q.contains("tg3-snapshot=export") {
+            if q.contains("s3gram-snapshot=export") {
                 return export_snapshot(&state).await;
             }
-            if q.contains("tg3-snapshot=import") {
+            if q.contains("s3gram-snapshot=import") {
                 return import_snapshot(&state, req).await;
             }
             Err(S3Error::method_not_allowed())
@@ -371,10 +371,10 @@ async fn delete_object(state: &AppState, bucket: &str, key: &str) -> Result<Resp
 async fn export_snapshot(state: &AppState) -> Result<Response, S3Error> {
     let snap = state.index.export_snapshot().await?;
     let json = serde_json::to_vec_pretty(&snap).map_err(|e| S3Error::internal(e.to_string()))?;
-    let filename = format!("tg3-index-{}.json", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+    let filename = format!("s3gram-index-{}.json", chrono::Utc::now().format("%Y%m%d%H%M%S"));
     let (file_id, message_id) = state
         .tg
-        .send_document(Bytes::from(json), &filename, "tg3-index-snapshot")
+        .send_document(Bytes::from(json), &filename, "s3gram-index-snapshot")
         .await
         .map_err(|e| S3Error::internal(e.to_string()))?;
 

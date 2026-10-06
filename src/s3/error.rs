@@ -113,7 +113,7 @@ impl IntoResponse for S3Error {
   <Code>{}</Code>
   <Message>{}</Message>
   <Resource>{}</Resource>
-  <RequestId>tg3</RequestId>
+  <RequestId>s3gram</RequestId>
 </Error>"#,
             xml_escape(self.code),
             xml_escape(&self.message),

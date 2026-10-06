@@ -1,7 +1,7 @@
 /target
-/tg3.db
-/tg3.db-*
-tg3-*.db
+/s3gram.db
+/s3gram.db-*
+s3gram-*.db
 .env
 *.bin
 out.bin

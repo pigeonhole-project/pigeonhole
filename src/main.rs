@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    info!("tg3 listening on http://{addr}");
+    info!("s3gram listening on http://{addr}");
     axum::serve(listener, app).await.context("serve")?;
     Ok(())
 }

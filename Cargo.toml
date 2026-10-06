@@ -1,5 +1,5 @@
 [package]
-name = "tg3"
+name = "s3gram"
 version = "0.1.0"
 edition = "2021"
 description = "S3-compatible gateway backed by Telegram Bot API"
