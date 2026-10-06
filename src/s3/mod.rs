@@ -1,16 +1,18 @@
 mod auth;
+mod aws_chunked;
 mod error;
 mod xml;
 
 use crate::chunker;
 use crate::config::Config;
-use crate::index::{parse_rfc3339, DeleteBucketResult, Index};
+use crate::index::{parse_rfc3339, Index, OrphanMsg};
+use crate::registry;
 use crate::snapshot::{self, PushOutcome};
 use crate::telegram::TelegramClient;
 use auth::authorize;
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, Method, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
@@ -19,11 +21,15 @@ use error::S3Error;
 use futures::StreamExt;
 use md5::{Digest, Md5};
 use serde::Deserialize;
+use sha2::Sha256;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use xml::*;
+
+/// CreateBucket header: Telegram chat that stores this bucket's blobs.
+const HEADER_CHAT_ID: &str = "x-s3gram-chat-id";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -84,7 +90,7 @@ async fn bucket_root(
     let q = parse_query(&query);
 
     match *req.method() {
-        Method::PUT => create_bucket(&state, &bucket).await,
+        Method::PUT => create_bucket(&state, &bucket, req.headers()).await,
         Method::DELETE => delete_bucket(&state, &bucket).await,
         Method::POST if q.contains_key("delete") => delete_objects(&state, &bucket, req).await,
         Method::GET | Method::HEAD if q.contains_key("versions") => {
@@ -186,16 +192,65 @@ struct ListParams {
     continuation_token: Option<String>,
 }
 
-async fn create_bucket(state: &AppState, bucket: &str) -> Result<Response, S3Error> {
-    let created = state.index.create_bucket(bucket).await?;
-    if !created {
-        // AWS returns BucketAlreadyOwnedByYou for same account — treat as success for demo
+async fn create_bucket(
+    state: &AppState,
+    bucket: &str,
+    headers: &HeaderMap,
+) -> Result<Response, S3Error> {
+    if bucket == state.cfg.service_bucket {
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(header::LOCATION, format!("/{bucket}"))
             .body(Body::empty())
             .unwrap());
     }
+
+    // Already registered via admin — idempotent OK.
+    if state.index.bucket_exists(bucket).await? {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::LOCATION, format!("/{bucket}"))
+            .body(Body::empty())
+            .unwrap());
+    }
+
+    // Data chat must be explicit: admin /bucket, header, or DEFAULT_DATA_CHAT_ID (tests).
+    // Never the service chat.
+    let chat_id = headers
+        .get(HEADER_CHAT_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| state.cfg.default_data_chat_id.clone());
+
+    let Some(chat_id) = chat_id else {
+        return Err(S3Error::invalid_argument(format!(
+            "bucket '{bucket}' is not registered; in the admin chat run: /bucket {bucket} \
+(after adding the bot to a dedicated data chat). Service chat cannot hold object data."
+        )));
+    };
+
+    if state.cfg.is_service_chat(&chat_id) {
+        return Err(S3Error::invalid_argument(
+            "cannot bind a data bucket to the service/admin chat; use a separate Telegram chat",
+        ));
+    }
+
+    let orphans = registry::register_bucket(
+        &state.index,
+        &state.tg,
+        &state.cfg.service_bucket,
+        &state.cfg.service_chat_id,
+        &state.cfg.admin_chat_id,
+        bucket,
+        &chat_id,
+        false, // don't rename from S3 API path
+    )
+    .await
+    .map_err(|e| S3Error::invalid_argument(e.to_string()))?;
+    cleanup_orphans(state, orphans.0).await;
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::LOCATION, format!("/{bucket}"))
@@ -204,11 +259,32 @@ async fn create_bucket(state: &AppState, bucket: &str) -> Result<Response, S3Err
 }
 
 async fn delete_bucket(state: &AppState, bucket: &str) -> Result<Response, S3Error> {
-    match state.index.delete_bucket(bucket).await? {
-        DeleteBucketResult::Deleted => Ok(StatusCode::NO_CONTENT.into_response()),
-        DeleteBucketResult::NotFound => Err(S3Error::no_such_bucket(bucket)),
-        DeleteBucketResult::NotEmpty => Err(S3Error::bucket_not_empty(bucket)),
+    if bucket == state.cfg.service_bucket {
+        return Err(S3Error::access_denied());
     }
+    match registry::unregister_bucket(&state.index, &state.cfg.service_bucket, bucket).await {
+        Ok(Some(orphans)) => {
+            cleanup_orphans(state, orphans).await;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        Ok(None) => Err(S3Error::no_such_bucket(bucket)),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not empty") {
+                Err(S3Error::bucket_not_empty(bucket))
+            } else {
+                Err(S3Error::internal(msg))
+            }
+        }
+    }
+}
+
+async fn require_bucket_chat(state: &AppState, bucket: &str) -> Result<String, S3Error> {
+    state
+        .index
+        .bucket_chat_id(bucket)
+        .await?
+        .ok_or_else(|| S3Error::no_such_bucket(bucket))
 }
 
 async fn list_objects(
@@ -227,7 +303,7 @@ async fn list_objects(
         .continuation_token
         .or(params.start_after);
 
-    let (objects, common, truncated) = state
+    let (objects, common, truncated, next_token) = state
         .index
         .list_objects(
             bucket,
@@ -237,12 +313,6 @@ async fn list_objects(
             start_after.as_deref(),
         )
         .await?;
-
-    let next_token = if truncated {
-        objects.last().map(|o| o.key.clone())
-    } else {
-        None
-    };
 
     let body = list_objects_v2(
         bucket,
@@ -280,7 +350,7 @@ async fn list_object_versions(
 
     let prefix = params.prefix.unwrap_or_default();
     let max_keys = params.max_keys.unwrap_or(1000).clamp(1, 1000);
-    let (objects, _common, truncated) = state
+    let (objects, _common, truncated, _next) = state
         .index
         .list_objects(bucket, &prefix, None, max_keys, None)
         .await?;
@@ -374,7 +444,8 @@ async fn put_object(
         .map(|s| s.to_string());
     let user_meta = extract_user_metadata(req.headers());
 
-    let (etag, total_size, uploaded) = ingest_body_to_telegram(state, bucket, key, req).await?;
+    let chat_id = require_bucket_chat(state, bucket).await?;
+    let (etag, total_size, uploaded) = ingest_body_to_telegram(state, &chat_id, req).await?;
     let orphans = state
         .index
         .put_object(
@@ -384,6 +455,7 @@ async fn put_object(
             total_size,
             content_type.as_deref(),
             &uploaded,
+            &chat_id,
             &user_meta,
         )
         .await?;
@@ -452,19 +524,38 @@ async fn copy_object(
         extract_user_metadata(req.headers())
     };
 
-    let (dst, orphans) = state
-        .index
-        .copy_object(
+    let src_chat = require_bucket_chat(state, &src_bucket).await?;
+    let dst_chat = require_bucket_chat(state, dst_bucket).await?;
+
+    let (dst, orphans) = if src_chat == dst_chat {
+        state
+            .index
+            .copy_object(
+                &src_bucket,
+                &src_key,
+                dst_bucket,
+                dst_key,
+                content_type.as_deref(),
+                &user_meta,
+                copy_source_meta,
+            )
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?
+    } else {
+        // Different Telegram chats: deep copy (re-upload into destination chat).
+        deep_copy_object(
+            state,
             &src_bucket,
             &src_key,
             dst_bucket,
             dst_key,
+            &dst_chat,
             content_type.as_deref(),
             &user_meta,
             copy_source_meta,
         )
-        .await
-        .map_err(|e| S3Error::internal(e.to_string()))?;
+        .await?
+    };
 
     cleanup_orphans(state, orphans).await;
 
@@ -473,7 +564,8 @@ async fn copy_object(
         src_key,
         dst_bucket,
         dst_key,
-        "CopyObject ok (shallow)"
+        shallow = (src_chat == dst_chat),
+        "CopyObject ok"
     );
 
     Ok(xml_response(
@@ -509,14 +601,89 @@ fn extract_user_metadata(headers: &axum::http::HeaderMap) -> Vec<(String, String
     out
 }
 
-async fn cleanup_orphans(state: &AppState, message_ids: Vec<i64>) {
+async fn deep_copy_object(
+    state: &AppState,
+    src_bucket: &str,
+    src_key: &str,
+    dst_bucket: &str,
+    dst_key: &str,
+    dst_chat: &str,
+    content_type: Option<&str>,
+    user_meta: &[(String, String)],
+    copy_source_meta: bool,
+) -> Result<(crate::index::ObjectMeta, Vec<OrphanMsg>), S3Error> {
+    let src = state
+        .index
+        .get_object(src_bucket, src_key)
+        .await?
+        .ok_or_else(|| S3Error::no_such_key(src_bucket, src_key))?;
+    let src_chunks = state.index.get_chunks(src_bucket, src_key).await?;
+
+    let mut uploaded = Vec::new();
+    for c in &src_chunks {
+        let data = state
+            .tg
+            .download_file(&c.file_id)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
+        let (file_id, message_id, size) = upload_blob(state, dst_chat, data).await?;
+        uploaded.push((c.part_no, file_id, message_id, size));
+    }
+
+    let ct = content_type.or(src.content_type.as_deref());
+    let meta: Vec<(String, String)> = if copy_source_meta {
+        state
+            .index
+            .get_user_metadata(src_bucket, src_key)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?
+    } else {
+        user_meta.to_vec()
+    };
+
+    let orphans = state
+        .index
+        .put_object(
+            dst_bucket,
+            dst_key,
+            &src.etag,
+            src.size,
+            ct,
+            &uploaded,
+            dst_chat,
+            &meta,
+        )
+        .await
+        .map_err(|e| S3Error::internal(e.to_string()))?;
+
+    let dst = state
+        .index
+        .get_object(dst_bucket, dst_key)
+        .await?
+        .ok_or_else(|| S3Error::internal("destination missing after deep copy"))?;
+    Ok((dst, orphans))
+}
+
+async fn cleanup_orphans(state: &AppState, orphans: Vec<OrphanMsg>) {
     let mut seen = std::collections::HashSet::new();
-    for message_id in message_ids {
-        if !seen.insert(message_id) {
+    for (chat_id, message_id) in orphans {
+        if !seen.insert((chat_id.clone(), message_id)) {
             continue;
         }
-        if let Err(e) = state.tg.delete_message(message_id).await {
-            warn!(error = %e, message_id, "failed to delete orphaned telegram message");
+        match state.tg.delete_message(&chat_id, message_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    chat_id,
+                    message_id,
+                    "Telegram deleteMessage did not remove message (age/rights?); queued for retry"
+                );
+                let _ = state.index.queue_tg_delete(&chat_id, message_id).await;
+            }
+            Err(e) => {
+                warn!(error = %e, chat_id, message_id, "failed to delete orphaned telegram message");
+                let _ = state.index.queue_tg_delete(&chat_id, message_id).await;
+            }
         }
     }
 }
@@ -773,11 +940,18 @@ async fn create_multipart_upload(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let user_meta = extract_user_metadata(req.headers());
 
     let upload_id = uuid::Uuid::new_v4().to_string();
     state
         .index
-        .create_multipart_upload(&upload_id, bucket, key, content_type.as_deref())
+        .create_multipart_upload(
+            &upload_id,
+            bucket,
+            key,
+            content_type.as_deref(),
+            &user_meta,
+        )
         .await?;
 
     info!(bucket, key, %upload_id, "CreateMultipartUpload");
@@ -809,11 +983,12 @@ async fn upload_part(
         return Err(S3Error::no_such_upload(upload_id));
     }
 
-    let (etag, size, tg_chunks) = ingest_body_to_telegram(state, bucket, key, req).await?;
+    let chat_id = require_bucket_chat(state, bucket).await?;
+    let (etag, size, tg_chunks) = ingest_body_to_telegram(state, &chat_id, req).await?;
 
     let orphans = state
         .index
-        .put_multipart_part(upload_id, part_number, &etag, size, &tg_chunks)
+        .put_multipart_part(upload_id, part_number, &etag, size, &tg_chunks, &chat_id)
         .await?;
     cleanup_orphans(state, orphans).await;
 
@@ -910,57 +1085,88 @@ async fn abort_multipart_upload(state: &AppState, upload_id: &str) -> Result<Res
 }
 
 /// Stream request body into Telegram documents (≤19 MiB each). Returns (md5_hex, size, chunks).
+/// Telegram filenames are content-addressed: blobs may be shared across keys via shallow copy.
 async fn ingest_body_to_telegram(
     state: &AppState,
-    bucket: &str,
-    key: &str,
+    chat_id: &str,
     req: Request,
 ) -> Result<(String, i64, Vec<(i64, String, i64, i64)>), S3Error> {
+    let expect_sha = req
+        .headers()
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let chunked = aws_chunked::is_aws_chunked(req.headers());
+
     let body = req.into_body();
     let mut stream = body.into_data_stream();
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut hasher = Md5::new();
-    let mut total_size: i64 = 0;
-    let mut part_no: i64 = 0;
-    let mut uploaded: Vec<(i64, String, i64, i64)> = Vec::new();
-
+    let mut raw: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| S3Error::internal(e.to_string()))?;
-        hasher.update(&chunk);
-        buffer.extend_from_slice(&chunk);
-        total_size += chunk.len() as i64;
+        raw.extend_from_slice(&chunk);
+    }
 
-        while buffer.len() >= chunker::CHUNK_SIZE {
-            let data: Bytes = buffer.drain(..chunker::CHUNK_SIZE).collect::<Vec<u8>>().into();
-            let chunk_size = data.len() as i64;
-            let filename = format!("{bucket}_{}_{part_no}.part", key.replace('/', "_"));
-            let caption = format!("{bucket}/{key}#{part_no}");
-            let (file_id, message_id) = state
-                .tg
-                .send_document(data, &filename, &caption)
-                .await
-                .map_err(|e| S3Error::internal(e.to_string()))?;
-            uploaded.push((part_no, file_id, message_id, chunk_size));
-            part_no += 1;
+    let payload = if chunked {
+        aws_chunked::decode_aws_chunked(&raw).map_err(|e| S3Error::invalid_argument(e.to_string()))?
+    } else {
+        raw
+    };
+
+    if let Some(ref sha) = expect_sha {
+        if sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            let got = {
+                use sha2::Digest as _;
+                hex::encode(Sha256::digest(&payload))
+            };
+            if !const_time_eq(&got, sha) {
+                return Err(S3Error::signature_mismatch());
+            }
         }
     }
 
-    if !buffer.is_empty() {
-        let data: Bytes = std::mem::take(&mut buffer).into();
-        let chunk_size = data.len() as i64;
-        let filename = format!("{bucket}_{}_{part_no}.part", key.replace('/', "_"));
-        let caption = format!("{bucket}/{key}#{part_no}");
-        let (file_id, message_id) = state
-            .tg
-            .send_document(data, &filename, &caption)
-            .await
-            .map_err(|e| S3Error::internal(e.to_string()))?;
-        uploaded.push((part_no, file_id, message_id, chunk_size));
-    }
-    // Empty object: no Telegram documents (Bot API rejects empty files).
-
+    let mut hasher = Md5::new();
+    hasher.update(&payload);
     let etag = format!("{:x}", hasher.finalize());
+    let total_size = payload.len() as i64;
+
+    let mut part_no: i64 = 0;
+    let mut uploaded: Vec<(i64, String, i64, i64)> = Vec::new();
+    let mut offset = 0;
+    while offset < payload.len() {
+        let end = (offset + chunker::CHUNK_SIZE).min(payload.len());
+        let data = Bytes::copy_from_slice(&payload[offset..end]);
+        let (file_id, message_id, chunk_size) = upload_blob(state, chat_id, data).await?;
+        uploaded.push((part_no, file_id, message_id, chunk_size));
+        part_no += 1;
+        offset = end;
+    }
+
     Ok((etag, total_size, uploaded))
+}
+
+fn const_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+async fn upload_blob(
+    state: &AppState,
+    chat_id: &str,
+    data: Bytes,
+) -> Result<(String, i64, i64), S3Error> {
+    let chunk_size = data.len() as i64;
+    let filename = format!("{:x}.bin", Md5::digest(&data));
+    let (file_id, message_id) = state
+        .tg
+        .send_document(chat_id, data, &filename, "")
+        .await
+        .map_err(|e| S3Error::internal(e.to_string()))?;
+    Ok((file_id, message_id, chunk_size))
 }
 
 fn parse_complete_parts(xml: &str) -> Result<Vec<(i64, String)>, S3Error> {
@@ -995,7 +1201,7 @@ fn extract_xml_text(block: &str, tag: &str) -> Option<String> {
 
 async fn export_snapshot(state: &AppState) -> Result<Response, S3Error> {
     let _guard = state.snapshot_gate.lock().await;
-    let outcome = snapshot::push_if_changed(&state.index, &state.tg)
+    let outcome = snapshot::push_if_changed(&state.index, &state.tg, &state.cfg.service_chat_id)
         .await
         .map_err(|e| S3Error::internal(e.to_string()))?;
 
@@ -1009,13 +1215,15 @@ async fn export_snapshot(state: &AppState) -> Result<Response, S3Error> {
             file_id,
             message_id,
             replaced_message_id,
+            parts,
         } => serde_json::json!({
             "status": "uploaded",
             "hash": hash,
             "file_id": file_id,
             "message_id": message_id,
             "replaced_message_id": replaced_message_id,
-            "filename": "s3gram-index.json",
+            "parts": parts,
+            "filename": "s3gram-index.json.gz",
         }),
     };
     Ok(Response::builder()
@@ -1030,12 +1238,10 @@ async fn import_snapshot(state: &AppState, req: Request) -> Result<Response, S3E
         .await
         .map_err(|e| S3Error::internal(e.to_string()))?;
 
-    // Body may be raw JSON snapshot, or {"file_id":"..."}
     let snap = if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-        if let Some(file_id) = v.get("file_id").and_then(|x| x.as_str()) {
-            let data = state
-                .tg
-                .download_file(file_id)
+        if v.get("file_id").is_some() || v.get("parts").is_some() {
+            let file_id = v.get("file_id").and_then(|x| x.as_str());
+            let data = snapshot::download_snapshot_bytes(&state.tg, &state.index, file_id)
                 .await
                 .map_err(|e| S3Error::internal(e.to_string()))?;
             serde_json::from_slice(&data).map_err(|e| S3Error::invalid_argument(e.to_string()))?
@@ -1043,7 +1249,10 @@ async fn import_snapshot(state: &AppState, req: Request) -> Result<Response, S3E
             serde_json::from_value(v).map_err(|e| S3Error::invalid_argument(e.to_string()))?
         }
     } else {
-        return Err(S3Error::invalid_argument("expected JSON snapshot or {file_id}"));
+        // Raw gzip or JSON body
+        let raw = snapshot::gunzip_bytes(&bytes)
+            .map_err(|e| S3Error::invalid_argument(e.to_string()))?;
+        serde_json::from_slice(&raw).map_err(|e| S3Error::invalid_argument(e.to_string()))?
     };
 
     state
