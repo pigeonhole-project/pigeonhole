@@ -59,6 +59,9 @@ make compat-s3s-boto3
 # s3s-e2e suite (Basic + Advanced) against MemoryBlobStore
 make compat-s3s-e2e
 make compat-s3s-e2e ARGS='--filter ^Basic'
+
+# s3s upstream rclone S3 e2e against MemoryBlobStore (downloads pinned rclone)
+make compat-rclone
 ```
 
 Point the AWS CLI at the gateway:
