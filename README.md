@@ -206,7 +206,24 @@ unpin/delete the previous parts. You can also copy the local `s3gram.db` file.
 | In-memory LRU cache for Telegram `file_path` | yes |
 | Presigned URLs / ACL / bucket versioning | later |
 
+## Limitations / ops notes
+
+- **One writer instance per SQLite file.** Concurrent s3gram processes on the same
+  `database_url` are unsupported (index corruption / lock errors).
+- **RPO ≈ snapshot interval.** Index durability to Telegram is the pin + snapshot
+  parts; between snapshots a crash can lose recent index mutations (blob bytes may
+  already be in the chat). Tune `[snapshot].interval_secs`.
+- **`file_id` is bot-bound.** Telegram `file_id` values are only valid for the bot
+  that uploaded them; rotating `BOT_TOKEN` without a restore from that bot’s pin
+  will break reads.
+- **ToS.** Storing arbitrary object data in Telegram/Discord must comply with their
+  Terms of Service and channel/server policies. This project is a technical gateway,
+  not a blessing to ignore those rules.
+- **Discord / ByteStream** are optional (`--features discord`, `--features bytestream`).
+
 ## Notes
 
 - Telegram `file_id` can become invalid; keep index snapshots.
 - Large objects are split automatically; multipart uploads map to sequential chunks.
+- HTTP server uses tower `TimeoutLayer`, `ConcurrencyLimitLayer`, and a header-count
+  guard (`[http]` in TOML). Backend/cache counters log on an interval via tracing.

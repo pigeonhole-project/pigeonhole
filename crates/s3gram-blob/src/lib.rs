@@ -3,6 +3,7 @@
 mod backend;
 mod bootstrap;
 pub mod cache;
+pub mod metrics;
 pub mod rate_limit;
 mod store;
 
@@ -14,6 +15,7 @@ pub use backend::{
 };
 pub use bootstrap::BootstrapPointer;
 pub use cache::{CacheConfig, CacheMetrics, CachedBlob, CachingBackend};
+pub use metrics::{spawn_metrics_logger, BackendMetrics};
 pub use rate_limit::{ChatLimiter, ChatLimiterConfig};
 pub use s3gram_core::{
     BackendId, BackendLimits, BlobKey, ByteRange, DeleteOutcome, Locator, PinnedContent, PutHint,

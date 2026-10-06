@@ -28,6 +28,7 @@ s3gram-telegram = { workspace = true }
 s3gram-discord = { workspace = true, optional = true }
 s3gram-bytestream = { workspace = true, optional = true }
 tokio = { workspace = true }
+tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

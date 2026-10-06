@@ -47,7 +47,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 toml = { version = "0.8", features = ["parse"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
