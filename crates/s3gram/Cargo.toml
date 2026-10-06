@@ -26,6 +26,7 @@ s3gram-index = { workspace = true }
 s3gram-s3 = { workspace = true }
 s3gram-telegram = { workspace = true }
 s3gram-discord = { workspace = true, optional = true }
+s3gram-bytestream = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -33,6 +34,7 @@ tracing-subscriber = { workspace = true }
 [features]
 default = []
 discord = ["dep:s3gram-discord"]
+bytestream = ["dep:s3gram-bytestream"]
 
 [dev-dependencies]
 bytes = { workspace = true }

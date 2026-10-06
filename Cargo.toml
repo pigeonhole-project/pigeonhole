@@ -9,6 +9,7 @@ members = [
     "crates/s3gram-index",
     "crates/s3gram-engine",
     "crates/s3gram-s3",
+    "crates/s3gram-bytestream",
     "crates/s3gram",
 ]
 default-members = ["crates/s3gram"]
@@ -61,3 +62,9 @@ wiremock = "0.6"
 s3gram-index = { path = "crates/s3gram-index" }
 s3gram-engine = { path = "crates/s3gram-engine" }
 s3gram-s3 = { path = "crates/s3gram-s3" }
+s3gram-bytestream = { path = "crates/s3gram-bytestream" }
+prost = "0.13"
+prost-types = "0.13"
+tonic = { version = "0.12", features = ["transport"] }
+tonic-build = "0.12"
+protoc-bin-vendored = "3.1"

@@ -200,6 +200,31 @@ async fn cmd_serve() -> anyhow::Result<()> {
         snapshot::spawn_pending_deletes(index.clone(), store.clone());
     }
 
+    #[cfg(feature = "bytestream")]
+    if cfg.bytestream.enabled {
+        use s3gram_bytestream::config::BytestreamConfig;
+        let bs_cfg = BytestreamConfig {
+            enabled: true,
+            listen_addr: cfg.bytestream.listen_addr.clone(),
+            instance_name: cfg.bytestream.instance_name.clone(),
+            max_batch_total_size_bytes: cfg.bytestream.max_batch_total_size_bytes,
+            gc_ttl_secs: cfg.bytestream.gc_ttl_secs,
+        };
+        let bs_index = index.clone();
+        let bs_store = store.clone();
+        let bs_chat = if cfg.memory_store {
+            String::new()
+        } else {
+            cfg.chat_id.clone()
+        };
+        tokio::spawn(async move {
+            if let Err(e) =
+                s3gram_bytestream::server::serve(bs_cfg, bs_index, bs_store, bs_chat).await
+            {
+                warn!(error = %e, "bytestream server exited");
+            }
+        });
+    }
 
     let s3_service = build_s3_service(s3gram, &cfg.access_key, &cfg.secret_key);
     let s3_service = HandleError::new(s3_service, handle_s3_error);
@@ -215,6 +240,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
         chat_id = %cfg.chat_id,
         chunk_size = cfg.chunk_size,
         chunk_codec = %cfg.chunk_codec,
+        bytestream = cfg.bytestream.enabled,
         "s3gram (s3s) listening on http://{addr}"
     );
     axum::serve(listener, app).await.context("serve")?;
