@@ -2,8 +2,10 @@
 
 S3-compatible HTTP gateway in Rust, backed by the Telegram Bot API.
 
-Objects are split into ≤19 MiB chunks and stored as documents in **one** private
-Telegram chat/channel (`CHAT_ID`). Object metadata lives in a local SQLite index.
+The S3 protocol surface is implemented with
+[s3s](https://github.com/s3s-project/s3s). Objects are split into ≤19 MiB chunks
+and stored as documents in **one** private Telegram chat/channel (`CHAT_ID`).
+Object metadata lives in a local SQLite index.
 
 Telegram I/O goes through a `BlobStore` trait (`TelegramBlobStore` in production,
 `MemoryBlobStore` in unit tests) so tests never hit the real Bot API.
@@ -59,7 +61,8 @@ aws --endpoint-url http://127.0.0.1:8333 s3 cp ./file.bin s3://demo/file.bin
 aws --endpoint-url http://127.0.0.1:8333 s3 cp s3://demo/file.bin ./out.bin
 ```
 
-For unsigned local debugging: `S3GRAM_INSECURE=1`.
+Authentication is AWS SigV4 via s3s `SimpleAuth` (keys from `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY`).
 
 ## Index snapshot
 
@@ -74,20 +77,9 @@ Interval (default 300s; `0` disables):
 SNAPSHOT_INTERVAL_SECS=300
 ```
 
-Manual export / import:
-
-```bash
-# export (uploads to Telegram if changed)
-curl -X POST 'http://127.0.0.1:8333/?s3gram-snapshot=export' \
-  -H "Authorization: ..." # or S3GRAM_INSECURE=1
-
-# import from Telegram file_id (manifest or single gzip)
-curl -X POST 'http://127.0.0.1:8333/?s3gram-snapshot=import' \
-  -H 'Content-Type: application/json' \
-  -d '{"file_id":"BQACAg..."}'
-```
-
-You can also copy the local `s3gram.db` file.
+Periodic export runs in the background; you can also copy the local `s3gram.db`
+file. (Manual HTTP export/import endpoints are not wired yet after the s3s
+migration.)
 
 ## Supported S3 ops (subset)
 
