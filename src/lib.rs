@@ -2,6 +2,7 @@
 
 pub mod chunker;
 pub mod config;
+pub mod frames;
 pub mod index;
 pub mod ingest;
 pub mod rate_limit;

@@ -12,24 +12,29 @@ pub const COMPRESS_PROBE_BYTES: usize = 128 * 1024;
 /// Leave headroom under `chunk.size` so a final encode frame fits.
 pub const COMPRESS_SIZE_MARGIN: usize = 256 * 1024;
 /// Cap uncompressed bytes buffered / decoded per chunk.
-/// Prevents RAM blow-ups on highly compressible streams while still packing many
-/// logical bytes into one Telegram message.
 pub const MAX_LOGICAL_CHUNK: usize = 256 * 1024 * 1024;
+/// Default independent frame size for `frames` codec packing.
+pub const DEFAULT_FRAME_SIZE: usize = 1024 * 1024;
+/// Default process-wide ingest buffer budget.
+pub const DEFAULT_INGEST_MEMORY_BUDGET: usize = 256 * 1024 * 1024;
 
 /// How new object chunks are encoded before `sendDocument`.
 ///
 /// Stored per-chunk codec may still be `raw` under a compress policy when the
-/// probe shows no gain.
+/// probe shows no gain. New compressible uploads use [`ChunkCodec::Frames`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChunkCodec {
     /// Store bytes as-is (no compression attempt).
     Raw,
-    /// Opportunistic gzip (legacy). Prefer [`ChunkCodec::Zstd`].
+    /// Opportunistic gzip (legacy single-frame chunk). Prefer zstd/frames.
     Gzip,
-    /// Opportunistic zstd (level 1); keep only when it shrinks.
-    #[default]
+    /// Opportunistic zstd (legacy single-frame chunk). Prefer [`ChunkCodec::Frames`].
     Zstd,
+    /// Concatenated independent frames (see `chunk_frames` table). Default for new
+    /// compressible uploads when config codec is `zstd` or `gzip`.
+    #[default]
+    Frames,
 }
 
 impl ChunkCodec {
@@ -38,6 +43,7 @@ impl ChunkCodec {
             Self::Raw => "raw",
             Self::Gzip => "gzip",
             Self::Zstd => "zstd",
+            Self::Frames => "frames",
         }
     }
 
@@ -46,12 +52,27 @@ impl ChunkCodec {
             "raw" | "none" | "off" => Ok(Self::Raw),
             "gzip" | "gz" => Ok(Self::Gzip),
             "zstd" | "zst" => Ok(Self::Zstd),
-            other => bail!("unknown chunk codec {other:?}; expected raw|gzip|zstd"),
+            "frames" | "frame" => Ok(Self::Frames),
+            other => bail!("unknown chunk codec {other:?}; expected raw|gzip|zstd|frames"),
         }
     }
 
+    /// Config policy that should pack with independent frames.
+    pub fn uses_frame_packing(self) -> bool {
+        matches!(self, Self::Gzip | Self::Zstd | Self::Frames)
+    }
+
     pub fn is_compressing(self) -> bool {
-        matches!(self, Self::Gzip | Self::Zstd)
+        matches!(self, Self::Gzip | Self::Zstd | Self::Frames)
+    }
+
+    /// Per-frame compression algorithm for a packing policy.
+    pub fn frame_codec(self) -> Self {
+        match self {
+            Self::Gzip => Self::Gzip,
+            Self::Zstd | Self::Frames => Self::Zstd,
+            Self::Raw => Self::Raw,
+        }
     }
 }
 
@@ -106,6 +127,7 @@ mod tests {
         assert_eq!(ChunkCodec::parse("raw").unwrap(), ChunkCodec::Raw);
         assert_eq!(ChunkCodec::parse("GZIP").unwrap(), ChunkCodec::Gzip);
         assert_eq!(ChunkCodec::parse("zstd").unwrap(), ChunkCodec::Zstd);
+        assert_eq!(ChunkCodec::parse("frames").unwrap(), ChunkCodec::Frames);
         assert_eq!(ChunkCodec::parse("none").unwrap(), ChunkCodec::Raw);
         assert!(ChunkCodec::parse("lz4").is_err());
     }
