@@ -1,6 +1,8 @@
+mod admin;
 mod chunker;
 mod config;
 mod index;
+mod registry;
 mod s3;
 mod snapshot;
 mod telegram;
@@ -27,15 +29,28 @@ async fn main() -> anyhow::Result<()> {
     let index = Index::connect(&cfg.database_url)
         .await
         .context("open index")?;
-    let tg = TelegramClient::new(cfg.bot_token.clone(), cfg.chat_id.clone())
-        .context("telegram client")?;
+    index
+        .ensure_service_bucket(&cfg.service_bucket, &cfg.service_chat_id)
+        .await
+        .context("ensure service bucket")?;
+    let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
 
     let snapshot_gate = Arc::new(Mutex::new(()));
     snapshot::spawn_periodic(
         index.clone(),
         tg.clone(),
+        cfg.service_chat_id.clone(),
         snapshot_gate.clone(),
         cfg.snapshot_interval_secs,
+    );
+
+    admin::spawn(index.clone(), tg.clone(), cfg.clone());
+
+    info!(
+        service_bucket = %cfg.service_bucket,
+        service_chat = %cfg.service_chat_id,
+        admin_chat = %cfg.admin_chat_id,
+        "service chat is registry/snapshots only; data buckets need their own chats"
     );
 
     let addr = cfg.listen_addr.clone();
