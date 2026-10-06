@@ -1,27 +1,16 @@
-mod chunker;
-mod config;
-mod index;
-mod ingest;
-mod service;
-mod snapshot;
-mod storage;
-mod telegram;
-
 use anyhow::Context;
 use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
 use axum::Router;
-use config::Config;
-use index::Index;
-use s3s::auth::SimpleAuth;
-use s3s::service::S3ServiceBuilder;
+use s3gram::config::Config;
+use s3gram::index::{Index, IndexSnapshot};
+use s3gram::snapshot;
+use s3gram::storage::{MemoryBlobStore, TelegramBlobStore};
+use s3gram::telegram::TelegramClient;
+use s3gram::{build_s3_service, build_s3gram};
 use s3s::{Body, HttpError};
-use service::S3gram;
 use std::sync::Arc;
-use storage::TelegramBlobStore;
-use telegram::TelegramClient;
-use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -32,6 +21,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("restore") => {
+            let file_id = args
+                .next()
+                .context("usage: s3gram restore <file_id>")?;
+            cmd_restore(&file_id).await
+        }
+        Some(other) => {
+            anyhow::bail!("unknown command {other:?}; usage: s3gram [restore <file_id>]")
+        }
+        None => cmd_serve().await,
+    }
+}
+
+async fn cmd_serve() -> anyhow::Result<()> {
     let cfg = Config::from_env().context("load config")?;
     let index = Index::connect(&cfg.database_url)
         .await
@@ -44,51 +49,76 @@ async fn main() -> anyhow::Result<()> {
         info!(migrated, "backfilled empty chat_id from CHAT_ID");
     }
 
-    let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
-    tg.ensure_chat_admin(&cfg.chat_id)
-        .await
-        .context("CHAT_ID access check")?;
-
-    let store: Arc<dyn storage::BlobStore> =
-        Arc::new(TelegramBlobStore::new(tg, cfg.chat_id.clone()));
-
-    let snapshot_gate = Arc::new(Mutex::new(()));
-    snapshot::spawn_periodic(
-        index.clone(),
-        store.clone(),
-        snapshot_gate.clone(),
-        cfg.snapshot_interval_secs,
-    );
-    snapshot::spawn_pending_deletes(index.clone(), store.clone());
-
-    let s3gram = S3gram {
-        cfg: cfg.clone(),
-        index,
-        store,
-        snapshot_gate,
+    let store: Arc<dyn s3gram::storage::BlobStore> = if cfg.memory_store {
+        warn!("S3GRAM_MEMORY=1: using MemoryBlobStore (no Telegram)");
+        Arc::new(MemoryBlobStore::new())
+    } else {
+        let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
+        tg.ensure_chat_admin(&cfg.chat_id)
+            .await
+            .context("CHAT_ID access check")?;
+        Arc::new(TelegramBlobStore::new(tg, cfg.chat_id.clone()))
     };
 
-    let mut builder = S3ServiceBuilder::new(s3gram);
-    // s3s without set_auth only accepts unsigned requests; AWS CLI always signs,
-    // so we always install SimpleAuth. (S3GRAM_INSECURE is ignored.)
-    if std::env::var("S3GRAM_INSECURE").ok().as_deref() == Some("1") {
-        tracing::warn!("S3GRAM_INSECURE=1 is ignored under s3s; SigV4 with AWS_* keys is required");
+    let s3gram = build_s3gram(cfg.clone(), index.clone(), store.clone());
+    if !cfg.memory_store {
+        snapshot::spawn_periodic(
+            index.clone(),
+            store.clone(),
+            s3gram.snapshot_gate.clone(),
+            cfg.snapshot_interval_secs,
+        );
+        snapshot::spawn_pending_deletes(index, store);
     }
-    builder.set_auth(SimpleAuth::from_single(
-        cfg.access_key.clone(),
-        cfg.secret_key.clone(),
-    ));
-    let s3_service = builder.build();
-    let s3_service = HandleError::new(s3_service, handle_s3_error);
 
+    if std::env::var("S3GRAM_INSECURE").ok().as_deref() == Some("1") {
+        warn!("S3GRAM_INSECURE=1 is ignored under s3s; SigV4 with AWS_* keys is required");
+    }
+
+    let s3_service = build_s3_service(s3gram, &cfg.access_key, &cfg.secret_key);
+    let s3_service = HandleError::new(s3_service, handle_s3_error);
     let app = Router::new().fallback_service(s3_service);
 
     let addr = cfg.listen_addr.clone();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    info!(chat_id = %cfg.chat_id, "s3gram (s3s) listening on http://{addr}");
+    info!(
+        memory = cfg.memory_store,
+        chat_id = %cfg.chat_id,
+        "s3gram (s3s) listening on http://{addr}"
+    );
     axum::serve(listener, app).await.context("serve")?;
+    Ok(())
+}
+
+/// Restore the SQLite index from a Telegram snapshot `file_id` (manifest or single gzip).
+/// Intended for a stopped server / clean machine.
+async fn cmd_restore(file_id: &str) -> anyhow::Result<()> {
+    let cfg = Config::from_env().context("load config")?;
+    let index = Index::connect(&cfg.database_url)
+        .await
+        .context("open index")?;
+    let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
+    tg.ensure_chat_admin(&cfg.chat_id)
+        .await
+        .context("CHAT_ID access check")?;
+    let store = TelegramBlobStore::new(tg, cfg.chat_id.clone());
+
+    info!(%file_id, "downloading snapshot");
+    let bytes = snapshot::download_snapshot_bytes(&store, &index, Some(file_id))
+        .await
+        .context("download snapshot")?;
+    let snap: IndexSnapshot = serde_json::from_slice(&bytes).context("parse snapshot JSON")?;
+    index
+        .import_snapshot(&snap)
+        .await
+        .context("import snapshot")?;
+    info!(
+        buckets = snap.buckets.len(),
+        objects = snap.objects.len(),
+        "index restored from snapshot"
+    );
     Ok(())
 }
 

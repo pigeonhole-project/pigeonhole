@@ -117,40 +117,6 @@ impl TelegramClient {
         Err(last_err.unwrap_or_else(|| anyhow!("sendDocument failed")))
     }
 
-    /// Re-send an existing Telegram file into `chat_id` by `file_id` (no byte transfer).
-    pub async fn send_document_by_file_id(
-        &self,
-        chat_id: &str,
-        file_id: &str,
-        caption: &str,
-    ) -> Result<(String, i64)> {
-        let mut last_err = None;
-        for attempt in 0..5u32 {
-            match self
-                .send_document_by_file_id_once(chat_id, file_id, caption)
-                .await
-            {
-                Ok(v) => return Ok(v),
-                Err(SendErr::Ambiguous(e)) => {
-                    return Err(e).context(
-                        "sendDocument(file_id) ambiguous failure; not retrying to avoid duplicates",
-                    );
-                }
-                Err(SendErr::RetryAfter(secs, e)) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
-                }
-                Err(SendErr::Connect(e)) => {
-                    let wait = Duration::from_millis(200 * 2u64.pow(attempt));
-                    last_err = Some(e);
-                    tokio::time::sleep(wait).await;
-                }
-                Err(SendErr::Fatal(e)) => return Err(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow!("sendDocument(file_id) failed")))
-    }
-
     async fn send_document_once(
         &self,
         chat_id: &str,
@@ -173,27 +139,6 @@ impl TelegramClient {
             .http
             .post(self.api_url("sendDocument"))
             .multipart(form)
-            .send()
-            .await
-            .map_err(classify_reqwest)?;
-
-        self.parse_send_document_response(resp).await
-    }
-
-    async fn send_document_by_file_id_once(
-        &self,
-        chat_id: &str,
-        file_id: &str,
-        caption: &str,
-    ) -> Result<(String, i64), SendErr> {
-        let resp = self
-            .http
-            .post(self.api_url("sendDocument"))
-            .form(&[
-                ("chat_id", chat_id),
-                ("document", file_id),
-                ("caption", caption),
-            ])
             .send()
             .await
             .map_err(classify_reqwest)?;

@@ -64,6 +64,7 @@ pub struct MultipartUpload {
     pub key: String,
     pub content_type: Option<String>,
     pub user_meta_json: String,
+    pub tagging_json: String,
     pub initiated_at: String,
 }
 
@@ -200,6 +201,7 @@ impl Index {
                 key TEXT NOT NULL,
                 content_type TEXT,
                 user_meta_json TEXT NOT NULL DEFAULT '[]',
+                tagging_json TEXT NOT NULL DEFAULT '[]',
                 initiated_at TEXT NOT NULL,
                 FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
             );
@@ -214,6 +216,17 @@ impl Index {
         {
             sqlx::query(
                 "ALTER TABLE multipart_uploads ADD COLUMN user_meta_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
+
+        if !self
+            .column_exists("multipart_uploads", "tagging_json")
+            .await?
+        {
+            sqlx::query(
+                "ALTER TABLE multipart_uploads ADD COLUMN tagging_json TEXT NOT NULL DEFAULT '[]'",
             )
             .execute(&self.pool)
             .await?;
@@ -280,6 +293,21 @@ impl Index {
                 name TEXT NOT NULL,
                 value TEXT NOT NULL,
                 PRIMARY KEY (bucket, key, name),
+                FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS object_tags (
+                bucket TEXT NOT NULL,
+                key TEXT NOT NULL,
+                tag_key TEXT NOT NULL,
+                tag_value TEXT NOT NULL,
+                PRIMARY KEY (bucket, key, tag_key),
                 FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
             );
             "#,
@@ -518,6 +546,11 @@ impl Index {
             .bind(key)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
+            .bind(bucket)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
 
         let mtime = Utc::now().to_rfc3339();
         sqlx::query(
@@ -598,6 +631,57 @@ impl Index {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    pub async fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT tag_key, tag_value FROM object_tags WHERE bucket = ? AND key = ? ORDER BY tag_key",
+        )
+        .bind(bucket)
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: &[(String, String)],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
+            .bind(bucket)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+        for (k, v) in tags {
+            sqlx::query(
+                "INSERT INTO object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
+            )
+            .bind(bucket)
+            .bind(key)
+            .bind(k)
+            .bind(v)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
+            .bind(bucket)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn get_chunks(&self, bucket: &str, key: &str) -> Result<Vec<Chunk>> {
@@ -1097,14 +1181,16 @@ impl Index {
         key: &str,
         content_type: Option<&str>,
         user_meta: &[(String, String)],
+        tags: &[(String, String)],
     ) -> Result<()> {
         let initiated_at = Utc::now().to_rfc3339();
         let user_meta_json = serde_json::to_string(user_meta)?;
+        let tagging_json = serde_json::to_string(tags)?;
         sqlx::query(
             r#"
             INSERT INTO multipart_uploads
-                (upload_id, bucket, key, content_type, user_meta_json, initiated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (upload_id, bucket, key, content_type, user_meta_json, tagging_json, initiated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(upload_id)
@@ -1112,6 +1198,7 @@ impl Index {
         .bind(key)
         .bind(content_type)
         .bind(user_meta_json)
+        .bind(tagging_json)
         .bind(initiated_at)
         .execute(&self.pool)
         .await?;
@@ -1120,7 +1207,7 @@ impl Index {
 
     pub async fn get_multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUpload>> {
         let row = sqlx::query_as::<_, MultipartUpload>(
-            "SELECT upload_id, bucket, key, content_type, user_meta_json, initiated_at FROM multipart_uploads WHERE upload_id = ?",
+            "SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json, initiated_at FROM multipart_uploads WHERE upload_id = ?",
         )
         .bind(upload_id)
         .fetch_optional(&self.pool)
@@ -1252,6 +1339,8 @@ impl Index {
             .unwrap_or_default();
         let user_meta: Vec<(String, String)> =
             serde_json::from_str(&upload.user_meta_json).unwrap_or_default();
+        let tags: Vec<(String, String)> =
+            serde_json::from_str(&upload.tagging_json).unwrap_or_default();
 
         let mut tx = self.pool.begin().await?;
         let mut assembled: Vec<(i64, String, i64, i64)> = Vec::new();
@@ -1299,6 +1388,11 @@ impl Index {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ?")
+            .bind(&upload.bucket)
+            .bind(&upload.key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
             .bind(&upload.bucket)
             .bind(&upload.key)
             .execute(&mut *tx)
@@ -1355,6 +1449,18 @@ impl Index {
             .await?;
         }
 
+        for (tag_key, tag_value) in &tags {
+            sqlx::query(
+                "INSERT INTO object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&upload.bucket)
+            .bind(&upload.key)
+            .bind(tag_key)
+            .bind(tag_value)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         // Release multipart refs (net-zero with bumps above for shared file_ids).
         for c in &part_chunks {
             if let Some(o) = release_blob(&mut tx, &c.file_id).await? {
@@ -1403,6 +1509,94 @@ impl Index {
         tx.commit().await?;
 
         Ok(Some(orphans))
+    }
+
+    /// List in-progress multipart uploads for a bucket (lexicographic by key, upload_id).
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: i64,
+    ) -> Result<(Vec<MultipartUpload>, bool, Option<(String, String)>)> {
+        let max_uploads = max_uploads.clamp(1, 1000) as usize;
+        let mut sql = String::from(
+            r#"
+            SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json, initiated_at
+            FROM multipart_uploads
+            WHERE bucket = ?
+            "#,
+        );
+        let mut binds: Vec<String> = vec![bucket.to_string()];
+        if !prefix.is_empty() {
+            sql.push_str(" AND key >= ?");
+            binds.push(prefix.to_string());
+            if let Some(end) = exclusive_prefix_end(prefix) {
+                sql.push_str(" AND key < ?");
+                binds.push(end);
+            }
+        }
+        if let Some(km) = key_marker.filter(|s| !s.is_empty()) {
+            if let Some(um) = upload_id_marker.filter(|s| !s.is_empty()) {
+                sql.push_str(" AND (key > ? OR (key = ? AND upload_id > ?))");
+                binds.push(km.to_string());
+                binds.push(km.to_string());
+                binds.push(um.to_string());
+            } else {
+                sql.push_str(" AND key > ?");
+                binds.push(km.to_string());
+            }
+        }
+        sql.push_str(" ORDER BY key, upload_id LIMIT ?");
+
+        let mut query = sqlx::query_as::<_, MultipartUpload>(&sql);
+        for b in &binds {
+            query = query.bind(b);
+        }
+        query = query.bind((max_uploads + 1) as i64);
+        let mut rows = query.fetch_all(&self.pool).await?;
+        let truncated = rows.len() > max_uploads;
+        rows.truncate(max_uploads);
+        let next = if truncated {
+            rows.last().map(|u| (u.key.clone(), u.upload_id.clone()))
+        } else {
+            None
+        };
+        Ok((rows, truncated, next))
+    }
+
+    /// List uploaded parts for a multipart upload (after `part_number_marker`).
+    pub async fn list_parts(
+        &self,
+        upload_id: &str,
+        part_number_marker: Option<i64>,
+        max_parts: i64,
+    ) -> Result<(Vec<MultipartPart>, bool, Option<i64>)> {
+        let max_parts = max_parts.clamp(1, 1000) as usize;
+        let marker = part_number_marker.unwrap_or(0);
+        let mut rows = sqlx::query_as::<_, MultipartPart>(
+            r#"
+            SELECT upload_id, part_number, etag, size
+            FROM multipart_parts
+            WHERE upload_id = ? AND part_number > ?
+            ORDER BY part_number
+            LIMIT ?
+            "#,
+        )
+        .bind(upload_id)
+        .bind(marker)
+        .bind((max_parts + 1) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let truncated = rows.len() > max_parts;
+        rows.truncate(max_parts);
+        let next = if truncated {
+            rows.last().map(|p| p.part_number)
+        } else {
+            None
+        };
+        Ok((rows, truncated, next))
     }
 }
 

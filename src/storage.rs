@@ -3,7 +3,7 @@
 use crate::telegram::TelegramClient;
 
 pub use crate::telegram::DeleteOutcome;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -13,16 +13,13 @@ use std::sync::Mutex;
 /// Backend that stores object chunk bytes (Telegram documents or a test double).
 #[async_trait]
 pub trait BlobStore: Send + Sync {
-    /// Upload bytes → (`file_id`, `message_id`).
+    /// Upload bytes → (`file_id`, `message_id`). Rejects empty payloads (Telegram cannot).
     async fn put(
         &self,
         data: Bytes,
         filename: &str,
         caption: &str,
     ) -> Result<(String, i64)>;
-
-    /// Re-post an existing `file_id` (Telegram: sendDocument by id; no byte transfer).
-    async fn put_by_file_id(&self, file_id: &str, caption: &str) -> Result<(String, i64)>;
 
     async fn get(&self, file_id: &str) -> Result<Bytes>;
 
@@ -57,14 +54,11 @@ impl BlobStore for TelegramBlobStore {
         filename: &str,
         caption: &str,
     ) -> Result<(String, i64)> {
+        if data.is_empty() {
+            bail!("refusing empty blob upload (Telegram rejects empty documents)");
+        }
         self.tg
             .send_document(&self.chat_id, data, filename, caption)
-            .await
-    }
-
-    async fn put_by_file_id(&self, file_id: &str, caption: &str) -> Result<(String, i64)> {
-        self.tg
-            .send_document_by_file_id(&self.chat_id, file_id, caption)
             .await
     }
 
@@ -119,6 +113,9 @@ impl BlobStore for MemoryBlobStore {
         _filename: &str,
         _caption: &str,
     ) -> Result<(String, i64)> {
+        if data.is_empty() {
+            bail!("refusing empty blob upload (Telegram rejects empty documents)");
+        }
         let file_id = format!("mem-{}", self.next_fid.fetch_add(1, Ordering::Relaxed));
         let message_id = self.next_msg.fetch_add(1, Ordering::Relaxed);
         self.files.lock().unwrap().insert(file_id.clone(), data);
@@ -127,22 +124,6 @@ impl BlobStore for MemoryBlobStore {
             .unwrap()
             .insert(message_id, file_id.clone());
         Ok((file_id, message_id))
-    }
-
-    async fn put_by_file_id(&self, file_id: &str, _caption: &str) -> Result<(String, i64)> {
-        let _data = self
-            .files
-            .lock()
-            .unwrap()
-            .get(file_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown file_id {file_id}"))?;
-        let message_id = self.next_msg.fetch_add(1, Ordering::Relaxed);
-        self.messages
-            .lock()
-            .unwrap()
-            .insert(message_id, file_id.to_string());
-        Ok((file_id.to_string(), message_id))
     }
 
     async fn get(&self, file_id: &str) -> Result<Bytes> {
@@ -189,5 +170,14 @@ mod tests {
             store.delete_message(mid).await.unwrap(),
             DeleteOutcome::Gone
         );
+    }
+
+    #[tokio::test]
+    async fn memory_rejects_empty_put() {
+        let store = MemoryBlobStore::new();
+        assert!(store
+            .put(Bytes::new(), "empty.bin", "")
+            .await
+            .is_err());
     }
 }
