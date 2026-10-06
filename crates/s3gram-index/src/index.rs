@@ -1,6 +1,6 @@
-use crate::chunker::ChunkCodec;
-use crate::frames::FrameRecord;
-use crate::ingest::{codec_from_sql, codec_to_sql, UploadedChunk};
+use s3gram_chunk::ChunkCodec;
+use s3gram_chunk::FrameRecord;
+use s3gram_chunk::{codec_from_sql, codec_to_sql, UploadedChunk};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ use sqlx::{sqlite::SqlitePoolOptions, FromRow, SqlitePool};
 
 #[derive(Clone)]
 pub struct Index {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -118,8 +118,20 @@ pub struct Blob {
     pub chat_id: String,
 }
 
+/// Placement of a blob on a concrete backend (`tg:<chat_id>`, `memory:local`, …).
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct BlobReplica {
+    pub file_id: String,
+    pub backend_id: String,
+    /// JSON [`s3gram_core::Locator`].
+    pub locator: String,
+    /// `ready` | `pending` | `failed` (policies later).
+    pub state: String,
+}
+
 /// Telegram message that became unreferenced and should be deleted: (chat_id, message_id).
-pub type OrphanMsg = (String, i64);
+/// `(chat_id, message_id, file_id)` for GC delete + cache invalidation.
+pub type OrphanMsg = (String, i64, String);
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct UserMeta {
@@ -178,6 +190,9 @@ pub struct IndexSnapshot {
     /// Optional: present in snapshots after frame packing landed.
     #[serde(default)]
     pub chunk_frames: Vec<ChunkFrameRow>,
+    /// Optional: backend placement rows (Stage 3+).
+    #[serde(default)]
+    pub blob_replicas: Vec<BlobReplica>,
 }
 
 impl Index {
@@ -438,6 +453,11 @@ impl Index {
                 .execute(&self.pool)
                 .await?;
         }
+        if !self.column_exists("blobs", "stored_crc32").await? {
+            sqlx::query("ALTER TABLE blobs ADD COLUMN stored_crc32 INTEGER")
+                .execute(&self.pool)
+                .await?;
+        }
 
         sqlx::query(
             r#"
@@ -534,6 +554,85 @@ impl Index {
             .execute(&self.pool)
             .await?;
         }
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS blob_replicas (
+                file_id TEXT NOT NULL,
+                backend_id TEXT NOT NULL,
+                locator TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'ready',
+                PRIMARY KEY (file_id, backend_id)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Backfill one replica per blob from legacy file_id/message_id/chat_id.
+        let (replica_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM blob_replicas")
+                .fetch_one(&self.pool)
+                .await?;
+        if replica_count == 0 {
+            let blobs = sqlx::query_as::<_, Blob>(
+                "SELECT file_id, message_id, size, refcount, chat_id FROM blobs",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            for b in blobs {
+                let backend_id = if b.chat_id.is_empty() {
+                    s3gram_core::BackendId::memory().0
+                } else {
+                    s3gram_core::BackendId::telegram(&b.chat_id).0
+                };
+                let locator = if b.chat_id.is_empty() {
+                    s3gram_core::Locator::memory(&b.file_id, b.message_id)
+                } else {
+                    s3gram_core::Locator::telegram(&b.file_id, b.message_id)
+                };
+                let locator_json = locator.to_json()?;
+                sqlx::query(
+                    r#"
+                    INSERT INTO blob_replicas (file_id, backend_id, locator, state)
+                    VALUES (?, ?, ?, 'ready')
+                    ON CONFLICT(file_id, backend_id) DO NOTHING
+                    "#,
+                )
+                .bind(&b.file_id)
+                .bind(&backend_id)
+                .bind(&locator_json)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cas_blobs (
+                hash TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                last_access TEXT NOT NULL,
+                PRIMARY KEY (hash, size)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_cas_deletes (
+                hash TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                queued_at TEXT NOT NULL,
+                PRIMARY KEY (hash, size)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -737,6 +836,7 @@ impl Index {
                 c.message_id,
                 c.logical_size,
                 chat_id,
+                c.stored_crc32,
             )
             .await?;
             sqlx::query(
@@ -943,6 +1043,7 @@ impl Index {
                 codec: c.stored_codec(),
                 // Frames stay keyed by file_id; shallow copy reuses them.
                 frames: Vec::new(),
+                stored_crc32: None,
             })
             .collect();
 
@@ -1243,6 +1344,15 @@ impl Index {
         sqlx::query("DELETE FROM objects")
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM blob_replicas")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM pending_cas_deletes")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM cas_blobs")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM blobs")
             .execute(&mut *tx)
             .await?;
@@ -1382,6 +1492,14 @@ impl Index {
         )
         .fetch_all(&mut *tx)
         .await?;
+        let blob_replicas = sqlx::query_as::<_, BlobReplica>(
+            r#"
+            SELECT file_id, backend_id, locator, state
+            FROM blob_replicas ORDER BY file_id, backend_id
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(IndexSnapshot {
             buckets,
@@ -1390,6 +1508,7 @@ impl Index {
             blobs,
             metadata,
             chunk_frames,
+            blob_replicas,
         })
     }
 
@@ -1411,6 +1530,9 @@ impl Index {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM chunks").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM blob_replicas")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM blobs").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM objects").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM buckets").execute(&mut *tx).await?;
@@ -1500,6 +1622,32 @@ impl Index {
                 .bind(b.size)
                 .bind(b.refcount)
                 .bind(&b.chat_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        if snap.blob_replicas.is_empty() {
+            // Derive replicas from imported blobs (legacy snapshots).
+            let blobs = sqlx::query_as::<_, Blob>(
+                "SELECT file_id, message_id, size, refcount, chat_id FROM blobs",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            for b in blobs {
+                upsert_replica_tx(&mut tx, &b.file_id, b.message_id, &b.chat_id).await?;
+            }
+        } else {
+            for r in &snap.blob_replicas {
+                sqlx::query(
+                    r#"
+                    INSERT INTO blob_replicas (file_id, backend_id, locator, state)
+                    VALUES (?, ?, ?, ?)
+                    "#,
+                )
+                .bind(&r.file_id)
+                .bind(&r.backend_id)
+                .bind(&r.locator)
+                .bind(&r.state)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1615,6 +1763,7 @@ impl Index {
                 c.message_id,
                 c.logical_size,
                 chat_id,
+                c.stored_crc32,
             )
             .await?;
             sqlx::query(
@@ -1720,6 +1869,7 @@ impl Index {
                     logical_size: c.size,
                     codec: c.stored_codec(),
                     frames: Vec::new(),
+                    stored_crc32: None,
                 });
                 part_chunks.push(c);
                 part_no += 1;
@@ -1786,6 +1936,7 @@ impl Index {
                 c.message_id,
                 c.logical_size,
                 &chat_id,
+                c.stored_crc32,
             )
             .await?;
             sqlx::query(
@@ -1970,32 +2121,71 @@ impl Index {
     }
 }
 
-async fn bump_blob(
+pub(crate) async fn bump_blob(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     file_id: &str,
     message_id: i64,
     size: i64,
     chat_id: &str,
+    stored_crc32: Option<u32>,
 ) -> Result<()> {
+    let crc = stored_crc32.map(|c| c as i64);
     sqlx::query(
         r#"
-        INSERT INTO blobs (file_id, message_id, size, refcount, chat_id)
-        VALUES (?, ?, ?, 1, ?)
+        INSERT INTO blobs (file_id, message_id, size, refcount, chat_id, stored_crc32)
+        VALUES (?, ?, ?, 1, ?, ?)
         ON CONFLICT(file_id) DO UPDATE SET
-            refcount = refcount + 1
+            refcount = refcount + 1,
+            stored_crc32 = COALESCE(excluded.stored_crc32, blobs.stored_crc32)
         "#,
     )
     .bind(file_id)
     .bind(message_id)
     .bind(size)
     .bind(chat_id)
+    .bind(crc)
+    .execute(&mut **tx)
+    .await?;
+    upsert_replica_tx(tx, file_id, message_id, chat_id).await?;
+    Ok(())
+}
+
+async fn upsert_replica_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    file_id: &str,
+    message_id: i64,
+    chat_id: &str,
+) -> Result<()> {
+    let backend_id = if chat_id.is_empty() {
+        s3gram_core::BackendId::memory().0
+    } else {
+        s3gram_core::BackendId::telegram(chat_id).0
+    };
+    let locator = if chat_id.is_empty() {
+        s3gram_core::Locator::memory(file_id, message_id)
+    } else {
+        s3gram_core::Locator::telegram(file_id, message_id)
+    };
+    let locator_json = locator.to_json()?;
+    sqlx::query(
+        r#"
+        INSERT INTO blob_replicas (file_id, backend_id, locator, state)
+        VALUES (?, ?, ?, 'ready')
+        ON CONFLICT(file_id, backend_id) DO UPDATE SET
+            locator = excluded.locator,
+            state = 'ready'
+        "#,
+    )
+    .bind(file_id)
+    .bind(&backend_id)
+    .bind(&locator_json)
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
-/// Decrement refcount; if it hits zero, delete blob row and return (chat_id, message_id).
-async fn release_blob(
+/// Decrement refcount; if it hits zero, delete blob row and return (chat_id, message_id, file_id).
+pub(crate) async fn release_blob(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     file_id: &str,
 ) -> Result<Option<OrphanMsg>> {
@@ -2014,11 +2204,15 @@ async fn release_blob(
             .bind(file_id)
             .execute(&mut **tx)
             .await?;
+        sqlx::query("DELETE FROM blob_replicas WHERE file_id = ?")
+            .bind(file_id)
+            .execute(&mut **tx)
+            .await?;
         sqlx::query("DELETE FROM blobs WHERE file_id = ?")
             .bind(file_id)
             .execute(&mut **tx)
             .await?;
-        Ok(Some((chat_id, message_id)))
+        Ok(Some((chat_id, message_id, file_id.to_string())))
     } else {
         sqlx::query("UPDATE blobs SET refcount = refcount - 1 WHERE file_id = ?")
             .bind(file_id)

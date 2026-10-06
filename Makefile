@@ -37,6 +37,6 @@ compat-telegram:
 	./scripts/compat-telegram.sh $(ARGS)
 
 test:
-	cargo test
+	cargo test --workspace
 
 test-all: test smoke

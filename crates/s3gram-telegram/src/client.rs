@@ -1,24 +1,24 @@
-use crate::rate_limit::ChatLimiter;
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use lru::LruCache;
+use moka::future::Cache as MokaCache;
 use reqwest::multipart::{Form, Part};
+use s3gram_blob::{ChatLimiter, DeleteOutcome, PinnedContent};
 use serde::Deserialize;
-use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::debug;
 
 /// Telegram `file_path` from `getFile` is reusable for ~1h; cache to avoid
 /// metering every chunk download against the getFile budget.
-const FILE_PATH_CACHE_CAP: usize = 4096;
+const FILE_PATH_CACHE_CAP: u64 = 4096;
+/// CDN path TTL — Telegram links live about an hour.
+const FILE_PATH_TTL: Duration = Duration::from_secs(50 * 60);
 
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
     bot_token: String,
     /// Shared across clones (`TelegramBlobStore` / snapshot workers).
-    file_paths: Arc<Mutex<LruCache<String, String>>>,
+    file_paths: MokaCache<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,16 +49,6 @@ enum DownloadErr {
     Other(anyhow::Error),
 }
 
-/// Result of deleteMessage: Gone/Deleted both mean the message is no longer present.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeleteOutcome {
-    Deleted,
-    /// Message already absent ("message to delete not found") — treat as success.
-    Gone,
-    /// Transient or policy failure — retry later.
-    Failed,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct Message {
     pub message_id: i64,
@@ -83,13 +73,6 @@ pub struct Chat {
     pub pinned_message: Option<Message>,
 }
 
-/// Content of the chat's latest pinned message (bootstrap pointer).
-#[derive(Debug, Clone)]
-pub enum PinnedContent {
-    Text { message_id: i64, text: String },
-    Document { message_id: i64, file_id: String },
-}
-
 #[derive(Debug, Deserialize)]
 struct FilePath {
     file_path: String,
@@ -105,31 +88,28 @@ impl TelegramClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
-        let cap = NonZeroUsize::new(FILE_PATH_CACHE_CAP).unwrap();
         Ok(Self {
             http,
             bot_token,
-            file_paths: Arc::new(Mutex::new(LruCache::new(cap))),
+            file_paths: MokaCache::builder()
+                .max_capacity(FILE_PATH_CACHE_CAP)
+                .time_to_live(FILE_PATH_TTL)
+                .build(),
         })
     }
 
-    fn cached_file_path(&self, file_id: &str) -> Option<String> {
-        self.file_paths
-            .lock()
-            .unwrap()
-            .get(file_id)
-            .cloned()
+    async fn cached_file_path(&self, file_id: &str) -> Option<String> {
+        self.file_paths.get(file_id).await
     }
 
-    fn remember_file_path(&self, file_id: &str, path: &str) {
+    async fn remember_file_path(&self, file_id: &str, path: &str) {
         self.file_paths
-            .lock()
-            .unwrap()
-            .put(file_id.to_string(), path.to_string());
+            .insert(file_id.to_string(), path.to_string())
+            .await;
     }
 
-    fn forget_file_path(&self, file_id: &str) {
-        self.file_paths.lock().unwrap().pop(file_id);
+    async fn forget_file_path(&self, file_id: &str) {
+        self.file_paths.invalidate(file_id).await;
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -318,7 +298,7 @@ impl TelegramClient {
                 Err(e) => {
                     let stale = is_cdn_path_stale(&e);
                     if stale {
-                        self.forget_file_path(file_id);
+                        self.forget_file_path(file_id).await;
                         force_refresh = true;
                         debug!(attempt, error = %e, "CDN path stale; refreshing getFile");
                     } else {
@@ -334,6 +314,91 @@ impl TelegramClient {
         Err(last_err.unwrap_or_else(|| anyhow!("download failed")))
     }
 
+    /// Best-effort ranged CDN download. Succeeds only on HTTP 206 with a
+    /// `Content-Range` that starts at `start`. End is exclusive (Rust-style).
+    pub async fn download_file_range(
+        &self,
+        file_id: &str,
+        start: u64,
+        end: u64,
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<Bytes> {
+        if end <= start {
+            bail!("empty range {start}..{end}");
+        }
+        let last = end - 1;
+        let mut last_err = None;
+        let mut force_refresh = false;
+        for attempt in 0..5u32 {
+            let path = match self
+                .resolve_file_path_cached(file_id, limiter, force_refresh)
+                .await
+            {
+                Ok(p) => p,
+                Err(DownloadErr::RetryAfter(secs, e)) => {
+                    last_err = Some(e);
+                    if let Some(lim) = limiter {
+                        lim.penalize_get_file(Duration::from_secs(secs.max(1)));
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
+                    }
+                    continue;
+                }
+                Err(DownloadErr::Other(e)) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(200 * 2u64.pow(attempt))).await;
+                    continue;
+                }
+            };
+
+            let _dl = if let Some(lim) = limiter {
+                Some(lim.acquire_download().await)
+            } else {
+                None
+            };
+            match self.download_cdn_range(&path, start, last).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let stale = is_cdn_path_stale(&e);
+                    if stale {
+                        self.forget_file_path(file_id).await;
+                        force_refresh = true;
+                    } else {
+                        force_refresh = false;
+                        tokio::time::sleep(Duration::from_millis(200 * 2u64.pow(attempt))).await;
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("ranged download failed")))
+    }
+
+    async fn download_cdn_range(&self, file_path: &str, start: u64, last: u64) -> Result<Bytes> {
+        let resp = self
+            .http
+            .get(self.file_url(file_path))
+            .header("Range", format!("bytes={start}-{last}"))
+            .send()
+            .await
+            .context("ranged file download http")?;
+        let status = resp.status();
+        if status.as_u16() != 206 {
+            bail!("ranged download expected 206, got {status}");
+        }
+        let cr = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        // Content-Range: bytes START-END/TOTAL
+        let ok_prefix = format!("bytes {start}-");
+        if !cr.starts_with(&ok_prefix) {
+            bail!("Content-Range {cr:?} does not start at {start}");
+        }
+        resp.bytes().await.context("ranged file download bytes")
+    }
+
     async fn resolve_file_path_cached(
         &self,
         file_id: &str,
@@ -341,7 +406,7 @@ impl TelegramClient {
         force_refresh: bool,
     ) -> Result<String, DownloadErr> {
         if !force_refresh {
-            if let Some(path) = self.cached_file_path(file_id) {
+            if let Some(path) = self.cached_file_path(file_id).await {
                 return Ok(path);
             }
         }
@@ -349,7 +414,7 @@ impl TelegramClient {
             lim.acquire_get_file().await;
         }
         let path = self.resolve_file_path(file_id).await?;
-        self.remember_file_path(file_id, &path);
+        self.remember_file_path(file_id, &path).await;
         Ok(path)
     }
 
@@ -759,23 +824,23 @@ pub struct TgUser {
 mod tests {
     use super::*;
 
-    #[test]
-    fn file_path_lru_roundtrip() {
+    #[tokio::test]
+    async fn file_path_moka_roundtrip() {
         let tg = TelegramClient::new("token".into()).unwrap();
-        assert!(tg.cached_file_path("fid-1").is_none());
-        tg.remember_file_path("fid-1", "photos/file.bin");
+        assert!(tg.cached_file_path("fid-1").await.is_none());
+        tg.remember_file_path("fid-1", "photos/file.bin").await;
         assert_eq!(
-            tg.cached_file_path("fid-1").as_deref(),
+            tg.cached_file_path("fid-1").await.as_deref(),
             Some("photos/file.bin")
         );
         // Clones share the cache.
         let tg2 = tg.clone();
         assert_eq!(
-            tg2.cached_file_path("fid-1").as_deref(),
+            tg2.cached_file_path("fid-1").await.as_deref(),
             Some("photos/file.bin")
         );
-        tg2.forget_file_path("fid-1");
-        assert!(tg.cached_file_path("fid-1").is_none());
+        tg2.forget_file_path("fid-1").await;
+        assert!(tg.cached_file_path("fid-1").await.is_none());
     }
 
     #[test]

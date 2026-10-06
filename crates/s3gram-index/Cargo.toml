@@ -1,0 +1,20 @@
+[package]
+name = "s3gram-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite index for s3gram"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+s3gram-chunk = { workspace = true }
+s3gram-core = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

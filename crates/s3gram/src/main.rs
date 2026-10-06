@@ -2,12 +2,13 @@ use anyhow::{bail, Context};
 use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
 use axum::Router;
-use s3gram::config::Config;
+use s3gram::config::{BackendKind, Config};
 use s3gram::index::{Index, IndexSnapshot};
 use s3gram::snapshot;
-use s3gram::storage::{BlobStore, DeleteOutcome, MemoryBlobStore, TelegramBlobStore};
-use s3gram::telegram::TelegramClient;
+use s3gram::storage::{BlobStore, DeleteOutcome, MemoryBlobStore};
+use s3gram::telegram::{PinnedContent, TelegramBlobStore, TelegramClient};
 use s3gram::{build_s3_service, build_s3gram};
+use s3gram_blob::{BlobBackend, BootstrapPointer, CachingBackend};
 use s3s::{Body, HttpError};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -89,40 +90,116 @@ async fn cmd_serve() -> anyhow::Result<()> {
     }
 
     let limiter = cfg.chat_limiter();
-    let (store, tg_for_snap): (
-        Arc<dyn s3gram::storage::BlobStore>,
-        Option<(TelegramClient, String)>,
+    let (store, pin, max_blob): (
+        Arc<dyn BlobStore>,
+        Option<Arc<dyn BootstrapPointer>>,
+        usize,
     ) = if cfg.memory_store {
         warn!("memory = true: using MemoryBlobStore (no Telegram)");
-        (Arc::new(MemoryBlobStore::new()), None)
+        let mem = MemoryBlobStore::new();
+        let max_blob = mem.limits().max_blob_size;
+        let store: Arc<dyn BlobStore> = if cfg.cache.enabled {
+            info!(
+                memory_bytes = cfg.cache.memory_bytes,
+                disk = ?cfg.cache.disk_path,
+                "L2 CachingBackend enabled"
+            );
+            Arc::new(
+                CachingBackend::new(mem, cfg.cache.clone())
+                    .await
+                    .context("init CachingBackend")?,
+            )
+        } else {
+            Arc::new(mem)
+        };
+        (store, None, max_blob)
+    } else if cfg.backend_kind == BackendKind::Discord {
+        #[cfg(feature = "discord")]
+        {
+            use s3gram_discord::{DiscordBlobStore, DiscordClient};
+            let dc = DiscordClient::new(cfg.bot_token.clone()).context("discord client")?;
+            dc.ensure_channel_permissions(&cfg.chat_id, Some(limiter.as_ref()))
+                .await
+                .context("channel_id permission check")?;
+            let dc_store = Arc::new(DiscordBlobStore::new(
+                dc,
+                cfg.chat_id.clone(),
+                limiter,
+                cfg.discord_max_blob_size,
+            ));
+            let max_blob = dc_store.limits().max_blob_size;
+            let pin: Arc<dyn BootstrapPointer> = dc_store.clone();
+            let store: Arc<dyn BlobStore> = if cfg.cache.enabled {
+                info!(
+                    memory_bytes = cfg.cache.memory_bytes,
+                    disk = ?cfg.cache.disk_path,
+                    "L2 CachingBackend enabled"
+                );
+                Arc::new(
+                    CachingBackend::new(ArcBackend(dc_store.clone()), cfg.cache.clone())
+                        .await
+                        .context("init CachingBackend")?,
+                )
+            } else {
+                dc_store
+            };
+            (store, Some(pin), max_blob)
+        }
+        #[cfg(not(feature = "discord"))]
+        {
+            bail!(
+                "config selects discord backend but this binary was built without `--features discord`"
+            );
+        }
     } else {
         let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
         tg.ensure_chat_admin(&cfg.chat_id)
             .await
             .context("chat_id access check")?;
-        let chat_id = cfg.chat_id.clone();
-        let store = Arc::new(TelegramBlobStore::new(
-            tg.clone(),
-            chat_id.clone(),
-            limiter.clone(),
+        let tg_store = Arc::new(TelegramBlobStore::new(
+            tg,
+            cfg.chat_id.clone(),
+            limiter,
         ));
-        (store, Some((tg, chat_id)))
+        let max_blob = tg_store.limits().max_blob_size;
+        let pin: Arc<dyn BootstrapPointer> = tg_store.clone();
+        let store: Arc<dyn BlobStore> = if cfg.cache.enabled {
+            info!(
+                memory_bytes = cfg.cache.memory_bytes,
+                disk = ?cfg.cache.disk_path,
+                "L2 CachingBackend enabled"
+            );
+            // Cache wraps the same Arc so pin + blob I/O share one client/limiter.
+            Arc::new(
+                CachingBackend::new(ArcBackend(tg_store.clone()), cfg.cache.clone())
+                    .await
+                    .context("init CachingBackend")?,
+            )
+        } else {
+            tg_store
+        };
+        (store, Some(pin), max_blob)
     };
+    if cfg.chunk_size > max_blob {
+        bail!(
+            "chunk.size {} exceeds backend max_blob_size {max_blob}",
+            cfg.chunk_size
+        );
+    }
 
     let s3gram = build_s3gram(cfg.clone(), index.clone(), store.clone());
-    if let Some((tg, chat_id)) = tg_for_snap {
+    if let Some(pin) = pin {
         snapshot::spawn_periodic(
             index.clone(),
             store.clone(),
-            tg,
-            chat_id,
+            pin,
             s3gram.snapshot_gate.clone(),
             cfg.snapshot_interval_secs,
             cfg.chunk_size,
-            limiter,
         );
-        snapshot::spawn_pending_deletes(index, store);
+        snapshot::spawn_pending_deletes(index.clone(), store.clone());
     }
+
 
     let s3_service = build_s3_service(s3gram, &cfg.access_key, &cfg.secret_key);
     let s3_service = HandleError::new(s3_service, handle_s3_error);
@@ -134,6 +211,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
         .with_context(|| format!("bind {addr}"))?;
     info!(
         memory = cfg.memory_store,
+        backend = ?cfg.backend_kind,
         chat_id = %cfg.chat_id,
         chunk_size = cfg.chunk_size,
         chunk_codec = %cfg.chunk_codec,
@@ -141,6 +219,36 @@ async fn cmd_serve() -> anyhow::Result<()> {
     );
     axum::serve(listener, app).await.context("serve")?;
     Ok(())
+}
+
+/// Thin Arc wrapper so [`CachingBackend`] can own a cloneable backend handle.
+struct ArcBackend<T>(Arc<T>);
+
+#[async_trait::async_trait]
+impl<T: BlobBackend + 'static> BlobBackend for ArcBackend<T> {
+    fn id(&self) -> &s3gram_blob::BackendId {
+        self.0.id()
+    }
+    fn limits(&self) -> &s3gram_blob::BackendLimits {
+        self.0.limits()
+    }
+    async fn put(
+        &self,
+        data: bytes::Bytes,
+        hint: s3gram_blob::PutHint,
+    ) -> anyhow::Result<s3gram_blob::Locator> {
+        self.0.put(data, hint).await
+    }
+    async fn get(
+        &self,
+        loc: &s3gram_blob::Locator,
+        range: Option<s3gram_blob::ByteRange>,
+    ) -> anyhow::Result<s3gram_blob::BoxByteStream> {
+        self.0.get(loc, range).await
+    }
+    async fn delete(&self, loc: &s3gram_blob::Locator) -> anyhow::Result<DeleteOutcome> {
+        self.0.delete(loc).await
+    }
 }
 
 /// Delete every Telegram message tracked by the local index, then wipe SQLite.
@@ -186,7 +294,7 @@ async fn cmd_purge(
     }
     if let Ok(Some(pinned)) = tg.get_pinned_content(&cfg.chat_id).await {
         match pinned {
-            s3gram::telegram::PinnedContent::Text { message_id, text } => {
+            PinnedContent::Text { message_id, text } => {
                 ids.insert(message_id);
                 if let Ok(m) = snapshot::parse_pin_manifest(&text) {
                     for p in m.parts {
@@ -194,7 +302,7 @@ async fn cmd_purge(
                     }
                 }
             }
-            s3gram::telegram::PinnedContent::Document { message_id, .. } => {
+            PinnedContent::Document { message_id, .. } => {
                 ids.insert(message_id);
             }
         }
@@ -286,11 +394,16 @@ async fn cmd_restore(file_id: Option<&str>, force: bool) -> anyhow::Result<()> {
         .await
         .context("chat_id access check")?;
     let limiter = cfg.chat_limiter();
-    let store = TelegramBlobStore::new(tg.clone(), cfg.chat_id.clone(), limiter);
+    let store = Arc::new(TelegramBlobStore::new(
+        tg,
+        cfg.chat_id.clone(),
+        limiter,
+    ));
+    let pin: Arc<dyn BootstrapPointer> = store.clone();
 
     if let Some(fid) = file_id {
         info!(%fid, "downloading snapshot by file_id");
-        let bytes = snapshot::download_snapshot_bytes(&store, &index, Some(fid))
+        let bytes = snapshot::download_snapshot_bytes(store.as_ref(), &index, Some(fid))
             .await
             .context("download snapshot")?;
         let snap: IndexSnapshot =
@@ -306,7 +419,7 @@ async fn cmd_restore(file_id: Option<&str>, force: bool) -> anyhow::Result<()> {
         );
     } else {
         info!(chat_id = %cfg.chat_id, "bootstrapping snapshot from pinned manifest");
-        let restored = snapshot::download_from_pinned(&tg, &cfg.chat_id, &store)
+        let restored = snapshot::download_from_pinned(pin.as_ref(), store.as_ref())
             .await
             .context("download from pin")?;
         let snap: IndexSnapshot =

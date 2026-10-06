@@ -15,6 +15,20 @@ a local SQLite index.
 Telegram I/O goes through a `BlobStore` trait (`TelegramBlobStore` in production,
 `MemoryBlobStore` in unit tests) so tests never hit the real Bot API.
 
+Layout is a Cargo workspace under `crates/`:
+
+| Crate | Role |
+|---|---|
+| `s3gram-core` | Shared types (`DeleteOutcome`, `PinnedContent`) |
+| `s3gram-chunk` | Codecs + `FrameWriter` |
+| `s3gram-blob` | `BlobBackend` / `BlobStore`, `MemoryBackend`, `ChatLimiter`, `BootstrapPointer` |
+| `s3gram-telegram` | Bot API client + `TelegramBackend` (Range best-effort) |
+| `s3gram-index` | SQLite index |
+| `s3gram-engine` | Ingest, snapshots, config (no Telegram dependency) |
+| `s3gram-s3` | `s3s::S3` impl |
+| `s3gram-bytestream` | REAPI v2 remote cache (CAS + ByteStream + ActionCache) |
+| `s3gram` | Binary + wiring |
+
 ## Bot API limits
 
 - Upload (`sendDocument`): 50 MiB
@@ -56,6 +70,21 @@ cargo run --release
 
 Listens on `http://0.0.0.0:8333` by default (`listen_addr` in TOML).
 
+### Bazel / Buck2 remote cache (REAPI)
+
+Build with the `bytestream` feature, enable `[bytestream]` in `s3gram.toml`, then
+point Bazel at the gRPC listener (separate port from S3):
+
+```bash
+cargo run --release --features bytestream
+# s3gram.toml: [bytestream] enabled = true, listen_addr = "127.0.0.1:8980"
+
+bazel build --remote_cache=grpc://127.0.0.1:8980 //your/target
+```
+
+The server exposes REAPI v2 `Capabilities`, `ContentAddressableStorage`,
+`ActionCache`, and `google.bytestream.ByteStream` (SHA256 digests, cache-only).
+
 ## Configuration
 
 See [`s3gram.toml.example`](s3gram.toml.example):
@@ -74,18 +103,20 @@ See [`s3gram.toml.example`](s3gram.toml.example):
 | `[telegram].get_file_*` | Budget for getFile |
 | `[telegram].delete_*` | Budget for deleteMessage (purge / GC) |
 | `[telegram].*_concurrency` | Upload / download connection semaphores |
+| `[bytestream].enabled` | REAPI remote cache gRPC (requires `--features bytestream`) |
+| `[bytestream].listen_addr` | gRPC bind address (default `127.0.0.1:8980`) |
 
 Legacy `[telegram].rate_per_sec` / `rate_burst` map to `send_*`.
 
 ## Tests / CI
 
-GitHub Actions (`.github/workflows/ci.yml`) runs `cargo test` plus the four
-MemoryBlobStore client suites: `compat-memory` (ceph/s3-tests known-good),
+GitHub Actions (`.github/workflows/ci.yml`) runs `cargo test --workspace` plus the
+four MemoryBlobStore client suites: `compat-memory` (ceph/s3-tests known-good),
 `compat-s3s-boto3`, `compat-s3s-e2e`, and `compat-rclone`.
 
 ```bash
 # unit + in-process S3 API tests (MemoryBlobStore, no Telegram)
-cargo test
+cargo test --workspace
 # or: make test
 
 # smoke against a running server

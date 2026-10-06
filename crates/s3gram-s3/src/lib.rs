@@ -1,33 +1,19 @@
-//! S3-compatible gateway backed by Telegram (`BlobStore`) and a SQLite index.
+//! s3s [`S3`](s3s::S3) backend over the s3gram engine.
 
-pub mod chunker;
-pub mod config;
-pub mod frames;
-pub mod index;
-pub mod ingest;
-pub mod rate_limit;
-pub mod service;
-pub mod snapshot;
-pub mod storage;
-pub mod telegram;
+mod service;
 
-use config::Config;
-use index::Index;
+pub use service::S3gram;
+pub use s3gram_blob::{BlobStore, DeleteOutcome, MemoryBlobStore};
+pub use s3gram_engine::Config;
+pub use s3gram_index::Index;
+
 use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};
-use service::S3gram;
 use std::sync::Arc;
-use storage::BlobStore;
-use tokio::sync::Mutex;
 
 /// Build an [`S3gram`] backend from an existing index + blob store (tests / custom wiring).
 pub fn build_s3gram(cfg: Config, index: Index, store: Arc<dyn BlobStore>) -> S3gram {
-    S3gram {
-        cfg,
-        index,
-        store,
-        snapshot_gate: Arc::new(Mutex::new(())),
-    }
+    S3gram::new(cfg, index, store)
 }
 
 /// Wrap [`S3gram`] in an authenticated s3s HTTP service.

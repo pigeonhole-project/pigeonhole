@@ -1,13 +1,13 @@
 //! Stream an S3 request body into Telegram-sized BlobStore chunks.
 //!
 //! With compressing policies (`zstd` / `gzip`), data is packed as independent
-//! fixed-size frames ([`crate::frames::FrameWriter`]) so each block is compressed
+//! fixed-size frames ([`s3gram_chunk::FrameWriter`]) so each block is compressed
 //! once. Chunk codec stored in the index is [`ChunkCodec::Frames`]. Legacy
 //! single-blob `raw` / `gzip` / `zstd` chunks remain readable.
 
-use crate::chunker::{self, ChunkCodec};
-use crate::frames::{self, ByteBudget, CompletedChunk, FrameRecord, FrameWriter};
-use crate::storage::{BlobStore, DeleteOutcome};
+use s3gram_blob::{BlobStore, DeleteOutcome};
+use s3gram_chunk::{self as chunker, ChunkCodec};
+use s3gram_chunk::{self as frames, ByteBudget, CompletedChunk, FrameRecord, FrameWriter};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use flate2::read::GzDecoder;
@@ -20,16 +20,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// One uploaded Telegram document (object/multipart part slice).
-#[derive(Debug, Clone)]
-pub struct UploadedChunk {
-    pub part_no: i64,
-    pub file_id: String,
-    pub message_id: i64,
-    pub logical_size: i64,
-    pub codec: ChunkCodec,
-    pub frames: Vec<FrameRecord>,
-}
+pub use s3gram_chunk::{codec_from_sql, codec_to_sql, UploadedChunk};
 
 #[derive(Debug)]
 pub struct IngestResult {
@@ -310,6 +301,7 @@ async fn put_completed(
     if done.payload.is_empty() {
         bail!("refusing empty framed chunk");
     }
+    let stored_crc32 = Some(crc32fast::hash(done.payload.as_ref()));
     let filename = format!("{:x}.bin.frames", Md5::digest(&done.payload));
     let (file_id, message_id) = store
         .put(done.payload, &filename, "")
@@ -322,6 +314,7 @@ async fn put_completed(
         logical_size: done.logical_size,
         codec: ChunkCodec::Frames,
         frames: done.frames,
+        stored_crc32,
     })
 }
 
@@ -331,6 +324,7 @@ async fn put_raw_piece(
     part_no: i64,
 ) -> Result<UploadedChunk> {
     let logical_size = piece.len() as i64;
+    let stored_crc32 = Some(crc32fast::hash(&piece));
     let filename = format!("{:x}.bin", Md5::digest(&piece));
     let (file_id, message_id) = store
         .put(Bytes::from(piece), &filename, "")
@@ -343,6 +337,7 @@ async fn put_raw_piece(
         logical_size,
         codec: ChunkCodec::Raw,
         frames: Vec::new(),
+        stored_crc32,
     })
 }
 
@@ -444,19 +439,6 @@ pub async fn decode_chunk_slice_async(
     }
 }
 
-pub fn codec_to_sql(c: ChunkCodec) -> &'static str {
-    c.as_str()
-}
-
-pub fn codec_from_sql(s: &str) -> Result<ChunkCodec> {
-    match s {
-        "0" | "false" => Ok(ChunkCodec::Raw),
-        "1" | "true" => Ok(ChunkCodec::Gzip),
-        other => ChunkCodec::parse(other)
-            .with_context(|| format!("invalid chunk codec in index: {other:?}")),
-    }
-}
-
 /// Sync encode helper for unit tests (legacy single-blob).
 pub fn encode_chunk(logical: Bytes, policy: ChunkCodec) -> (Bytes, ChunkCodec) {
     if policy == ChunkCodec::Raw || logical.is_empty() {
@@ -484,7 +466,7 @@ fn compress_slice(data: &[u8], codec: ChunkCodec) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MemoryBlobStore;
+    use s3gram_blob::MemoryBlobStore;
     use futures::stream;
 
     #[tokio::test]

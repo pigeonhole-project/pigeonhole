@@ -92,10 +92,10 @@ record() {
   fi
 }
 
-log_step "cargo test"
+log_step "cargo test --workspace"
 set +e
-cargo test 2>&1 | tee -a "$REPORT"
-record "cargo test" "${PIPESTATUS[0]}"
+cargo test --workspace 2>&1 | tee -a "$REPORT"
+record "cargo test --workspace" "${PIPESTATUS[0]}"
 set -e
 
 log_step "build release"

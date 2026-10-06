@@ -1,11 +1,24 @@
-[package]
-name = "s3gram"
+[workspace]
+resolver = "2"
+members = [
+    "crates/s3gram-core",
+    "crates/s3gram-chunk",
+    "crates/s3gram-blob",
+    "crates/s3gram-telegram",
+    "crates/s3gram-index",
+    "crates/s3gram-engine",
+    "crates/s3gram-s3",
+    "crates/s3gram",
+]
+default-members = ["crates/s3gram"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "S3-compatible gateway backed by Telegram Bot API"
 license = "MIT"
+description = "S3-compatible gateway backed by Telegram Bot API"
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1.92"
 axum = { version = "0.8", features = ["macros"] }
@@ -15,8 +28,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 crc32fast = "1"
 dotenvy = "0.15"
 flate2 = "1"
+foyer = { version = "0.22", features = ["serde"] }
 futures = "0.3"
 hex = "0.4"
+moka = { version = "0.12", features = ["future"] }
 http = "1"
 lru = "0.12"
 md-5 = "0.10"
@@ -26,6 +41,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 toml = { version = "0.8", features = ["parse"] }
@@ -35,5 +51,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 zstd = "0.13"
 
-[dev-dependencies]
-tempfile = "3"
+s3gram-core = { path = "crates/s3gram-core" }
+s3gram-chunk = { path = "crates/s3gram-chunk" }
+s3gram-blob = { path = "crates/s3gram-blob" }
+s3gram-telegram = { path = "crates/s3gram-telegram" }
+s3gram-index = { path = "crates/s3gram-index" }
+s3gram-engine = { path = "crates/s3gram-engine" }
+s3gram-s3 = { path = "crates/s3gram-s3" }

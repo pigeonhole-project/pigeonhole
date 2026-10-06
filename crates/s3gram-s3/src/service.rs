@@ -1,12 +1,15 @@
 //! S3 API implementation on top of SQLite index + BlobStore (via s3s).
 
-use crate::config::Config;
-use crate::index::{parse_rfc3339, DeleteBucketResult, Index, OrphanMsg};
-use crate::chunker::ChunkCodec;
-use crate::ingest::{
+use s3gram_blob::{BlobStore, DeleteOutcome};
+use s3gram_chunk::ChunkCodec;
+use s3gram_core::{BackendId, BlobKey, Locator};
+use s3gram_engine::config::Config;
+use s3gram_engine::frame_cache::FrameCache;
+use s3gram_engine::ingest::{
     decode_chunk_slice_async, ingest_stream_with_options, IngestOptions, UploadedChunk,
 };
-use crate::storage::{BlobStore, DeleteOutcome};
+use s3gram_engine::read::read_chunk_range_cached;
+use s3gram_index::{parse_rfc3339, DeleteBucketResult, Index, OrphanMsg};
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
@@ -14,6 +17,7 @@ use futures::StreamExt;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::{S3, S3Request, S3Response, S3Result};
+use std::collections::HashMap;
 use std::ops::Not;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -26,9 +30,32 @@ pub struct S3gram {
     pub index: Index,
     pub store: Arc<dyn BlobStore>,
     pub snapshot_gate: Arc<Mutex<()>>,
+    /// L1 unpacked-frame cache (None when `[cache] enabled = false`).
+    pub frame_cache: Option<Arc<FrameCache>>,
+    /// Last exclusive end offset per object for sequential readahead detection.
+    pub(crate) sequential_ends: Arc<Mutex<HashMap<(String, String), u64>>>,
 }
 
 impl S3gram {
+    pub fn new(cfg: Config, index: Index, store: Arc<dyn BlobStore>) -> Self {
+        let frame_cache = if cfg.cache.enabled {
+            Some(Arc::new(FrameCache::new(
+                cfg.cache.frame_memory_bytes,
+                cfg.cache.readahead_frames,
+            )))
+        } else {
+            None
+        };
+        Self {
+            cfg,
+            index,
+            store,
+            snapshot_gate: Arc::new(Mutex::new(())),
+            frame_cache,
+            sequential_ends: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     fn chat_id(&self) -> &str {
         &self.cfg.chat_id
     }
@@ -42,10 +69,11 @@ impl S3gram {
 
     async fn cleanup_orphans(&self, orphans: Vec<OrphanMsg>) {
         let mut seen = std::collections::HashSet::new();
-        for (_chat, message_id) in orphans {
+        for (_chat, message_id, file_id) in orphans {
             if !seen.insert(message_id) {
                 continue;
             }
+            self.invalidate_caches_for_file(&file_id).await;
             match self.store.delete_message(message_id).await {
                 Ok(DeleteOutcome::Deleted | DeleteOutcome::Gone) => {}
                 Ok(DeleteOutcome::Failed) => {
@@ -63,6 +91,61 @@ impl S3gram {
                 }
             }
         }
+    }
+
+    async fn invalidate_caches_for_file(&self, file_id: &str) {
+        self.store.invalidate_blob(file_id).await;
+        if let Some(fc) = &self.frame_cache {
+            let key = blob_key_for_file(file_id);
+            fc.invalidate_blob(&key).await;
+        }
+    }
+
+    async fn warm_l1_frames(&self, chunks: &[UploadedChunk]) {
+        let Some(fc) = &self.frame_cache else {
+            return;
+        };
+        if !self.cfg.cache.write_through {
+            return;
+        }
+        for c in chunks {
+            if c.codec != ChunkCodec::Frames || c.frames.is_empty() {
+                continue;
+            }
+            let Ok(stored) = self.store.get(&c.file_id).await else {
+                continue;
+            };
+            let key = blob_key_for_file(&c.file_id);
+            for fr in &c.frames {
+                let soff = fr.stored_off as usize;
+                let slen = fr.stored_len as usize;
+                if soff + slen > stored.len() {
+                    continue;
+                }
+                let slice = stored.slice(soff..soff + slen);
+                let mut rec = fr.clone();
+                rec.stored_off = 0;
+                if let Ok(decoded) = s3gram_chunk::decode_frames_range(
+                    slice.as_ref(),
+                    &[rec],
+                    0,
+                    fr.logical_len as usize,
+                ) {
+                    fc.insert(key.clone(), fr.frame_no as u32, decoded).await;
+                }
+            }
+        }
+    }
+
+    async fn note_sequential(&self, bucket: &str, key: &str, start: u64, end_excl: u64) -> bool {
+        let mut map = self.sequential_ends.lock().await;
+        let k = (bucket.to_string(), key.to_string());
+        let readahead = match map.get(&k) {
+            None => start == 0,
+            Some(&prev) => start == prev || start == 0,
+        };
+        map.insert(k, end_excl);
+        readahead
     }
 
     async fn queue_pending_deletes(&self, message_ids: Vec<i64>) {
@@ -488,7 +571,7 @@ struct ChunkSlice {
 }
 
 fn plan_chunk_slices(
-    chunks: &[crate::index::Chunk],
+    chunks: &[s3gram_index::Chunk],
     mut start: u64,
     mut remaining: u64,
 ) -> Vec<ChunkSlice> {
@@ -523,7 +606,7 @@ fn plan_chunk_slices(
 /// If `[start, start+length)` covers whole Telegram chunks only, return them
 /// renumbered as multipart part chunks. Misaligned ranges return `None`.
 fn try_aligned_part_chunks(
-    chunks: &[crate::index::Chunk],
+    chunks: &[s3gram_index::Chunk],
     start: u64,
     length: u64,
 ) -> Option<Vec<UploadedChunk>> {
@@ -555,6 +638,7 @@ fn try_aligned_part_chunks(
             logical_size: c.size,
             codec: c.stored_codec(),
             frames: Vec::new(),
+            stored_crc32: None,
         });
         chunk_no += 1;
         offset = cend;
@@ -566,48 +650,54 @@ fn try_aligned_part_chunks(
     Some(out)
 }
 
+fn blob_key_for_file(file_id: &str) -> BlobKey {
+    let (backend, loc) = if file_id.starts_with("mem-") {
+        (BackendId::memory(), Locator::memory(file_id, 0))
+    } else {
+        (BackendId::new("tg", "cached"), Locator::telegram(file_id, 0))
+    };
+    BlobKey::new(backend, loc)
+}
+
 fn stream_object_body(
     store: Arc<dyn BlobStore>,
     index: Index,
-    chunks: Vec<crate::index::Chunk>,
+    chunks: Vec<s3gram_index::Chunk>,
     start: u64,
     length: u64,
+    frame_cache: Option<Arc<FrameCache>>,
+    readahead: bool,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + 'static {
     let plan = plan_chunk_slices(&chunks, start, length);
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
     tokio::spawn(async move {
         for slice in plan {
-            let result = match store.get(&slice.file_id).await {
-                Ok(data) => {
-                    let frames = if slice.codec == ChunkCodec::Frames {
-                        match index.get_chunk_frames(&slice.file_id).await {
-                            Ok(f) => f,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(std::io::Error::other(e.to_string())))
-                                    .await;
-                                break;
-                            }
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    match decode_chunk_slice_async(
-                        data,
-                        slice.codec,
-                        &frames,
-                        slice.from,
-                        slice.to,
-                        slice.logical_size.max(1),
-                    )
-                    .await
-                    {
-                        Ok(logical) => Ok(logical),
-                        Err(e) => Err(std::io::Error::other(e.to_string())),
+            let frames = if slice.codec == ChunkCodec::Frames {
+                match index.get_chunk_frames(&slice.file_id).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(std::io::Error::other(e.to_string())))
+                            .await;
+                        break;
                     }
                 }
-                Err(e) => Err(std::io::Error::other(e.to_string())),
+            } else {
+                Vec::new()
             };
+            let result = read_chunk_range_cached(
+                store.clone(),
+                &slice.file_id,
+                slice.codec,
+                &frames,
+                slice.from,
+                slice.to,
+                slice.logical_size.max(1),
+                frame_cache.clone(),
+                readahead,
+            )
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()));
             if tx.send(result).await.is_err() {
                 break; // client disconnected
             }
@@ -1037,6 +1127,7 @@ impl S3 for S3gram {
             .await
             .map_err(Self::map_err)?;
         self.cleanup_orphans(orphans).await;
+        self.warm_l1_frames(&ingested.chunks).await;
 
         if !tags.is_empty() {
             self.index
@@ -1110,12 +1201,18 @@ impl S3 for S3gram {
         let body = if length == 0 {
             Some(StreamingBlob::from_bytes(Bytes::new()))
         } else {
+            let end_excl = start.saturating_add(length);
+            let readahead = self
+                .note_sequential(&input.bucket, &input.key, start, end_excl)
+                .await;
             let body_stream = stream_object_body(
                 self.store.clone(),
                 self.index.clone(),
                 chunks,
                 start,
                 length,
+                self.frame_cache.clone(),
+                readahead,
             );
             Some(StreamingBlob::wrap(body_stream))
         };
@@ -1590,6 +1687,8 @@ impl S3 for S3gram {
                     chunks,
                     start,
                     length,
+                    self.frame_cache.clone(),
+                    true,
                 )
                 .map(|r| r.map_err(|e| anyhow::anyhow!(e)));
                 let ingested = match ingest_stream_with_options(

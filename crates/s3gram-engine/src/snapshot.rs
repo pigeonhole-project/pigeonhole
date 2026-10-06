@@ -3,11 +3,10 @@
 //! Bootstrap after disk loss needs only `BOT_TOKEN` + `CHAT_ID`:
 //! `getChat` → pinned manifest → download parts → verify sha256 → import SQLite.
 
-use crate::chunker;
-use crate::index::Index;
-use crate::rate_limit::ChatLimiter;
-use crate::storage::{BlobStore, DeleteOutcome};
-use crate::telegram::{PinnedContent, TelegramClient};
+use s3gram_blob::{BlobStore, BootstrapPointer, DeleteOutcome, PinnedContent};
+use s3gram_chunk as chunker;
+use s3gram_index::Index;
+
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chrono::Utc;
@@ -125,10 +124,8 @@ fn validate_pin_manifest(m: &PinManifest) -> Result<()> {
 pub async fn push_if_changed(
     index: &Index,
     store: &dyn BlobStore,
-    tg: &TelegramClient,
-    chat_id: &str,
+    pin: &dyn BootstrapPointer,
     chunk_size: usize,
-    limiter: &ChatLimiter,
 ) -> Result<PushOutcome> {
     let max_part = chunk_size.clamp(1, chunker::MAX_CHUNK_SIZE);
     let snap = index.export_snapshot().await.context("export snapshot")?;
@@ -190,8 +187,8 @@ pub async fn push_if_changed(
     // Prefer a text message (easy getChat → pinned_message.text). Fall back to a
     // tiny document if the JSON ever exceeds Telegram's text limit.
     let (manifest_message_id, manifest_file_id) = if manifest_body.len() <= TG_TEXT_MAX {
-        let mid = tg
-            .send_message(chat_id, &manifest_body, Some(limiter))
+        let mid = pin
+            .send_text(&manifest_body)
             .await
             .context("send pin manifest text")?;
         (mid, String::new())
@@ -208,7 +205,7 @@ pub async fn push_if_changed(
     };
 
     // Atomic-ish pointer swap: pin new, then unpin/delete old.
-    tg.pin_chat_message(chat_id, manifest_message_id, Some(limiter))
+    pin.pin_message(manifest_message_id)
         .await
         .context("pin new snapshot manifest")?;
 
@@ -216,17 +213,17 @@ pub async fn push_if_changed(
         if parts.iter().any(|p| p.message_id == *old_id) || *old_id == manifest_message_id {
             continue;
         }
-        if let Err(e) = tg.unpin_chat_message(chat_id, *old_id, Some(limiter)).await {
+        if let Err(e) = pin.unpin_message(*old_id).await {
             debug_unpin_err(*old_id, &e);
         }
         match store.delete_message(*old_id).await {
             Ok(DeleteOutcome::Deleted | DeleteOutcome::Gone) => {}
             Ok(DeleteOutcome::Failed) => {
-                let _ = index.queue_tg_delete(chat_id, *old_id).await;
+                let _ = index.queue_tg_delete(pin.scope_id(), *old_id).await;
             }
             Err(e) => {
                 warn!(old_id, error = %e, "failed to delete previous snapshot message");
-                let _ = index.queue_tg_delete(chat_id, *old_id).await;
+                let _ = index.queue_tg_delete(pin.scope_id(), *old_id).await;
             }
         }
     }
@@ -326,15 +323,15 @@ pub struct PinnedRestore {
 
 /// Bootstrap from the chat's pinned manifest (no local meta / file_id required).
 pub async fn download_from_pinned(
-    tg: &TelegramClient,
-    chat_id: &str,
+    pin: &dyn BootstrapPointer,
     store: &dyn BlobStore,
 ) -> Result<PinnedRestore> {
-    let pinned = tg
-        .get_pinned_content(chat_id)
+    let scope = pin.scope_id().to_string();
+    let pinned = pin
+        .get_pinned()
         .await
         .context("get pinned content")?
-        .ok_or_else(|| anyhow::anyhow!("chat {chat_id} has no pinned message (run a snapshot first)"))?;
+        .ok_or_else(|| anyhow::anyhow!("chat {scope} has no pinned message (run a snapshot first)"))?;
 
     let (manifest_message_id, manifest_file_id, manifest, legacy_bytes) = match pinned {
         PinnedContent::Text { text, message_id } => {
@@ -504,12 +501,10 @@ pub async fn download_snapshot_bytes(
 pub fn spawn_periodic(
     index: Index,
     store: Arc<dyn BlobStore>,
-    tg: TelegramClient,
-    chat_id: String,
+    pin: Arc<dyn BootstrapPointer>,
     gate: Arc<Mutex<()>>,
     interval_secs: u64,
     chunk_size: usize,
-    limiter: Arc<ChatLimiter>,
 ) {
     if interval_secs == 0 {
         info!("periodic index snapshots disabled (snapshot.interval_secs=0)");
@@ -524,16 +519,7 @@ pub fn spawn_periodic(
         loop {
             tokio::time::sleep(period).await;
             let _guard = gate.lock().await;
-            match push_if_changed(
-                &index,
-                store.as_ref(),
-                &tg,
-                &chat_id,
-                chunk_size,
-                limiter.as_ref(),
-            )
-            .await
-            {
+            match push_if_changed(&index, store.as_ref(), pin.as_ref(), chunk_size).await {
                 Ok(PushOutcome::Unchanged { .. }) => {
                     tracing::debug!("index snapshot unchanged, skip upload");
                 }
