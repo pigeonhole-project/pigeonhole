@@ -96,13 +96,63 @@ async fn object_route(
         return Err(S3Error::invalid_argument("Empty key"));
     }
 
+    let query = req.uri().query().unwrap_or("").to_string();
+    let q = parse_query(&query);
+
     match *req.method() {
+        Method::POST if q.contains_key("uploads") => {
+            create_multipart_upload(&state, &bucket, &key, req).await
+        }
+        Method::POST if q.contains_key("uploadId") => {
+            let upload_id = q.get("uploadId").cloned().unwrap_or_default();
+            complete_multipart_upload(&state, &bucket, &key, &upload_id, req).await
+        }
+        Method::PUT if q.contains_key("uploadId") && q.contains_key("partNumber") => {
+            let upload_id = q.get("uploadId").cloned().unwrap_or_default();
+            let part_number: i64 = q
+                .get("partNumber")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| S3Error::invalid_argument("Invalid partNumber"))?;
+            upload_part(&state, &bucket, &key, &upload_id, part_number, req).await
+        }
         Method::PUT => put_object(&state, &bucket, &key, req).await,
-        Method::GET => get_object(&state, &bucket, &key).await,
+        Method::GET => {
+            let range = req
+                .headers()
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            get_object(&state, &bucket, &key, range.as_deref()).await
+        }
         Method::HEAD => head_object(&state, &bucket, &key).await,
+        Method::DELETE if q.contains_key("uploadId") => {
+            let upload_id = q.get("uploadId").cloned().unwrap_or_default();
+            abort_multipart_upload(&state, &upload_id).await
+        }
         Method::DELETE => delete_object(&state, &bucket, &key).await,
         _ => Err(S3Error::method_not_allowed()),
     }
+}
+
+fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if query.is_empty() {
+        return map;
+    }
+    for part in query.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        let mut it = part.splitn(2, '=');
+        let k = urlencoding::decode(it.next().unwrap_or(""))
+            .unwrap_or_default()
+            .into_owned();
+        let v = urlencoding::decode(it.next().unwrap_or(""))
+            .unwrap_or_default()
+            .into_owned();
+        map.insert(k, v);
+    }
+    map
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -216,51 +266,7 @@ async fn put_object(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let body = req.into_body();
-    let mut stream = body.into_data_stream();
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut hasher = Md5::new();
-    let mut total_size: i64 = 0;
-    let mut part_no: i64 = 0;
-    let mut uploaded: Vec<(i64, String, i64, i64)> = Vec::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| S3Error::internal(e.to_string()))?;
-        hasher.update(&chunk);
-        buffer.extend_from_slice(&chunk);
-        total_size += chunk.len() as i64;
-
-        while buffer.len() >= chunker::CHUNK_SIZE {
-            let data: Bytes = buffer.drain(..chunker::CHUNK_SIZE).collect::<Vec<u8>>().into();
-            let chunk_size = data.len() as i64;
-            let filename = format!("{bucket}_{}_{part_no}.part", key.replace('/', "_"));
-            let caption = format!("{bucket}/{key}#{part_no}");
-            let (file_id, message_id) = state
-                .tg
-                .send_document(data, &filename, &caption)
-                .await
-                .map_err(|e| S3Error::internal(e.to_string()))?;
-            uploaded.push((part_no, file_id, message_id, chunk_size));
-            part_no += 1;
-        }
-    }
-
-    // Final (possibly empty) chunk — empty object still needs one telegram doc or we allow empty with zero chunks.
-    // For empty objects, store a single empty chunk so Get works symmetrically.
-    if uploaded.is_empty() || !buffer.is_empty() {
-        let data: Bytes = std::mem::take(&mut buffer).into();
-        let chunk_size = data.len() as i64;
-        let filename = format!("{bucket}_{}_{part_no}.part", key.replace('/', "_"));
-        let caption = format!("{bucket}/{key}#{part_no}");
-        let (file_id, message_id) = state
-            .tg
-            .send_document(data, &filename, &caption)
-            .await
-            .map_err(|e| S3Error::internal(e.to_string()))?;
-        uploaded.push((part_no, file_id, message_id, chunk_size));
-    }
-
-    let etag = format!("{:x}", hasher.finalize());
+    let (etag, total_size, uploaded) = ingest_body_to_telegram(state, bucket, key, req).await?;
     let old = state
         .index
         .put_object(
@@ -273,7 +279,6 @@ async fn put_object(
         )
         .await?;
 
-    // Best-effort cleanup of replaced object chunks
     for c in old {
         if let Err(e) = state.tg.delete_message(c.message_id).await {
             warn!(error = %e, "failed to delete old telegram message");
@@ -289,7 +294,12 @@ async fn put_object(
         .unwrap())
 }
 
-async fn get_object(state: &AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
+async fn get_object(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    range_hdr: Option<&str>,
+) -> Result<Response, S3Error> {
     let meta = state
         .index
         .get_object(bucket, key)
@@ -297,25 +307,44 @@ async fn get_object(state: &AppState, bucket: &str, key: &str) -> Result<Respons
         .ok_or_else(|| S3Error::no_such_key(bucket, key))?;
 
     let chunks = state.index.get_chunks(bucket, key).await?;
+    let total = meta.size as u64;
+
+    let (start, end_inclusive) = match parse_byte_range(range_hdr, total)? {
+        None => (0u64, total.saturating_sub(1)),
+        Some((s, e)) => (s, e),
+    };
+    let is_range = range_hdr.is_some() && total > 0;
+    let length = if total == 0 {
+        0
+    } else {
+        end_inclusive.saturating_sub(start) + 1
+    };
+
     let tg = state.tg.clone();
-    let stream = futures::stream::iter(chunks).then(move |c| {
-        let tg = tg.clone();
-        async move {
-            tg.download_file(&c.file_id)
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }
-    });
+    let stream = stream_object_range(tg, chunks, start, length);
+
+    let status = if is_range {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
 
     let mut builder = Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header(header::ETAG, format!("\"{}\"", meta.etag))
-        .header(header::CONTENT_LENGTH, meta.size)
+        .header(header::CONTENT_LENGTH, length)
         .header(
             header::LAST_MODIFIED,
             httpdate(&parse_rfc3339(&meta.mtime)),
         )
         .header(header::ACCEPT_RANGES, "bytes");
+
+    if is_range && total > 0 {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end_inclusive}/{total}"),
+        );
+    }
 
     if let Some(ct) = &meta.content_type {
         builder = builder.header(header::CONTENT_TYPE, ct);
@@ -323,9 +352,130 @@ async fn get_object(state: &AppState, bucket: &str, key: &str) -> Result<Respons
         builder = builder.header(header::CONTENT_TYPE, "application/octet-stream");
     }
 
-    Ok(builder
-        .body(Body::from_stream(stream))
-        .unwrap())
+    Ok(builder.body(Body::from_stream(stream)).unwrap())
+}
+
+/// Returns Ok(None) for full object; Ok(Some(start,end_inclusive)) for a range.
+fn parse_byte_range(header: Option<&str>, total: u64) -> Result<Option<(u64, u64)>, S3Error> {
+    let Some(h) = header else {
+        return Ok(None);
+    };
+    if total == 0 {
+        return Ok(None);
+    }
+    let h = h.strip_prefix("bytes=").ok_or_else(|| {
+        S3Error::invalid_argument("Only bytes ranges are supported")
+    })?;
+    // Single range only for MVP
+    let spec = h.split(',').next().unwrap_or(h).trim();
+    if let Some(start_str) = spec.strip_suffix('-') {
+        // bytes=start-
+        let start: u64 = start_str
+            .parse()
+            .map_err(|_| S3Error::invalid_argument("bad range"))?;
+        if start >= total {
+            return Err(S3Error::invalid_range());
+        }
+        return Ok(Some((start, total - 1)));
+    }
+    if let Some(suffix_str) = spec.strip_prefix('-') {
+        // bytes=-suffix
+        let suffix: u64 = suffix_str
+            .parse()
+            .map_err(|_| S3Error::invalid_argument("bad range"))?;
+        if suffix == 0 {
+            return Err(S3Error::invalid_argument("bad range"));
+        }
+        let start = total.saturating_sub(suffix);
+        return Ok(Some((start, total - 1)));
+    }
+    let (a, b) = spec
+        .split_once('-')
+        .ok_or_else(|| S3Error::invalid_argument("bad range"))?;
+    let start: u64 = a
+        .parse()
+        .map_err(|_| S3Error::invalid_argument("bad range"))?;
+    let end: u64 = b
+        .parse()
+        .map_err(|_| S3Error::invalid_argument("bad range"))?;
+    if start > end || start >= total {
+        return Err(S3Error::invalid_range());
+    }
+    let end = end.min(total - 1);
+    Ok(Some((start, end)))
+}
+
+fn stream_object_range(
+    tg: TelegramClient,
+    chunks: Vec<crate::index::Chunk>,
+    start: u64,
+    length: u64,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream_range(tg, chunks, start, length)
+}
+
+fn async_stream_range(
+    tg: TelegramClient,
+    chunks: Vec<crate::index::Chunk>,
+    start: u64,
+    length: u64,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+    Box::pin(futures::stream::unfold(
+        RangeState {
+            tg,
+            chunks,
+            idx: 0,
+            offset: 0,
+            start,
+            remaining: length,
+        },
+        |mut st| async move {
+            if st.remaining == 0 {
+                return None;
+            }
+            while st.idx < st.chunks.len() {
+                let chunk = &st.chunks[st.idx];
+                let chunk_size = chunk.size as u64;
+                let chunk_end = st.offset + chunk_size;
+                if chunk_end <= st.start {
+                    st.offset = chunk_end;
+                    st.idx += 1;
+                    continue;
+                }
+
+                let data = match st.tg.download_file(&chunk.file_id).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Some((
+                            Err(std::io::Error::other(e.to_string())),
+                            st,
+                        ));
+                    }
+                };
+
+                let local_start = st.start.saturating_sub(st.offset) as usize;
+                let take = (chunk_size - local_start as u64).min(st.remaining) as usize;
+                let slice = data.slice(local_start..local_start + take);
+
+                st.remaining -= take as u64;
+                st.start += take as u64;
+                st.offset = chunk_end;
+                st.idx += 1;
+
+                return Some((Ok(slice), st));
+            }
+            None
+        },
+    ))
+}
+
+struct RangeState {
+    tg: TelegramClient,
+    chunks: Vec<crate::index::Chunk>,
+    idx: usize,
+    offset: u64,
+    start: u64,
+    remaining: u64,
 }
 
 async fn head_object(state: &AppState, bucket: &str, key: &str) -> Result<Response, S3Error> {
@@ -366,6 +516,252 @@ async fn delete_object(state: &AppState, bucket: &str, key: &str) -> Result<Resp
 
     // S3 DeleteObject is idempotent — always 204
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn create_multipart_upload(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    req: Request,
+) -> Result<Response, S3Error> {
+    if !state.index.bucket_exists(bucket).await? {
+        return Err(S3Error::no_such_bucket(bucket));
+    }
+
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let upload_id = uuid::Uuid::new_v4().to_string();
+    state
+        .index
+        .create_multipart_upload(&upload_id, bucket, key, content_type.as_deref())
+        .await?;
+
+    info!(bucket, key, %upload_id, "CreateMultipartUpload");
+    Ok(xml_response(
+        StatusCode::OK,
+        &initiate_multipart_upload(bucket, key, &upload_id),
+    ))
+}
+
+async fn upload_part(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i64,
+    req: Request,
+) -> Result<Response, S3Error> {
+    if !(1..=10000).contains(&part_number) {
+        return Err(S3Error::invalid_argument("partNumber must be 1..10000"));
+    }
+
+    let upload = state
+        .index
+        .get_multipart_upload(upload_id)
+        .await?
+        .ok_or_else(|| S3Error::no_such_upload(upload_id))?;
+
+    if upload.bucket != bucket || upload.key != key {
+        return Err(S3Error::no_such_upload(upload_id));
+    }
+
+    let (etag, size, tg_chunks) = ingest_body_to_telegram(state, bucket, key, req).await?;
+
+    let old = state
+        .index
+        .put_multipart_part(upload_id, part_number, &etag, size, &tg_chunks)
+        .await?;
+    for c in old {
+        if let Err(e) = state.tg.delete_message(c.message_id).await {
+            warn!(error = %e, "failed to delete replaced part chunk");
+        }
+    }
+
+    info!(bucket, key, part_number, size, "UploadPart ok");
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ETAG, format!("\"{etag}\""))
+        .body(Body::empty())
+        .unwrap())
+}
+
+async fn complete_multipart_upload(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    req: Request,
+) -> Result<Response, S3Error> {
+    let upload = state
+        .index
+        .get_multipart_upload(upload_id)
+        .await?
+        .ok_or_else(|| S3Error::no_such_upload(upload_id))?;
+
+    if upload.bucket != bucket || upload.key != key {
+        return Err(S3Error::no_such_upload(upload_id));
+    }
+
+    let body = axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024)
+        .await
+        .map_err(|e| S3Error::internal(e.to_string()))?;
+    let body_str = String::from_utf8_lossy(&body);
+    let completed = parse_complete_parts(&body_str)?;
+    if completed.is_empty() {
+        return Err(S3Error::invalid_argument("CompleteMultipartUpload requires parts"));
+    }
+
+    let mut md5_concat = Md5::new();
+    let mut total_size: i64 = 0;
+    let mut part_numbers = Vec::new();
+
+    for (part_number, client_etag) in &completed {
+        let part = state
+            .index
+            .get_multipart_part(upload_id, *part_number)
+            .await?
+            .ok_or_else(|| S3Error::invalid_part(format!("part {part_number} not found")))?;
+
+        let normalized = client_etag.trim_matches('"');
+        if part.etag != normalized {
+            return Err(S3Error::invalid_part(format!(
+                "etag mismatch for part {part_number}"
+            )));
+        }
+
+        let digest = hex::decode(&part.etag)
+            .map_err(|_| S3Error::invalid_part(format!("bad etag for part {part_number}")))?;
+        md5_concat.update(&digest);
+        total_size += part.size;
+        part_numbers.push(*part_number);
+    }
+
+    let etag = format!(
+        "{}-{}",
+        hex::encode(md5_concat.finalize()),
+        part_numbers.len()
+    );
+
+    let old = state
+        .index
+        .complete_multipart_upload(&upload, &part_numbers, &etag, total_size)
+        .await?;
+
+    for c in old {
+        if let Err(e) = state.tg.delete_message(c.message_id).await {
+            warn!(error = %e, "failed to delete replaced object chunk");
+        }
+    }
+
+    info!(bucket, key, parts = part_numbers.len(), size = total_size, "CompleteMultipartUpload ok");
+
+    let location = format!("/{bucket}/{key}");
+    Ok(xml_response(
+        StatusCode::OK,
+        &complete_multipart_result(&location, bucket, key, &etag),
+    ))
+}
+
+async fn abort_multipart_upload(state: &AppState, upload_id: &str) -> Result<Response, S3Error> {
+    match state.index.abort_multipart_upload(upload_id).await? {
+        None => Err(S3Error::no_such_upload(upload_id)),
+        Some((_upload, chunks)) => {
+            for c in chunks {
+                if let Err(e) = state.tg.delete_message(c.message_id).await {
+                    warn!(error = %e, "failed to delete aborted part chunk");
+                }
+            }
+            info!(%upload_id, "AbortMultipartUpload ok");
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+    }
+}
+
+/// Stream request body into Telegram documents (≤19 MiB each). Returns (md5_hex, size, chunks).
+async fn ingest_body_to_telegram(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    req: Request,
+) -> Result<(String, i64, Vec<(i64, String, i64, i64)>), S3Error> {
+    let body = req.into_body();
+    let mut stream = body.into_data_stream();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut hasher = Md5::new();
+    let mut total_size: i64 = 0;
+    let mut part_no: i64 = 0;
+    let mut uploaded: Vec<(i64, String, i64, i64)> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| S3Error::internal(e.to_string()))?;
+        hasher.update(&chunk);
+        buffer.extend_from_slice(&chunk);
+        total_size += chunk.len() as i64;
+
+        while buffer.len() >= chunker::CHUNK_SIZE {
+            let data: Bytes = buffer.drain(..chunker::CHUNK_SIZE).collect::<Vec<u8>>().into();
+            let chunk_size = data.len() as i64;
+            let filename = format!("{bucket}_{}_{part_no}.part", key.replace('/', "_"));
+            let caption = format!("{bucket}/{key}#{part_no}");
+            let (file_id, message_id) = state
+                .tg
+                .send_document(data, &filename, &caption)
+                .await
+                .map_err(|e| S3Error::internal(e.to_string()))?;
+            uploaded.push((part_no, file_id, message_id, chunk_size));
+            part_no += 1;
+        }
+    }
+
+    if uploaded.is_empty() || !buffer.is_empty() {
+        let data: Bytes = std::mem::take(&mut buffer).into();
+        let chunk_size = data.len() as i64;
+        let filename = format!("{bucket}_{}_{part_no}.part", key.replace('/', "_"));
+        let caption = format!("{bucket}/{key}#{part_no}");
+        let (file_id, message_id) = state
+            .tg
+            .send_document(data, &filename, &caption)
+            .await
+            .map_err(|e| S3Error::internal(e.to_string()))?;
+        uploaded.push((part_no, file_id, message_id, chunk_size));
+    }
+
+    let etag = format!("{:x}", hasher.finalize());
+    Ok((etag, total_size, uploaded))
+}
+
+fn parse_complete_parts(xml: &str) -> Result<Vec<(i64, String)>, S3Error> {
+    let mut parts = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Part>") {
+        let after = &rest[start + 6..];
+        let end = after
+            .find("</Part>")
+            .ok_or_else(|| S3Error::invalid_argument("malformed CompleteMultipartUpload XML"))?;
+        let block = &after[..end];
+        let part_number = extract_xml_text(block, "PartNumber")
+            .ok_or_else(|| S3Error::invalid_argument("missing PartNumber"))?
+            .parse::<i64>()
+            .map_err(|_| S3Error::invalid_argument("bad PartNumber"))?;
+        let etag = extract_xml_text(block, "ETag")
+            .ok_or_else(|| S3Error::invalid_argument("missing ETag"))?;
+        parts.push((part_number, etag));
+        rest = &after[end + 7..];
+    }
+    parts.sort_by_key(|(n, _)| *n);
+    Ok(parts)
+}
+
+fn extract_xml_text(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(&open)? + open.len();
+    let end = block[start..].find(&close)? + start;
+    Some(block[start..end].trim().to_string())
 }
 
 async fn export_snapshot(state: &AppState) -> Result<Response, S3Error> {

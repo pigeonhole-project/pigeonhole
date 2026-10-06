@@ -34,6 +34,33 @@ pub struct Chunk {
     pub size: i64,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct MultipartUpload {
+    pub upload_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub content_type: Option<String>,
+    pub initiated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct MultipartPart {
+    pub upload_id: String,
+    pub part_number: i64,
+    pub etag: String,
+    pub size: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct MultipartPartChunk {
+    pub upload_id: String,
+    pub part_number: i64,
+    pub chunk_no: i64,
+    pub file_id: String,
+    pub message_id: i64,
+    pub size: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexSnapshot {
     pub buckets: Vec<Bucket>,
@@ -107,6 +134,54 @@ impl Index {
                 size INTEGER NOT NULL,
                 PRIMARY KEY (bucket, key, part_no),
                 FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS multipart_uploads (
+                upload_id TEXT PRIMARY KEY,
+                bucket TEXT NOT NULL,
+                key TEXT NOT NULL,
+                content_type TEXT,
+                initiated_at TEXT NOT NULL,
+                FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS multipart_parts (
+                upload_id TEXT NOT NULL,
+                part_number INTEGER NOT NULL,
+                etag TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                PRIMARY KEY (upload_id, part_number),
+                FOREIGN KEY (upload_id) REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS multipart_part_chunks (
+                upload_id TEXT NOT NULL,
+                part_number INTEGER NOT NULL,
+                chunk_no INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                PRIMARY KEY (upload_id, part_number, chunk_no),
+                FOREIGN KEY (upload_id, part_number)
+                    REFERENCES multipart_parts(upload_id, part_number) ON DELETE CASCADE
             );
             "#,
         )
@@ -383,6 +458,206 @@ impl Index {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn create_multipart_upload(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+    ) -> Result<()> {
+        let initiated_at = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, initiated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(upload_id)
+        .bind(bucket)
+        .bind(key)
+        .bind(content_type)
+        .bind(initiated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUpload>> {
+        let row = sqlx::query_as::<_, MultipartUpload>(
+            "SELECT upload_id, bucket, key, content_type, initiated_at FROM multipart_uploads WHERE upload_id = ?",
+        )
+        .bind(upload_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn put_multipart_part(
+        &self,
+        upload_id: &str,
+        part_number: i64,
+        etag: &str,
+        size: i64,
+        chunks: &[(i64, String, i64, i64)],
+    ) -> Result<Vec<MultipartPartChunk>> {
+        let mut tx = self.pool.begin().await?;
+
+        let old = sqlx::query_as::<_, MultipartPartChunk>(
+            r#"
+            SELECT upload_id, part_number, chunk_no, file_id, message_id, size
+            FROM multipart_part_chunks
+            WHERE upload_id = ? AND part_number = ?
+            "#,
+        )
+        .bind(upload_id)
+        .bind(part_number)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM multipart_part_chunks WHERE upload_id = ? AND part_number = ?")
+            .bind(upload_id)
+            .bind(part_number)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM multipart_parts WHERE upload_id = ? AND part_number = ?")
+            .bind(upload_id)
+            .bind(part_number)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO multipart_parts (upload_id, part_number, etag, size) VALUES (?, ?, ?, ?)",
+        )
+        .bind(upload_id)
+        .bind(part_number)
+        .bind(etag)
+        .bind(size)
+        .execute(&mut *tx)
+        .await?;
+
+        for (chunk_no, file_id, message_id, chunk_size) in chunks {
+            sqlx::query(
+                r#"
+                INSERT INTO multipart_part_chunks
+                    (upload_id, part_number, chunk_no, file_id, message_id, size)
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(upload_id)
+            .bind(part_number)
+            .bind(chunk_no)
+            .bind(file_id)
+            .bind(message_id)
+            .bind(chunk_size)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(old)
+    }
+
+    pub async fn get_multipart_part(
+        &self,
+        upload_id: &str,
+        part_number: i64,
+    ) -> Result<Option<MultipartPart>> {
+        let row = sqlx::query_as::<_, MultipartPart>(
+            "SELECT upload_id, part_number, etag, size FROM multipart_parts WHERE upload_id = ? AND part_number = ?",
+        )
+        .bind(upload_id)
+        .bind(part_number)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn list_multipart_part_chunks(
+        &self,
+        upload_id: &str,
+        part_number: i64,
+    ) -> Result<Vec<MultipartPartChunk>> {
+        let rows = sqlx::query_as::<_, MultipartPartChunk>(
+            r#"
+            SELECT upload_id, part_number, chunk_no, file_id, message_id, size
+            FROM multipart_part_chunks
+            WHERE upload_id = ? AND part_number = ?
+            ORDER BY chunk_no
+            "#,
+        )
+        .bind(upload_id)
+        .bind(part_number)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Finalize multipart: assemble object chunks and drop upload metadata (TG blobs stay).
+    pub async fn complete_multipart_upload(
+        &self,
+        upload: &MultipartUpload,
+        part_numbers: &[i64],
+        etag: &str,
+        total_size: i64,
+    ) -> Result<Vec<Chunk>> {
+        let mut assembled: Vec<(i64, String, i64, i64)> = Vec::new();
+        let mut part_no: i64 = 0;
+        for pn in part_numbers {
+            let chunks = self.list_multipart_part_chunks(&upload.upload_id, *pn).await?;
+            for c in chunks {
+                assembled.push((part_no, c.file_id, c.message_id, c.size));
+                part_no += 1;
+            }
+        }
+
+        let old = self
+            .put_object(
+                &upload.bucket,
+                &upload.key,
+                etag,
+                total_size,
+                upload.content_type.as_deref(),
+                &assembled,
+            )
+            .await?;
+
+        // Remove multipart rows only (do not touch TG messages — they are now object chunks)
+        sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?")
+            .bind(&upload.upload_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(old)
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<(MultipartUpload, Vec<MultipartPartChunk>)>> {
+        let upload = match self.get_multipart_upload(upload_id).await? {
+            Some(u) => u,
+            None => return Ok(None),
+        };
+        let chunks = sqlx::query_as::<_, MultipartPartChunk>(
+            r#"
+            SELECT upload_id, part_number, chunk_no, file_id, message_id, size
+            FROM multipart_part_chunks
+            WHERE upload_id = ?
+            "#,
+        )
+        .bind(upload_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?")
+            .bind(upload_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(Some((upload, chunks)))
     }
 }
 

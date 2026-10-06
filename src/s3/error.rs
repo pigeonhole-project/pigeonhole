@@ -83,6 +83,33 @@ impl S3Error {
         }
     }
 
+    pub fn no_such_upload(upload_id: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "NoSuchUpload",
+            message: "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.".into(),
+            resource: format!("/{upload_id}"),
+        }
+    }
+
+    pub fn invalid_part(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidPart",
+            message: msg.into(),
+            resource: "/".into(),
+        }
+    }
+
+    pub fn invalid_range() -> Self {
+        Self {
+            status: StatusCode::RANGE_NOT_SATISFIABLE,
+            code: "InvalidRange",
+            message: "The requested range is not satisfiable".into(),
+            resource: "/".into(),
+        }
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,33 +1,35 @@
-# s3gram — S3 поверх Telegram Bot API
+# s3gram
 
-S3-совместимый HTTP gateway на Rust. Объекты режутся на чанки по 19 MiB и хранятся как документы в приватном Telegram-чате/канале. Метаданные — в локальном SQLite.
+S3-compatible HTTP gateway in Rust, backed by the Telegram Bot API.
 
-## Ограничения Bot API
+Objects are split into ≤19 MiB chunks and stored as documents in a private Telegram chat/channel. Object metadata lives in a local SQLite index.
 
-- upload ≤ 50 MiB на файл
-- download через `getFile` ≤ 20 MiB → размер чанка **19 MiB**
+## Bot API limits
 
-## Подготовка
+- Upload ≤ 50 MiB per file
+- Download via `getFile` ≤ 20 MiB → chunk size is **19 MiB**
 
-1. Создай бота у [@BotFather](https://t.me/BotFather), получи `BOT_TOKEN`.
-2. Создай приватный канал (или группу), добавь бота админом с правом писать сообщения.
-3. Узнай `CHAT_ID` (для каналов обычно `-100...`).
-4. Скопируй env:
+## Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and get a `BOT_TOKEN`.
+2. Create a private channel (or group) and add the bot as an admin with permission to post messages.
+3. Find the `CHAT_ID` (channels are usually `-100...`).
+4. Copy env and fill in secrets:
 
 ```bash
 cp .env.example .env
-# отредактируй BOT_TOKEN и CHAT_ID
+# edit BOT_TOKEN and CHAT_ID
 ```
 
-## Запуск
+## Run
 
 ```bash
 cargo run --release
 ```
 
-Сервер слушает `http://0.0.0.0:8333`.
+Listens on `http://0.0.0.0:8333` by default.
 
-## Smoke test (aws cli)
+## Smoke test (AWS CLI)
 
 ```bash
 export AWS_ACCESS_KEY_ID=s3gram
@@ -41,19 +43,20 @@ aws --endpoint-url http://127.0.0.1:8333 s3 cp s3://demo/readme.md ./out.md
 aws --endpoint-url http://127.0.0.1:8333 s3 rm s3://demo/readme.md
 ```
 
-Для отладки без подписи: `S3GRAM_INSECURE=1`.
+Large files use multipart upload automatically (supported).
 
-## Snapshot индекса
+For unsigned local debugging: `S3GRAM_INSECURE=1`.
 
-Экспорт метаданных в Telegram (JSON-документ в тот же чат):
+## Index snapshot
+
+Export metadata to Telegram (JSON document in the same chat):
 
 ```bash
-curl -X POST 'http://127.0.0.1:8333/?s3gram-snapshot=export' \
-  -H "Authorization: dummy" \
-  # либо с S3GRAM_INSECURE=1
+# with S3GRAM_INSECURE=1, or a valid SigV4 signature
+curl -X POST 'http://127.0.0.1:8333/?s3gram-snapshot=export'
 ```
 
-Восстановление из `file_id` или сырого JSON:
+Restore from a `file_id` or raw JSON body:
 
 ```bash
 curl -X POST 'http://127.0.0.1:8333/?s3gram-snapshot=import' \
@@ -61,17 +64,21 @@ curl -X POST 'http://127.0.0.1:8333/?s3gram-snapshot=import' \
   -d '{"file_id":"BQACAg..."}'
 ```
 
-## MVP API
+You can also copy the local `s3gram.db` file.
 
-| Операция | Статус |
+## Supported API
+
+| Operation | Status |
 |---|---|
-| CreateBucket / ListBuckets / DeleteBucket | есть |
-| PutObject / GetObject / HeadObject / DeleteObject | есть |
-| ListObjectsV2 | есть |
-| Multipart / Copy / Range / Presign | позже |
+| CreateBucket / ListBuckets / DeleteBucket | yes |
+| PutObject / GetObject / HeadObject / DeleteObject | yes |
+| ListObjectsV2 | yes |
+| Multipart Upload (Create / UploadPart / Complete / Abort) | yes |
+| GetObject Range | yes |
+| CopyObject / Presigned URLs | later |
 
-## Заметки
+## Notes
 
-- Это эксперимент, не production object storage.
-- `file_id` может инвалидироваться; держи snapshot индекса.
-- Telegram ToS: не строй на этом публичный SaaS.
+- Experimental — not production object storage.
+- Telegram `file_id` values can become invalid; keep index snapshots.
+- Respect Telegram ToS; do not run a public SaaS on top of this.

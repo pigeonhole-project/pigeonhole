@@ -88,3 +88,38 @@ pub fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
+
+pub fn initiate_multipart_upload(bucket: &str, key: &str, upload_id: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <UploadId>{}</UploadId>
+</InitiateMultipartUploadResult>"#,
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(upload_id),
+    )
+}
+
+pub fn complete_multipart_result(
+    location: &str,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Location>{}</Location>
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <ETag>&quot;{}&quot;</ETag>
+</CompleteMultipartUploadResult>"#,
+        xml_escape(location),
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(etag),
+    )
+}
