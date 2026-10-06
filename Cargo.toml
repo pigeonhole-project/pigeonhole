@@ -5,6 +5,7 @@ members = [
     "crates/s3gram-chunk",
     "crates/s3gram-blob",
     "crates/s3gram-telegram",
+    "crates/s3gram-discord",
     "crates/s3gram-index",
     "crates/s3gram-engine",
     "crates/s3gram-s3",
@@ -55,6 +56,8 @@ s3gram-core = { path = "crates/s3gram-core" }
 s3gram-chunk = { path = "crates/s3gram-chunk" }
 s3gram-blob = { path = "crates/s3gram-blob" }
 s3gram-telegram = { path = "crates/s3gram-telegram" }
+s3gram-discord = { path = "crates/s3gram-discord" }
+wiremock = "0.6"
 s3gram-index = { path = "crates/s3gram-index" }
 s3gram-engine = { path = "crates/s3gram-engine" }
 s3gram-s3 = { path = "crates/s3gram-s3" }
