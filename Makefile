@@ -1,4 +1,4 @@
-.PHONY: run smoke compat compat-all compat-memory test test-all
+.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e test test-all
 
 run:
 	cargo run --release
@@ -17,6 +17,15 @@ compat-all:
 # Full s3-tests against MemoryBlobStore (no Telegram). Starts a temp server.
 compat-memory:
 	./scripts/compat-memory.sh
+
+# s3s upstream tests/boto3 against MemoryBlobStore (no Telegram).
+compat-s3s-boto3:
+	./scripts/compat-s3s-boto3.sh
+
+# s3s-e2e suite against MemoryBlobStore (no Telegram).
+# Extra args are forwarded, e.g. `make compat-s3s-e2e ARGS='--filter ^Basic'`
+compat-s3s-e2e:
+	./scripts/compat-s3s-e2e.sh $(ARGS)
 
 test:
 	cargo test

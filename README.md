@@ -52,6 +52,13 @@ make smoke
 # ceph/s3-tests against a temporary MemoryBlobStore server (no Telegram)
 make compat-memory           # curated known-good
 ./scripts/compat-memory.sh --all
+
+# s3s upstream tests/boto3 (presigned POST, Content-Length edge cases)
+make compat-s3s-boto3
+
+# s3s-e2e suite (Basic + Advanced) against MemoryBlobStore
+make compat-s3s-e2e
+make compat-s3s-e2e ARGS='--filter ^Basic'
 ```
 
 Point the AWS CLI at the gateway:
