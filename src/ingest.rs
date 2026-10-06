@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use md5::{Digest, Md5};
+use s3s::checksum::ChecksumHasher;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -40,9 +41,12 @@ impl std::error::Error for IngestError {
 
 /// Upload body bytes into ≤19 MiB store documents.
 /// Empty bodies produce no Telegram uploads (zero-byte S3 objects / "folder" keys).
+///
+/// When `checksum` is `Some`, every non-empty body chunk is also fed into the hasher.
 pub async fn ingest_stream_to_store(
     store: &Arc<dyn BlobStore>,
     mut stream: impl futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
+    mut checksum: Option<&mut ChecksumHasher>,
 ) -> Result<IngestResult, IngestError> {
     let mut md5 = Md5::new();
     let mut crc = crc32fast::Hasher::new();
@@ -67,6 +71,9 @@ pub async fn ingest_stream_to_store(
         }
         md5.update(&chunk);
         crc.update(&chunk);
+        if let Some(hasher) = checksum.as_mut() {
+            hasher.update(&chunk);
+        }
         total_size += chunk.len() as i64;
 
         let mut offset = 0;
@@ -152,7 +159,9 @@ mod tests {
     async fn empty_body_stores_no_chunks() {
         let mem = Arc::new(MemoryBlobStore::new());
         let store: Arc<dyn BlobStore> = mem.clone();
-        let r = ingest_stream_to_store(&store, stream::empty()).await.unwrap();
+        let r = ingest_stream_to_store(&store, stream::empty(), None)
+            .await
+            .unwrap();
         assert_eq!(r.size, 0);
         assert!(r.chunks.is_empty());
         assert_eq!(r.etag, format!("{:x}", Md5::digest(b"")));
@@ -164,7 +173,7 @@ mod tests {
         let mem = Arc::new(MemoryBlobStore::new());
         let store: Arc<dyn BlobStore> = mem.clone();
         let body = stream::iter(vec![Ok::<_, anyhow::Error>(Bytes::from_static(b"hi"))]);
-        let r = ingest_stream_to_store(&store, body).await.unwrap();
+        let r = ingest_stream_to_store(&store, body, None).await.unwrap();
         assert_eq!(r.size, 2);
         assert_eq!(r.chunks.len(), 1);
         assert_eq!(mem.len(), 1);

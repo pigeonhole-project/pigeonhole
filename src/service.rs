@@ -234,6 +234,240 @@ fn verify_checksum_crc32(expected: Option<&str>, crc: u32) -> S3Result<()> {
     Ok(())
 }
 
+fn enable_expected_checksums(hasher: &mut s3s::checksum::ChecksumHasher, checksum: &Checksum) {
+    if checksum.checksum_crc32.is_some() {
+        hasher.crc32 = Some(Default::default());
+    }
+    if checksum.checksum_crc32c.is_some() {
+        hasher.crc32c = Some(Default::default());
+    }
+    if checksum.checksum_sha1.is_some() {
+        hasher.sha1 = Some(Default::default());
+    }
+    if checksum.checksum_sha256.is_some() {
+        hasher.sha256 = Some(Default::default());
+    }
+    if checksum.checksum_crc64nvme.is_some() {
+        hasher.crc64nvme = Some(Default::default());
+    }
+    if checksum.checksum_sha512.is_some() {
+        hasher.sha512 = Some(Default::default());
+    }
+    if checksum.checksum_md5.is_some() {
+        hasher.md5 = Some(Default::default());
+    }
+    if checksum.checksum_xxhash64.is_some() {
+        hasher.xxhash64 = Some(Default::default());
+    }
+    if checksum.checksum_xxhash3.is_some() {
+        hasher.xxhash3 = Some(Default::default());
+    }
+    if checksum.checksum_xxhash128.is_some() {
+        hasher.xxhash128 = Some(Default::default());
+    }
+}
+
+fn enable_checksum_algorithm(
+    hasher: &mut s3s::checksum::ChecksumHasher,
+    algorithm: &str,
+) -> S3Result<()> {
+    match algorithm {
+        ChecksumAlgorithm::CRC32 => hasher.crc32 = Some(Default::default()),
+        ChecksumAlgorithm::CRC32C => hasher.crc32c = Some(Default::default()),
+        ChecksumAlgorithm::SHA1 => hasher.sha1 = Some(Default::default()),
+        ChecksumAlgorithm::SHA256 => hasher.sha256 = Some(Default::default()),
+        ChecksumAlgorithm::CRC64NVME => hasher.crc64nvme = Some(Default::default()),
+        ChecksumAlgorithm::SHA512 => hasher.sha512 = Some(Default::default()),
+        ChecksumAlgorithm::MD5 => hasher.md5 = Some(Default::default()),
+        ChecksumAlgorithm::XXHASH64 => hasher.xxhash64 = Some(Default::default()),
+        ChecksumAlgorithm::XXHASH3 => hasher.xxhash3 = Some(Default::default()),
+        ChecksumAlgorithm::XXHASH128 => hasher.xxhash128 = Some(Default::default()),
+        _ => return Err(s3_error!(NotImplemented, "Unsupported checksum algorithm")),
+    }
+    Ok(())
+}
+
+fn hasher_is_active(hasher: &s3s::checksum::ChecksumHasher) -> bool {
+    hasher.crc32.is_some()
+        || hasher.crc32c.is_some()
+        || hasher.sha1.is_some()
+        || hasher.sha256.is_some()
+        || hasher.crc64nvme.is_some()
+        || hasher.sha512.is_some()
+        || hasher.md5.is_some()
+        || hasher.xxhash64.is_some()
+        || hasher.xxhash3.is_some()
+        || hasher.xxhash128.is_some()
+}
+
+fn checksum_mismatch(actual: &Checksum, expected: &Checksum) -> Option<&'static str> {
+    if expected.checksum_crc32.is_some() && actual.checksum_crc32 != expected.checksum_crc32 {
+        return Some("checksum_crc32");
+    }
+    if expected.checksum_crc32c.is_some() && actual.checksum_crc32c != expected.checksum_crc32c {
+        return Some("checksum_crc32c");
+    }
+    if expected.checksum_sha1.is_some() && actual.checksum_sha1 != expected.checksum_sha1 {
+        return Some("checksum_sha1");
+    }
+    if expected.checksum_sha256.is_some() && actual.checksum_sha256 != expected.checksum_sha256 {
+        return Some("checksum_sha256");
+    }
+    if expected.checksum_crc64nvme.is_some()
+        && actual.checksum_crc64nvme != expected.checksum_crc64nvme
+    {
+        return Some("checksum_crc64nvme");
+    }
+    if expected.checksum_sha512.is_some() && actual.checksum_sha512 != expected.checksum_sha512 {
+        return Some("checksum_sha512");
+    }
+    if expected.checksum_md5.is_some() && actual.checksum_md5 != expected.checksum_md5 {
+        return Some("checksum_md5");
+    }
+    if expected.checksum_xxhash64.is_some()
+        && actual.checksum_xxhash64 != expected.checksum_xxhash64
+    {
+        return Some("checksum_xxhash64");
+    }
+    if expected.checksum_xxhash3.is_some() && actual.checksum_xxhash3 != expected.checksum_xxhash3 {
+        return Some("checksum_xxhash3");
+    }
+    if expected.checksum_xxhash128.is_some()
+        && actual.checksum_xxhash128 != expected.checksum_xxhash128
+    {
+        return Some("checksum_xxhash128");
+    }
+    None
+}
+
+fn merge_trailer_checksums(expected: &mut Checksum, trailers: &http::HeaderMap) -> S3Result<()> {
+    let take = |name: &str| -> S3Result<Option<String>> {
+        match trailers.get(name) {
+            Some(v) => Ok(Some(
+                v.to_str()
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid trailer checksum"))?
+                    .to_owned(),
+            )),
+            None => Ok(None),
+        }
+    };
+    if let Some(v) = take("x-amz-checksum-crc32")? {
+        expected.checksum_crc32 = Some(v);
+    }
+    if let Some(v) = take("x-amz-checksum-crc32c")? {
+        expected.checksum_crc32c = Some(v);
+    }
+    if let Some(v) = take("x-amz-checksum-sha1")? {
+        expected.checksum_sha1 = Some(v);
+    }
+    if let Some(v) = take("x-amz-checksum-sha256")? {
+        expected.checksum_sha256 = Some(v);
+    }
+    if let Some(v) = take("x-amz-checksum-crc64nvme")? {
+        expected.checksum_crc64nvme = Some(v);
+    }
+    if let Some(v) = take("x-amz-checksum-sha512")? {
+        expected.checksum_sha512 = Some(v);
+    }
+    if let Some(v) = take("x-amz-checksum-md5")? {
+        expected.checksum_md5 = Some(v);
+    }
+    if let Some(v) = take("x-amz-checksum-xxhash64")? {
+        expected.checksum_xxhash64 = Some(v);
+    }
+    if let Some(v) = take("x-amz-checksum-xxhash3")? {
+        expected.checksum_xxhash3 = Some(v);
+    }
+    if let Some(v) = take("x-amz-checksum-xxhash128")? {
+        expected.checksum_xxhash128 = Some(v);
+    }
+    Ok(())
+}
+
+fn checksum_to_json(c: &Checksum) -> String {
+    let mut map = serde_json::Map::new();
+    let mut put = |k: &str, v: &Option<String>| {
+        if let Some(val) = v {
+            map.insert(k.to_string(), serde_json::Value::String(val.clone()));
+        }
+    };
+    put("crc32", &c.checksum_crc32);
+    put("crc32c", &c.checksum_crc32c);
+    put("sha1", &c.checksum_sha1);
+    put("sha256", &c.checksum_sha256);
+    put("crc64nvme", &c.checksum_crc64nvme);
+    put("sha512", &c.checksum_sha512);
+    put("md5", &c.checksum_md5);
+    put("xxhash64", &c.checksum_xxhash64);
+    put("xxhash3", &c.checksum_xxhash3);
+    put("xxhash128", &c.checksum_xxhash128);
+    serde_json::Value::Object(map).to_string()
+}
+
+fn checksum_from_json(s: &str) -> Checksum {
+    let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(s) else {
+        return Checksum::default();
+    };
+    let get = |k: &str| -> Option<String> {
+        map.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+    };
+    Checksum {
+        checksum_crc32: get("crc32"),
+        checksum_crc32c: get("crc32c"),
+        checksum_sha1: get("sha1"),
+        checksum_sha256: get("sha256"),
+        checksum_crc64nvme: get("crc64nvme"),
+        checksum_sha512: get("sha512"),
+        checksum_md5: get("md5"),
+        checksum_xxhash64: get("xxhash64"),
+        checksum_xxhash3: get("xxhash3"),
+        checksum_xxhash128: get("xxhash128"),
+        ..Default::default()
+    }
+}
+
+fn apply_checksum_to_put(output: &mut PutObjectOutput, c: &Checksum) {
+    output.checksum_crc32 = c.checksum_crc32.clone();
+    output.checksum_crc32c = c.checksum_crc32c.clone();
+    output.checksum_sha1 = c.checksum_sha1.clone();
+    output.checksum_sha256 = c.checksum_sha256.clone();
+    output.checksum_crc64nvme = c.checksum_crc64nvme.clone();
+    output.checksum_sha512 = c.checksum_sha512.clone();
+    output.checksum_md5 = c.checksum_md5.clone();
+    output.checksum_xxhash64 = c.checksum_xxhash64.clone();
+    output.checksum_xxhash3 = c.checksum_xxhash3.clone();
+    output.checksum_xxhash128 = c.checksum_xxhash128.clone();
+}
+
+fn apply_checksum_to_get(output: &mut GetObjectOutput, c: &Checksum) {
+    output.checksum_crc32 = c.checksum_crc32.clone();
+    output.checksum_crc32c = c.checksum_crc32c.clone();
+    output.checksum_sha1 = c.checksum_sha1.clone();
+    output.checksum_sha256 = c.checksum_sha256.clone();
+    output.checksum_crc64nvme = c.checksum_crc64nvme.clone();
+    output.checksum_sha512 = c.checksum_sha512.clone();
+    output.checksum_md5 = c.checksum_md5.clone();
+    output.checksum_xxhash64 = c.checksum_xxhash64.clone();
+    output.checksum_xxhash3 = c.checksum_xxhash3.clone();
+    output.checksum_xxhash128 = c.checksum_xxhash128.clone();
+}
+
+fn apply_checksum_to_upload_part(output: &mut UploadPartOutput, c: &Checksum) {
+    output.checksum_crc32 = c.checksum_crc32.clone();
+    output.checksum_crc32c = c.checksum_crc32c.clone();
+    output.checksum_sha1 = c.checksum_sha1.clone();
+    output.checksum_sha256 = c.checksum_sha256.clone();
+    output.checksum_crc64nvme = c.checksum_crc64nvme.clone();
+    output.checksum_sha512 = c.checksum_sha512.clone();
+    output.checksum_md5 = c.checksum_md5.clone();
+    output.checksum_xxhash64 = c.checksum_xxhash64.clone();
+    output.checksum_xxhash3 = c.checksum_xxhash3.clone();
+    output.checksum_xxhash128 = c.checksum_xxhash128.clone();
+}
+
 struct ChunkSlice {
     file_id: String,
     from: usize,
@@ -604,7 +838,8 @@ impl S3 for S3gram {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        let input = req.input;
+        let trailing_headers = req.trailing_headers;
+        let mut input = req.input;
         if !self
             .index
             .bucket_exists(&input.bucket)
@@ -620,12 +855,39 @@ impl S3 for S3gram {
             None => Vec::new(),
         };
 
-        let stream = match input.body {
+        let mut expected_checksum = Checksum {
+            checksum_crc32: input.checksum_crc32.clone(),
+            checksum_crc32c: input.checksum_crc32c.clone(),
+            checksum_sha1: input.checksum_sha1.clone(),
+            checksum_sha256: input.checksum_sha256.clone(),
+            checksum_crc64nvme: input.checksum_crc64nvme.clone(),
+            checksum_sha512: input.checksum_sha512.clone(),
+            checksum_md5: input.checksum_md5.clone(),
+            checksum_xxhash64: input.checksum_xxhash64.clone(),
+            checksum_xxhash3: input.checksum_xxhash3.clone(),
+            checksum_xxhash128: input.checksum_xxhash128.clone(),
+            ..Default::default()
+        };
+
+        let mut hasher = s3s::checksum::ChecksumHasher::default();
+        enable_expected_checksums(&mut hasher, &expected_checksum);
+        if let Some(alg) = input.checksum_algorithm.as_ref() {
+            enable_checksum_algorithm(&mut hasher, alg.as_str())?;
+        }
+        let use_hasher = hasher_is_active(&hasher);
+
+        let stream = match input.body.take() {
             Some(body) => body.map(|r| r.map_err(|e| anyhow::anyhow!(e))).left_stream(),
             None => futures::stream::empty().right_stream(),
         };
 
-        let ingested = match ingest_stream_to_store(&self.store, stream).await {
+        let ingested = match ingest_stream_to_store(
+            &self.store,
+            stream,
+            use_hasher.then_some(&mut hasher),
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 self.queue_pending_deletes(e.pending_deletes).await;
@@ -636,7 +898,26 @@ impl S3 for S3gram {
         if let Some(exp) = expected_md5 {
             verify_content_md5_digest(exp, &ingested.md5)?;
         }
-        verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32)?;
+
+        let computed = if use_hasher {
+            hasher.finalize()
+        } else {
+            Checksum::default()
+        };
+
+        if let Some(trailers) = trailing_headers {
+            if let Some(trailers) = trailers.take() {
+                merge_trailer_checksums(&mut expected_checksum, &trailers)?;
+            }
+        }
+
+        if let Some(field) = checksum_mismatch(&computed, &expected_checksum) {
+            return Err(s3_error!(BadDigest, "{} mismatch", field));
+        }
+        // Fallback for legacy CRC32 header when hasher was not enabled.
+        if !use_hasher {
+            verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32)?;
+        }
 
         let content_type = input.content_type.as_deref();
         let user_meta: Vec<(String, String)> = input
@@ -644,6 +925,11 @@ impl S3 for S3gram {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        let checksums_json = if use_hasher {
+            checksum_to_json(&computed)
+        } else {
+            "{}".to_string()
+        };
 
         let orphans = self
             .index
@@ -656,6 +942,7 @@ impl S3 for S3gram {
                 &ingested.chunks,
                 self.chat_id(),
                 &user_meta,
+                &checksums_json,
             )
             .await
             .map_err(Self::map_err)?;
@@ -676,10 +963,14 @@ impl S3 for S3gram {
             "PutObject ok"
         );
 
-        Ok(S3Response::new(PutObjectOutput {
+        let mut output = PutObjectOutput {
             e_tag: Some(etag_hex(&ingested.etag)),
             ..Default::default()
-        }))
+        };
+        if use_hasher {
+            apply_checksum_to_put(&mut output, &computed);
+        }
+        Ok(S3Response::new(output))
     }
 
     async fn get_object(
@@ -754,7 +1045,23 @@ impl S3 for S3gram {
             .map_err(Self::map_err)?
             .len() as i32;
 
-        Ok(S3Response::new(GetObjectOutput {
+        let checksum_enabled = input
+            .checksum_mode
+            .as_ref()
+            .is_some_and(|m| m.as_str() == ChecksumMode::ENABLED);
+        let full_object = length == total;
+        let stored_checksum = if checksum_enabled && full_object {
+            self.index
+                .get_object_checksums_json(&input.bucket, &input.key)
+                .await
+                .map_err(Self::map_err)?
+                .map(|j| checksum_from_json(&j))
+                .unwrap_or_default()
+        } else {
+            Checksum::default()
+        };
+
+        let mut output = GetObjectOutput {
             body,
             content_length: Some(length as i64),
             content_range,
@@ -764,7 +1071,11 @@ impl S3 for S3gram {
             metadata,
             tag_count: (tag_count > 0).then_some(tag_count),
             ..Default::default()
-        }))
+        };
+        if checksum_enabled && full_object {
+            apply_checksum_to_get(&mut output, &stored_checksum);
+        }
+        Ok(S3Response::new(output))
     }
 
     async fn head_object(
@@ -958,6 +1269,10 @@ impl S3 for S3gram {
             None => Vec::new(),
         };
         let upload_id = uuid::Uuid::new_v4().to_string();
+        let checksum_algorithm = input
+            .checksum_algorithm
+            .as_ref()
+            .map(|a| a.as_str().to_owned());
         self.index
             .create_multipart_upload(
                 &upload_id,
@@ -966,6 +1281,7 @@ impl S3 for S3gram {
                 input.content_type.as_deref(),
                 &user_meta,
                 &tags,
+                checksum_algorithm.as_deref(),
             )
             .await
             .map_err(Self::map_err)?;
@@ -981,16 +1297,54 @@ impl S3 for S3gram {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
-        let input = req.input;
-        let upload_id = input.upload_id;
+        let trailing_headers = req.trailing_headers;
+        let mut input = req.input;
+        let upload_id = input.upload_id.clone();
         let part_number = i64::from(input.part_number);
         let expected_md5 = parse_content_md5_header(input.content_md5.as_deref())?;
 
-        let stream = match input.body {
+        let upload = self
+            .index
+            .get_multipart_upload(&upload_id)
+            .await
+            .map_err(Self::map_err)?
+            .ok_or_else(|| s3_error!(NoSuchUpload))?;
+
+        let mut expected_checksum = Checksum {
+            checksum_crc32: input.checksum_crc32.clone(),
+            checksum_crc32c: input.checksum_crc32c.clone(),
+            checksum_sha1: input.checksum_sha1.clone(),
+            checksum_sha256: input.checksum_sha256.clone(),
+            checksum_crc64nvme: input.checksum_crc64nvme.clone(),
+            checksum_sha512: input.checksum_sha512.clone(),
+            checksum_md5: input.checksum_md5.clone(),
+            checksum_xxhash64: input.checksum_xxhash64.clone(),
+            checksum_xxhash3: input.checksum_xxhash3.clone(),
+            checksum_xxhash128: input.checksum_xxhash128.clone(),
+            ..Default::default()
+        };
+
+        let mut hasher = s3s::checksum::ChecksumHasher::default();
+        enable_expected_checksums(&mut hasher, &expected_checksum);
+        if let Some(alg) = upload.checksum_algorithm.as_deref() {
+            enable_checksum_algorithm(&mut hasher, alg)?;
+        }
+        if let Some(alg) = input.checksum_algorithm.as_ref() {
+            enable_checksum_algorithm(&mut hasher, alg.as_str())?;
+        }
+        let use_hasher = hasher_is_active(&hasher);
+
+        let stream = match input.body.take() {
             Some(body) => body.map(|r| r.map_err(|e| anyhow::anyhow!(e))).left_stream(),
             None => futures::stream::empty().right_stream(),
         };
-        let ingested = match ingest_stream_to_store(&self.store, stream).await {
+        let ingested = match ingest_stream_to_store(
+            &self.store,
+            stream,
+            use_hasher.then_some(&mut hasher),
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 self.queue_pending_deletes(e.pending_deletes).await;
@@ -1000,7 +1354,25 @@ impl S3 for S3gram {
         if let Some(exp) = expected_md5 {
             verify_content_md5_digest(exp, &ingested.md5)?;
         }
-        verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32)?;
+
+        let computed = if use_hasher {
+            hasher.finalize()
+        } else {
+            Checksum::default()
+        };
+
+        if let Some(trailers) = trailing_headers {
+            if let Some(trailers) = trailers.take() {
+                merge_trailer_checksums(&mut expected_checksum, &trailers)?;
+            }
+        }
+
+        if let Some(field) = checksum_mismatch(&computed, &expected_checksum) {
+            return Err(s3_error!(BadDigest, "{} mismatch", field));
+        }
+        if !use_hasher {
+            verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32)?;
+        }
 
         let orphans = self
             .index
@@ -1016,10 +1388,14 @@ impl S3 for S3gram {
             .map_err(Self::map_err)?;
         self.cleanup_orphans(orphans).await;
 
-        Ok(S3Response::new(UploadPartOutput {
+        let mut output = UploadPartOutput {
             e_tag: Some(etag_hex(&ingested.etag)),
             ..Default::default()
-        }))
+        };
+        if use_hasher {
+            apply_checksum_to_upload_part(&mut output, &computed);
+        }
+        Ok(S3Response::new(output))
     }
 
     async fn upload_part_copy(
@@ -1062,7 +1438,7 @@ impl S3 for S3gram {
         let part_number = i64::from(input.part_number);
         let body_stream = stream_object_body(self.store.clone(), chunks, start, length)
             .map(|r| r.map_err(|e| anyhow::anyhow!(e)));
-        let ingested = match ingest_stream_to_store(&self.store, body_stream).await {
+        let ingested = match ingest_stream_to_store(&self.store, body_stream, None).await {
             Ok(v) => v,
             Err(e) => {
                 self.queue_pending_deletes(e.pending_deletes).await;

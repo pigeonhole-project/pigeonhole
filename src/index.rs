@@ -65,6 +65,7 @@ pub struct MultipartUpload {
     pub content_type: Option<String>,
     pub user_meta_json: String,
     pub tagging_json: String,
+    pub checksum_algorithm: Option<String>,
     pub initiated_at: String,
 }
 
@@ -168,6 +169,7 @@ impl Index {
                 size INTEGER NOT NULL,
                 content_type TEXT,
                 mtime TEXT NOT NULL,
+                checksums_json TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (bucket, key),
                 FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
             );
@@ -175,6 +177,14 @@ impl Index {
         )
         .execute(&self.pool)
         .await?;
+
+        if !self.column_exists("objects", "checksums_json").await? {
+            sqlx::query(
+                "ALTER TABLE objects ADD COLUMN checksums_json TEXT NOT NULL DEFAULT '{}'",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
 
         sqlx::query(
             r#"
@@ -202,6 +212,7 @@ impl Index {
                 content_type TEXT,
                 user_meta_json TEXT NOT NULL DEFAULT '[]',
                 tagging_json TEXT NOT NULL DEFAULT '[]',
+                checksum_algorithm TEXT,
                 initiated_at TEXT NOT NULL,
                 FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
             );
@@ -230,6 +241,15 @@ impl Index {
             )
             .execute(&self.pool)
             .await?;
+        }
+
+        if !self
+            .column_exists("multipart_uploads", "checksum_algorithm")
+            .await?
+        {
+            sqlx::query("ALTER TABLE multipart_uploads ADD COLUMN checksum_algorithm TEXT")
+                .execute(&self.pool)
+                .await?;
         }
 
         sqlx::query(
@@ -517,6 +537,7 @@ impl Index {
         chunks: &[(i64, String, i64, i64)],
         chat_id: &str,
         user_meta: &[(String, String)],
+        checksums_json: &str,
     ) -> Result<Vec<OrphanMsg>> {
         let mut tx = self.pool.begin().await?;
         let mut orphans = Vec::new();
@@ -555,13 +576,14 @@ impl Index {
         let mtime = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
-            INSERT INTO objects (bucket, key, etag, size, content_type, mtime)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO objects (bucket, key, etag, size, content_type, mtime, checksums_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(bucket, key) DO UPDATE SET
                 etag = excluded.etag,
                 size = excluded.size,
                 content_type = excluded.content_type,
-                mtime = excluded.mtime
+                mtime = excluded.mtime,
+                checksums_json = excluded.checksums_json
             "#,
         )
         .bind(bucket)
@@ -570,6 +592,7 @@ impl Index {
         .bind(size)
         .bind(content_type)
         .bind(&mtime)
+        .bind(checksums_json)
         .execute(&mut *tx)
         .await?;
 
@@ -616,6 +639,21 @@ impl Index {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    pub async fn get_object_checksums_json(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT checksums_json FROM objects WHERE bucket = ? AND key = ?",
+        )
+        .bind(bucket)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(j,)| j))
     }
 
     pub async fn get_user_metadata(
@@ -759,6 +797,10 @@ impl Index {
         } else {
             user_meta.to_vec()
         };
+        let checksums_json = self
+            .get_object_checksums_json(src_bucket, src_key)
+            .await?
+            .unwrap_or_else(|| "{}".to_string());
 
         // Shallow copy keeps blobs in the source chat (refcount++).
         let orphans = self
@@ -771,6 +813,7 @@ impl Index {
                 &chunk_tuples,
                 &src_chat,
                 &meta,
+                &checksums_json,
             )
             .await?;
 
@@ -1182,6 +1225,7 @@ impl Index {
         content_type: Option<&str>,
         user_meta: &[(String, String)],
         tags: &[(String, String)],
+        checksum_algorithm: Option<&str>,
     ) -> Result<()> {
         let initiated_at = Utc::now().to_rfc3339();
         let user_meta_json = serde_json::to_string(user_meta)?;
@@ -1189,8 +1233,9 @@ impl Index {
         sqlx::query(
             r#"
             INSERT INTO multipart_uploads
-                (upload_id, bucket, key, content_type, user_meta_json, tagging_json, initiated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (upload_id, bucket, key, content_type, user_meta_json, tagging_json,
+                 checksum_algorithm, initiated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(upload_id)
@@ -1199,6 +1244,7 @@ impl Index {
         .bind(content_type)
         .bind(user_meta_json)
         .bind(tagging_json)
+        .bind(checksum_algorithm)
         .bind(initiated_at)
         .execute(&self.pool)
         .await?;
@@ -1207,7 +1253,11 @@ impl Index {
 
     pub async fn get_multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUpload>> {
         let row = sqlx::query_as::<_, MultipartUpload>(
-            "SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json, initiated_at FROM multipart_uploads WHERE upload_id = ?",
+            r#"
+            SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json,
+                   checksum_algorithm, initiated_at
+            FROM multipart_uploads WHERE upload_id = ?
+            "#,
         )
         .bind(upload_id)
         .fetch_optional(&self.pool)
@@ -1401,13 +1451,14 @@ impl Index {
         let mtime = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
-            INSERT INTO objects (bucket, key, etag, size, content_type, mtime)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO objects (bucket, key, etag, size, content_type, mtime, checksums_json)
+            VALUES (?, ?, ?, ?, ?, ?, '{}')
             ON CONFLICT(bucket, key) DO UPDATE SET
                 etag = excluded.etag,
                 size = excluded.size,
                 content_type = excluded.content_type,
-                mtime = excluded.mtime
+                mtime = excluded.mtime,
+                checksums_json = excluded.checksums_json
             "#,
         )
         .bind(&upload.bucket)
@@ -1523,7 +1574,8 @@ impl Index {
         let max_uploads = max_uploads.clamp(1, 1000) as usize;
         let mut sql = String::from(
             r#"
-            SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json, initiated_at
+            SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json,
+                   checksum_algorithm, initiated_at
             FROM multipart_uploads
             WHERE bucket = ?
             "#,
