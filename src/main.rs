@@ -1,10 +1,9 @@
-mod admin;
 mod chunker;
 mod config;
 mod index;
-mod registry;
 mod s3;
 mod snapshot;
+mod storage;
 mod telegram;
 
 use anyhow::Context;
@@ -12,6 +11,7 @@ use config::Config;
 use index::Index;
 use s3::{router, AppState};
 use std::sync::Arc;
+use storage::TelegramBlobStore;
 use telegram::TelegramClient;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -29,35 +29,38 @@ async fn main() -> anyhow::Result<()> {
     let index = Index::connect(&cfg.database_url)
         .await
         .context("open index")?;
-    index
-        .ensure_service_bucket(&cfg.service_bucket, &cfg.service_chat_id)
+    let migrated = index
+        .migrate_legacy_chat_ids(&cfg.chat_id)
         .await
-        .context("ensure service bucket")?;
+        .context("migrate legacy chat_id")?;
+    if migrated > 0 {
+        info!(migrated, "backfilled empty chat_id from CHAT_ID");
+    }
+
     let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
+    tg.ensure_chat_admin(&cfg.chat_id)
+        .await
+        .context("CHAT_ID access check")?;
+
+    let store: Arc<dyn storage::BlobStore> =
+        Arc::new(TelegramBlobStore::new(tg, cfg.chat_id.clone()));
 
     let snapshot_gate = Arc::new(Mutex::new(()));
     snapshot::spawn_periodic(
         index.clone(),
-        tg.clone(),
-        cfg.service_chat_id.clone(),
+        store.clone(),
         snapshot_gate.clone(),
         cfg.snapshot_interval_secs,
     );
+    snapshot::spawn_pending_deletes(index.clone(), store.clone());
 
-    admin::spawn(index.clone(), tg.clone(), cfg.clone());
-
-    info!(
-        service_bucket = %cfg.service_bucket,
-        service_chat = %cfg.service_chat_id,
-        admin_chat = %cfg.admin_chat_id,
-        "service chat is registry/snapshots only; data buckets need their own chats"
-    );
+    info!(chat_id = %cfg.chat_id, "s3gram using single Telegram chat for all blobs");
 
     let addr = cfg.listen_addr.clone();
     let app = router(AppState {
         cfg,
         index,
-        tg,
+        store,
         snapshot_gate,
     });
 
