@@ -11,6 +11,10 @@ pub const DEFAULT_CHUNK_SIZE: usize = 19 * 1024 * 1024;
 pub const COMPRESS_PROBE_BYTES: usize = 128 * 1024;
 /// Leave headroom under `chunk.size` so a final encode frame fits.
 pub const COMPRESS_SIZE_MARGIN: usize = 256 * 1024;
+/// Cap uncompressed bytes buffered / decoded per chunk as a multiple of on-wire size.
+/// Prevents RAM blow-ups on highly compressible streams while still packing many
+/// logical bytes into one Telegram message.
+pub const MAX_LOGICAL_MULTIPLIER: usize = 8;
 
 /// How new object chunks are encoded before `sendDocument`.
 ///
@@ -76,6 +80,12 @@ pub fn fill_target(chunk_size: usize) -> usize {
     capped.saturating_sub(margin).max(1024).min(capped)
 }
 
+/// Max logical (uncompressed) bytes held for one chunk before a forced flush.
+pub fn max_logical_bytes(chunk_size: usize) -> usize {
+    let stored = chunk_size.clamp(1, MAX_CHUNK_SIZE);
+    stored.saturating_mul(MAX_LOGICAL_MULTIPLIER).max(stored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +108,11 @@ mod tests {
         assert_eq!(ChunkCodec::parse("zstd").unwrap(), ChunkCodec::Zstd);
         assert_eq!(ChunkCodec::parse("none").unwrap(), ChunkCodec::Raw);
         assert!(ChunkCodec::parse("lz4").is_err());
+    }
+
+    #[test]
+    fn max_logical_is_multiple_of_stored() {
+        assert_eq!(max_logical_bytes(DEFAULT_CHUNK_SIZE), DEFAULT_CHUNK_SIZE * 8);
+        assert_eq!(max_logical_bytes(1024), 8192);
     }
 }

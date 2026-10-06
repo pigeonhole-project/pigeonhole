@@ -1,8 +1,10 @@
 //! Stream an S3 request body into Telegram-sized BlobStore chunks.
 //!
 //! `chunk_size` caps **on-wire** payload size. With `zstd`/`gzip`, bytes are packed
-//! until compressed output approaches that cap (saving Telegram messages). A
-//! 128 KiB probe skips compression when there is no gain.
+//! until compressed output approaches that cap (saving Telegram messages), but
+//! uncompressed buffering is also capped at [`chunker::max_logical_bytes`] so a
+//! highly compressible PUT cannot grow RAM without bound. A 128 KiB probe skips
+//! compression when there is no gain.
 
 use crate::chunker::{self, ChunkCodec};
 use crate::storage::{BlobStore, DeleteOutcome};
@@ -57,6 +59,7 @@ pub async fn ingest_stream_to_store(
 ) -> Result<IngestResult, IngestError> {
     let max_stored = chunk_size.clamp(1, chunker::MAX_CHUNK_SIZE);
     let fill_target = chunker::fill_target(max_stored);
+    let max_logical = chunker::max_logical_bytes(max_stored);
     let mut md5 = Md5::new();
     let mut crc = crc32fast::Hasher::new();
     let mut part_no: i64 = 0;
@@ -107,27 +110,8 @@ pub async fn ingest_stream_to_store(
                 break; // wait for more data before probe
             };
 
-            let ready = match m {
-                ChunkCodec::Raw => logical.len() >= max_stored,
-                ChunkCodec::Gzip | ChunkCodec::Zstd => {
-                    match estimate_compressed_len(&logical, m).await {
-                        Ok(n) => n >= fill_target,
-                        Err(e) => {
-                            let pending = cleanup_uploads(store, &uploaded).await;
-                            return Err(IngestError {
-                                source: e,
-                                pending_deletes: pending,
-                            });
-                        }
-                    }
-                }
-            };
-            if !ready {
-                break;
-            }
-
-            let prepared = match take_chunk(&mut logical, m, max_stored, fill_target).await {
-                Ok(p) => p,
+            let ready = match chunk_ready(&logical, m, max_stored, fill_target, max_logical).await {
+                Ok(r) => r,
                 Err(e) => {
                     let pending = cleanup_uploads(store, &uploaded).await;
                     return Err(IngestError {
@@ -136,6 +120,21 @@ pub async fn ingest_stream_to_store(
                     });
                 }
             };
+            if !ready {
+                break;
+            }
+
+            let prepared =
+                match take_chunk(&mut logical, m, max_stored, fill_target, max_logical).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let pending = cleanup_uploads(store, &uploaded).await;
+                        return Err(IngestError {
+                            source: e,
+                            pending_deletes: pending,
+                        });
+                    }
+                };
             match put_prepared(store, prepared).await {
                 Ok(c) => {
                     uploaded.push((part_no, c.0, c.1, c.2, c.3));
@@ -152,7 +151,8 @@ pub async fn ingest_stream_to_store(
         }
     }
 
-    if !logical.is_empty() {
+    // Drain remainder (may need several takes if compressed size > max_stored).
+    while !logical.is_empty() {
         let m = match mode {
             Some(m) => m,
             None => match probe_worth_compressing(&logical, codec).await {
@@ -167,7 +167,10 @@ pub async fn ingest_stream_to_store(
                 }
             },
         };
-        let prepared = match finalize_chunk(logical, m, max_stored).await {
+        mode = Some(m);
+
+        let prepared = match drain_one(&mut logical, m, max_stored, fill_target, max_logical).await
+        {
             Ok(p) => p,
             Err(e) => {
                 let pending = cleanup_uploads(store, &uploaded).await;
@@ -178,7 +181,10 @@ pub async fn ingest_stream_to_store(
             }
         };
         match put_prepared(store, prepared).await {
-            Ok(c) => uploaded.push((part_no, c.0, c.1, c.2, c.3)),
+            Ok(c) => {
+                uploaded.push((part_no, c.0, c.1, c.2, c.3));
+                part_no += 1;
+            }
             Err(e) => {
                 let pending = cleanup_uploads(store, &uploaded).await;
                 return Err(IngestError {
@@ -207,13 +213,33 @@ struct Prepared {
     codec: ChunkCodec,
 }
 
+async fn chunk_ready(
+    logical: &[u8],
+    mode: ChunkCodec,
+    max_stored: usize,
+    fill_target: usize,
+    max_logical: usize,
+) -> Result<bool> {
+    if logical.is_empty() {
+        return Ok(false);
+    }
+    match mode {
+        ChunkCodec::Raw => Ok(logical.len() >= max_stored),
+        ChunkCodec::Gzip | ChunkCodec::Zstd => {
+            if logical.len() >= max_logical {
+                return Ok(true);
+            }
+            Ok(estimate_compressed_len(logical, mode).await? >= fill_target)
+        }
+    }
+}
+
 async fn probe_worth_compressing(logical: &[u8], policy: ChunkCodec) -> Result<bool> {
     if !policy.is_compressing() || logical.is_empty() {
         return Ok(false);
     }
     let n = logical.len().min(chunker::COMPRESS_PROBE_BYTES);
     let probe = logical[..n].to_vec();
-    let policy = policy;
     let compressed = tokio::task::spawn_blocking(move || compress_slice(&probe, policy))
         .await
         .context("spawn_blocking probe")??;
@@ -227,13 +253,37 @@ async fn estimate_compressed_len(logical: &[u8], codec: ChunkCodec) -> Result<us
         .context("spawn_blocking estimate")?
 }
 
+/// Emit one chunk from the remainder buffer (EOF path).
+async fn drain_one(
+    logical: &mut Vec<u8>,
+    codec: ChunkCodec,
+    max_stored: usize,
+    fill_target: usize,
+    max_logical: usize,
+) -> Result<Prepared> {
+    if codec == ChunkCodec::Raw {
+        return take_chunk(logical, codec, max_stored, fill_target, max_logical).await;
+    }
+    let est = estimate_compressed_len(logical, codec).await?;
+    if est <= max_stored && logical.len() <= max_logical {
+        let data = std::mem::take(logical);
+        return finalize_chunk(data, codec, max_stored).await;
+    }
+    take_chunk(logical, codec, max_stored, fill_target, max_logical).await
+}
+
 /// Cut a prefix of `logical` that encodes to ≤ `max_stored`, preferring ≥ `fill_target`.
+/// Only the first `max_logical` bytes are considered (RAM / decode bound).
 async fn take_chunk(
     logical: &mut Vec<u8>,
     codec: ChunkCodec,
     max_stored: usize,
     fill_target: usize,
+    max_logical: usize,
 ) -> Result<Prepared> {
+    if logical.is_empty() {
+        bail!("take_chunk on empty buffer");
+    }
     if codec == ChunkCodec::Raw {
         let n = logical.len().min(max_stored);
         let chunk = logical.drain(..n).collect::<Vec<_>>();
@@ -244,8 +294,8 @@ async fn take_chunk(
         });
     }
 
-    // Binary search largest prefix whose compressed size ≤ max_stored.
-    let data = logical.clone();
+    let search_hi = logical.len().min(max_logical);
+    let data = logical[..search_hi].to_vec();
     let (end, payload, stored_codec) = tokio::task::spawn_blocking(move || {
         let mut lo = 1usize;
         let mut hi = data.len();
@@ -263,8 +313,6 @@ async fn take_chunk(
             }
         }
         let (end, mut c) = best.context("no prefix fits under max_stored")?;
-        // Prefer not to emit tiny chunks when we can grow — caller only invokes
-        // take_chunk when estimate ≥ fill_target, so end should be substantial.
         let _ = fill_target;
         // If compression lost, store raw prefix of max_stored.
         if c.len() >= end {
@@ -291,7 +339,11 @@ async fn finalize_chunk(logical: Vec<u8>, codec: ChunkCodec, max_stored: usize) 
     }
     if codec == ChunkCodec::Raw {
         if logical.len() > max_stored {
-            bail!("raw remainder {} exceeds max_stored {}", logical.len(), max_stored);
+            bail!(
+                "raw remainder {} exceeds max_stored {}",
+                logical.len(),
+                max_stored
+            );
         }
         return Ok(Prepared {
             logical: Bytes::from(logical.clone()),
@@ -367,30 +419,62 @@ fn compress_slice(data: &[u8], codec: ChunkCodec) -> Result<Vec<u8>> {
     }
 }
 
-pub fn decode_chunk(stored: Bytes, codec: ChunkCodec) -> Result<Bytes> {
-    match codec {
-        ChunkCodec::Raw => Ok(stored),
-        ChunkCodec::Gzip => {
-            let mut dec = GzDecoder::new(stored.as_ref());
-            let mut out = Vec::new();
-            dec.read_to_end(&mut out).context("gunzip")?;
-            Ok(Bytes::from(out))
+fn gunzip_capped(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
+    let mut dec = GzDecoder::new(data);
+    let mut out = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = dec.read(&mut buf).context("gunzip")?;
+        if n == 0 {
+            break;
         }
+        if out.len().saturating_add(n) > max_out {
+            bail!("gzip output exceeds max_logical {max_out}");
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
+/// Decode a stored chunk. `max_logical` is the allowed uncompressed size
+/// (typically the `chunks.size` column from the index).
+pub fn decode_chunk(stored: Bytes, codec: ChunkCodec, max_logical: usize) -> Result<Bytes> {
+    let max_logical = max_logical.max(1);
+    match codec {
+        ChunkCodec::Raw => {
+            if stored.len() > max_logical {
+                bail!(
+                    "raw chunk {} exceeds max_logical {max_logical}",
+                    stored.len()
+                );
+            }
+            Ok(stored)
+        }
+        ChunkCodec::Gzip => Ok(Bytes::from(gunzip_capped(stored.as_ref(), max_logical)?)),
         ChunkCodec::Zstd => {
-            // Frame includes size; bound by Telegram max for safety.
-            let out = zstd::bulk::decompress(stored.as_ref(), chunker::MAX_CHUNK_SIZE)
+            let out = zstd::bulk::decompress(stored.as_ref(), max_logical)
                 .context("zstd decompress")?;
+            if out.len() > max_logical {
+                bail!(
+                    "zstd output {} exceeds max_logical {max_logical}",
+                    out.len()
+                );
+            }
             Ok(Bytes::from(out))
         }
     }
 }
 
 /// Async decode that offloads CPU work for non-trivial payloads.
-pub async fn decode_chunk_async(stored: Bytes, codec: ChunkCodec) -> Result<Bytes> {
+pub async fn decode_chunk_async(
+    stored: Bytes,
+    codec: ChunkCodec,
+    max_logical: usize,
+) -> Result<Bytes> {
     if matches!(codec, ChunkCodec::Raw) || stored.len() < 64 * 1024 {
-        return decode_chunk(stored, codec);
+        return decode_chunk(stored, codec, max_logical);
     }
-    tokio::task::spawn_blocking(move || decode_chunk(stored, codec))
+    tokio::task::spawn_blocking(move || decode_chunk(stored, codec, max_logical))
         .await
         .context("spawn_blocking decode")?
 }
@@ -464,7 +548,10 @@ mod tests {
         assert_eq!(*codec, ChunkCodec::Zstd);
         let stored = store.get(file_id).await.unwrap();
         assert!(stored.len() < data.len());
-        assert_eq!(decode_chunk(stored, ChunkCodec::Zstd).unwrap(), data);
+        assert_eq!(
+            decode_chunk(stored, ChunkCodec::Zstd, data.len()).unwrap(),
+            data
+        );
     }
 
     #[tokio::test]
@@ -486,12 +573,58 @@ mod tests {
             r.chunks.len()
         );
         let mut out = Vec::new();
-        for (_, fid, _, _, codec) in &r.chunks {
+        for (_, fid, _, logical_size, codec) in &r.chunks {
             let stored = store.get(fid).await.unwrap();
             assert!(stored.len() <= max_stored);
-            out.extend_from_slice(&decode_chunk(stored, *codec).unwrap());
+            assert!(*logical_size as usize <= chunker::max_logical_bytes(max_stored));
+            out.extend_from_slice(
+                &decode_chunk(stored, *codec, *logical_size as usize).unwrap(),
+            );
         }
         assert_eq!(out, data.as_ref());
+    }
+
+    #[tokio::test]
+    async fn logical_cap_splits_huge_compressible() {
+        let mem = Arc::new(MemoryBlobStore::new());
+        let store: Arc<dyn BlobStore> = mem.clone();
+        let max_stored = 4 * 1024;
+        let max_logical = chunker::max_logical_bytes(max_stored);
+        // Well above one logical cap so packing must flush mid-stream.
+        let data = Bytes::from(vec![0u8; max_logical * 3 + 100]);
+        let body = stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]);
+        let r = ingest_stream_to_store(&store, body, None, max_stored, ChunkCodec::Zstd)
+            .await
+            .unwrap();
+        assert!(
+            r.chunks.len() >= 3,
+            "expected >=3 chunks under logical cap, got {}",
+            r.chunks.len()
+        );
+        for (_, _, _, logical_size, _) in &r.chunks {
+            assert!(
+                *logical_size as usize <= max_logical,
+                "chunk logical {} > max_logical {max_logical}",
+                logical_size
+            );
+        }
+        let mut out = Vec::new();
+        for (_, fid, _, logical_size, codec) in &r.chunks {
+            let stored = store.get(fid).await.unwrap();
+            out.extend_from_slice(
+                &decode_chunk(stored, *codec, *logical_size as usize).unwrap(),
+            );
+        }
+        assert_eq!(out, data.as_ref());
+    }
+
+    #[test]
+    fn gzip_decode_respects_cap() {
+        let logical = vec![b'x'; 8192];
+        let stored = compress_slice(&logical, ChunkCodec::Gzip).unwrap();
+        assert!(decode_chunk(Bytes::from(stored.clone()), ChunkCodec::Gzip, 8192).is_ok());
+        let err = decode_chunk(Bytes::from(stored), ChunkCodec::Gzip, 100).unwrap_err();
+        assert!(err.to_string().contains("max_logical"), "{err}");
     }
 
     #[test]

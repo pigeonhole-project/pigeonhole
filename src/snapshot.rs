@@ -97,16 +97,27 @@ pub fn gunzip_bytes(data: &[u8]) -> Result<Vec<u8>> {
 
 pub fn parse_pin_manifest(text: &str) -> Result<PinManifest> {
     let m: PinManifest = serde_json::from_str(text).context("parse pin manifest JSON")?;
+    validate_pin_manifest(&m)?;
+    Ok(m)
+}
+
+fn parse_pin_manifest_bytes(data: &[u8]) -> Result<PinManifest> {
+    let m: PinManifest = serde_json::from_slice(data).context("parse pin manifest JSON")?;
+    validate_pin_manifest(&m)?;
+    Ok(m)
+}
+
+fn validate_pin_manifest(m: &PinManifest) -> Result<()> {
     if m.format != PIN_MANIFEST_FORMAT {
         bail!("unsupported pin manifest format {}", m.format);
     }
     if m.parts.is_empty() {
         bail!("pin manifest has no parts");
     }
-    if m.sha256.len() != 64 {
+    if m.sha256.len() != 64 || !m.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("pin manifest sha256 must be 64 hex chars");
     }
-    Ok(m)
+    Ok(())
 }
 
 /// Export the SQLite index when it changed: upload parts, pin a new immutable manifest,
@@ -336,13 +347,15 @@ pub async fn download_from_pinned(
         } => {
             info!(message_id, %file_id, "using pinned document manifest");
             let data = store.get(&file_id).await.context("download pinned manifest")?;
-            if let Ok(m) = serde_json::from_slice::<PinManifest>(&data) {
-                if m.format == PIN_MANIFEST_FORMAT {
-                    (message_id, file_id, m, None)
-                } else {
-                    bail!("unsupported pinned manifest format {}", m.format);
-                }
+            if let Ok(m) = parse_pin_manifest_bytes(&data) {
+                (message_id, file_id, m, None)
             } else if let Ok(legacy) = serde_json::from_slice::<LegacyDocManifest>(&data) {
+                if legacy.hash.len() != 64 || !legacy.hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("legacy document manifest hash must be 64 hex chars");
+                }
+                if legacy.parts.is_empty() {
+                    bail!("legacy document manifest has no parts");
+                }
                 (
                     message_id,
                     file_id,
@@ -356,8 +369,9 @@ pub async fn download_from_pinned(
                     },
                     None,
                 )
-            } else {
+            } else if data.starts_with(&[0x1f, 0x8b]) {
                 // Single gzip document pinned (very old) — treat as payload.
+                // No separate integrity hash in this legacy form.
                 (
                     message_id,
                     file_id,
@@ -371,6 +385,10 @@ pub async fn download_from_pinned(
                     },
                     Some(gunzip_bytes(&data)?),
                 )
+            } else {
+                bail!(
+                    "pinned document is neither a pin manifest, legacy manifest, nor gzip snapshot"
+                );
             }
         }
     };
@@ -390,9 +408,7 @@ pub async fn download_from_pinned(
         "downloading snapshot parts from pin manifest"
     );
     let json = download_parts(store, &manifest.parts).await?;
-    if manifest.sha256.len() == 64 {
-        verify_sha256(&json, &manifest.sha256)?;
-    }
+    verify_sha256(&json, &manifest.sha256)?;
     Ok(PinnedRestore {
         bytes: json,
         manifest_message_id,
@@ -603,5 +619,13 @@ mod tests {
     fn parse_rejects_bad_format() {
         let s = r#"{"format":99,"generation":1,"created_at":"x","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parts":[{"message_id":1,"file_id":"f","size":1}]}"#;
         assert!(parse_pin_manifest(s).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_or_short_sha256() {
+        let s = r#"{"format":1,"generation":1,"created_at":"x","sha256":"","parts":[{"message_id":1,"file_id":"f","size":1}]}"#;
+        assert!(parse_pin_manifest(s).is_err());
+        let bytes = br#"{"format":1,"generation":1,"created_at":"x","sha256":"abcd","parts":[{"message_id":1,"file_id":"f","size":1}]}"#;
+        assert!(parse_pin_manifest_bytes(bytes).is_err());
     }
 }

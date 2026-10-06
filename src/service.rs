@@ -472,6 +472,8 @@ fn apply_checksum_to_upload_part(output: &mut UploadPartOutput, c: &Checksum) {
 struct ChunkSlice {
     file_id: String,
     codec: ChunkCodec,
+    /// Full logical size of the Telegram chunk (decode bound).
+    logical_size: usize,
     from: usize,
     to: usize,
 }
@@ -498,6 +500,7 @@ fn plan_chunk_slices(
         plan.push(ChunkSlice {
             file_id: chunk.file_id.clone(),
             codec: chunk.stored_codec(),
+            logical_size: chunk.size.max(0) as usize,
             from: local_start,
             to: local_start + take,
         });
@@ -564,10 +567,12 @@ fn stream_object_body(
     tokio::spawn(async move {
         for slice in plan {
             let result = match store.get(&slice.file_id).await {
-                Ok(data) => match decode_chunk_async(data, slice.codec).await {
-                    Ok(logical) => Ok(logical.slice(slice.from..slice.to)),
-                    Err(e) => Err(std::io::Error::other(e.to_string())),
-                },
+                Ok(data) => {
+                    match decode_chunk_async(data, slice.codec, slice.logical_size.max(1)).await {
+                        Ok(logical) => Ok(logical.slice(slice.from..slice.to)),
+                        Err(e) => Err(std::io::Error::other(e.to_string())),
+                    }
+                }
                 Err(e) => Err(std::io::Error::other(e.to_string())),
             };
             if tx.send(result).await.is_err() {
@@ -1506,15 +1511,19 @@ impl S3 for S3gram {
                     // Hash logical bytes via getFile only — no sendDocument.
                     use md5::Digest;
                     let mut md5 = md5::Md5::new();
-                    for (_, file_id, _, _, codec) in &aligned {
+                    for (_, file_id, _, logical_size, codec) in &aligned {
                         let data = self
                             .store
                             .get(file_id)
                             .await
                             .map_err(Self::map_err)?;
-                        let logical = decode_chunk_async(data, *codec)
-                            .await
-                            .map_err(Self::map_err)?;
+                        let logical = decode_chunk_async(
+                            data,
+                            *codec,
+                            (*logical_size).max(1) as usize,
+                        )
+                        .await
+                        .map_err(Self::map_err)?;
                         md5.update(&logical);
                     }
                     format!("{:x}", md5.finalize())
