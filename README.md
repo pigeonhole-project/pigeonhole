@@ -8,7 +8,7 @@ chunks (default on-wire ≤19 MiB, hard cap `< 20 MiB` for Telegram `getFile`) a
 stored as documents in **one** private Telegram chat/channel. Chunk encoding is
 `raw` | `gzip` | `zstd` (default `zstd`): compressible data is packed until the
 **compressed** payload approaches `chunk.size`, so one message carries more
-logical bytes (uncompressed buffering is capped at `8× chunk.size`). The index
+logical bytes (uncompressed buffering is capped at 256 MiB per chunk). The index
 records the stored `codec` per chunk. Object metadata lives in a local SQLite
 index.
 

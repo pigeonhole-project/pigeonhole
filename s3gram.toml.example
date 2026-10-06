@@ -24,7 +24,7 @@ interval_secs = 300
 [chunk]
 # Max on-wire chunk size in bytes (Telegram getFile < 20 MiB). Default 19 MiB.
 # With codec zstd/gzip, a chunk is filled until *compressed* output approaches this size,
-# but uncompressed buffering is also capped at 8× this value (RAM / decode safety).
+# but uncompressed buffering is also capped at 256 MiB (RAM / decode safety).
 size = 19922944
 # Encoding for new object chunks: "raw" | "gzip" | "zstd" (default zstd).
 codec = "zstd"

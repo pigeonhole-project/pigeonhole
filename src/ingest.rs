@@ -585,37 +585,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logical_cap_splits_huge_compressible() {
-        let mem = Arc::new(MemoryBlobStore::new());
-        let store: Arc<dyn BlobStore> = mem.clone();
+    async fn chunk_ready_flushes_at_logical_cap() {
+        // Avoid allocating 256 MiB in unit tests: drive chunk_ready directly.
         let max_stored = 4 * 1024;
-        let max_logical = chunker::max_logical_bytes(max_stored);
-        // Well above one logical cap so packing must flush mid-stream.
-        let data = Bytes::from(vec![0u8; max_logical * 3 + 100]);
-        let body = stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]);
-        let r = ingest_stream_to_store(&store, body, None, max_stored, ChunkCodec::Zstd)
+        let fill_target = chunker::fill_target(max_stored);
+        let max_logical = 64 * 1024; // synthetic cap for this test
+        let under = vec![0u8; max_logical - 1];
+        // Tiny compressible payload stays under fill_target and under cap → not ready.
+        assert!(!chunk_ready(&under[..1024], ChunkCodec::Zstd, max_stored, fill_target, max_logical)
             .await
-            .unwrap();
-        assert!(
-            r.chunks.len() >= 3,
-            "expected >=3 chunks under logical cap, got {}",
-            r.chunks.len()
-        );
-        for (_, _, _, logical_size, _) in &r.chunks {
-            assert!(
-                *logical_size as usize <= max_logical,
-                "chunk logical {} > max_logical {max_logical}",
-                logical_size
-            );
-        }
-        let mut out = Vec::new();
-        for (_, fid, _, logical_size, codec) in &r.chunks {
-            let stored = store.get(fid).await.unwrap();
-            out.extend_from_slice(
-                &decode_chunk(stored, *codec, *logical_size as usize).unwrap(),
-            );
-        }
-        assert_eq!(out, data.as_ref());
+            .unwrap());
+        let at_cap = vec![0u8; max_logical];
+        assert!(chunk_ready(&at_cap, ChunkCodec::Zstd, max_stored, fill_target, max_logical)
+            .await
+            .unwrap());
     }
 
     #[test]
