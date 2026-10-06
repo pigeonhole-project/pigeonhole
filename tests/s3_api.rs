@@ -134,6 +134,57 @@ async fn put_get_roundtrip_and_range() {
 }
 
 #[tokio::test]
+async fn compressible_object_roundtrip_and_snapshot_flag() {
+    let (s3, mem, _dir) = setup().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "demo".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let data = Bytes::from(vec![b'z'; 200_000]);
+    s3.put_object(req(PutObjectInput {
+        bucket: "demo".into(),
+        key: "zeros.bin".into(),
+        body: Some(StreamingBlob::from_bytes(data.clone())),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let chunks = s3
+        .index
+        .get_chunks("demo", "zeros.bin")
+        .await
+        .unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].codec, "gzip");
+    assert_eq!(chunks[0].size, data.len() as i64);
+    let stored = mem.get(&chunks[0].file_id).await.unwrap();
+    assert!(stored.len() < data.len());
+
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "demo".into(),
+            key: "zeros.bin".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(collect_body(got.body).await, data.as_ref());
+
+    let snap = s3.index.export_snapshot().await.unwrap();
+    let sc = snap
+        .chunks
+        .iter()
+        .find(|c| c.key == "zeros.bin")
+        .unwrap();
+    assert_eq!(sc.codec, "gzip");
+}
+
+#[tokio::test]
 async fn content_md5_mismatch_rejected() {
     let (s3, _mem, _dir) = setup().await;
     s3.create_bucket(req(CreateBucketInput {
@@ -345,7 +396,7 @@ async fn object_tagging_roundtrip() {
 
 #[tokio::test]
 async fn upload_part_copy_range() {
-    let (s3, _mem, _dir) = setup().await;
+    let (s3, mem, _dir) = setup().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -362,6 +413,7 @@ async fn upload_part_copy_range() {
     }))
     .await
     .unwrap();
+    assert_eq!(mem.len(), 1);
 
     let created = s3
         .create_multipart_upload(req(CreateMultipartUploadInput {
@@ -388,6 +440,8 @@ async fn upload_part_copy_range() {
         .build()
         .unwrap();
     let copied = s3.upload_part_copy(req(copy_input)).await.unwrap().output;
+    // Misaligned range must re-ingest (new blob).
+    assert_eq!(mem.len(), 2);
     let part_etag = copied
         .copy_part_result
         .as_ref()
@@ -421,6 +475,91 @@ async fn upload_part_copy_range() {
         .unwrap()
         .output;
     assert_eq!(collect_body(got.body).await, b"0123");
+}
+
+#[tokio::test]
+async fn upload_part_copy_whole_object_reuses_blobs() {
+    let (s3, mem, _dir) = setup().await;
+    s3.create_bucket(req(CreateBucketInput {
+        bucket: "demo".into(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let body = Bytes::from_static(b"whole-object-shallow-copy");
+    s3.put_object(req(PutObjectInput {
+        bucket: "demo".into(),
+        key: "src.bin".into(),
+        body: Some(StreamingBlob::from_bytes(body.clone())),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let blobs_before = mem.len();
+    assert_eq!(blobs_before, 1);
+
+    let created = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "demo".into(),
+            key: "dst.bin".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let upload_id = created.upload_id.unwrap();
+
+    let copy_input = UploadPartCopyInput::builder()
+        .bucket("demo".into())
+        .key("dst.bin".into())
+        .upload_id(upload_id.clone())
+        .part_number(1)
+        .copy_source(CopySource::Bucket {
+            bucket: "demo".into(),
+            key: "src.bin".into(),
+            version_id: None,
+        })
+        .build()
+        .unwrap();
+    let copied = s3.upload_part_copy(req(copy_input)).await.unwrap().output;
+    assert_eq!(
+        mem.len(),
+        blobs_before,
+        "chunk-aligned whole-object copy must reuse file_id (no new upload)"
+    );
+    let part_etag = copied
+        .copy_part_result
+        .as_ref()
+        .and_then(|r| r.e_tag.clone())
+        .unwrap();
+
+    s3.complete_multipart_upload(req(CompleteMultipartUploadInput {
+        bucket: "demo".into(),
+        key: "dst.bin".into(),
+        upload_id,
+        multipart_upload: Some(CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                e_tag: Some(part_etag),
+                part_number: Some(1),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+
+    let got = s3
+        .get_object(req(GetObjectInput {
+            bucket: "demo".into(),
+            key: "dst.bin".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(collect_body(got.body).await, body.as_ref());
 }
 
 #[tokio::test]

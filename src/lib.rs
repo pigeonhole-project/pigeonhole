@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod config;
 pub mod index;
 pub mod ingest;
+pub mod rate_limit;
 pub mod service;
 pub mod snapshot;
 pub mod storage;

@@ -2,7 +2,8 @@
 
 use crate::config::Config;
 use crate::index::{parse_rfc3339, DeleteBucketResult, Index, OrphanMsg};
-use crate::ingest::ingest_stream_to_store;
+use crate::chunker::ChunkCodec;
+use crate::ingest::{decode_chunk, ingest_stream_to_store, UploadedChunk};
 use crate::storage::{BlobStore, DeleteOutcome};
 use async_trait::async_trait;
 use base64::Engine;
@@ -470,6 +471,7 @@ fn apply_checksum_to_upload_part(output: &mut UploadPartOutput, c: &Checksum) {
 
 struct ChunkSlice {
     file_id: String,
+    codec: ChunkCodec,
     from: usize,
     to: usize,
 }
@@ -495,6 +497,7 @@ fn plan_chunk_slices(
         let take = (chunk_size - local_start as u64).min(remaining) as usize;
         plan.push(ChunkSlice {
             file_id: chunk.file_id.clone(),
+            codec: chunk.stored_codec(),
             from: local_start,
             to: local_start + take,
         });
@@ -503,6 +506,51 @@ fn plan_chunk_slices(
         offset = chunk_end;
     }
     plan
+}
+
+/// If `[start, start+length)` covers whole Telegram chunks only, return them
+/// renumbered as multipart part chunks. Misaligned ranges return `None`.
+fn try_aligned_part_chunks(
+    chunks: &[crate::index::Chunk],
+    start: u64,
+    length: u64,
+) -> Option<Vec<UploadedChunk>> {
+    if length == 0 {
+        return Some(Vec::new());
+    }
+    let end = start.checked_add(length)?;
+    let mut offset = 0u64;
+    let mut out = Vec::new();
+    let mut chunk_no: i64 = 0;
+    for c in chunks {
+        let csize = c.size as u64;
+        let cend = offset + csize;
+        if cend <= start {
+            offset = cend;
+            continue;
+        }
+        if offset >= end {
+            break;
+        }
+        // Partial overlap with the requested range → not chunk-aligned.
+        if offset < start || cend > end {
+            return None;
+        }
+        out.push((
+            chunk_no,
+            c.file_id.clone(),
+            c.message_id,
+            c.size,
+            c.stored_codec(),
+        ));
+        chunk_no += 1;
+        offset = cend;
+    }
+    let covered: u64 = out.iter().map(|(_, _, _, s, _)| *s as u64).sum();
+    if covered != length {
+        return None;
+    }
+    Some(out)
 }
 
 fn stream_object_body(
@@ -516,7 +564,10 @@ fn stream_object_body(
     tokio::spawn(async move {
         for slice in plan {
             let result = match store.get(&slice.file_id).await {
-                Ok(data) => Ok(data.slice(slice.from..slice.to)),
+                Ok(data) => match decode_chunk(data, slice.codec) {
+                    Ok(logical) => Ok(logical.slice(slice.from..slice.to)),
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                },
                 Err(e) => Err(std::io::Error::other(e.to_string())),
             };
             if tx.send(result).await.is_err() {
@@ -885,6 +936,8 @@ impl S3 for S3gram {
             &self.store,
             stream,
             use_hasher.then_some(&mut hasher),
+            self.cfg.chunk_size,
+            self.cfg.chunk_codec,
         )
         .await
         {
@@ -1342,6 +1395,8 @@ impl S3 for S3gram {
             &self.store,
             stream,
             use_hasher.then_some(&mut hasher),
+            self.cfg.chunk_size,
+            self.cfg.chunk_codec,
         )
         .await
         {
@@ -1436,25 +1491,74 @@ impl S3 for S3gram {
         };
 
         let part_number = i64::from(input.part_number);
-        let body_stream = stream_object_body(self.store.clone(), chunks, start, length)
-            .map(|r| r.map_err(|e| anyhow::anyhow!(e)));
-        let ingested = match ingest_stream_to_store(&self.store, body_stream, None).await {
-            Ok(v) => v,
-            Err(e) => {
-                self.queue_pending_deletes(e.pending_deletes).await;
-                return Err(Self::map_err(e.source));
-            }
-        };
+
+        // Chunk-aligned ranges: reuse Telegram file_ids (refcount++), like CopyObject.
+        // Misaligned byte ranges still download + re-upload.
+        let (etag, size, part_chunks, chat_for_blobs) =
+            if let Some(aligned) = try_aligned_part_chunks(&chunks, start, length) {
+                let etag = if start == 0
+                    && length == total
+                    && !src.etag.contains('-')
+                {
+                    // Single-shot PutObject etag is content-MD5; safe to reuse.
+                    src.etag.clone()
+                } else {
+                    // Hash logical bytes via getFile only — no sendDocument.
+                    use md5::Digest;
+                    let mut md5 = md5::Md5::new();
+                    for (_, file_id, _, _, codec) in &aligned {
+                        let data = self
+                            .store
+                            .get(file_id)
+                            .await
+                            .map_err(Self::map_err)?;
+                        let logical = decode_chunk(data, *codec).map_err(Self::map_err)?;
+                        md5.update(&logical);
+                    }
+                    format!("{:x}", md5.finalize())
+                };
+                let src_chat = self
+                    .index
+                    .bucket_chat_id(&src_bucket)
+                    .await
+                    .map_err(Self::map_err)?
+                    .unwrap_or_else(|| self.chat_id().to_string());
+                (etag, length as i64, aligned, src_chat)
+            } else {
+                let body_stream = stream_object_body(self.store.clone(), chunks, start, length)
+                    .map(|r| r.map_err(|e| anyhow::anyhow!(e)));
+                let ingested = match ingest_stream_to_store(
+                    &self.store,
+                    body_stream,
+                    None,
+                    self.cfg.chunk_size,
+                    self.cfg.chunk_codec,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.queue_pending_deletes(e.pending_deletes).await;
+                        return Err(Self::map_err(e.source));
+                    }
+                };
+                (
+                    ingested.etag,
+                    ingested.size,
+                    ingested.chunks,
+                    self.chat_id().to_string(),
+                )
+            };
 
         let orphans = self
             .index
             .put_multipart_part(
                 &input.upload_id,
                 part_number,
-                &ingested.etag,
-                ingested.size,
-                &ingested.chunks,
-                self.chat_id(),
+                &etag,
+                size,
+                &part_chunks,
+                &chat_for_blobs,
             )
             .await
             .map_err(Self::map_err)?;

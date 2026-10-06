@@ -1,3 +1,4 @@
+use crate::rate_limit::ChatLimiter;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use reqwest::multipart::{Form, Part};
@@ -47,12 +48,32 @@ pub enum DeleteOutcome {
 #[derive(Debug, Deserialize)]
 pub struct Message {
     pub message_id: i64,
+    #[serde(default)]
+    pub text: Option<String>,
     pub document: Option<Document>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Document {
     pub file_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Chat {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub chat_type: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub pinned_message: Option<Message>,
+}
+
+/// Content of the chat's latest pinned message (bootstrap pointer).
+#[derive(Debug, Clone)]
+pub enum PinnedContent {
+    Text { message_id: i64, text: String },
+    Document { message_id: i64, file_id: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,17 +100,24 @@ impl TelegramClient {
         )
     }
 
+    /// Upload a document. When `limiter` is set, request budget and 429 cool-down
+    /// are shared across the process (see [`ChatLimiter`]); otherwise each call
+    /// sleeps `retry_after` independently (legacy / one-off tools).
     pub async fn send_document(
         &self,
         chat_id: &str,
         data: Bytes,
         filename: &str,
         caption: &str,
+        limiter: Option<&ChatLimiter>,
     ) -> Result<(String, i64)> {
         // Non-idempotent: only retry connect failures and 429. Timeouts, 5xx, and
         // response parse errors are ambiguous (message may already exist).
         let mut last_err = None;
         for attempt in 0..5u32 {
+            if let Some(lim) = limiter {
+                lim.acquire().await;
+            }
             match self
                 .send_document_once(chat_id, data.clone(), filename, caption)
                 .await
@@ -103,7 +131,11 @@ impl TelegramClient {
                 Err(SendErr::RetryAfter(secs, e)) => {
                     debug!(attempt, secs, error = %e, "sendDocument rate-limited");
                     last_err = Some(e);
-                    tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
+                    if let Some(lim) = limiter {
+                        lim.penalize(Duration::from_secs(secs.max(1)));
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
+                    }
                 }
                 Err(SendErr::Connect(e)) => {
                     let wait = Duration::from_millis(200 * 2u64.pow(attempt));
@@ -198,9 +230,16 @@ impl TelegramClient {
         Ok((doc.file_id, msg.message_id))
     }
 
-    pub async fn download_file(&self, file_id: &str) -> Result<Bytes> {
+    pub async fn download_file(
+        &self,
+        file_id: &str,
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<Bytes> {
         let mut last_err = None;
         for attempt in 0..5u32 {
+            if let Some(lim) = limiter {
+                lim.acquire().await;
+            }
             match self.download_file_once(file_id).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
@@ -248,7 +287,15 @@ impl TelegramClient {
     }
 
     /// Delete a chat message. `Gone` (already missing) is success for queue purposes.
-    pub async fn delete_message(&self, chat_id: &str, message_id: i64) -> Result<DeleteOutcome> {
+    pub async fn delete_message(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<DeleteOutcome> {
+        if let Some(lim) = limiter {
+            lim.acquire().await;
+        }
         let resp = self
             .http
             .post(self.api_url("deleteMessage"))
@@ -261,6 +308,26 @@ impl TelegramClient {
             .context("deleteMessage http")?;
 
         let status = resp.status();
+        if status.as_u16() == 429 {
+            let body: ApiResponse<bool> = resp.json().await.unwrap_or(ApiResponse {
+                ok: false,
+                result: None,
+                description: Some("rate limited".into()),
+                parameters: None,
+            });
+            let secs = body
+                .parameters
+                .as_ref()
+                .and_then(|p| p.retry_after)
+                .unwrap_or(3)
+                .max(1) as u64;
+            if let Some(lim) = limiter {
+                lim.penalize(Duration::from_secs(secs));
+            }
+            debug!(message_id, secs, "deleteMessage rate-limited");
+            return Ok(DeleteOutcome::Failed);
+        }
+
         let body: ApiResponse<bool> = resp.json().await.context("deleteMessage json")?;
         if status.is_success() && body.ok && body.result.unwrap_or(false) {
             return Ok(DeleteOutcome::Deleted);
@@ -301,6 +368,117 @@ impl TelegramClient {
         body.result.ok_or_else(|| anyhow!("getMe missing result"))
     }
 
+    pub async fn get_chat(&self, chat_id: &str) -> Result<Chat> {
+        let resp = self
+            .http
+            .post(self.api_url("getChat"))
+            .form(&[("chat_id", chat_id)])
+            .send()
+            .await
+            .context("getChat http")?;
+        let status = resp.status();
+        let body: ApiResponse<Chat> = resp.json().await.context("getChat json")?;
+        if !status.is_success() || !body.ok {
+            return Err(anyhow!(
+                "getChat failed: {}",
+                body.description.unwrap_or_else(|| status.to_string())
+            ));
+        }
+        body.result.ok_or_else(|| anyhow!("getChat missing result"))
+    }
+
+    /// Latest pinned message content, if any.
+    pub async fn get_pinned_content(&self, chat_id: &str) -> Result<Option<PinnedContent>> {
+        let chat = self.get_chat(chat_id).await?;
+        let Some(msg) = chat.pinned_message else {
+            return Ok(None);
+        };
+        if let Some(text) = msg.text.filter(|t| !t.is_empty()) {
+            return Ok(Some(PinnedContent::Text {
+                message_id: msg.message_id,
+                text,
+            }));
+        }
+        if let Some(doc) = msg.document {
+            return Ok(Some(PinnedContent::Document {
+                message_id: msg.message_id,
+                file_id: doc.file_id,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Send a plain text message; returns `message_id`.
+    pub async fn send_message(&self, chat_id: &str, text: &str) -> Result<i64> {
+        let resp = self
+            .http
+            .post(self.api_url("sendMessage"))
+            .form(&[("chat_id", chat_id), ("text", text)])
+            .send()
+            .await
+            .context("sendMessage http")?;
+        let status = resp.status();
+        let body: ApiResponse<Message> = resp.json().await.context("sendMessage json")?;
+        if !status.is_success() || !body.ok {
+            return Err(anyhow!(
+                "sendMessage failed: {}",
+                body.description.unwrap_or_else(|| status.to_string())
+            ));
+        }
+        Ok(body
+            .result
+            .ok_or_else(|| anyhow!("sendMessage missing result"))?
+            .message_id)
+    }
+
+    pub async fn pin_chat_message(&self, chat_id: &str, message_id: i64) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.api_url("pinChatMessage"))
+            .form(&[
+                ("chat_id", chat_id),
+                ("message_id", &message_id.to_string()),
+                ("disable_notification", "true"),
+            ])
+            .send()
+            .await
+            .context("pinChatMessage http")?;
+        let status = resp.status();
+        let body: ApiResponse<bool> = resp.json().await.context("pinChatMessage json")?;
+        if status.is_success() && body.ok {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "pinChatMessage failed: {}",
+            body.description.unwrap_or_else(|| status.to_string())
+        ))
+    }
+
+    pub async fn unpin_chat_message(&self, chat_id: &str, message_id: i64) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.api_url("unpinChatMessage"))
+            .form(&[
+                ("chat_id", chat_id),
+                ("message_id", &message_id.to_string()),
+            ])
+            .send()
+            .await
+            .context("unpinChatMessage http")?;
+        let status = resp.status();
+        let body: ApiResponse<bool> = resp.json().await.context("unpinChatMessage json")?;
+        if status.is_success() && body.ok {
+            return Ok(());
+        }
+        let desc = body.description.unwrap_or_else(|| status.to_string());
+        let lower = desc.to_ascii_lowercase();
+        // Already unpinned / missing — fine for cleanup.
+        if lower.contains("not found") || lower.contains("message to unpin not found") {
+            return Ok(());
+        }
+        Err(anyhow!("unpinChatMessage failed: {desc}"))
+    }
+
     pub async fn get_chat_member(&self, chat_id: &str, user_id: i64) -> Result<ChatMember> {
         let resp = self
             .http
@@ -324,7 +502,7 @@ impl TelegramClient {
             .ok_or_else(|| anyhow!("getChatMember missing result"))
     }
 
-    /// Fail fast unless the bot is a member with admin (or creator) rights in `chat_id`.
+    /// Fail fast unless the bot is admin/creator and can pin messages in `chat_id`.
     pub async fn ensure_chat_admin(&self, chat_id: &str) -> Result<()> {
         let me = self.get_me().await.context("getMe")?;
         let member = self
@@ -332,11 +510,30 @@ impl TelegramClient {
             .await
             .with_context(|| format!("bot is not in chat {chat_id}"))?;
         match member.status.as_str() {
-            "administrator" | "creator" => {
+            "creator" => {
                 tracing::info!(
                     chat_id,
                     bot_id = me.id,
                     status = %member.status,
+                    "telegram chat access ok"
+                );
+                Ok(())
+            }
+            "administrator" => {
+                // Channels/groups: pin bootstrap needs can_pin_messages.
+                // Some chat types omit the field for admins that still can pin; treat
+                // explicit false as hard fail, missing as ok (API variance).
+                if member.can_pin_messages == Some(false) {
+                    anyhow::bail!(
+                        "bot is admin in {chat_id} but can_pin_messages=false; \
+                         enable pin rights for snapshot bootstrap"
+                    );
+                }
+                tracing::info!(
+                    chat_id,
+                    bot_id = me.id,
+                    status = %member.status,
+                    can_pin = ?member.can_pin_messages,
                     "telegram chat access ok"
                 );
                 Ok(())
@@ -362,6 +559,9 @@ fn classify_reqwest(e: reqwest::Error) -> SendErr {
 pub struct ChatMember {
     pub status: String,
     pub user: TgUser,
+    /// Present for administrators in groups/channels when Telegram reports pin rights.
+    #[serde(default)]
+    pub can_pin_messages: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

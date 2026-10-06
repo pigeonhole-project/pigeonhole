@@ -1,5 +1,6 @@
 //! Pluggable blob storage. Production uses Telegram; tests use in-memory.
 
+use crate::rate_limit::ChatLimiter;
 use crate::telegram::TelegramClient;
 
 pub use crate::telegram::DeleteOutcome;
@@ -30,11 +31,16 @@ pub trait BlobStore: Send + Sync {
 pub struct TelegramBlobStore {
     tg: TelegramClient,
     chat_id: String,
+    limiter: ChatLimiter,
 }
 
 impl TelegramBlobStore {
-    pub fn new(tg: TelegramClient, chat_id: String) -> Self {
-        Self { tg, chat_id }
+    pub fn new(tg: TelegramClient, chat_id: String, limiter: ChatLimiter) -> Self {
+        Self {
+            tg,
+            chat_id,
+            limiter,
+        }
     }
 
     pub fn chat_id(&self) -> &str {
@@ -57,17 +63,29 @@ impl BlobStore for TelegramBlobStore {
         if data.is_empty() {
             bail!("refusing empty blob upload (Telegram rejects empty documents)");
         }
+        // Cap parallel sendDocument; token bucket + 429 cool-down are inside send_document.
+        let _upload = self.limiter.acquire_upload().await;
         self.tg
-            .send_document(&self.chat_id, data, filename, caption)
+            .send_document(
+                &self.chat_id,
+                data,
+                filename,
+                caption,
+                Some(&self.limiter),
+            )
             .await
     }
 
     async fn get(&self, file_id: &str) -> Result<Bytes> {
-        self.tg.download_file(file_id).await
+        self.tg
+            .download_file(file_id, Some(&self.limiter))
+            .await
     }
 
     async fn delete_message(&self, message_id: i64) -> Result<DeleteOutcome> {
-        self.tg.delete_message(&self.chat_id, message_id).await
+        self.tg
+            .delete_message(&self.chat_id, message_id, Some(&self.limiter))
+            .await
     }
 }
 

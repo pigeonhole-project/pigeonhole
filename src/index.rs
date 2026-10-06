@@ -1,3 +1,5 @@
+use crate::chunker::ChunkCodec;
+use crate::ingest::{codec_from_sql, codec_to_sql, UploadedChunk};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -26,14 +28,59 @@ pub struct ObjectMeta {
     pub mtime: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct Chunk {
     pub bucket: String,
     pub key: String,
     pub part_no: i64,
     pub file_id: String,
     pub message_id: i64,
+    /// Logical (uncompressed) byte length of this slice.
     pub size: i64,
+    /// On-wire encoding of the Telegram document: `raw` or `gzip`.
+    pub codec: String,
+}
+
+impl Chunk {
+    pub fn stored_codec(&self) -> ChunkCodec {
+        codec_from_sql(&self.codec).unwrap_or(ChunkCodec::Raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for Chunk {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawChunk {
+            bucket: String,
+            key: String,
+            part_no: i64,
+            file_id: String,
+            message_id: i64,
+            size: i64,
+            #[serde(default)]
+            codec: Option<String>,
+            /// Legacy pin/index field from early compression builds.
+            #[serde(default)]
+            compressed: Option<bool>,
+        }
+        let r = RawChunk::deserialize(deserializer)?;
+        let codec = match r.codec.filter(|s| !s.is_empty()) {
+            Some(c) => c,
+            None => match r.compressed {
+                Some(true) => ChunkCodec::Gzip.as_str().to_string(),
+                _ => ChunkCodec::Raw.as_str().to_string(),
+            },
+        };
+        Ok(Self {
+            bucket: r.bucket,
+            key: r.key,
+            part_no: r.part_no,
+            file_id: r.file_id,
+            message_id: r.message_id,
+            size: r.size,
+            codec,
+        })
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -85,6 +132,13 @@ pub struct MultipartPartChunk {
     pub file_id: String,
     pub message_id: i64,
     pub size: i64,
+    pub codec: String,
+}
+
+impl MultipartPartChunk {
+    pub fn stored_codec(&self) -> ChunkCodec {
+        codec_from_sql(&self.codec).unwrap_or(ChunkCodec::Raw)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -195,6 +249,7 @@ impl Index {
                 file_id TEXT NOT NULL,
                 message_id INTEGER NOT NULL,
                 size INTEGER NOT NULL,
+                codec TEXT NOT NULL DEFAULT 'raw',
                 PRIMARY KEY (bucket, key, part_no),
                 FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
             );
@@ -202,6 +257,18 @@ impl Index {
         )
         .execute(&self.pool)
         .await?;
+
+        if !self.column_exists("chunks", "codec").await? {
+            sqlx::query("ALTER TABLE chunks ADD COLUMN codec TEXT NOT NULL DEFAULT 'raw'")
+                .execute(&self.pool)
+                .await?;
+            // Migrate briefly-lived `compressed` INTEGER column if present.
+            if self.column_exists("chunks", "compressed").await? {
+                sqlx::query("UPDATE chunks SET codec = 'gzip' WHERE compressed = 1")
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
 
         sqlx::query(
             r#"
@@ -276,6 +343,7 @@ impl Index {
                 file_id TEXT NOT NULL,
                 message_id INTEGER NOT NULL,
                 size INTEGER NOT NULL,
+                codec TEXT NOT NULL DEFAULT 'raw',
                 PRIMARY KEY (upload_id, part_number, chunk_no),
                 FOREIGN KEY (upload_id, part_number)
                     REFERENCES multipart_parts(upload_id, part_number) ON DELETE CASCADE
@@ -284,6 +352,27 @@ impl Index {
         )
         .execute(&self.pool)
         .await?;
+
+        if !self
+            .column_exists("multipart_part_chunks", "codec")
+            .await?
+        {
+            sqlx::query(
+                "ALTER TABLE multipart_part_chunks ADD COLUMN codec TEXT NOT NULL DEFAULT 'raw'",
+            )
+            .execute(&self.pool)
+            .await?;
+            if self
+                .column_exists("multipart_part_chunks", "compressed")
+                .await?
+            {
+                sqlx::query(
+                    "UPDATE multipart_part_chunks SET codec = 'gzip' WHERE compressed = 1",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
 
         sqlx::query(
             r#"
@@ -534,7 +623,7 @@ impl Index {
         etag: &str,
         size: i64,
         content_type: Option<&str>,
-        chunks: &[(i64, String, i64, i64)],
+        chunks: &[UploadedChunk],
         chat_id: &str,
         user_meta: &[(String, String)],
         checksums_json: &str,
@@ -543,7 +632,7 @@ impl Index {
         let mut orphans = Vec::new();
 
         let old_chunks = sqlx::query_as::<_, Chunk>(
-            "SELECT bucket, key, part_no, file_id, message_id, size FROM chunks WHERE bucket = ? AND key = ?",
+            "SELECT bucket, key, part_no, file_id, message_id, size, codec FROM chunks WHERE bucket = ? AND key = ?",
         )
         .bind(bucket)
         .bind(key)
@@ -596,12 +685,12 @@ impl Index {
         .execute(&mut *tx)
         .await?;
 
-        for (part_no, file_id, message_id, chunk_size) in chunks {
+        for (part_no, file_id, message_id, chunk_size, codec) in chunks {
             bump_blob(&mut tx, file_id, *message_id, *chunk_size, chat_id).await?;
             sqlx::query(
                 r#"
-                INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size, codec)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(bucket)
@@ -610,6 +699,7 @@ impl Index {
             .bind(file_id)
             .bind(message_id)
             .bind(chunk_size)
+            .bind(codec_to_sql(*codec))
             .execute(&mut *tx)
             .await?;
         }
@@ -724,7 +814,7 @@ impl Index {
 
     pub async fn get_chunks(&self, bucket: &str, key: &str) -> Result<Vec<Chunk>> {
         let rows = sqlx::query_as::<_, Chunk>(
-            "SELECT bucket, key, part_no, file_id, message_id, size FROM chunks WHERE bucket = ? AND key = ? ORDER BY part_no",
+            "SELECT bucket, key, part_no, file_id, message_id, size, codec FROM chunks WHERE bucket = ? AND key = ? ORDER BY part_no",
         )
         .bind(bucket)
         .bind(key)
@@ -736,7 +826,7 @@ impl Index {
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<OrphanMsg>>> {
         let mut tx = self.pool.begin().await?;
         let chunks = sqlx::query_as::<_, Chunk>(
-            "SELECT bucket, key, part_no, file_id, message_id, size FROM chunks WHERE bucket = ? AND key = ?",
+            "SELECT bucket, key, part_no, file_id, message_id, size, codec FROM chunks WHERE bucket = ? AND key = ?",
         )
         .bind(bucket)
         .bind(key)
@@ -787,9 +877,17 @@ impl Index {
             .unwrap_or_default();
 
         let ct = content_type.or(src.content_type.as_deref());
-        let chunk_tuples: Vec<(i64, String, i64, i64)> = src_chunks
+        let chunk_tuples: Vec<UploadedChunk> = src_chunks
             .iter()
-            .map(|c| (c.part_no, c.file_id.clone(), c.message_id, c.size))
+            .map(|c| {
+                (
+                    c.part_no,
+                    c.file_id.clone(),
+                    c.message_id,
+                    c.size,
+                    c.stored_codec(),
+                )
+            })
             .collect();
 
         let meta: Vec<(String, String)> = if copy_source_meta {
@@ -1007,6 +1105,77 @@ impl Index {
         Ok(())
     }
 
+    /// All Telegram `message_id`s known to the index (blobs, chunks, multipart, pending deletes).
+    pub async fn list_tracked_message_ids(&self) -> Result<Vec<i64>> {
+        let mut ids: Vec<i64> = Vec::new();
+        let mut push_rows = |rows: Vec<(i64,)>| {
+            for (id,) in rows {
+                ids.push(id);
+            }
+        };
+        push_rows(
+            sqlx::query_as("SELECT message_id FROM blobs")
+                .fetch_all(&self.pool)
+                .await?,
+        );
+        push_rows(
+            sqlx::query_as("SELECT message_id FROM chunks")
+                .fetch_all(&self.pool)
+                .await?,
+        );
+        push_rows(
+            sqlx::query_as("SELECT message_id FROM multipart_part_chunks")
+                .fetch_all(&self.pool)
+                .await?,
+        );
+        push_rows(
+            sqlx::query_as("SELECT message_id FROM pending_tg_deletes")
+                .fetch_all(&self.pool)
+                .await?,
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Wipe all S3/index state. Does not touch Telegram; call after deleting tracked messages.
+    pub async fn wipe_all(&self) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM pending_tg_deletes")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM multipart_part_chunks")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM multipart_parts")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM multipart_uploads")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM object_tags")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM object_metadata")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chunks")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM objects")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM blobs")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM buckets")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM meta").execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn queue_tg_delete(&self, chat_id: &str, message_id: i64) -> Result<()> {
         let queued_at = Utc::now().to_rfc3339();
         sqlx::query(
@@ -1100,7 +1269,7 @@ impl Index {
         .fetch_all(&mut *tx)
         .await?;
         let chunks = sqlx::query_as::<_, Chunk>(
-            "SELECT bucket, key, part_no, file_id, message_id, size FROM chunks ORDER BY bucket, key, part_no",
+            "SELECT bucket, key, part_no, file_id, message_id, size, codec FROM chunks ORDER BY bucket, key, part_no",
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -1166,7 +1335,7 @@ impl Index {
         }
         for c in &snap.chunks {
             sqlx::query(
-                "INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size, codec) VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&c.bucket)
             .bind(&c.key)
@@ -1174,6 +1343,7 @@ impl Index {
             .bind(&c.file_id)
             .bind(c.message_id)
             .bind(c.size)
+            .bind(codec_to_sql(c.stored_codec()))
             .execute(&mut *tx)
             .await?;
         }
@@ -1271,7 +1441,7 @@ impl Index {
         part_number: i64,
         etag: &str,
         size: i64,
-        chunks: &[(i64, String, i64, i64)],
+        chunks: &[UploadedChunk],
         chat_id: &str,
     ) -> Result<Vec<OrphanMsg>> {
         let mut tx = self.pool.begin().await?;
@@ -1279,7 +1449,7 @@ impl Index {
 
         let old = sqlx::query_as::<_, MultipartPartChunk>(
             r#"
-            SELECT upload_id, part_number, chunk_no, file_id, message_id, size
+            SELECT upload_id, part_number, chunk_no, file_id, message_id, size, codec
             FROM multipart_part_chunks
             WHERE upload_id = ? AND part_number = ?
             "#,
@@ -1317,13 +1487,13 @@ impl Index {
         .execute(&mut *tx)
         .await?;
 
-        for (chunk_no, file_id, message_id, chunk_size) in chunks {
+        for (chunk_no, file_id, message_id, chunk_size, codec) in chunks {
             bump_blob(&mut tx, file_id, *message_id, *chunk_size, chat_id).await?;
             sqlx::query(
                 r#"
                 INSERT INTO multipart_part_chunks
-                    (upload_id, part_number, chunk_no, file_id, message_id, size)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (upload_id, part_number, chunk_no, file_id, message_id, size, codec)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(upload_id)
@@ -1332,6 +1502,7 @@ impl Index {
             .bind(file_id)
             .bind(message_id)
             .bind(chunk_size)
+            .bind(codec_to_sql(*codec))
             .execute(&mut *tx)
             .await?;
         }
@@ -1362,7 +1533,7 @@ impl Index {
     ) -> Result<Vec<MultipartPartChunk>> {
         let rows = sqlx::query_as::<_, MultipartPartChunk>(
             r#"
-            SELECT upload_id, part_number, chunk_no, file_id, message_id, size
+            SELECT upload_id, part_number, chunk_no, file_id, message_id, size, codec
             FROM multipart_part_chunks
             WHERE upload_id = ? AND part_number = ?
             ORDER BY chunk_no
@@ -1393,14 +1564,14 @@ impl Index {
             serde_json::from_str(&upload.tagging_json).unwrap_or_default();
 
         let mut tx = self.pool.begin().await?;
-        let mut assembled: Vec<(i64, String, i64, i64)> = Vec::new();
+        let mut assembled: Vec<UploadedChunk> = Vec::new();
         let mut part_chunks: Vec<MultipartPartChunk> = Vec::new();
         let mut part_no: i64 = 0;
 
         for pn in part_numbers {
             let chunks = sqlx::query_as::<_, MultipartPartChunk>(
                 r#"
-                SELECT upload_id, part_number, chunk_no, file_id, message_id, size
+                SELECT upload_id, part_number, chunk_no, file_id, message_id, size, codec
                 FROM multipart_part_chunks
                 WHERE upload_id = ? AND part_number = ?
                 ORDER BY chunk_no
@@ -1411,7 +1582,13 @@ impl Index {
             .fetch_all(&mut *tx)
             .await?;
             for c in chunks {
-                assembled.push((part_no, c.file_id.clone(), c.message_id, c.size));
+                assembled.push((
+                    part_no,
+                    c.file_id.clone(),
+                    c.message_id,
+                    c.size,
+                    c.stored_codec(),
+                ));
                 part_chunks.push(c);
                 part_no += 1;
             }
@@ -1419,7 +1596,7 @@ impl Index {
 
         // Replace destination object inside this transaction.
         let old_chunks = sqlx::query_as::<_, Chunk>(
-            "SELECT bucket, key, part_no, file_id, message_id, size FROM chunks WHERE bucket = ? AND key = ?",
+            "SELECT bucket, key, part_no, file_id, message_id, size, codec FROM chunks WHERE bucket = ? AND key = ?",
         )
         .bind(&upload.bucket)
         .bind(&upload.key)
@@ -1470,12 +1647,12 @@ impl Index {
         .execute(&mut *tx)
         .await?;
 
-        for (pno, file_id, message_id, chunk_size) in &assembled {
+        for (pno, file_id, message_id, chunk_size, codec) in &assembled {
             bump_blob(&mut tx, file_id, *message_id, *chunk_size, &chat_id).await?;
             sqlx::query(
                 r#"
-                INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size, codec)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&upload.bucket)
@@ -1484,6 +1661,7 @@ impl Index {
             .bind(file_id)
             .bind(message_id)
             .bind(chunk_size)
+            .bind(codec_to_sql(*codec))
             .execute(&mut *tx)
             .await?;
         }
@@ -1537,7 +1715,7 @@ impl Index {
         let mut tx = self.pool.begin().await?;
         let chunks = sqlx::query_as::<_, MultipartPartChunk>(
             r#"
-            SELECT upload_id, part_number, chunk_no, file_id, message_id, size
+            SELECT upload_id, part_number, chunk_no, file_id, message_id, size, codec
             FROM multipart_part_chunks
             WHERE upload_id = ?
             "#,
