@@ -50,6 +50,10 @@ interval_secs = ${SNAPSHOT_SECS}
 [chunk]
 size = ${CHUNK_SIZE}
 codec = "${CHUNK_CODEC}"
+frame_size = 1048576
+
+[ingest]
+memory_budget = 268435456
 
 [telegram]
 send_rate_per_sec = 0.5

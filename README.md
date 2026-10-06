@@ -6,11 +6,11 @@ The S3 protocol surface is implemented with
 [s3s](https://github.com/s3s-project/s3s). Objects are split into configurable
 chunks (default on-wire ≤19 MiB, hard cap `< 20 MiB` for Telegram `getFile`) and
 stored as documents in **one** private Telegram chat/channel. Chunk encoding is
-`raw` | `gzip` | `zstd` (default `zstd`): compressible data is packed until the
-**compressed** payload approaches `chunk.size`, so one message carries more
-logical bytes (uncompressed buffering is capped at 256 MiB per chunk). The index
-records the stored `codec` per chunk. Object metadata lives in a local SQLite
-index.
+`raw` | `gzip` | `zstd` (default `zstd`): compressing policies pack independent
+1 MiB frames into Telegram documents (stored codec `frames`) so each block is
+compressed once; on-wire size stays ≤ `chunk.size` (logical ≤ 256 MiB). Legacy
+single-blob `raw`/`gzip`/`zstd` chunks remain readable. Object metadata lives in
+a local SQLite index.
 
 Telegram I/O goes through a `BlobStore` trait (`TelegramBlobStore` in production,
 `MemoryBlobStore` in unit tests) so tests never hit the real Bot API.
