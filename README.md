@@ -52,7 +52,17 @@ For unsigned local debugging: `S3GRAM_INSECURE=1`.
 
 ## Index snapshot
 
-Export metadata to Telegram (JSON document in the same chat):
+s3gram periodically exports the SQLite index as a Telegram document (`s3gram-index.json`)
+in the same chat. Uploads happen only when the index hash changes; the previous snapshot
+message is deleted.
+
+Interval (default 300s; `0` disables):
+
+```bash
+SNAPSHOT_INTERVAL_SECS=300
+```
+
+Manual export (same replace-if-changed logic):
 
 ```bash
 # with S3GRAM_INSECURE=1, or a valid SigV4 signature

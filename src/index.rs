@@ -236,6 +236,17 @@ impl Index {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Backfill blobs from existing chunk references (idempotent for empty blobs table).
         let (blob_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs")
             .fetch_one(&self.pool)
@@ -572,6 +583,25 @@ impl Index {
         let truncated = objs.len() as i64 > max_keys;
         objs.truncate(max_keys as usize);
         Ok((objs, Vec::new(), truncated))
+    }
+
+    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn export_snapshot(&self) -> Result<IndexSnapshot> {

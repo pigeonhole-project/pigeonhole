@@ -2,13 +2,16 @@ mod chunker;
 mod config;
 mod index;
 mod s3;
+mod snapshot;
 mod telegram;
 
 use anyhow::Context;
 use config::Config;
 use index::Index;
 use s3::{router, AppState};
+use std::sync::Arc;
 use telegram::TelegramClient;
+use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -27,11 +30,20 @@ async fn main() -> anyhow::Result<()> {
     let tg = TelegramClient::new(cfg.bot_token.clone(), cfg.chat_id.clone())
         .context("telegram client")?;
 
+    let snapshot_gate = Arc::new(Mutex::new(()));
+    snapshot::spawn_periodic(
+        index.clone(),
+        tg.clone(),
+        snapshot_gate.clone(),
+        cfg.snapshot_interval_secs,
+    );
+
     let addr = cfg.listen_addr.clone();
     let app = router(AppState {
         cfg,
         index,
         tg,
+        snapshot_gate,
     });
 
     let listener = tokio::net::TcpListener::bind(&addr)

@@ -11,6 +11,8 @@ pub struct Config {
     pub secret_key: String,
     #[allow(dead_code)]
     pub region: String,
+    /// Seconds between automatic index snapshots. `0` disables.
+    pub snapshot_interval_secs: u64,
 }
 
 impl Config {
@@ -24,6 +26,10 @@ impl Config {
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8333".into());
         let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:s3gram.db".into());
         let region = env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
+        let snapshot_interval_secs = env::var("SNAPSHOT_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
 
         Ok(Self {
             bot_token,
@@ -33,6 +39,7 @@ impl Config {
             access_key,
             secret_key,
             region,
+            snapshot_interval_secs,
         })
     }
 }

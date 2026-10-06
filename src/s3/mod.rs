@@ -5,6 +5,7 @@ mod xml;
 use crate::chunker;
 use crate::config::Config;
 use crate::index::{parse_rfc3339, DeleteBucketResult, Index};
+use crate::snapshot::{self, PushOutcome};
 use crate::telegram::TelegramClient;
 use auth::authorize;
 use axum::body::Body;
@@ -19,6 +20,7 @@ use futures::StreamExt;
 use md5::{Digest, Md5};
 use serde::Deserialize;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use xml::*;
@@ -28,6 +30,7 @@ pub struct AppState {
     pub cfg: Config,
     pub index: Index,
     pub tg: TelegramClient,
+    pub snapshot_gate: Arc<Mutex<()>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -991,20 +994,30 @@ fn extract_xml_text(block: &str, tag: &str) -> Option<String> {
 }
 
 async fn export_snapshot(state: &AppState) -> Result<Response, S3Error> {
-    let snap = state.index.export_snapshot().await?;
-    let json = serde_json::to_vec_pretty(&snap).map_err(|e| S3Error::internal(e.to_string()))?;
-    let filename = format!("s3gram-index-{}.json", chrono::Utc::now().format("%Y%m%d%H%M%S"));
-    let (file_id, message_id) = state
-        .tg
-        .send_document(Bytes::from(json), &filename, "s3gram-index-snapshot")
+    let _guard = state.snapshot_gate.lock().await;
+    let outcome = snapshot::push_if_changed(&state.index, &state.tg)
         .await
         .map_err(|e| S3Error::internal(e.to_string()))?;
 
-    let body = serde_json::json!({
-        "file_id": file_id,
-        "message_id": message_id,
-        "filename": filename,
-    });
+    let body = match outcome {
+        PushOutcome::Unchanged { hash } => serde_json::json!({
+            "status": "unchanged",
+            "hash": hash,
+        }),
+        PushOutcome::Uploaded {
+            hash,
+            file_id,
+            message_id,
+            replaced_message_id,
+        } => serde_json::json!({
+            "status": "uploaded",
+            "hash": hash,
+            "file_id": file_id,
+            "message_id": message_id,
+            "replaced_message_id": replaced_message_id,
+            "filename": "s3gram-index.json",
+        }),
+    };
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
