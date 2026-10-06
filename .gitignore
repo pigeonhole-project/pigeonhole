@@ -1,0 +1,13 @@
+/target
+/tg3.db
+/tg3.db-*
+tg3-*.db
+.env
+*.bin
+out.bin
+*.mp4
+*.m4v
+*.mov
+*.mkv
+readme.downloaded.md
+out.md
