@@ -356,8 +356,8 @@ impl Index {
         Ok(())
     }
 
-    /// Backfill empty `chat_id` on buckets/blobs with the legacy single-chat id
-    /// (former CHAT_ID, now SERVICE_CHAT_ID). Safe to call on every startup.
+    /// Backfill empty `chat_id` on buckets/blobs with `CHAT_ID`.
+    /// Safe to call on every startup.
     pub async fn migrate_legacy_chat_ids(&self, legacy_chat_id: &str) -> Result<u64> {
         if legacy_chat_id.is_empty() {
             return Ok(0);

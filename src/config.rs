@@ -21,16 +21,7 @@ impl Config {
         let _ = dotenvy::dotenv();
 
         let bot_token = require("BOT_TOKEN")?;
-        let chat_id = match env::var("CHAT_ID") {
-            Ok(v) if !v.is_empty() => v,
-            _ => match env::var("SERVICE_CHAT_ID") {
-                Ok(v) if !v.is_empty() => {
-                    tracing::warn!("SERVICE_CHAT_ID is deprecated; rename to CHAT_ID");
-                    v
-                }
-                _ => bail!("missing required env var CHAT_ID"),
-            },
-        };
+        let chat_id = require("CHAT_ID")?;
 
         let access_key = env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "s3gram".into());
         let secret_key = env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "s3gramsecret".into());
