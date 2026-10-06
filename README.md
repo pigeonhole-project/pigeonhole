@@ -4,11 +4,12 @@ S3-compatible HTTP gateway in Rust, backed by the Telegram Bot API.
 
 The S3 protocol surface is implemented with
 [s3s](https://github.com/s3s-project/s3s). Objects are split into configurable
-chunks (default ≤19 MiB, hard cap `< 20 MiB` for Telegram `getFile`) and stored
-as documents in **one** private Telegram chat/channel. Chunk encoding is
-configurable (`raw` | `gzip`; default `gzip` keeps gzip only when it shrinks the
-payload). The index/snapshot records the **stored** `codec` per chunk.
-Object metadata lives in a local SQLite index.
+chunks (default on-wire ≤19 MiB, hard cap `< 20 MiB` for Telegram `getFile`) and
+stored as documents in **one** private Telegram chat/channel. Chunk encoding is
+`raw` | `gzip` | `zstd` (default `zstd`): compressible data is packed until the
+**compressed** payload approaches `chunk.size`, so one message carries more
+logical bytes. The index records the stored `codec` per chunk. Object metadata
+lives in a local SQLite index.
 
 Telegram I/O goes through a `BlobStore` trait (`TelegramBlobStore` in production,
 `MemoryBlobStore` in unit tests) so tests never hit the real Bot API.
@@ -17,11 +18,18 @@ Telegram I/O goes through a `BlobStore` trait (`TelegramBlobStore` in production
 
 - Upload (`sendDocument`): 50 MiB
 - Download (`getFile`): 20 MiB → `chunk.size` must be `< 20 MiB` (default 19 MiB)
+- Sends to a chat are slow (~20/min); `getFile` is much faster. s3gram uses
+  **separate** token budgets for send / getFile / delete; CDN byte downloads are
+  only capped by a connection semaphore. Resolved `file_path` values are kept in
+  an in-memory LRU so repeated chunk reads do not call `getFile` again.
 
 ## Setup
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and get a `BOT_TOKEN`.
-2. Create a private channel or group, add the bot as **administrator**.
+2. Create a private channel or group, add the bot as **administrator** with:
+   - **Channel:** permission to **edit messages** (needed to pin).
+   - **Group / supergroup:** permission to **pin messages**.
+   - Pinning in a group also posts a Telegram service message — expected noise.
 3. Copy config + secrets:
 
 ```bash
@@ -36,7 +44,7 @@ Secrets stay in **`.env` / environment**: `BOT_TOKEN`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`.
 
 On startup s3gram calls `getMe` + `getChatMember` and exits if the bot is not
-an admin in `chat_id`.
+an admin with the pin/edit rights above.
 
 ## Run
 
@@ -59,11 +67,20 @@ See [`s3gram.toml.example`](s3gram.toml.example):
 | `region` | SigV4 region string |
 | `memory` | `true` → MemoryBlobStore (no Telegram) |
 | `[snapshot].interval_secs` | Auto snapshot period (`0` disables) |
-| `[chunk].size` | Logical chunk size in bytes (`< 20 MiB`) |
-| `[chunk].codec` | `raw` \| `gzip` |
-| `[telegram].rate_*` | Bot API token bucket + upload concurrency |
+| `[chunk].size` | Max **on-wire** chunk size (`< 20 MiB`) |
+| `[chunk].codec` | `raw` \| `gzip` \| `zstd` |
+| `[telegram].send_*` | Budget for sendDocument / sendMessage / pin |
+| `[telegram].get_file_*` | Budget for getFile |
+| `[telegram].delete_*` | Budget for deleteMessage (purge / GC) |
+| `[telegram].*_concurrency` | Upload / download connection semaphores |
 
-## Tests
+Legacy `[telegram].rate_per_sec` / `rate_burst` map to `send_*`.
+
+## Tests / CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs `cargo test` plus the four
+MemoryBlobStore client suites: `compat-memory` (ceph/s3-tests known-good),
+`compat-s3s-boto3`, `compat-s3s-e2e`, and `compat-rclone`.
 
 ```bash
 # unit + in-process S3 API tests (MemoryBlobStore, no Telegram)
@@ -74,7 +91,7 @@ cargo test
 make smoke
 
 # ceph/s3-tests against a temporary MemoryBlobStore server (no Telegram)
-make compat-memory           # curated known-good
+make compat-memory           # curated known-good (compat/known-good.txt)
 ./scripts/compat-memory.sh --all
 
 # s3s upstream tests/boto3 (presigned POST, Content-Length edge cases)
@@ -93,7 +110,9 @@ make compat-telegram
 # make compat-telegram ARGS=--all
 
 # Wipe Telegram messages tracked by the local index (server must be stopped)
-cargo run --release -- purge
+cargo run --release -- purge --yes
+# safer: also confirm chat / planned delete count
+# cargo run --release -- purge --yes --expect-chat "$CHAT_ID" --expect-messages N
 ```
 
 Point the AWS CLI at the gateway:
@@ -118,18 +137,20 @@ s3gram periodically exports the SQLite index as gzip Telegram document(s) in
 is the bootstrap pointer (no need to remember `file_id`s after disk loss).
 
 Flow on change: upload parts → send manifest → pin new → unpin/delete old.
-Uploads happen only when the index hash changes. The bot needs admin **pin**
-rights in `chat_id`. Interval: `[snapshot].interval_secs` (default 300; `0` disables).
+Uploads happen only when the index hash changes. Interval:
+`[snapshot].interval_secs` (default 300; `0` disables).
 
 Restore on a stopped server / clean machine (`BOT_TOKEN` in `.env` + `chat_id` in TOML):
 
 ```bash
-# stop s3gram first
+# stop s3gram first; refuses a non-empty index unless --force
 cargo run --release -- restore
-# optional legacy: cargo run --release -- restore <file_id>
+# cargo run --release -- restore --force
+# optional legacy: cargo run --release -- restore [--force] <file_id>
 ```
 
-You can also copy the local `s3gram.db` file.
+After a pin restore, meta records the current generation so the next snapshot can
+unpin/delete the previous parts. You can also copy the local `s3gram.db` file.
 
 ## Supported S3 ops (subset)
 
@@ -149,7 +170,8 @@ You can also copy the local `s3gram.db` file.
 | Zero-byte objects (no Telegram upload) | yes |
 | Blob refcount in SQLite | yes |
 | `memory = true` (in-memory BlobStore, no Telegram) | yes |
-| Shared Telegram rate limit (token bucket + upload semaphore) | yes |
+| Separate send / getFile / delete budgets + upload/download semaphores | yes |
+| In-memory LRU cache for Telegram `file_path` | yes |
 | Presigned URLs / ACL / bucket versioning | later |
 
 ## Notes

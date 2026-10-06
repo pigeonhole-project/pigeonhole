@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  AWS_ACCESS_KEY_ID: s3gram
+  AWS_SECRET_ACCESS_KEY: s3gramsecret
+  AWS_DEFAULT_REGION: us-east-1
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  compat-memory:
+    name: compat-memory (ceph known-good)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tox
+        run: pip install tox
+      - name: Run curated s3-tests (MemoryBlobStore)
+        run: ./scripts/compat-memory.sh
+
+  compat-s3s-boto3:
+    name: compat-s3s-boto3
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run s3s upstream boto3 suite (MemoryBlobStore)
+        run: ./scripts/compat-s3s-boto3.sh
+
+  compat-s3s-e2e:
+    name: compat-s3s-e2e
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run s3s-e2e suite (MemoryBlobStore)
+        run: ./scripts/compat-s3s-e2e.sh
+
+  compat-rclone:
+    name: compat-rclone
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+      - name: Run s3s rclone e2e (MemoryBlobStore)
+        run: ./scripts/compat-rclone.sh
