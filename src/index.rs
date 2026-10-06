@@ -132,6 +132,13 @@ impl Index {
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(&self.pool)
             .await?;
+        // WAL lets readers (snapshot export) proceed while writers run.
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout = 5000")
+            .execute(&self.pool)
+            .await?;
 
         sqlx::query(
             r#"
@@ -297,12 +304,33 @@ impl Index {
                 chat_id TEXT NOT NULL,
                 message_id INTEGER NOT NULL,
                 queued_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
                 PRIMARY KEY (chat_id, message_id)
             );
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        if !self
+            .column_exists("pending_tg_deletes", "attempts")
+            .await?
+        {
+            sqlx::query(
+                "ALTER TABLE pending_tg_deletes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
+        if !self
+            .column_exists("pending_tg_deletes", "last_error")
+            .await?
+        {
+            sqlx::query("ALTER TABLE pending_tg_deletes ADD COLUMN last_error TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
 
         // Backfill blobs from existing chunk references (idempotent for empty blobs table).
         let (blob_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs")
@@ -326,6 +354,27 @@ impl Index {
         }
 
         Ok(())
+    }
+
+    /// Backfill empty `chat_id` on buckets/blobs with the legacy single-chat id
+    /// (former CHAT_ID, now SERVICE_CHAT_ID). Safe to call on every startup.
+    pub async fn migrate_legacy_chat_ids(&self, legacy_chat_id: &str) -> Result<u64> {
+        if legacy_chat_id.is_empty() {
+            return Ok(0);
+        }
+        let r1 = sqlx::query(
+            "UPDATE buckets SET chat_id = ? WHERE chat_id IS NULL OR chat_id = ''",
+        )
+        .bind(legacy_chat_id)
+        .execute(&self.pool)
+        .await?;
+        let r2 = sqlx::query(
+            "UPDATE blobs SET chat_id = ? WHERE chat_id IS NULL OR chat_id = ''",
+        )
+        .bind(legacy_chat_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r1.rows_affected() + r2.rows_affected())
     }
 
     /// Ensure the reserved service bucket exists and maps to the service Telegram chat.
@@ -648,7 +697,7 @@ impl Index {
         Ok((dst, orphans))
     }
 
-    /// List objects with byte-range prefix match (case-sensitive) and S3-correct
+    /// List objects with prefix range scan (case-sensitive) and S3-correct
     /// delimiter pagination. Returns (objects, common_prefixes, truncated, next_token).
     pub async fn list_objects(
         &self,
@@ -659,14 +708,18 @@ impl Index {
         start_after: Option<&str>,
     ) -> Result<(Vec<ObjectMeta>, Vec<String>, bool, Option<String>)> {
         let max_keys = max_keys.clamp(1, 1000) as usize;
-        let prefix_len = prefix.chars().count() as i64;
+        let range_end = exclusive_prefix_end(prefix);
 
         if let Some(delim) = delimiter {
-            // Common-prefix tokens (e.g. "a_b/") must exclude the whole group, not just
-            // `key > token` — keys like `a_b/x` still regroup into `a_b/`. Fetch in
-            // batches and filter grouped sort keys strictly after the token.
             let batch = (max_keys * 32).max(64).min(10_000) as i64;
-            let mut cursor = start_after.map(|s| s.to_string());
+            // After an object key: key > cursor. After a common prefix: key >= succ(cp).
+            let mut cursor: Option<(bool /*inclusive*/, String)> = match start_after {
+                Some(after) if after.ends_with(delim) => {
+                    exclusive_prefix_end(after).map(|e| (true, e))
+                }
+                Some(after) => Some((false, after.to_string())),
+                None => None,
+            };
             let mut collected: Vec<(String, DelimEntry)> = Vec::new();
             let mut exhausted = false;
 
@@ -676,20 +729,33 @@ impl Index {
                     SELECT bucket, key, etag, size, content_type, mtime
                     FROM objects
                     WHERE bucket = ?
-                      AND substr(key, 1, ?) = ? COLLATE BINARY
                     "#,
                 );
-                if cursor.is_some() {
-                    q.push_str(" AND key > ? COLLATE BINARY");
+                let mut binds: Vec<String> = Vec::new();
+                if !prefix.is_empty() {
+                    q.push_str(" AND key >= ? COLLATE BINARY");
+                    binds.push(prefix.to_string());
+                }
+                if let Some(ref hi) = range_end {
+                    q.push_str(" AND key < ? COLLATE BINARY");
+                    binds.push(hi.clone());
+                }
+                match &cursor {
+                    Some((true, c)) => {
+                        q.push_str(" AND key >= ? COLLATE BINARY");
+                        binds.push(c.clone());
+                    }
+                    Some((false, c)) => {
+                        q.push_str(" AND key > ? COLLATE BINARY");
+                        binds.push(c.clone());
+                    }
+                    None => {}
                 }
                 q.push_str(" ORDER BY key COLLATE BINARY LIMIT ?");
 
-                let mut query = sqlx::query_as::<_, ObjectMeta>(&q)
-                    .bind(bucket)
-                    .bind(prefix_len)
-                    .bind(prefix);
-                if let Some(ref after) = cursor {
-                    query = query.bind(after);
+                let mut query = sqlx::query_as::<_, ObjectMeta>(&q).bind(bucket);
+                for b in &binds {
+                    query = query.bind(b);
                 }
                 query = query.bind(batch);
 
@@ -697,31 +763,38 @@ impl Index {
                 if (objs.len() as i64) < batch {
                     exhausted = true;
                 }
-                let last_raw_key = objs.last().map(|o| o.key.clone());
 
                 let batch_entries = group_delimiter_entries(prefix, delim, objs);
+                let mut advanced = false;
                 for e in batch_entries {
                     if let Some(after) = start_after {
                         if e.0.as_str() <= after {
                             continue;
                         }
                     }
-                    // Dedup common prefixes across fetch batches
                     if collected.last().map(|(k, _)| k) == Some(&e.0) {
                         continue;
                     }
+                    let is_prefix = matches!(e.1, DelimEntry::Prefix(_));
+                    let sort_key = e.0.clone();
                     collected.push(e);
+                    advanced = true;
+                    if is_prefix {
+                        if let Some(end) = exclusive_prefix_end(&sort_key) {
+                            cursor = Some((true, end));
+                        } else {
+                            cursor = Some((false, sort_key));
+                        }
+                    } else {
+                        cursor = Some((false, sort_key));
+                    }
                     if collected.len() > max_keys {
                         break;
                     }
                 }
 
-                if collected.len() > max_keys || exhausted {
+                if collected.len() > max_keys || exhausted || !advanced {
                     break;
-                }
-                match last_raw_key {
-                    Some(k) => cursor = Some(k),
-                    None => break,
                 }
             }
 
@@ -749,18 +822,27 @@ impl Index {
             SELECT bucket, key, etag, size, content_type, mtime
             FROM objects
             WHERE bucket = ?
-              AND substr(key, 1, ?) = ? COLLATE BINARY
             "#,
         );
+        // Prefix as range so SQLite can use an index on (bucket, key) / key.
+        if !prefix.is_empty() {
+            q.push_str(" AND key >= ? COLLATE BINARY");
+        }
+        if range_end.is_some() {
+            q.push_str(" AND key < ? COLLATE BINARY");
+        }
         if start_after.is_some() {
             q.push_str(" AND key > ? COLLATE BINARY");
         }
         q.push_str(" ORDER BY key COLLATE BINARY LIMIT ?");
 
-        let mut query = sqlx::query_as::<_, ObjectMeta>(&q)
-            .bind(bucket)
-            .bind(prefix_len)
-            .bind(prefix);
+        let mut query = sqlx::query_as::<_, ObjectMeta>(&q).bind(bucket);
+        if !prefix.is_empty() {
+            query = query.bind(prefix);
+        }
+        if let Some(ref hi) = range_end {
+            query = query.bind(hi);
+        }
         if let Some(after) = start_after {
             query = query.bind(after);
         }
@@ -802,8 +884,8 @@ impl Index {
         let queued_at = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
-            INSERT INTO pending_tg_deletes (chat_id, message_id, queued_at)
-            VALUES (?, ?, ?)
+            INSERT INTO pending_tg_deletes (chat_id, message_id, queued_at, attempts, last_error)
+            VALUES (?, ?, ?, 0, NULL)
             ON CONFLICT(chat_id, message_id) DO NOTHING
             "#,
         )
@@ -815,14 +897,47 @@ impl Index {
         Ok(())
     }
 
-    pub async fn list_pending_tg_deletes(&self, limit: i64) -> Result<Vec<(String, i64)>> {
+    /// Prefer entries with fewer attempts so permanent failures cannot block the queue.
+    pub async fn list_pending_tg_deletes(
+        &self,
+        limit: i64,
+        max_attempts: i64,
+    ) -> Result<Vec<(String, i64, i64)>> {
         sqlx::query_as(
-            "SELECT chat_id, message_id FROM pending_tg_deletes ORDER BY queued_at LIMIT ?",
+            r#"
+            SELECT chat_id, message_id, attempts
+            FROM pending_tg_deletes
+            WHERE attempts < ?
+            ORDER BY attempts ASC, queued_at ASC
+            LIMIT ?
+            "#,
         )
+        .bind(max_attempts)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    pub async fn bump_pending_tg_delete(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        error: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE pending_tg_deletes
+            SET attempts = attempts + 1, last_error = ?
+            WHERE chat_id = ? AND message_id = ?
+            "#,
+        )
+        .bind(error)
+        .bind(chat_id)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn clear_pending_tg_delete(&self, chat_id: &str, message_id: i64) -> Result<()> {
@@ -834,6 +949,15 @@ impl Index {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Drop permanently failed deletes so they stop occupying the queue.
+    pub async fn drop_exhausted_pending_tg_deletes(&self, max_attempts: i64) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM pending_tg_deletes WHERE attempts >= ?")
+            .bind(max_attempts)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
     }
 
     pub async fn export_snapshot(&self) -> Result<IndexSnapshot> {
@@ -1339,6 +1463,22 @@ async fn release_blob(
 enum DelimEntry {
     Object(ObjectMeta),
     Prefix(String),
+}
+
+/// Smallest string strictly greater than all keys with the given prefix (byte successor).
+fn exclusive_prefix_end(prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(b) = bytes.last_mut() {
+        if *b != 0xff {
+            *b += 1;
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.pop();
+    }
+    None
 }
 
 /// Group object keys into interleaved (sort_key, key|common-prefix) entries.
