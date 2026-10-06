@@ -42,11 +42,16 @@ Listens on `http://0.0.0.0:8333` by default.
 ## Tests
 
 ```bash
-# unit tests (in-memory BlobStore, no Telegram)
+# unit + in-process S3 API tests (MemoryBlobStore, no Telegram)
 cargo test
+# or: make test
 
 # smoke against a running server
 make smoke
+
+# ceph/s3-tests against a temporary MemoryBlobStore server (no Telegram)
+make compat-memory           # curated known-good
+./scripts/compat-memory.sh --all
 ```
 
 Point the AWS CLI at the gateway:
@@ -68,8 +73,9 @@ Authentication is AWS SigV4 via s3s `SimpleAuth` (keys from `AWS_ACCESS_KEY_ID` 
 
 s3gram periodically exports the SQLite index as a gzip Telegram document in
 `CHAT_ID`. Oversized snapshots are split into parts plus a small **manifest**;
-restore with `{"file_id": "<manifest_or_single>"}`. Uploads happen only when the
-index hash changes; previous snapshot messages are deleted.
+the restore handle is the single gzip `file_id` or the manifest `file_id`.
+Uploads happen only when the index hash changes; previous snapshot messages are
+deleted.
 
 Interval (default 300s; `0` disables):
 
@@ -77,23 +83,34 @@ Interval (default 300s; `0` disables):
 SNAPSHOT_INTERVAL_SECS=300
 ```
 
-Periodic export runs in the background; you can also copy the local `s3gram.db`
-file. (Manual HTTP export/import endpoints are not wired yet after the s3s
-migration.)
+Restore on a stopped server / clean machine:
+
+```bash
+# stop s3gram first
+cargo run --release -- restore <file_id>
+```
+
+You can also copy the local `s3gram.db` file.
 
 ## Supported S3 ops (subset)
 
 | Operation | Status |
 |---|---|
-| CreateBucket / ListBuckets / DeleteBucket | yes |
-| PutObject / GetObject / HeadObject / DeleteObject | yes |
-| ListObjectsV2 | yes |
-| Multipart Upload (Create / UploadPart / Complete / Abort) | yes |
-| GetObject Range | yes |
+| CreateBucket / ListBuckets / DeleteBucket / HeadBucket | yes |
+| GetBucketLocation | yes |
+| PutObject / GetObject / HeadObject / DeleteObject / DeleteObjects | yes |
+| ListObjects (v1) / ListObjectsV2 | yes |
+| ListObjectVersions (non-versioned stub, `VersionId=null`) | yes |
+| Multipart (Create / UploadPart / UploadPartCopy / Complete / Abort / ListParts / ListMultipartUploads) | yes |
+| GetObject Range (streaming) | yes |
 | CopyObject (shallow — reuses Telegram file_ids) | yes |
+| Object tagging (Put/Get/Delete + header on Put/CreateMultipart) | yes |
+| Content-MD5 (`InvalidDigest` / `BadDigest`) / CRC32 on Put/UploadPart | yes |
 | User metadata (`x-amz-meta-*`) | yes |
+| Zero-byte objects (no Telegram upload) | yes |
 | Blob refcount in SQLite | yes |
-| Presigned URLs | later |
+| `S3GRAM_MEMORY=1` (in-memory BlobStore, no Telegram) | yes |
+| Presigned URLs / ACL / bucket versioning | later |
 
 ## License
 

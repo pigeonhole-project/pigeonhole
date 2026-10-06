@@ -1,4 +1,4 @@
-.PHONY: run smoke compat compat-all test
+.PHONY: run smoke compat compat-all compat-memory test test-all
 
 run:
 	cargo run --release
@@ -14,4 +14,11 @@ compat:
 compat-all:
 	./scripts/compat.sh --all
 
-test: smoke
+# Full s3-tests against MemoryBlobStore (no Telegram). Starts a temp server.
+compat-memory:
+	./scripts/compat-memory.sh
+
+test:
+	cargo test
+
+test-all: test smoke
