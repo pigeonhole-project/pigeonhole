@@ -12,6 +12,8 @@ pub struct Index {
 pub struct Bucket {
     pub name: String,
     pub created_at: String,
+    #[serde(default)]
+    pub chat_id: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -40,7 +42,12 @@ pub struct Blob {
     pub message_id: i64,
     pub size: i64,
     pub refcount: i64,
+    #[serde(default)]
+    pub chat_id: String,
 }
+
+/// Telegram message that became unreferenced and should be deleted: (chat_id, message_id).
+pub type OrphanMsg = (String, i64);
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct UserMeta {
@@ -56,6 +63,7 @@ pub struct MultipartUpload {
     pub bucket: String,
     pub key: String,
     pub content_type: Option<String>,
+    pub user_meta_json: String,
     pub initiated_at: String,
 }
 
@@ -110,6 +118,16 @@ impl Index {
         Ok(idx)
     }
 
+    async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let (n,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?"
+        ))
+        .bind(column)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n > 0)
+    }
+
     async fn migrate(&self) -> Result<()> {
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(&self.pool)
@@ -119,12 +137,19 @@ impl Index {
             r#"
             CREATE TABLE IF NOT EXISTS buckets (
                 name TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                chat_id TEXT NOT NULL DEFAULT ''
             );
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        if !self.column_exists("buckets", "chat_id").await? {
+            sqlx::query("ALTER TABLE buckets ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await?;
+        }
 
         sqlx::query(
             r#"
@@ -167,6 +192,7 @@ impl Index {
                 bucket TEXT NOT NULL,
                 key TEXT NOT NULL,
                 content_type TEXT,
+                user_meta_json TEXT NOT NULL DEFAULT '[]',
                 initiated_at TEXT NOT NULL,
                 FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
             );
@@ -174,6 +200,17 @@ impl Index {
         )
         .execute(&self.pool)
         .await?;
+
+        if !self
+            .column_exists("multipart_uploads", "user_meta_json")
+            .await?
+        {
+            sqlx::query(
+                "ALTER TABLE multipart_uploads ADD COLUMN user_meta_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
 
         sqlx::query(
             r#"
@@ -214,12 +251,19 @@ impl Index {
                 file_id TEXT PRIMARY KEY,
                 message_id INTEGER NOT NULL,
                 size INTEGER NOT NULL,
-                refcount INTEGER NOT NULL
+                refcount INTEGER NOT NULL,
+                chat_id TEXT NOT NULL DEFAULT ''
             );
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        if !self.column_exists("blobs", "chat_id").await? {
+            sqlx::query("ALTER TABLE blobs ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await?;
+        }
 
         sqlx::query(
             r#"
@@ -247,6 +291,19 @@ impl Index {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_tg_deletes (
+                chat_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                queued_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Backfill blobs from existing chunk references (idempotent for empty blobs table).
         let (blob_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs")
             .fetch_one(&self.pool)
@@ -254,8 +311,8 @@ impl Index {
         if blob_count == 0 {
             sqlx::query(
                 r#"
-                INSERT INTO blobs (file_id, message_id, size, refcount)
-                SELECT file_id, MIN(message_id), MAX(size), COUNT(*)
+                INSERT INTO blobs (file_id, message_id, size, refcount, chat_id)
+                SELECT file_id, MIN(message_id), MAX(size), COUNT(*), ''
                 FROM (
                     SELECT file_id, message_id, size FROM chunks
                     UNION ALL
@@ -271,14 +328,68 @@ impl Index {
         Ok(())
     }
 
-    pub async fn create_bucket(&self, name: &str) -> Result<bool> {
+    /// Ensure the reserved service bucket exists and maps to the service Telegram chat.
+    pub async fn ensure_service_bucket(&self, name: &str, chat_id: &str) -> Result<()> {
         let created_at = Utc::now().to_rfc3339();
-        let res = sqlx::query("INSERT OR IGNORE INTO buckets (name, created_at) VALUES (?, ?)")
-            .bind(name)
-            .bind(created_at)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO buckets (name, created_at, chat_id) VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET chat_id = excluded.chat_id
+            "#,
+        )
+        .bind(name)
+        .bind(&created_at)
+        .bind(chat_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn create_bucket(&self, name: &str, chat_id: &str) -> Result<bool> {
+        let created_at = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO buckets (name, created_at, chat_id) VALUES (?, ?, ?)",
+        )
+        .bind(name)
+        .bind(created_at)
+        .bind(chat_id)
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn upsert_bucket(&self, name: &str, chat_id: &str) -> Result<()> {
+        let created_at = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO buckets (name, created_at, chat_id) VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET chat_id = excluded.chat_id
+            "#,
+        )
+        .bind(name)
+        .bind(created_at)
+        .bind(chat_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn bucket_chat_id(&self, name: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT chat_id FROM buckets WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn bucket_using_chat(&self, chat_id: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM buckets WHERE chat_id = ? LIMIT 1")
+                .bind(chat_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
     }
 
     pub async fn delete_bucket(&self, name: &str) -> Result<DeleteBucketResult> {
@@ -304,7 +415,7 @@ impl Index {
 
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>> {
         let rows = sqlx::query_as::<_, Bucket>(
-            "SELECT name, created_at FROM buckets ORDER BY name",
+            "SELECT name, created_at, chat_id FROM buckets ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -327,8 +438,9 @@ impl Index {
         size: i64,
         content_type: Option<&str>,
         chunks: &[(i64, String, i64, i64)],
+        chat_id: &str,
         user_meta: &[(String, String)],
-    ) -> Result<Vec<i64>> {
+    ) -> Result<Vec<OrphanMsg>> {
         let mut tx = self.pool.begin().await?;
         let mut orphans = Vec::new();
 
@@ -341,8 +453,8 @@ impl Index {
         .await?;
 
         for c in &old_chunks {
-            if let Some(msg) = release_blob(&mut tx, &c.file_id).await? {
-                orphans.push(msg);
+            if let Some(o) = release_blob(&mut tx, &c.file_id).await? {
+                orphans.push(o);
             }
         }
 
@@ -380,7 +492,7 @@ impl Index {
         .await?;
 
         for (part_no, file_id, message_id, chunk_size) in chunks {
-            bump_blob(&mut tx, file_id, *message_id, *chunk_size).await?;
+            bump_blob(&mut tx, file_id, *message_id, *chunk_size, chat_id).await?;
             sqlx::query(
                 r#"
                 INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size)
@@ -450,7 +562,7 @@ impl Index {
         Ok(rows)
     }
 
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<i64>>> {
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<OrphanMsg>>> {
         let mut tx = self.pool.begin().await?;
         let chunks = sqlx::query_as::<_, Chunk>(
             "SELECT bucket, key, part_no, file_id, message_id, size FROM chunks WHERE bucket = ? AND key = ?",
@@ -474,8 +586,8 @@ impl Index {
         // chunks/metadata cascade-deleted; release blob refs
         let mut orphans = Vec::new();
         for c in chunks {
-            if let Some(msg) = release_blob(&mut tx, &c.file_id).await? {
-                orphans.push(msg);
+            if let Some(o) = release_blob(&mut tx, &c.file_id).await? {
+                orphans.push(o);
             }
         }
         tx.commit().await?;
@@ -492,12 +604,16 @@ impl Index {
         content_type: Option<&str>,
         user_meta: &[(String, String)],
         copy_source_meta: bool,
-    ) -> Result<(ObjectMeta, Vec<i64>)> {
+    ) -> Result<(ObjectMeta, Vec<OrphanMsg>)> {
         let src = self
             .get_object(src_bucket, src_key)
             .await?
             .ok_or_else(|| anyhow::anyhow!("source object not found"))?;
         let src_chunks = self.get_chunks(src_bucket, src_key).await?;
+        let src_chat = self
+            .bucket_chat_id(src_bucket)
+            .await?
+            .unwrap_or_default();
 
         let ct = content_type.or(src.content_type.as_deref());
         let chunk_tuples: Vec<(i64, String, i64, i64)> = src_chunks
@@ -511,6 +627,7 @@ impl Index {
             user_meta.to_vec()
         };
 
+        // Shallow copy keeps blobs in the source chat (refcount++).
         let orphans = self
             .put_object(
                 dst_bucket,
@@ -519,6 +636,7 @@ impl Index {
                 src.size,
                 ct,
                 &chunk_tuples,
+                &src_chat,
                 &meta,
             )
             .await?;
@@ -530,6 +648,8 @@ impl Index {
         Ok((dst, orphans))
     }
 
+    /// List objects with byte-range prefix match (case-sensitive) and S3-correct
+    /// delimiter pagination. Returns (objects, common_prefixes, truncated, next_token).
     pub async fn list_objects(
         &self,
         bucket: &str,
@@ -537,52 +657,126 @@ impl Index {
         delimiter: Option<&str>,
         max_keys: i64,
         start_after: Option<&str>,
-    ) -> Result<(Vec<ObjectMeta>, Vec<String>, bool)> {
-        let mut objs = sqlx::query_as::<_, ObjectMeta>(
-            r#"
-            SELECT bucket, key, etag, size, content_type, mtime
-            FROM objects
-            WHERE bucket = ? AND key LIKE ?
-            ORDER BY key
-            "#,
-        )
-        .bind(bucket)
-        .bind(format!("{prefix}%"))
-        .fetch_all(&self.pool)
-        .await?;
-
-        if let Some(after) = start_after {
-            objs.retain(|o| o.key.as_str() > after);
-        }
+    ) -> Result<(Vec<ObjectMeta>, Vec<String>, bool, Option<String>)> {
+        let max_keys = max_keys.clamp(1, 1000) as usize;
+        let prefix_len = prefix.chars().count() as i64;
 
         if let Some(delim) = delimiter {
-            let mut keys = Vec::new();
-            let mut common = Vec::new();
-            let mut seen_prefixes = std::collections::BTreeSet::new();
+            // Common-prefix tokens (e.g. "a_b/") must exclude the whole group, not just
+            // `key > token` — keys like `a_b/x` still regroup into `a_b/`. Fetch in
+            // batches and filter grouped sort keys strictly after the token.
+            let batch = (max_keys * 32).max(64).min(10_000) as i64;
+            let mut cursor = start_after.map(|s| s.to_string());
+            let mut collected: Vec<(String, DelimEntry)> = Vec::new();
+            let mut exhausted = false;
 
-            for obj in objs {
-                let rest = &obj.key[prefix.len()..];
-                if let Some(idx) = rest.find(delim) {
-                    let cp = format!("{prefix}{}", &rest[..=idx]);
-                    if seen_prefixes.insert(cp.clone()) {
-                        common.push(cp);
+            loop {
+                let mut q = String::from(
+                    r#"
+                    SELECT bucket, key, etag, size, content_type, mtime
+                    FROM objects
+                    WHERE bucket = ?
+                      AND substr(key, 1, ?) = ? COLLATE BINARY
+                    "#,
+                );
+                if cursor.is_some() {
+                    q.push_str(" AND key > ? COLLATE BINARY");
+                }
+                q.push_str(" ORDER BY key COLLATE BINARY LIMIT ?");
+
+                let mut query = sqlx::query_as::<_, ObjectMeta>(&q)
+                    .bind(bucket)
+                    .bind(prefix_len)
+                    .bind(prefix);
+                if let Some(ref after) = cursor {
+                    query = query.bind(after);
+                }
+                query = query.bind(batch);
+
+                let objs = query.fetch_all(&self.pool).await?;
+                if (objs.len() as i64) < batch {
+                    exhausted = true;
+                }
+                let last_raw_key = objs.last().map(|o| o.key.clone());
+
+                let batch_entries = group_delimiter_entries(prefix, delim, objs);
+                for e in batch_entries {
+                    if let Some(after) = start_after {
+                        if e.0.as_str() <= after {
+                            continue;
+                        }
                     }
-                } else {
-                    keys.push(obj);
+                    // Dedup common prefixes across fetch batches
+                    if collected.last().map(|(k, _)| k) == Some(&e.0) {
+                        continue;
+                    }
+                    collected.push(e);
+                    if collected.len() > max_keys {
+                        break;
+                    }
+                }
+
+                if collected.len() > max_keys || exhausted {
+                    break;
+                }
+                match last_raw_key {
+                    Some(k) => cursor = Some(k),
+                    None => break,
                 }
             }
 
-            let truncated = (keys.len() + common.len()) as i64 > max_keys;
-            keys.truncate(max_keys as usize);
-            // Prefer keys first then common prefixes within max_keys budget
-            let remaining = max_keys as usize - keys.len();
-            common.truncate(remaining);
-            return Ok((keys, common, truncated));
+            let truncated = collected.len() > max_keys;
+            collected.truncate(max_keys);
+            let next = if truncated {
+                collected.last().map(|(k, _)| k.clone())
+            } else {
+                None
+            };
+            let mut objects = Vec::new();
+            let mut common = Vec::new();
+            for (_, e) in collected {
+                match e {
+                    DelimEntry::Object(o) => objects.push(o),
+                    DelimEntry::Prefix(p) => common.push(p),
+                }
+            }
+            return Ok((objects, common, truncated, next));
         }
 
-        let truncated = objs.len() as i64 > max_keys;
-        objs.truncate(max_keys as usize);
-        Ok((objs, Vec::new(), truncated))
+        let fetch_limit = (max_keys + 1) as i64;
+        let mut q = String::from(
+            r#"
+            SELECT bucket, key, etag, size, content_type, mtime
+            FROM objects
+            WHERE bucket = ?
+              AND substr(key, 1, ?) = ? COLLATE BINARY
+            "#,
+        );
+        if start_after.is_some() {
+            q.push_str(" AND key > ? COLLATE BINARY");
+        }
+        q.push_str(" ORDER BY key COLLATE BINARY LIMIT ?");
+
+        let mut query = sqlx::query_as::<_, ObjectMeta>(&q)
+            .bind(bucket)
+            .bind(prefix_len)
+            .bind(prefix);
+        if let Some(after) = start_after {
+            query = query.bind(after);
+        }
+        query = query.bind(fetch_limit);
+
+        let objs = query.fetch_all(&self.pool).await?;
+
+        let truncated = objs.len() > max_keys;
+        let mut objs = objs;
+        objs.truncate(max_keys);
+        let next = if truncated {
+            objs.last().map(|o| o.key.clone())
+        } else {
+            None
+        };
+        Ok((objs, Vec::new(), truncated, next))
     }
 
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -604,28 +798,72 @@ impl Index {
         Ok(())
     }
 
+    pub async fn queue_tg_delete(&self, chat_id: &str, message_id: i64) -> Result<()> {
+        let queued_at = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO pending_tg_deletes (chat_id, message_id, queued_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id, message_id) DO NOTHING
+            "#,
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(queued_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_pending_tg_deletes(&self, limit: i64) -> Result<Vec<(String, i64)>> {
+        sqlx::query_as(
+            "SELECT chat_id, message_id FROM pending_tg_deletes ORDER BY queued_at LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn clear_pending_tg_delete(&self, chat_id: &str, message_id: i64) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM pending_tg_deletes WHERE chat_id = ? AND message_id = ?",
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn export_snapshot(&self) -> Result<IndexSnapshot> {
-        let buckets = self.list_buckets().await?;
+        let mut tx = self.pool.begin().await?;
+        let buckets = sqlx::query_as::<_, Bucket>(
+            "SELECT name, created_at, chat_id FROM buckets ORDER BY name",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         let objects = sqlx::query_as::<_, ObjectMeta>(
             "SELECT bucket, key, etag, size, content_type, mtime FROM objects ORDER BY bucket, key",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let chunks = sqlx::query_as::<_, Chunk>(
             "SELECT bucket, key, part_no, file_id, message_id, size FROM chunks ORDER BY bucket, key, part_no",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let blobs = sqlx::query_as::<_, Blob>(
-            "SELECT file_id, message_id, size, refcount FROM blobs ORDER BY file_id",
+            "SELECT file_id, message_id, size, refcount, chat_id FROM blobs ORDER BY file_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let metadata = sqlx::query_as::<_, UserMeta>(
             "SELECT bucket, key, name, value FROM object_metadata ORDER BY bucket, key, name",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(IndexSnapshot {
             buckets,
             objects,
@@ -655,9 +893,10 @@ impl Index {
         sqlx::query("DELETE FROM buckets").execute(&mut *tx).await?;
 
         for b in &snap.buckets {
-            sqlx::query("INSERT INTO buckets (name, created_at) VALUES (?, ?)")
+            sqlx::query("INSERT INTO buckets (name, created_at, chat_id) VALUES (?, ?, ?)")
                 .bind(&b.name)
                 .bind(&b.created_at)
+                .bind(&b.chat_id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -701,8 +940,8 @@ impl Index {
         if snap.blobs.is_empty() {
             sqlx::query(
                 r#"
-                INSERT INTO blobs (file_id, message_id, size, refcount)
-                SELECT file_id, MIN(message_id), MAX(size), COUNT(*)
+                INSERT INTO blobs (file_id, message_id, size, refcount, chat_id)
+                SELECT file_id, MIN(message_id), MAX(size), COUNT(*), ''
                 FROM chunks
                 GROUP BY file_id
                 "#,
@@ -712,12 +951,13 @@ impl Index {
         } else {
             for b in &snap.blobs {
                 sqlx::query(
-                    "INSERT INTO blobs (file_id, message_id, size, refcount) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO blobs (file_id, message_id, size, refcount, chat_id) VALUES (?, ?, ?, ?, ?)",
                 )
                 .bind(&b.file_id)
                 .bind(b.message_id)
                 .bind(b.size)
                 .bind(b.refcount)
+                .bind(&b.chat_id)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -732,18 +972,22 @@ impl Index {
         bucket: &str,
         key: &str,
         content_type: Option<&str>,
+        user_meta: &[(String, String)],
     ) -> Result<()> {
         let initiated_at = Utc::now().to_rfc3339();
+        let user_meta_json = serde_json::to_string(user_meta)?;
         sqlx::query(
             r#"
-            INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, initiated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO multipart_uploads
+                (upload_id, bucket, key, content_type, user_meta_json, initiated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(upload_id)
         .bind(bucket)
         .bind(key)
         .bind(content_type)
+        .bind(user_meta_json)
         .bind(initiated_at)
         .execute(&self.pool)
         .await?;
@@ -752,7 +996,7 @@ impl Index {
 
     pub async fn get_multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUpload>> {
         let row = sqlx::query_as::<_, MultipartUpload>(
-            "SELECT upload_id, bucket, key, content_type, initiated_at FROM multipart_uploads WHERE upload_id = ?",
+            "SELECT upload_id, bucket, key, content_type, user_meta_json, initiated_at FROM multipart_uploads WHERE upload_id = ?",
         )
         .bind(upload_id)
         .fetch_optional(&self.pool)
@@ -767,7 +1011,8 @@ impl Index {
         etag: &str,
         size: i64,
         chunks: &[(i64, String, i64, i64)],
-    ) -> Result<Vec<i64>> {
+        chat_id: &str,
+    ) -> Result<Vec<OrphanMsg>> {
         let mut tx = self.pool.begin().await?;
         let mut orphans = Vec::new();
 
@@ -784,8 +1029,8 @@ impl Index {
         .await?;
 
         for c in &old {
-            if let Some(msg) = release_blob(&mut tx, &c.file_id).await? {
-                orphans.push(msg);
+            if let Some(o) = release_blob(&mut tx, &c.file_id).await? {
+                orphans.push(o);
             }
         }
 
@@ -812,7 +1057,7 @@ impl Index {
         .await?;
 
         for (chunk_no, file_id, message_id, chunk_size) in chunks {
-            bump_blob(&mut tx, file_id, *message_id, *chunk_size).await?;
+            bump_blob(&mut tx, file_id, *message_id, *chunk_size, chat_id).await?;
             sqlx::query(
                 r#"
                 INSERT INTO multipart_part_chunks
@@ -869,19 +1114,39 @@ impl Index {
         Ok(rows)
     }
 
-    /// Finalize multipart: object takes ownership of part blobs (refcount net-zero transfer).
+    /// Finalize multipart atomically: object ownership + release part refs + delete upload.
     pub async fn complete_multipart_upload(
         &self,
         upload: &MultipartUpload,
         part_numbers: &[i64],
         etag: &str,
         total_size: i64,
-    ) -> Result<Vec<i64>> {
+    ) -> Result<Vec<OrphanMsg>> {
+        let chat_id = self
+            .bucket_chat_id(&upload.bucket)
+            .await?
+            .unwrap_or_default();
+        let user_meta: Vec<(String, String)> =
+            serde_json::from_str(&upload.user_meta_json).unwrap_or_default();
+
+        let mut tx = self.pool.begin().await?;
         let mut assembled: Vec<(i64, String, i64, i64)> = Vec::new();
         let mut part_chunks: Vec<MultipartPartChunk> = Vec::new();
         let mut part_no: i64 = 0;
+
         for pn in part_numbers {
-            let chunks = self.list_multipart_part_chunks(&upload.upload_id, *pn).await?;
+            let chunks = sqlx::query_as::<_, MultipartPartChunk>(
+                r#"
+                SELECT upload_id, part_number, chunk_no, file_id, message_id, size
+                FROM multipart_part_chunks
+                WHERE upload_id = ? AND part_number = ?
+                ORDER BY chunk_no
+                "#,
+            )
+            .bind(&upload.upload_id)
+            .bind(pn)
+            .fetch_all(&mut *tx)
+            .await?;
             for c in chunks {
                 assembled.push((part_no, c.file_id.clone(), c.message_id, c.size));
                 part_chunks.push(c);
@@ -889,35 +1154,99 @@ impl Index {
             }
         }
 
-        // Bump via put_object (object refs), then release multipart refs.
-        let mut orphans = self
-            .put_object(
-                &upload.bucket,
-                &upload.key,
-                etag,
-                total_size,
-                upload.content_type.as_deref(),
-                &assembled,
-                &[],
-            )
+        // Replace destination object inside this transaction.
+        let old_chunks = sqlx::query_as::<_, Chunk>(
+            "SELECT bucket, key, part_no, file_id, message_id, size FROM chunks WHERE bucket = ? AND key = ?",
+        )
+        .bind(&upload.bucket)
+        .bind(&upload.key)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut orphans = Vec::new();
+        for c in &old_chunks {
+            if let Some(o) = release_blob(&mut tx, &c.file_id).await? {
+                orphans.push(o);
+            }
+        }
+        sqlx::query("DELETE FROM chunks WHERE bucket = ? AND key = ?")
+            .bind(&upload.bucket)
+            .bind(&upload.key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ?")
+            .bind(&upload.bucket)
+            .bind(&upload.key)
+            .execute(&mut *tx)
             .await?;
 
-        let mut tx = self.pool.begin().await?;
+        let mtime = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO objects (bucket, key, etag, size, content_type, mtime)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bucket, key) DO UPDATE SET
+                etag = excluded.etag,
+                size = excluded.size,
+                content_type = excluded.content_type,
+                mtime = excluded.mtime
+            "#,
+        )
+        .bind(&upload.bucket)
+        .bind(&upload.key)
+        .bind(etag)
+        .bind(total_size)
+        .bind(&upload.content_type)
+        .bind(&mtime)
+        .execute(&mut *tx)
+        .await?;
+
+        for (pno, file_id, message_id, chunk_size) in &assembled {
+            bump_blob(&mut tx, file_id, *message_id, *chunk_size, &chat_id).await?;
+            sqlx::query(
+                r#"
+                INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size)
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&upload.bucket)
+            .bind(&upload.key)
+            .bind(pno)
+            .bind(file_id)
+            .bind(message_id)
+            .bind(chunk_size)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for (name, value) in &user_meta {
+            sqlx::query(
+                "INSERT INTO object_metadata (bucket, key, name, value) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&upload.bucket)
+            .bind(&upload.key)
+            .bind(name)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Release multipart refs (net-zero with bumps above for shared file_ids).
         for c in &part_chunks {
-            if let Some(msg) = release_blob(&mut tx, &c.file_id).await? {
-                orphans.push(msg);
+            if let Some(o) = release_blob(&mut tx, &c.file_id).await? {
+                orphans.push(o);
             }
         }
         sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?")
             .bind(&upload.upload_id)
             .execute(&mut *tx)
             .await?;
-        tx.commit().await?;
 
+        tx.commit().await?;
         Ok(orphans)
     }
 
-    pub async fn abort_multipart_upload(&self, upload_id: &str) -> Result<Option<Vec<i64>>> {
+    pub async fn abort_multipart_upload(&self, upload_id: &str) -> Result<Option<Vec<OrphanMsg>>> {
         let upload = match self.get_multipart_upload(upload_id).await? {
             Some(u) => u,
             None => return Ok(None),
@@ -938,8 +1267,8 @@ impl Index {
 
         let mut orphans = Vec::new();
         for c in &chunks {
-            if let Some(msg) = release_blob(&mut tx, &c.file_id).await? {
-                orphans.push(msg);
+            if let Some(o) = release_blob(&mut tx, &c.file_id).await? {
+                orphans.push(o);
             }
         }
 
@@ -958,37 +1287,37 @@ async fn bump_blob(
     file_id: &str,
     message_id: i64,
     size: i64,
+    chat_id: &str,
 ) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO blobs (file_id, message_id, size, refcount)
-        VALUES (?, ?, ?, 1)
+        INSERT INTO blobs (file_id, message_id, size, refcount, chat_id)
+        VALUES (?, ?, ?, 1, ?)
         ON CONFLICT(file_id) DO UPDATE SET
-            refcount = refcount + 1,
-            message_id = excluded.message_id,
-            size = excluded.size
+            refcount = refcount + 1
         "#,
     )
     .bind(file_id)
     .bind(message_id)
     .bind(size)
+    .bind(chat_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
-/// Decrement refcount; if it hits zero, delete blob row and return message_id for TG cleanup.
+/// Decrement refcount; if it hits zero, delete blob row and return (chat_id, message_id).
 async fn release_blob(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     file_id: &str,
-) -> Result<Option<i64>> {
-    let row: Option<(i64, i64)> =
-        sqlx::query_as("SELECT message_id, refcount FROM blobs WHERE file_id = ?")
+) -> Result<Option<OrphanMsg>> {
+    let row: Option<(String, i64, i64)> =
+        sqlx::query_as("SELECT chat_id, message_id, refcount FROM blobs WHERE file_id = ?")
             .bind(file_id)
             .fetch_optional(&mut **tx)
             .await?;
 
-    let Some((message_id, refcount)) = row else {
+    let Some((chat_id, message_id, refcount)) = row else {
         return Ok(None);
     };
 
@@ -997,7 +1326,7 @@ async fn release_blob(
             .bind(file_id)
             .execute(&mut **tx)
             .await?;
-        Ok(Some(message_id))
+        Ok(Some((chat_id, message_id)))
     } else {
         sqlx::query("UPDATE blobs SET refcount = refcount - 1 WHERE file_id = ?")
             .bind(file_id)
@@ -1005,6 +1334,36 @@ async fn release_blob(
             .await?;
         Ok(None)
     }
+}
+
+enum DelimEntry {
+    Object(ObjectMeta),
+    Prefix(String),
+}
+
+/// Group object keys into interleaved (sort_key, key|common-prefix) entries.
+fn group_delimiter_entries(
+    prefix: &str,
+    delim: &str,
+    objs: Vec<ObjectMeta>,
+) -> Vec<(String, DelimEntry)> {
+    let mut entries: Vec<(String, DelimEntry)> = Vec::new();
+    let mut seen_cp = std::collections::BTreeSet::new();
+
+    for obj in objs {
+        let Some(rest) = obj.key.strip_prefix(prefix) else {
+            continue;
+        };
+        if let Some(idx) = rest.find(delim) {
+            let cp = format!("{prefix}{}", &rest[..=idx]);
+            if seen_cp.insert(cp.clone()) {
+                entries.push((cp.clone(), DelimEntry::Prefix(cp)));
+            }
+        } else {
+            entries.push((obj.key.clone(), DelimEntry::Object(obj)));
+        }
+    }
+    entries
 }
 
 #[derive(Debug, PartialEq, Eq)]
