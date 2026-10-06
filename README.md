@@ -75,7 +75,8 @@ You can also copy the local `s3gram.db` file.
 | ListObjectsV2 | yes |
 | Multipart Upload (Create / UploadPart / Complete / Abort) | yes |
 | GetObject Range | yes |
-| CopyObject / Presigned URLs | later |
+| CopyObject (shallow — reuses Telegram file_ids) | yes |
+| Presigned URLs | later |
 
 ## Notes
 

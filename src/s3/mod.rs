@@ -115,7 +115,13 @@ async fn object_route(
                 .ok_or_else(|| S3Error::invalid_argument("Invalid partNumber"))?;
             upload_part(&state, &bucket, &key, &upload_id, part_number, req).await
         }
-        Method::PUT => put_object(&state, &bucket, &key, req).await,
+        Method::PUT => {
+            if req.headers().contains_key("x-amz-copy-source") {
+                copy_object(&state, &bucket, &key, req).await
+            } else {
+                put_object(&state, &bucket, &key, req).await
+            }
+        }
         Method::GET => {
             let range = req
                 .headers()
@@ -279,11 +285,7 @@ async fn put_object(
         )
         .await?;
 
-    for c in old {
-        if let Err(e) = state.tg.delete_message(c.message_id).await {
-            warn!(error = %e, "failed to delete old telegram message");
-        }
-    }
+    cleanup_unreferenced(state, old.into_iter().map(|c| (c.file_id, c.message_id))).await;
 
     info!(bucket, key, size = total_size, parts = uploaded.len(), "PutObject ok");
 
@@ -292,6 +294,115 @@ async fn put_object(
         .header(header::ETAG, format!("\"{etag}\""))
         .body(Body::empty())
         .unwrap())
+}
+
+async fn copy_object(
+    state: &AppState,
+    dst_bucket: &str,
+    dst_key: &str,
+    req: Request,
+) -> Result<Response, S3Error> {
+    if !state.index.bucket_exists(dst_bucket).await? {
+        return Err(S3Error::no_such_bucket(dst_bucket));
+    }
+
+    let src_raw = req
+        .headers()
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| S3Error::invalid_argument("Missing x-amz-copy-source"))?;
+
+    let (src_bucket, src_key) = parse_copy_source(src_raw)?;
+    if !state.index.bucket_exists(&src_bucket).await? {
+        return Err(S3Error::no_such_bucket(&src_bucket));
+    }
+    if state
+        .index
+        .get_object(&src_bucket, &src_key)
+        .await?
+        .is_none()
+    {
+        return Err(S3Error::no_such_key(&src_bucket, &src_key));
+    }
+
+    let directive = req
+        .headers()
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("COPY");
+
+    let content_type = if directive.eq_ignore_ascii_case("REPLACE") {
+        Some(
+            req.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    let (dst, old) = state
+        .index
+        .copy_object(
+            &src_bucket,
+            &src_key,
+            dst_bucket,
+            dst_key,
+            content_type.as_deref(),
+        )
+        .await
+        .map_err(|e| S3Error::internal(e.to_string()))?;
+
+    cleanup_unreferenced(state, old.into_iter().map(|c| (c.file_id, c.message_id))).await;
+
+    info!(
+        src_bucket,
+        src_key,
+        dst_bucket,
+        dst_key,
+        "CopyObject ok (shallow)"
+    );
+
+    Ok(xml_response(
+        StatusCode::OK,
+        &copy_object_result(&dst.mtime, &dst.etag),
+    ))
+}
+
+fn parse_copy_source(raw: &str) -> Result<(String, String), S3Error> {
+    let decoded = urlencoding::decode(raw.trim_start_matches('/'))
+        .map_err(|_| S3Error::invalid_argument("Invalid x-amz-copy-source encoding"))?
+        .into_owned();
+    let (bucket, key) = decoded
+        .split_once('/')
+        .ok_or_else(|| S3Error::invalid_argument("x-amz-copy-source must be bucket/key"))?;
+    if bucket.is_empty() || key.is_empty() {
+        return Err(S3Error::invalid_argument("x-amz-copy-source must be bucket/key"));
+    }
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+async fn cleanup_unreferenced(
+    state: &AppState,
+    refs: impl Iterator<Item = (String, i64)>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    for (file_id, message_id) in refs {
+        if !seen.insert(file_id.clone()) {
+            continue;
+        }
+        match state.index.count_file_id_refs(&file_id).await {
+            Ok(0) => {
+                if let Err(e) = state.tg.delete_message(message_id).await {
+                    warn!(error = %e, %file_id, "failed to delete unreferenced telegram message");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, %file_id, "refcount check failed"),
+        }
+    }
 }
 
 async fn get_object(
@@ -507,11 +618,7 @@ async fn delete_object(state: &AppState, bucket: &str, key: &str) -> Result<Resp
     }
 
     if let Some(chunks) = state.index.delete_object(bucket, key).await? {
-        for c in chunks {
-            if let Err(e) = state.tg.delete_message(c.message_id).await {
-                warn!(error = %e, "failed to delete telegram message");
-            }
-        }
+        cleanup_unreferenced(state, chunks.into_iter().map(|c| (c.file_id, c.message_id))).await;
     }
 
     // S3 DeleteObject is idempotent — always 204
@@ -575,11 +682,7 @@ async fn upload_part(
         .index
         .put_multipart_part(upload_id, part_number, &etag, size, &tg_chunks)
         .await?;
-    for c in old {
-        if let Err(e) = state.tg.delete_message(c.message_id).await {
-            warn!(error = %e, "failed to delete replaced part chunk");
-        }
-    }
+    cleanup_unreferenced(state, old.into_iter().map(|c| (c.file_id, c.message_id))).await;
 
     info!(bucket, key, part_number, size, "UploadPart ok");
     Ok(Response::builder()
@@ -651,11 +754,7 @@ async fn complete_multipart_upload(
         .complete_multipart_upload(&upload, &part_numbers, &etag, total_size)
         .await?;
 
-    for c in old {
-        if let Err(e) = state.tg.delete_message(c.message_id).await {
-            warn!(error = %e, "failed to delete replaced object chunk");
-        }
-    }
+    cleanup_unreferenced(state, old.into_iter().map(|c| (c.file_id, c.message_id))).await;
 
     info!(bucket, key, parts = part_numbers.len(), size = total_size, "CompleteMultipartUpload ok");
 
@@ -670,11 +769,11 @@ async fn abort_multipart_upload(state: &AppState, upload_id: &str) -> Result<Res
     match state.index.abort_multipart_upload(upload_id).await? {
         None => Err(S3Error::no_such_upload(upload_id)),
         Some((_upload, chunks)) => {
-            for c in chunks {
-                if let Err(e) = state.tg.delete_message(c.message_id).await {
-                    warn!(error = %e, "failed to delete aborted part chunk");
-                }
-            }
+            cleanup_unreferenced(
+                state,
+                chunks.into_iter().map(|c| (c.file_id, c.message_id)),
+            )
+            .await;
             info!(%upload_id, "AbortMultipartUpload ok");
             Ok(StatusCode::NO_CONTENT.into_response())
         }

@@ -123,3 +123,15 @@ pub fn complete_multipart_result(
         xml_escape(etag),
     )
 }
+
+pub fn copy_object_result(last_modified: &str, etag: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <LastModified>{}</LastModified>
+  <ETag>&quot;{}&quot;</ETag>
+</CopyObjectResult>"#,
+        xml_escape(last_modified),
+        xml_escape(etag),
+    )
+}

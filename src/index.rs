@@ -343,6 +343,61 @@ impl Index {
         }
     }
 
+    /// Shallow copy: destination reuses the same Telegram file_ids.
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        content_type: Option<&str>,
+    ) -> Result<(ObjectMeta, Vec<Chunk>)> {
+        let src = self
+            .get_object(src_bucket, src_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("source object not found"))?;
+        let src_chunks = self.get_chunks(src_bucket, src_key).await?;
+
+        let ct = content_type.or(src.content_type.as_deref());
+        let chunk_tuples: Vec<(i64, String, i64, i64)> = src_chunks
+            .iter()
+            .map(|c| (c.part_no, c.file_id.clone(), c.message_id, c.size))
+            .collect();
+
+        let old = self
+            .put_object(
+                dst_bucket,
+                dst_key,
+                &src.etag,
+                src.size,
+                ct,
+                &chunk_tuples,
+            )
+            .await?;
+
+        let dst = self
+            .get_object(dst_bucket, dst_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("destination missing after copy"))?;
+        Ok((dst, old))
+    }
+
+    /// How many index rows still reference this Telegram file_id.
+    pub async fn count_file_id_refs(&self, file_id: &str) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM chunks WHERE file_id = ?)
+              + (SELECT COUNT(*) FROM multipart_part_chunks WHERE file_id = ?)
+            "#,
+        )
+        .bind(file_id)
+        .bind(file_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
     pub async fn list_objects(
         &self,
         bucket: &str,
