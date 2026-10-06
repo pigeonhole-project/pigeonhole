@@ -1,19 +1,21 @@
 use crate::config::Config;
 use crate::s3::error::S3Error;
 use axum::http::Request;
+use chrono::{TimeZone, Utc};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Max allowed clock skew for x-amz-date (AWS uses 15 minutes).
+const MAX_SKEW_SECS: i64 = 15 * 60;
+
 pub fn authorize<B>(cfg: &Config, req: &Request<B>) -> Result<(), S3Error> {
     // Allow unsigned local health probes
     if req.headers().get("authorization").is_none()
         && req.headers().get("x-amz-content-sha256").is_none()
     {
-        // Still require credentials for aws cli compatibility path — but for demo
-        // accept missing auth only if S3GRAM_INSECURE=1
         if std::env::var("S3GRAM_INSECURE").ok().as_deref() == Some("1") {
             return Ok(());
         }
@@ -64,6 +66,8 @@ pub fn authorize<B>(cfg: &Config, req: &Request<B>) -> Result<(), S3Error> {
         .get("x-amz-date")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(S3Error::access_denied)?;
+
+    check_amz_date(amz_date)?;
 
     let payload_hash = req
         .headers()
@@ -118,10 +122,44 @@ pub fn authorize<B>(cfg: &Config, req: &Request<B>) -> Result<(), S3Error> {
     let signing_key = derive_signing_key(&cfg.secret_key, date_stamp, region, service);
     let expected = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
 
-    if expected != signature {
+    if !const_time_eq(&expected, signature) {
         return Err(S3Error::signature_mismatch());
     }
     Ok(())
+}
+
+fn check_amz_date(amz_date: &str) -> Result<(), S3Error> {
+    // Format: YYYYMMDD'T'HHMMSS'Z'
+    if amz_date.len() != 16 || !amz_date.ends_with('Z') {
+        return Err(S3Error::access_denied());
+    }
+    let date = &amz_date[..8];
+    let time = &amz_date[9..15];
+    let y: i32 = date[0..4].parse().map_err(|_| S3Error::access_denied())?;
+    let mo: u32 = date[4..6].parse().map_err(|_| S3Error::access_denied())?;
+    let d: u32 = date[6..8].parse().map_err(|_| S3Error::access_denied())?;
+    let h: u32 = time[0..2].parse().map_err(|_| S3Error::access_denied())?;
+    let mi: u32 = time[2..4].parse().map_err(|_| S3Error::access_denied())?;
+    let s: u32 = time[4..6].parse().map_err(|_| S3Error::access_denied())?;
+    let dt = Utc
+        .with_ymd_and_hms(y, mo, d, h, mi, s)
+        .single()
+        .ok_or_else(S3Error::access_denied)?;
+    let skew = (Utc::now() - dt).num_seconds().abs();
+    if skew > MAX_SKEW_SECS {
+        return Err(S3Error::access_denied());
+    }
+    Ok(())
+}
+
+fn const_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// URI-encode path per AWS SigV4 (encode each segment, keep `/`).
@@ -139,8 +177,6 @@ fn canonical_query_string(query: &str) -> String {
     if query.is_empty() {
         return String::new();
     }
-    // Wire query is already percent-encoded; decode then re-encode for SigV4
-    // so values like `%2F` become `/` → `%2F` instead of `%252F`.
     let mut pairs: Vec<(String, String)> = query
         .split('&')
         .filter(|p| !p.is_empty())
