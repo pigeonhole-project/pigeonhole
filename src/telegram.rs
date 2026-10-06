@@ -26,10 +26,22 @@ struct ResponseParameters {
 }
 
 enum SendErr {
-    Timeout(anyhow::Error),
+    /// Ambiguous: request may have reached Telegram — do not retry.
+    Ambiguous(anyhow::Error),
     RetryAfter(u64, anyhow::Error),
-    Retryable(anyhow::Error),
+    /// Safe to retry: connection never established.
+    Connect(anyhow::Error),
     Fatal(anyhow::Error),
+}
+
+/// Result of deleteMessage: Gone/Deleted both mean the message is no longer present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    /// Message already absent ("message to delete not found") — treat as success.
+    Gone,
+    /// Transient or policy failure — retry later.
+    Failed,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,8 +86,8 @@ impl TelegramClient {
         filename: &str,
         caption: &str,
     ) -> Result<(String, i64)> {
-        // Non-idempotent: only retry when we know the request did not commit
-        // (connection errors, 429, 5xx). Do not retry ambiguous timeouts.
+        // Non-idempotent: only retry connect failures and 429. Timeouts, 5xx, and
+        // response parse errors are ambiguous (message may already exist).
         let mut last_err = None;
         for attempt in 0..5u32 {
             match self
@@ -83,17 +95,19 @@ impl TelegramClient {
                 .await
             {
                 Ok(v) => return Ok(v),
-                Err(SendErr::Timeout(e)) => {
-                    return Err(e).context("sendDocument timed out; not retrying to avoid duplicate uploads");
+                Err(SendErr::Ambiguous(e)) => {
+                    return Err(e).context(
+                        "sendDocument ambiguous failure; not retrying to avoid duplicate uploads",
+                    );
                 }
                 Err(SendErr::RetryAfter(secs, e)) => {
                     debug!(attempt, secs, error = %e, "sendDocument rate-limited");
                     last_err = Some(e);
                     tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
                 }
-                Err(SendErr::Retryable(e)) => {
+                Err(SendErr::Connect(e)) => {
                     let wait = Duration::from_millis(200 * 2u64.pow(attempt));
-                    debug!(attempt, ?wait, error = %e, "sendDocument retry");
+                    debug!(attempt, ?wait, error = %e, "sendDocument connect retry");
                     last_err = Some(e);
                     tokio::time::sleep(wait).await;
                 }
@@ -103,6 +117,40 @@ impl TelegramClient {
         Err(last_err.unwrap_or_else(|| anyhow!("sendDocument failed")))
     }
 
+    /// Re-send an existing Telegram file into `chat_id` by `file_id` (no byte transfer).
+    pub async fn send_document_by_file_id(
+        &self,
+        chat_id: &str,
+        file_id: &str,
+        caption: &str,
+    ) -> Result<(String, i64)> {
+        let mut last_err = None;
+        for attempt in 0..5u32 {
+            match self
+                .send_document_by_file_id_once(chat_id, file_id, caption)
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(SendErr::Ambiguous(e)) => {
+                    return Err(e).context(
+                        "sendDocument(file_id) ambiguous failure; not retrying to avoid duplicates",
+                    );
+                }
+                Err(SendErr::RetryAfter(secs, e)) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
+                }
+                Err(SendErr::Connect(e)) => {
+                    let wait = Duration::from_millis(200 * 2u64.pow(attempt));
+                    last_err = Some(e);
+                    tokio::time::sleep(wait).await;
+                }
+                Err(SendErr::Fatal(e)) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("sendDocument(file_id) failed")))
+    }
+
     async fn send_document_once(
         &self,
         chat_id: &str,
@@ -110,7 +158,8 @@ impl TelegramClient {
         filename: &str,
         caption: &str,
     ) -> Result<(String, i64), SendErr> {
-        let part = Part::bytes(data.to_vec())
+        let len = data.len() as u64;
+        let part = Part::stream_with_length(reqwest::Body::from(data), len)
             .file_name(filename.to_string())
             .mime_str("application/octet-stream")
             .map_err(|e| SendErr::Fatal(e.into()))?;
@@ -126,16 +175,36 @@ impl TelegramClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    SendErr::Timeout(e.into())
-                } else if e.is_connect() || e.is_request() {
-                    SendErr::Retryable(e.into())
-                } else {
-                    SendErr::Fatal(e.into())
-                }
-            })?;
+            .map_err(classify_reqwest)?;
 
+        self.parse_send_document_response(resp).await
+    }
+
+    async fn send_document_by_file_id_once(
+        &self,
+        chat_id: &str,
+        file_id: &str,
+        caption: &str,
+    ) -> Result<(String, i64), SendErr> {
+        let resp = self
+            .http
+            .post(self.api_url("sendDocument"))
+            .form(&[
+                ("chat_id", chat_id),
+                ("document", file_id),
+                ("caption", caption),
+            ])
+            .send()
+            .await
+            .map_err(classify_reqwest)?;
+
+        self.parse_send_document_response(resp).await
+    }
+
+    async fn parse_send_document_response(
+        &self,
+        resp: reqwest::Response,
+    ) -> Result<(String, i64), SendErr> {
         let status = resp.status();
         if status.as_u16() == 429 {
             let retry_after = resp
@@ -151,9 +220,7 @@ impl TelegramClient {
                 parameters: None,
             });
             let api_retry = body.parameters.as_ref().and_then(|p| p.retry_after);
-            let desc = body
-                .description
-                .unwrap_or_else(|| status.to_string());
+            let desc = body.description.unwrap_or_else(|| status.to_string());
             let secs = api_retry.unwrap_or(retry_after as i64).max(1) as u64;
             return Err(SendErr::RetryAfter(secs, anyhow!("sendDocument 429: {desc}")));
         }
@@ -161,9 +228,10 @@ impl TelegramClient {
         let body: ApiResponse<Message> = resp
             .json()
             .await
-            .map_err(|e| SendErr::Retryable(e.into()))?;
+            .map_err(|e| SendErr::Ambiguous(e.into()))?;
         if status.is_server_error() {
-            return Err(SendErr::Retryable(anyhow!(
+            // 5xx after accept is ambiguous — message may exist.
+            return Err(SendErr::Ambiguous(anyhow!(
                 "sendDocument {}: {}",
                 status,
                 body.description.unwrap_or_default()
@@ -234,9 +302,8 @@ impl TelegramClient {
         Ok(bytes)
     }
 
-    /// Returns Ok(true) if Telegram confirmed deletion, Ok(false) if API rejected
-    /// (message too old / missing rights) — caller should queue for retry/audit.
-    pub async fn delete_message(&self, chat_id: &str, message_id: i64) -> Result<bool> {
+    /// Delete a chat message. `Gone` (already missing) is success for queue purposes.
+    pub async fn delete_message(&self, chat_id: &str, message_id: i64) -> Result<DeleteOutcome> {
         let resp = self
             .http
             .post(self.api_url("deleteMessage"))
@@ -251,126 +318,105 @@ impl TelegramClient {
         let status = resp.status();
         let body: ApiResponse<bool> = resp.json().await.context("deleteMessage json")?;
         if status.is_success() && body.ok && body.result.unwrap_or(false) {
-            return Ok(true);
+            return Ok(DeleteOutcome::Deleted);
+        }
+        let desc = body.description.unwrap_or_default();
+        let lower = desc.to_ascii_lowercase();
+        if lower.contains("message to delete not found")
+            || lower.contains("message not found")
+            || (lower.contains("message can't be deleted") && lower.contains("not found"))
+        {
+            return Ok(DeleteOutcome::Gone);
         }
         debug!(
             chat_id,
             message_id,
-            desc = ?body.description,
+            %desc,
             %status,
             "deleteMessage not confirmed"
         );
-        Ok(false)
+        Ok(DeleteOutcome::Failed)
     }
 
-    pub async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
+    pub async fn get_me(&self) -> Result<TgUser> {
         let resp = self
             .http
-            .post(self.api_url("sendMessage"))
+            .get(self.api_url("getMe"))
+            .send()
+            .await
+            .context("getMe http")?;
+        let status = resp.status();
+        let body: ApiResponse<TgUser> = resp.json().await.context("getMe json")?;
+        if !status.is_success() || !body.ok {
+            return Err(anyhow!(
+                "getMe failed: {}",
+                body.description.unwrap_or_else(|| status.to_string())
+            ));
+        }
+        body.result.ok_or_else(|| anyhow!("getMe missing result"))
+    }
+
+    pub async fn get_chat_member(&self, chat_id: &str, user_id: i64) -> Result<ChatMember> {
+        let resp = self
+            .http
+            .post(self.api_url("getChatMember"))
             .form(&[
                 ("chat_id", chat_id),
-                ("text", text),
-                ("disable_web_page_preview", "true"),
+                ("user_id", &user_id.to_string()),
             ])
             .send()
             .await
-            .context("sendMessage http")?;
+            .context("getChatMember http")?;
         let status = resp.status();
-        let body: ApiResponse<serde_json::Value> =
-            resp.json().await.context("sendMessage json")?;
+        let body: ApiResponse<ChatMember> = resp.json().await.context("getChatMember json")?;
         if !status.is_success() || !body.ok {
             return Err(anyhow!(
-                "sendMessage failed: {}",
+                "getChatMember failed: {}",
                 body.description.unwrap_or_else(|| status.to_string())
             ));
         }
-        Ok(())
+        body.result
+            .ok_or_else(|| anyhow!("getChatMember missing result"))
     }
 
-    /// Rename a group/supergroup/channel. Requires bot admin with can_change_info.
-    /// Private chats cannot be renamed.
-    pub async fn set_chat_title(&self, chat_id: &str, title: &str) -> Result<()> {
-        let resp = self
-            .http
-            .post(self.api_url("setChatTitle"))
-            .form(&[("chat_id", chat_id), ("title", title)])
-            .send()
+    /// Fail fast unless the bot is a member with admin (or creator) rights in `chat_id`.
+    pub async fn ensure_chat_admin(&self, chat_id: &str) -> Result<()> {
+        let me = self.get_me().await.context("getMe")?;
+        let member = self
+            .get_chat_member(chat_id, me.id)
             .await
-            .context("setChatTitle http")?;
-        let status = resp.status();
-        let body: ApiResponse<bool> = resp.json().await.context("setChatTitle json")?;
-        if !status.is_success() || !body.ok {
-            return Err(anyhow!(
-                "setChatTitle failed: {}",
-                body.description.unwrap_or_else(|| status.to_string())
-            ));
+            .with_context(|| format!("bot is not in chat {chat_id}"))?;
+        match member.status.as_str() {
+            "administrator" | "creator" => {
+                tracing::info!(
+                    chat_id,
+                    bot_id = me.id,
+                    status = %member.status,
+                    "telegram chat access ok"
+                );
+                Ok(())
+            }
+            other => anyhow::bail!(
+                "bot must be administrator in chat {chat_id} (current status: {other})"
+            ),
         }
-        Ok(())
-    }
-
-    pub async fn get_updates(&self, offset: i64, timeout_secs: u64) -> Result<Vec<Update>> {
-        let resp = self
-            .http
-            .get(self.api_url("getUpdates"))
-            .query(&[
-                ("offset", offset.to_string()),
-                ("timeout", timeout_secs.to_string()),
-                (
-                    "allowed_updates",
-                    serde_json::json!(["message", "my_chat_member"]).to_string(),
-                ),
-            ])
-            .timeout(Duration::from_secs(timeout_secs + 10))
-            .send()
-            .await
-            .context("getUpdates http")?;
-
-        let status = resp.status();
-        let body: ApiResponse<Vec<Update>> = resp.json().await.context("getUpdates json")?;
-        if !status.is_success() || !body.ok {
-            return Err(anyhow!(
-                "getUpdates failed: {}",
-                body.description.unwrap_or_else(|| status.to_string())
-            ));
-        }
-        Ok(body.result.unwrap_or_default())
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Update {
-    pub update_id: i64,
-    pub message: Option<IncomingMessage>,
-    pub my_chat_member: Option<ChatMemberUpdated>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct IncomingMessage {
-    pub message_id: i64,
-    pub chat: TgChat,
-    pub text: Option<String>,
-    pub from: Option<TgUser>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ChatMemberUpdated {
-    pub chat: TgChat,
-    pub new_chat_member: ChatMember,
+fn classify_reqwest(e: reqwest::Error) -> SendErr {
+    if e.is_connect() {
+        SendErr::Connect(e.into())
+    } else if e.is_timeout() || e.is_request() || e.is_body() {
+        SendErr::Ambiguous(e.into())
+    } else {
+        SendErr::Fatal(e.into())
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ChatMember {
     pub status: String,
     pub user: TgUser,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TgChat {
-    pub id: i64,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(rename = "type")]
-    pub chat_type: String,
 }
 
 #[derive(Debug, Deserialize)]
