@@ -1,0 +1,55 @@
+[DEFAULT]
+host = 127.0.0.1
+port = 8333
+is_secure = False
+ssl_verify = False
+
+[fixtures]
+bucket prefix = s3gram-{random}-
+iam name prefix = s3gram-
+iam path prefix = /s3gram/
+
+[s3 main]
+display_name = s3gram
+user_id = s3gram
+email = s3gram@example.com
+api_name = default
+access_key = __ACCESS_KEY__
+secret_key = __SECRET_KEY__
+
+[s3 alt]
+# Same credentials: s3gram is single-tenant. ACL/alt-user tests will fail.
+display_name = s3gram-alt
+user_id = s3gram-alt
+email = s3gram-alt@example.com
+access_key = __ACCESS_KEY__
+secret_key = __SECRET_KEY__
+
+[s3 tenant]
+display_name = s3gram-tenant
+user_id = s3gram-tenant
+email = s3gram-tenant@example.com
+access_key = __ACCESS_KEY__
+secret_key = __SECRET_KEY__
+tenant = s3gram
+
+[iam]
+display_name = s3gram-iam
+user_id = s3gram-iam
+email = s3gram-iam@example.com
+access_key = __ACCESS_KEY__
+secret_key = __SECRET_KEY__
+
+[iam root]
+access_key = __ACCESS_KEY__
+secret_key = __SECRET_KEY__
+account_id = s3gram
+user_id = s3gram
+email = s3gram@example.com
+
+[iam alt root]
+access_key = __ACCESS_KEY__
+secret_key = __SECRET_KEY__
+account_id = s3gram-alt
+user_id = s3gram-alt
+email = s3gram-alt@example.com

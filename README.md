@@ -25,25 +25,28 @@ cp .env.example .env
 
 ```bash
 cargo run --release
+# or: make run
 ```
 
 Listens on `http://0.0.0.0:8333` by default.
 
-## Smoke test (AWS CLI)
+## Tests
+
+With s3gram already running (`make run` in another terminal):
 
 ```bash
-export AWS_ACCESS_KEY_ID=s3gram
-export AWS_SECRET_ACCESS_KEY=s3gramsecret
-export AWS_DEFAULT_REGION=us-east-1
-
-aws --endpoint-url http://127.0.0.1:8333 s3 mb s3://demo
-aws --endpoint-url http://127.0.0.1:8333 s3 cp ./README.md s3://demo/readme.md
-aws --endpoint-url http://127.0.0.1:8333 s3 ls s3://demo/
-aws --endpoint-url http://127.0.0.1:8333 s3 cp s3://demo/readme.md ./out.md
-aws --endpoint-url http://127.0.0.1:8333 s3 rm s3://demo/readme.md
+make smoke        # AWS CLI: put/get, multipart, copy, metadata
+make compat       # curated ceph/s3-tests (compat/known-good.txt)
+make compat-all   # full s3-tests functional suite (many failures expected)
 ```
 
-Large files use multipart upload automatically (supported).
+`make compat` clones [ceph/s3-tests](https://github.com/ceph/s3-tests) into `.cache/s3-tests` and runs them via `tox`. Needs `python3`, `tox`, `git`.
+
+```bash
+./scripts/compat.sh -- s3tests/functional/test_s3.py -k multipart
+```
+
+Credentials come from `.env` (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
 
 For unsigned local debugging: `S3GRAM_INSECURE=1`.
 
@@ -76,6 +79,8 @@ You can also copy the local `s3gram.db` file.
 | Multipart Upload (Create / UploadPart / Complete / Abort) | yes |
 | GetObject Range | yes |
 | CopyObject (shallow — reuses Telegram file_ids) | yes |
+| User metadata (`x-amz-meta-*`) | yes |
+| Blob refcount in SQLite | yes |
 | Presigned URLs | later |
 
 ## Notes

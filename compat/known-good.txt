@@ -1,0 +1,19 @@
+# Curated ceph/s3-tests that exercise features s3gram implements.
+# One pytest node id per line. Comments and blank lines ignored.
+#
+# Run: ./scripts/compat.sh
+# Full suite: ./scripts/compat.sh --all
+# Extra args: ./scripts/compat.sh -- s3tests/functional/test_s3.py -k bucket_create
+
+s3tests/functional/test_s3.py::test_bucket_list_empty
+s3tests/functional/test_s3.py::test_object_write_read_update_read_delete
+s3tests/functional/test_s3.py::test_object_read_not_exist
+s3tests/functional/test_s3.py::test_object_write_to_nonexist_bucket
+s3tests/functional/test_s3.py::test_object_head_zero_bytes
+s3tests/functional/test_s3.py::test_object_write_file
+s3tests/functional/test_s3.py::test_object_copy_zero_size
+s3tests/functional/test_s3.py::test_object_copy_same_bucket
+# Multipart: empty complete error code and idempotent re-complete still diverge from AWS.
+# s3tests/functional/test_s3.py::test_multipart_upload_empty
+# s3tests/functional/test_s3.py::test_multipart_upload_small
+# s3tests/functional/test_s3.py::test_multipart_upload

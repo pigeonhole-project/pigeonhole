@@ -77,9 +77,16 @@ async fn bucket_root(
     authorize(&state.cfg, &req)?;
     validate_bucket_name(&bucket)?;
 
+    let query = req.uri().query().unwrap_or("").to_string();
+    let q = parse_query(&query);
+
     match *req.method() {
         Method::PUT => create_bucket(&state, &bucket).await,
         Method::DELETE => delete_bucket(&state, &bucket).await,
+        Method::POST if q.contains_key("delete") => delete_objects(&state, &bucket, req).await,
+        Method::GET | Method::HEAD if q.contains_key("versions") => {
+            list_object_versions(&state, &bucket, params, req.method()).await
+        }
         Method::GET | Method::HEAD => list_objects(&state, &bucket, params, req.method()).await,
         _ => Err(S3Error::method_not_allowed()),
     }
@@ -256,6 +263,97 @@ async fn list_objects(
     Ok(xml_response(StatusCode::OK, &body))
 }
 
+async fn list_object_versions(
+    state: &AppState,
+    bucket: &str,
+    params: ListParams,
+    method: &Method,
+) -> Result<Response, S3Error> {
+    // Non-versioned store: expose current objects as versions with VersionId "null"
+    // so clients like s3-tests can empty buckets during cleanup.
+    if !state.index.bucket_exists(bucket).await? {
+        return Err(S3Error::no_such_bucket(bucket));
+    }
+
+    let prefix = params.prefix.unwrap_or_default();
+    let max_keys = params.max_keys.unwrap_or(1000).clamp(1, 1000);
+    let (objects, _common, truncated) = state
+        .index
+        .list_objects(bucket, &prefix, None, max_keys, None)
+        .await?;
+
+    let body = list_versions_result(bucket, &prefix, max_keys, &objects, truncated);
+
+    if *method == Method::HEAD {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/xml")
+            .body(Body::empty())
+            .unwrap());
+    }
+    Ok(xml_response(StatusCode::OK, &body))
+}
+
+async fn delete_objects(
+    state: &AppState,
+    bucket: &str,
+    req: Request,
+) -> Result<Response, S3Error> {
+    if !state.index.bucket_exists(bucket).await? {
+        return Err(S3Error::no_such_bucket(bucket));
+    }
+
+    let body = axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024)
+        .await
+        .map_err(|e| S3Error::internal(e.to_string()))?;
+    let body_str = String::from_utf8_lossy(&body);
+    let quiet = body_str.contains("<Quiet>true</Quiet>") || body_str.contains("<Quiet>True</Quiet>");
+    let keys = parse_delete_objects_keys(&body_str)?;
+
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    let mut orphans = Vec::new();
+
+    for key in keys {
+        match state.index.delete_object(bucket, &key).await {
+            Ok(Some(o)) => {
+                orphans.extend(o);
+                deleted.push(key);
+            }
+            Ok(None) => {
+                // S3 delete is idempotent — still report as deleted
+                deleted.push(key);
+            }
+            Err(e) => {
+                errors.push((key, e.to_string()));
+            }
+        }
+    }
+
+    cleanup_orphans(state, orphans).await;
+    Ok(xml_response(
+        StatusCode::OK,
+        &delete_objects_result(&deleted, &errors, quiet),
+    ))
+}
+
+fn parse_delete_objects_keys(xml: &str) -> Result<Vec<String>, S3Error> {
+    let mut keys = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Object>") {
+        let after = &rest[start + 8..];
+        let end = after
+            .find("</Object>")
+            .ok_or_else(|| S3Error::invalid_argument("malformed Delete XML"))?;
+        let block = &after[..end];
+        if let Some(key) = extract_xml_text(block, "Key") {
+            keys.push(key);
+        }
+        rest = &after[end + 9..];
+    }
+    Ok(keys)
+}
+
 async fn put_object(
     state: &AppState,
     bucket: &str,
@@ -271,9 +369,10 @@ async fn put_object(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let user_meta = extract_user_metadata(req.headers());
 
     let (etag, total_size, uploaded) = ingest_body_to_telegram(state, bucket, key, req).await?;
-    let old = state
+    let orphans = state
         .index
         .put_object(
             bucket,
@@ -282,10 +381,11 @@ async fn put_object(
             total_size,
             content_type.as_deref(),
             &uploaded,
+            &user_meta,
         )
         .await?;
 
-    cleanup_unreferenced(state, old.into_iter().map(|c| (c.file_id, c.message_id))).await;
+    cleanup_orphans(state, orphans).await;
 
     info!(bucket, key, size = total_size, parts = uploaded.len(), "PutObject ok");
 
@@ -331,7 +431,10 @@ async fn copy_object(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("COPY");
 
-    let content_type = if directive.eq_ignore_ascii_case("REPLACE") {
+    let copy_source_meta = !directive.eq_ignore_ascii_case("REPLACE");
+    let content_type = if copy_source_meta {
+        None
+    } else {
         Some(
             req.headers()
                 .get(header::CONTENT_TYPE)
@@ -339,11 +442,14 @@ async fn copy_object(
                 .unwrap_or("application/octet-stream")
                 .to_string(),
         )
+    };
+    let user_meta = if copy_source_meta {
+        vec![]
     } else {
-        None
+        extract_user_metadata(req.headers())
     };
 
-    let (dst, old) = state
+    let (dst, orphans) = state
         .index
         .copy_object(
             &src_bucket,
@@ -351,11 +457,13 @@ async fn copy_object(
             dst_bucket,
             dst_key,
             content_type.as_deref(),
+            &user_meta,
+            copy_source_meta,
         )
         .await
         .map_err(|e| S3Error::internal(e.to_string()))?;
 
-    cleanup_unreferenced(state, old.into_iter().map(|c| (c.file_id, c.message_id))).await;
+    cleanup_orphans(state, orphans).await;
 
     info!(
         src_bucket,
@@ -384,25 +492,41 @@ fn parse_copy_source(raw: &str) -> Result<(String, String), S3Error> {
     Ok((bucket.to_string(), key.to_string()))
 }
 
-async fn cleanup_unreferenced(
-    state: &AppState,
-    refs: impl Iterator<Item = (String, i64)>,
-) {
-    let mut seen = std::collections::HashSet::new();
-    for (file_id, message_id) in refs {
-        if !seen.insert(file_id.clone()) {
-            continue;
-        }
-        match state.index.count_file_id_refs(&file_id).await {
-            Ok(0) => {
-                if let Err(e) = state.tg.delete_message(message_id).await {
-                    warn!(error = %e, %file_id, "failed to delete unreferenced telegram message");
-                }
+fn extract_user_metadata(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, value) in headers.iter() {
+        let key = name.as_str();
+        if let Some(rest) = key.strip_prefix("x-amz-meta-") {
+            if let Ok(v) = value.to_str() {
+                out.push((rest.to_ascii_lowercase(), v.to_string()));
             }
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, %file_id, "refcount check failed"),
         }
     }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+async fn cleanup_orphans(state: &AppState, message_ids: Vec<i64>) {
+    let mut seen = std::collections::HashSet::new();
+    for message_id in message_ids {
+        if !seen.insert(message_id) {
+            continue;
+        }
+        if let Err(e) = state.tg.delete_message(message_id).await {
+            warn!(error = %e, message_id, "failed to delete orphaned telegram message");
+        }
+    }
+}
+
+fn apply_user_metadata(mut builder: axum::http::response::Builder, meta: &[(String, String)]) -> axum::http::response::Builder {
+    for (name, value) in meta {
+        if let Ok(h) = axum::http::HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()) {
+            if let Ok(v) = axum::http::HeaderValue::from_str(value) {
+                builder = builder.header(h, v);
+            }
+        }
+    }
+    builder
 }
 
 async fn get_object(
@@ -418,6 +542,7 @@ async fn get_object(
         .ok_or_else(|| S3Error::no_such_key(bucket, key))?;
 
     let chunks = state.index.get_chunks(bucket, key).await?;
+    let user_meta = state.index.get_user_metadata(bucket, key).await?;
     let total = meta.size as u64;
 
     let (start, end_inclusive) = match parse_byte_range(range_hdr, total)? {
@@ -462,6 +587,8 @@ async fn get_object(
     } else {
         builder = builder.header(header::CONTENT_TYPE, "application/octet-stream");
     }
+
+    builder = apply_user_metadata(builder, &user_meta);
 
     Ok(builder.body(Body::from_stream(stream)).unwrap())
 }
@@ -595,6 +722,7 @@ async fn head_object(state: &AppState, bucket: &str, key: &str) -> Result<Respon
         .get_object(bucket, key)
         .await?
         .ok_or_else(|| S3Error::no_such_key(bucket, key))?;
+    let user_meta = state.index.get_user_metadata(bucket, key).await?;
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -609,6 +737,8 @@ async fn head_object(state: &AppState, bucket: &str, key: &str) -> Result<Respon
         builder = builder.header(header::CONTENT_TYPE, ct);
     }
 
+    builder = apply_user_metadata(builder, &user_meta);
+
     Ok(builder.body(Body::empty()).unwrap())
 }
 
@@ -617,8 +747,8 @@ async fn delete_object(state: &AppState, bucket: &str, key: &str) -> Result<Resp
         return Err(S3Error::no_such_bucket(bucket));
     }
 
-    if let Some(chunks) = state.index.delete_object(bucket, key).await? {
-        cleanup_unreferenced(state, chunks.into_iter().map(|c| (c.file_id, c.message_id))).await;
+    if let Some(orphans) = state.index.delete_object(bucket, key).await? {
+        cleanup_orphans(state, orphans).await;
     }
 
     // S3 DeleteObject is idempotent — always 204
@@ -678,11 +808,11 @@ async fn upload_part(
 
     let (etag, size, tg_chunks) = ingest_body_to_telegram(state, bucket, key, req).await?;
 
-    let old = state
+    let orphans = state
         .index
         .put_multipart_part(upload_id, part_number, &etag, size, &tg_chunks)
         .await?;
-    cleanup_unreferenced(state, old.into_iter().map(|c| (c.file_id, c.message_id))).await;
+    cleanup_orphans(state, orphans).await;
 
     info!(bucket, key, part_number, size, "UploadPart ok");
     Ok(Response::builder()
@@ -749,12 +879,12 @@ async fn complete_multipart_upload(
         part_numbers.len()
     );
 
-    let old = state
+    let orphans = state
         .index
         .complete_multipart_upload(&upload, &part_numbers, &etag, total_size)
         .await?;
 
-    cleanup_unreferenced(state, old.into_iter().map(|c| (c.file_id, c.message_id))).await;
+    cleanup_orphans(state, orphans).await;
 
     info!(bucket, key, parts = part_numbers.len(), size = total_size, "CompleteMultipartUpload ok");
 
@@ -768,12 +898,8 @@ async fn complete_multipart_upload(
 async fn abort_multipart_upload(state: &AppState, upload_id: &str) -> Result<Response, S3Error> {
     match state.index.abort_multipart_upload(upload_id).await? {
         None => Err(S3Error::no_such_upload(upload_id)),
-        Some((_upload, chunks)) => {
-            cleanup_unreferenced(
-                state,
-                chunks.into_iter().map(|c| (c.file_id, c.message_id)),
-            )
-            .await;
+        Some(orphans) => {
+            cleanup_orphans(state, orphans).await;
             info!(%upload_id, "AbortMultipartUpload ok");
             Ok(StatusCode::NO_CONTENT.into_response())
         }
@@ -816,7 +942,7 @@ async fn ingest_body_to_telegram(
         }
     }
 
-    if uploaded.is_empty() || !buffer.is_empty() {
+    if !buffer.is_empty() {
         let data: Bytes = std::mem::take(&mut buffer).into();
         let chunk_size = data.len() as i64;
         let filename = format!("{bucket}_{}_{part_no}.part", key.replace('/', "_"));
@@ -828,6 +954,7 @@ async fn ingest_body_to_telegram(
             .map_err(|e| S3Error::internal(e.to_string()))?;
         uploaded.push((part_no, file_id, message_id, chunk_size));
     }
+    // Empty object: no Telegram documents (Bot API rejects empty files).
 
     let etag = format!("{:x}", hasher.finalize());
     Ok((etag, total_size, uploaded))

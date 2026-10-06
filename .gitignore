@@ -1,4 +1,5 @@
 /target
+/tg3.db
 /s3gram.db
 /s3gram.db-*
 s3gram-*.db
@@ -11,3 +12,4 @@ out.bin
 *.mkv
 readme.downloaded.md
 out.md
+.cache/

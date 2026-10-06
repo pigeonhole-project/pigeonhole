@@ -135,3 +135,67 @@ pub fn copy_object_result(last_modified: &str, etag: &str) -> String {
         xml_escape(etag),
     )
 }
+
+pub fn list_versions_result(
+    bucket: &str,
+    prefix: &str,
+    max_keys: i64,
+    objects: &[ObjectMeta],
+    truncated: bool,
+) -> String {
+    let mut versions = String::new();
+    for o in objects {
+        versions.push_str(&format!(
+            "<Version><Key>{}</Key><VersionId>null</VersionId><IsLatest>true</IsLatest><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass><Owner><ID>s3gram</ID><DisplayName>s3gram</DisplayName></Owner></Version>",
+            xml_escape(&o.key),
+            xml_escape(&o.mtime),
+            xml_escape(&o.etag),
+            o.size,
+        ));
+    }
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>{}</Name>
+  <Prefix>{}</Prefix>
+  <KeyMarker></KeyMarker>
+  <VersionIdMarker></VersionIdMarker>
+  <MaxKeys>{max_keys}</MaxKeys>
+  <IsTruncated>{}</IsTruncated>
+  {versions}
+</ListVersionsResult>"#,
+        xml_escape(bucket),
+        xml_escape(prefix),
+        if truncated { "true" } else { "false" },
+    )
+}
+
+pub fn delete_objects_result(
+    deleted: &[String],
+    errors: &[(String, String)],
+    quiet: bool,
+) -> String {
+    let mut body = String::new();
+    if !quiet {
+        for key in deleted {
+            body.push_str(&format!(
+                "<Deleted><Key>{}</Key></Deleted>",
+                xml_escape(key)
+            ));
+        }
+    }
+    for (key, message) in errors {
+        body.push_str(&format!(
+            "<Error><Key>{}</Key><Code>InternalError</Code><Message>{}</Message></Error>",
+            xml_escape(key),
+            xml_escape(message),
+        ));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+{body}
+</DeleteResult>"#
+    )
+}
