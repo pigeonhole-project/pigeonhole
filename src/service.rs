@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::index::{parse_rfc3339, DeleteBucketResult, Index, OrphanMsg};
 use crate::chunker::ChunkCodec;
-use crate::ingest::{decode_chunk, ingest_stream_to_store, UploadedChunk};
+use crate::ingest::{decode_chunk_async, ingest_stream_to_store, UploadedChunk};
 use crate::storage::{BlobStore, DeleteOutcome};
 use async_trait::async_trait;
 use base64::Engine;
@@ -564,7 +564,7 @@ fn stream_object_body(
     tokio::spawn(async move {
         for slice in plan {
             let result = match store.get(&slice.file_id).await {
-                Ok(data) => match decode_chunk(data, slice.codec) {
+                Ok(data) => match decode_chunk_async(data, slice.codec).await {
                     Ok(logical) => Ok(logical.slice(slice.from..slice.to)),
                     Err(e) => Err(std::io::Error::other(e.to_string())),
                 },
@@ -1512,7 +1512,9 @@ impl S3 for S3gram {
                             .get(file_id)
                             .await
                             .map_err(Self::map_err)?;
-                        let logical = decode_chunk(data, *codec).map_err(Self::map_err)?;
+                        let logical = decode_chunk_async(data, *codec)
+                            .await
+                            .map_err(Self::map_err)?;
                         md5.update(&logical);
                     }
                     format!("{:x}", md5.finalize())

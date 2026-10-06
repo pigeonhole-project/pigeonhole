@@ -11,7 +11,6 @@ use s3gram::{build_s3_service, build_s3gram};
 use s3s::{Body, HttpError};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -26,16 +25,50 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("restore") => {
-            // `s3gram restore` → pinned manifest bootstrap
-            // `s3gram restore <file_id>` → legacy explicit handle
-            let file_id = args.next();
-            cmd_restore(file_id.as_deref()).await
+            let mut force = false;
+            let mut file_id = None;
+            for a in args {
+                match a.as_str() {
+                    "--force" | "--yes" => force = true,
+                    other if other.starts_with('-') => {
+                        bail!("unknown restore flag {other}; usage: s3gram restore [--force] [file_id]")
+                    }
+                    other => file_id = Some(other.to_string()),
+                }
+            }
+            cmd_restore(file_id.as_deref(), force).await
         }
-        Some("purge") => cmd_purge().await,
+        Some("purge") => {
+            let mut yes = false;
+            let mut expect_messages: Option<usize> = None;
+            let mut expect_chat: Option<String> = None;
+            let mut rest = args;
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--yes" => yes = true,
+                    "--expect-messages" => {
+                        let v = rest
+                            .next()
+                            .context("--expect-messages requires a number")?;
+                        expect_messages = Some(v.parse().context("--expect-messages")?);
+                    }
+                    "--expect-chat" => {
+                        expect_chat = Some(
+                            rest.next()
+                                .context("--expect-chat requires chat_id")?
+                                .to_string(),
+                        );
+                    }
+                    other => bail!(
+                        "unknown purge flag {other}; usage: s3gram purge --yes \
+                         [--expect-messages N] [--expect-chat CHAT_ID]"
+                    ),
+                }
+            }
+            cmd_purge(yes, expect_messages, expect_chat.as_deref()).await
+        }
         Some(other) => {
-            anyhow::bail!(
-                "unknown command {other:?}; usage: s3gram [restore [file_id] | purge]"
-            )
+            bail!("unknown command {other:?}; usage: s3gram [restore [--force] [file_id] | purge --yes]")
         }
         None => cmd_serve().await,
     }
@@ -55,6 +88,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
         info!(migrated, "backfilled empty chat_id from config chat_id");
     }
 
+    let limiter = cfg.chat_limiter();
     let (store, tg_for_snap): (
         Arc<dyn s3gram::storage::BlobStore>,
         Option<(TelegramClient, String)>,
@@ -70,7 +104,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
         let store = Arc::new(TelegramBlobStore::new(
             tg.clone(),
             chat_id.clone(),
-            cfg.chat_limiter(),
+            limiter.clone(),
         ));
         (store, Some((tg, chat_id)))
     };
@@ -85,6 +119,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
             s3gram.snapshot_gate.clone(),
             cfg.snapshot_interval_secs,
             cfg.chunk_size,
+            limiter,
         );
         snapshot::spawn_pending_deletes(index, store);
     }
@@ -109,8 +144,11 @@ async fn cmd_serve() -> anyhow::Result<()> {
 }
 
 /// Delete every Telegram message tracked by the local index, then wipe SQLite.
-/// Intended for a stopped server. Refuses `memory = true`.
-async fn cmd_purge() -> anyhow::Result<()> {
+async fn cmd_purge(
+    yes: bool,
+    expect_messages: Option<usize>,
+    expect_chat: Option<&str>,
+) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     if cfg.memory_store {
         bail!("refuse to purge when memory = true");
@@ -122,7 +160,8 @@ async fn cmd_purge() -> anyhow::Result<()> {
     tg.ensure_chat_admin(&cfg.chat_id)
         .await
         .context("chat_id access check")?;
-    let store = TelegramBlobStore::new(tg.clone(), cfg.chat_id.clone(), cfg.chat_limiter());
+    let limiter = cfg.chat_limiter();
+    let store = TelegramBlobStore::new(tg.clone(), cfg.chat_id.clone(), limiter);
 
     let mut ids: BTreeSet<i64> = index
         .list_tracked_message_ids()
@@ -131,7 +170,6 @@ async fn cmd_purge() -> anyhow::Result<()> {
         .into_iter()
         .collect();
 
-    // Snapshot meta may reference messages not present in blobs (e.g. manifest-only).
     if let Some(raw) = index.get_meta("snapshot_message_id").await? {
         if let Ok(id) = raw.parse::<i64>() {
             ids.insert(id);
@@ -146,7 +184,6 @@ async fn cmd_purge() -> anyhow::Result<()> {
             }
         }
     }
-    // Also collect the currently pinned bootstrap pointer (if any).
     if let Ok(Some(pinned)) = tg.get_pinned_content(&cfg.chat_id).await {
         match pinned {
             s3gram::telegram::PinnedContent::Text { message_id, text } => {
@@ -163,11 +200,42 @@ async fn cmd_purge() -> anyhow::Result<()> {
         }
     }
 
+    let objects = index.count_objects().await.unwrap_or(0);
+    let buckets = index.count_buckets().await.unwrap_or(0);
     info!(
         chat_id = %cfg.chat_id,
         messages = ids.len(),
-        "purging Telegram messages tracked by the index"
+        objects,
+        buckets,
+        "purge plan"
     );
+
+    if let Some(expected) = expect_chat {
+        if expected != cfg.chat_id {
+            bail!(
+                "--expect-chat mismatch: config chat_id={} got {expected}",
+                cfg.chat_id
+            );
+        }
+    }
+    if let Some(n) = expect_messages {
+        if n != ids.len() {
+            bail!(
+                "--expect-messages mismatch: planned {} deletes, expected {n}",
+                ids.len()
+            );
+        }
+    }
+    if !yes {
+        bail!(
+            "refusing to purge {} Telegram messages (chat_id={}, objects={objects}). \
+             Re-run with: s3gram purge --yes [--expect-chat {}] [--expect-messages {}]",
+            ids.len(),
+            cfg.chat_id,
+            cfg.chat_id,
+            ids.len()
+        );
+    }
 
     let mut deleted = 0u64;
     let mut gone = 0u64;
@@ -185,8 +253,6 @@ async fn cmd_purge() -> anyhow::Result<()> {
                 warn!(error = %e, message_id, "deleteMessage error");
             }
         }
-        // Stay under Bot API flood limits on large indexes.
-        tokio::time::sleep(Duration::from_millis(40)).await;
     }
 
     index.wipe_all().await.context("wipe sqlite index")?;
@@ -203,41 +269,62 @@ async fn cmd_purge() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Restore the SQLite index from Telegram.
-/// - `None` → bootstrap from pinned manifest (`getChat` → pin → parts)
-/// - `Some(file_id)` → legacy explicit document / manifest handle
-async fn cmd_restore(file_id: Option<&str>) -> anyhow::Result<()> {
+async fn cmd_restore(file_id: Option<&str>, force: bool) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     let index = Index::connect(&cfg.database_url)
         .await
         .context("open index")?;
+    if index.has_data().await.context("check index")? && !force {
+        bail!(
+            "index is not empty (buckets={}, objects={}); pass --force to overwrite",
+            index.count_buckets().await.unwrap_or(0),
+            index.count_objects().await.unwrap_or(0)
+        );
+    }
     let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
     tg.ensure_chat_admin(&cfg.chat_id)
         .await
         .context("chat_id access check")?;
-    let store = TelegramBlobStore::new(tg.clone(), cfg.chat_id.clone(), cfg.chat_limiter());
+    let limiter = cfg.chat_limiter();
+    let store = TelegramBlobStore::new(tg.clone(), cfg.chat_id.clone(), limiter);
 
-    let bytes = if let Some(fid) = file_id {
+    if let Some(fid) = file_id {
         info!(%fid, "downloading snapshot by file_id");
-        snapshot::download_snapshot_bytes(&store, &index, Some(fid))
+        let bytes = snapshot::download_snapshot_bytes(&store, &index, Some(fid))
             .await
-            .context("download snapshot")?
+            .context("download snapshot")?;
+        let snap: IndexSnapshot =
+            serde_json::from_slice(&bytes).context("parse snapshot JSON")?;
+        index
+            .import_snapshot(&snap)
+            .await
+            .context("import snapshot")?;
+        info!(
+            buckets = snap.buckets.len(),
+            objects = snap.objects.len(),
+            "index restored from snapshot"
+        );
     } else {
         info!(chat_id = %cfg.chat_id, "bootstrapping snapshot from pinned manifest");
-        snapshot::download_from_pinned(&tg, &cfg.chat_id, &store)
+        let restored = snapshot::download_from_pinned(&tg, &cfg.chat_id, &store)
             .await
-            .context("download from pin")?
-    };
-    let snap: IndexSnapshot = serde_json::from_slice(&bytes).context("parse snapshot JSON")?;
-    index
-        .import_snapshot(&snap)
-        .await
-        .context("import snapshot")?;
-    info!(
-        buckets = snap.buckets.len(),
-        objects = snap.objects.len(),
-        "index restored from snapshot"
-    );
+            .context("download from pin")?;
+        let snap: IndexSnapshot =
+            serde_json::from_slice(&restored.bytes).context("parse snapshot JSON")?;
+        index
+            .import_snapshot(&snap)
+            .await
+            .context("import snapshot")?;
+        snapshot::record_restored_pin(&index, &restored)
+            .await
+            .context("record restored pin meta")?;
+        info!(
+            buckets = snap.buckets.len(),
+            objects = snap.objects.len(),
+            generation = restored.manifest.generation,
+            "index restored from pinned snapshot"
+        );
+    }
     Ok(())
 }
 
@@ -245,6 +332,6 @@ async fn handle_s3_error(err: HttpError) -> Response<Body> {
     tracing::error!(?err, "s3s HTTP error");
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(Body::from("Internal Server Error".to_string()))
-        .unwrap()
+        .body(Body::from(err.to_string()))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }

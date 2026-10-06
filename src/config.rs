@@ -1,39 +1,32 @@
 use crate::chunker::{self, ChunkCodec};
-use crate::rate_limit::ChatLimiter;
+use crate::rate_limit::{ChatLimiter, ChatLimiterConfig};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Runtime config: non-secrets from TOML, secrets from environment / `.env`.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bot_token: String,
-    /// Single Telegram chat/channel where all object blobs and snapshots live.
     pub chat_id: String,
     pub listen_addr: String,
     pub database_url: String,
     pub access_key: String,
     pub secret_key: String,
     pub region: String,
-    /// Seconds between automatic index snapshots. `0` disables.
     pub snapshot_interval_secs: u64,
-    /// Logical object/snapshot part size in bytes. Must be `< 20 MiB`.
+    /// Max on-wire chunk size in bytes (`< 20 MiB`).
     pub chunk_size: usize,
-    /// Encoding policy for new object chunks.
     pub chunk_codec: ChunkCodec,
-    pub tg_rate_per_sec: f64,
-    pub tg_rate_burst: f64,
-    pub tg_upload_concurrency: usize,
-    /// Use in-memory BlobStore (no Telegram). For local s3-tests / CI.
+    pub tg: ChatLimiterConfig,
     pub memory_store: bool,
-    /// Path the TOML was loaded from (for logs).
     pub config_path: PathBuf,
 }
 
 impl Config {
-    /// Load `S3GRAM_CONFIG` or `./s3gram.toml`, then secrets from the environment.
     pub fn load() -> Result<Self> {
         let _ = dotenvy::dotenv();
         let path = config_path_from_env();
@@ -82,15 +75,15 @@ impl Config {
         chunker::validate_chunk_size(chunk_size).context("chunk.size")?;
         let chunk_codec = file.chunk.codec;
 
-        let tg = file.telegram;
-        if tg.rate_per_sec <= 0.0 {
-            bail!("telegram.rate_per_sec must be > 0");
+        let tg = file.telegram.into_limiter_config();
+        if tg.send_rate_per_sec <= 0.0
+            || tg.get_file_rate_per_sec <= 0.0
+            || tg.delete_rate_per_sec <= 0.0
+        {
+            bail!("telegram.*_rate_per_sec must be > 0");
         }
-        if tg.rate_burst < 1.0 {
-            bail!("telegram.rate_burst must be >= 1");
-        }
-        if tg.upload_concurrency == 0 {
-            bail!("telegram.upload_concurrency must be >= 1");
+        if tg.upload_concurrency == 0 || tg.download_concurrency == 0 {
+            bail!("telegram upload/download concurrency must be >= 1");
         }
 
         Ok(Self {
@@ -104,15 +97,12 @@ impl Config {
             snapshot_interval_secs: file.snapshot.interval_secs,
             chunk_size,
             chunk_codec,
-            tg_rate_per_sec: tg.rate_per_sec,
-            tg_rate_burst: tg.rate_burst,
-            tg_upload_concurrency: tg.upload_concurrency,
+            tg,
             memory_store,
             config_path,
         })
     }
 
-    /// Config for in-process tests (no Telegram / files required).
     pub fn for_test(database_url: &str) -> Self {
         Self {
             bot_token: "test-token".into(),
@@ -124,21 +114,24 @@ impl Config {
             region: "us-east-1".into(),
             snapshot_interval_secs: 0,
             chunk_size: chunker::DEFAULT_CHUNK_SIZE,
-            chunk_codec: ChunkCodec::Gzip,
-            tg_rate_per_sec: 1000.0,
-            tg_rate_burst: 100.0,
-            tg_upload_concurrency: 8,
+            chunk_codec: ChunkCodec::Zstd,
+            tg: ChatLimiterConfig {
+                send_rate_per_sec: 1000.0,
+                send_burst: 100.0,
+                get_file_rate_per_sec: 1000.0,
+                get_file_burst: 100.0,
+                delete_rate_per_sec: 1000.0,
+                delete_burst: 100.0,
+                upload_concurrency: 8,
+                download_concurrency: 8,
+            },
             memory_store: true,
             config_path: PathBuf::from("(test)"),
         }
     }
 
-    pub fn chat_limiter(&self) -> ChatLimiter {
-        ChatLimiter::new(
-            self.tg_rate_per_sec,
-            self.tg_rate_burst,
-            self.tg_upload_concurrency,
-        )
+    pub fn chat_limiter(&self) -> Arc<ChatLimiter> {
+        Arc::new(ChatLimiter::new(self.tg.clone()))
     }
 }
 
@@ -209,7 +202,7 @@ impl Default for FileChunk {
     fn default() -> Self {
         Self {
             size: chunker::DEFAULT_CHUNK_SIZE,
-            codec: ChunkCodec::Gzip,
+            codec: ChunkCodec::Zstd,
         }
     }
 }
@@ -217,17 +210,59 @@ impl Default for FileChunk {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct FileTelegram {
-    rate_per_sec: f64,
-    rate_burst: f64,
+    /// Legacy alias for `send_rate_per_sec`.
+    rate_per_sec: Option<f64>,
+    rate_burst: Option<f64>,
+    send_rate_per_sec: Option<f64>,
+    send_burst: Option<f64>,
+    get_file_rate_per_sec: Option<f64>,
+    get_file_burst: Option<f64>,
+    delete_rate_per_sec: Option<f64>,
+    delete_burst: Option<f64>,
     upload_concurrency: usize,
+    download_concurrency: usize,
 }
 
 impl Default for FileTelegram {
     fn default() -> Self {
+        let d = ChatLimiterConfig::default();
         Self {
-            rate_per_sec: 0.5,
-            rate_burst: 3.0,
-            upload_concurrency: 2,
+            rate_per_sec: None,
+            rate_burst: None,
+            send_rate_per_sec: None,
+            send_burst: None,
+            get_file_rate_per_sec: None,
+            get_file_burst: None,
+            delete_rate_per_sec: None,
+            delete_burst: None,
+            upload_concurrency: d.upload_concurrency,
+            download_concurrency: d.download_concurrency,
+        }
+    }
+}
+
+impl FileTelegram {
+    fn into_limiter_config(self) -> ChatLimiterConfig {
+        let d = ChatLimiterConfig::default();
+        ChatLimiterConfig {
+            send_rate_per_sec: self
+                .send_rate_per_sec
+                .or(self.rate_per_sec)
+                .unwrap_or(d.send_rate_per_sec),
+            send_burst: self
+                .send_burst
+                .or(self.rate_burst)
+                .unwrap_or(d.send_burst),
+            get_file_rate_per_sec: self
+                .get_file_rate_per_sec
+                .unwrap_or(d.get_file_rate_per_sec),
+            get_file_burst: self.get_file_burst.unwrap_or(d.get_file_burst),
+            delete_rate_per_sec: self
+                .delete_rate_per_sec
+                .unwrap_or(d.delete_rate_per_sec),
+            delete_burst: self.delete_burst.unwrap_or(d.delete_burst),
+            upload_concurrency: self.upload_concurrency.max(1),
+            download_concurrency: self.download_concurrency.max(1),
         }
     }
 }
@@ -252,18 +287,37 @@ interval_secs = 0
 size = 1024
 codec = "raw"
 [telegram]
-rate_per_sec = 1.0
-rate_burst = 2.0
+send_rate_per_sec = 1.0
+send_burst = 2.0
+get_file_rate_per_sec = 20.0
 upload_concurrency = 4
 "#
         )
         .unwrap();
-        // memory mode does not require BOT_TOKEN
         let cfg = Config::load_from_path(f.path()).unwrap();
         assert!(cfg.memory_store);
         assert_eq!(cfg.chunk_size, 1024);
         assert_eq!(cfg.chunk_codec, ChunkCodec::Raw);
-        assert_eq!(cfg.snapshot_interval_secs, 0);
-        assert_eq!(cfg.tg_upload_concurrency, 4);
+        assert_eq!(cfg.tg.send_rate_per_sec, 1.0);
+        assert_eq!(cfg.tg.get_file_rate_per_sec, 20.0);
+        assert_eq!(cfg.tg.upload_concurrency, 4);
+    }
+
+    #[test]
+    fn legacy_rate_per_sec_maps_to_send() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"
+memory = true
+[telegram]
+rate_per_sec = 0.25
+rate_burst = 2.0
+"#
+        )
+        .unwrap();
+        let cfg = Config::load_from_path(f.path()).unwrap();
+        assert_eq!(cfg.tg.send_rate_per_sec, 0.25);
+        assert_eq!(cfg.tg.send_burst, 2.0);
     }
 }

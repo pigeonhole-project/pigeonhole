@@ -1,24 +1,31 @@
-//! Telegram getFile is limited to 20 MiB; object/snapshot chunks must stay below that.
+//! Telegram getFile is limited to 20 MiB; on-wire chunk payloads must stay below that.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 /// Hard ceiling: stored payload must be downloadable via getFile (< 20 MiB).
 pub const MAX_CHUNK_SIZE: usize = 20 * 1024 * 1024 - 1;
-/// Default logical chunk size (safety margin under the getFile limit).
+/// Default max **stored** (on-wire) chunk size.
 pub const DEFAULT_CHUNK_SIZE: usize = 19 * 1024 * 1024;
+/// Probe window before committing to compression for a chunk.
+pub const COMPRESS_PROBE_BYTES: usize = 128 * 1024;
+/// Leave headroom under `chunk.size` so a final encode frame fits.
+pub const COMPRESS_SIZE_MARGIN: usize = 256 * 1024;
 
 /// How new object chunks are encoded before `sendDocument`.
 ///
-/// Stored per-chunk codec may still be `raw` under `Gzip` when gzip does not shrink.
+/// Stored per-chunk codec may still be `raw` under a compress policy when the
+/// probe shows no gain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChunkCodec {
     /// Store bytes as-is (no compression attempt).
     Raw,
-    /// Opportunistic gzip: keep gzip only when strictly smaller than raw.
-    #[default]
+    /// Opportunistic gzip (legacy). Prefer [`ChunkCodec::Zstd`].
     Gzip,
+    /// Opportunistic zstd (level 1); keep only when it shrinks.
+    #[default]
+    Zstd,
 }
 
 impl ChunkCodec {
@@ -26,6 +33,7 @@ impl ChunkCodec {
         match self {
             Self::Raw => "raw",
             Self::Gzip => "gzip",
+            Self::Zstd => "zstd",
         }
     }
 
@@ -33,8 +41,13 @@ impl ChunkCodec {
         match s.trim().to_ascii_lowercase().as_str() {
             "raw" | "none" | "off" => Ok(Self::Raw),
             "gzip" | "gz" => Ok(Self::Gzip),
-            other => bail!("unknown chunk codec {other:?}; expected raw|gzip"),
+            "zstd" | "zst" => Ok(Self::Zstd),
+            other => bail!("unknown chunk codec {other:?}; expected raw|gzip|zstd"),
         }
+    }
+
+    pub fn is_compressing(self) -> bool {
+        matches!(self, Self::Gzip | Self::Zstd)
     }
 }
 
@@ -56,6 +69,13 @@ pub fn validate_chunk_size(n: usize) -> Result<()> {
     Ok(())
 }
 
+/// Target compressed/raw fill size: stay under `chunk_size` with a safety margin.
+pub fn fill_target(chunk_size: usize) -> usize {
+    let capped = chunk_size.min(MAX_CHUNK_SIZE).max(1024);
+    let margin = COMPRESS_SIZE_MARGIN.min(capped / 8).max(256);
+    capped.saturating_sub(margin).max(1024).min(capped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,7 +95,8 @@ mod tests {
     fn codec_parse() {
         assert_eq!(ChunkCodec::parse("raw").unwrap(), ChunkCodec::Raw);
         assert_eq!(ChunkCodec::parse("GZIP").unwrap(), ChunkCodec::Gzip);
+        assert_eq!(ChunkCodec::parse("zstd").unwrap(), ChunkCodec::Zstd);
         assert_eq!(ChunkCodec::parse("none").unwrap(), ChunkCodec::Raw);
-        assert!(ChunkCodec::parse("zstd").is_err());
+        assert!(ChunkCodec::parse("lz4").is_err());
     }
 }

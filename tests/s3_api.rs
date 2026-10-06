@@ -159,7 +159,7 @@ async fn compressible_object_roundtrip_and_snapshot_flag() {
         .await
         .unwrap();
     assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].codec, "gzip");
+    assert_eq!(chunks[0].codec, "zstd");
     assert_eq!(chunks[0].size, data.len() as i64);
     let stored = mem.get(&chunks[0].file_id).await.unwrap();
     assert!(stored.len() < data.len());
@@ -181,7 +181,7 @@ async fn compressible_object_roundtrip_and_snapshot_flag() {
         .iter()
         .find(|c| c.key == "zeros.bin")
         .unwrap();
-    assert_eq!(sc.codec, "gzip");
+    assert_eq!(sc.codec, "zstd");
 }
 
 #[tokio::test]

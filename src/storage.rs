@@ -9,12 +9,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Backend that stores object chunk bytes (Telegram documents or a test double).
 #[async_trait]
 pub trait BlobStore: Send + Sync {
-    /// Upload bytes → (`file_id`, `message_id`). Rejects empty payloads (Telegram cannot).
     async fn put(
         &self,
         data: Bytes,
@@ -31,11 +30,11 @@ pub trait BlobStore: Send + Sync {
 pub struct TelegramBlobStore {
     tg: TelegramClient,
     chat_id: String,
-    limiter: ChatLimiter,
+    limiter: Arc<ChatLimiter>,
 }
 
 impl TelegramBlobStore {
-    pub fn new(tg: TelegramClient, chat_id: String, limiter: ChatLimiter) -> Self {
+    pub fn new(tg: TelegramClient, chat_id: String, limiter: Arc<ChatLimiter>) -> Self {
         Self {
             tg,
             chat_id,
@@ -50,6 +49,10 @@ impl TelegramBlobStore {
     pub fn client(&self) -> &TelegramClient {
         &self.tg
     }
+
+    pub fn limiter(&self) -> &ChatLimiter {
+        &self.limiter
+    }
 }
 
 #[async_trait]
@@ -63,7 +66,6 @@ impl BlobStore for TelegramBlobStore {
         if data.is_empty() {
             bail!("refusing empty blob upload (Telegram rejects empty documents)");
         }
-        // Cap parallel sendDocument; token bucket + 429 cool-down are inside send_document.
         let _upload = self.limiter.acquire_upload().await;
         self.tg
             .send_document(
@@ -71,20 +73,20 @@ impl BlobStore for TelegramBlobStore {
                 data,
                 filename,
                 caption,
-                Some(&self.limiter),
+                Some(self.limiter.as_ref()),
             )
             .await
     }
 
     async fn get(&self, file_id: &str) -> Result<Bytes> {
         self.tg
-            .download_file(file_id, Some(&self.limiter))
+            .download_file(file_id, Some(self.limiter.as_ref()))
             .await
     }
 
     async fn delete_message(&self, message_id: i64) -> Result<DeleteOutcome> {
         self.tg
-            .delete_message(&self.chat_id, message_id, Some(&self.limiter))
+            .delete_message(&self.chat_id, message_id, Some(self.limiter.as_ref()))
             .await
     }
 }
@@ -94,7 +96,6 @@ pub struct MemoryBlobStore {
     next_msg: AtomicI64,
     next_fid: AtomicU64,
     files: Mutex<HashMap<String, Bytes>>,
-    /// message_id → file_id
     messages: Mutex<HashMap<i64, String>>,
 }
 

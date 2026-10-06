@@ -123,7 +123,7 @@ CONFIG_OUT="$CFG" \
 export S3GRAM_CONFIG="$CFG"
 
 log_step "purge Telegram + wipe index"
-./target/release/s3gram purge 2>&1 | tee -a "$REPORT"
+./target/release/s3gram purge --yes --expect-chat "$CHAT_ID" 2>&1 | tee -a "$REPORT"
 
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-s3gram}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-s3gramsecret}"

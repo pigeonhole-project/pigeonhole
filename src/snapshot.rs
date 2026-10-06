@@ -5,6 +5,7 @@
 
 use crate::chunker;
 use crate::index::Index;
+use crate::rate_limit::ChatLimiter;
 use crate::storage::{BlobStore, DeleteOutcome};
 use crate::telegram::{PinnedContent, TelegramClient};
 use anyhow::{bail, Context, Result};
@@ -116,6 +117,7 @@ pub async fn push_if_changed(
     tg: &TelegramClient,
     chat_id: &str,
     chunk_size: usize,
+    limiter: &ChatLimiter,
 ) -> Result<PushOutcome> {
     let max_part = chunk_size.clamp(1, chunker::MAX_CHUNK_SIZE);
     let snap = index.export_snapshot().await.context("export snapshot")?;
@@ -178,7 +180,7 @@ pub async fn push_if_changed(
     // tiny document if the JSON ever exceeds Telegram's text limit.
     let (manifest_message_id, manifest_file_id) = if manifest_body.len() <= TG_TEXT_MAX {
         let mid = tg
-            .send_message(chat_id, &manifest_body)
+            .send_message(chat_id, &manifest_body, Some(limiter))
             .await
             .context("send pin manifest text")?;
         (mid, String::new())
@@ -195,7 +197,7 @@ pub async fn push_if_changed(
     };
 
     // Atomic-ish pointer swap: pin new, then unpin/delete old.
-    tg.pin_chat_message(chat_id, manifest_message_id)
+    tg.pin_chat_message(chat_id, manifest_message_id, Some(limiter))
         .await
         .context("pin new snapshot manifest")?;
 
@@ -203,7 +205,7 @@ pub async fn push_if_changed(
         if parts.iter().any(|p| p.message_id == *old_id) || *old_id == manifest_message_id {
             continue;
         }
-        if let Err(e) = tg.unpin_chat_message(chat_id, *old_id).await {
+        if let Err(e) = tg.unpin_chat_message(chat_id, *old_id, Some(limiter)).await {
             debug_unpin_err(*old_id, &e);
         }
         match store.delete_message(*old_id).await {
@@ -303,22 +305,30 @@ fn verify_sha256(json: &[u8], expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
+/// Result of bootstrapping from the chat pin (bytes + pointer to record in meta).
+pub struct PinnedRestore {
+    pub bytes: Vec<u8>,
+    pub manifest_message_id: i64,
+    pub manifest_file_id: String,
+    pub manifest: PinManifest,
+}
+
 /// Bootstrap from the chat's pinned manifest (no local meta / file_id required).
 pub async fn download_from_pinned(
     tg: &TelegramClient,
     chat_id: &str,
     store: &dyn BlobStore,
-) -> Result<Vec<u8>> {
+) -> Result<PinnedRestore> {
     let pinned = tg
         .get_pinned_content(chat_id)
         .await
         .context("get pinned content")?
         .ok_or_else(|| anyhow::anyhow!("chat {chat_id} has no pinned message (run a snapshot first)"))?;
 
-    let manifest = match pinned {
+    let (manifest_message_id, manifest_file_id, manifest, legacy_bytes) = match pinned {
         PinnedContent::Text { text, message_id } => {
             info!(message_id, "using pinned text manifest");
-            parse_pin_manifest(&text)?
+            (message_id, String::new(), parse_pin_manifest(&text)?, None)
         }
         PinnedContent::Document {
             file_id,
@@ -326,28 +336,53 @@ pub async fn download_from_pinned(
         } => {
             info!(message_id, %file_id, "using pinned document manifest");
             let data = store.get(&file_id).await.context("download pinned manifest")?;
-            // New pin manifest JSON, or legacy doc manifest.
             if let Ok(m) = serde_json::from_slice::<PinManifest>(&data) {
                 if m.format == PIN_MANIFEST_FORMAT {
-                    m
+                    (message_id, file_id, m, None)
                 } else {
                     bail!("unsupported pinned manifest format {}", m.format);
                 }
             } else if let Ok(legacy) = serde_json::from_slice::<LegacyDocManifest>(&data) {
-                PinManifest {
-                    format: PIN_MANIFEST_FORMAT,
-                    generation: 0,
-                    created_at: String::new(),
-                    sha256: legacy.hash,
-                    index_bytes: 0,
-                    parts: legacy.parts,
-                }
+                (
+                    message_id,
+                    file_id,
+                    PinManifest {
+                        format: PIN_MANIFEST_FORMAT,
+                        generation: 0,
+                        created_at: String::new(),
+                        sha256: legacy.hash,
+                        index_bytes: 0,
+                        parts: legacy.parts,
+                    },
+                    None,
+                )
             } else {
                 // Single gzip document pinned (very old) — treat as payload.
-                return gunzip_bytes(&data);
+                (
+                    message_id,
+                    file_id,
+                    PinManifest {
+                        format: PIN_MANIFEST_FORMAT,
+                        generation: 0,
+                        created_at: String::new(),
+                        sha256: String::new(),
+                        index_bytes: 0,
+                        parts: Vec::new(),
+                    },
+                    Some(gunzip_bytes(&data)?),
+                )
             }
         }
     };
+
+    if let Some(bytes) = legacy_bytes {
+        return Ok(PinnedRestore {
+            bytes,
+            manifest_message_id,
+            manifest_file_id,
+            manifest,
+        });
+    }
 
     info!(
         generation = manifest.generation,
@@ -358,7 +393,42 @@ pub async fn download_from_pinned(
     if manifest.sha256.len() == 64 {
         verify_sha256(&json, &manifest.sha256)?;
     }
-    Ok(json)
+    Ok(PinnedRestore {
+        bytes: json,
+        manifest_message_id,
+        manifest_file_id,
+        manifest,
+    })
+}
+
+/// Persist pin pointer so the next `push_if_changed` can unpin/delete this generation.
+pub async fn record_restored_pin(index: &Index, restored: &PinnedRestore) -> Result<()> {
+    let parts_json = serde_json::to_string(&restored.manifest.parts)?;
+    if !restored.manifest.sha256.is_empty() {
+        index.set_meta(META_HASH, &restored.manifest.sha256).await?;
+    }
+    index
+        .set_meta(META_MESSAGE_ID, &restored.manifest_message_id.to_string())
+        .await?;
+    let file_id = if restored.manifest_file_id.is_empty() {
+        restored
+            .manifest
+            .parts
+            .first()
+            .map(|p| p.file_id.as_str())
+            .unwrap_or("")
+    } else {
+        restored.manifest_file_id.as_str()
+    };
+    index.set_meta(META_FILE_ID, file_id).await?;
+    index.set_meta(META_PARTS, &parts_json).await?;
+    index
+        .set_meta(
+            META_GENERATION,
+            &restored.manifest.generation.to_string(),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Download snapshot bytes.
@@ -423,6 +493,7 @@ pub fn spawn_periodic(
     gate: Arc<Mutex<()>>,
     interval_secs: u64,
     chunk_size: usize,
+    limiter: Arc<ChatLimiter>,
 ) {
     if interval_secs == 0 {
         info!("periodic index snapshots disabled (snapshot.interval_secs=0)");
@@ -437,7 +508,16 @@ pub fn spawn_periodic(
         loop {
             tokio::time::sleep(period).await;
             let _guard = gate.lock().await;
-            match push_if_changed(&index, store.as_ref(), &tg, &chat_id, chunk_size).await {
+            match push_if_changed(
+                &index,
+                store.as_ref(),
+                &tg,
+                &chat_id,
+                chunk_size,
+                limiter.as_ref(),
+            )
+            .await
+            {
                 Ok(PushOutcome::Unchanged { .. }) => {
                     tracing::debug!("index snapshot unchanged, skip upload");
                 }

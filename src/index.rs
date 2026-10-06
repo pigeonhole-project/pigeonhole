@@ -37,7 +37,7 @@ pub struct Chunk {
     pub message_id: i64,
     /// Logical (uncompressed) byte length of this slice.
     pub size: i64,
-    /// On-wire encoding of the Telegram document: `raw` or `gzip`.
+    /// On-wire encoding of the Telegram document: `raw`, `gzip`, or `zstd`.
     pub codec: String,
 }
 
@@ -1136,6 +1136,25 @@ impl Index {
         ids.sort_unstable();
         ids.dedup();
         Ok(ids)
+    }
+
+    pub async fn count_objects(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM objects")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
+    pub async fn count_buckets(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM buckets")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
+    /// True when the index has any buckets or objects (unsafe to silent-overwrite).
+    pub async fn has_data(&self) -> Result<bool> {
+        Ok(self.count_buckets().await? > 0 || self.count_objects().await? > 0)
     }
 
     /// Wipe all S3/index state. Does not touch Telegram; call after deleting tracked messages.

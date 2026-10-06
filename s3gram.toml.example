@@ -5,7 +5,9 @@
 #
 # Override path with S3GRAM_CONFIG=/path/to.toml
 
-# Telegram chat/channel for blobs + index snapshots (bot must be admin).
+# Telegram chat/channel for blobs + index snapshots (bot must be admin with pin rights).
+# Channels: enable "Edit messages". Groups: enable "Pin messages".
+# Pinning in groups also posts a service message.
 chat_id = "-1001234567890"
 
 listen_addr = "0.0.0.0:8333"
@@ -20,15 +22,20 @@ memory = false
 interval_secs = 300
 
 [chunk]
-# Logical chunk size in bytes (also splits large index snapshots).
-# Must be < 20 MiB (Telegram getFile limit). Default 19 MiB.
+# Max on-wire chunk size in bytes (Telegram getFile < 20 MiB). Default 19 MiB.
+# With codec zstd/gzip, a chunk is filled until *compressed* output approaches this size.
 size = 19922944
-# Encoding policy for new object chunks: "raw" | "gzip"
-# gzip keeps compression only when the payload shrinks.
-codec = "gzip"
+# Encoding for new object chunks: "raw" | "gzip" | "zstd" (default zstd).
+codec = "zstd"
 
 [telegram]
-# Shared Bot API rate limit (token bucket + upload semaphore).
-rate_per_sec = 0.5
-rate_burst = 3.0
+# Separate Bot API budgets (sends must not starve reads / deletes).
+send_rate_per_sec = 0.5
+send_burst = 3.0
+get_file_rate_per_sec = 15.0
+get_file_burst = 30.0
+delete_rate_per_sec = 1.0
+delete_burst = 5.0
 upload_concurrency = 2
+download_concurrency = 8
+# Legacy aliases (map to send_*): rate_per_sec, rate_burst

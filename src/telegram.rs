@@ -1,15 +1,24 @@
 use crate::rate_limit::ChatLimiter;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
+use lru::LruCache;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::debug;
+
+/// Telegram `file_path` from `getFile` is reusable for ~1h; cache to avoid
+/// metering every chunk download against the getFile budget.
+const FILE_PATH_CACHE_CAP: usize = 4096;
 
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
     bot_token: String,
+    /// Shared across clones (`TelegramBlobStore` / snapshot workers).
+    file_paths: Arc<Mutex<LruCache<String, String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +42,11 @@ enum SendErr {
     /// Safe to retry: connection never established.
     Connect(anyhow::Error),
     Fatal(anyhow::Error),
+}
+
+enum DownloadErr {
+    RetryAfter(u64, anyhow::Error),
+    Other(anyhow::Error),
 }
 
 /// Result of deleteMessage: Gone/Deleted both mean the message is no longer present.
@@ -81,12 +95,41 @@ struct FilePath {
     file_path: String,
 }
 
+fn is_cdn_path_stale(err: &anyhow::Error) -> bool {
+    let s = err.to_string();
+    s.contains("404") || s.contains("410") || s.contains("403")
+}
+
 impl TelegramClient {
     pub fn new(bot_token: String) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
-        Ok(Self { http, bot_token })
+        let cap = NonZeroUsize::new(FILE_PATH_CACHE_CAP).unwrap();
+        Ok(Self {
+            http,
+            bot_token,
+            file_paths: Arc::new(Mutex::new(LruCache::new(cap))),
+        })
+    }
+
+    fn cached_file_path(&self, file_id: &str) -> Option<String> {
+        self.file_paths
+            .lock()
+            .unwrap()
+            .get(file_id)
+            .cloned()
+    }
+
+    fn remember_file_path(&self, file_id: &str, path: &str) {
+        self.file_paths
+            .lock()
+            .unwrap()
+            .put(file_id.to_string(), path.to_string());
+    }
+
+    fn forget_file_path(&self, file_id: &str) {
+        self.file_paths.lock().unwrap().pop(file_id);
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -100,9 +143,7 @@ impl TelegramClient {
         )
     }
 
-    /// Upload a document. When `limiter` is set, request budget and 429 cool-down
-    /// are shared across the process (see [`ChatLimiter`]); otherwise each call
-    /// sleeps `retry_after` independently (legacy / one-off tools).
+    /// Upload a document. Uses the **send** budget when `limiter` is set.
     pub async fn send_document(
         &self,
         chat_id: &str,
@@ -116,7 +157,7 @@ impl TelegramClient {
         let mut last_err = None;
         for attempt in 0..5u32 {
             if let Some(lim) = limiter {
-                lim.acquire().await;
+                lim.acquire_send().await;
             }
             match self
                 .send_document_once(chat_id, data.clone(), filename, caption)
@@ -132,7 +173,7 @@ impl TelegramClient {
                     debug!(attempt, secs, error = %e, "sendDocument rate-limited");
                     last_err = Some(e);
                     if let Some(lim) = limiter {
-                        lim.penalize(Duration::from_secs(secs.max(1)));
+                        lim.penalize_send(Duration::from_secs(secs.max(1)));
                     } else {
                         tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
                     }
@@ -230,51 +271,135 @@ impl TelegramClient {
         Ok((doc.file_id, msg.message_id))
     }
 
+    /// Resolve `file_id` via `getFile` (getFile budget) then download bytes from the
+    /// CDN (download semaphore only — not API-metered).
+    ///
+    /// `file_path` is LRU-cached so repeated reads of the same chunk do not spend
+    /// another getFile token. Stale paths are dropped on CDN 4xx and re-resolved.
     pub async fn download_file(
         &self,
         file_id: &str,
         limiter: Option<&ChatLimiter>,
     ) -> Result<Bytes> {
         let mut last_err = None;
+        let mut force_refresh = false;
         for attempt in 0..5u32 {
-            if let Some(lim) = limiter {
-                lim.acquire().await;
-            }
-            match self.download_file_once(file_id).await {
-                Ok(v) => return Ok(v),
-                Err(e) => {
+            let path = match self
+                .resolve_file_path_cached(file_id, limiter, force_refresh)
+                .await
+            {
+                Ok(p) => p,
+                Err(DownloadErr::RetryAfter(secs, e)) => {
+                    debug!(attempt, secs, error = %e, "getFile rate-limited");
+                    last_err = Some(e);
+                    if let Some(lim) = limiter {
+                        lim.penalize_get_file(Duration::from_secs(secs.max(1)));
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
+                    }
+                    continue;
+                }
+                Err(DownloadErr::Other(e)) => {
                     let wait = Duration::from_millis(200 * 2u64.pow(attempt));
                     debug!(attempt, ?wait, error = %e, "getFile retry");
                     last_err = Some(e);
                     tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+
+            let _dl = if let Some(lim) = limiter {
+                Some(lim.acquire_download().await)
+            } else {
+                None
+            };
+            match self.download_cdn_bytes(&path).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let stale = is_cdn_path_stale(&e);
+                    if stale {
+                        self.forget_file_path(file_id);
+                        force_refresh = true;
+                        debug!(attempt, error = %e, "CDN path stale; refreshing getFile");
+                    } else {
+                        force_refresh = false;
+                        let wait = Duration::from_millis(200 * 2u64.pow(attempt));
+                        debug!(attempt, ?wait, error = %e, "file CDN download retry");
+                        tokio::time::sleep(wait).await;
+                    }
+                    last_err = Some(e);
                 }
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow!("download failed")))
     }
 
-    async fn download_file_once(&self, file_id: &str) -> Result<Bytes> {
+    async fn resolve_file_path_cached(
+        &self,
+        file_id: &str,
+        limiter: Option<&ChatLimiter>,
+        force_refresh: bool,
+    ) -> Result<String, DownloadErr> {
+        if !force_refresh {
+            if let Some(path) = self.cached_file_path(file_id) {
+                return Ok(path);
+            }
+        }
+        if let Some(lim) = limiter {
+            lim.acquire_get_file().await;
+        }
+        let path = self.resolve_file_path(file_id).await?;
+        self.remember_file_path(file_id, &path);
+        Ok(path)
+    }
+
+    async fn resolve_file_path(&self, file_id: &str) -> Result<String, DownloadErr> {
         let resp = self
             .http
             .post(self.api_url("getFile"))
             .form(&[("file_id", file_id)])
             .send()
             .await
-            .context("getFile http")?;
+            .map_err(|e| DownloadErr::Other(e.into()))?;
 
         let status = resp.status();
-        let body: ApiResponse<FilePath> = resp.json().await.context("getFile json")?;
-        if !status.is_success() || !body.ok {
-            return Err(anyhow!(
-                "getFile failed: {}",
-                body.description.unwrap_or_else(|| status.to_string())
-            ));
+        if status.as_u16() == 429 {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(3);
+            let body: ApiResponse<FilePath> = resp.json().await.unwrap_or(ApiResponse {
+                ok: false,
+                result: None,
+                description: Some("rate limited".into()),
+                parameters: None,
+            });
+            let api_retry = body.parameters.as_ref().and_then(|p| p.retry_after);
+            let desc = body.description.unwrap_or_else(|| status.to_string());
+            let secs = api_retry.unwrap_or(retry_after as i64).max(1) as u64;
+            return Err(DownloadErr::RetryAfter(secs, anyhow!("getFile 429: {desc}")));
         }
 
-        let path = body.result.context("missing file_path")?.file_path;
-        let bytes = self
-            .http
-            .get(self.file_url(&path))
+        let body: ApiResponse<FilePath> = resp
+            .json()
+            .await
+            .map_err(|e| DownloadErr::Other(e.into()))?;
+        if !status.is_success() || !body.ok {
+            return Err(DownloadErr::Other(anyhow!(
+                "getFile failed: {}",
+                body.description.unwrap_or_else(|| status.to_string())
+            )));
+        }
+        body.result
+            .map(|r| r.file_path)
+            .ok_or_else(|| DownloadErr::Other(anyhow!("missing file_path")))
+    }
+
+    async fn download_cdn_bytes(&self, file_path: &str) -> Result<Bytes> {
+        self.http
+            .get(self.file_url(file_path))
             .send()
             .await
             .context("file download http")?
@@ -282,11 +407,10 @@ impl TelegramClient {
             .context("file download status")?
             .bytes()
             .await
-            .context("file download bytes")?;
-        Ok(bytes)
+            .context("file download bytes")
     }
 
-    /// Delete a chat message. `Gone` (already missing) is success for queue purposes.
+    /// Delete a chat message. Uses the **delete** budget when `limiter` is set.
     pub async fn delete_message(
         &self,
         chat_id: &str,
@@ -294,7 +418,7 @@ impl TelegramClient {
         limiter: Option<&ChatLimiter>,
     ) -> Result<DeleteOutcome> {
         if let Some(lim) = limiter {
-            lim.acquire().await;
+            lim.acquire_delete().await;
         }
         let resp = self
             .http
@@ -322,7 +446,7 @@ impl TelegramClient {
                 .unwrap_or(3)
                 .max(1) as u64;
             if let Some(lim) = limiter {
-                lim.penalize(Duration::from_secs(secs));
+                lim.penalize_delete(Duration::from_secs(secs));
             }
             debug!(message_id, secs, "deleteMessage rate-limited");
             return Ok(DeleteOutcome::Failed);
@@ -408,8 +532,16 @@ impl TelegramClient {
         Ok(None)
     }
 
-    /// Send a plain text message; returns `message_id`.
-    pub async fn send_message(&self, chat_id: &str, text: &str) -> Result<i64> {
+    /// Send a plain text message; returns `message_id`. Uses the **send** budget.
+    pub async fn send_message(
+        &self,
+        chat_id: &str,
+        text: &str,
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<i64> {
+        if let Some(lim) = limiter {
+            lim.acquire_send().await;
+        }
         let resp = self
             .http
             .post(self.api_url("sendMessage"))
@@ -418,6 +550,13 @@ impl TelegramClient {
             .await
             .context("sendMessage http")?;
         let status = resp.status();
+        if status.as_u16() == 429 {
+            let secs = 3u64;
+            if let Some(lim) = limiter {
+                lim.penalize_send(Duration::from_secs(secs));
+            }
+            bail!("sendMessage 429");
+        }
         let body: ApiResponse<Message> = resp.json().await.context("sendMessage json")?;
         if !status.is_success() || !body.ok {
             return Err(anyhow!(
@@ -431,7 +570,15 @@ impl TelegramClient {
             .message_id)
     }
 
-    pub async fn pin_chat_message(&self, chat_id: &str, message_id: i64) -> Result<()> {
+    pub async fn pin_chat_message(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<()> {
+        if let Some(lim) = limiter {
+            lim.acquire_send().await;
+        }
         let resp = self
             .http
             .post(self.api_url("pinChatMessage"))
@@ -454,7 +601,15 @@ impl TelegramClient {
         ))
     }
 
-    pub async fn unpin_chat_message(&self, chat_id: &str, message_id: i64) -> Result<()> {
+    pub async fn unpin_chat_message(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<()> {
+        if let Some(lim) = limiter {
+            lim.acquire_send().await;
+        }
         let resp = self
             .http
             .post(self.api_url("unpinChatMessage"))
@@ -502,9 +657,14 @@ impl TelegramClient {
             .ok_or_else(|| anyhow!("getChatMember missing result"))
     }
 
-    /// Fail fast unless the bot is admin/creator and can pin messages in `chat_id`.
+    /// Fail fast unless the bot can administer `chat_id` and pin the bootstrap manifest.
+    ///
+    /// Channels need `can_edit_messages` (pin is implemented as edit). Groups/supergroups
+    /// need `can_pin_messages`. Explicit `false` fails; omitted fields are treated as ok
+    /// (Bot API variance).
     pub async fn ensure_chat_admin(&self, chat_id: &str) -> Result<()> {
         let me = self.get_me().await.context("getMe")?;
+        let chat = self.get_chat(chat_id).await.context("getChat")?;
         let member = self
             .get_chat_member(chat_id, me.id)
             .await
@@ -515,32 +675,51 @@ impl TelegramClient {
                     chat_id,
                     bot_id = me.id,
                     status = %member.status,
+                    chat_type = %chat.chat_type,
                     "telegram chat access ok"
                 );
                 Ok(())
             }
             "administrator" => {
-                // Channels/groups: pin bootstrap needs can_pin_messages.
-                // Some chat types omit the field for admins that still can pin; treat
-                // explicit false as hard fail, missing as ok (API variance).
-                if member.can_pin_messages == Some(false) {
-                    anyhow::bail!(
-                        "bot is admin in {chat_id} but can_pin_messages=false; \
-                         enable pin rights for snapshot bootstrap"
-                    );
+                match chat.chat_type.as_str() {
+                    "channel" => {
+                        if member.can_edit_messages == Some(false) {
+                            bail!(
+                                "bot is admin in channel {chat_id} but can_edit_messages=false; \
+                                 enable Edit messages (required to pin the snapshot manifest)"
+                            );
+                        }
+                    }
+                    "group" | "supergroup" => {
+                        if member.can_pin_messages == Some(false) {
+                            bail!(
+                                "bot is admin in {chat_id} but can_pin_messages=false; \
+                                 enable Pin messages for snapshot bootstrap"
+                            );
+                        }
+                    }
+                    _ => {
+                        if member.can_pin_messages == Some(false)
+                            && member.can_edit_messages == Some(false)
+                        {
+                            bail!(
+                                "bot is admin in {chat_id} but lacks pin/edit rights for snapshots"
+                            );
+                        }
+                    }
                 }
                 tracing::info!(
                     chat_id,
                     bot_id = me.id,
                     status = %member.status,
+                    chat_type = %chat.chat_type,
                     can_pin = ?member.can_pin_messages,
+                    can_edit = ?member.can_edit_messages,
                     "telegram chat access ok"
                 );
                 Ok(())
             }
-            other => anyhow::bail!(
-                "bot must be administrator in chat {chat_id} (current status: {other})"
-            ),
+            other => bail!("bot must be administrator in chat {chat_id} (current status: {other})"),
         }
     }
 }
@@ -559,9 +738,12 @@ fn classify_reqwest(e: reqwest::Error) -> SendErr {
 pub struct ChatMember {
     pub status: String,
     pub user: TgUser,
-    /// Present for administrators in groups/channels when Telegram reports pin rights.
+    /// Groups/supergroups: pin rights.
     #[serde(default)]
     pub can_pin_messages: Option<bool>,
+    /// Channels: editing (and pinning) messages.
+    #[serde(default)]
+    pub can_edit_messages: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -571,4 +753,35 @@ pub struct TgUser {
     pub is_bot: bool,
     #[serde(default)]
     pub username: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_path_lru_roundtrip() {
+        let tg = TelegramClient::new("token".into()).unwrap();
+        assert!(tg.cached_file_path("fid-1").is_none());
+        tg.remember_file_path("fid-1", "photos/file.bin");
+        assert_eq!(
+            tg.cached_file_path("fid-1").as_deref(),
+            Some("photos/file.bin")
+        );
+        // Clones share the cache.
+        let tg2 = tg.clone();
+        assert_eq!(
+            tg2.cached_file_path("fid-1").as_deref(),
+            Some("photos/file.bin")
+        );
+        tg2.forget_file_path("fid-1");
+        assert!(tg.cached_file_path("fid-1").is_none());
+    }
+
+    #[test]
+    fn cdn_stale_detects_http_codes() {
+        assert!(is_cdn_path_stale(&anyhow!("file download status: 404 Not Found")));
+        assert!(is_cdn_path_stale(&anyhow!("410 Gone")));
+        assert!(!is_cdn_path_stale(&anyhow!("file download status: 500")));
+    }
 }

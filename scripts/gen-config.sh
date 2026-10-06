@@ -12,7 +12,7 @@
 #   CONFIG_REGION       default us-east-1
 #   CONFIG_SNAPSHOT_SECS default 300 (0 for memory suites)
 #   CONFIG_CHUNK_SIZE   default 19922944
-#   CONFIG_CHUNK_CODEC  default gzip
+#   CONFIG_CHUNK_CODEC  default zstd
 
 set -euo pipefail
 
@@ -22,7 +22,7 @@ MEMORY="${CONFIG_MEMORY:-false}"
 LISTEN_ADDR="${CONFIG_LISTEN_ADDR:-0.0.0.0:8333}"
 REGION="${CONFIG_REGION:-us-east-1}"
 CHUNK_SIZE="${CONFIG_CHUNK_SIZE:-19922944}"
-CHUNK_CODEC="${CONFIG_CHUNK_CODEC:-gzip}"
+CHUNK_CODEC="${CONFIG_CHUNK_CODEC:-zstd}"
 
 if [[ "$MEMORY" == "true" || "$MEMORY" == "1" ]]; then
   SNAPSHOT_SECS="${CONFIG_SNAPSHOT_SECS:-0}"
@@ -52,7 +52,12 @@ size = ${CHUNK_SIZE}
 codec = "${CHUNK_CODEC}"
 
 [telegram]
-rate_per_sec = 0.5
-rate_burst = 3.0
+send_rate_per_sec = 0.5
+send_burst = 3.0
+get_file_rate_per_sec = 15.0
+get_file_burst = 30.0
+delete_rate_per_sec = 1.0
+delete_burst = 5.0
 upload_concurrency = 2
+download_concurrency = 8
 EOF
