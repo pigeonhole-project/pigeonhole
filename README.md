@@ -3,8 +3,11 @@
 S3-compatible HTTP gateway in Rust, backed by the Telegram Bot API.
 
 The S3 protocol surface is implemented with
-[s3s](https://github.com/s3s-project/s3s). Objects are split into ≤19 MiB chunks
-and stored as documents in **one** private Telegram chat/channel (`CHAT_ID`).
+[s3s](https://github.com/s3s-project/s3s). Objects are split into configurable
+chunks (default ≤19 MiB, hard cap `< 20 MiB` for Telegram `getFile`) and stored
+as documents in **one** private Telegram chat/channel. Chunk encoding is
+configurable (`raw` | `gzip`; default `gzip` keeps gzip only when it shrinks the
+payload). The index/snapshot records the **stored** `codec` per chunk.
 Object metadata lives in a local SQLite index.
 
 Telegram I/O goes through a `BlobStore` trait (`TelegramBlobStore` in production,
@@ -13,22 +16,27 @@ Telegram I/O goes through a `BlobStore` trait (`TelegramBlobStore` in production
 ## Bot API limits
 
 - Upload (`sendDocument`): 50 MiB
-- Download (`getFile`): 20 MiB → s3gram uses 19 MiB chunks
+- Download (`getFile`): 20 MiB → `chunk.size` must be `< 20 MiB` (default 19 MiB)
 
 ## Setup
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and get a `BOT_TOKEN`.
 2. Create a private channel or group, add the bot as **administrator**.
-3. Set `CHAT_ID` (channels are usually `-100...`).
-4. Copy env and fill in secrets:
+3. Copy config + secrets:
 
 ```bash
+cp s3gram.toml.example s3gram.toml
 cp .env.example .env
-# edit BOT_TOKEN and CHAT_ID
+# edit s3gram.toml (chat_id, listen_addr, chunk, …)
+# edit .env (BOT_TOKEN, AWS_* credentials)
 ```
 
+Non-secret settings live in **`s3gram.toml`** (path override: `S3GRAM_CONFIG`).
+Secrets stay in **`.env` / environment**: `BOT_TOKEN`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`.
+
 On startup s3gram calls `getMe` + `getChatMember` and exits if the bot is not
-an admin in `CHAT_ID`.
+an admin in `chat_id`.
 
 ## Run
 
@@ -37,7 +45,23 @@ cargo run --release
 # or: make run
 ```
 
-Listens on `http://0.0.0.0:8333` by default.
+Listens on `http://0.0.0.0:8333` by default (`listen_addr` in TOML).
+
+## Configuration
+
+See [`s3gram.toml.example`](s3gram.toml.example):
+
+| TOML | Meaning |
+|---|---|
+| `chat_id` | Telegram chat/channel for blobs + snapshots |
+| `listen_addr` | Bind address |
+| `database_url` | SQLite URL |
+| `region` | SigV4 region string |
+| `memory` | `true` → MemoryBlobStore (no Telegram) |
+| `[snapshot].interval_secs` | Auto snapshot period (`0` disables) |
+| `[chunk].size` | Logical chunk size in bytes (`< 20 MiB`) |
+| `[chunk].codec` | `raw` \| `gzip` |
+| `[telegram].rate_*` | Bot API token bucket + upload concurrency |
 
 ## Tests
 
@@ -62,6 +86,14 @@ make compat-s3s-e2e ARGS='--filter ^Basic'
 
 # s3s upstream rclone S3 e2e against MemoryBlobStore (downloads pinned rclone)
 make compat-rclone
+
+# Real Telegram once: purge tracked messages, wipe index, run all client suites
+make compat-telegram
+# optional: full ceph/s3-tests functional (slow / many failures expected)
+# make compat-telegram ARGS=--all
+
+# Wipe Telegram messages tracked by the local index (server must be stopped)
+cargo run --release -- purge
 ```
 
 Point the AWS CLI at the gateway:
@@ -81,23 +113,20 @@ Authentication is AWS SigV4 via s3s `SimpleAuth` (keys from `AWS_ACCESS_KEY_ID` 
 
 ## Index snapshot
 
-s3gram periodically exports the SQLite index as a gzip Telegram document in
-`CHAT_ID`. Oversized snapshots are split into parts plus a small **manifest**;
-the restore handle is the single gzip `file_id` or the manifest `file_id`.
-Uploads happen only when the index hash changes; previous snapshot messages are
-deleted.
+s3gram periodically exports the SQLite index as gzip Telegram document(s) in
+`chat_id`. A small **immutable JSON manifest** is sent and **pinned**; that pin
+is the bootstrap pointer (no need to remember `file_id`s after disk loss).
 
-Interval (default 300s; `0` disables):
+Flow on change: upload parts → send manifest → pin new → unpin/delete old.
+Uploads happen only when the index hash changes. The bot needs admin **pin**
+rights in `chat_id`. Interval: `[snapshot].interval_secs` (default 300; `0` disables).
 
-```bash
-SNAPSHOT_INTERVAL_SECS=300
-```
-
-Restore on a stopped server / clean machine:
+Restore on a stopped server / clean machine (`BOT_TOKEN` in `.env` + `chat_id` in TOML):
 
 ```bash
 # stop s3gram first
-cargo run --release -- restore <file_id>
+cargo run --release -- restore
+# optional legacy: cargo run --release -- restore <file_id>
 ```
 
 You can also copy the local `s3gram.db` file.
@@ -119,9 +148,11 @@ You can also copy the local `s3gram.db` file.
 | User metadata (`x-amz-meta-*`) | yes |
 | Zero-byte objects (no Telegram upload) | yes |
 | Blob refcount in SQLite | yes |
-| `S3GRAM_MEMORY=1` (in-memory BlobStore, no Telegram) | yes |
+| `memory = true` (in-memory BlobStore, no Telegram) | yes |
+| Shared Telegram rate limit (token bucket + upload semaphore) | yes |
 | Presigned URLs / ACL / bucket versioning | later |
 
-## License
+## Notes
 
-MIT
+- Telegram `file_id` can become invalid; keep index snapshots.
+- Large objects are split automatically; multipart uploads map to sequential chunks.

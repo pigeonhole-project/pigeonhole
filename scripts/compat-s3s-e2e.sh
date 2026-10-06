@@ -32,7 +32,6 @@ if [[ -f .env ]]; then
   source .env
   set +a
 fi
-unset S3GRAM_INSECURE || true
 
 cleanup() {
   if [[ -f "$PIDFILE" ]]; then
@@ -82,10 +81,14 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   exit 1
 fi
 
-export S3GRAM_MEMORY=1
-export DATABASE_URL="sqlite:${DB}?mode=rwc"
-export SNAPSHOT_INTERVAL_SECS=0
-export LISTEN_ADDR="127.0.0.1:${PORT}"
+CFG="$ROOT/.cache/s3gram-s3s-e2e-config.toml"
+CONFIG_OUT="$CFG" \
+  CONFIG_MEMORY=true \
+  CONFIG_LISTEN_ADDR="127.0.0.1:${PORT}" \
+  CONFIG_DATABASE_URL="sqlite:${DB}?mode=rwc" \
+  CONFIG_SNAPSHOT_SECS=0 \
+  "$ROOT/scripts/gen-config.sh"
+export S3GRAM_CONFIG="$CFG"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-s3gram}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-s3gramsecret}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"

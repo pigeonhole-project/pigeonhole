@@ -1,0 +1,34 @@
+# Copy to s3gram.toml and adjust. Secrets stay in .env (see .env.example).
+#
+#   cp s3gram.toml.example s3gram.toml
+#   cp .env.example .env
+#
+# Override path with S3GRAM_CONFIG=/path/to.toml
+
+# Telegram chat/channel for blobs + index snapshots (bot must be admin).
+chat_id = "-1001234567890"
+
+listen_addr = "0.0.0.0:8333"
+database_url = "sqlite:s3gram.db"
+region = "us-east-1"
+
+# true = MemoryBlobStore (no Telegram). For local suites / CI.
+memory = false
+
+[snapshot]
+# Seconds between automatic index snapshots. 0 disables.
+interval_secs = 300
+
+[chunk]
+# Logical chunk size in bytes (also splits large index snapshots).
+# Must be < 20 MiB (Telegram getFile limit). Default 19 MiB.
+size = 19922944
+# Encoding policy for new object chunks: "raw" | "gzip"
+# gzip keeps compression only when the payload shrinks.
+codec = "gzip"
+
+[telegram]
+# Shared Bot API rate limit (token bucket + upload semaphore).
+rate_per_sec = 0.5
+rate_burst = 3.0
+upload_concurrency = 2

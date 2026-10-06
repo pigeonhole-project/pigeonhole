@@ -1,4 +1,4 @@
-.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone test test-all
+.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram test test-all
 
 run:
 	cargo run --release
@@ -30,6 +30,11 @@ compat-s3s-e2e:
 # s3s upstream rclone S3 e2e against MemoryBlobStore (no Telegram / no Docker).
 compat-rclone:
 	./scripts/compat-rclone.sh
+
+# Purge real Telegram + run the full client suite against TelegramBlobStore.
+# Extra args forwarded to compat.sh, e.g. `make compat-telegram ARGS=--all`
+compat-telegram:
+	./scripts/compat-telegram.sh $(ARGS)
 
 test:
 	cargo test
