@@ -3,7 +3,9 @@
 use crate::config::Config;
 use crate::index::{parse_rfc3339, DeleteBucketResult, Index, OrphanMsg};
 use crate::chunker::ChunkCodec;
-use crate::ingest::{decode_chunk_async, ingest_stream_to_store, UploadedChunk};
+use crate::ingest::{
+    decode_chunk_slice_async, ingest_stream_with_options, IngestOptions, UploadedChunk,
+};
 use crate::storage::{BlobStore, DeleteOutcome};
 use async_trait::async_trait;
 use base64::Engine;
@@ -29,6 +31,13 @@ pub struct S3gram {
 impl S3gram {
     fn chat_id(&self) -> &str {
         &self.cfg.chat_id
+    }
+
+    fn ingest_options(&self) -> IngestOptions {
+        let mut opts = IngestOptions::new(self.cfg.chunk_size, self.cfg.chunk_codec);
+        opts.frame_size = self.cfg.frame_size;
+        opts.memory_budget = self.cfg.ingest_budget.clone();
+        opts
     }
 
     async fn cleanup_orphans(&self, orphans: Vec<OrphanMsg>) {
@@ -539,17 +548,18 @@ fn try_aligned_part_chunks(
         if offset < start || cend > end {
             return None;
         }
-        out.push((
-            chunk_no,
-            c.file_id.clone(),
-            c.message_id,
-            c.size,
-            c.stored_codec(),
-        ));
+        out.push(UploadedChunk {
+            part_no: chunk_no,
+            file_id: c.file_id.clone(),
+            message_id: c.message_id,
+            logical_size: c.size,
+            codec: c.stored_codec(),
+            frames: Vec::new(),
+        });
         chunk_no += 1;
         offset = cend;
     }
-    let covered: u64 = out.iter().map(|(_, _, _, s, _)| *s as u64).sum();
+    let covered: u64 = out.iter().map(|c| c.logical_size as u64).sum();
     if covered != length {
         return None;
     }
@@ -558,6 +568,7 @@ fn try_aligned_part_chunks(
 
 fn stream_object_body(
     store: Arc<dyn BlobStore>,
+    index: Index,
     chunks: Vec<crate::index::Chunk>,
     start: u64,
     length: u64,
@@ -568,8 +579,30 @@ fn stream_object_body(
         for slice in plan {
             let result = match store.get(&slice.file_id).await {
                 Ok(data) => {
-                    match decode_chunk_async(data, slice.codec, slice.logical_size.max(1)).await {
-                        Ok(logical) => Ok(logical.slice(slice.from..slice.to)),
+                    let frames = if slice.codec == ChunkCodec::Frames {
+                        match index.get_chunk_frames(&slice.file_id).await {
+                            Ok(f) => f,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(std::io::Error::other(e.to_string())))
+                                    .await;
+                                break;
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    match decode_chunk_slice_async(
+                        data,
+                        slice.codec,
+                        &frames,
+                        slice.from,
+                        slice.to,
+                        slice.logical_size.max(1),
+                    )
+                    .await
+                    {
+                        Ok(logical) => Ok(logical),
                         Err(e) => Err(std::io::Error::other(e.to_string())),
                     }
                 }
@@ -937,12 +970,11 @@ impl S3 for S3gram {
             None => futures::stream::empty().right_stream(),
         };
 
-        let ingested = match ingest_stream_to_store(
+        let ingested = match ingest_stream_with_options(
             &self.store,
             stream,
             use_hasher.then_some(&mut hasher),
-            self.cfg.chunk_size,
-            self.cfg.chunk_codec,
+            self.ingest_options(),
         )
         .await
         {
@@ -1078,7 +1110,13 @@ impl S3 for S3gram {
         let body = if length == 0 {
             Some(StreamingBlob::from_bytes(Bytes::new()))
         } else {
-            let body_stream = stream_object_body(self.store.clone(), chunks, start, length);
+            let body_stream = stream_object_body(
+                self.store.clone(),
+                self.index.clone(),
+                chunks,
+                start,
+                length,
+            );
             Some(StreamingBlob::wrap(body_stream))
         };
         let content_range = input
@@ -1396,12 +1434,11 @@ impl S3 for S3gram {
             Some(body) => body.map(|r| r.map_err(|e| anyhow::anyhow!(e))).left_stream(),
             None => futures::stream::empty().right_stream(),
         };
-        let ingested = match ingest_stream_to_store(
+        let ingested = match ingest_stream_with_options(
             &self.store,
             stream,
             use_hasher.then_some(&mut hasher),
-            self.cfg.chunk_size,
-            self.cfg.chunk_codec,
+            self.ingest_options(),
         )
         .await
         {
@@ -1511,16 +1548,27 @@ impl S3 for S3gram {
                     // Hash logical bytes via getFile only — no sendDocument.
                     use md5::Digest;
                     let mut md5 = md5::Md5::new();
-                    for (_, file_id, _, logical_size, codec) in &aligned {
+                    for c in &aligned {
                         let data = self
                             .store
-                            .get(file_id)
+                            .get(&c.file_id)
                             .await
                             .map_err(Self::map_err)?;
-                        let logical = decode_chunk_async(
+                        let frames = if c.codec == ChunkCodec::Frames {
+                            self.index
+                                .get_chunk_frames(&c.file_id)
+                                .await
+                                .map_err(Self::map_err)?
+                        } else {
+                            Vec::new()
+                        };
+                        let logical = decode_chunk_slice_async(
                             data,
-                            *codec,
-                            (*logical_size).max(1) as usize,
+                            c.codec,
+                            &frames,
+                            0,
+                            c.logical_size as usize,
+                            c.logical_size.max(1) as usize,
                         )
                         .await
                         .map_err(Self::map_err)?;
@@ -1536,14 +1584,19 @@ impl S3 for S3gram {
                     .unwrap_or_else(|| self.chat_id().to_string());
                 (etag, length as i64, aligned, src_chat)
             } else {
-                let body_stream = stream_object_body(self.store.clone(), chunks, start, length)
-                    .map(|r| r.map_err(|e| anyhow::anyhow!(e)));
-                let ingested = match ingest_stream_to_store(
+                let body_stream = stream_object_body(
+                    self.store.clone(),
+                    self.index.clone(),
+                    chunks,
+                    start,
+                    length,
+                )
+                .map(|r| r.map_err(|e| anyhow::anyhow!(e)));
+                let ingested = match ingest_stream_with_options(
                     &self.store,
                     body_stream,
                     None,
-                    self.cfg.chunk_size,
-                    self.cfg.chunk_codec,
+                    self.ingest_options(),
                 )
                 .await
                 {

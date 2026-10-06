@@ -1,4 +1,5 @@
 use crate::chunker::ChunkCodec;
+use crate::frames::FrameRecord;
 use crate::ingest::{codec_from_sql, codec_to_sql, UploadedChunk};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -37,8 +38,32 @@ pub struct Chunk {
     pub message_id: i64,
     /// Logical (uncompressed) byte length of this slice.
     pub size: i64,
-    /// On-wire encoding of the Telegram document: `raw`, `gzip`, or `zstd`.
+    /// On-wire encoding: `raw`, `gzip`, `zstd`, or `frames`.
     pub codec: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ChunkFrameRow {
+    pub file_id: String,
+    pub frame_no: i64,
+    pub stored_off: i64,
+    pub stored_len: i64,
+    pub logical_off: i64,
+    pub logical_len: i64,
+    pub codec: String,
+}
+
+impl ChunkFrameRow {
+    pub fn to_record(&self) -> FrameRecord {
+        FrameRecord {
+            frame_no: self.frame_no,
+            stored_off: self.stored_off,
+            stored_len: self.stored_len,
+            logical_off: self.logical_off,
+            logical_len: self.logical_len,
+            codec: self.codec.clone(),
+        }
+    }
 }
 
 impl Chunk {
@@ -150,6 +175,9 @@ pub struct IndexSnapshot {
     pub blobs: Vec<Blob>,
     #[serde(default)]
     pub metadata: Vec<UserMeta>,
+    /// Optional: present in snapshots after frame packing landed.
+    #[serde(default)]
+    pub chunk_frames: Vec<ChunkFrameRow>,
 }
 
 impl Index {
@@ -269,6 +297,23 @@ impl Index {
                     .await?;
             }
         }
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS chunk_frames (
+                file_id TEXT NOT NULL,
+                frame_no INTEGER NOT NULL,
+                stored_off INTEGER NOT NULL,
+                stored_len INTEGER NOT NULL,
+                logical_off INTEGER NOT NULL,
+                logical_len INTEGER NOT NULL,
+                codec TEXT NOT NULL,
+                PRIMARY KEY (file_id, frame_no)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         sqlx::query(
             r#"
@@ -685,8 +730,15 @@ impl Index {
         .execute(&mut *tx)
         .await?;
 
-        for (part_no, file_id, message_id, chunk_size, codec) in chunks {
-            bump_blob(&mut tx, file_id, *message_id, *chunk_size, chat_id).await?;
+        for c in chunks {
+            bump_blob(
+                &mut tx,
+                &c.file_id,
+                c.message_id,
+                c.logical_size,
+                chat_id,
+            )
+            .await?;
             sqlx::query(
                 r#"
                 INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size, codec)
@@ -695,13 +747,17 @@ impl Index {
             )
             .bind(bucket)
             .bind(key)
-            .bind(part_no)
-            .bind(file_id)
-            .bind(message_id)
-            .bind(chunk_size)
-            .bind(codec_to_sql(*codec))
+            .bind(c.part_no)
+            .bind(&c.file_id)
+            .bind(c.message_id)
+            .bind(c.logical_size)
+            .bind(codec_to_sql(c.codec))
             .execute(&mut *tx)
             .await?;
+            // Shallow copies pass empty frames and must not wipe existing rows.
+            if !c.frames.is_empty() {
+                replace_chunk_frames(&mut tx, &c.file_id, &c.frames).await?;
+            }
         }
 
         for (name, value) in user_meta {
@@ -879,14 +935,14 @@ impl Index {
         let ct = content_type.or(src.content_type.as_deref());
         let chunk_tuples: Vec<UploadedChunk> = src_chunks
             .iter()
-            .map(|c| {
-                (
-                    c.part_no,
-                    c.file_id.clone(),
-                    c.message_id,
-                    c.size,
-                    c.stored_codec(),
-                )
+            .map(|c| UploadedChunk {
+                part_no: c.part_no,
+                file_id: c.file_id.clone(),
+                message_id: c.message_id,
+                logical_size: c.size,
+                codec: c.stored_codec(),
+                // Frames stay keyed by file_id; shallow copy reuses them.
+                frames: Vec::new(),
             })
             .collect();
 
@@ -1178,6 +1234,9 @@ impl Index {
         sqlx::query("DELETE FROM object_metadata")
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM chunk_frames")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM chunks")
             .execute(&mut *tx)
             .await?;
@@ -1193,6 +1252,19 @@ impl Index {
         sqlx::query("DELETE FROM meta").execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn get_chunk_frames(&self, file_id: &str) -> Result<Vec<FrameRecord>> {
+        let rows = sqlx::query_as::<_, ChunkFrameRow>(
+            r#"
+            SELECT file_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec
+            FROM chunk_frames WHERE file_id = ? ORDER BY frame_no
+            "#,
+        )
+        .bind(file_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.to_record()).collect())
     }
 
     pub async fn queue_tg_delete(&self, chat_id: &str, message_id: i64) -> Result<()> {
@@ -1302,6 +1374,14 @@ impl Index {
         )
         .fetch_all(&mut *tx)
         .await?;
+        let chunk_frames = sqlx::query_as::<_, ChunkFrameRow>(
+            r#"
+            SELECT file_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec
+            FROM chunk_frames ORDER BY file_id, frame_no
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(IndexSnapshot {
             buckets,
@@ -1309,6 +1389,7 @@ impl Index {
             chunks,
             blobs,
             metadata,
+            chunk_frames,
         })
     }
 
@@ -1324,6 +1405,9 @@ impl Index {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM object_metadata")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chunk_frames")
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM chunks").execute(&mut *tx).await?;
@@ -1363,6 +1447,24 @@ impl Index {
             .bind(c.message_id)
             .bind(c.size)
             .bind(codec_to_sql(c.stored_codec()))
+            .execute(&mut *tx)
+            .await?;
+        }
+        for f in &snap.chunk_frames {
+            sqlx::query(
+                r#"
+                INSERT INTO chunk_frames
+                    (file_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&f.file_id)
+            .bind(f.frame_no)
+            .bind(f.stored_off)
+            .bind(f.stored_len)
+            .bind(f.logical_off)
+            .bind(f.logical_len)
+            .bind(&f.codec)
             .execute(&mut *tx)
             .await?;
         }
@@ -1506,8 +1608,15 @@ impl Index {
         .execute(&mut *tx)
         .await?;
 
-        for (chunk_no, file_id, message_id, chunk_size, codec) in chunks {
-            bump_blob(&mut tx, file_id, *message_id, *chunk_size, chat_id).await?;
+        for c in chunks {
+            bump_blob(
+                &mut tx,
+                &c.file_id,
+                c.message_id,
+                c.logical_size,
+                chat_id,
+            )
+            .await?;
             sqlx::query(
                 r#"
                 INSERT INTO multipart_part_chunks
@@ -1517,13 +1626,16 @@ impl Index {
             )
             .bind(upload_id)
             .bind(part_number)
-            .bind(chunk_no)
-            .bind(file_id)
-            .bind(message_id)
-            .bind(chunk_size)
-            .bind(codec_to_sql(*codec))
+            .bind(c.part_no)
+            .bind(&c.file_id)
+            .bind(c.message_id)
+            .bind(c.logical_size)
+            .bind(codec_to_sql(c.codec))
             .execute(&mut *tx)
             .await?;
+            if !c.frames.is_empty() {
+                replace_chunk_frames(&mut tx, &c.file_id, &c.frames).await?;
+            }
         }
 
         tx.commit().await?;
@@ -1601,13 +1713,14 @@ impl Index {
             .fetch_all(&mut *tx)
             .await?;
             for c in chunks {
-                assembled.push((
+                assembled.push(UploadedChunk {
                     part_no,
-                    c.file_id.clone(),
-                    c.message_id,
-                    c.size,
-                    c.stored_codec(),
-                ));
+                    file_id: c.file_id.clone(),
+                    message_id: c.message_id,
+                    logical_size: c.size,
+                    codec: c.stored_codec(),
+                    frames: Vec::new(),
+                });
                 part_chunks.push(c);
                 part_no += 1;
             }
@@ -1666,8 +1779,15 @@ impl Index {
         .execute(&mut *tx)
         .await?;
 
-        for (pno, file_id, message_id, chunk_size, codec) in &assembled {
-            bump_blob(&mut tx, file_id, *message_id, *chunk_size, &chat_id).await?;
+        for c in &assembled {
+            bump_blob(
+                &mut tx,
+                &c.file_id,
+                c.message_id,
+                c.logical_size,
+                &chat_id,
+            )
+            .await?;
             sqlx::query(
                 r#"
                 INSERT INTO chunks (bucket, key, part_no, file_id, message_id, size, codec)
@@ -1676,13 +1796,14 @@ impl Index {
             )
             .bind(&upload.bucket)
             .bind(&upload.key)
-            .bind(pno)
-            .bind(file_id)
-            .bind(message_id)
-            .bind(chunk_size)
-            .bind(codec_to_sql(*codec))
+            .bind(c.part_no)
+            .bind(&c.file_id)
+            .bind(c.message_id)
+            .bind(c.logical_size)
+            .bind(codec_to_sql(c.codec))
             .execute(&mut *tx)
             .await?;
+            // Frames already written at UploadPart time for these file_ids.
         }
 
         for (name, value) in &user_meta {
@@ -1889,6 +2010,10 @@ async fn release_blob(
     };
 
     if refcount <= 1 {
+        sqlx::query("DELETE FROM chunk_frames WHERE file_id = ?")
+            .bind(file_id)
+            .execute(&mut **tx)
+            .await?;
         sqlx::query("DELETE FROM blobs WHERE file_id = ?")
             .bind(file_id)
             .execute(&mut **tx)
@@ -1901,6 +2026,36 @@ async fn release_blob(
             .await?;
         Ok(None)
     }
+}
+
+async fn replace_chunk_frames(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    file_id: &str,
+    frames: &[FrameRecord],
+) -> Result<()> {
+    sqlx::query("DELETE FROM chunk_frames WHERE file_id = ?")
+        .bind(file_id)
+        .execute(&mut **tx)
+        .await?;
+    for f in frames {
+        sqlx::query(
+            r#"
+            INSERT INTO chunk_frames
+                (file_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(file_id)
+        .bind(f.frame_no)
+        .bind(f.stored_off)
+        .bind(f.stored_len)
+        .bind(f.logical_off)
+        .bind(f.logical_len)
+        .bind(&f.codec)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 enum DelimEntry {

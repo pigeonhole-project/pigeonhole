@@ -1,4 +1,5 @@
 use crate::chunker::{self, ChunkCodec};
+use crate::frames::ByteBudget;
 use crate::rate_limit::{ChatLimiter, ChatLimiterConfig};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -21,6 +22,10 @@ pub struct Config {
     /// Max on-wire chunk size in bytes (`< 20 MiB`).
     pub chunk_size: usize,
     pub chunk_codec: ChunkCodec,
+    /// Independent frame size for `frames` packing.
+    pub frame_size: usize,
+    /// Process-wide ingest buffer budget (shared across PUTs).
+    pub ingest_budget: Option<ByteBudget>,
     pub tg: ChatLimiterConfig,
     pub memory_store: bool,
     pub config_path: PathBuf,
@@ -74,6 +79,12 @@ impl Config {
         let chunk_size = file.chunk.size;
         chunker::validate_chunk_size(chunk_size).context("chunk.size")?;
         let chunk_codec = file.chunk.codec;
+        let frame_size = file.chunk.frame_size.max(1024);
+        if frame_size > chunker::MAX_LOGICAL_CHUNK {
+            bail!("chunk.frame_size exceeds MAX_LOGICAL_CHUNK");
+        }
+        let memory_budget = file.ingest.memory_budget.max(frame_size);
+        let ingest_budget = Some(ByteBudget::new(memory_budget));
 
         let tg = file.telegram.into_limiter_config();
         if tg.send_rate_per_sec <= 0.0
@@ -97,6 +108,8 @@ impl Config {
             snapshot_interval_secs: file.snapshot.interval_secs,
             chunk_size,
             chunk_codec,
+            frame_size,
+            ingest_budget,
             tg,
             memory_store,
             config_path,
@@ -115,6 +128,8 @@ impl Config {
             snapshot_interval_secs: 0,
             chunk_size: chunker::DEFAULT_CHUNK_SIZE,
             chunk_codec: ChunkCodec::Zstd,
+            frame_size: chunker::DEFAULT_FRAME_SIZE,
+            ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
             tg: ChatLimiterConfig {
                 send_rate_per_sec: 1000.0,
                 send_burst: 100.0,
@@ -159,6 +174,8 @@ struct FileConfig {
     memory: bool,
     snapshot: FileSnapshot,
     chunk: FileChunk,
+    #[serde(default)]
+    ingest: FileIngest,
     telegram: FileTelegram,
 }
 
@@ -172,6 +189,7 @@ impl Default for FileConfig {
             memory: false,
             snapshot: FileSnapshot::default(),
             chunk: FileChunk::default(),
+            ingest: FileIngest::default(),
             telegram: FileTelegram::default(),
         }
     }
@@ -196,6 +214,7 @@ impl Default for FileSnapshot {
 struct FileChunk {
     size: usize,
     codec: ChunkCodec,
+    frame_size: usize,
 }
 
 impl Default for FileChunk {
@@ -203,6 +222,21 @@ impl Default for FileChunk {
         Self {
             size: chunker::DEFAULT_CHUNK_SIZE,
             codec: ChunkCodec::Zstd,
+            frame_size: chunker::DEFAULT_FRAME_SIZE,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct FileIngest {
+    memory_budget: usize,
+}
+
+impl Default for FileIngest {
+    fn default() -> Self {
+        Self {
+            memory_budget: chunker::DEFAULT_INGEST_MEMORY_BUDGET,
         }
     }
 }
