@@ -38,7 +38,7 @@ impl BlockRecord {
     }
 }
 
-/// A finished on-wire chunk ready for `BlobStore::put`.
+/// A finished on-wire chunk ready for `LegacyBlobStore::put`.
 ///
 /// `_permits` holds ingest-budget slots for this chunk's logical bytes; they are
 /// released when the chunk is dropped (after a successful put, or on cancel/error).

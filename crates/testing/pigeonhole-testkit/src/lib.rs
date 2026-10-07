@@ -3,12 +3,12 @@
 use anyhow::Result;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    collect_stream, BlobBackend, DeleteOutcome, PutHint, Sweepable, TypedBlobBackend,
+    collect_stream, LegacyBlobStore, DeleteOutcome, PutHint, Sweepable, BlobBackend,
     TypedBootstrapPointer,
 };
 
 /// Run the shared put/get/range/delete suite against any backend.
-pub async fn run_conformance(backend: &dyn BlobBackend) -> Result<()> {
+pub async fn run_conformance(backend: &dyn LegacyBlobStore) -> Result<()> {
     // empty rejected
     assert!(backend
         .put(Bytes::new(), PutHint::new("empty.bin", ""))
@@ -67,13 +67,13 @@ pub async fn run_conformance(backend: &dyn BlobBackend) -> Result<()> {
     Ok(())
 }
 
-/// Shared suite for [`TypedBlobBackend`] + [`Sweepable`] + [`TypedBootstrapPointer`].
+/// Shared suite for [`BlobBackend`] + [`Sweepable`] + [`TypedBootstrapPointer`].
 ///
 /// Covers: put/get/range/delete, repeat delete, empty rejected, near-`max_blob_size`
 /// blob, monotonic keys, candidates covering written keys, pin swap/read.
 pub async fn run_typed_conformance<B>(backend: &B) -> Result<()>
 where
-    B: TypedBlobBackend + Sweepable + TypedBootstrapPointer,
+    B: BlobBackend + Sweepable + TypedBootstrapPointer,
 {
     // empty rejected
     assert!(

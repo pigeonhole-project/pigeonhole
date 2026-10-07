@@ -5,7 +5,7 @@ use futures::StreamExt;
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::storage::BlobStore;
+use pigeonhole::storage::{store_get, LegacyBlobStore};
 use pigeonhole::build_s3gram;
 use http::{HeaderMap, Method, Uri};
 use http::Extensions;
@@ -34,7 +34,7 @@ async fn setup() -> (pigeonhole::service::S3gram, Arc<MemoryBlobStore>, tempfile
     let cfg = Config::for_test(&url);
     let index = Index::connect(&url).await.unwrap();
     let mem = Arc::new(MemoryBlobStore::new());
-    let store: Arc<dyn BlobStore> = mem.clone();
+    let store: Arc<dyn LegacyBlobStore> = mem.clone();
     let s3 = build_s3gram(cfg, index, store);
     (s3, mem, dir)
 }
@@ -162,7 +162,7 @@ async fn compressible_object_roundtrip_and_snapshot_flag() {
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].codec, "blocks");
     assert_eq!(chunks[0].size, data.len() as i64);
-    let stored = mem.get(&chunks[0].file_id).await.unwrap();
+    let stored = store_get(mem.as_ref(), &chunks[0].file_id).await.unwrap();
     assert!(stored.len() < data.len());
     let frames = s3.index.get_chunk_blocks(&chunks[0].file_id).await.unwrap();
     assert!(!frames.is_empty());

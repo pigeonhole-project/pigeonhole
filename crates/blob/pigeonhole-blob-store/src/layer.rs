@@ -1,6 +1,6 @@
 //! Gateway-facing blob layer API (stage 1.6).
 //!
-//! Gateways see only [`BlobId`] / [`ChunkRef`] — not `DynBackend`, locators, or instances.
+//! Gateways see only [`BlobId`] / [`ChunkRef`] — not `DynBlobBackend`, locators, or instances.
 
 use crate::blob_db::BlobDb;
 use crate::ingest::IngestOptions;
@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use md5::{Digest, Md5};
-use pigeonhole_blob::{collect_stream, erase_sweep, SharedBackend, StoredId, Sweepable};
+use pigeonhole_blob::{collect_stream, erase_sweep, SharedBackend, BlobLocator, Sweepable};
 use pigeonhole_codec::{
     decode_blocks_range, ByteBudget, ChunkCodec, BlockRecord, BlockWriter, DEFAULT_CHUNK_SIZE,
 };
@@ -33,7 +33,7 @@ pub struct Ingested {
     pub crc32: u32,
 }
 
-/// Blob layer: metadata (`blob.db`) + typed backends behind [`DynBackend`].
+/// Blob layer: metadata (`blob.db`) + typed backends behind [`DynBlobBackend`].
 pub struct BlobLayer {
     db: BlobDb,
     write: SharedBackend,
@@ -176,7 +176,7 @@ impl BlobLayer {
             .get_any_replica(blob_id)
             .await?
             .with_context(|| format!("no replica for blob {blob_id}"))?;
-        let stored = StoredId {
+        let stored = BlobLocator {
             key: _key,
             locator,
         };
@@ -195,7 +195,7 @@ impl BlobLayer {
         &self,
         size: i64,
         crc: u32,
-        stored: &StoredId,
+        stored: &BlobLocator,
         blocks: &[BlockRecord],
     ) -> Result<BlobId> {
         let blob_id = self.db.insert_blob(size, crc).await?;

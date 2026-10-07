@@ -1,8 +1,8 @@
 //! Typed blob backend model (stage 1).
 //!
-//! Gateways will eventually see only [`crate::BlobStore`] / blob-store APIs.
-//! Storage crates implement [`TypedBlobBackend`] with concrete `Id` / `Key`;
-//! stage 1.2 erases them behind `DynBackend`.
+//! Gateways will eventually see only [`crate::LegacyBlobStore`] / blob-store APIs.
+//! Storage crates implement [`BlobBackend`] with concrete `Id` / `Key`;
+//! stage 1.2 erases them behind `DynBlobBackend`.
 
 use crate::BoxByteStream;
 use anyhow::{bail, Result};
@@ -132,14 +132,14 @@ impl CostHint {
 
 /// Type-erased stored identity: order key + postcard/bincode locator bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredId {
+pub struct BlobLocator {
     pub key: Vec<u8>,
     pub locator: Vec<u8>,
 }
 
 /// Typed backend with associated Id/Key (stage 1.1).
 #[async_trait]
-pub trait TypedBlobBackend: Send + Sync + 'static {
+pub trait BlobBackend: Send + Sync + 'static {
     type Id: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static;
     type Key: OrderedKey;
 
@@ -158,7 +158,7 @@ pub trait TypedBlobBackend: Send + Sync + 'static {
 
 /// Backends that can list keys in order for the sweeper.
 #[async_trait]
-pub trait Sweepable: TypedBlobBackend {
+pub trait Sweepable: BlobBackend {
     async fn candidates(
         &self,
         after: Option<Self::Key>,
@@ -174,19 +174,19 @@ pub trait TypedBootstrapPointer: Send + Sync {
     async fn swap(&self, new: Bytes) -> Result<()>;
 }
 
-/// Encode a typed id into [`StoredId`].
-pub fn store_id<B: TypedBlobBackend>(id: &B::Id) -> Result<StoredId> {
+/// Encode a typed id into [`BlobLocator`].
+pub fn store_id<B: BlobBackend>(id: &B::Id) -> Result<BlobLocator> {
     let key = B::key(id).to_bytes();
     let locator = serde_json::to_vec(id)?;
-    Ok(StoredId { key, locator })
+    Ok(BlobLocator { key, locator })
 }
 
 /// Decode a typed id from locator bytes.
-pub fn load_id<B: TypedBlobBackend>(stored: &StoredId) -> Result<B::Id> {
+pub fn load_id<B: BlobBackend>(stored: &BlobLocator) -> Result<B::Id> {
     let id: B::Id = serde_json::from_slice(&stored.locator)?;
     let expect = B::key(&id).to_bytes();
     if expect != stored.key {
-        bail!("StoredId key mismatch for decoded locator");
+        bail!("BlobLocator key mismatch for decoded locator");
     }
     Ok(id)
 }

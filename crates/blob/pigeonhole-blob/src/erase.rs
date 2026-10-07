@@ -1,7 +1,7 @@
-//! Object-safe erasure of [`TypedBlobBackend`] (stage 1.2).
+//! Object-safe erasure of [`BlobBackend`] (stage 1.2).
 
 use crate::typed::{
-    store_id, CostHint, InstanceInfo, OpKind, OrderedKey, StoredId, Sweepable, TypedBlobBackend,
+    store_id, CostHint, InstanceInfo, OpKind, OrderedKey, BlobLocator, Sweepable, BlobBackend,
 };
 use crate::BoxByteStream;
 use anyhow::Result;
@@ -13,12 +13,12 @@ use std::sync::Arc;
 
 /// Object-safe backend used by blob-store / replication.
 #[async_trait]
-pub trait DynBackend: Send + Sync + 'static {
+pub trait DynBlobBackend: Send + Sync + 'static {
     fn instance(&self) -> &InstanceInfo;
     fn limits(&self) -> &BackendLimits;
-    fn cost(&self, op: OpKind, id: Option<&StoredId>) -> CostHint;
-    async fn put(&self, data: Bytes) -> Result<StoredId>;
-    async fn get(&self, id: &StoredId, range: Option<ByteRange>) -> Result<BoxByteStream>;
+    fn cost(&self, op: OpKind, id: Option<&BlobLocator>) -> CostHint;
+    async fn put(&self, data: Bytes) -> Result<BlobLocator>;
+    async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream>;
     async fn delete(&self, keys: &[Vec<u8>]) -> Result<()>;
     /// Optional sweeper registration.
     fn sweeper(&self) -> Option<&dyn DynSweep>;
@@ -35,7 +35,7 @@ pub trait DynSweep: Send + Sync {
     ) -> Result<Vec<Vec<u8>>>;
 }
 
-/// Wrap a concrete [`TypedBlobBackend`] as [`DynBackend`].
+/// Wrap a concrete [`BlobBackend`] as [`DynBlobBackend`].
 pub struct Erased<B> {
     inner: B,
 }
@@ -51,9 +51,9 @@ impl<B> Erased<B> {
 }
 
 #[async_trait]
-impl<B> DynBackend for Erased<B>
+impl<B> DynBlobBackend for Erased<B>
 where
-    B: TypedBlobBackend,
+    B: BlobBackend,
 {
     fn instance(&self) -> &InstanceInfo {
         self.inner.instance()
@@ -63,17 +63,17 @@ where
         self.inner.limits()
     }
 
-    fn cost(&self, op: OpKind, id: Option<&StoredId>) -> CostHint {
+    fn cost(&self, op: OpKind, id: Option<&BlobLocator>) -> CostHint {
         let typed = id.and_then(|s| serde_json::from_slice::<B::Id>(&s.locator).ok());
         self.inner.cost(op, typed.as_ref())
     }
 
-    async fn put(&self, data: Bytes) -> Result<StoredId> {
+    async fn put(&self, data: Bytes) -> Result<BlobLocator> {
         let id = self.inner.put(data).await?;
         store_id::<B>(&id)
     }
 
-    async fn get(&self, id: &StoredId, range: Option<ByteRange>) -> Result<BoxByteStream> {
+    async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let typed: B::Id = serde_json::from_slice(&id.locator)?;
         self.inner.get(&typed, range).await
     }
@@ -107,7 +107,7 @@ impl<B> ErasedSweep<B> {
 }
 
 #[async_trait]
-impl<B> DynBackend for ErasedSweep<B>
+impl<B> DynBlobBackend for ErasedSweep<B>
 where
     B: Sweepable,
 {
@@ -119,19 +119,19 @@ where
         self.inner.limits()
     }
 
-    fn cost(&self, op: OpKind, id: Option<&StoredId>) -> CostHint {
+    fn cost(&self, op: OpKind, id: Option<&BlobLocator>) -> CostHint {
         let typed = id.and_then(|s| serde_json::from_slice::<B::Id>(&s.locator).ok());
         self.inner.cost(op, typed.as_ref())
     }
 
-    async fn put(&self, data: Bytes) -> Result<StoredId> {
-        let id = TypedBlobBackend::put(&self.inner, data).await?;
+    async fn put(&self, data: Bytes) -> Result<BlobLocator> {
+        let id = BlobBackend::put(&self.inner, data).await?;
         store_id::<B>(&id)
     }
 
-    async fn get(&self, id: &StoredId, range: Option<ByteRange>) -> Result<BoxByteStream> {
+    async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let typed: B::Id = serde_json::from_slice(&id.locator)?;
-        TypedBlobBackend::get(&self.inner, &typed, range).await
+        BlobBackend::get(&self.inner, &typed, range).await
     }
 
     async fn delete(&self, keys: &[Vec<u8>]) -> Result<()> {
@@ -139,7 +139,7 @@ where
         for k in keys {
             typed.push(B::Key::from_bytes(k)?);
         }
-        TypedBlobBackend::delete(&self.inner, &typed).await
+        BlobBackend::delete(&self.inner, &typed).await
     }
 
     fn sweeper(&self) -> Option<&dyn DynSweep> {
@@ -169,10 +169,10 @@ where
 }
 
 /// Arc helper.
-pub type SharedBackend = Arc<dyn DynBackend>;
+pub type SharedBackend = Arc<dyn DynBlobBackend>;
 
 /// Adapt a non-sweep backend; `PhantomData` keeps unused type params quiet in macros.
-pub fn erase<B: TypedBlobBackend>(backend: B) -> Erased<B> {
+pub fn erase<B: BlobBackend>(backend: B) -> Erased<B> {
     let _ = PhantomData::<B>;
     Erased::new(backend)
 }
@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl TypedBlobBackend for TinyMem {
+    impl BlobBackend for TinyMem {
         type Id = TinyId;
         type Key = u64;
         fn instance(&self) -> &InstanceInfo {

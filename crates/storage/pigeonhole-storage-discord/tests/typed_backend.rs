@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use pigeonhole_blob::{
-    collect_stream, ChatLimiter, ChatLimiterConfig, CostHint, OpKind, Sweepable, TypedBlobBackend,
+    collect_stream, ChatLimiter, ChatLimiterConfig, CostHint, OpKind, Sweepable, BlobBackend,
     TypedBootstrapPointer,
 };
 use pigeonhole_storage_discord::{
@@ -354,14 +354,14 @@ async fn typed_put_get_sweep_delete_and_fingerprint() {
     );
     assert_eq!(store.instance().location, discord_location(CHANNEL));
 
-    let id = TypedBlobBackend::put(&store, Bytes::from_static(b"typed-dc"))
+    let id = BlobBackend::put(&store, Bytes::from_static(b"typed-dc"))
         .await
         .unwrap();
     assert!(id.message_id > 0);
     assert!(!id.attachment_id.is_empty());
     assert_eq!(DiscordBlobStore::key(&id), id.message_id);
 
-    let got = collect_stream(TypedBlobBackend::get(&store, &id, None).await.unwrap())
+    let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
         .await
         .unwrap();
     assert_eq!(got.as_ref(), b"typed-dc");
@@ -372,10 +372,10 @@ async fn typed_put_get_sweep_delete_and_fingerprint() {
     assert!(keys.contains(&id.message_id));
 
     // List path observed remaining=0 → cost(List) reports wait.
-    let list_cost = TypedBlobBackend::cost(&store, OpKind::List, None);
+    let list_cost = BlobBackend::cost(&store, OpKind::List, None);
     assert!(list_cost.wait_secs > 0.0);
 
-    TypedBlobBackend::delete(&store, &[id.message_id])
+    BlobBackend::delete(&store, &[id.message_id])
         .await
         .unwrap();
     // Single young key → one-by-one (bulk needs ≥2).
@@ -383,7 +383,7 @@ async fn typed_put_get_sweep_delete_and_fingerprint() {
     assert!(state.deleted.lock().unwrap().contains(&id.message_id));
 
     // Not-found delete is success.
-    TypedBlobBackend::delete(&store, &[id.message_id])
+    BlobBackend::delete(&store, &[id.message_id])
         .await
         .unwrap();
 }
@@ -407,17 +407,17 @@ async fn typed_bulk_delete_for_young_messages() {
     let dc = DiscordClient::with_api_base(TOKEN.into(), api_base).unwrap();
     let store = DiscordBlobStore::new(dc, CHANNEL.into(), fast_limiter(), None);
 
-    let a = TypedBlobBackend::put(&store, Bytes::from_static(b"a"))
+    let a = BlobBackend::put(&store, Bytes::from_static(b"a"))
         .await
         .unwrap();
-    let b = TypedBlobBackend::put(&store, Bytes::from_static(b"b"))
+    let b = BlobBackend::put(&store, Bytes::from_static(b"b"))
         .await
         .unwrap();
-    let c = TypedBlobBackend::put(&store, Bytes::from_static(b"c"))
+    let c = BlobBackend::put(&store, Bytes::from_static(b"c"))
         .await
         .unwrap();
 
-    TypedBlobBackend::delete(&store, &[a.message_id, b.message_id, c.message_id])
+    BlobBackend::delete(&store, &[a.message_id, b.message_id, c.message_id])
         .await
         .unwrap();
 
@@ -452,7 +452,7 @@ async fn typed_old_messages_delete_one_by_one() {
     let store = DiscordBlobStore::new(dc, CHANNEL.into(), fast_limiter(), None);
 
     assert!(snowflake_timestamp_ms(old_a) < unix_now_ms());
-    TypedBlobBackend::delete(&store, &[old_a, old_b])
+    BlobBackend::delete(&store, &[old_a, old_b])
         .await
         .unwrap();
     assert!(
@@ -614,7 +614,7 @@ async fn cost_free_before_headers() {
     let dc = DiscordClient::with_api_base(TOKEN.into(), api_base).unwrap();
     let store = DiscordBlobStore::new(dc, CHANNEL.into(), fast_limiter(), None);
     assert_eq!(
-        TypedBlobBackend::cost(&store, OpKind::Put, None::<&DiscordId>),
+        BlobBackend::cost(&store, OpKind::Put, None::<&DiscordId>),
         CostHint::free()
     );
 }
@@ -631,5 +631,5 @@ async fn delete_not_found_is_ok() {
 
     let dc = DiscordClient::with_api_base(TOKEN.into(), api_base).unwrap();
     let store = DiscordBlobStore::new(dc, CHANNEL.into(), fast_limiter(), None);
-    TypedBlobBackend::delete(&store, &[12345]).await.unwrap();
+    BlobBackend::delete(&store, &[12345]).await.unwrap();
 }

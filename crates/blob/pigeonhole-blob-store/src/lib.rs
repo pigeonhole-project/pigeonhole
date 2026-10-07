@@ -32,7 +32,8 @@ pub use ingest::{
 };
 pub use read::read_chunk_range_cached;
 pub use pigeonhole_blob::{
-    collect_stream, BlobStore, BootstrapPointer, BoxByteStream, DeleteOutcome, PinnedContent,
+    collect_stream, store_delete_message, store_get, store_put, BootstrapPointer, BoxByteStream,
+    DeleteOutcome, LegacyBlobStore, PinnedContent,
 };
 pub use pigeonhole_codec::{ByteBudget, ChunkCodec, BlockRecord};
 pub use pigeonhole_index::{Index, IndexSnapshot};

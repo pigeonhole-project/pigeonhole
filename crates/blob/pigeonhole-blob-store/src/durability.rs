@@ -7,7 +7,7 @@ use crate::blob_db::BlobDb;
 use crate::layer::BlobId;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use pigeonhole_blob::{collect_stream, SharedBackend, StoredId, TypedBootstrapPointer};
+use pigeonhole_blob::{collect_stream, SharedBackend, BlobLocator, TypedBootstrapPointer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -24,9 +24,9 @@ pub struct Superblock {
     pub instance_id: String,
     pub fingerprint: String,
     /// Locators of checkpoint payload parts (usually one).
-    pub checkpoint: Vec<StoredId>,
+    pub checkpoint: Vec<BlobLocator>,
     /// Locators of journal segments since the checkpoint, oldest first.
-    pub log: Vec<Vec<StoredId>>,
+    pub log: Vec<Vec<BlobLocator>>,
     /// Committed roots at this generation.
     pub roots: BTreeMap<String, BlobId>,
     /// Hex sha256 of the canonical JSON without this field.
@@ -85,8 +85,8 @@ struct CanonicalSuperblock<'a> {
     generation: u64,
     instance_id: &'a str,
     fingerprint: &'a str,
-    checkpoint: &'a [StoredId],
-    log: &'a [Vec<StoredId>],
+    checkpoint: &'a [BlobLocator],
+    log: &'a [Vec<BlobLocator>],
     roots: &'a BTreeMap<String, BlobId>,
 }
 

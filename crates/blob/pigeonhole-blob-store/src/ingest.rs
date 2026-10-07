@@ -1,11 +1,11 @@
-//! Stream an S3 request body into Telegram-sized BlobStore chunks.
+//! Stream an S3 request body into Telegram-sized LegacyBlobStore chunks.
 //!
 //! With compressing policies (`zstd` / `gzip`), data is packed as independent
 //! fixed-size frames ([`pigeonhole_codec::BlockWriter`]) so each block is compressed
 //! once. Chunk codec stored in the index is [`ChunkCodec::Blocks`]. Legacy
 //! single-blob `raw` / `gzip` / `zstd` chunks remain readable.
 
-use pigeonhole_blob::{BlobStore, DeleteOutcome};
+use pigeonhole_blob::{store_delete_message, store_get, store_put, DeleteOutcome, LegacyBlobStore};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::{ByteBudget, CompletedChunk, BlockRecord, BlockWriter};
 use anyhow::{bail, Context, Result};
@@ -85,7 +85,7 @@ impl IngestOptions {
 
 /// Upload body bytes into documents of at most `chunk_size` on-wire bytes.
 pub async fn ingest_stream_to_store(
-    store: &Arc<dyn BlobStore>,
+    store: &Arc<dyn LegacyBlobStore>,
     stream: impl futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
     checksum: Option<&mut dyn IngestHasher>,
     chunk_size: usize,
@@ -101,7 +101,7 @@ pub async fn ingest_stream_to_store(
 }
 
 pub async fn ingest_stream_with_options(
-    store: &Arc<dyn BlobStore>,
+    store: &Arc<dyn LegacyBlobStore>,
     mut stream: impl futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
     checksum: Option<&mut dyn IngestHasher>,
     opts: IngestOptions,
@@ -113,7 +113,7 @@ pub async fn ingest_stream_with_options(
 }
 
 async fn ingest_framed(
-    store: &Arc<dyn BlobStore>,
+    store: &Arc<dyn LegacyBlobStore>,
     stream: &mut (impl futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin),
     mut checksum: Option<&mut dyn IngestHasher>,
     opts: IngestOptions,
@@ -239,7 +239,7 @@ async fn ingest_framed(
 }
 
 async fn ingest_raw(
-    store: &Arc<dyn BlobStore>,
+    store: &Arc<dyn LegacyBlobStore>,
     stream: &mut (impl futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin),
     mut checksum: Option<&mut dyn IngestHasher>,
     chunk_size: usize,
@@ -317,7 +317,7 @@ async fn ingest_raw(
 }
 
 async fn put_completed(
-    store: &Arc<dyn BlobStore>,
+    store: &Arc<dyn LegacyBlobStore>,
     mut done: CompletedChunk,
     part_no: i64,
 ) -> Result<UploadedChunk> {
@@ -329,7 +329,7 @@ async fn put_completed(
     let logical_size = done.logical_size;
     let stored_crc32 = Some(crc32fast::hash(payload.as_ref()));
     let filename = format!("{:x}.bin.blocks", Md5::digest(&payload));
-    let put_result = store.put(payload, &filename, "").await;
+    let put_result = store_put(store.as_ref(), payload, &filename, "").await;
     // Release ingest-budget permits only after put attempt finishes.
     drop(done);
     let (file_id, message_id) = put_result.context("blob store put")?;
@@ -345,15 +345,14 @@ async fn put_completed(
 }
 
 async fn put_raw_piece(
-    store: &Arc<dyn BlobStore>,
+    store: &Arc<dyn LegacyBlobStore>,
     piece: Vec<u8>,
     part_no: i64,
 ) -> Result<UploadedChunk> {
     let logical_size = piece.len() as i64;
     let stored_crc32 = Some(crc32fast::hash(&piece));
     let filename = format!("{:x}.bin", Md5::digest(&piece));
-    let (file_id, message_id) = store
-        .put(Bytes::from(piece), &filename, "")
+    let (file_id, message_id) = store_put(store.as_ref(), Bytes::from(piece), &filename, "")
         .await
         .context("blob store put")?;
     Ok(UploadedChunk {
@@ -367,10 +366,10 @@ async fn put_raw_piece(
     })
 }
 
-async fn cleanup_uploads(store: &Arc<dyn BlobStore>, uploaded: &[UploadedChunk]) -> Vec<i64> {
+async fn cleanup_uploads(store: &Arc<dyn LegacyBlobStore>, uploaded: &[UploadedChunk]) -> Vec<i64> {
     let mut pending = Vec::new();
     for u in uploaded {
-        match store.delete_message(u.message_id).await {
+        match store_delete_message(store.as_ref(), u.message_id).await {
             Ok(DeleteOutcome::Deleted | DeleteOutcome::Gone) => {}
             Ok(DeleteOutcome::Failed) | Err(_) => pending.push(u.message_id),
         }
@@ -498,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn empty_body_stores_no_chunks() {
         let mem = Arc::new(MemoryBlobStore::new());
-        let store: Arc<dyn BlobStore> = mem.clone();
+        let store: Arc<dyn LegacyBlobStore> = mem.clone();
         let r = ingest_stream_to_store(&store, stream::empty(), None, 1024, ChunkCodec::Zstd)
             .await
             .unwrap();
@@ -509,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn raw_policy_never_compresses() {
         let mem = Arc::new(MemoryBlobStore::new());
-        let store: Arc<dyn BlobStore> = mem.clone();
+        let store: Arc<dyn LegacyBlobStore> = mem.clone();
         let data = Bytes::from(vec![b'a'; 64 * 1024]);
         let body = stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]);
         let r = ingest_stream_to_store(&store, body, None, 64 * 1024, ChunkCodec::Raw)
@@ -517,13 +516,13 @@ mod tests {
             .unwrap();
         assert_eq!(r.chunks[0].codec, ChunkCodec::Raw);
         assert!(r.chunks[0].blocks.is_empty());
-        assert_eq!(store.get(&r.chunks[0].file_id).await.unwrap(), data);
+        assert_eq!(store_get(store.as_ref(), &r.chunks[0].file_id).await.unwrap(), data);
     }
 
     #[tokio::test]
     async fn zstd_policy_stores_blocks_codec() {
         let mem = Arc::new(MemoryBlobStore::new());
-        let store: Arc<dyn BlobStore> = mem.clone();
+        let store: Arc<dyn LegacyBlobStore> = mem.clone();
         let data = Bytes::from(vec![b'a'; 128 * 1024]);
         let body = stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]);
         let mut opts = IngestOptions::new(256 * 1024, ChunkCodec::Zstd);
@@ -534,7 +533,7 @@ mod tests {
         assert_eq!(r.chunks[0].codec, ChunkCodec::Blocks);
         assert!(!r.chunks[0].blocks.is_empty());
         assert!(r.compress_calls <= 2);
-        let stored = store.get(&r.chunks[0].file_id).await.unwrap();
+        let stored = store_get(store.as_ref(), &r.chunks[0].file_id).await.unwrap();
         let got = pigeonhole_codec::decode_blocks_range(
             stored.as_ref(),
             &r.chunks[0].blocks,
@@ -548,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn compress_calls_bounded_by_frame_count() {
         let mem = Arc::new(MemoryBlobStore::new());
-        let store: Arc<dyn BlobStore> = mem.clone();
+        let store: Arc<dyn LegacyBlobStore> = mem.clone();
         let frame = 32 * 1024;
         let n = 200 * 1024;
         let data = Bytes::from(vec![0u8; n]);
@@ -566,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn mixed_compressible_and_random() {
         let mem = Arc::new(MemoryBlobStore::new());
-        let store: Arc<dyn BlobStore> = mem.clone();
+        let store: Arc<dyn LegacyBlobStore> = mem.clone();
         let mut data = vec![0u8; 100 * 1024];
         for (i, b) in data[50 * 1024..].iter_mut().enumerate() {
             *b = (i % 251) as u8;
@@ -579,7 +578,7 @@ mod tests {
             .unwrap();
         let mut out = Vec::new();
         for c in &r.chunks {
-            let stored = store.get(&c.file_id).await.unwrap();
+            let stored = store_get(store.as_ref(), &c.file_id).await.unwrap();
             out.extend_from_slice(
                 &pigeonhole_codec::decode_blocks_range(stored.as_ref(), &c.blocks, 0, c.logical_size as usize)
                     .unwrap(),
@@ -610,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn large_put_under_small_budget_completes() {
         let mem = Arc::new(MemoryBlobStore::new());
-        let store: Arc<dyn BlobStore> = mem.clone();
+        let store: Arc<dyn LegacyBlobStore> = mem.clone();
         let budget = ByteBudget::new(32 * 1024 * 1024);
         let n = 300 * 1024 * 1024;
         // Stream in 4 MiB pieces so we do not hold the whole object in one Bytes.
@@ -641,7 +640,7 @@ mod tests {
             let budget = budget.clone();
             joins.push(tokio::spawn(async move {
                 let mem = Arc::new(MemoryBlobStore::new());
-                let store: Arc<dyn BlobStore> = mem;
+                let store: Arc<dyn LegacyBlobStore> = mem;
                 let n = 64 * 1024 * 1024;
                 let piece = 2 * 1024 * 1024;
                 let body = futures::stream::unfold(0usize, move |off| async move {
@@ -676,7 +675,7 @@ mod tests {
             let budget = budget.clone();
             joins.push(tokio::spawn(async move {
                 let mem = Arc::new(MemoryBlobStore::new());
-                let store: Arc<dyn BlobStore> = mem;
+                let store: Arc<dyn LegacyBlobStore> = mem;
                 let n = 8 * 1024 * 1024;
                 let piece = 256 * 1024;
                 let body = futures::stream::unfold(0usize, move |off| async move {
@@ -711,7 +710,7 @@ mod tests {
     async fn cancel_mid_put_returns_budget() {
         let budget = ByteBudget::new(16 * 1024 * 1024);
         let mem = Arc::new(MemoryBlobStore::new());
-        let store: Arc<dyn BlobStore> = mem;
+        let store: Arc<dyn LegacyBlobStore> = mem;
         let budget_c = budget.clone();
         let handle = tokio::spawn(async move {
             let n = 128 * 1024 * 1024;

@@ -3,7 +3,7 @@
 use crate::blob_db::BlobDb;
 use crate::instances::{telegram_fingerprint, telegram_location, InstanceConfig};
 use anyhow::{Context, Result};
-use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole, StoredId};
+use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole, BlobLocator};
 use pigeonhole_index::Index;
 use serde::Serialize;
 
@@ -68,7 +68,7 @@ pub async fn migrate_index_to_blob_db(
         } else if b.refcount == 0 {
             blob_db.release(&[blob_id]).await?;
         }
-        let stored = StoredId {
+        let stored = BlobLocator {
             key: (b.message_id as u64).to_be_bytes().to_vec(),
             locator: serde_json::to_vec(&serde_json::json!({
                 "file_id": b.file_id,

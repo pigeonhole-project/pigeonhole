@@ -12,7 +12,7 @@ block is compressed once; on-wire size stays ≤ `chunk.size` (logical ≤ 256�
 Legacy single-blob `raw`/`gzip`/`zstd` chunks remain readable. Object metadata
 lives in a local SQLite index.
 
-Storage I/O goes through `BlobBackend` / `BlobStore` (`storage-telegram` or
+Storage I/O goes through `LegacyBlobStore` / `LegacyBlobStoreTg` (`storage-telegram` or
 `storage-discord` in production, `storage-memory` in tests) so unit tests never
 hit a real Bot API. Roadmap gateways: Kafka, WebDAV.
 
@@ -22,7 +22,7 @@ Layout is a Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 |---|---|
 | `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
 | `core/pigeonhole-codec` | Codecs + `BlockWriter` |
-| `blob/pigeonhole-blob` | `BlobBackend` / `BlobStore`, rate limits, `BootstrapPointer`, cache |
+| `blob/pigeonhole-blob` | `LegacyBlobStore` / `LegacyBlobStoreTg`, rate limits, `BootstrapPointer`, cache |
 | `blob/pigeonhole-index` | SQLite index (blob-store layer; merging into blob-store later) |
 | `blob/pigeonhole-blob-store` | Ingest, snapshots, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
@@ -237,7 +237,7 @@ unpin/delete the previous parts. You can also copy the local `s3gram.db` file.
 | User metadata (`x-amz-meta-*`) | yes |
 | Zero-byte objects (no Telegram upload) | yes |
 | Blob refcount in SQLite | yes |
-| `memory = true` (in-memory BlobStore, no Telegram) | yes |
+| `memory = true` (in-memory LegacyBlobStoreTg, no Telegram) | yes |
 | Separate send / getFile / delete budgets + upload/download semaphores | yes |
 | In-memory LRU cache for Telegram `file_path` | yes |
 | Presigned URLs / ACL / bucket versioning | later |

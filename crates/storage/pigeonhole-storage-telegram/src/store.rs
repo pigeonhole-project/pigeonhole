@@ -3,9 +3,9 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    bytes_stream, slice_range, store_delete_message, store_get, store_put, BlobBackend, BlobStore,
+    bytes_stream, slice_range, store_delete_message, store_get, store_put, LegacyBlobStore,
     BootstrapPointer, BoxByteStream, ChatLimiter, CostHint, DeleteOutcome, InstanceInfo,
-    InstanceKind, InstanceRole, LimitBudget, OpKind, PinnedContent, Sweepable, TypedBlobBackend,
+    InstanceKind, InstanceRole, LimitBudget, OpKind, PinnedContent, Sweepable, BlobBackend,
     TypedBootstrapPointer,
 };
 use pigeonhole_types::{
@@ -82,7 +82,7 @@ impl TelegramBlobStore {
 }
 
 #[async_trait]
-impl BlobBackend for TelegramBlobStore {
+impl LegacyBlobStore for TelegramBlobStore {
     fn id(&self) -> &BackendId {
         &self.id
     }
@@ -161,7 +161,7 @@ impl BlobBackend for TelegramBlobStore {
 }
 
 #[async_trait]
-impl TypedBlobBackend for TelegramBlobStore {
+impl BlobBackend for TelegramBlobStore {
     type Id = TelegramId;
     type Key = i64;
 
@@ -198,7 +198,7 @@ impl TypedBlobBackend for TelegramBlobStore {
     }
 
     async fn put(&self, data: Bytes) -> Result<Self::Id> {
-        let loc = BlobBackend::put(self, data, PutHint::default()).await?;
+        let loc = LegacyBlobStore::put(self, data, PutHint::default()).await?;
         match loc {
             Locator::Telegram {
                 file_id,
@@ -213,7 +213,7 @@ impl TypedBlobBackend for TelegramBlobStore {
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let loc = Locator::telegram(&id.file_id, id.message_id);
-        BlobBackend::get(self, &loc, range).await
+        LegacyBlobStore::get(self, &loc, range).await
     }
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
@@ -256,25 +256,6 @@ impl Sweepable for TelegramBlobStore {
     }
 }
 
-#[async_trait]
-impl BlobStore for TelegramBlobStore {
-    async fn put(
-        &self,
-        data: Bytes,
-        filename: &str,
-        caption: &str,
-    ) -> Result<(String, i64)> {
-        store_put(self, data, filename, caption).await
-    }
-
-    async fn get(&self, file_id: &str) -> Result<Bytes> {
-        store_get(self, file_id).await
-    }
-
-    async fn delete_message(&self, message_id: i64) -> Result<DeleteOutcome> {
-        store_delete_message(self, message_id).await
-    }
-}
 
 #[async_trait]
 impl BootstrapPointer for TelegramBlobStore {

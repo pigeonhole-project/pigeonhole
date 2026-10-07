@@ -7,7 +7,7 @@ use pigeonhole::http_timeout::with_http_timeouts;
 use pigeonhole::index::{Index, IndexSnapshot};
 use pigeonhole::snapshot;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::storage::{BlobStore, DeleteOutcome};
+use pigeonhole::storage::DeleteOutcome;
 use pigeonhole_blob::InstanceKind;
 use pigeonhole_blob_store::{
     default_instance_for_migrate, migrate_index_to_blob_db, BlobDb,
@@ -15,7 +15,8 @@ use pigeonhole_blob_store::{
 use pigeonhole::telegram::{PinnedContent, TelegramBlobStore, TelegramClient};
 use pigeonhole::{build_s3_service, build_s3gram};
 use pigeonhole_blob::{
-    spawn_metrics_logger, BackendMetrics, BlobBackend, BootstrapPointer, CachingBackend,
+    spawn_metrics_logger, store_delete_message, BackendMetrics, BootstrapPointer, CachingBackend,
+    LegacyBlobStore,
 };
 use s3s::{Body, HttpError};
 use std::collections::BTreeSet;
@@ -113,14 +114,14 @@ async fn cmd_serve() -> anyhow::Result<()> {
 
     let limiter = cfg.chat_limiter();
     let (store, pin, max_blob): (
-        Arc<dyn BlobStore>,
+        Arc<dyn LegacyBlobStore>,
         Option<Arc<dyn BootstrapPointer>>,
         usize,
     ) = if cfg.memory_store {
         warn!("memory = true: using MemoryBlobStore (no Telegram)");
         let mem = MemoryBlobStore::new();
         let max_blob = mem.limits().max_blob_size;
-        let store: Arc<dyn BlobStore> = if cfg.cache.enabled {
+        let store: Arc<dyn LegacyBlobStore> = if cfg.cache.enabled {
             info!(
                 memory_bytes = cfg.cache.memory_bytes,
                 disk = ?cfg.cache.disk_path,
@@ -151,7 +152,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
             ));
             let max_blob = dc_store.limits().max_blob_size;
             let pin: Arc<dyn BootstrapPointer> = dc_store.clone();
-            let store: Arc<dyn BlobStore> = if cfg.cache.enabled {
+            let store: Arc<dyn LegacyBlobStore> = if cfg.cache.enabled {
                 info!(
                     memory_bytes = cfg.cache.memory_bytes,
                     disk = ?cfg.cache.disk_path,
@@ -185,7 +186,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
         ));
         let max_blob = tg_store.limits().max_blob_size;
         let pin: Arc<dyn BootstrapPointer> = tg_store.clone();
-        let store: Arc<dyn BlobStore> = if cfg.cache.enabled {
+        let store: Arc<dyn LegacyBlobStore> = if cfg.cache.enabled {
             info!(
                 memory_bytes = cfg.cache.memory_bytes,
                 disk = ?cfg.cache.disk_path,
@@ -351,7 +352,7 @@ fn blob_db_url_from_index(database_url: &str) -> String {
 struct ArcBackend<T>(Arc<T>);
 
 #[async_trait::async_trait]
-impl<T: BlobBackend + 'static> BlobBackend for ArcBackend<T> {
+impl<T: LegacyBlobStore + 'static> LegacyBlobStore for ArcBackend<T> {
     fn id(&self) -> &pigeonhole_blob::BackendId {
         self.0.id()
     }
@@ -475,7 +476,7 @@ async fn cmd_purge(
     let mut gone = 0u64;
     let mut failed = 0u64;
     for message_id in &ids {
-        match store.delete_message(*message_id).await {
+        match store_delete_message(&store, *message_id).await {
             Ok(DeleteOutcome::Deleted) => deleted += 1,
             Ok(DeleteOutcome::Gone) => gone += 1,
             Ok(DeleteOutcome::Failed) => {

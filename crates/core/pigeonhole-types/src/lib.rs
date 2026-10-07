@@ -126,7 +126,7 @@ impl Locator {
         }
     }
 
-    /// Legacy [`BlobStore::get`] key: `{message_id}:{attachment_id}`.
+    /// Legacy [`LegacyBlobStore::get`] key: `{message_id}:{attachment_id}`.
     pub fn discord_store_file_id(message_id: i64, attachment_id: &str) -> String {
         format!("{message_id}:{attachment_id}")
     }

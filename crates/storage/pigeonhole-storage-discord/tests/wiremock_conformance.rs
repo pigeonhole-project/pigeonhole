@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use pigeonhole_testkit::run_conformance;
-use pigeonhole_blob::{BlobBackend, ChatLimiter, ChatLimiterConfig, PutHint};
+use pigeonhole_blob::{LegacyBlobStore, ChatLimiter, ChatLimiterConfig, PutHint};
 use pigeonhole_storage_discord::{DiscordBlobStore, DiscordClient};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

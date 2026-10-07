@@ -1,7 +1,7 @@
 //! In-process REAPI tests (localhost only, no external network).
 
 use bytes::Bytes;
-use pigeonhole_blob_store::{BlobStore, Index};
+use pigeonhole_blob_store::{LegacyBlobStore, Index};
 use pigeonhole_storage_memory::MemoryBlobStore;
 use pigeonhole_gateway_bytestream::config::BytestreamConfig;
 use pigeonhole_gateway_bytestream::digest::sha256_hex;
@@ -23,7 +23,7 @@ async fn test_harness() -> (
     let url = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display());
     let index = Index::connect(&url).await.unwrap();
     let mem = Arc::new(MemoryBlobStore::new());
-    let store: Arc<dyn BlobStore> = mem.clone();
+    let store: Arc<dyn LegacyBlobStore> = mem.clone();
     let cfg = BytestreamConfig {
         enabled: true,
         instance_name: "s3gram".into(),

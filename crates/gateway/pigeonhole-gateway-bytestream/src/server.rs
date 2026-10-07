@@ -24,7 +24,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use prost::Message;
-use pigeonhole_blob_store::{BlobStore, Index};
+use pigeonhole_blob_store::{store_delete_message, Index, LegacyBlobStore};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,7 +61,7 @@ struct PendingUpload {
     last_activity: Instant,
 }
 
-fn make_state(cfg: &BytestreamConfig, index: Index, store: Arc<dyn BlobStore>, chat_id: String) -> ReapiState {
+fn make_state(cfg: &BytestreamConfig, index: Index, store: Arc<dyn LegacyBlobStore>, chat_id: String) -> ReapiState {
     let state = ReapiState {
         cas: CasStore::new(index, store.clone(), chat_id),
         instance: cfg.instance_name.clone(),
@@ -74,7 +74,7 @@ fn make_state(cfg: &BytestreamConfig, index: Index, store: Arc<dyn BlobStore>, c
     state
 }
 
-pub async fn serve(cfg: BytestreamConfig, index: Index, store: Arc<dyn BlobStore>, chat_id: String) -> Result<()> {
+pub async fn serve(cfg: BytestreamConfig, index: Index, store: Arc<dyn LegacyBlobStore>, chat_id: String) -> Result<()> {
     let state = make_state(&cfg, index, store, chat_id);
 
     let addr = cfg.listen_addr.parse().context("parse bytestream listen_addr")?;
@@ -97,7 +97,7 @@ pub async fn serve(cfg: BytestreamConfig, index: Index, store: Arc<dyn BlobStore
 pub async fn serve_ephemeral(
     cfg: BytestreamConfig,
     index: Index,
-    store: Arc<dyn BlobStore>,
+    store: Arc<dyn LegacyBlobStore>,
     chat_id: String,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -142,7 +142,7 @@ fn spawn_upload_gc(state: ReapiState) {
     });
 }
 
-fn spawn_cas_gc(state: ReapiState, store: Arc<dyn BlobStore>, ttl_secs: u64) {
+fn spawn_cas_gc(state: ReapiState, store: Arc<dyn LegacyBlobStore>, ttl_secs: u64) {
     if ttl_secs == 0 {
         return;
     }
@@ -162,7 +162,7 @@ fn spawn_cas_gc(state: ReapiState, store: Arc<dyn BlobStore>, ttl_secs: u64) {
                     match cas.release(&hash, size).await {
                         Ok(orphans) => {
                             for (_chat, message_id, _fid) in orphans {
-                                let _ = store.delete_message(message_id).await;
+                                let _ = store_delete_message(store.as_ref(), message_id).await;
                             }
                         }
                         Err(e) => warn!(error = %e, %hash, size, "cas gc release"),
@@ -623,7 +623,7 @@ impl ByteStream for ReapiState {
             let _ = handle.await;
             if let Ok(orphans) = self.cas.cas.release(&expected_hash, expected_size).await {
                 for (_chat, message_id, _fid) in orphans {
-                    let _ = self.cas.store.delete_message(message_id).await;
+                    let _ = store_delete_message(self.cas.store.as_ref(), message_id).await;
                 }
             }
             let mut uploads = self.uploads.lock().await;

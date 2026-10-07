@@ -1,9 +1,9 @@
-//! In-memory [`BlobBackend`] / [`BlobStore`] for tests and `memory = true`.
+//! In-memory [`LegacyBlobStore`] / [`LegacyBlobStore`] for tests and `memory = true`.
 
 use pigeonhole_blob::{
-    bytes_stream, slice_range, store_delete_message, store_get, store_put, BlobBackend, BlobStore,
+    bytes_stream, slice_range, store_delete_message, store_get, store_put, LegacyBlobStore,
     BoxByteStream, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, Sweepable,
-    TypedBlobBackend, TypedBootstrapPointer,
+    BlobBackend, TypedBootstrapPointer,
 };
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -81,7 +81,7 @@ impl Default for MemoryBlobStore {
 }
 
 #[async_trait]
-impl BlobBackend for MemoryBlobStore {
+impl LegacyBlobStore for MemoryBlobStore {
     fn id(&self) -> &BackendId {
         &self.id
     }
@@ -145,7 +145,7 @@ impl BlobBackend for MemoryBlobStore {
 }
 
 #[async_trait]
-impl TypedBlobBackend for MemoryBlobStore {
+impl BlobBackend for MemoryBlobStore {
     type Id = MemoryId;
     type Key = u64;
 
@@ -166,7 +166,7 @@ impl TypedBlobBackend for MemoryBlobStore {
     }
 
     async fn put(&self, data: Bytes) -> Result<Self::Id> {
-        let loc = BlobBackend::put(self, data, PutHint::default()).await?;
+        let loc = LegacyBlobStore::put(self, data, PutHint::default()).await?;
         match loc {
             Locator::Memory {
                 file_id,
@@ -181,13 +181,13 @@ impl TypedBlobBackend for MemoryBlobStore {
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let loc = Locator::memory(&id.file_id, id.message_id as i64);
-        BlobBackend::get(self, &loc, range).await
+        LegacyBlobStore::get(self, &loc, range).await
     }
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
         for &k in keys {
             let loc = Locator::memory(String::new(), k as i64);
-            let _ = BlobBackend::delete(self, &loc).await?;
+            let _ = LegacyBlobStore::delete(self, &loc).await?;
         }
         Ok(())
     }
@@ -226,49 +226,30 @@ impl TypedBootstrapPointer for MemoryBlobStore {
     }
 }
 
-#[async_trait]
-impl BlobStore for MemoryBlobStore {
-    async fn put(
-        &self,
-        data: Bytes,
-        filename: &str,
-        caption: &str,
-    ) -> Result<(String, i64)> {
-        store_put(self, data, filename, caption).await
-    }
-
-    async fn get(&self, file_id: &str) -> Result<Bytes> {
-        store_get(self, file_id).await
-    }
-
-    async fn delete_message(&self, message_id: i64) -> Result<DeleteOutcome> {
-        store_delete_message(self, message_id).await
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pigeonhole_blob::{collect_stream, BlobStore};
+    use pigeonhole_blob::{collect_stream, LegacyBlobStore};
     use pigeonhole_types::PutHint;
 
     #[tokio::test]
     async fn memory_put_get_delete() {
         let store = MemoryBlobStore::new();
-        let loc = BlobBackend::put(&store, Bytes::from_static(b"hello"), PutHint::new("a.bin", ""))
+        let loc = LegacyBlobStore::put(&store, Bytes::from_static(b"hello"), PutHint::new("a.bin", ""))
             .await
             .unwrap();
-        let got = collect_stream(BlobBackend::get(&store, &loc, None).await.unwrap())
+        let got = collect_stream(LegacyBlobStore::get(&store, &loc, None).await.unwrap())
             .await
             .unwrap();
         assert_eq!(got.as_ref(), b"hello");
         assert_eq!(
-            BlobBackend::delete(&store, &loc).await.unwrap(),
+            LegacyBlobStore::delete(&store, &loc).await.unwrap(),
             DeleteOutcome::Deleted
         );
-        assert!(BlobBackend::get(&store, &loc, None).await.is_err());
+        assert!(LegacyBlobStore::get(&store, &loc, None).await.is_err());
         assert_eq!(
-            BlobBackend::delete(&store, &loc).await.unwrap(),
+            LegacyBlobStore::delete(&store, &loc).await.unwrap(),
             DeleteOutcome::Gone
         );
     }
@@ -276,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn memory_rejects_empty_put() {
         let store = MemoryBlobStore::new();
-        assert!(BlobBackend::put(&store, Bytes::new(), PutHint::new("empty.bin", ""))
+        assert!(LegacyBlobStore::put(&store, Bytes::new(), PutHint::new("empty.bin", ""))
             .await
             .is_err());
     }
@@ -284,14 +265,14 @@ mod tests {
     #[tokio::test]
     async fn memory_range_get() {
         let store = MemoryBlobStore::new();
-        let loc = BlobBackend::put(
+        let loc = LegacyBlobStore::put(
             &store,
             Bytes::from_static(b"abcdefgh"),
             PutHint::new("a.bin", ""),
         )
         .await
         .unwrap();
-        let got = collect_stream(BlobBackend::get(&store, &loc, Some(2..5)).await.unwrap())
+        let got = collect_stream(LegacyBlobStore::get(&store, &loc, Some(2..5)).await.unwrap())
             .await
             .unwrap();
         assert_eq!(got.as_ref(), b"cde");
@@ -299,12 +280,12 @@ mod tests {
 
     #[tokio::test]
     async fn typed_backend_put_get_sweep() {
-        use pigeonhole_blob::{collect_stream, TypedBlobBackend};
+        use pigeonhole_blob::{collect_stream, BlobBackend};
         let store = MemoryBlobStore::new();
-        let id = TypedBlobBackend::put(&store, Bytes::from_static(b"typed"))
+        let id = BlobBackend::put(&store, Bytes::from_static(b"typed"))
             .await
             .unwrap();
-        let got = collect_stream(TypedBlobBackend::get(&store, &id, None).await.unwrap())
+        let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
             .await
             .unwrap();
         assert_eq!(got.as_ref(), b"typed");
@@ -312,21 +293,21 @@ mod tests {
             .await
             .unwrap();
         assert!(keys.contains(&id.message_id));
-        TypedBlobBackend::delete(&store, &[id.message_id])
+        BlobBackend::delete(&store, &[id.message_id])
             .await
             .unwrap();
-        assert!(TypedBlobBackend::get(&store, &id, None).await.is_err());
+        assert!(BlobBackend::get(&store, &id, None).await.is_err());
     }
 
     #[tokio::test]
     async fn blob_store_adapter_still_works() {
         let store = MemoryBlobStore::new();
-        let (fid, mid) = BlobStore::put(&store, Bytes::from_static(b"x"), "a", "")
+        let (fid, mid) = store_put(&store, Bytes::from_static(b"x"), "a", "")
             .await
             .unwrap();
-        assert_eq!(BlobStore::get(&store, &fid).await.unwrap().as_ref(), b"x");
+        assert_eq!(store_get(&store, &fid).await.unwrap().as_ref(), b"x");
         assert_eq!(
-            BlobStore::delete_message(&store, mid).await.unwrap(),
+            store_delete_message(&store, mid).await.unwrap(),
             DeleteOutcome::Deleted
         );
     }

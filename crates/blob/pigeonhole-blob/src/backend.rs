@@ -10,7 +10,7 @@ use pigeonhole_types::{
 };
 use std::pin::Pin;
 
-/// Stream of blob bytes returned by [`BlobBackend::get`].
+/// Stream of blob bytes returned by [`LegacyBlobStore::get`].
 pub type BoxByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send>>;
 
@@ -47,9 +47,9 @@ pub fn slice_range(data: Bytes, range: Option<ByteRange>) -> Result<Bytes> {
     Ok(data.slice(start..end))
 }
 
-/// Generalized blob backend. Replaces the Telegram-centric [`super::BlobStore`].
+/// Legacy locator-based blob API (former `BlobBackend` / `BlobStore`; removed in stage G).
 #[async_trait]
-pub trait BlobBackend: Send + Sync {
+pub trait LegacyBlobStore: Send + Sync {
     fn id(&self) -> &BackendId;
     fn limits(&self) -> &BackendLimits;
 
@@ -58,29 +58,14 @@ pub trait BlobBackend: Send + Sync {
     async fn get(&self, loc: &Locator, range: Option<ByteRange>) -> Result<BoxByteStream>;
 
     async fn delete(&self, loc: &Locator) -> Result<DeleteOutcome>;
-}
-
-/// Legacy Telegram-shaped API kept as a thin adapter over [`BlobBackend`].
-#[async_trait]
-pub trait BlobStore: Send + Sync {
-    async fn put(
-        &self,
-        data: Bytes,
-        filename: &str,
-        caption: &str,
-    ) -> Result<(String, i64)>;
-
-    async fn get(&self, file_id: &str) -> Result<Bytes>;
-
-    async fn delete_message(&self, message_id: i64) -> Result<DeleteOutcome>;
 
     /// Drop cached entries for `file_id` (L2). Default: no-op.
     async fn invalidate_blob(&self, _file_id: &str) {}
 }
 
-/// Helper for explicit [`BlobStore`] adapters over a [`BlobBackend`].
+/// Helper for explicit [`LegacyBlobStore`] adapters over a [`LegacyBlobStore`].
 pub async fn store_put(
-    backend: &dyn BlobBackend,
+    backend: &dyn LegacyBlobStore,
     data: Bytes,
     filename: &str,
     caption: &str,
@@ -108,8 +93,8 @@ pub async fn store_put(
     Ok((file_id, message_id))
 }
 
-/// Build a [`Locator`] for legacy [`BlobStore::get`] / invalidate from `file_id`.
-pub fn locator_for_store_file_id(backend: &dyn BlobBackend, file_id: &str) -> Result<Locator> {
+/// Build a [`Locator`] for legacy [`LegacyBlobStore::get`] / invalidate from `file_id`.
+pub fn locator_for_store_file_id(backend: &dyn LegacyBlobStore, file_id: &str) -> Result<Locator> {
     let id = backend.id().as_str();
     if id.starts_with("memory:") {
         return Ok(Locator::memory(file_id, 0));
@@ -122,13 +107,13 @@ pub fn locator_for_store_file_id(backend: &dyn BlobBackend, file_id: &str) -> Re
     Ok(Locator::telegram(file_id, 0))
 }
 
-pub async fn store_get(backend: &dyn BlobBackend, file_id: &str) -> Result<Bytes> {
+pub async fn store_get(backend: &dyn LegacyBlobStore, file_id: &str) -> Result<Bytes> {
     let loc = locator_for_store_file_id(backend, file_id)?;
     collect_stream(backend.get(&loc, None).await?).await
 }
 
 pub async fn store_delete_message(
-    backend: &dyn BlobBackend,
+    backend: &dyn LegacyBlobStore,
     message_id: i64,
 ) -> Result<DeleteOutcome> {
     let id = backend.id().as_str();

@@ -14,7 +14,7 @@ pub use pigeonhole_gateway_s3::{build_s3_service, build_s3gram};
 pub use pigeonhole_storage_telegram as telegram;
 pub use pigeonhole_storage_memory as memory;
 
-pub use pigeonhole_blob::{BlobBackend, BlobStore, ChatLimiter, DeleteOutcome};
+pub use pigeonhole_blob::{LegacyBlobStore, ChatLimiter, DeleteOutcome};
 pub use pigeonhole_storage_memory::{MemoryBackend, MemoryBlobStore};
 pub use pigeonhole_types::{BackendId, BackendLimits, BlobKey, Locator, PutHint, RangeSupport};
 pub use pigeonhole_blob_store::{BackendKind, Config};

@@ -1,4 +1,4 @@
-//! S3 API implementation on top of SQLite index + BlobStore (via s3s).
+//! S3 API implementation on top of SQLite index + LegacyBlobStore (via s3s).
 
 use pigeonhole_codec::ChunkCodec;
 use pigeonhole_types::{BackendId, BlobKey, Locator};
@@ -10,7 +10,8 @@ use pigeonhole_blob_store::ingest::{
 };
 use pigeonhole_blob_store::read::read_chunk_range_cached;
 use pigeonhole_blob_store::{
-    parse_rfc3339, BlobStore, Chunk, DeleteBucketResult, DeleteOutcome, Index, OrphanMsg,
+    parse_rfc3339, store_delete_message, store_get, Chunk, DeleteBucketResult, DeleteOutcome, Index,
+    LegacyBlobStore, OrphanMsg,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -38,7 +39,7 @@ impl IngestHasher for S3IngestHasher {
 pub struct S3gram {
     pub cfg: Config,
     pub index: Index,
-    pub store: Arc<dyn BlobStore>,
+    pub store: Arc<dyn LegacyBlobStore>,
     pub snapshot_gate: Arc<Mutex<()>>,
     /// L1 unpacked-frame cache (None when `[cache] enabled = false`).
     pub block_cache: Option<Arc<BlockCache>>,
@@ -47,7 +48,7 @@ pub struct S3gram {
 }
 
 impl S3gram {
-    pub fn new(cfg: Config, index: Index, store: Arc<dyn BlobStore>) -> Self {
+    pub fn new(cfg: Config, index: Index, store: Arc<dyn LegacyBlobStore>) -> Self {
         let block_cache = if cfg.cache.enabled {
             Some(Arc::new(BlockCache::new(
                 cfg.cache.block_memory_bytes,
@@ -84,7 +85,7 @@ impl S3gram {
                 continue;
             }
             self.invalidate_caches_for_file(&file_id).await;
-            match self.store.delete_message(message_id).await {
+            match store_delete_message(self.store.as_ref(), message_id).await {
                 Ok(DeleteOutcome::Deleted | DeleteOutcome::Gone) => {}
                 Ok(DeleteOutcome::Failed) => {
                     let _ = self
@@ -122,7 +123,7 @@ impl S3gram {
             if c.codec != ChunkCodec::Blocks || c.blocks.is_empty() {
                 continue;
             }
-            let Ok(stored) = self.store.get(&c.file_id).await else {
+            let Ok(stored) = store_get(self.store.as_ref(), &c.file_id).await else {
                 continue;
             };
             let key = blob_key_for_file(&c.file_id);
@@ -676,7 +677,7 @@ fn blob_key_for_file(file_id: &str) -> BlobKey {
 }
 
 fn stream_object_body(
-    store: Arc<dyn BlobStore>,
+    store: Arc<dyn LegacyBlobStore>,
     index: Index,
     chunks: Vec<Chunk>,
     start: u64,
@@ -1666,9 +1667,7 @@ impl S3 for S3gram {
                     use md5::Digest;
                     let mut md5 = md5::Md5::new();
                     for c in &aligned {
-                        let data = self
-                            .store
-                            .get(&c.file_id)
+                        let data = store_get(self.store.as_ref(), &c.file_id)
                             .await
                             .map_err(Self::map_err)?;
                         let frames = if c.codec == ChunkCodec::Blocks {

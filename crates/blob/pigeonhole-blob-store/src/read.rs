@@ -4,7 +4,7 @@ use crate::block_cache::BlockCache;
 use crate::ingest::decode_chunk_slice_async;
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use pigeonhole_blob::BlobStore;
+use pigeonhole_blob::{store_get, LegacyBlobStore};
 use pigeonhole_codec::{decode_blocks_range, ChunkCodec, BlockRecord};
 use pigeonhole_types::{BackendId, BlobKey, Locator};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ fn blob_key_for(file_id: &str) -> BlobKey {
 
 /// Decode `[from, to)` of a chunk, using L1 for individual frames when available.
 pub async fn read_chunk_range_cached(
-    store: Arc<dyn BlobStore>,
+    store: Arc<dyn LegacyBlobStore>,
     file_id: &str,
     codec: ChunkCodec,
     blocks: &[BlockRecord],
@@ -37,7 +37,7 @@ pub async fn read_chunk_range_cached(
     readahead: bool,
 ) -> Result<Bytes> {
     if codec != ChunkCodec::Blocks || blocks.is_empty() || block_cache.is_none() {
-        let data = store.get(file_id).await.context("blob get")?;
+        let data = store_get(store.as_ref(), file_id).await.context("blob get")?;
         return decode_chunk_slice_async(data, codec, blocks, from, to, logical_size).await;
     }
     let cache = block_cache.expect("checked");
@@ -56,7 +56,7 @@ pub async fn read_chunk_range_cached(
         needed.push((i as u32, fr.clone(), start));
     }
 
-    let stored = store.get(file_id).await.context("blob get for frames")?;
+    let stored = store_get(store.as_ref(), file_id).await.context("blob get for frames")?;
     let mut out = Vec::with_capacity(to.saturating_sub(from));
     let mut last_frame_idx = None;
     for (block_no, fr, frame_start) in &needed {
@@ -105,7 +105,7 @@ pub async fn read_chunk_range_cached(
 }
 
 fn spawn_readahead(
-    store: Arc<dyn BlobStore>,
+    store: Arc<dyn LegacyBlobStore>,
     file_id: String,
     blocks: Vec<BlockRecord>,
     key: BlobKey,
@@ -121,7 +121,7 @@ fn spawn_readahead(
         let Ok(_permit) = sem.try_acquire_owned() else {
             return;
         };
-        let stored = match store.get(&file_id).await {
+        let stored = match store_get(store.as_ref(), &file_id).await {
             Ok(b) => b,
             Err(_) => return,
         };

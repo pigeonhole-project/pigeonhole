@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use pigeonhole_blob_store::{
-    collect_stream, ingest_stream_with_options, read_chunk_range_cached, BlobStore, BoxByteStream,
-    ChunkCodec, BlockRecord, Index, IngestOptions, UploadedChunk,
+    collect_stream, ingest_stream_with_options, read_chunk_range_cached, store_delete_message,
+    store_get, BoxByteStream, BlockRecord, ChunkCodec, Index, IngestOptions, LegacyBlobStore,
+    UploadedChunk,
 };
 use pigeonhole_codec::DEFAULT_CHUNK_SIZE;
 use serde::{Deserialize, Serialize};
@@ -40,17 +41,17 @@ impl From<&UploadedChunk> for CasChunkMeta {
     }
 }
 
-/// Store and fetch CAS payloads through [`CasIndex`] + chunked [`BlobStore`] ingest.
+/// Store and fetch CAS payloads through [`CasIndex`] + chunked [`LegacyBlobStore`] ingest.
 #[derive(Clone)]
 pub struct CasStore {
     pub cas: CasIndex,
-    pub store: Arc<dyn BlobStore>,
+    pub store: Arc<dyn LegacyBlobStore>,
     pub chat_id: String,
     pub chunk_size: usize,
 }
 
 impl CasStore {
-    pub fn new(index: Index, store: Arc<dyn BlobStore>, chat_id: String) -> Self {
+    pub fn new(index: Index, store: Arc<dyn LegacyBlobStore>, chat_id: String) -> Self {
         Self {
             cas: CasIndex::new(index),
             store,
@@ -133,8 +134,7 @@ impl CasStore {
             let hash_hex = hash_hex.to_string();
             tokio::spawn(async move {
                 let result = async {
-                    let raw = store
-                        .get(&file_id)
+                    let raw = store_get(store.as_ref(), &file_id)
                         .await
                         .with_context(|| format!("blob get {file_id}"))?;
                     if raw.len() as i64 != size {
@@ -179,7 +179,7 @@ impl CasStore {
             Ok(v) => v,
             Err(e) => {
                 for mid in e.pending_deletes {
-                    let _ = self.store.delete_message(mid).await;
+                    let _ = store_delete_message(self.store.as_ref(), mid).await;
                 }
                 return Err(e.source);
             }
@@ -222,13 +222,13 @@ impl CasStore {
 
     pub async fn abort_chunks(&self, chunks: &[UploadedChunk]) {
         for c in chunks {
-            let _ = self.store.delete_message(c.message_id).await;
+            let _ = store_delete_message(self.store.as_ref(), c.message_id).await;
         }
     }
 }
 
 async fn stream_manifest_range(
-    store: Arc<dyn BlobStore>,
+    store: Arc<dyn LegacyBlobStore>,
     manifest: &CasManifest,
     from: usize,
     to: usize,
@@ -250,7 +250,7 @@ async fn stream_manifest_range(
         let codec = match ch.codec.as_str() {
             "gzip" => ChunkCodec::Gzip,
             "zstd" => ChunkCodec::Zstd,
-            "frames" => ChunkCodec::Blocks,
+            "blocks" | "frames" => ChunkCodec::Blocks,
             _ => ChunkCodec::Raw,
         };
         stream_chunk_range(
@@ -279,7 +279,7 @@ async fn stream_manifest_range(
 /// Yield one frame (or one legacy slice) at a time so the caller never holds the
 /// whole object range.
 async fn stream_chunk_range(
-    store: Arc<dyn BlobStore>,
+    store: Arc<dyn LegacyBlobStore>,
     file_id: &str,
     codec: ChunkCodec,
     blocks: &[BlockRecord],
@@ -289,7 +289,7 @@ async fn stream_chunk_range(
     tx: &mpsc::Sender<Result<Bytes, anyhow::Error>>,
 ) -> Result<()> {
     if codec == ChunkCodec::Blocks && !blocks.is_empty() {
-        let stored = store.get(file_id).await.context("blob get for blocks")?;
+        let stored = store_get(store.as_ref(), file_id).await.context("blob get for blocks")?;
         let mut logical_cursor = 0usize;
         for fr in blocks {
             let flen = fr.logical_len as usize;
@@ -347,23 +347,30 @@ mod tests {
     }
 
     #[async_trait]
-    impl BlobStore for CountingStore {
+    impl LegacyBlobStore for CountingStore {
+        fn id(&self) -> &pigeonhole_types::BackendId {
+            self.inner.id()
+        }
+        fn limits(&self) -> &pigeonhole_types::BackendLimits {
+            self.inner.limits()
+        }
         async fn put(
             &self,
             data: Bytes,
-            filename: &str,
-            caption: &str,
-        ) -> Result<(String, i64)> {
-            BlobStore::put(&self.inner, data, filename, caption).await
+            hint: pigeonhole_types::PutHint,
+        ) -> Result<pigeonhole_types::Locator> {
+            LegacyBlobStore::put(&self.inner, data, hint).await
         }
-
-        async fn get(&self, file_id: &str) -> Result<Bytes> {
+        async fn get(
+            &self,
+            loc: &pigeonhole_types::Locator,
+            range: Option<pigeonhole_types::ByteRange>,
+        ) -> Result<BoxByteStream> {
             self.gets.fetch_add(1, Ordering::SeqCst);
-            BlobStore::get(&self.inner, file_id).await
+            LegacyBlobStore::get(&self.inner, loc, range).await
         }
-
-        async fn delete_message(&self, message_id: i64) -> Result<DeleteOutcome> {
-            BlobStore::delete_message(&self.inner, message_id).await
+        async fn delete(&self, loc: &pigeonhole_types::Locator) -> Result<DeleteOutcome> {
+            LegacyBlobStore::delete(&self.inner, loc).await
         }
     }
 
@@ -373,7 +380,7 @@ mod tests {
         let url = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display());
         let index = Index::connect(&url).await.unwrap();
         let gets = Arc::new(AtomicUsize::new(0));
-        let store: Arc<dyn BlobStore> = Arc::new(CountingStore {
+        let store: Arc<dyn LegacyBlobStore> = Arc::new(CountingStore {
             inner: MemoryBlobStore::new(),
             gets: gets.clone(),
         });

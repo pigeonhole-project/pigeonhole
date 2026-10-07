@@ -4,9 +4,9 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    bytes_stream, collect_stream, slice_range, BlobBackend, BlobStore, BootstrapPointer,
+    bytes_stream, collect_stream, slice_range, LegacyBlobStore, BootstrapPointer,
     BoxByteStream, ChatLimiter, CostHint, DeleteOutcome, InstanceInfo, InstanceKind, InstanceRole,
-    OpKind, PinnedContent, Sweepable, TypedBlobBackend, TypedBootstrapPointer,
+    OpKind, PinnedContent, Sweepable, BlobBackend, TypedBootstrapPointer,
 };
 use pigeonhole_types::{
     BackendId, BackendLimits, ByteRange, Locator, PutHint, RangeSupport,
@@ -186,7 +186,7 @@ impl DiscordBlobStore {
 }
 
 #[async_trait]
-impl BlobBackend for DiscordBlobStore {
+impl LegacyBlobStore for DiscordBlobStore {
     fn id(&self) -> &BackendId {
         &self.id
     }
@@ -285,7 +285,7 @@ impl BlobBackend for DiscordBlobStore {
 }
 
 #[async_trait]
-impl TypedBlobBackend for DiscordBlobStore {
+impl BlobBackend for DiscordBlobStore {
     type Id = DiscordId;
     type Key = u64;
 
@@ -315,7 +315,7 @@ impl TypedBlobBackend for DiscordBlobStore {
     }
 
     async fn put(&self, data: Bytes) -> Result<Self::Id> {
-        let loc = BlobBackend::put(self, data, PutHint::default()).await?;
+        let loc = LegacyBlobStore::put(self, data, PutHint::default()).await?;
         match loc {
             Locator::Discord {
                 message_id,
@@ -336,7 +336,7 @@ impl TypedBlobBackend for DiscordBlobStore {
             &id.attachment_id,
             "",
         );
-        BlobBackend::get(self, &loc, range).await
+        LegacyBlobStore::get(self, &loc, range).await
     }
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
@@ -418,48 +418,6 @@ impl Sweepable for DiscordBlobStore {
     }
 }
 
-#[async_trait]
-impl BlobStore for DiscordBlobStore {
-    async fn put(
-        &self,
-        data: Bytes,
-        filename: &str,
-        caption: &str,
-    ) -> Result<(String, i64)> {
-        let loc = BlobBackend::put(self, data, PutHint::new(filename, caption)).await?;
-        let message_id = loc
-            .message_id()
-            .ok_or_else(|| anyhow::anyhow!("locator missing message_id"))?;
-        let attachment_id = loc
-            .file_id()
-            .ok_or_else(|| anyhow::anyhow!("locator missing attachment_id"))?;
-        Ok((
-            Locator::discord_store_file_id(message_id, attachment_id),
-            message_id,
-        ))
-    }
-
-    async fn get(&self, file_id: &str) -> Result<Bytes> {
-        let loc = self.locator_from_store_file_id(file_id)?;
-        collect_stream(BlobBackend::get(self, &loc, None).await?).await
-    }
-
-    async fn delete_message(&self, message_id: i64) -> Result<DeleteOutcome> {
-        self.dc
-            .delete_message(
-                &self.channel_id,
-                message_id,
-                Some(self.limiter.as_ref()),
-            )
-            .await
-    }
-
-    async fn invalidate_blob(&self, file_id: &str) {
-        if let Some((_mid, aid)) = Locator::parse_discord_store_file_id(file_id) {
-            self.dc.forget_attachment(aid).await;
-        }
-    }
-}
 
 #[async_trait]
 impl BootstrapPointer for DiscordBlobStore {
@@ -523,7 +481,7 @@ impl TypedBootstrapPointer for DiscordBlobStore {
                 .map_err(|_| anyhow::anyhow!("bootstrap pin payload is not valid UTF-8"))?;
             BootstrapPointer::send_text(self, text).await?
         } else {
-            let loc = BlobBackend::put(
+            let loc = LegacyBlobStore::put(
                 self,
                 new,
                 PutHint::new("superblock.bin", "pigeonhole-superblock"),

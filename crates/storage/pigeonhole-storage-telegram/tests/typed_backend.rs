@@ -1,9 +1,9 @@
-//! Wiremock tests for TypedBlobBackend / Sweepable / TypedBootstrapPointer (no network).
+//! Wiremock tests for BlobBackend / Sweepable / TypedBootstrapPointer (no network).
 
 use bytes::Bytes;
 use pigeonhole_blob::{
     collect_stream, ChatLimiter, ChatLimiterConfig, LimitBudget, OpKind, Sweepable,
-    TypedBlobBackend, TypedBootstrapPointer,
+    BlobBackend, TypedBootstrapPointer,
 };
 use pigeonhole_storage_telegram::{TelegramBlobStore, TelegramClient, DELETE_MESSAGES_MAX};
 use pigeonhole_testkit::run_typed_conformance;
@@ -280,15 +280,15 @@ async fn typed_put_get_delete_and_instance_info() {
     assert_eq!(store.instance().fingerprint, "tg:123456:-100111");
     assert_eq!(store.instance().location, "tg:chat:-100111");
 
-    let id = TypedBlobBackend::put(&store, Bytes::from_static(b"hello-typed"))
+    let id = BlobBackend::put(&store, Bytes::from_static(b"hello-typed"))
         .await
         .unwrap();
-    let got = collect_stream(TypedBlobBackend::get(&store, &id, None).await.unwrap())
+    let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
         .await
         .unwrap();
     assert_eq!(got.as_ref(), b"hello-typed");
 
-    TypedBlobBackend::delete(&store, &[id.message_id])
+    BlobBackend::delete(&store, &[id.message_id])
         .await
         .unwrap();
 }
@@ -307,7 +307,7 @@ async fn delete_messages_batches_by_100() {
 
     let n = DELETE_MESSAGES_MAX + 3;
     let keys: Vec<i64> = (1..=n as i64).collect();
-    TypedBlobBackend::delete(&store, &keys).await.unwrap();
+    BlobBackend::delete(&store, &keys).await.unwrap();
 
     let batches = st.delete_batches.lock().unwrap().clone();
     assert_eq!(batches.len(), 2);
@@ -334,21 +334,21 @@ async fn cost_get_zero_when_file_path_cached() {
     let server = MockServer::start().await;
     let (store, _) = make_store(&server).await;
 
-    let id = TypedBlobBackend::put(&store, Bytes::from_static(b"cached-path"))
+    let id = BlobBackend::put(&store, Bytes::from_static(b"cached-path"))
         .await
         .unwrap();
     // Prime getFile cache.
-    let _ = collect_stream(TypedBlobBackend::get(&store, &id, None).await.unwrap())
+    let _ = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
         .await
         .unwrap();
 
-    let hint = TypedBlobBackend::cost(&store, OpKind::Get, Some(&id));
+    let hint = BlobBackend::cost(&store, OpKind::Get, Some(&id));
     assert_eq!(hint.wait_secs, 0.0);
 
     // Exhaust getFile bucket; cached get must still report wait=0.
     store.limiter().penalize_get_file(std::time::Duration::from_secs(60));
     assert!(store.limiter().peek_wait(LimitBudget::GetFile) > std::time::Duration::ZERO);
-    let hint2 = TypedBlobBackend::cost(&store, OpKind::Get, Some(&id));
+    let hint2 = BlobBackend::cost(&store, OpKind::Get, Some(&id));
     assert_eq!(hint2.wait_secs, 0.0);
 }
 

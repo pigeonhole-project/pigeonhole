@@ -1,6 +1,6 @@
-//! L2 blob cache: [`CachingBackend`] decorator over [`BlobBackend`].
+//! L2 blob cache: [`CachingBackend`] decorator over [`LegacyBlobStore`].
 
-use crate::backend::{bytes_stream, collect_stream, BlobBackend, BoxByteStream};
+use crate::backend::{bytes_stream, collect_stream, LegacyBlobStore, BoxByteStream};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -96,15 +96,15 @@ impl CacheMetrics {
     }
 }
 
-/// Transparent L2 cache over any [`BlobBackend`].
-pub struct CachingBackend<B: BlobBackend> {
+/// Transparent L2 cache over any [`LegacyBlobStore`].
+pub struct CachingBackend<B: LegacyBlobStore> {
     inner: Arc<B>,
     l2: HybridCache<BlobKey, CachedBlob>,
     cfg: CacheConfig,
     metrics: Arc<CacheMetrics>,
 }
 
-impl<B: BlobBackend + 'static> CachingBackend<B> {
+impl<B: LegacyBlobStore + 'static> CachingBackend<B> {
     pub async fn new(inner: B, cfg: CacheConfig) -> Result<Self> {
         let l2 = if let Some(ref path) = cfg.disk_path {
             let disk_bytes = cfg
@@ -275,33 +275,7 @@ async fn build_hybrid(
 }
 
 #[async_trait]
-impl<B: BlobBackend + 'static> crate::BlobStore for CachingBackend<B> {
-    async fn put(
-        &self,
-        data: Bytes,
-        filename: &str,
-        caption: &str,
-    ) -> Result<(String, i64)> {
-        crate::backend::store_put(self, data, filename, caption).await
-    }
-
-    async fn get(&self, file_id: &str) -> Result<Bytes> {
-        crate::backend::store_get(self, file_id).await
-    }
-
-    async fn delete_message(&self, message_id: i64) -> Result<DeleteOutcome> {
-        crate::backend::store_delete_message(self, message_id).await
-    }
-
-    async fn invalidate_blob(&self, file_id: &str) {
-        if let Ok(loc) = crate::backend::locator_for_store_file_id(self, file_id) {
-            self.invalidate_locator(&loc).await;
-        }
-    }
-}
-
-#[async_trait]
-impl<B: BlobBackend + 'static> BlobBackend for CachingBackend<B> {
+impl<B: LegacyBlobStore + 'static> LegacyBlobStore for CachingBackend<B> {
     fn id(&self) -> &BackendId {
         self.inner.id()
     }
@@ -335,6 +309,12 @@ impl<B: BlobBackend + 'static> BlobBackend for CachingBackend<B> {
         let out = self.inner.delete(loc).await?;
         self.invalidate_locator(loc).await;
         Ok(out)
+    }
+
+    async fn invalidate_blob(&self, file_id: &str) {
+        if let Ok(loc) = crate::backend::locator_for_store_file_id(self, file_id) {
+            self.invalidate_locator(&loc).await;
+        }
     }
 }
 
@@ -370,7 +350,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl BlobBackend for CountingMemory {
+    impl LegacyBlobStore for CountingMemory {
         fn id(&self) -> &BackendId {
             &self.id
         }

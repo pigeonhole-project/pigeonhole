@@ -3,7 +3,7 @@
 //! Bootstrap after disk loss needs only `BOT_TOKEN` + `CHAT_ID`:
 //! `getChat` → pinned manifest → download parts → verify sha256 → import SQLite.
 
-use pigeonhole_blob::{BlobStore, BootstrapPointer, DeleteOutcome, PinnedContent};
+use pigeonhole_blob::{store_delete_message, store_get, store_put, LegacyBlobStore, BootstrapPointer, DeleteOutcome, PinnedContent};
 use pigeonhole_codec as chunker;
 use pigeonhole_index::Index;
 
@@ -123,7 +123,7 @@ fn validate_pin_manifest(m: &PinManifest) -> Result<()> {
 /// unpin/delete the previous generation.
 pub async fn push_if_changed(
     index: &Index,
-    store: &dyn BlobStore,
+    store: &dyn LegacyBlobStore,
     pin: &dyn BootstrapPointer,
     chunk_size: usize,
 ) -> Result<PushOutcome> {
@@ -150,8 +150,7 @@ pub async fn push_if_changed(
 
     let mut parts: Vec<PinManifestPart> = Vec::new();
     if compressed.len() <= max_part {
-        let (file_id, message_id) = store
-            .put(Bytes::from(compressed), FILENAME, CAPTION)
+        let (file_id, message_id) = store_put(store, Bytes::from(compressed), FILENAME, CAPTION)
             .await
             .context("upload snapshot")?;
         parts.push(PinManifestPart {
@@ -162,8 +161,7 @@ pub async fn push_if_changed(
     } else {
         for (i, chunk) in compressed.chunks(max_part).enumerate() {
             let name = format!("pigeonhole-index-{i:04}.json.gz.part");
-            let (file_id, message_id) = store
-                .put(Bytes::copy_from_slice(chunk), &name, CAPTION)
+            let (file_id, message_id) = store_put(store, Bytes::copy_from_slice(chunk), &name, CAPTION)
                 .await
                 .with_context(|| format!("upload snapshot part {i}"))?;
             parts.push(PinManifestPart {
@@ -193,12 +191,12 @@ pub async fn push_if_changed(
             .context("send pin manifest text")?;
         (mid, String::new())
     } else {
-        let (file_id, mid) = store
-            .put(
-                Bytes::from(manifest_body.into_bytes()),
-                MANIFEST_DOC_NAME,
-                CAPTION,
-            )
+        let (file_id, mid) = store_put(
+            store,
+            Bytes::from(manifest_body.into_bytes()),
+            MANIFEST_DOC_NAME,
+            CAPTION,
+        )
             .await
             .context("upload pin manifest document")?;
         (mid, file_id)
@@ -216,7 +214,7 @@ pub async fn push_if_changed(
         if let Err(e) = pin.unpin_message(*old_id).await {
             debug_unpin_err(*old_id, &e);
         }
-        match store.delete_message(*old_id).await {
+        match store_delete_message(store, *old_id).await {
             Ok(DeleteOutcome::Deleted | DeleteOutcome::Gone) => {}
             Ok(DeleteOutcome::Failed) => {
                 let _ = index.queue_tg_delete(pin.scope_id(), *old_id).await;
@@ -293,11 +291,10 @@ async fn load_old_message_ids(index: &Index) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
-async fn download_parts(store: &dyn BlobStore, parts: &[PinManifestPart]) -> Result<Vec<u8>> {
+async fn download_parts(store: &dyn LegacyBlobStore, parts: &[PinManifestPart]) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     for p in parts {
-        let chunk = store
-            .get(&p.file_id)
+        let chunk = store_get(store, &p.file_id)
             .await
             .with_context(|| format!("download snapshot part file_id={}", p.file_id))?;
         buf.extend_from_slice(&chunk);
@@ -324,7 +321,7 @@ pub struct PinnedRestore {
 /// Bootstrap from the chat's pinned manifest (no local meta / file_id required).
 pub async fn download_from_pinned(
     pin: &dyn BootstrapPointer,
-    store: &dyn BlobStore,
+    store: &dyn LegacyBlobStore,
 ) -> Result<PinnedRestore> {
     let scope = pin.scope_id().to_string();
     let pinned = pin
@@ -343,7 +340,7 @@ pub async fn download_from_pinned(
             message_id,
         } => {
             info!(message_id, %file_id, "using pinned document manifest");
-            let data = store.get(&file_id).await.context("download pinned manifest")?;
+            let data = store_get(store, &file_id).await.context("download pinned manifest")?;
             if let Ok(m) = parse_pin_manifest_bytes(&data) {
                 (message_id, file_id, m, None)
             } else if let Ok(legacy) = serde_json::from_slice::<LegacyDocManifest>(&data) {
@@ -451,7 +448,7 @@ pub async fn record_restored_pin(index: &Index, restored: &PinnedRestore) -> Res
 /// - a legacy document manifest listing part file_ids
 /// - omitted → use local meta (same machine)
 pub async fn download_snapshot_bytes(
-    store: &dyn BlobStore,
+    store: &dyn LegacyBlobStore,
     index: &Index,
     file_id_hint: Option<&str>,
 ) -> Result<Vec<u8>> {
@@ -463,7 +460,7 @@ pub async fn download_snapshot_bytes(
             .ok_or_else(|| anyhow::anyhow!("no snapshot file_id"))?,
     };
 
-    let data = store.get(&fid).await?;
+    let data = store_get(store, &fid).await?;
 
     if let Ok(manifest) = serde_json::from_slice::<PinManifest>(&data) {
         if manifest.format == PIN_MANIFEST_FORMAT && !manifest.parts.is_empty() {
@@ -500,7 +497,7 @@ pub async fn download_snapshot_bytes(
 
 pub fn spawn_periodic(
     index: Index,
-    store: Arc<dyn BlobStore>,
+    store: Arc<dyn LegacyBlobStore>,
     pin: Arc<dyn BootstrapPointer>,
     gate: Arc<Mutex<()>>,
     interval_secs: u64,
@@ -531,7 +528,7 @@ pub fn spawn_periodic(
 }
 
 /// Independent of snapshot interval — always drains pending deletes.
-pub fn spawn_pending_deletes(index: Index, store: Arc<dyn BlobStore>) {
+pub fn spawn_pending_deletes(index: Index, store: Arc<dyn LegacyBlobStore>) {
     tokio::spawn(async move {
         info!(
             poll_secs = PENDING_DELETE_POLL_SECS,
@@ -556,7 +553,7 @@ pub fn spawn_pending_deletes(index: Index, store: Arc<dyn BlobStore>) {
                 continue;
             };
             for (chat_id, message_id, _attempts) in pending {
-                match store.delete_message(message_id).await {
+                match store_delete_message(store.as_ref(), message_id).await {
                     Ok(DeleteOutcome::Deleted | DeleteOutcome::Gone) => {
                         let _ = index.clear_pending_tg_delete(&chat_id, message_id).await;
                     }

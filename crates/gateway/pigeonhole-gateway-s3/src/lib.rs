@@ -3,14 +3,14 @@
 mod service;
 
 pub use service::S3gram;
-pub use pigeonhole_blob_store::{BlobStore, DeleteOutcome, Config, Index};
+pub use pigeonhole_blob_store::{LegacyBlobStore, DeleteOutcome, Config, Index};
 
 use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use std::sync::Arc;
 
 /// Build an [`S3gram`] backend from an existing index + blob store (tests / custom wiring).
-pub fn build_s3gram(cfg: Config, index: Index, store: Arc<dyn BlobStore>) -> S3gram {
+pub fn build_s3gram(cfg: Config, index: Index, store: Arc<dyn LegacyBlobStore>) -> S3gram {
     S3gram::new(cfg, index, store)
 }
 
