@@ -52,6 +52,36 @@ impl BucketState {
         };
         Duration::from_secs_f64(secs.max(0.001))
     }
+
+    /// Estimated wait until a token is available (no capture, no state mutation).
+    fn peek_wait(&self) -> Duration {
+        let now = Instant::now();
+        if let Some(until) = self.cool_down_until {
+            if now < until {
+                return until.saturating_duration_since(now);
+            }
+        }
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let tokens = (self.tokens + elapsed.as_secs_f64() * self.rate_per_sec).min(self.capacity);
+        if tokens >= 1.0 {
+            return Duration::ZERO;
+        }
+        let need = 1.0 - tokens;
+        let secs = if self.rate_per_sec > 0.0 {
+            need / self.rate_per_sec
+        } else {
+            1.0
+        };
+        Duration::from_secs_f64(secs.max(0.001))
+    }
+}
+
+/// Which ChatLimiter bucket to peek / acquire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitBudget {
+    Send,
+    GetFile,
+    Delete,
 }
 
 struct TokenBucket {
@@ -105,6 +135,10 @@ impl TokenBucket {
                 }
             }
         }
+    }
+
+    fn peek_wait(&self) -> Duration {
+        self.state.lock().unwrap().peek_wait()
     }
 
     fn penalize(&self, retry_after: Duration) {
@@ -212,6 +246,15 @@ impl ChatLimiter {
             .await
             .expect("download semaphore closed")
     }
+
+    /// Estimated wait before the next token for `budget` (does not capture a token).
+    pub fn peek_wait(&self, budget: LimitBudget) -> Duration {
+        match budget {
+            LimitBudget::Send => self.send.peek_wait(),
+            LimitBudget::GetFile => self.get_file.peek_wait(),
+            LimitBudget::Delete => self.delete.peek_wait(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -275,5 +318,22 @@ mod tests {
         drop(p1);
         rx.await.unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peek_wait_does_not_capture_tokens() {
+        let lim = ChatLimiter::new(ChatLimiterConfig {
+            send_rate_per_sec: 0.01,
+            send_burst: 1.0,
+            ..ChatLimiterConfig::default()
+        });
+        assert_eq!(lim.peek_wait(LimitBudget::Send), Duration::ZERO);
+        lim.acquire_send().await;
+        let peeked = lim.peek_wait(LimitBudget::Send);
+        assert!(peeked > Duration::from_millis(50));
+        // Second peek must not change the estimate (no capture).
+        let peeked2 = lim.peek_wait(LimitBudget::Send);
+        assert!((peeked2.as_secs_f64() - peeked.as_secs_f64()).abs() < 0.05);
+        assert_eq!(lim.peek_wait(LimitBudget::GetFile), Duration::ZERO);
     }
 }

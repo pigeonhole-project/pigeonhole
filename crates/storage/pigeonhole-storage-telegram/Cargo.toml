@@ -19,4 +19,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+pigeonhole-testkit = { workspace = true }
 tokio = { workspace = true }
+wiremock = { workspace = true }

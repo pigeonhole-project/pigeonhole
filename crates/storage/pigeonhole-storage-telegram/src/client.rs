@@ -13,10 +13,17 @@ const FILE_PATH_CACHE_CAP: u64 = 4096;
 /// CDN path TTL — Telegram links live about an hour.
 const FILE_PATH_TTL: Duration = Duration::from_secs(50 * 60);
 
+const DEFAULT_API_BASE: &str = "https://api.telegram.org";
+
+/// Max message ids per Bot API `deleteMessages` call.
+pub const DELETE_MESSAGES_MAX: usize = 100;
+
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
     bot_token: String,
+    /// e.g. `https://api.telegram.org` (tests override with wiremock).
+    api_base: String,
     /// Shared across clones (`TelegramBlobStore` / snapshot workers).
     file_paths: MokaCache<String, String>,
 }
@@ -85,17 +92,42 @@ fn is_cdn_path_stale(err: &anyhow::Error) -> bool {
 
 impl TelegramClient {
     pub fn new(bot_token: String) -> Result<Self> {
+        Self::with_api_base(bot_token, DEFAULT_API_BASE.into())
+    }
+
+    /// Construct a client pointed at a custom Bot API root (wiremock tests).
+    pub fn with_api_base(bot_token: String, api_base: String) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
         Ok(Self {
             http,
             bot_token,
+            api_base: api_base.trim_end_matches('/').to_string(),
             file_paths: MokaCache::builder()
                 .max_capacity(FILE_PATH_CACHE_CAP)
                 .time_to_live(FILE_PATH_TTL)
                 .build(),
         })
+    }
+
+    /// Bot id prefix from `bot_token` (`123456:ABC` → `123456`).
+    pub fn bot_id(&self) -> Result<&str> {
+        self.bot_token
+            .split_once(':')
+            .map(|(a, _)| a)
+            .filter(|s| !s.is_empty())
+            .context("telegram bot token missing bot_id prefix before ':'")
+    }
+
+    /// `tg:{bot_id}:{chat_id}` — matches `telegram_fingerprint` in blob-store.
+    pub fn fingerprint(&self, chat_id: &str) -> Result<String> {
+        Ok(format!("tg:{}:{chat_id}", self.bot_id()?))
+    }
+
+    /// Sync cache probe for [`crate::TelegramBlobStore`] `cost()` (no token capture).
+    pub fn has_cached_file_path(&self, file_id: &str) -> bool {
+        self.file_paths.contains_key(file_id)
     }
 
     async fn cached_file_path(&self, file_id: &str) -> Option<String> {
@@ -113,14 +145,19 @@ impl TelegramClient {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{}", self.bot_token, method)
+        format!("{}/bot{}/{}", self.api_base, self.bot_token, method)
     }
 
     fn file_url(&self, file_path: &str) -> String {
         format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.bot_token, file_path
+            "{}/file/bot{}/{}",
+            self.api_base, self.bot_token, file_path
         )
+    }
+
+    /// Map transport errors without embedding the bot token (URL redaction).
+    fn http_err(what: &str, e: reqwest::Error) -> anyhow::Error {
+        anyhow!("{what}: {}", e.without_url())
     }
 
     /// Upload a document. Uses the **send** budget when `limiter` is set.
@@ -194,7 +231,7 @@ impl TelegramClient {
             .multipart(form)
             .send()
             .await
-            .map_err(classify_reqwest)?;
+            .map_err(|e| classify_reqwest(e))?;
 
         self.parse_send_document_response(resp).await
     }
@@ -494,7 +531,7 @@ impl TelegramClient {
             ])
             .send()
             .await
-            .context("deleteMessage http")?;
+            .map_err(|e| Self::http_err("deleteMessage http", e))?;
 
         let status = resp.status();
         if status.as_u16() == 429 {
@@ -522,11 +559,7 @@ impl TelegramClient {
             return Ok(DeleteOutcome::Deleted);
         }
         let desc = body.description.unwrap_or_default();
-        let lower = desc.to_ascii_lowercase();
-        if lower.contains("message to delete not found")
-            || lower.contains("message not found")
-            || (lower.contains("message can't be deleted") && lower.contains("not found"))
-        {
+        if delete_not_found(&desc) {
             return Ok(DeleteOutcome::Gone);
         }
         debug!(
@@ -537,6 +570,65 @@ impl TelegramClient {
             "deleteMessage not confirmed"
         );
         Ok(DeleteOutcome::Failed)
+    }
+
+    /// Batch-delete via Bot API `deleteMessages` (1–100 ids per call).
+    /// Missing messages are skipped by Telegram (= success). Uses one **delete**
+    /// token per batch HTTP call.
+    pub async fn delete_messages(
+        &self,
+        chat_id: &str,
+        message_ids: &[i64],
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<()> {
+        for chunk in message_ids.chunks(DELETE_MESSAGES_MAX) {
+            if chunk.is_empty() {
+                continue;
+            }
+            if let Some(lim) = limiter {
+                lim.acquire_delete().await;
+            }
+            let ids_json = serde_json::to_string(chunk).context("serialize message_ids")?;
+            let resp = self
+                .http
+                .post(self.api_url("deleteMessages"))
+                .form(&[("chat_id", chat_id), ("message_ids", ids_json.as_str())])
+                .send()
+                .await
+                .map_err(|e| Self::http_err("deleteMessages http", e))?;
+
+            let status = resp.status();
+            if status.as_u16() == 429 {
+                let body: ApiResponse<bool> = resp.json().await.unwrap_or(ApiResponse {
+                    ok: false,
+                    result: None,
+                    description: Some("rate limited".into()),
+                    parameters: None,
+                });
+                let secs = body
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| p.retry_after)
+                    .unwrap_or(3)
+                    .max(1) as u64;
+                if let Some(lim) = limiter {
+                    lim.penalize_delete(Duration::from_secs(secs));
+                }
+                bail!("deleteMessages rate-limited (retry_after={secs}s)");
+            }
+
+            let body: ApiResponse<bool> = resp.json().await.context("deleteMessages json")?;
+            if status.is_success() && body.ok {
+                // result may be true; missing messages are skipped per Bot API.
+                continue;
+            }
+            let desc = body.description.unwrap_or_else(|| status.to_string());
+            if delete_not_found(&desc) {
+                continue;
+            }
+            bail!("deleteMessages failed: {desc}");
+        }
+        Ok(())
     }
 
     pub async fn get_me(&self) -> Result<TgUser> {
@@ -790,13 +882,24 @@ impl TelegramClient {
 }
 
 fn classify_reqwest(e: reqwest::Error) -> SendErr {
-    if e.is_connect() {
-        SendErr::Connect(e.into())
-    } else if e.is_timeout() || e.is_request() || e.is_body() {
-        SendErr::Ambiguous(e.into())
+    // Strip URL so bot tokens never appear in error chains.
+    let connect = e.is_connect();
+    let ambiguous = e.is_timeout() || e.is_request() || e.is_body();
+    let msg = e.without_url().to_string();
+    if connect {
+        SendErr::Connect(anyhow!(msg))
+    } else if ambiguous {
+        SendErr::Ambiguous(anyhow!(msg))
     } else {
-        SendErr::Fatal(e.into())
+        SendErr::Fatal(anyhow!(msg))
     }
+}
+
+fn delete_not_found(desc: &str) -> bool {
+    let lower = desc.to_ascii_lowercase();
+    lower.contains("message to delete not found")
+        || lower.contains("message not found")
+        || (lower.contains("message can't be deleted") && lower.contains("not found"))
 }
 
 #[derive(Debug, Deserialize)]

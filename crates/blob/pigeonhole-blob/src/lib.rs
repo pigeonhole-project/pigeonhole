@@ -15,7 +15,7 @@ pub use bootstrap::BootstrapPointer;
 pub use cache::{CacheConfig, CacheMetrics, CachedBlob, CachingBackend};
 pub use erase::{erase, erase_sweep, DynBackend, DynSweep, Erased, ErasedSweep, SharedBackend};
 pub use metrics::{spawn_metrics_logger, BackendMetrics};
-pub use rate_limit::{ChatLimiter, ChatLimiterConfig};
+pub use rate_limit::{ChatLimiter, ChatLimiterConfig, LimitBudget};
 pub use typed::{
     load_id, store_id, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
     StoredId, Sweepable, TypedBlobBackend, TypedBootstrapPointer,
