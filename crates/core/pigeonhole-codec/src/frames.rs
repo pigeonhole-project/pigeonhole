@@ -38,14 +38,31 @@ impl FrameRecord {
 }
 
 /// A finished on-wire chunk ready for `BlobStore::put`.
-#[derive(Debug)]
+///
+/// `_permits` holds ingest-budget slots for this chunk's logical bytes; they are
+/// released when the chunk is dropped (after a successful put, or on cancel/error).
 pub struct CompletedChunk {
     pub payload: Bytes,
     pub logical_size: i64,
     pub frames: Vec<FrameRecord>,
+    _permits: Vec<OwnedSemaphorePermit>,
+}
+
+impl std::fmt::Debug for CompletedChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletedChunk")
+            .field("payload_len", &self.payload.len())
+            .field("logical_size", &self.logical_size)
+            .field("frames", &self.frames.len())
+            .field("permits", &self._permits.len())
+            .finish()
+    }
 }
 
 /// Process-wide byte budget for ingest buffers (Semaphore permits = bytes).
+///
+/// Only the open (unsealed) chunk + current block holds permits; sealed chunks
+/// carry their own permits until uploaded and dropped.
 #[derive(Clone, Debug)]
 pub struct ByteBudget {
     sem: Arc<Semaphore>,
@@ -63,6 +80,10 @@ impl ByteBudget {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.sem.available_permits()
     }
 
     pub async fn acquire(&self, n: usize) -> Result<OwnedSemaphorePermit> {
@@ -87,7 +108,10 @@ pub struct FrameWriter {
     frames: Vec<FrameRecord>,
     compress_calls: Arc<AtomicU64>,
     budget: Option<ByteBudget>,
-    permits: Vec<OwnedSemaphorePermit>,
+    /// Permits for bytes in the current incomplete `block`.
+    block_permits: Vec<OwnedSemaphorePermit>,
+    /// Permits for logical bytes already framed into the open (unsealed) chunk.
+    chunk_permits: Vec<OwnedSemaphorePermit>,
 }
 
 impl FrameWriter {
@@ -113,7 +137,8 @@ impl FrameWriter {
             frames: Vec::new(),
             compress_calls,
             budget,
-            permits: Vec::new(),
+            block_permits: Vec::new(),
+            chunk_permits: Vec::new(),
         }
     }
 
@@ -121,20 +146,44 @@ impl FrameWriter {
         self.compress_calls.load(Ordering::Relaxed)
     }
 
-    /// Push stream bytes; returns zero or more completed chunks.
-    pub async fn push(&mut self, mut data: &[u8]) -> Result<Vec<CompletedChunk>> {
+    /// Push stream bytes; returns completed chunks and how many input bytes were
+    /// consumed.
+    ///
+    /// When a memory budget is configured, this returns as soon as one or more
+    /// chunks are sealed so the caller can upload/drop them (freeing permits)
+    /// before more input is reserved. Callers must loop until `consumed == data.len()`.
+    pub async fn push(&mut self, mut data: &[u8]) -> Result<(Vec<CompletedChunk>, usize)> {
+        let total = data.len();
         let mut out = Vec::new();
         while !data.is_empty() {
             let need = self.frame_size - self.block.len();
             let take = need.min(data.len());
+            // If the open chunk already holds most of the budget, seal it first so
+            // the caller can free permits (otherwise highly compressible data can
+            // grow the open chunk toward max_logical and deadlock).
+            if let Some(budget) = &self.budget {
+                if budget.available_permits() < take && !self.chunk_stored.is_empty() {
+                    if let Some(c) = self.seal_chunk() {
+                        out.push(c);
+                        return Ok((out, total - data.len()));
+                    }
+                }
+            }
             self.reserve_budget(take).await?;
             self.block.extend_from_slice(&data[..take]);
             data = &data[take..];
             if self.block.len() >= self.frame_size {
-                out.extend(self.emit_frame().await?);
+                let sealed = self.emit_frame().await?;
+                if !sealed.is_empty() {
+                    out.extend(sealed);
+                    // With a budget, stop so the caller can free permits via put/drop.
+                    if self.budget.is_some() {
+                        return Ok((out, total - data.len()));
+                    }
+                }
             }
         }
-        Ok(out)
+        Ok((out, total))
     }
 
     /// Finish the stream: flush partial block and seal the last chunk.
@@ -146,7 +195,7 @@ impl FrameWriter {
         if let Some(c) = self.seal_chunk() {
             out.push(c);
         }
-        self.permits.clear();
+        // Any leftover permits (empty stream edge cases) drop with `self`.
         Ok(out)
     }
 
@@ -156,6 +205,7 @@ impl FrameWriter {
             return Ok(Vec::new());
         }
         let logical = std::mem::take(&mut self.block);
+        let frame_permits = std::mem::take(&mut self.block_permits);
         let logical_len = logical.len();
         let frame_codec = self.frame_codec;
         let calls = self.compress_calls.clone();
@@ -192,6 +242,7 @@ impl FrameWriter {
         let logical_off = self.chunk_logical as i64;
         self.chunk_stored.extend_from_slice(&payload);
         self.chunk_logical += logical_len;
+        self.chunk_permits.extend(frame_permits);
         self.frames.push(FrameRecord {
             frame_no,
             stored_off,
@@ -210,17 +261,19 @@ impl FrameWriter {
         let payload = Bytes::from(std::mem::take(&mut self.chunk_stored));
         let logical_size = self.chunk_logical as i64;
         let frames = std::mem::take(&mut self.frames);
+        let permits = std::mem::take(&mut self.chunk_permits);
         self.chunk_logical = 0;
         Some(CompletedChunk {
             payload,
             logical_size,
             frames,
+            _permits: permits,
         })
     }
 
     async fn reserve_budget(&mut self, n: usize) -> Result<()> {
         if let Some(budget) = &self.budget {
-            self.permits.push(budget.acquire(n).await?);
+            self.block_permits.push(budget.acquire(n).await?);
         }
         Ok(())
     }
@@ -362,7 +415,8 @@ mod tests {
         );
         let n = 512 * 1024;
         let data = vec![0u8; n];
-        let mut chunks = w.push(&data).await.unwrap();
+        let (mut chunks, consumed) = w.push(&data).await.unwrap();
+        assert_eq!(consumed, n);
         chunks.extend(w.finish().await.unwrap());
         assert!(!chunks.is_empty());
         let expected_calls = (n + frame - 1) / frame;
@@ -406,5 +460,51 @@ mod tests {
         let mut expect = vec![1u8; 10];
         expect.extend(std::iter::repeat(2u8).take(10));
         assert_eq!(mid.as_ref(), expect.as_slice());
+    }
+
+    #[tokio::test]
+    async fn budget_push_returns_early_so_caller_can_free_permits() {
+        let budget = ByteBudget::new(64 * 1024);
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut w = FrameWriter::new(
+            16 * 1024,
+            32 * 1024,
+            1024 * 1024,
+            ChunkCodec::Raw,
+            Some(budget.clone()),
+            calls,
+        );
+        let data = vec![7u8; 96 * 1024];
+        let mut offset = 0;
+        while offset < data.len() {
+            let (sealed, consumed) = w.push(&data[offset..]).await.unwrap();
+            assert!(consumed > 0);
+            offset += consumed;
+            // Simulate upload: drop sealed chunks to free budget.
+            drop(sealed);
+        }
+        let last = w.finish().await.unwrap();
+        drop(last);
+        assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
+    #[tokio::test]
+    async fn budget_returns_on_writer_drop_mid_stream() {
+        let budget = ByteBudget::new(32 * 1024);
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut w = FrameWriter::new(
+            8 * 1024,
+            16 * 1024,
+            1024 * 1024,
+            ChunkCodec::Raw,
+            Some(budget.clone()),
+            calls,
+        );
+        let (sealed, _) = w.push(&[1u8; 24 * 1024]).await.unwrap();
+        drop(sealed);
+        // Writer may still hold an open block/chunk.
+        assert!(budget.available_permits() <= budget.capacity());
+        drop(w);
+        assert_eq!(budget.available_permits(), budget.capacity());
     }
 }

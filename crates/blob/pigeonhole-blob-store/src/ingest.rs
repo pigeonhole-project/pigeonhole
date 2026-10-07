@@ -159,28 +159,41 @@ async fn ingest_framed(
         }
         total_size += chunk.len() as i64;
 
-        let completed = match writer.push(&chunk).await {
-            Ok(c) => c,
-            Err(e) => {
-                let pending = cleanup_uploads(store, &uploaded).await;
-                return Err(IngestError {
-                    source: e,
-                    pending_deletes: pending,
-                });
-            }
-        };
-        for done in completed {
-            match put_completed(store, done, part_no).await {
-                Ok(u) => {
-                    uploaded.push(u);
-                    part_no += 1;
-                }
+        let mut rest = chunk.as_ref();
+        while !rest.is_empty() {
+            let (completed, consumed) = match writer.push(rest).await {
+                Ok(v) => v,
                 Err(e) => {
                     let pending = cleanup_uploads(store, &uploaded).await;
                     return Err(IngestError {
                         source: e,
                         pending_deletes: pending,
                     });
+                }
+            };
+            // Under budget pressure the writer may seal with consumed==0 so the
+            // caller can free permits before more input is reserved.
+            if consumed == 0 && completed.is_empty() {
+                let pending = cleanup_uploads(store, &uploaded).await;
+                return Err(IngestError {
+                    source: anyhow::anyhow!("ingest made no progress (budget deadlock?)"),
+                    pending_deletes: pending,
+                });
+            }
+            rest = &rest[consumed..];
+            for done in completed {
+                match put_completed(store, done, part_no).await {
+                    Ok(u) => {
+                        uploaded.push(u);
+                        part_no += 1;
+                    }
+                    Err(e) => {
+                        let pending = cleanup_uploads(store, &uploaded).await;
+                        return Err(IngestError {
+                            source: e,
+                            pending_deletes: pending,
+                        });
+                    }
                 }
             }
         }
@@ -305,25 +318,28 @@ async fn ingest_raw(
 
 async fn put_completed(
     store: &Arc<dyn BlobStore>,
-    done: CompletedChunk,
+    mut done: CompletedChunk,
     part_no: i64,
 ) -> Result<UploadedChunk> {
     if done.payload.is_empty() {
         bail!("refusing empty framed chunk");
     }
-    let stored_crc32 = Some(crc32fast::hash(done.payload.as_ref()));
-    let filename = format!("{:x}.bin.frames", Md5::digest(&done.payload));
-    let (file_id, message_id) = store
-        .put(done.payload, &filename, "")
-        .await
-        .context("blob store put")?;
+    let payload = std::mem::replace(&mut done.payload, Bytes::new());
+    let frames = std::mem::take(&mut done.frames);
+    let logical_size = done.logical_size;
+    let stored_crc32 = Some(crc32fast::hash(payload.as_ref()));
+    let filename = format!("{:x}.bin.frames", Md5::digest(&payload));
+    let put_result = store.put(payload, &filename, "").await;
+    // Release ingest-budget permits only after put attempt finishes.
+    drop(done);
+    let (file_id, message_id) = put_result.context("blob store put")?;
     Ok(UploadedChunk {
         part_no,
         file_id,
         message_id,
-        logical_size: done.logical_size,
+        logical_size,
         codec: ChunkCodec::Frames,
-        frames: done.frames,
+        frames,
         stored_crc32,
     })
 }
@@ -587,5 +603,101 @@ mod tests {
         let (payload, codec) = encode_chunk(data.clone(), ChunkCodec::Raw);
         assert_eq!(codec, ChunkCodec::Raw);
         assert_eq!(payload, data);
+    }
+
+    /// Object larger than the ingest budget must still complete (budget covers
+    /// only the open chunk + block, not the whole object).
+    #[tokio::test]
+    async fn large_put_under_small_budget_completes() {
+        let mem = Arc::new(MemoryBlobStore::new());
+        let store: Arc<dyn BlobStore> = mem.clone();
+        let budget = ByteBudget::new(32 * 1024 * 1024);
+        let n = 300 * 1024 * 1024;
+        // Stream in 4 MiB pieces so we do not hold the whole object in one Bytes.
+        let piece = 4 * 1024 * 1024;
+        let body = futures::stream::unfold(0usize, move |off| async move {
+            if off >= n {
+                return None;
+            }
+            let len = (n - off).min(piece);
+            Some((Ok::<_, anyhow::Error>(Bytes::from(vec![0u8; len])), off + len))
+        });
+        let mut opts = IngestOptions::new(8 * 1024 * 1024, ChunkCodec::Zstd);
+        opts.frame_size = 1024 * 1024;
+        opts.memory_budget = Some(budget.clone());
+        let r = ingest_stream_with_options(&store, Box::pin(body), None, opts)
+            .await
+            .expect("300 MiB ingest under 32 MiB budget");
+        assert_eq!(r.size, n as i64);
+        assert!(!r.chunks.is_empty());
+        assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
+    #[tokio::test]
+    async fn parallel_puts_share_budget_without_deadlock() {
+        let budget = ByteBudget::new(64 * 1024 * 1024);
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let budget = budget.clone();
+            joins.push(tokio::spawn(async move {
+                let mem = Arc::new(MemoryBlobStore::new());
+                let store: Arc<dyn BlobStore> = mem;
+                let n = 64 * 1024 * 1024;
+                let piece = 2 * 1024 * 1024;
+                let body = futures::stream::unfold(0usize, move |off| async move {
+                    if off >= n {
+                        return None;
+                    }
+                    let len = (n - off).min(piece);
+                    Some((Ok::<_, anyhow::Error>(Bytes::from(vec![1u8; len])), off + len))
+                });
+                let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
+                opts.frame_size = 512 * 1024;
+                opts.memory_budget = Some(budget);
+                ingest_stream_with_options(&store, Box::pin(body), None, opts).await
+            }));
+        }
+        for j in joins {
+            j.await
+                .expect("join")
+                .expect("parallel 64 MiB ingest under 64 MiB shared budget");
+        }
+        assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_put_returns_budget() {
+        let budget = ByteBudget::new(16 * 1024 * 1024);
+        let mem = Arc::new(MemoryBlobStore::new());
+        let store: Arc<dyn BlobStore> = mem;
+        let budget_c = budget.clone();
+        let handle = tokio::spawn(async move {
+            let n = 128 * 1024 * 1024;
+            let piece = 1024 * 1024;
+            let body = futures::stream::unfold(0usize, move |off| async move {
+                if off >= n {
+                    return None;
+                }
+                // Yield so the parent can abort while permits are held.
+                tokio::task::yield_now().await;
+                let len = (n - off).min(piece);
+                Some((Ok::<_, anyhow::Error>(Bytes::from(vec![2u8; len])), off + len))
+            });
+            let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
+            opts.frame_size = 512 * 1024;
+            opts.memory_budget = Some(budget_c);
+            ingest_stream_with_options(&store, Box::pin(body), None, opts).await
+        });
+        // Wait until some budget is taken, then cancel.
+        for _ in 0..200 {
+            if budget.available_permits() < budget.capacity() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+        let _ = handle.await;
+        // Abort drops the task's FrameWriter / CompletedChunks → permits return.
+        assert_eq!(budget.available_permits(), budget.capacity());
     }
 }
