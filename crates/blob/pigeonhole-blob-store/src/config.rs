@@ -1,4 +1,7 @@
-use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig};
+use crate::instances::{
+    legacy_default_instance, resolve_instances, FileInstance, InstanceConfig,
+};
+use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
 use anyhow::{bail, Context, Result};
@@ -40,6 +43,8 @@ pub struct Config {
     pub cache: CacheConfig,
     pub bytestream: BytestreamSettings,
     pub http: HttpSettings,
+    /// Resolved backend instances (`[[instances]]` or legacy single default).
+    pub instances: Vec<InstanceConfig>,
     pub config_path: PathBuf,
 }
 
@@ -183,6 +188,32 @@ impl Config {
             bail!("telegram upload/download concurrency must be >= 1");
         }
 
+        let instances = if !file.instances.is_empty() {
+            resolve_instances(&file.instances)?
+        } else if memory_store {
+            vec![legacy_default_instance(
+                InstanceKind::Memory,
+                "",
+                "local",
+                "",
+            )?]
+        } else {
+            let kind = match backend_kind {
+                BackendKind::Telegram => InstanceKind::Telegram,
+                BackendKind::Discord => InstanceKind::Discord,
+            };
+            let env_name = match backend_kind {
+                BackendKind::Telegram => "BOT_TOKEN",
+                BackendKind::Discord => "DISCORD_BOT_TOKEN",
+            };
+            vec![legacy_default_instance(
+                kind,
+                &bot_token,
+                &chat_id,
+                env_name,
+            )?]
+        };
+
         Ok(Self {
             backend_kind,
             bot_token,
@@ -203,6 +234,7 @@ impl Config {
             cache: file.cache.into_cache_config()?,
             bytestream: file.bytestream.into_settings(),
             http: file.http.into_settings(),
+            instances,
             config_path,
         })
     }
@@ -240,6 +272,13 @@ impl Config {
             },
             bytestream: BytestreamSettings::default(),
             http: HttpSettings::default(),
+            instances: vec![legacy_default_instance(
+                InstanceKind::Memory,
+                "",
+                "local",
+                "",
+            )
+            .expect("memory instance")],
             config_path: PathBuf::from("(test)"),
         }
     }
@@ -286,6 +325,8 @@ struct FileConfig {
     bytestream: FileBytestream,
     #[serde(default)]
     http: FileHttp,
+    #[serde(default)]
+    instances: Vec<FileInstance>,
 }
 
 impl Default for FileConfig {
@@ -305,6 +346,7 @@ impl Default for FileConfig {
             cache: FileCache::default(),
             bytestream: FileBytestream::default(),
             http: FileHttp::default(),
+            instances: Vec::new(),
         }
     }
 }

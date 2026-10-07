@@ -3,10 +3,16 @@
 pub mod config;
 pub mod frame_cache;
 pub mod ingest;
+pub mod instances;
 pub mod read;
 pub mod snapshot;
 
 pub use config::{BackendKind, BytestreamSettings, Config, HttpSettings};
+pub use instances::{
+    check_fingerprints, discord_fingerprint, discord_location, legacy_default_instance,
+    memory_fingerprint, memory_location, telegram_fingerprint, telegram_location, validate_instances,
+    InstanceConfig,
+};
 pub use frame_cache::FrameCache;
 pub use pigeonhole_blob::CacheConfig;
 pub use ingest::{
