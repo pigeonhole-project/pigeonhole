@@ -70,6 +70,15 @@ impl BlobLayer {
         &self.db
     }
 
+    /// Shared write backend (journal/checkpoint segments, not gateway-facing).
+    pub fn write_backend(&self) -> SharedBackend {
+        self.write.clone()
+    }
+
+    pub fn write_instance_id(&self) -> &str {
+        &self.write_instance_id
+    }
+
     pub async fn put_small(&self, data: Bytes) -> Result<BlobId> {
         if data.is_empty() {
             bail!("put_small refuses empty payload");
