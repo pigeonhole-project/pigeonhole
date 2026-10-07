@@ -14,7 +14,7 @@ pub struct CasBlobRow {
 
 /// Resolved CAS object: either a legacy single blob or a chunked manifest JSON.
 #[derive(Debug, Clone)]
-pub struct CasEntry {
+pub struct CasIndexEntry {
     pub file_id: String,
     pub manifest: Option<String>,
 }
@@ -44,7 +44,7 @@ impl Index {
         Ok(self.cas_get(hash, size).await?.map(|e| e.file_id))
     }
 
-    pub async fn cas_get(&self, hash: &str, size: i64) -> Result<Option<CasEntry>> {
+    pub async fn cas_get(&self, hash: &str, size: i64) -> Result<Option<CasIndexEntry>> {
         let row: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT file_id, manifest FROM cas_blobs WHERE hash = ? AND size = ?",
         )
@@ -52,7 +52,7 @@ impl Index {
         .bind(size)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(file_id, manifest)| CasEntry { file_id, manifest }))
+        Ok(row.map(|(file_id, manifest)| CasIndexEntry { file_id, manifest }))
     }
 
     pub async fn cas_touch(&self, hash: &str, size: i64) -> Result<()> {

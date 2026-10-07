@@ -1,6 +1,6 @@
 //! Gateway-facing blob layer API (stage 1.6).
 //!
-//! Gateways see only [`ChunkId`] / [`ChunkRef`] — not `DynBlobBackend`, locators, or instances.
+//! Gateways see only [`ChunkId`] / [`Extent`] — not `DynBlobBackend`, locators, or instances.
 
 use crate::blob_db::BlobDb;
 use crate::ingest::IngestOptions;
@@ -18,10 +18,12 @@ use std::sync::Arc;
 /// Internal integer blob id (row in `blobs`).
 pub type ChunkId = i64;
 
-/// Reference to an ingested chunk for ranged reads.
+/// Logical byte range within a chunk (`offset`/`len` are logical bytes).
 #[derive(Debug, Clone)]
-pub struct ChunkRef {
-    pub chunk_id: ChunkId,
+pub struct Extent {
+    pub chunk: ChunkId,
+    pub offset: i64,
+    pub len: i64,
 }
 
 /// Result of streaming ingest.
@@ -122,21 +124,30 @@ impl ChunkStore {
         self.ingest_framed(&mut stream, opts).await
     }
 
-    /// Read a logical byte range across chunk refs (None = entire concatenation).
+    /// Read a logical byte range across extents (None = entire concatenation).
     pub async fn read(
         &self,
-        blobs: &[ChunkRef],
+        extents: &[Extent],
         range: Option<ByteRange>,
     ) -> Result<Bytes> {
         let mut pieces = Vec::new();
         let mut cursor = 0u64;
-        for ch in blobs {
+        for ext in extents {
             let meta = self
                 .db
-                .chunk_meta(ch.chunk_id)
+                .chunk_meta(ext.chunk)
                 .await?
-                .with_context(|| format!("unknown chunk_id {}", ch.chunk_id))?;
-            let logical = meta.0 as u64;
+                .with_context(|| format!("unknown chunk_id {}", ext.chunk))?;
+            let chunk_size = meta.0;
+            let ext_off = ext.offset.max(0);
+            let ext_len = if ext.len < 0 {
+                bail!("extent len must be >= 0");
+            } else if ext.len == 0 {
+                continue;
+            } else {
+                ext.len.min(chunk_size.saturating_sub(ext_off))
+            };
+            let logical = ext_len as u64;
             let start = cursor;
             let end = cursor + logical;
             cursor = end;
@@ -155,7 +166,9 @@ impl ChunkStore {
             if local_from >= local_to {
                 continue;
             }
-            pieces.push(self.read_blob_range(ch.chunk_id, local_from, local_to).await?);
+            let from = ext_off as usize + local_from;
+            let to = ext_off as usize + local_to;
+            pieces.push(self.read_blob_range(ext.chunk, from, to).await?);
         }
         if pieces.is_empty() {
             return Ok(Bytes::new());
@@ -368,11 +381,15 @@ mod tests {
         assert_eq!(ingested.size, body.len() as i64);
         assert!(!ingested.blobs.is_empty());
 
-        let refs: Vec<ChunkRef> = ingested
-            .blobs
-            .iter()
-            .map(|&chunk_id| ChunkRef { chunk_id })
-            .collect();
+        let mut refs = Vec::new();
+        for &chunk_id in &ingested.blobs {
+            let (size, _, _) = layer.db().chunk_meta(chunk_id).await.unwrap().unwrap();
+            refs.push(Extent {
+                chunk: chunk_id,
+                offset: 0,
+                len: size,
+            });
+        }
         let got = layer.read(&refs, None).await.unwrap();
         assert_eq!(got, body);
 

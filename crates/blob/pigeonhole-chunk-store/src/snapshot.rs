@@ -640,9 +640,18 @@ pub async fn restore_gateway_snapshot(
         .get_root(root_name)
         .await?
         .with_context(|| format!("missing root {root_name}"))?;
+    let (size, _, _) = layer
+        .db()
+        .chunk_meta(chunk_id)
+        .await?
+        .with_context(|| format!("missing chunk {chunk_id}"))?;
     let data = layer
         .read(
-            &[crate::layer::ChunkRef { chunk_id }],
+            &[crate::layer::Extent {
+                chunk: chunk_id,
+                offset: 0,
+                len: size,
+            }],
             None,
         )
         .await

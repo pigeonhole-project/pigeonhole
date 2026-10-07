@@ -15,8 +15,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CasManifest {
-    pub chunks: Vec<CasChunkMeta>,
+pub struct CasEntry {
+    /// Chunk pieces of this CAS object (legacy JSON key: `chunks`).
+    #[serde(alias = "chunks")]
+    pub extents: Vec<CasChunkMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,7 +123,7 @@ impl CasStore {
         let (tx, rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(1);
 
         if let Some(manifest_json) = entry.manifest.as_deref().filter(|s| !s.is_empty()) {
-            let manifest: CasManifest =
+            let manifest: CasEntry =
                 serde_json::from_str(manifest_json).context("parse CAS manifest")?;
             tokio::spawn(async move {
                 if let Err(e) = stream_manifest_range(store, &manifest, from, to, &tx).await {
@@ -192,8 +194,8 @@ impl CasStore {
             );
         }
 
-        let manifest = CasManifest {
-            chunks: ingested.chunks.iter().map(CasChunkMeta::from).collect(),
+        let manifest = CasEntry {
+            extents: ingested.chunks.iter().map(CasChunkMeta::from).collect(),
         };
         let manifest_json = serde_json::to_string(&manifest).context("serialize CAS manifest")?;
         let bump: Vec<(String, i64, i64, Option<u32>)> = ingested
@@ -229,7 +231,7 @@ impl CasStore {
 
 async fn stream_manifest_range(
     store: Arc<dyn LegacyBlobStore>,
-    manifest: &CasManifest,
+    manifest: &CasEntry,
     from: usize,
     to: usize,
     tx: &mpsc::Sender<Result<Bytes, anyhow::Error>>,
@@ -237,7 +239,7 @@ async fn stream_manifest_range(
     let mut cursor = 0usize;
     let mut produced = 0usize;
     let expected = to.saturating_sub(from);
-    for ch in &manifest.chunks {
+    for ch in &manifest.extents {
         let clen = ch.logical_size as usize;
         let start = cursor;
         let end = cursor + clen;
@@ -411,8 +413,8 @@ mod tests {
             .await
             .expect("ingest 512 MiB");
         assert!(ingested.chunks.len() >= 64, "expected many chunks");
-        let manifest = CasManifest {
-            chunks: ingested.chunks.iter().map(CasChunkMeta::from).collect(),
+        let manifest = CasEntry {
+            extents: ingested.chunks.iter().map(CasChunkMeta::from).collect(),
         };
         let manifest_json = serde_json::to_string(&manifest).unwrap();
         let bump: Vec<(String, i64, i64, Option<u32>)> = ingested
