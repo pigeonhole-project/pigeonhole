@@ -11,7 +11,6 @@ use md5::{Digest, Md5};
 use pigeonhole_blob::{collect_stream, erase_sweep, SharedBackend, StoredId, Sweepable};
 use pigeonhole_codec::{
     decode_frames_range, ByteBudget, ChunkCodec, FrameRecord, FrameWriter, DEFAULT_CHUNK_SIZE,
-    DEFAULT_FRAME_SIZE,
 };
 use pigeonhole_types::ByteRange;
 use std::sync::Arc;
@@ -341,6 +340,7 @@ pub fn default_layer_opts() -> IngestOptions {
 /// Test helper: open a memory-backed layer with a temp `blob.db`.
 #[cfg(test)]
 pub async fn open_memory_layer(db_url: &str) -> Result<BlobLayer> {
+    use pigeonhole_codec::DEFAULT_FRAME_SIZE;
     use pigeonhole_storage_memory::MemoryBlobStore;
     let db = BlobDb::connect(db_url).await?;
     let mut opts = default_layer_opts();
