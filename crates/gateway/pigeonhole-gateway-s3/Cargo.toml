@@ -1,0 +1,29 @@
+[package]
+name = "pigeonhole-gateway-s3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "S3 gateway (s3s) for pigeonhole"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+md-5 = { workspace = true }
+s3s = { workspace = true }
+serde_json = { workspace = true }
+pigeonhole-codec = { workspace = true }
+pigeonhole-types = { workspace = true }
+pigeonhole-blob-store = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

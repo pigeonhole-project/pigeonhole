@@ -20,6 +20,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Check workspace dependency layers
+        run: ./scripts/check-deps.sh --strict
       - run: cargo test --workspace
 
   compat-memory:

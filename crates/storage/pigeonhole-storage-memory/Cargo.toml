@@ -1,0 +1,18 @@
+[package]
+name = "pigeonhole-storage-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-memory storage backend for pigeonhole tests"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-types = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pigeonhole-testkit = { workspace = true }
+tokio = { workspace = true }

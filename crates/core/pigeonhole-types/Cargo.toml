@@ -1,0 +1,10 @@
+[package]
+name = "pigeonhole-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types for pigeonhole (no I/O)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

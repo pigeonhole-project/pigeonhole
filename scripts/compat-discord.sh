@@ -11,8 +11,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LOG="${S3GRAM_DC_LOG:-$ROOT/.cache/s3gram-discord.log}"
-PIDFILE="${S3GRAM_DC_PID:-$ROOT/.cache/s3gram-discord.pid}"
+LOG="${S3GRAM_DC_LOG:-$ROOT/.cache/pigeonhole-storage-discord.log}"
+PIDFILE="${S3GRAM_DC_PID:-$ROOT/.cache/pigeonhole-storage-discord.pid}"
 REPORT="${S3GRAM_DC_REPORT:-$ROOT/.cache/discord-suite-report.txt}"
 
 COMPAT_ARGS=()
@@ -87,8 +87,8 @@ record() {
 
 log_step "cargo test --workspace (discord crate uses wiremock only)"
 set +e
-cargo test -p s3gram-discord 2>&1 | tee -a "$REPORT"
-record "cargo test -p s3gram-discord" "${PIPESTATUS[0]}"
+cargo test -p pigeonhole-storage-discord 2>&1 | tee -a "$REPORT"
+record "cargo test -p pigeonhole-storage-discord" "${PIPESTATUS[0]}"
 set -e
 
 log_step "build release (features discord)"
@@ -99,7 +99,7 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   exit 1
 fi
 
-CFG="$ROOT/.cache/s3gram-discord-config.toml"
+CFG="$ROOT/.cache/pigeonhole-storage-discord-config.toml"
 DB_URL="sqlite:s3gram.db"
 if [[ -f s3gram.toml ]]; then
   parsed="$(sed -n 's/^database_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' s3gram.toml | head -1 || true)"

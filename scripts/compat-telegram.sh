@@ -17,8 +17,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LOG="${S3GRAM_TG_LOG:-$ROOT/.cache/s3gram-telegram.log}"
-PIDFILE="${S3GRAM_TG_PID:-$ROOT/.cache/s3gram-telegram.pid}"
+LOG="${S3GRAM_TG_LOG:-$ROOT/.cache/pigeonhole-storage-telegram.log}"
+PIDFILE="${S3GRAM_TG_PID:-$ROOT/.cache/pigeonhole-storage-telegram.pid}"
 REPORT="${S3GRAM_TG_REPORT:-$ROOT/.cache/telegram-suite-report.txt}"
 S3S_DIR="${S3S_DIR:-$ROOT/.cache/s3s-upstream}"
 S3S_REPO="${S3S_REPO:-https://github.com/s3s-project/s3s.git}"
@@ -106,7 +106,7 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   exit 1
 fi
 
-CFG="$ROOT/.cache/s3gram-telegram-config.toml"
+CFG="$ROOT/.cache/pigeonhole-storage-telegram-config.toml"
 # Prefer database_url from local s3gram.toml if present.
 DB_URL="sqlite:s3gram.db"
 if [[ -f s3gram.toml ]]; then

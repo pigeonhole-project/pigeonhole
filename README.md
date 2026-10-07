@@ -1,34 +1,39 @@
-# s3gram
+# pigeonhole
 
-S3-compatible HTTP gateway in Rust, backed by the Telegram Bot API.
+Pluggable blob storage with protocol gateways. The first profile is **s3gram**:
+an S3-compatible HTTP gateway in Rust, backed by Telegram (or Discord) Bot API.
 
-The S3 protocol surface is implemented with
-[s3s](https://github.com/s3s-project/s3s). Objects are split into configurable
-chunks (default on-wire ≤19 MiB, hard cap `< 20 MiB` for Telegram `getFile`) and
-stored as documents in **one** private Telegram chat/channel. Chunk encoding is
-`raw` | `gzip` | `zstd` (default `zstd`): compressing policies pack independent
-1 MiB frames into Telegram documents (stored codec `frames`) so each block is
-compressed once; on-wire size stays ≤ `chunk.size` (logical ≤ 256 MiB). Legacy
-single-blob `raw`/`gzip`/`zstd` chunks remain readable. Object metadata lives in
-a local SQLite index.
+The S3 surface uses [s3s](https://github.com/s3s-project/s3s). Objects are split
+into configurable chunks (default on-wire ≤19 MiB, hard cap `< 20 MiB` for
+Telegram `getFile`) and stored as documents in **one** private chat/channel.
+Chunk encoding is `raw` | `gzip` | `zstd` (default `zstd`): compressing policies
+pack independent 1 MiB frames into documents (stored codec `frames`) so each
+block is compressed once; on-wire size stays ≤ `chunk.size` (logical ≤ 256 MiB).
+Legacy single-blob `raw`/`gzip`/`zstd` chunks remain readable. Object metadata
+lives in a local SQLite index.
 
-Telegram I/O goes through a `BlobStore` trait (`TelegramBlobStore` in production,
-`MemoryBlobStore` in unit tests) so tests never hit the real Bot API.
+Storage I/O goes through `BlobBackend` / `BlobStore` (`storage-telegram` or
+`storage-discord` in production, `storage-memory` in tests) so unit tests never
+hit a real Bot API. Roadmap gateways: Kafka, WebDAV.
 
-Layout is a Cargo workspace under `crates/`:
+Layout is a Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 
 | Crate | Role |
 |---|---|
-| `s3gram-core` | Shared types (`DeleteOutcome`, `PinnedContent`) |
-| `s3gram-chunk` | Codecs + `FrameWriter` |
-| `s3gram-blob` | `BlobBackend` / `BlobStore`, `MemoryBackend`, `ChatLimiter`, `BootstrapPointer` |
-| `s3gram-telegram` | Bot API client + `TelegramBackend` (Range best-effort) |
-| `s3gram-discord` | Discord Bot API backend (default feature) |
-| `s3gram-index` | SQLite index |
-| `s3gram-engine` | Ingest, snapshots, config (no Telegram dependency) |
-| `s3gram-s3` | `s3s::S3` impl |
-| `s3gram-bytestream` | REAPI v2 remote cache (CAS + ByteStream + ActionCache) |
-| `s3gram` | Binary + wiring |
+| `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
+| `core/pigeonhole-codec` | Codecs + `FrameWriter` |
+| `blob/pigeonhole-blob` | `BlobBackend` / `BlobStore`, rate limits, `BootstrapPointer`, cache |
+| `blob/pigeonhole-index` | SQLite index (blob-store layer; merging into blob-store later) |
+| `blob/pigeonhole-blob-store` | Ingest, snapshots, config (no protocol crates) |
+| `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
+| `storage/pigeonhole-storage-discord` | Discord Bot API storage |
+| `storage/pigeonhole-storage-memory` | In-memory storage for tests / `memory = true` |
+| `gateway/pigeonhole-gateway-s3` | S3 (`s3s`) gateway |
+| `gateway/pigeonhole-gateway-bytestream` | REAPI v2 remote cache |
+| `testing/pigeonhole-testkit` | Storage conformance suites |
+| `bin/pigeonhole` | Binaries `pigeonhole` and `s3gram` (same wiring; features select storage/gateways) |
+
+Dependency layering is enforced by `./scripts/check-deps.sh --strict` in CI.
 
 ## Bot API limits
 

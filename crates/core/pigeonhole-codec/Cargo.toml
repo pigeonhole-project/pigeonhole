@@ -1,0 +1,18 @@
+[package]
+name = "pigeonhole-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chunk codecs and frame packing for pigeonhole"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

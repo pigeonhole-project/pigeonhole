@@ -1,0 +1,55 @@
+[package]
+name = "pigeonhole"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "pigeonhole"
+path = "src/main.rs"
+
+[[bin]]
+name = "s3gram"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+dotenvy = { workspace = true }
+http = { workspace = true }
+s3s = { workspace = true }
+serde_json = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-types = { workspace = true }
+pigeonhole-codec = { workspace = true }
+pigeonhole-blob-store = { workspace = true }
+pigeonhole-index = { workspace = true }
+pigeonhole-gateway-s3 = { workspace = true }
+pigeonhole-storage-telegram = { workspace = true }
+pigeonhole-storage-memory = { workspace = true }
+pigeonhole-storage-discord = { workspace = true, optional = true }
+pigeonhole-gateway-bytestream = { workspace = true, optional = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = ["discord"]
+discord = ["dep:pigeonhole-storage-discord"]
+bytestream = ["dep:pigeonhole-gateway-bytestream"]
+
+[dev-dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+s3s = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[lib]
+name = "pigeonhole"
+path = "src/lib.rs"

@@ -1,24 +1,26 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/s3gram-core",
-    "crates/s3gram-chunk",
-    "crates/s3gram-blob",
-    "crates/s3gram-telegram",
-    "crates/s3gram-discord",
-    "crates/s3gram-index",
-    "crates/s3gram-engine",
-    "crates/s3gram-s3",
-    "crates/s3gram-bytestream",
-    "crates/s3gram",
+    "crates/core/pigeonhole-types",
+    "crates/core/pigeonhole-codec",
+    "crates/blob/pigeonhole-blob",
+    "crates/blob/pigeonhole-index",
+    "crates/blob/pigeonhole-blob-store",
+    "crates/storage/pigeonhole-storage-telegram",
+    "crates/storage/pigeonhole-storage-discord",
+    "crates/storage/pigeonhole-storage-memory",
+    "crates/gateway/pigeonhole-gateway-s3",
+    "crates/gateway/pigeonhole-gateway-bytestream",
+    "crates/bin/pigeonhole",
+    "crates/testing/pigeonhole-testkit",
 ]
-default-members = ["crates/s3gram"]
+default-members = ["crates/bin/pigeonhole"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "S3-compatible gateway backed by Telegram Bot API"
+description = "Pluggable blob storage with protocol gateways (S3, ByteStream, …)"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -52,19 +54,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 zstd = "0.13"
-
-s3gram-core = { path = "crates/s3gram-core" }
-s3gram-chunk = { path = "crates/s3gram-chunk" }
-s3gram-blob = { path = "crates/s3gram-blob" }
-s3gram-telegram = { path = "crates/s3gram-telegram" }
-s3gram-discord = { path = "crates/s3gram-discord" }
 wiremock = "0.6"
-s3gram-index = { path = "crates/s3gram-index" }
-s3gram-engine = { path = "crates/s3gram-engine" }
-s3gram-s3 = { path = "crates/s3gram-s3" }
-s3gram-bytestream = { path = "crates/s3gram-bytestream" }
 prost = "0.13"
 prost-types = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 tonic-build = "0.12"
 protoc-bin-vendored = "3.1"
+
+pigeonhole-types = { path = "crates/core/pigeonhole-types" }
+pigeonhole-codec = { path = "crates/core/pigeonhole-codec" }
+pigeonhole-blob = { path = "crates/blob/pigeonhole-blob" }
+pigeonhole-index = { path = "crates/blob/pigeonhole-index" }
+pigeonhole-blob-store = { path = "crates/blob/pigeonhole-blob-store" }
+pigeonhole-storage-telegram = { path = "crates/storage/pigeonhole-storage-telegram" }
+pigeonhole-storage-discord = { path = "crates/storage/pigeonhole-storage-discord" }
+pigeonhole-storage-memory = { path = "crates/storage/pigeonhole-storage-memory" }
+pigeonhole-gateway-s3 = { path = "crates/gateway/pigeonhole-gateway-s3" }
+pigeonhole-gateway-bytestream = { path = "crates/gateway/pigeonhole-gateway-bytestream" }
+pigeonhole-testkit = { path = "crates/testing/pigeonhole-testkit" }

@@ -1,0 +1,20 @@
+[package]
+name = "pigeonhole-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite index for pigeonhole"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pigeonhole-codec = { workspace = true }
+pigeonhole-types = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

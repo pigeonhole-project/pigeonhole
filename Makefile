@@ -1,4 +1,4 @@
-.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all
+.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps
 
 run:
 	cargo run --release
@@ -47,4 +47,7 @@ compat-discord:
 test:
 	cargo test --workspace
 
-test-all: test smoke
+check-deps:
+	./scripts/check-deps.sh --strict
+
+test-all: check-deps test smoke

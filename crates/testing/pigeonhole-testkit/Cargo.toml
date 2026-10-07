@@ -1,0 +1,12 @@
+[package]
+name = "pigeonhole-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Conformance testkits for pigeonhole storage and gateways"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-types = { workspace = true }

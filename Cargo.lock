@@ -1966,6 +1966,231 @@ dependencies = [
 ]
 
 [[package]]
+name = "pigeonhole"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.9",
+ "bytes",
+ "dotenvy",
+ "futures",
+ "http",
+ "pigeonhole-blob",
+ "pigeonhole-blob-store",
+ "pigeonhole-codec",
+ "pigeonhole-gateway-bytestream",
+ "pigeonhole-gateway-s3",
+ "pigeonhole-index",
+ "pigeonhole-storage-discord",
+ "pigeonhole-storage-memory",
+ "pigeonhole-storage-telegram",
+ "pigeonhole-types",
+ "s3s",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "pigeonhole-blob"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "crc32fast",
+ "foyer",
+ "futures",
+ "moka",
+ "pigeonhole-types",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pigeonhole-blob-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "dotenvy",
+ "flate2",
+ "futures",
+ "hex",
+ "md-5 0.10.6",
+ "moka",
+ "pigeonhole-blob",
+ "pigeonhole-codec",
+ "pigeonhole-index",
+ "pigeonhole-storage-memory",
+ "pigeonhole-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "pigeonhole-codec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "flate2",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "pigeonhole-gateway-bytestream"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "pigeonhole-blob-store",
+ "pigeonhole-storage-memory",
+ "pigeonhole-types",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "pigeonhole-gateway-s3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "hex",
+ "http",
+ "md-5 0.10.6",
+ "pigeonhole-blob-store",
+ "pigeonhole-codec",
+ "pigeonhole-types",
+ "s3s",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "pigeonhole-index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "pigeonhole-codec",
+ "pigeonhole-types",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pigeonhole-storage-discord"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "moka",
+ "pigeonhole-blob",
+ "pigeonhole-testkit",
+ "pigeonhole-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "pigeonhole-storage-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "pigeonhole-blob",
+ "pigeonhole-testkit",
+ "pigeonhole-types",
+ "tokio",
+]
+
+[[package]]
+name = "pigeonhole-storage-telegram"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "moka",
+ "pigeonhole-blob",
+ "pigeonhole-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pigeonhole-testkit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "pigeonhole-blob",
+ "pigeonhole-types",
+]
+
+[[package]]
+name = "pigeonhole-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2523,207 +2748,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "s3gram"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum 0.8.9",
- "bytes",
- "dotenvy",
- "futures",
- "http",
- "s3gram-blob",
- "s3gram-bytestream",
- "s3gram-chunk",
- "s3gram-core",
- "s3gram-discord",
- "s3gram-engine",
- "s3gram-index",
- "s3gram-s3",
- "s3gram-telegram",
- "s3s",
- "serde_json",
- "tempfile",
- "tokio",
- "tower 0.5.3",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "s3gram-blob"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "crc32fast",
- "foyer",
- "futures",
- "moka",
- "s3gram-core",
- "serde",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "s3gram-bytestream"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "s3gram-blob",
- "s3gram-index",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "s3gram-chunk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "flate2",
- "serde",
- "tempfile",
- "tokio",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "s3gram-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "s3gram-discord"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "moka",
- "reqwest",
- "s3gram-blob",
- "s3gram-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "s3gram-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "chrono",
- "crc32fast",
- "dotenvy",
- "flate2",
- "futures",
- "hex",
- "md-5 0.10.6",
- "moka",
- "s3gram-blob",
- "s3gram-chunk",
- "s3gram-core",
- "s3gram-index",
- "s3s",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "s3gram-index"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "s3gram-chunk",
- "s3gram-core",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "s3gram-s3"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "futures",
- "hex",
- "http",
- "md-5 0.10.6",
- "s3gram-blob",
- "s3gram-chunk",
- "s3gram-core",
- "s3gram-engine",
- "s3gram-index",
- "s3s",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "s3gram-telegram"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "moka",
- "reqwest",
- "s3gram-blob",
- "s3gram-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "s3s"

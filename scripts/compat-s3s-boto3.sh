@@ -9,9 +9,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${S3GRAM_PORT:-18333}"
-DB="${S3GRAM_MEMORY_DB:-$ROOT/.cache/s3gram-s3s-boto3.db}"
-LOG="${S3GRAM_MEMORY_LOG:-$ROOT/.cache/s3gram-s3s-boto3.log}"
-PIDFILE="${S3GRAM_MEMORY_PID:-$ROOT/.cache/s3gram-s3s-boto3.pid}"
+DB="${S3GRAM_MEMORY_DB:-$ROOT/.cache/pigeonhole-gateway-s3s-boto3.db}"
+LOG="${S3GRAM_MEMORY_LOG:-$ROOT/.cache/pigeonhole-gateway-s3s-boto3.log}"
+PIDFILE="${S3GRAM_MEMORY_PID:-$ROOT/.cache/pigeonhole-gateway-s3s-boto3.pid}"
 S3S_DIR="${S3S_DIR:-$ROOT/.cache/s3s-upstream}"
 S3S_REPO="${S3S_REPO:-https://github.com/s3s-project/s3s.git}"
 S3S_REF="${S3S_REF:-main}"
@@ -67,7 +67,7 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   exit 1
 fi
 
-CFG="$ROOT/.cache/s3gram-s3s-boto3-config.toml"
+CFG="$ROOT/.cache/pigeonhole-gateway-s3s-boto3-config.toml"
 CONFIG_OUT="$CFG" \
   CONFIG_MEMORY=true \
   CONFIG_LISTEN_ADDR="127.0.0.1:${PORT}" \
