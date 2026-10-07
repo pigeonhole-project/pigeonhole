@@ -4,12 +4,14 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use pigeonhole_blob_store::{
-    ingest_stream_with_options, read_chunk_range_cached, BlobStore, ChunkCodec, FrameRecord,
-    Index, IngestOptions, UploadedChunk,
+    collect_stream, ingest_stream_with_options, read_chunk_range_cached, BlobStore, BoxByteStream,
+    ChunkCodec, FrameRecord, Index, IngestOptions, UploadedChunk,
 };
 use pigeonhole_codec::DEFAULT_CHUNK_SIZE;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CasManifest {
@@ -75,17 +77,23 @@ impl CasStore {
     }
 
     pub async fn get_bytes(&self, hash_hex: &str, size: i64) -> Result<Option<Bytes>> {
-        self.read_range(hash_hex, size, 0, size).await
+        let Some(stream) = self.read_range(hash_hex, size, 0, size).await? else {
+            return Ok(None);
+        };
+        Ok(Some(collect_stream(stream).await?))
     }
 
     /// Read `[offset, offset+limit)` of a CAS blob (limit <= 0 means through EOF).
+    ///
+    /// Returns a byte stream that yields data frame-by-frame (or per legacy blob)
+    /// so callers never buffer the whole range.
     pub async fn read_range(
         &self,
         hash_hex: &str,
         size: i64,
         offset: i64,
         limit: i64,
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<BoxByteStream>> {
         let Some(entry) = self.cas.get(hash_hex, size).await? else {
             return Ok(None);
         };
@@ -100,27 +108,45 @@ impl CasStore {
         };
         if from == to {
             let _ = self.cas.touch(hash_hex, size).await;
-            return Ok(Some(Bytes::new()));
+            return Ok(Some(Box::pin(futures::stream::once(async {
+                Ok(Bytes::new())
+            }))));
         }
 
-        let data = if let Some(manifest_json) = entry.manifest.as_deref().filter(|s| !s.is_empty()) {
+        let _ = self.cas.touch(hash_hex, size).await;
+        let store = self.store.clone();
+        // Small channel so the producer cannot race ahead and retain many chunks.
+        let (tx, rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(1);
+
+        if let Some(manifest_json) = entry.manifest.as_deref().filter(|s| !s.is_empty()) {
             let manifest: CasManifest =
                 serde_json::from_str(manifest_json).context("parse CAS manifest")?;
-            read_manifest_range(self.store.clone(), &manifest, from, to).await?
+            tokio::spawn(async move {
+                if let Err(e) = stream_manifest_range(store, &manifest, from, to, &tx).await {
+                    let _ = tx.send(Err(e)).await;
+                }
+            });
         } else {
             // Legacy single-blob row.
-            let raw = self
-                .store
-                .get(&entry.file_id)
-                .await
-                .with_context(|| format!("blob get {}", entry.file_id))?;
-            if raw.len() as i64 != size {
-                anyhow::bail!("stored blob size mismatch for {hash_hex}/{size}");
-            }
-            raw.slice(from..to)
-        };
-        let _ = self.cas.touch(hash_hex, size).await;
-        Ok(Some(data))
+            let file_id = entry.file_id.clone();
+            let hash_hex = hash_hex.to_string();
+            tokio::spawn(async move {
+                let result = async {
+                    let raw = store
+                        .get(&file_id)
+                        .await
+                        .with_context(|| format!("blob get {file_id}"))?;
+                    if raw.len() as i64 != size {
+                        anyhow::bail!("stored blob size mismatch for {hash_hex}/{size}");
+                    }
+                    Ok(raw.slice(from..to))
+                }
+                .await;
+                let _ = tx.send(result).await;
+            });
+        }
+
+        Ok(Some(Box::pin(ReceiverStream::new(rx))))
     }
 
     pub async fn put_bytes(&self, hash_hex: &str, size: i64, data: Bytes) -> Result<()> {
@@ -200,14 +226,16 @@ impl CasStore {
     }
 }
 
-async fn read_manifest_range(
+async fn stream_manifest_range(
     store: Arc<dyn BlobStore>,
     manifest: &CasManifest,
     from: usize,
     to: usize,
-) -> Result<Bytes> {
-    let mut out = Vec::with_capacity(to.saturating_sub(from));
+    tx: &mpsc::Sender<Result<Bytes, anyhow::Error>>,
+) -> Result<()> {
     let mut cursor = 0usize;
+    let mut produced = 0usize;
+    let expected = to.saturating_sub(from);
     for ch in &manifest.chunks {
         let clen = ch.logical_size as usize;
         let start = cursor;
@@ -224,7 +252,7 @@ async fn read_manifest_range(
             "frames" => ChunkCodec::Frames,
             _ => ChunkCodec::Raw,
         };
-        let piece = read_chunk_range_cached(
+        stream_chunk_range(
             store.clone(),
             &ch.file_id,
             codec,
@@ -232,19 +260,193 @@ async fn read_manifest_range(
             local_from,
             local_to,
             clen,
-            None,
-            false,
+            tx,
         )
         .await
         .with_context(|| format!("read CAS chunk {}", ch.file_id))?;
-        out.extend_from_slice(piece.as_ref());
+        produced += local_to - local_from;
+        if tx.is_closed() {
+            return Ok(());
+        }
     }
-    if out.len() != to - from {
-        anyhow::bail!(
-            "CAS range decode produced {} bytes, expected {}",
-            out.len(),
-            to - from
+    if produced != expected {
+        anyhow::bail!("CAS range decode produced {produced} bytes, expected {expected}");
+    }
+    Ok(())
+}
+
+/// Yield one frame (or one legacy slice) at a time so the caller never holds the
+/// whole object range.
+async fn stream_chunk_range(
+    store: Arc<dyn BlobStore>,
+    file_id: &str,
+    codec: ChunkCodec,
+    frames: &[FrameRecord],
+    from: usize,
+    to: usize,
+    logical_size: usize,
+    tx: &mpsc::Sender<Result<Bytes, anyhow::Error>>,
+) -> Result<()> {
+    if codec == ChunkCodec::Frames && !frames.is_empty() {
+        let stored = store.get(file_id).await.context("blob get for frames")?;
+        let mut logical_cursor = 0usize;
+        for fr in frames {
+            let flen = fr.logical_len as usize;
+            let frame_start = logical_cursor;
+            let frame_end = logical_cursor + flen;
+            logical_cursor = frame_end;
+            if frame_end <= from || frame_start >= to {
+                continue;
+            }
+            let local_from = from.saturating_sub(frame_start).min(flen);
+            let local_to = to.saturating_sub(frame_start).min(flen);
+            let piece = pigeonhole_codec::decode_frames_range(
+                stored.as_ref(),
+                std::slice::from_ref(fr),
+                local_from,
+                local_to,
+            )
+            .with_context(|| format!("decode frame {} of {file_id}", fr.frame_no))?;
+            if tx.send(Ok(piece)).await.is_err() {
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
+
+    let piece = read_chunk_range_cached(
+        store,
+        file_id,
+        codec,
+        frames,
+        from,
+        to,
+        logical_size,
+        None,
+        false,
+    )
+    .await?;
+    let _ = tx.send(Ok(piece)).await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use pigeonhole_blob_store::DeleteOutcome;
+    use pigeonhole_storage_memory::MemoryBlobStore;
+    use sha2::{Digest as _, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts `get` calls so tests can assert the stream yields before all chunks load.
+    struct CountingStore {
+        inner: MemoryBlobStore,
+        gets: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl BlobStore for CountingStore {
+        async fn put(
+            &self,
+            data: Bytes,
+            filename: &str,
+            caption: &str,
+        ) -> Result<(String, i64)> {
+            BlobStore::put(&self.inner, data, filename, caption).await
+        }
+
+        async fn get(&self, file_id: &str) -> Result<Bytes> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            BlobStore::get(&self.inner, file_id).await
+        }
+
+        async fn delete_message(&self, message_id: i64) -> Result<DeleteOutcome> {
+            BlobStore::delete_message(&self.inner, message_id).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_range_streams_before_all_chunks_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display());
+        let index = Index::connect(&url).await.unwrap();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn BlobStore> = Arc::new(CountingStore {
+            inner: MemoryBlobStore::new(),
+            gets: gets.clone(),
+        });
+        let mut cas = CasStore::new(index, store, String::new());
+        // Many raw chunks → many backend gets on a full read.
+        cas.chunk_size = 1024 * 1024;
+        let n = 512 * 1024 * 1024;
+        let piece = 1024 * 1024;
+        let mut hasher = Sha256::new();
+        let mut off = 0usize;
+        while off < n {
+            let len = (n - off).min(piece);
+            hasher.update(&vec![0u8; len]);
+            off += len;
+        }
+        let hash = hex::encode(hasher.finalize());
+
+        let body = futures::stream::unfold(0usize, move |off| async move {
+            if off >= n {
+                return None;
+            }
+            let len = (n - off).min(piece);
+            Some((Ok::<_, anyhow::Error>(Bytes::from(vec![0u8; len])), off + len))
+        });
+        let mut opts = IngestOptions::new(cas.chunk_size, ChunkCodec::Raw);
+        opts.frame_size = 1024 * 1024;
+        let ingested = ingest_stream_with_options(&cas.store, Box::pin(body), None, opts)
+            .await
+            .expect("ingest 512 MiB");
+        assert!(ingested.chunks.len() >= 64, "expected many chunks");
+        let manifest = CasManifest {
+            chunks: ingested.chunks.iter().map(CasChunkMeta::from).collect(),
+        };
+        let manifest_json = serde_json::to_string(&manifest).unwrap();
+        let bump: Vec<(String, i64, i64, Option<u32>)> = ingested
+            .chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.file_id.clone(),
+                    c.message_id,
+                    c.logical_size,
+                    c.stored_crc32,
+                )
+            })
+            .collect();
+        cas.cas
+            .store_manifest(&hash, n as i64, "", &bump, &manifest_json)
+            .await
+            .unwrap();
+
+        gets.store(0, Ordering::SeqCst);
+        let total_chunks = ingested.chunks.len();
+        let mut stream = cas
+            .read_range(&hash, n as i64, 0, n as i64)
+            .await
+            .unwrap()
+            .expect("stream");
+        let first = stream
+            .next()
+            .await
+            .expect("first item")
+            .expect("first bytes");
+        assert!(!first.is_empty());
+        let gets_after_first = gets.load(Ordering::SeqCst);
+        assert!(
+            gets_after_first < total_chunks / 2,
+            "stream yielded after {gets_after_first} gets, but blob has {total_chunks} chunks — still buffering too much"
         );
+        let mut got = first.len();
+        while let Some(item) = stream.next().await {
+            got += item.expect("chunk").len();
+        }
+        assert_eq!(got, n);
+        assert_eq!(gets.load(Ordering::SeqCst), total_chunks);
     }
-    Ok(Bytes::from(out))
 }

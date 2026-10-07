@@ -28,8 +28,11 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
+hex = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 pigeonhole-blob-store = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

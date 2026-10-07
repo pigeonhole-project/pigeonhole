@@ -31,7 +31,9 @@ pub use ingest::{
     IngestOptions, IngestResult, UploadedChunk,
 };
 pub use read::read_chunk_range_cached;
-pub use pigeonhole_blob::{BlobStore, BootstrapPointer, DeleteOutcome, PinnedContent};
+pub use pigeonhole_blob::{
+    collect_stream, BlobStore, BootstrapPointer, BoxByteStream, DeleteOutcome, PinnedContent,
+};
 pub use pigeonhole_codec::{ByteBudget, ChunkCodec, FrameRecord};
 pub use pigeonhole_index::{Index, IndexSnapshot};
 // Re-export index helpers gateways need without taking a direct index dep.

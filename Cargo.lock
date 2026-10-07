@@ -2174,12 +2174,14 @@ dependencies = [
  "bytes",
  "moka",
  "pigeonhole-blob",
+ "pigeonhole-testkit",
  "pigeonhole-types",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

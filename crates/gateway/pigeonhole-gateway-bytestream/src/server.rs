@@ -442,7 +442,7 @@ impl ByteStream for ReapiState {
         if offset < 0 || offset > size {
             return Err(grpc_status(tonic::Code::OutOfRange, "read_offset out of range"));
         }
-        let data = self
+        let mut body = self
             .cas
             .read_range(&hash_hex, size, offset, req.read_limit)
             .await
@@ -452,20 +452,49 @@ impl ByteStream for ReapiState {
         let (tx, rx) = mpsc::channel(4);
         const CHUNK: usize = 256 * 1024;
         tokio::spawn(async move {
-            let mut off = 0;
-            while off < data.len() {
-                let end = (off + CHUNK).min(data.len());
-                let chunk = data.slice(off..end);
-                if tx
-                    .send(Ok(ReadResponse {
-                        data: chunk.to_vec(),
-                    }))
-                    .await
-                    .is_err()
-                {
-                    break;
+            let mut pending = Bytes::new();
+            loop {
+                while pending.len() >= CHUNK {
+                    let piece = pending.slice(0..CHUNK);
+                    pending = pending.slice(CHUNK..);
+                    if tx
+                        .send(Ok(ReadResponse {
+                            data: piece.to_vec(),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-                off = end;
+                match body.next().await {
+                    Some(Ok(more)) => {
+                        if pending.is_empty() {
+                            pending = more;
+                        } else {
+                            let mut buf = Vec::with_capacity(pending.len() + more.len());
+                            buf.extend_from_slice(&pending);
+                            buf.extend_from_slice(&more);
+                            pending = Bytes::from(buf);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let _ = tx
+                            .send(Err(grpc_status(tonic::Code::Internal, e.to_string())))
+                            .await;
+                        return;
+                    }
+                    None => {
+                        if !pending.is_empty() {
+                            let _ = tx
+                                .send(Ok(ReadResponse {
+                                    data: pending.to_vec(),
+                                }))
+                                .await;
+                        }
+                        return;
+                    }
+                }
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
