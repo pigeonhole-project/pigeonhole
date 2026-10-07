@@ -106,6 +106,16 @@ interval_secs = 60
 # Candidate keys fetched / deleted per batch.
 batch_size = 100
 
+[repair]
+# Pause between repair / backfill passes.
+interval_secs = 30
+# Jobs claimed per pass (fewest-replica chunks first).
+batch_size = 16
+# Skip a job when source Get or target Put cost().wait_secs exceeds this.
+max_cost_wait_secs = 2.0
+# Scrub under-replicated chunks into the repair queue each pass.
+scrub = true
+
 [http]
 # Idle timeout for request/response bodies (resets on each byte frame).
 # Large streaming PUT/GET may run longer than this while bytes keep flowing.

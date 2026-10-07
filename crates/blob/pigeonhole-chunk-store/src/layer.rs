@@ -13,6 +13,7 @@ use pigeonhole_blob::{
     collect_stream, erase_sweep, CheapestFirst, EncodedBlock, ReplicaLayout, Replicated,
     SharedBackend, Sweepable,
 };
+use crate::repair::spawn_enqueue_repair;
 use pigeonhole_codec::{
     decode_block_slice, encode_block_bytes, ByteBudget, ChunkCodec, DEFAULT_LOGICAL_CHUNK_SIZE,
 };
@@ -139,9 +140,12 @@ impl ChunkStore {
             stored_len: logical,
             codec: "raw".into(),
         }];
-        self.db
+        let chunk_id = self
+            .db
             .commit_chunk(logical, crc, &blocks, &layouts)
-            .await
+            .await?;
+        self.enqueue_missing_replicas(chunk_id, &layouts).await?;
+        Ok(chunk_id)
     }
 
     pub async fn set_root(&self, name: &str, extents: &[Extent]) -> Result<()> {
@@ -270,9 +274,10 @@ impl ChunkStore {
         let blocks = self.db.get_blocks(chunk_id).await?;
         if blocks.is_empty() {
             // Single raw part covering the whole chunk (put_small / raw legacy).
+            let hook = self.not_found_hook(chunk_id);
             let stored = collect_stream(
                 self.replicated
-                    .read(replicas, 0..1)
+                    .read_with_hook(replicas, 0..1, hook)
                     .await
                     .context("replicated read raw")?,
             )
@@ -356,9 +361,10 @@ impl ChunkStore {
     ) -> Result<Bytes> {
         let block_no = block.block_no as u32;
         let loader = || async {
+            let hook = self.not_found_hook(chunk_id);
             let raw = collect_stream(
                 self.replicated
-                    .read(replicas, block_no..block_no + 1)
+                    .read_with_hook(replicas, block_no..block_no + 1, hook)
                     .await
                     .context("replicated read block")?,
             )
@@ -381,6 +387,33 @@ impl ChunkStore {
             return l2.get_or_load(key, block_no, loader).await;
         }
         loader().await
+    }
+
+    fn not_found_hook(
+        &self,
+        chunk_id: ChunkId,
+    ) -> Option<Arc<dyn Fn(&str) + Send + Sync>> {
+        let db = self.db.clone();
+        Some(Arc::new(move |instance_id: &str| {
+            spawn_enqueue_repair(db.clone(), chunk_id, instance_id.to_string());
+        }))
+    }
+
+    /// After a quorum write, enqueue backfill for placement members that missed.
+    async fn enqueue_missing_replicas(
+        &self,
+        chunk_id: ChunkId,
+        layouts: &[ReplicaLayout],
+    ) -> Result<()> {
+        let have: std::collections::HashSet<&str> =
+            layouts.iter().map(|l| l.instance.as_str()).collect();
+        for m in self.replicated.members() {
+            let id = m.instance().id.as_str();
+            if !have.contains(id) {
+                self.db.enqueue_repair(chunk_id, id).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn ingest_blocks<S>(&self, stream: &mut S, opts: IngestOptions) -> Result<Ingested>
@@ -558,6 +591,7 @@ impl ChunkStore {
             .db
             .commit_chunk(logical, crc, &blocks, &layouts)
             .await?;
+        self.enqueue_missing_replicas(chunk_id, &layouts).await?;
         Ok(Extent {
             chunk: chunk_id,
             offset: 0,

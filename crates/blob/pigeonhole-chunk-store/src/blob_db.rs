@@ -1,7 +1,7 @@
 //! Separate `blob.db` metadata for the blob layer (stage E schema).
 //!
 //! Gateways keep their own SQLite indexes; this DB owns instances, chunks,
-//! parts, chunk blocks, roots (extent lists), and sweeper state.
+//! parts, chunk blocks, roots (extent lists), sweeper state, and repair queue.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -212,6 +212,19 @@ impl BlobDb {
             CREATE TABLE IF NOT EXISTS sweep_cursor (
                 instance_id TEXT PRIMARY KEY NOT NULL,
                 after BLOB
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS repair_queue (
+                chunk_id INTEGER NOT NULL REFERENCES chunks(id),
+                instance_id TEXT NOT NULL,
+                enqueued_at TEXT NOT NULL,
+                PRIMARY KEY (chunk_id, instance_id)
             )
             "#,
         )
@@ -912,12 +925,128 @@ impl BlobDb {
             .bind(chunk_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM repair_queue WHERE chunk_id = ?")
+            .bind(chunk_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM chunks WHERE id = ?")
             .bind(chunk_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Enqueue `repair(chunk_id, instance_id)` (idempotent).
+    pub async fn enqueue_repair(&self, chunk_id: ChunkId, instance_id: &str) -> Result<()> {
+        let at = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO repair_queue (chunk_id, instance_id, enqueued_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chunk_id, instance_id) DO NOTHING
+            "#,
+        )
+        .bind(chunk_id)
+        .bind(instance_id)
+        .bind(&at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a completed / cancelled repair job.
+    pub async fn dequeue_repair(&self, chunk_id: ChunkId, instance_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM repair_queue WHERE chunk_id = ? AND instance_id = ?")
+            .bind(chunk_id)
+            .bind(instance_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Pop up to `limit` jobs, prioritizing chunks with the fewest replicas.
+    pub async fn take_repair_jobs(&self, limit: usize) -> Result<Vec<(ChunkId, String)>> {
+        let limit = limit.max(1) as i64;
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            r#"
+            SELECT q.chunk_id, q.instance_id
+            FROM repair_queue q
+            LEFT JOIN (
+                SELECT chunk_id, COUNT(DISTINCT instance_id) AS n
+                FROM chunk_parts
+                GROUP BY chunk_id
+            ) r ON r.chunk_id = q.chunk_id
+            ORDER BY COALESCE(r.n, 0) ASC, q.enqueued_at ASC, q.chunk_id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Live chunks (`refs > 0`) missing a replica on `instance_id`.
+    pub async fn chunks_missing_instance(&self, instance_id: &str) -> Result<Vec<ChunkId>> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT c.id
+            FROM chunks c
+            WHERE c.refs > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM chunk_parts p
+                  WHERE p.chunk_id = c.id AND p.instance_id = ?
+              )
+            ORDER BY c.id
+            "#,
+        )
+        .bind(instance_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Replace all parts for one instance replica in a single transaction.
+    pub async fn commit_instance_replica(
+        &self,
+        chunk_id: ChunkId,
+        layout: &ReplicaLayout,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM chunk_parts WHERE chunk_id = ? AND instance_id = ?")
+            .bind(chunk_id)
+            .bind(&layout.instance)
+            .execute(&mut *tx)
+            .await?;
+        for (part_no, part) in layout.parts.iter().enumerate() {
+            sqlx::query(
+                r#"
+                INSERT INTO chunk_parts
+                  (chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(chunk_id)
+            .bind(&layout.instance)
+            .bind(part_no as i64)
+            .bind(i64::from(part.first_block))
+            .bind(i64::from(part.block_count))
+            .bind(&part.locator.key)
+            .bind(&part.locator.locator)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Pending repair queue depth (tests / metrics).
+    pub async fn repair_queue_len(&self) -> Result<u64> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM repair_queue")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0.max(0) as u64)
     }
 }
 

@@ -236,6 +236,10 @@ impl Replicated {
         &self.members
     }
 
+    pub fn member(&self, instance_id: &str) -> Option<&Arc<dyn DynBlobBackend>> {
+        self.by_id.get(instance_id)
+    }
+
     pub fn write_quorum(&self) -> usize {
         self.write_quorum
     }
@@ -275,6 +279,17 @@ impl Replicated {
         replicas: &[ReplicaLayout],
         blocks: Range<u32>,
     ) -> Result<BoxByteStream> {
+        self.read_with_hook(replicas, blocks, None).await
+    }
+
+    /// Like [`Self::read`], invoking `on_not_found(instance_id)` when a part GET
+    /// looks like a missing blob (repair enqueue hook).
+    pub async fn read_with_hook(
+        &self,
+        replicas: &[ReplicaLayout],
+        blocks: Range<u32>,
+        on_not_found: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    ) -> Result<BoxByteStream> {
         if blocks.start >= blocks.end {
             return Ok(bytes_stream(Bytes::new()));
         }
@@ -304,6 +319,7 @@ impl Replicated {
             next_block: blocks.start,
             end_block: blocks.end,
             active: None,
+            on_not_found,
         };
         Ok(Box::pin(stream::unfold(state, |mut st| async move {
             match st.pull().await {
@@ -449,6 +465,7 @@ struct ReadState {
     next_block: u32,
     end_block: u32,
     active: Option<ActivePart>,
+    on_not_found: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 struct ActivePart {
@@ -493,6 +510,11 @@ impl ReadState {
                         }
                     }
                     Ok(Some(Err(e))) => {
+                        if is_not_found_err(&e) {
+                            if let Some(hook) = &self.on_not_found {
+                                hook(&active.instance);
+                            }
+                        }
                         let (status, timed_out) = classify_err(&e);
                         self.selector
                             .record_failure(&active.instance, status, timed_out);
@@ -593,6 +615,11 @@ impl ReadState {
                     return Ok(true);
                 }
                 Ok(Err(e)) => {
+                    if is_not_found_err(&e) {
+                        if let Some(hook) = &self.on_not_found {
+                            hook(&layout.instance);
+                        }
+                    }
                     let (status, timed_out) = classify_err(&e);
                     self.selector
                         .record_failure(&layout.instance, status, timed_out);
@@ -665,12 +692,27 @@ fn classify_err(e: &anyhow::Error) -> (Option<u16>, bool) {
     if msg.contains("429") {
         return (Some(429), false);
     }
+    if is_not_found_msg(&msg) {
+        return (Some(404), false);
+    }
     for code in [500u16, 502, 503, 504] {
         if msg.contains(&code.to_string()) {
             return (Some(code), false);
         }
     }
     (None, false)
+}
+
+fn is_not_found_err(e: &anyhow::Error) -> bool {
+    is_not_found_msg(&format!("{e:#}").to_ascii_lowercase())
+}
+
+fn is_not_found_msg(msg: &str) -> bool {
+    msg.contains("404")
+        || msg.contains("not found")
+        || msg.contains("unknown file")
+        || msg.contains("missing")
+        || msg.contains("no such")
 }
 
 #[cfg(test)]

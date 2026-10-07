@@ -1,6 +1,9 @@
 use crate::instances::{
     legacy_default_instance, resolve_instances, FileInstance, InstanceConfig,
 };
+use crate::repair::{
+    RepairConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
+};
 use crate::sweep::{SweepConfig, DEFAULT_SWEEP_GRACE, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};
 use pigeonhole_blob::{
     CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind, InstanceRole,
@@ -62,6 +65,8 @@ pub struct Config {
     pub placement: PlacementConfig,
     /// Stage H sweeper (`[sweep]`).
     pub sweep: SweepConfig,
+    /// Stage I repair / backfill (`[repair]`).
+    pub repair: RepairConfig,
     pub config_path: PathBuf,
 }
 
@@ -267,6 +272,7 @@ impl Config {
             instances,
             placement,
             sweep: file.sweep.into_sweep_config(),
+            repair: file.repair.into_repair_config(),
             config_path,
         })
     }
@@ -316,6 +322,7 @@ impl Config {
                 write_quorum: 1,
             },
             sweep: SweepConfig::default(),
+            repair: RepairConfig::default(),
             config_path: PathBuf::from("(test)"),
         }
     }
@@ -386,6 +393,8 @@ struct FileConfig {
     placement: Option<FilePlacement>,
     #[serde(default)]
     sweep: FileSweep,
+    #[serde(default)]
+    repair: FileRepair,
 }
 
 impl Default for FileConfig {
@@ -408,6 +417,7 @@ impl Default for FileConfig {
             instances: Vec::new(),
             placement: None,
             sweep: FileSweep::default(),
+            repair: FileRepair::default(),
         }
     }
 }
@@ -436,6 +446,37 @@ impl FileSweep {
             grace: Duration::from_secs(self.grace_secs),
             batch_size: self.batch_size.max(1),
             interval: Duration::from_secs(self.interval_secs.max(1)),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct FileRepair {
+    interval_secs: u64,
+    batch_size: usize,
+    max_cost_wait_secs: f64,
+    scrub: bool,
+}
+
+impl Default for FileRepair {
+    fn default() -> Self {
+        Self {
+            interval_secs: DEFAULT_REPAIR_INTERVAL.as_secs(),
+            batch_size: REPAIR_BATCH_SIZE,
+            max_cost_wait_secs: DEFAULT_MAX_COST_WAIT_SECS,
+            scrub: true,
+        }
+    }
+}
+
+impl FileRepair {
+    fn into_repair_config(self) -> RepairConfig {
+        RepairConfig {
+            interval: Duration::from_secs(self.interval_secs.max(1)),
+            batch_size: self.batch_size.max(1),
+            max_cost_wait_secs: self.max_cost_wait_secs.max(0.0),
+            scrub: self.scrub,
         }
     }
 }

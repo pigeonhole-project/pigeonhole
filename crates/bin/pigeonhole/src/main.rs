@@ -14,8 +14,8 @@ use pigeonhole_blob::{
 };
 use pigeonhole_chunk_store::{
     check_fingerprints, legacy_index_has_blobs, migrate_index_to_blob_db, start_or_restore,
-    BlockCache, BlobDb, ChunkStore, Durability, IngestOptions, JournalOp, PinTarget, Superblock,
-    Sweeper, WatermarkBackend,
+    BlockCache, BlobDb, ChunkStore, Durability, IngestOptions, JournalOp, PinTarget, Repairer,
+    Superblock, Sweeper, WatermarkBackend,
 };
 use pigeonhole_gateway_s3::snapshot::{
     push_index_snapshot_durable, restore_index_snapshot,
@@ -260,7 +260,21 @@ fn spawn_background_tasks(
         interval_secs = cfg.sweep.interval.as_secs(),
         "sweeper background task started"
     );
-    // Stage I (repair): not wired yet.
+
+    let repairer = Repairer::new(
+        rt.store.db().clone(),
+        rt.store.replicated().clone(),
+        cfg.repair.clone(),
+    );
+    tokio::spawn(async move {
+        repairer.run_loop().await;
+    });
+    info!(
+        interval_secs = cfg.repair.interval.as_secs(),
+        batch_size = cfg.repair.batch_size,
+        scrub = cfg.repair.scrub,
+        "repair background task started"
+    );
 }
 
 async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
