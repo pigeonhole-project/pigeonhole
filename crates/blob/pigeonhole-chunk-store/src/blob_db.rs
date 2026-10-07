@@ -1,18 +1,40 @@
-//! Separate `blob.db` metadata for the blob layer (stage 1.4).
+//! Separate `blob.db` metadata for the blob layer (stage E schema).
 //!
-//! Gateways keep their own SQLite indexes; this DB owns instances, blobs,
-//! replicas, chunk frames (by chunk_id), roots, and sweeper state.
+//! Gateways keep their own SQLite indexes; this DB owns instances, chunks,
+//! parts, chunk blocks, roots (extent lists), and sweeper state.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use pigeonhole_blob::InstanceInfo;
+use pigeonhole_blob::{InstanceInfo, PartLayout, ReplicaLayout, BlobLocator};
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
+
+/// Internal integer chunk id (row in `chunks`).
+pub type ChunkId = i64;
+
+/// Logical byte range within a chunk (`offset`/`len` are logical bytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Extent {
+    pub chunk: ChunkId,
+    pub offset: i64,
+    pub len: i64,
+}
 
 /// Connection to the blob-layer metadata database.
 #[derive(Clone, Debug)]
 pub struct BlobDb {
     pool: SqlitePool,
+}
+
+/// One stored block row (offsets inside a part are derived from `stored_len`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredBlock {
+    pub block_no: i64,
+    pub logical_off: i64,
+    pub logical_len: i64,
+    pub stored_len: i64,
+    pub codec: String,
 }
 
 impl BlobDb {
@@ -63,8 +85,6 @@ impl BlobDb {
         .execute(&self.pool)
         .await?;
 
-        // At most one read-write writer per location is enforced in config;
-        // DB keeps a partial unique index for non-retired rows when possible.
         sqlx::query(
             r#"
             CREATE UNIQUE INDEX IF NOT EXISTS idx_instances_location_active
@@ -75,13 +95,15 @@ impl BlobDb {
         .execute(&self.pool)
         .await?;
 
+        // Create chunks with the stage-E shape when missing.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS chunks (
                 id INTEGER PRIMARY KEY NOT NULL,
-                size INTEGER NOT NULL,
+                logical_size INTEGER NOT NULL,
                 crc32 INTEGER NOT NULL,
                 refs INTEGER NOT NULL DEFAULT 0,
+                block_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
             "#,
@@ -89,6 +111,17 @@ impl BlobDb {
         .execute(&self.pool)
         .await?;
 
+        // Upgrade pre-E chunks: size → logical_size, add block_count.
+        Self::rename_column_if_exists(&self.pool, "chunks", "size", "logical_size").await?;
+        Self::add_column_if_missing(
+            &self.pool,
+            "chunks",
+            "block_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+
+        // Legacy single-replica table (migrated → chunk_parts below).
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS chunk_replicas (
@@ -104,37 +137,63 @@ impl BlobDb {
         .execute(&self.pool)
         .await?;
 
-        // Legacy name from pre-rename DBs.
         Self::rename_table_if_exists(&self.pool, "chunk_frames", "chunk_blocks").await?;
         Self::rename_column_if_exists(&self.pool, "chunk_blocks", "frame_no", "block_no").await?;
 
+        // Pre-E tables may still have a unused `stored_off` column; new installs omit it.
+        // Offsets inside a part are derived from sum(stored_len), not from this column.
+        if !Self::table_exists(&self.pool, "chunk_blocks").await? {
+            sqlx::query(
+                r#"
+                CREATE TABLE chunk_blocks (
+                    chunk_id INTEGER NOT NULL REFERENCES chunks(id),
+                    block_no INTEGER NOT NULL,
+                    logical_off INTEGER NOT NULL,
+                    logical_len INTEGER NOT NULL,
+                    stored_len INTEGER NOT NULL,
+                    codec TEXT NOT NULL,
+                    PRIMARY KEY (chunk_id, block_no)
+                )
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+        }
+
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS chunk_blocks (
+            CREATE TABLE IF NOT EXISTS chunk_parts (
                 chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-                block_no INTEGER NOT NULL,
-                stored_off INTEGER NOT NULL,
-                stored_len INTEGER NOT NULL,
-                logical_off INTEGER NOT NULL,
-                logical_len INTEGER NOT NULL,
-                codec TEXT NOT NULL,
-                PRIMARY KEY (chunk_id, block_no)
+                instance_id TEXT NOT NULL REFERENCES instances(id),
+                part_no INTEGER NOT NULL,
+                first_block INTEGER NOT NULL,
+                block_count INTEGER NOT NULL,
+                sort_key BLOB NOT NULL,
+                locator BLOB NOT NULL,
+                PRIMARY KEY (chunk_id, instance_id, part_no),
+                UNIQUE (instance_id, sort_key)
             )
             "#,
         )
         .execute(&self.pool)
         .await?;
 
+        self.migrate_replicas_to_parts().await?;
+
+        // Fill block_count on chunks from chunk_blocks when still zero.
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS roots (
-                name TEXT PRIMARY KEY NOT NULL,
-                chunk_id INTEGER NOT NULL REFERENCES chunks(id)
+            UPDATE chunks SET block_count = (
+                SELECT COUNT(*) FROM chunk_blocks b WHERE b.chunk_id = chunks.id
             )
+            WHERE block_count = 0
+              AND EXISTS (SELECT 1 FROM chunk_blocks b WHERE b.chunk_id = chunks.id)
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        self.migrate_roots_to_extents().await?;
 
         sqlx::query(
             r#"
@@ -159,6 +218,159 @@ impl BlobDb {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    async fn migrate_replicas_to_parts(&self) -> Result<()> {
+        let replicas_exist = Self::table_exists(&self.pool, "chunk_replicas").await?;
+        if !replicas_exist {
+            return Ok(());
+        }
+        let rows: Vec<(i64, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT chunk_id, instance_id, sort_key, locator FROM chunk_replicas",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (chunk_id, instance_id, sort_key, locator) in rows {
+            let block_count: (i64,) = sqlx::query_as(
+                "SELECT COALESCE((SELECT block_count FROM chunks WHERE id = ?), 0)",
+            )
+            .bind(chunk_id)
+            .fetch_one(&self.pool)
+            .await?;
+            let mut bc = block_count.0;
+            if bc == 0 {
+                let counted: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM chunk_blocks WHERE chunk_id = ?",
+                )
+                .bind(chunk_id)
+                .fetch_one(&self.pool)
+                .await?;
+                bc = counted.0;
+            }
+            // Legacy: one replica blob held all blocks → part_no 0.
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO chunk_parts
+                  (chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)
+                VALUES (?, ?, 0, 0, ?, ?, ?)
+                "#,
+            )
+            .bind(chunk_id)
+            .bind(&instance_id)
+            .bind(bc)
+            .bind(&sort_key)
+            .bind(&locator)
+            .execute(&self.pool)
+            .await?;
+        }
+        sqlx::query("DELETE FROM chunk_replicas")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn migrate_roots_to_extents(&self) -> Result<()> {
+        if !Self::table_exists(&self.pool, "roots").await? {
+            sqlx::query(
+                r#"
+                CREATE TABLE roots (
+                    name TEXT PRIMARY KEY NOT NULL,
+                    extents_json TEXT NOT NULL DEFAULT '[]'
+                )
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+
+        if Self::column_exists(&self.pool, "roots", "extents_json").await?
+            && !Self::column_exists(&self.pool, "roots", "chunk_id").await?
+        {
+            return Ok(());
+        }
+
+        // In-place: add extents_json; legacy chunk_id column may remain unused.
+        Self::add_column_if_missing(
+            &self.pool,
+            "roots",
+            "extents_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        .await?;
+
+        if Self::column_exists(&self.pool, "roots", "chunk_id").await? {
+            let rows: Vec<(String, i64, String)> = sqlx::query_as(
+                "SELECT name, chunk_id, extents_json FROM roots",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            for (name, chunk_id, json) in rows {
+                if json != "[]" && !json.is_empty() {
+                    continue;
+                }
+                let size: Option<(i64,)> =
+                    sqlx::query_as("SELECT logical_size FROM chunks WHERE id = ?")
+                        .bind(chunk_id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                let size = size.map(|s| s.0).unwrap_or(0);
+                let extents = vec![Extent {
+                    chunk: chunk_id,
+                    offset: 0,
+                    len: size,
+                }];
+                let new_json = serde_json::to_string(&extents)?;
+                sqlx::query("UPDATE roots SET extents_json = ? WHERE name = ?")
+                    .bind(&new_json)
+                    .bind(&name)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn table_exists(pool: &SqlitePool, name: &str) -> Result<bool> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+        Ok(exists.is_some())
+    }
+
+    async fn column_exists(pool: &SqlitePool, table: &str, col: &str) -> Result<bool> {
+        if !Self::table_exists(pool, table).await? {
+            return Ok(false);
+        }
+        let cols: Vec<(i64, String)> =
+            sqlx::query_as(&format!("SELECT cid, name FROM pragma_table_info('{table}')"))
+                .fetch_all(pool)
+                .await?;
+        Ok(cols.iter().any(|(_, n)| n == col))
+    }
+
+    async fn add_column_if_missing(
+        pool: &SqlitePool,
+        table: &str,
+        col: &str,
+        decl: &str,
+    ) -> Result<()> {
+        if Self::column_exists(pool, table, col).await? {
+            return Ok(());
+        }
+        if !Self::table_exists(pool, table).await? {
+            return Ok(());
+        }
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))
+            .execute(pool)
+            .await?;
         Ok(())
     }
 
@@ -272,35 +484,29 @@ impl BlobDb {
             .collect())
     }
 
-    /// Insert a blob row with refs=1; returns chunk_id.
-    pub async fn insert_chunk(&self, size: i64, crc32: u32) -> Result<i64> {
-        let at = Utc::now().to_rfc3339();
-        let res = sqlx::query(
-            "INSERT INTO chunks (size, crc32, refs, created_at) VALUES (?, ?, 1, ?)",
-        )
-        .bind(size)
-        .bind(i64::from(crc32))
-        .bind(&at)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.last_insert_rowid())
-    }
-
-    pub async fn add_replica(
+    /// Insert a single part row (legacy migrate / repair).
+    pub async fn add_part(
         &self,
         chunk_id: i64,
         instance_id: &str,
+        part_no: i64,
+        first_block: i64,
+        block_count: i64,
         sort_key: &[u8],
         locator: &[u8],
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO chunk_replicas (chunk_id, instance_id, sort_key, locator)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO chunk_parts
+              (chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(chunk_id)
         .bind(instance_id)
+        .bind(part_no)
+        .bind(first_block)
+        .bind(block_count)
         .bind(sort_key)
         .bind(locator)
         .execute(&self.pool)
@@ -308,26 +514,125 @@ impl BlobDb {
         Ok(())
     }
 
-    pub async fn set_root(&self, name: &str, chunk_id: i64) -> Result<()> {
+    /// Insert a chunk row with refs=1; returns chunk_id.
+    pub async fn insert_chunk(
+        &self,
+        logical_size: i64,
+        crc32: u32,
+        block_count: i64,
+    ) -> Result<i64> {
+        let at = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"
+            INSERT INTO chunks (logical_size, crc32, refs, block_count, created_at)
+            VALUES (?, ?, 1, ?, ?)
+            "#,
+        )
+        .bind(logical_size)
+        .bind(i64::from(crc32))
+        .bind(block_count)
+        .bind(&at)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// Atomically insert chunk + blocks + parts after a successful quorum write.
+    pub async fn commit_chunk(
+        &self,
+        logical_size: i64,
+        crc32: u32,
+        blocks: &[StoredBlock],
+        replicas: &[ReplicaLayout],
+    ) -> Result<ChunkId> {
+        let at = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query(
+            r#"
+            INSERT INTO chunks (logical_size, crc32, refs, block_count, created_at)
+            VALUES (?, ?, 1, ?, ?)
+            "#,
+        )
+        .bind(logical_size)
+        .bind(i64::from(crc32))
+        .bind(blocks.len() as i64)
+        .bind(&at)
+        .execute(&mut *tx)
+        .await?;
+        let chunk_id = res.last_insert_rowid();
+
+        for b in blocks {
+            sqlx::query(
+                r#"
+                INSERT INTO chunk_blocks
+                  (chunk_id, block_no, logical_off, logical_len, stored_len, codec)
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(chunk_id)
+            .bind(b.block_no)
+            .bind(b.logical_off)
+            .bind(b.logical_len)
+            .bind(b.stored_len)
+            .bind(&b.codec)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for rep in replicas {
+            for (part_no, part) in rep.parts.iter().enumerate() {
+                sqlx::query(
+                    r#"
+                    INSERT INTO chunk_parts
+                      (chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(chunk_id)
+                .bind(&rep.instance)
+                .bind(part_no as i64)
+                .bind(i64::from(part.first_block))
+                .bind(i64::from(part.block_count))
+                .bind(&part.locator.key)
+                .bind(&part.locator.locator)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(chunk_id)
+    }
+
+    pub async fn set_root(&self, name: &str, extents: &[Extent]) -> Result<()> {
+        let json = serde_json::to_string(extents).context("serialize root extents")?;
         sqlx::query(
             r#"
-            INSERT INTO roots (name, chunk_id) VALUES (?, ?)
-            ON CONFLICT(name) DO UPDATE SET chunk_id = excluded.chunk_id
+            INSERT INTO roots (name, extents_json) VALUES (?, ?)
+            ON CONFLICT(name) DO UPDATE SET extents_json = excluded.extents_json
             "#,
         )
         .bind(name)
-        .bind(chunk_id)
+        .bind(&json)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn get_root(&self, name: &str) -> Result<Option<i64>> {
-        let row: Option<(i64,)> = sqlx::query_as("SELECT chunk_id FROM roots WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| r.0))
+    pub async fn get_root(&self, name: &str) -> Result<Option<Vec<Extent>>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT extents_json FROM roots WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            None => Ok(None),
+            Some((json,)) => {
+                let extents: Vec<Extent> =
+                    serde_json::from_str(&json).context("parse root extents_json")?;
+                Ok(Some(extents))
+            }
+        }
     }
 
     pub async fn retain(&self, ids: &[i64]) -> Result<()> {
@@ -352,18 +657,23 @@ impl BlobDb {
 
     pub async fn chunk_meta(&self, chunk_id: i64) -> Result<Option<(i64, u32, i64)>> {
         let row: Option<(i64, i64, i64)> =
-            sqlx::query_as("SELECT size, crc32, refs FROM chunks WHERE id = ?")
+            sqlx::query_as("SELECT logical_size, crc32, refs FROM chunks WHERE id = ?")
                 .bind(chunk_id)
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.map(|(size, crc, refs)| (size, crc as u32, refs)))
     }
 
-    pub async fn replace_blocks(
-        &self,
-        chunk_id: i64,
-        blocks: &[pigeonhole_codec::BlockRecord],
-    ) -> Result<()> {
+    pub async fn chunk_block_count(&self, chunk_id: i64) -> Result<Option<i64>> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT block_count FROM chunks WHERE id = ?")
+                .bind(chunk_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn replace_blocks(&self, chunk_id: i64, blocks: &[StoredBlock]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM chunk_blocks WHERE chunk_id = ?")
             .bind(chunk_id)
@@ -373,28 +683,32 @@ impl BlobDb {
             sqlx::query(
                 r#"
                 INSERT INTO chunk_blocks
-                  (chunk_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                  (chunk_id, block_no, logical_off, logical_len, stored_len, codec)
+                VALUES (?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(chunk_id)
             .bind(fr.block_no)
-            .bind(fr.stored_off)
-            .bind(fr.stored_len)
             .bind(fr.logical_off)
             .bind(fr.logical_len)
+            .bind(fr.stored_len)
             .bind(&fr.codec)
             .execute(&mut *tx)
             .await?;
         }
+        sqlx::query("UPDATE chunks SET block_count = ? WHERE id = ?")
+            .bind(blocks.len() as i64)
+            .bind(chunk_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
 
-    pub async fn get_blocks(&self, chunk_id: i64) -> Result<Vec<pigeonhole_codec::BlockRecord>> {
-        let rows: Vec<(i64, i64, i64, i64, i64, String)> = sqlx::query_as(
+    pub async fn get_blocks(&self, chunk_id: i64) -> Result<Vec<StoredBlock>> {
+        let rows: Vec<(i64, i64, i64, i64, String)> = sqlx::query_as(
             r#"
-            SELECT block_no, stored_off, stored_len, logical_off, logical_len, codec
+            SELECT block_no, logical_off, logical_len, stored_len, codec
             FROM chunk_blocks WHERE chunk_id = ? ORDER BY block_no
             "#,
         )
@@ -404,29 +718,63 @@ impl BlobDb {
         Ok(rows
             .into_iter()
             .map(
-                |(block_no, stored_off, stored_len, logical_off, logical_len, codec)| {
-                    pigeonhole_codec::BlockRecord {
-                        block_no,
-                        stored_off,
-                        stored_len,
-                        logical_off,
-                        logical_len,
-                        codec,
-                    }
+                |(block_no, logical_off, logical_len, stored_len, codec)| StoredBlock {
+                    block_no,
+                    logical_off,
+                    logical_len,
+                    stored_len,
+                    codec,
                 },
             )
             .collect())
     }
 
-    /// First ready replica for a blob (any instance).
-    pub async fn get_any_replica(&self, chunk_id: i64) -> Result<Option<(String, Vec<u8>, Vec<u8>)>> {
-        let row: Option<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-            "SELECT instance_id, sort_key, locator FROM chunk_replicas WHERE chunk_id = ? LIMIT 1",
+    /// Replica layouts for a chunk (for [`pigeonhole_blob::Replicated::read`]).
+    ///
+    /// `block_stored_lens` are reconstructed from `chunk_blocks` for Range GETs.
+    pub async fn get_replica_layouts(&self, chunk_id: i64) -> Result<Vec<ReplicaLayout>> {
+        let blocks = self.get_blocks(chunk_id).await?;
+        let stored_lens: Vec<u32> = blocks
+            .iter()
+            .map(|b| b.stored_len.max(0) as u32)
+            .collect();
+
+        let rows: Vec<(String, i64, i64, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            r#"
+            SELECT instance_id, part_no, first_block, block_count, sort_key, locator
+            FROM chunk_parts WHERE chunk_id = ?
+            ORDER BY instance_id, part_no
+            "#,
         )
         .bind(chunk_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(row)
+
+        let mut by_inst: std::collections::BTreeMap<String, Vec<PartLayout>> =
+            std::collections::BTreeMap::new();
+        for (instance_id, _part_no, first_block, block_count, sort_key, locator) in rows {
+            let first = first_block.max(0) as u32;
+            let count = block_count.max(0) as u32;
+            let end = (first as usize).saturating_add(count as usize);
+            let lenses = if end <= stored_lens.len() {
+                stored_lens[first as usize..end].to_vec()
+            } else {
+                Vec::new()
+            };
+            by_inst.entry(instance_id).or_default().push(PartLayout {
+                first_block: first,
+                block_count: count,
+                locator: BlobLocator {
+                    key: sort_key,
+                    locator,
+                },
+                block_stored_lens: lenses,
+            });
+        }
+        Ok(by_inst
+            .into_iter()
+            .map(|(instance, parts)| ReplicaLayout { instance, parts })
+            .collect())
     }
 }
 
@@ -451,14 +799,44 @@ mod tests {
         let fps = db.list_instance_fingerprints().await.unwrap();
         assert_eq!(fps, vec![("tg-main".into(), "tg:1:-100".into())]);
 
-        let chunk_id = db.insert_chunk(32, 0xdeadbeef).await.unwrap();
-        db.add_replica(chunk_id, "tg-main", &[0, 0, 0, 1], b"loc")
+        let chunk_id = db.insert_chunk(32, 0xdeadbeef, 0).await.unwrap();
+        let layouts = vec![ReplicaLayout {
+            instance: "tg-main".into(),
+            parts: vec![PartLayout {
+                first_block: 0,
+                block_count: 0,
+                locator: BlobLocator {
+                    key: vec![0, 0, 0, 1],
+                    locator: b"loc".to_vec(),
+                },
+                block_stored_lens: vec![],
+            }],
+        }];
+        // Direct part insert via commit of empty blocks + one part.
+        let id2 = db
+            .commit_chunk(
+                32,
+                1,
+                &[],
+                &layouts,
+            )
             .await
             .unwrap();
-        db.set_root("s3/index", chunk_id).await.unwrap();
-        assert_eq!(db.get_root("s3/index").await.unwrap(), Some(chunk_id));
-        db.release(&[chunk_id]).await.unwrap();
-        db.retain(&[chunk_id]).await.unwrap();
+        let _ = chunk_id;
+        db.set_root(
+            "s3/index",
+            &[Extent {
+                chunk: id2,
+                offset: 0,
+                len: 32,
+            }],
+        )
+        .await
+        .unwrap();
+        let root = db.get_root("s3/index").await.unwrap().unwrap();
+        assert_eq!(root[0].chunk, id2);
+        db.release(&[id2]).await.unwrap();
+        db.retain(&[id2]).await.unwrap();
     }
 
     #[tokio::test]
@@ -480,5 +858,160 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.0, "retired");
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_replicas_to_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        // Build a pre-E schema manually.
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE instances (
+                id TEXT PRIMARY KEY, kind TEXT, fingerprint TEXT, location TEXT, state TEXT
+            );
+            CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY, size INTEGER, crc32 INTEGER, refs INTEGER, created_at TEXT
+            );
+            CREATE TABLE chunk_replicas (
+                chunk_id INTEGER, instance_id TEXT, sort_key BLOB, locator BLOB,
+                PRIMARY KEY (chunk_id, instance_id)
+            );
+            CREATE TABLE chunk_blocks (
+                chunk_id INTEGER, block_no INTEGER, stored_off INTEGER, stored_len INTEGER,
+                logical_off INTEGER, logical_len INTEGER, codec TEXT,
+                PRIMARY KEY (chunk_id, block_no)
+            );
+            CREATE TABLE roots (name TEXT PRIMARY KEY, chunk_id INTEGER);
+            INSERT INTO instances VALUES ('mem','memory','memory:m','memory:m','read-write');
+            INSERT INTO chunks VALUES (1, 100, 0, 1, 't');
+            INSERT INTO chunk_replicas VALUES (1, 'mem', x'01', x'02');
+            INSERT INTO chunk_blocks VALUES (1, 0, 0, 50, 0, 50, 'raw');
+            INSERT INTO chunk_blocks VALUES (1, 1, 50, 50, 50, 50, 'raw');
+            INSERT INTO roots VALUES ('s3/index', 1);
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        drop(pool);
+
+        let db = BlobDb::connect(&url).await.unwrap();
+        let layouts = db.get_replica_layouts(1).await.unwrap();
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].parts.len(), 1);
+        assert_eq!(layouts[0].parts[0].first_block, 0);
+        assert_eq!(layouts[0].parts[0].block_count, 2);
+        assert_eq!(layouts[0].parts[0].block_stored_lens, vec![50, 50]);
+        let root = db.get_root("s3/index").await.unwrap().unwrap();
+        assert_eq!(root[0].chunk, 1);
+        assert_eq!(root[0].len, 100);
+        let blocks = db.get_blocks(1).await.unwrap();
+        assert_eq!(blocks.len(), 2);
+        // Legacy stored_off may remain; readers ignore it.
+    }
+
+    #[tokio::test]
+    async fn migrated_parts_are_readable_via_layer() {
+        use crate::ingest::IngestOptions;
+        use crate::layer::ChunkStore;
+        use pigeonhole_blob::{erase, CheapestFirst, Replicated};
+        use pigeonhole_codec::ChunkCodec;
+        use pigeonhole_storage_memory::MemoryBlobStore;
+        use pigeonhole_types::{BackendLimits, RangeSupport};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+
+        // Seed legacy schema + one replica blob in memory store.
+        let store = MemoryBlobStore::with_limits(BackendLimits {
+            max_blob_size: 1024 * 1024,
+            supports_range: RangeSupport::BestEffort,
+            can_list: false,
+        })
+        .with_instance_id("mem");
+        let payload = bytes::Bytes::from(vec![3u8; 200]);
+        let id = {
+            use pigeonhole_blob::BlobBackend;
+            BlobBackend::put(&store, payload.clone()).await.unwrap()
+        };
+        let loc = pigeonhole_blob::store_id::<MemoryBlobStore>(&id).unwrap();
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE instances (
+                id TEXT PRIMARY KEY, kind TEXT, fingerprint TEXT, location TEXT, state TEXT
+            );
+            CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY, size INTEGER, crc32 INTEGER, refs INTEGER, created_at TEXT
+            );
+            CREATE TABLE chunk_replicas (
+                chunk_id INTEGER, instance_id TEXT, sort_key BLOB, locator BLOB,
+                PRIMARY KEY (chunk_id, instance_id)
+            );
+            CREATE TABLE chunk_blocks (
+                chunk_id INTEGER, block_no INTEGER, stored_off INTEGER, stored_len INTEGER,
+                logical_off INTEGER, logical_len INTEGER, codec TEXT,
+                PRIMARY KEY (chunk_id, block_no)
+            );
+            CREATE TABLE roots (name TEXT PRIMARY KEY, chunk_id INTEGER);
+            INSERT INTO instances VALUES ('mem','memory','memory:mem','memory:mem','read-write');
+            INSERT INTO chunks VALUES (1, 200, 0, 1, 't');
+            INSERT INTO chunk_blocks VALUES (1, 0, 0, 200, 0, 200, 'raw');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chunk_replicas (chunk_id, instance_id, sort_key, locator) VALUES (1, 'mem', ?, ?)",
+        )
+        .bind(&loc.key)
+        .bind(&loc.locator)
+        .execute(&pool)
+        .await
+        .unwrap();
+        drop(pool);
+
+        let db = BlobDb::connect(&url).await.unwrap();
+        let layouts = db.get_replica_layouts(1).await.unwrap();
+        assert_eq!(layouts[0].parts.len(), 1);
+
+        let rep = Arc::new(
+            Replicated::new(
+                vec![Arc::new(erase(store))],
+                1,
+                Arc::new(CheapestFirst::new()),
+            )
+            .unwrap(),
+        );
+        let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
+        opts.block_size = 64 * 1024;
+        let layer = ChunkStore::open_replicated(db, rep, opts).await.unwrap();
+        let got = layer
+            .read(
+                &[Extent {
+                    chunk: 1,
+                    offset: 0,
+                    len: 200,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, payload);
     }
 }
