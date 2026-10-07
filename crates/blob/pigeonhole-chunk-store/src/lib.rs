@@ -11,12 +11,15 @@ pub mod migrate;
 pub mod read;
 pub mod snapshot;
 
-pub use blob_db::BlobDb;
+pub use blob_db::{BlobDb, StoredBlock};
 pub use config::{BackendKind, BytestreamSettings, Config, HttpSettings, PlacementConfig};
 pub use durability::{
-    commit_root, start_or_restore, CheckpointPayload, Durability, JournalOp, Superblock,
+    commit_root, start_or_restore, CheckpointPayload, Durability, JournalOp, PinTarget,
+    Superblock,
 };
-pub use layer::{default_layer_opts, ChunkId, ChunkStore, Extent, Ingested};
+pub use layer::{
+    check_block_fits_members, default_layer_opts, ChunkId, ChunkStore, Extent, Ingested,
+};
 pub use migrate::{default_instance_for_migrate, migrate_index_to_blob_db, MigrateReport};
 pub use instances::{
     check_fingerprints, discord_fingerprint, discord_location, legacy_default_instance,

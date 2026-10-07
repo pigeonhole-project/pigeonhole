@@ -5,7 +5,9 @@
 //! once. Chunk codec stored in the index is [`ChunkCodec::Blocks`]. Legacy
 //! single-blob `raw` / `gzip` / `zstd` chunks remain readable.
 
-use pigeonhole_blob::{store_delete_message, store_get, store_put, DeleteOutcome, LegacyBlobStore};
+use pigeonhole_blob::{store_delete_message, store_put, DeleteOutcome, LegacyBlobStore};
+#[cfg(test)]
+use pigeonhole_blob::store_get;
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::{ByteBudget, CompletedChunk, BlockRecord, BlockWriter};
 use anyhow::{bail, Context, Result};

@@ -234,6 +234,11 @@ impl Config {
         };
 
         let placement = resolve_placement(file.placement, &instances)?;
+        check_block_size_against_instances(
+            block_size,
+            &instances,
+            discord_max_blob_size,
+        )?;
 
         Ok(Self {
             backend_kind,
@@ -384,6 +389,41 @@ impl Default for FileConfig {
 struct FilePlacement {
     group: Vec<String>,
     write_quorum: usize,
+}
+
+/// E.4: `block_size` (+ margin) must fit under every instance's max_blob_size,
+/// including read-only / retired members that may still serve repair reads.
+pub fn check_block_size_against_instances(
+    block_size: usize,
+    instances: &[InstanceConfig],
+    discord_max_blob_size: Option<usize>,
+) -> Result<()> {
+    if instances.is_empty() {
+        return Ok(());
+    }
+    let mut min_max = usize::MAX;
+    for inst in instances {
+        let max = match inst.info.kind {
+            InstanceKind::Telegram | InstanceKind::Memory => 20 * 1024 * 1024 - 1,
+            InstanceKind::Discord => {
+                pigeonhole_types::BackendLimits::discord(discord_max_blob_size).max_blob_size
+            }
+        };
+        min_max = min_max.min(max);
+    }
+    if block_size >= min_max {
+        bail!(
+            "chunk.block_size ({block_size}) must be < min(max_blob_size) of configured instances ({min_max})"
+        );
+    }
+    // Incompressible blocks store raw `block_size`; keep a small header margin.
+    let need = block_size.saturating_add(64);
+    if need >= min_max {
+        bail!(
+            "chunk.block_size ({block_size}) with frame margin exceeds min(max_blob_size) ({min_max})"
+        );
+    }
+    Ok(())
 }
 
 fn resolve_placement(
@@ -856,7 +896,7 @@ memory = false
 kind = "discord"
 [discord]
 channel_id = "123456789"
-max_blob_size = 1048576
+max_blob_size = 8388608
 "#
         )
         .unwrap();
@@ -864,7 +904,7 @@ max_blob_size = 1048576
         let cfg = Config::load_from_path(f.path()).unwrap();
         assert_eq!(cfg.backend_kind, BackendKind::Discord);
         assert_eq!(cfg.chat_id, "123456789");
-        assert_eq!(cfg.discord_max_blob_size, Some(1048576));
+        assert_eq!(cfg.discord_max_blob_size, Some(8388608));
         std::env::remove_var("DISCORD_BOT_TOKEN");
     }
 

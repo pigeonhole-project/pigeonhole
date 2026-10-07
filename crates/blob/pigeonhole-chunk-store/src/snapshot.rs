@@ -606,7 +606,17 @@ pub async fn push_gateway_snapshot(
         .put_small(Bytes::from(compressed))
         .await
         .context("put_small gateway snapshot")?;
-    crate::durability::commit_root(layer.db(), dur, root_name, chunk_id)
+    let (size, _, _) = layer
+        .db()
+        .chunk_meta(chunk_id)
+        .await?
+        .context("missing snapshot chunk")?;
+    let extents = vec![crate::layer::Extent {
+        chunk: chunk_id,
+        offset: 0,
+        len: size,
+    }];
+    crate::durability::commit_root(layer.db(), dur, root_name, &extents)
         .await
         .context("commit_root gateway snapshot")?;
 
@@ -636,24 +646,12 @@ pub async fn restore_gateway_snapshot(
     layer: &crate::layer::ChunkStore,
     root_name: &str,
 ) -> Result<()> {
-    let chunk_id = layer
+    let extents = layer
         .get_root(root_name)
         .await?
         .with_context(|| format!("missing root {root_name}"))?;
-    let (size, _, _) = layer
-        .db()
-        .chunk_meta(chunk_id)
-        .await?
-        .with_context(|| format!("missing chunk {chunk_id}"))?;
     let data = layer
-        .read(
-            &[crate::layer::Extent {
-                chunk: chunk_id,
-                offset: 0,
-                len: size,
-            }],
-            None,
-        )
+        .read(&extents, None)
         .await
         .context("read gateway snapshot blob")?;
     let json = gunzip_bytes(&data).context("gunzip gateway snapshot")?;
