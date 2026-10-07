@@ -7,42 +7,30 @@ import argparse
 import json
 import sys
 
-# Map package name → role. Supports legacy s3gram-* and target pigeonhole-*.
+# Map package name → role.
 ROLE = {
-    "s3gram-core": "types",
     "pigeonhole-types": "types",
-    "s3gram-chunk": "codec",
     "pigeonhole-codec": "codec",
-    "s3gram-blob": "blob",
     "pigeonhole-blob": "blob",
-    "s3gram-index": "blob-store",
-    "s3gram-engine": "blob-store",
-    "pigeonhole-index": "blob-store",
-    "pigeonhole-engine": "blob-store",
-    "pigeonhole-chunk-store": "blob-store",
-    # index remains a blob-store-layer crate until fully merged
-    "s3gram-telegram": "storage",
-    "s3gram-discord": "storage",
+    "pigeonhole-index": "chunk-store",  # until stage F merges it away
+    "pigeonhole-chunk-store": "chunk-store",
     "pigeonhole-storage-telegram": "storage",
     "pigeonhole-storage-discord": "storage",
     "pigeonhole-storage-memory": "storage",
-    "s3gram-s3": "gateway",
-    "s3gram-bytestream": "gateway",
     "pigeonhole-gateway-s3": "gateway",
     "pigeonhole-gateway-bytestream": "gateway",
     "pigeonhole-gateway-kafka": "gateway",
     "pigeonhole-gateway-webdav": "gateway",
-    "s3gram": "bin",
     "pigeonhole": "bin",
     "pigeonhole-testkit": "testkit",
 }
 
 FORBIDDEN_SOFT = {
-    "storage": {"blob-store", "gateway", "storage", "bin"},
+    "storage": {"chunk-store", "gateway", "storage", "bin"},
     "gateway": {"storage", "gateway", "bin"},
 }
 
-BLOB_STORE_FORBIDDEN_CRATES = {"s3s", "tonic", "axum"}
+CHUNK_STORE_FORBIDDEN_CRATES = {"s3s", "tonic", "axum"}
 
 
 def main() -> int:
@@ -50,7 +38,7 @@ def main() -> int:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="full pigeonhole target rules (fails on current engine→s3s)",
+        help="full pigeonhole target rules",
     )
     args = parser.parse_args()
     strict = args.strict
@@ -97,7 +85,7 @@ def main() -> int:
 
         elif role == "gateway":
             if strict:
-                allowed = {"blob-store", "codec", "types"}
+                allowed = {"chunk-store", "codec", "types"}
                 for dep_name in dep_names:
                     dr = ROLE.get(dep_name)
                     if dr is None:
@@ -108,8 +96,8 @@ def main() -> int:
                             f"allowed: {sorted(allowed)}"
                         )
                     # Gateways must not take a direct dependency on pigeonhole-index;
-                    # S3/CAS indexes live in the gateway or behind blob-store APIs.
-                    if dep_name in ("pigeonhole-index", "s3gram-index"):
+                    # S3/CAS indexes live in the gateway or behind chunk-store APIs.
+                    if dep_name == "pigeonhole-index":
                         errors.append(
                             f"{name} (gateway) must not depend on {dep_name} directly"
                         )
@@ -121,17 +109,17 @@ def main() -> int:
                     if dr in FORBIDDEN_SOFT["gateway"]:
                         errors.append(f"{name} (gateway) → {dep_name} ({dr})")
 
-        elif role == "blob-store" and strict:
+        elif role == "chunk-store" and strict:
             for dep_name in dep_names:
                 dr = ROLE.get(dep_name)
                 if dr in {"storage", "gateway", "bin", "testkit"}:
-                    errors.append(f"{name} (blob-store) → {dep_name} ({dr})")
+                    errors.append(f"{name} (chunk-store) → {dep_name} ({dr})")
             for dep in pkg.get("dependencies", []):
                 if dep.get("kind") in ("dev", "build"):
                     continue
-                if dep["name"] in BLOB_STORE_FORBIDDEN_CRATES:
+                if dep["name"] in CHUNK_STORE_FORBIDDEN_CRATES:
                     errors.append(
-                        f"{name} (blob-store) must not depend on {dep['name']}"
+                        f"{name} (chunk-store) must not depend on {dep['name']}"
                     )
 
         elif role in ("blob", "codec", "types") and strict:

@@ -12,9 +12,11 @@ block is compressed once; on-wire size stays ≤ `chunk.size` (logical ≤ 256�
 Legacy single-blob `raw`/`gzip`/`zstd` chunks remain readable. Object metadata
 lives in a local SQLite index.
 
-Storage I/O goes through `LegacyBlobStore` / `LegacyBlobStoreTg` (`storage-telegram` or
+Storage I/O goes through `LegacyBlobStore` / typed `BlobBackend` (`storage-telegram` or
 `storage-discord` in production, `storage-memory` in tests) so unit tests never
 hit a real Bot API. Roadmap gateways: Kafka, WebDAV.
+
+Architecture terms: see [docs/glossary.md](docs/glossary.md) (Instance, Blob, Block, Chunk, Replica, Extent, …).
 
 Layout is a Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 
@@ -22,9 +24,9 @@ Layout is a Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 |---|---|
 | `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
 | `core/pigeonhole-codec` | Codecs + `BlockWriter` |
-| `blob/pigeonhole-blob` | `LegacyBlobStore` / `LegacyBlobStoreTg`, rate limits, `BootstrapPointer`, cache |
-| `blob/pigeonhole-index` | SQLite index (blob-store layer; merging into blob-store later) |
-| `blob/pigeonhole-chunk-store` | Ingest, snapshots, config (no protocol crates) |
+| `blob/pigeonhole-blob` | `BlobBackend` / `LegacyBlobStore`, rate limits, `BootstrapPointer`, cache |
+| `blob/pigeonhole-index` | SQLite index (chunk-store layer; merging later) |
+| `blob/pigeonhole-chunk-store` | `ChunkStore`, ingest, snapshots, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
 | `storage/pigeonhole-storage-discord` | Discord Bot API storage |
 | `storage/pigeonhole-storage-memory` | In-memory storage for tests / `memory = true` |
