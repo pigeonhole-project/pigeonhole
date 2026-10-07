@@ -49,6 +49,10 @@ bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-chunk-store = { workspace = true }
+pigeonhole-codec = { workspace = true }
+pigeonhole-gateway-s3 = { workspace = true }
 s3s = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

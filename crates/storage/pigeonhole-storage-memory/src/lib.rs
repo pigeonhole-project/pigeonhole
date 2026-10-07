@@ -75,6 +75,12 @@ impl MemoryBlobStore {
         self
     }
 
+    /// Use a pre-resolved [`InstanceInfo`] (from `[[instances]]` / legacy default).
+    pub fn with_instance_info(mut self, info: InstanceInfo) -> Self {
+        self.instance = info;
+        self
+    }
+
     /// Attach a shared unavailable flag for failover tests.
     pub fn with_unavailable_flag(mut self) -> Self {
         self.unavailable = Some(Arc::new(AtomicBool::new(false)));

@@ -69,17 +69,10 @@ impl CasIndex {
         .execute(&self.pool)
         .await?;
 
-        // Legacy columns from pre-F schema (ignore if absent).
-        let _ = sqlx::query(
-            "CREATE TABLE IF NOT EXISTS pending_cas_deletes (
-                hash TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                queued_at TEXT NOT NULL,
-                PRIMARY KEY (hash, size)
-            )",
-        )
-        .execute(&self.pool)
-        .await;
+        // Drop legacy pending-delete queue (stage G: GC releases directly).
+        let _ = sqlx::query("DROP TABLE IF EXISTS pending_cas_deletes")
+            .execute(&self.pool)
+            .await;
 
         sqlx::query(
             r#"
@@ -238,46 +231,6 @@ impl CasIndex {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
-    }
-
-    pub async fn queue_delete(&self, hash: &str, size: i64) -> Result<()> {
-        let queued_at = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            INSERT INTO pending_cas_deletes (hash, size, queued_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(hash, size) DO NOTHING
-            "#,
-        )
-        .bind(hash)
-        .bind(size)
-        .bind(queued_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn list_pending_deletes(&self, limit: i64) -> Result<Vec<(String, i64)>> {
-        sqlx::query_as(
-            r#"
-            SELECT hash, size FROM pending_cas_deletes
-            ORDER BY queued_at ASC
-            LIMIT ?
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
-    }
-
-    pub async fn clear_pending_delete(&self, hash: &str, size: i64) -> Result<()> {
-        sqlx::query("DELETE FROM pending_cas_deletes WHERE hash = ? AND size = ?")
-            .bind(hash)
-            .bind(size)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {

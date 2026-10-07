@@ -204,6 +204,35 @@ async fn get_meta(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
     Ok(row.map(|r| r.0))
 }
 
+/// True when a legacy s3gram index still has `blobs` rows (needs migrate → blob.db).
+pub async fn legacy_index_has_blobs(legacy_database_url: &str) -> Result<bool> {
+    let url = if legacy_database_url.starts_with("sqlite:") && !legacy_database_url.contains('?') {
+        format!("{legacy_database_url}?mode=rwc")
+    } else {
+        legacy_database_url.to_string()
+    };
+    let pool = match SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+    {
+        Ok(p) => p,
+        Err(_) => return Ok(false),
+    };
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'blobs'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    if exists.is_none() {
+        return Ok(false);
+    }
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs")
+        .fetch_one(&pool)
+        .await?;
+    Ok(n > 0)
+}
+
 /// Build a default telegram/memory instance for migration from legacy config fields.
 pub fn default_instance_for_migrate(
     kind: InstanceKind,

@@ -52,16 +52,31 @@ impl TelegramBlobStore {
             .fingerprint(&chat_id)
             .unwrap_or_else(|_| format!("tg:unknown:{chat_id}"));
         let location = format!("tg:chat:{chat_id}");
-        Self {
-            id: BackendId::telegram(&chat_id),
-            limits: BackendLimits::telegram(),
-            instance: InstanceInfo {
+        Self::with_instance(
+            tg,
+            chat_id,
+            limiter,
+            InstanceInfo {
                 id: instance_id.into(),
                 kind: InstanceKind::Telegram,
                 fingerprint,
                 location,
                 role: InstanceRole::ReadWrite,
             },
+        )
+    }
+
+    /// Build with a pre-resolved [`InstanceInfo`] (from `[[instances]]`).
+    pub fn with_instance(
+        tg: TelegramClient,
+        chat_id: String,
+        limiter: Arc<ChatLimiter>,
+        instance: InstanceInfo,
+    ) -> Self {
+        Self {
+            id: BackendId::telegram(&chat_id),
+            limits: BackendLimits::telegram(),
+            instance,
             tg,
             chat_id,
             limiter,

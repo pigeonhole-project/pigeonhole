@@ -36,8 +36,10 @@ impl S3gram {
         }
     }
 
-    fn chat_id(&self) -> &str {
-        &self.cfg.chat_id
+    fn scope_id(&self) -> &str {
+        self.cfg
+            .primary_scope_id()
+            .unwrap_or(self.cfg.chat_id.as_str())
     }
 
     fn ingest_options(&self) -> IngestOptions {
@@ -523,7 +525,7 @@ impl S3 for S3gram {
         let name = req.input.bucket;
         let created = self
             .index
-            .create_bucket(&name, self.chat_id())
+            .create_bucket(&name, self.scope_id())
             .await
             .map_err(Self::map_err)?;
         if !created && self.index.bucket_exists(&name).await.map_err(Self::map_err)? {

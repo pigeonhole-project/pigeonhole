@@ -635,6 +635,29 @@ impl BlobDb {
         }
     }
 
+    /// All named roots (for purge / release-all).
+    pub async fn list_roots(&self) -> Result<Vec<(String, Vec<Extent>)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, extents_json FROM roots ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (name, json) in rows {
+            let extents: Vec<Extent> =
+                serde_json::from_str(&json).context("parse root extents_json")?;
+            out.push((name, extents));
+        }
+        Ok(out)
+    }
+
+    pub async fn delete_root(&self, name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM roots WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn retain(&self, ids: &[i64]) -> Result<()> {
         for id in ids {
             sqlx::query("UPDATE chunks SET refs = refs + 1 WHERE id = ?")

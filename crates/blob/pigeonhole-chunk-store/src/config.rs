@@ -317,6 +317,24 @@ impl Config {
     pub fn chat_limiter(&self) -> Arc<ChatLimiter> {
         Arc::new(ChatLimiter::new(self.tg.clone()))
     }
+
+    /// Primary write instance (first member of `[placement].group`).
+    pub fn primary_instance(&self) -> Result<&InstanceConfig> {
+        let id = self
+            .placement
+            .group
+            .first()
+            .context("placement.group is empty")?;
+        self.instances
+            .iter()
+            .find(|i| i.info.id == *id)
+            .with_context(|| format!("placement primary instance {id:?} not in [[instances]]"))
+    }
+
+    /// Scope id (chat/channel) of the primary write instance — replaces runtime `chat_id`.
+    pub fn primary_scope_id(&self) -> Result<&str> {
+        Ok(self.primary_instance()?.scope_id.as_str())
+    }
 }
 
 fn config_path_from_env() -> PathBuf {

@@ -174,6 +174,57 @@ pub trait TypedBootstrapPointer: Send + Sync {
     async fn swap(&self, new: Bytes) -> Result<()>;
 }
 
+/// Share one backend instance as both [`SharedBackend`](crate::SharedBackend) member and pin.
+#[async_trait]
+impl<B: BlobBackend> BlobBackend for std::sync::Arc<B> {
+    type Id = B::Id;
+    type Key = B::Key;
+
+    fn instance(&self) -> &InstanceInfo {
+        (**self).instance()
+    }
+    fn limits(&self) -> &BackendLimits {
+        (**self).limits()
+    }
+    fn key(id: &Self::Id) -> Self::Key {
+        B::key(id)
+    }
+    fn cost(&self, op: OpKind, id: Option<&Self::Id>) -> CostHint {
+        (**self).cost(op, id)
+    }
+    async fn put(&self, data: Bytes) -> Result<Self::Id> {
+        (**self).put(data).await
+    }
+    async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
+        (**self).get(id, range).await
+    }
+    async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
+        (**self).delete(keys).await
+    }
+}
+
+#[async_trait]
+impl<B: Sweepable> Sweepable for std::sync::Arc<B> {
+    async fn candidates(
+        &self,
+        after: Option<Self::Key>,
+        upto: Self::Key,
+        limit: usize,
+    ) -> Result<Vec<Self::Key>> {
+        (**self).candidates(after, upto, limit).await
+    }
+}
+
+#[async_trait]
+impl<B: TypedBootstrapPointer + ?Sized> TypedBootstrapPointer for std::sync::Arc<B> {
+    async fn read(&self) -> Result<Option<Bytes>> {
+        (**self).read().await
+    }
+    async fn swap(&self, new: Bytes) -> Result<()> {
+        (**self).swap(new).await
+    }
+}
+
 /// Encode a typed id into [`BlobLocator`].
 pub fn store_id<B: BlobBackend>(id: &B::Id) -> Result<BlobLocator> {
     let key = B::key(id).to_bytes();

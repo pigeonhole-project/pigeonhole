@@ -694,34 +694,72 @@ impl BlobDb {
     }
 }
 
-/// Stage 2.3: restore from pin into `db`, then fence by publishing generation+1.
+fn fingerprint_ok(sb: &Superblock, dur: &Durability, expected: &str) -> bool {
+    sb.fingerprint == expected || dur.pins.iter().any(|p| p.fingerprint == sb.fingerprint)
+}
+
+/// Stage G boot: empty DB → restore from superblocks (if any); else publish `generation+1`.
+///
+/// - Empty local DB + pin → `restore_into`, then fence with `generation+1`.
+/// - Empty local DB + no pin → first boot; publish genesis as generation 1.
+/// - Non-empty DB → keep local data; fence by publishing `generation+1` (unless `force`).
+/// - `force` → overwrite non-empty DB from superblocks (CLI `restore --force`).
 pub async fn start_or_restore(
     db: &BlobDb,
     dur: &Durability,
     expected_fingerprint: &str,
     force: bool,
 ) -> Result<Superblock> {
-    if !force && !db.is_empty_metadata().await? {
-        bail!("blob.db is not empty; pass force=true to overwrite (like restore --force)");
-    }
-    let sb = dur.restore_into(db).await?;
-    let fp_ok = sb.fingerprint == expected_fingerprint
-        || dur
-            .pins
-            .iter()
-            .any(|p| p.fingerprint == sb.fingerprint);
-    if !fp_ok {
-        bail!(
-            "superblock fingerprint {:?} != config {:?}",
-            sb.fingerprint,
-            expected_fingerprint
-        );
-    }
+    let empty = db.is_empty_metadata().await?;
 
-    let mut next = sb.clone();
-    next.generation = next.generation.saturating_add(1);
-    dur.publish_superblock(next).await?;
-    Ok(sb)
+    if empty || force {
+        match dur.read_best_superblock().await? {
+            Some(_) => {
+                let sb = dur.restore_into(db).await?;
+                if !fingerprint_ok(&sb, dur, expected_fingerprint) {
+                    bail!(
+                        "superblock fingerprint {:?} != config {:?}",
+                        sb.fingerprint,
+                        expected_fingerprint
+                    );
+                }
+                let mut next = sb.clone();
+                next.generation = next.generation.saturating_add(1);
+                dur.publish_superblock(next).await?;
+                Ok(sb)
+            }
+            None if empty && !force => {
+                let mut sb = dur.current.lock().await.clone();
+                if !fingerprint_ok(&sb, dur, expected_fingerprint) {
+                    sb.fingerprint = expected_fingerprint.to_string();
+                }
+                sb.generation = sb.generation.max(1);
+                dur.publish_superblock(sb.clone()).await?;
+                Ok(sb)
+            }
+            None => bail!("restore --force requires a superblock pin; none found"),
+        }
+    } else {
+        // Non-empty local DB: fencing only.
+        let base = match dur.read_best_superblock().await? {
+            Some(remote) => {
+                if !fingerprint_ok(&remote, dur, expected_fingerprint) {
+                    bail!(
+                        "superblock fingerprint {:?} != config {:?}",
+                        remote.fingerprint,
+                        expected_fingerprint
+                    );
+                }
+                *dur.current.lock().await = remote.clone();
+                remote
+            }
+            None => dur.current.lock().await.clone(),
+        };
+        let mut next = base.clone();
+        next.generation = next.generation.saturating_add(1).max(1);
+        dur.publish_superblock(next).await?;
+        Ok(base)
+    }
 }
 
 #[cfg(test)]
@@ -852,10 +890,12 @@ mod tests {
         let err = dur_a.ensure_not_fenced().await.unwrap_err();
         assert!(err.to_string().contains("fenced"));
 
-        let err = start_or_restore(&db_b, &dur_b, &info.fingerprint, false)
+        // Non-empty DB: fencing bump succeeds (keeps local data).
+        let gen_before = dur_b.generation().await;
+        let _ = start_or_restore(&db_b, &dur_b, &info.fingerprint, false)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("not empty"));
+            .unwrap();
+        assert!(dur_b.generation().await > gen_before);
     }
 
     #[tokio::test]

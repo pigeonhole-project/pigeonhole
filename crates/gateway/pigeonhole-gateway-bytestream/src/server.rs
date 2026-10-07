@@ -155,20 +155,26 @@ fn spawn_cas_gc(state: ReapiState, ttl_secs: u64) {
             let cutoff = Utc::now() - ttl;
             if let Ok(stale) = cas.stale_before(cutoff).await {
                 for row in stale {
-                    let _ = cas.queue_delete(&row.hash, row.size).await;
-                }
-            }
-            if let Ok(pending) = cas.list_pending_deletes(32).await {
-                for (hash, size) in pending {
-                    match cas.release(&hash, size).await {
+                    match cas.release(&row.hash, row.size).await {
                         Ok(ids) => {
                             if let Err(e) = store.release(&ids).await {
-                                warn!(error = %e, %hash, size, "cas gc chunk release");
+                                warn!(
+                                    error = %e,
+                                    hash = %row.hash,
+                                    size = row.size,
+                                    "cas gc chunk release"
+                                );
                             }
                         }
-                        Err(e) => warn!(error = %e, %hash, size, "cas gc release"),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                hash = %row.hash,
+                                size = row.size,
+                                "cas gc release"
+                            );
+                        }
                     }
-                    let _ = cas.clear_pending_delete(&hash, size).await;
                 }
             }
         }

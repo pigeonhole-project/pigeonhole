@@ -276,19 +276,6 @@ impl Index {
         Ok(n > 0)
     }
 
-    pub async fn migrate_legacy_chat_ids(&self, legacy_chat_id: &str) -> Result<u64> {
-        if legacy_chat_id.is_empty() {
-            return Ok(0);
-        }
-        let r = sqlx::query(
-            "UPDATE buckets SET chat_id = ? WHERE chat_id IS NULL OR chat_id = ''",
-        )
-        .bind(legacy_chat_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(r.rows_affected())
-    }
-
     pub async fn create_bucket(&self, name: &str, chat_id: &str) -> Result<bool> {
         let created_at = Utc::now().to_rfc3339();
         let res = sqlx::query(

@@ -54,16 +54,33 @@ impl DiscordBlobStore {
         max_blob_size: Option<usize>,
     ) -> Self {
         let app_id = dc.app_id();
-        Self {
-            id: BackendId::discord(&channel_id),
-            limits: BackendLimits::discord(max_blob_size),
-            instance: InstanceInfo {
+        Self::with_instance(
+            dc,
+            channel_id.clone(),
+            limiter,
+            max_blob_size,
+            InstanceInfo {
                 id: format!("discord-{channel_id}"),
                 kind: InstanceKind::Discord,
                 fingerprint: discord_fingerprint(&app_id, &channel_id),
                 location: discord_location(&channel_id),
                 role: InstanceRole::ReadWrite,
             },
+        )
+    }
+
+    /// Build with a pre-resolved [`InstanceInfo`] (from `[[instances]]`).
+    pub fn with_instance(
+        dc: DiscordClient,
+        channel_id: String,
+        limiter: Arc<ChatLimiter>,
+        max_blob_size: Option<usize>,
+        instance: InstanceInfo,
+    ) -> Self {
+        Self {
+            id: BackendId::discord(&channel_id),
+            limits: BackendLimits::discord(max_blob_size),
+            instance,
             dc,
             channel_id,
             limiter,

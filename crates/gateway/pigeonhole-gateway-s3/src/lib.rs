@@ -10,7 +10,9 @@ pub use index::{
 };
 pub use pigeonhole_chunk_store::{ChunkStore, Config, Extent};
 pub use service::S3gram;
-pub use snapshot::{push_index_snapshot, restore_index_snapshot, PushOutcome, ROOT_NAME};
+pub use snapshot::{
+    push_index_snapshot, push_index_snapshot_durable, restore_index_snapshot, PushOutcome, ROOT_NAME,
+};
 
 use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};

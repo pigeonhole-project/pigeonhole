@@ -2,25 +2,31 @@ use anyhow::{bail, Context};
 use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
 use axum::Router;
-use pigeonhole::config::{BackendKind, Config};
+use pigeonhole::config::Config;
 use pigeonhole::http_timeout::with_http_timeouts;
-use pigeonhole::index::{Index, IndexSnapshot};
+use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::snapshot;
 use pigeonhole::telegram::{TelegramBlobStore, TelegramClient};
 use pigeonhole::{build_s3_service, build_s3gram};
-use pigeonhole_blob::{spawn_metrics_logger, BackendMetrics, BootstrapPointer};
-use pigeonhole_blob::InstanceKind;
-use pigeonhole_chunk_store::{
-    default_instance_for_migrate, migrate_index_to_blob_db, BlockCache, BlobDb, ChunkStore,
-    IngestOptions,
+use pigeonhole_blob::{
+    erase_sweep, spawn_metrics_logger, BackendMetrics, CheapestFirst, InstanceKind, Replicated,
+    SharedBackend, TypedBootstrapPointer,
 };
-use pigeonhole_gateway_s3::snapshot::{push_index_snapshot, restore_index_snapshot};
+use pigeonhole_chunk_store::{
+    check_fingerprints, legacy_index_has_blobs, migrate_index_to_blob_db, start_or_restore,
+    BlockCache, BlobDb, ChunkStore, Durability, IngestOptions, JournalOp, PinTarget, Superblock,
+};
+use pigeonhole_gateway_s3::snapshot::{
+    push_index_snapshot_durable, restore_index_snapshot,
+};
 use s3s::{Body, HttpError};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+const JOURNAL_FLUSH_SECS: u64 = 5;
+const DEFAULT_CHECKPOINT_SECS: u64 = 300;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,17 +40,17 @@ async fn main() -> anyhow::Result<()> {
     match args.next().as_deref() {
         Some("restore") => {
             let mut force = false;
-            let mut file_id = None;
             for a in args {
                 match a.as_str() {
                     "--force" | "--yes" => force = true,
-                    other if other.starts_with('-') => {
-                        bail!("unknown restore flag {other}; usage: s3gram restore [--force] [file_id]")
+                    other => {
+                        bail!(
+                            "unknown restore flag {other}; usage: pigeonhole restore [--force]"
+                        )
                     }
-                    other => file_id = Some(other.to_string()),
                 }
             }
-            cmd_restore(file_id.as_deref(), force).await
+            cmd_restore(force).await
         }
         Some("purge") => {
             let mut yes = false;
@@ -55,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
                     "--yes" => yes = true,
                     "--expect-messages" => {
                         let _ = rest.next().context("--expect-messages requires a number")?;
-                        warn!("--expect-messages ignored after stage F (refs live in blob.db)");
+                        warn!("--expect-messages ignored (refs live in blob.db; sweeper is stage H)");
                     }
                     "--expect-chat" => {
                         expect_chat = Some(
@@ -65,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     other => bail!(
-                        "unknown purge flag {other}; usage: s3gram purge --yes [--expect-chat CHAT_ID]"
+                        "unknown purge flag {other}; usage: pigeonhole purge --yes [--expect-chat CHAT_ID]"
                     ),
                 }
             }
@@ -76,7 +82,9 @@ async fn main() -> anyhow::Result<()> {
             for a in args {
                 match a.as_str() {
                     "--dry-run" => dry_run = true,
-                    other => bail!("unknown migrate flag {other}; usage: pigeonhole migrate [--dry-run]"),
+                    other => {
+                        bail!("unknown migrate flag {other}; usage: pigeonhole migrate [--dry-run]")
+                    }
                 }
             }
             cmd_migrate(dry_run).await
@@ -84,11 +92,17 @@ async fn main() -> anyhow::Result<()> {
         Some(other) => {
             bail!(
                 "unknown command {other:?}; usage: pigeonhole \
-                 [restore [--force] [file_id] | purge --yes | migrate [--dry-run]]"
+                 [restore [--force] | purge --yes | migrate [--dry-run]]"
             )
         }
         None => cmd_serve().await,
     }
+}
+
+struct Runtime {
+    store: Arc<ChunkStore>,
+    durability: Arc<Durability>,
+    primary_fingerprint: String,
 }
 
 async fn cmd_serve() -> anyhow::Result<()> {
@@ -97,86 +111,19 @@ async fn cmd_serve() -> anyhow::Result<()> {
     let index = Index::connect(&cfg.database_url)
         .await
         .context("open s3 index")?;
-    let migrated = index
-        .migrate_legacy_chat_ids(&cfg.chat_id)
-        .await
-        .context("migrate legacy chat_id")?;
-    if migrated > 0 {
-        info!(migrated, "backfilled empty chat_id from config chat_id");
-    }
 
-    let blob_url = blob_db_url_from_index(&cfg.database_url);
-    let blob_db = BlobDb::connect(&blob_url)
-        .await
-        .context("open blob.db")?;
+    let rt = open_runtime(&cfg).await.context("open runtime")?;
+    start_or_restore(
+        rt.store.db(),
+        rt.durability.as_ref(),
+        &rt.primary_fingerprint,
+        false,
+    )
+    .await
+    .context("start_or_restore")?;
 
-    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    opts.block_size = cfg.block_size;
-    opts.memory_budget = cfg.ingest_budget.clone();
-
-    let limiter = cfg.chat_limiter();
-    let store: Arc<ChunkStore> = if cfg.memory_store {
-        warn!("memory = true: using MemoryBlobStore (no Telegram)");
-        let layer = ChunkStore::open(blob_db, MemoryBlobStore::new(), opts)
-            .await
-            .context("open ChunkStore(memory)")?;
-        Arc::new(with_optional_caches(layer, &cfg))
-    } else if cfg.backend_kind == BackendKind::Discord {
-        #[cfg(feature = "discord")]
-        {
-            use pigeonhole_storage_discord::{DiscordBlobStore, DiscordClient};
-            let dc = DiscordClient::new(cfg.bot_token.clone()).context("discord client")?;
-            dc.ensure_channel_permissions(&cfg.chat_id, Some(limiter.as_ref()))
-                .await
-                .context("channel_id permission check")?;
-            let dc_store = DiscordBlobStore::new(
-                dc,
-                cfg.chat_id.clone(),
-                limiter,
-                cfg.discord_max_blob_size,
-            );
-            let layer = ChunkStore::open(blob_db, dc_store, opts)
-                .await
-                .context("open ChunkStore(discord)")?;
-            Arc::new(with_optional_caches(layer, &cfg))
-        }
-        #[cfg(not(feature = "discord"))]
-        {
-            bail!(
-                "config selects discord backend but this binary was built without `--features discord`"
-            );
-        }
-    } else {
-        let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
-        tg.ensure_chat_admin(&cfg.chat_id)
-            .await
-            .context("chat_id access check")?;
-        let tg_store = TelegramBlobStore::new(tg, cfg.chat_id.clone(), limiter);
-        let layer = ChunkStore::open(blob_db, tg_store, opts)
-            .await
-            .context("open ChunkStore(telegram)")?;
-        Arc::new(with_optional_caches(layer, &cfg))
-    };
-
-    let s3gram = build_s3gram(cfg.clone(), index.clone(), store.clone());
-
-    // Stage F: gateway snapshot → set_root("s3/index"); full pin/durability cutover is Stage G.
-    if cfg.snapshot_interval_secs > 0 {
-        let idx = index.clone();
-        let st = store.clone();
-        let gate = s3gram.snapshot_gate.clone();
-        let interval = cfg.snapshot_interval_secs;
-        tokio::spawn(async move {
-            let period = Duration::from_secs(interval);
-            loop {
-                tokio::time::sleep(period).await;
-                let _g = gate.lock().await;
-                if let Err(e) = push_index_snapshot(&idx, st.as_ref()).await {
-                    warn!(error = %e, "periodic s3 index snapshot failed");
-                }
-            }
-        });
-    }
+    let s3gram = build_s3gram(cfg.clone(), index.clone(), rt.store.clone());
+    spawn_background_tasks(&cfg, &rt, &index, &s3gram);
 
     #[cfg(feature = "bytestream")]
     if cfg.bytestream.enabled {
@@ -194,7 +141,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
         let cas = CasIndex::connect(&cas_url)
             .await
             .context("open cas index")?;
-        let bs_store = store.clone();
+        let bs_store = rt.store.clone();
         tokio::spawn(async move {
             if let Err(e) =
                 pigeonhole_gateway_bytestream::server::serve(bs_cfg, cas, bs_store).await
@@ -225,10 +172,13 @@ async fn cmd_serve() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
+    let scope = cfg.primary_scope_id().unwrap_or("?");
     info!(
         memory = cfg.memory_store,
         backend = ?cfg.backend_kind,
-        chat_id = %cfg.chat_id,
+        scope_id = %scope,
+        instances = cfg.instances.len(),
+        placement = ?cfg.placement.group,
         chunk_size = cfg.chunk_size,
         chunk_codec = %cfg.chunk_codec,
         bytestream = cfg.bytestream.enabled,
@@ -236,10 +186,223 @@ async fn cmd_serve() -> anyhow::Result<()> {
         headers_timeout_secs = cfg.http.headers_timeout_secs,
         max_concurrent = cfg.http.max_concurrent_requests,
         max_headers = cfg.http.max_headers,
-        "s3gram (s3s) listening on http://{addr}"
+        "pigeonhole listening on http://{addr}"
     );
     axum::serve(listener, app).await.context("serve")?;
     Ok(())
+}
+
+fn spawn_background_tasks(
+    cfg: &Config,
+    rt: &Runtime,
+    index: &Index,
+    s3gram: &pigeonhole::S3gram,
+) {
+    let dur = rt.durability.clone();
+    tokio::spawn(async move {
+        let period = Duration::from_secs(JOURNAL_FLUSH_SECS);
+        loop {
+            tokio::time::sleep(period).await;
+            if let Err(e) = dur.flush_journal().await {
+                warn!(error = %e, "journal flush failed");
+            }
+        }
+    });
+
+    let checkpoint_secs = if cfg.snapshot_interval_secs > 0 {
+        cfg.snapshot_interval_secs.max(60)
+    } else {
+        DEFAULT_CHECKPOINT_SECS
+    };
+    let dur = rt.durability.clone();
+    let store = rt.store.clone();
+    tokio::spawn(async move {
+        let period = Duration::from_secs(checkpoint_secs);
+        loop {
+            tokio::time::sleep(period).await;
+            if let Err(e) = dur.checkpoint(store.db()).await {
+                warn!(error = %e, "blob.db checkpoint failed");
+            }
+        }
+    });
+
+    if cfg.snapshot_interval_secs > 0 {
+        let idx = index.clone();
+        let st = rt.store.clone();
+        let dur = rt.durability.clone();
+        let gate = s3gram.snapshot_gate.clone();
+        let interval = cfg.snapshot_interval_secs;
+        tokio::spawn(async move {
+            let period = Duration::from_secs(interval);
+            loop {
+                tokio::time::sleep(period).await;
+                let _g = gate.lock().await;
+                if let Err(e) = push_index_snapshot_durable(&idx, st.as_ref(), dur.as_ref()).await {
+                    warn!(error = %e, "periodic s3 index snapshot failed");
+                }
+            }
+        });
+    }
+
+    // Stage H (sweeper) / Stage I (repair): not wired yet.
+    info!("sweeper/repair background tasks deferred (stages H/I)");
+}
+
+async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
+    let blob_url = blob_db_url_from_index(&cfg.database_url);
+    let blob_db = BlobDb::connect(&blob_url)
+        .await
+        .context("open blob.db")?;
+
+    let stored = blob_db
+        .list_instance_fingerprints()
+        .await
+        .context("list instance fingerprints")?;
+    check_fingerprints(&cfg.instances, &stored).context("fingerprint check")?;
+
+    if blob_db.is_empty_metadata().await? {
+        if legacy_index_has_blobs(&cfg.database_url)
+            .await
+            .context("probe legacy index")?
+        {
+            let primary = cfg.primary_instance()?;
+            info!("legacy s3gram index has blobs; migrating into blob.db");
+            let report =
+                migrate_index_to_blob_db(&cfg.database_url, &blob_db, primary, false).await?;
+            info!(
+                blobs = report.blobs,
+                roots = report.roots,
+                "legacy index migrated"
+            );
+        }
+    }
+
+    let (replicated, pins, primary_fingerprint, primary_id) =
+        build_placement(cfg).await.context("build placement group")?;
+
+    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
+    opts.block_size = cfg.block_size;
+    opts.memory_budget = cfg.ingest_budget.clone();
+
+    let layer = ChunkStore::open_replicated(blob_db, replicated.clone(), opts)
+        .await
+        .context("open ChunkStore")?;
+    let store = Arc::new(with_optional_caches(layer, cfg));
+
+    let genesis = Superblock::new(0, primary_id, primary_fingerprint.clone());
+    let durability = Arc::new(Durability::new_replicated(replicated, pins, genesis));
+
+    Ok(Runtime {
+        store,
+        durability,
+        primary_fingerprint,
+    })
+}
+
+async fn build_placement(
+    cfg: &Config,
+) -> anyhow::Result<(Arc<Replicated>, Vec<PinTarget>, String, String)> {
+    let limiter = cfg.chat_limiter();
+    let mut members: Vec<SharedBackend> = Vec::new();
+    let mut pins: Vec<PinTarget> = Vec::new();
+
+    for id in &cfg.placement.group {
+        let inst = cfg
+            .instances
+            .iter()
+            .find(|i| i.info.id == *id)
+            .with_context(|| format!("placement member {id:?} missing from instances"))?;
+
+        match inst.info.kind {
+            InstanceKind::Memory => {
+                warn!("memory instance {id}: in-process MemoryBlobStore (no durable pin across processes)");
+                let mem = Arc::new(
+                    MemoryBlobStore::new().with_instance_info(inst.info.clone()),
+                );
+                let pin: Arc<dyn TypedBootstrapPointer> = mem.clone();
+                let backend: SharedBackend = Arc::new(erase_sweep(mem));
+                pins.push(PinTarget {
+                    instance_id: inst.info.id.clone(),
+                    fingerprint: inst.info.fingerprint.clone(),
+                    pin,
+                    backend: backend.clone(),
+                });
+                members.push(backend);
+            }
+            InstanceKind::Telegram => {
+                let tg = TelegramClient::new(inst.bot_token.clone()).context("telegram client")?;
+                tg.ensure_chat_admin(&inst.scope_id)
+                    .await
+                    .context("chat_id access check")?;
+                let store = Arc::new(TelegramBlobStore::with_instance(
+                    tg,
+                    inst.scope_id.clone(),
+                    limiter.clone(),
+                    inst.info.clone(),
+                ));
+                let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
+                let backend: SharedBackend = Arc::new(erase_sweep(store));
+                pins.push(PinTarget {
+                    instance_id: inst.info.id.clone(),
+                    fingerprint: inst.info.fingerprint.clone(),
+                    pin,
+                    backend: backend.clone(),
+                });
+                members.push(backend);
+            }
+            InstanceKind::Discord => {
+                #[cfg(feature = "discord")]
+                {
+                    use pigeonhole_storage_discord::{DiscordBlobStore, DiscordClient};
+                    let dc = DiscordClient::new(inst.bot_token.clone()).context("discord client")?;
+                    dc.ensure_channel_permissions(&inst.scope_id, Some(limiter.as_ref()))
+                        .await
+                        .context("channel_id permission check")?;
+                    let store = Arc::new(DiscordBlobStore::with_instance(
+                        dc,
+                        inst.scope_id.clone(),
+                        limiter.clone(),
+                        cfg.discord_max_blob_size,
+                        inst.info.clone(),
+                    ));
+                    let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
+                    let backend: SharedBackend = Arc::new(erase_sweep(store));
+                    pins.push(PinTarget {
+                        instance_id: inst.info.id.clone(),
+                        fingerprint: inst.info.fingerprint.clone(),
+                        pin,
+                        backend: backend.clone(),
+                    });
+                    members.push(backend);
+                }
+                #[cfg(not(feature = "discord"))]
+                {
+                    bail!(
+                        "instance {id:?} is discord but this binary was built without `--features discord`"
+                    );
+                }
+            }
+        }
+    }
+
+    if members.is_empty() {
+        bail!("placement.group produced no backends");
+    }
+    let replicated = Arc::new(
+        Replicated::new(
+            members,
+            cfg.placement.write_quorum,
+            Arc::new(CheapestFirst::new()),
+        )
+        .context("Replicated::new")?,
+    );
+    let primary = cfg.primary_instance()?;
+    Ok((
+        replicated,
+        pins,
+        primary.info.fingerprint.clone(),
+        primary.info.id.clone(),
+    ))
 }
 
 fn with_optional_caches(layer: ChunkStore, cfg: &Config) -> ChunkStore {
@@ -272,22 +435,8 @@ async fn cmd_migrate(dry_run: bool) -> anyhow::Result<()> {
     let blob_db = BlobDb::connect(&blob_url)
         .await
         .context("open blob.db")?;
-
-    let kind = if cfg.memory_store {
-        InstanceKind::Memory
-    } else {
-        match cfg.backend_kind {
-            BackendKind::Telegram => InstanceKind::Telegram,
-            BackendKind::Discord => InstanceKind::Discord,
-        }
-    };
-    let token = if cfg.memory_store {
-        ""
-    } else {
-        cfg.bot_token.as_str()
-    };
-    let inst = default_instance_for_migrate(kind, token, &cfg.chat_id)?;
-    let report = migrate_index_to_blob_db(&cfg.database_url, &blob_db, &inst, dry_run).await?;
+    let primary = cfg.primary_instance()?;
+    let report = migrate_index_to_blob_db(&cfg.database_url, &blob_db, primary, dry_run).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -311,6 +460,7 @@ fn blob_db_url_from_index(database_url: &str) -> String {
     format!("{database_url}-blob")
 }
 
+#[cfg(feature = "bytestream")]
 fn cas_db_url_from_index(database_url: &str) -> String {
     if let Some(rest) = database_url.strip_prefix("sqlite:") {
         let (path, query) = match rest.split_once('?') {
@@ -330,18 +480,16 @@ fn cas_db_url_from_index(database_url: &str) -> String {
     format!("{database_url}-cas")
 }
 
-/// Wipe the S3 gateway index (blob.db GC / backend purge is Stage G).
+/// Release all roots + wipe gateway index. Backend object reclaim is stage H (sweeper).
 async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     if cfg.memory_store {
         bail!("refuse to purge when memory = true");
     }
+    let scope = cfg.primary_scope_id().context("primary scope_id")?;
     if let Some(expected) = expect_chat {
-        if expected != cfg.chat_id {
-            bail!(
-                "--expect-chat mismatch: config chat_id={} got {expected}",
-                cfg.chat_id
-            );
+        if expected != scope {
+            bail!("--expect-chat mismatch: config scope_id={scope} got {expected}");
         }
     }
     let index = Index::connect(&cfg.database_url)
@@ -349,26 +497,53 @@ async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<()> {
         .context("open index")?;
     let objects = index.count_objects().await.unwrap_or(0);
     let buckets = index.count_buckets().await.unwrap_or(0);
+
+    let rt = open_runtime(&cfg).await.context("open runtime")?;
+    let roots = rt.store.db().list_roots().await.context("list roots")?;
     info!(
-        chat_id = %cfg.chat_id,
+        scope_id = %scope,
         objects,
         buckets,
-        "purge plan (gateway index only; chunk refs remain in blob.db until sweeper)"
+        roots = roots.len(),
+        "purge plan: release all roots, wipe gateway index"
     );
     if !yes {
         bail!(
-            "refusing to wipe gateway index (chat_id={}, objects={objects}). \
-             Re-run with: s3gram purge --yes [--expect-chat {}]",
-            cfg.chat_id,
-            cfg.chat_id,
+            "refusing to purge (scope_id={scope}, objects={objects}, roots={}). \
+             Re-run with: pigeonhole purge --yes [--expect-chat {scope}]",
+            roots.len(),
         );
     }
+
+    for (name, extents) in &roots {
+        let ids: Vec<_> = extents.iter().map(|e| e.chunk).collect();
+        if !ids.is_empty() {
+            rt.store.release(&ids).await.with_context(|| format!("release root {name}"))?;
+        }
+        rt.store.db().delete_root(name).await?;
+        rt.durability
+            .enqueue(JournalOp::SetRoot {
+                name: name.clone(),
+                extents: vec![],
+            })
+            .await;
+    }
+    if let Err(e) = rt.durability.flush_journal().await {
+        warn!(error = %e, "purge journal flush failed");
+    }
+    // Attempt a checkpoint so pins reflect cleared roots (best-effort).
+    if let Err(e) = rt.durability.checkpoint(rt.store.db()).await {
+        warn!(error = %e, "purge checkpoint failed");
+    }
+
     index.wipe_all().await.context("wipe sqlite index")?;
-    info!("purge complete; gateway index wiped");
+    warn!("sweeper (stage H) not yet implemented; unreclaimed backend blobs may remain");
+    info!("purge complete: roots released, gateway index wiped");
     Ok(())
 }
 
-async fn cmd_restore(file_id: Option<&str>, force: bool) -> anyhow::Result<()> {
+/// Restore blob.db (+ gateway index) from superblock pins.
+async fn cmd_restore(force: bool) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     let index = Index::connect(&cfg.database_url)
         .await
@@ -381,80 +556,24 @@ async fn cmd_restore(file_id: Option<&str>, force: bool) -> anyhow::Result<()> {
         );
     }
 
-    if let Some(fid) = file_id {
-        let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
-        tg.ensure_chat_admin(&cfg.chat_id)
-            .await
-            .context("chat_id access check")?;
-        let limiter = cfg.chat_limiter();
-        let store = Arc::new(TelegramBlobStore::new(
-            tg,
-            cfg.chat_id.clone(),
-            limiter,
-        ));
-        info!(%fid, "downloading snapshot by file_id");
-        let bytes = snapshot::download_snapshot_bytes(store.as_ref(), fid)
-            .await
-            .context("download snapshot")?;
-        let snap: IndexSnapshot =
-            serde_json::from_slice(&bytes).context("parse snapshot JSON")?;
-        index
-            .import_snapshot(&snap)
-            .await
-            .context("import snapshot")?;
-        info!(
-            buckets = snap.buckets.len(),
-            objects = snap.objects.len(),
-            "index restored from snapshot"
-        );
-        return Ok(());
-    }
+    let rt = open_runtime(&cfg).await.context("open runtime")?;
+    start_or_restore(
+        rt.store.db(),
+        rt.durability.as_ref(),
+        &rt.primary_fingerprint,
+        force,
+    )
+    .await
+    .context("restore from superblocks")?;
 
-    let blob_url = blob_db_url_from_index(&cfg.database_url);
-    let blob_db = BlobDb::connect(&blob_url).await.context("open blob.db")?;
-    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    opts.block_size = cfg.block_size;
-    let layer = ChunkStore::open(blob_db, MemoryBlobStore::new(), opts)
-        .await
-        .context("open ChunkStore")?;
-    if layer.get_root("s3/index").await?.is_some() {
-        restore_index_snapshot(&index, &layer)
+    if rt.store.get_root("s3/index").await?.is_some() {
+        restore_index_snapshot(&index, rt.store.as_ref())
             .await
-            .context("restore s3/index root")?;
-        info!("index restored from chunk-store root s3/index");
-        return Ok(());
+            .context("restore s3/index root into gateway index")?;
+        info!("gateway index restored from chunk-store root s3/index");
+    } else {
+        info!("no s3/index root after superblock restore; gateway index left unchanged");
     }
-
-    if cfg.memory_store {
-        bail!("no s3/index root in blob.db");
-    }
-
-    let tg = TelegramClient::new(cfg.bot_token.clone()).context("telegram client")?;
-    tg.ensure_chat_admin(&cfg.chat_id)
-        .await
-        .context("chat_id access check")?;
-    let limiter = cfg.chat_limiter();
-    let store = Arc::new(TelegramBlobStore::new(
-        tg,
-        cfg.chat_id.clone(),
-        limiter,
-    ));
-    let pin: Arc<dyn BootstrapPointer> = store.clone();
-    info!(chat_id = %cfg.chat_id, "bootstrapping snapshot from pinned manifest");
-    let restored = snapshot::download_from_pinned(pin.as_ref(), store.as_ref())
-        .await
-        .context("download from pin")?;
-    let snap: IndexSnapshot =
-        serde_json::from_slice(&restored.bytes).context("parse snapshot JSON")?;
-    index
-        .import_snapshot(&snap)
-        .await
-        .context("import snapshot")?;
-    info!(
-        buckets = snap.buckets.len(),
-        objects = snap.objects.len(),
-        "index restored from pinned manifest"
-    );
     Ok(())
 }
 

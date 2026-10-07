@@ -6,7 +6,7 @@ use bytes::Bytes;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use pigeonhole_chunk_store::{ChunkStore, Extent};
+use pigeonhole_chunk_store::{commit_root, ChunkStore, Durability, Extent};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use tracing::info;
@@ -38,8 +38,26 @@ fn gunzip_bytes(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Export index → gzip → `put_small` → `set_root("s3/index", …)`.
+/// Export index → gzip → `put_small` → root `s3/index`.
+///
+/// When `dur` is set, the root switch is journaled via [`commit_root`].
 pub async fn push_index_snapshot(index: &Index, store: &ChunkStore) -> Result<PushOutcome> {
+    push_index_snapshot_inner(index, store, None).await
+}
+
+pub async fn push_index_snapshot_durable(
+    index: &Index,
+    store: &ChunkStore,
+    dur: &Durability,
+) -> Result<PushOutcome> {
+    push_index_snapshot_inner(index, store, Some(dur)).await
+}
+
+async fn push_index_snapshot_inner(
+    index: &Index,
+    store: &ChunkStore,
+    dur: Option<&Durability>,
+) -> Result<PushOutcome> {
     let snap = index.export_snapshot().await.context("export snapshot")?;
     let json = serde_json::to_vec(&snap).context("serialize snapshot")?;
     let hash = hex::encode(Sha256::digest(&json));
@@ -73,7 +91,13 @@ pub async fn push_index_snapshot(index: &Index, store: &ChunkStore) -> Result<Pu
         offset: 0,
         len: size,
     }];
-    store.set_root(ROOT_NAME, &extents).await?;
+    if let Some(dur) = dur {
+        commit_root(store.db(), dur, ROOT_NAME, &extents)
+            .await
+            .context("commit_root s3/index")?;
+    } else {
+        store.set_root(ROOT_NAME, &extents).await?;
+    }
 
     if let Some(old) = prev_root {
         let ids: Vec<_> = old.iter().map(|e| e.chunk).collect();
