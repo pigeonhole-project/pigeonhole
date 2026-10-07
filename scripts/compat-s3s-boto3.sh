@@ -36,7 +36,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-rm -f "$DB" "${DB}-wal" "${DB}-shm"
+# shellcheck source=rm-suite-dbs.sh
+source "$ROOT/scripts/rm-suite-dbs.sh"
+rm_suite_dbs "$DB"
 
 if [[ ! -d "$S3S_DIR/.git" ]]; then
   echo "cloning s3s into $S3S_DIR ..."

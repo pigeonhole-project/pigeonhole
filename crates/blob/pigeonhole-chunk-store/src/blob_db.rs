@@ -592,6 +592,24 @@ impl BlobDb {
             .await?;
         }
 
+        // Reject duplicate sort keys inside one commit (would violate UNIQUE and
+        // indicate a packer / fan-out bug).
+        {
+            use std::collections::HashSet;
+            let mut seen = HashSet::new();
+            for rep in replicas {
+                for part in &rep.parts {
+                    let k = (rep.instance.as_str(), part.locator.key.as_slice());
+                    if !seen.insert(k) {
+                        anyhow::bail!(
+                            "duplicate sort_key in commit_chunk for instance {}",
+                            rep.instance
+                        );
+                    }
+                }
+            }
+        }
+
         for rep in replicas {
             for (part_no, part) in rep.parts.iter().enumerate() {
                 sqlx::query(
@@ -609,7 +627,14 @@ impl BlobDb {
                 .bind(&part.locator.key)
                 .bind(&part.locator.locator)
                 .execute(&mut *tx)
-                .await?;
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "insert chunk_parts chunk={chunk_id} instance={} part={part_no} key_hex={}: {e}",
+                        rep.instance,
+                        hex::encode(&part.locator.key)
+                    )
+                })?;
             }
         }
 

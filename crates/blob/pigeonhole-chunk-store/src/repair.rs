@@ -150,6 +150,11 @@ impl Repairer {
 
     /// Scrub: enqueue under-replicated (chunk, member) pairs; prioritize happens at take.
     pub async fn scrub_enqueue(&self) -> Result<u64> {
+        // Single-member groups have nothing to backfill; scrubbing them only
+        // burns budget and can race ingest under heavy S3 suites.
+        if self.replicated.members().len() <= 1 {
+            return Ok(0);
+        }
         let mut n = 0u64;
         for member in self.replicated.members() {
             let id = member.instance().id.as_str();

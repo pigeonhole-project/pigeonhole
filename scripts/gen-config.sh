@@ -28,11 +28,14 @@ if [[ "$MEMORY" == "true" || "$MEMORY" == "1" ]]; then
   SNAPSHOT_SECS="${CONFIG_SNAPSHOT_SECS:-0}"
   DATABASE_URL="${CONFIG_DATABASE_URL:-sqlite:s3gram-memory.db}"
   CHAT_LINE=""
+  # MemoryBlobStore is process-local; quiet background tasks under heavy suites.
+  EXTRA_BG=$'\n[repair]\nscrub = false\ninterval_secs = 3600\n\n[sweep]\ninterval_secs = 3600\n'
 else
   SNAPSHOT_SECS="${CONFIG_SNAPSHOT_SECS:-300}"
   DATABASE_URL="${CONFIG_DATABASE_URL:-sqlite:s3gram.db}"
   : "${CONFIG_CHAT_ID:?CONFIG_CHAT_ID required when memory=false}"
   CHAT_LINE="chat_id = \"${CONFIG_CHAT_ID}\""
+  EXTRA_BG=""
 fi
 
 mkdir -p "$(dirname "$CONFIG_OUT")"
@@ -64,4 +67,5 @@ delete_rate_per_sec = 1.0
 delete_burst = 5.0
 upload_concurrency = 2
 download_concurrency = 8
+${EXTRA_BG}
 EOF

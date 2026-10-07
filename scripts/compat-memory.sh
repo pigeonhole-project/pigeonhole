@@ -32,8 +32,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Fresh index for a clean suite run.
-rm -f "$DB" "${DB}-wal" "${DB}-shm"
+# Fresh index + chunk-store (+ CAS) DBs for a clean suite run.
+# MemoryBlobStore keys restart at 1 each process; leftover *-blob.db
+# sort_keys would collide under UNIQUE (instance_id, sort_key).
+# shellcheck source=rm-suite-dbs.sh
+source "$ROOT/scripts/rm-suite-dbs.sh"
+rm_suite_dbs "$DB"
 
 source "$HOME/.cargo/env" 2>/dev/null || true
 cargo build --release -q
