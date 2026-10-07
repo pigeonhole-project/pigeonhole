@@ -5,13 +5,20 @@ use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::multipart::{Form, Part};
 use pigeonhole_blob::{ChatLimiter, DeleteOutcome, PinnedContent};
 use serde::Deserialize;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
 const ATTACHMENT_URL_CACHE_CAP: u64 = 4096;
 /// Discord CDN links expire; refresh before typical expiry.
 const ATTACHMENT_URL_TTL: Duration = Duration::from_secs(50 * 60);
+/// Discord snowflake epoch (2015-01-01T00:00:00.000Z), milliseconds.
+pub const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+/// Bulk-delete only accepts messages younger than 14 days (API error 50034).
+const BULK_DELETE_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Safety margin so we do not race the 14-day cutoff.
+const BULK_DELETE_AGE_SLACK: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 struct CachedAttachment {
@@ -25,6 +32,7 @@ pub struct DiscordClient {
     bot_token: String,
     api_base: String,
     attachment_urls: MokaCache<String, CachedAttachment>,
+    route_limits: Arc<Mutex<RouteLimitState>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +51,24 @@ pub struct Message {
     attachments: Vec<Attachment>,
 }
 
+impl Message {
+    pub fn message_id(&self) -> u64 {
+        self.id.as_u64()
+    }
+
+    pub fn message_id_i64(&self) -> i64 {
+        self.id.as_i64()
+    }
+
+    pub fn content(&self) -> Option<&str> {
+        self.content.as_deref()
+    }
+
+    pub fn first_attachment_id(&self) -> Option<String> {
+        self.attachments.first().map(|a| a.id.to_string())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Attachment {
     id: Snowflake,
@@ -59,17 +85,98 @@ enum Snowflake {
 }
 
 impl Snowflake {
-    fn as_i64(&self) -> i64 {
+    fn as_u64(&self) -> u64 {
         match self {
-            Self::Num(n) => *n as i64,
+            Self::Num(n) => *n,
             Self::Str(s) => s.parse().unwrap_or(0),
         }
+    }
+
+    fn as_i64(&self) -> i64 {
+        self.as_u64() as i64
     }
 
     fn to_string(&self) -> String {
         match self {
             Self::Num(n) => n.to_string(),
             Self::Str(s) => s.clone(),
+        }
+    }
+}
+
+/// Milliseconds since Unix epoch encoded in a Discord snowflake.
+pub fn snowflake_timestamp_ms(id: u64) -> u64 {
+    (id >> 22) + DISCORD_EPOCH_MS
+}
+
+/// Whether Discord's bulk-delete endpoint will accept this message id by age.
+pub fn snowflake_bulk_deletable(id: u64, unix_now_ms: u64) -> bool {
+    let created = snowflake_timestamp_ms(id);
+    let age_ms = unix_now_ms.saturating_sub(created);
+    let max = BULK_DELETE_MAX_AGE
+        .saturating_sub(BULK_DELETE_AGE_SLACK)
+        .as_millis() as u64;
+    age_ms < max
+}
+
+/// Per-route wait derived from `X-RateLimit-*` response headers (no token capture).
+#[derive(Default)]
+struct RouteLimitState {
+    /// Cool-down deadline per local rate budget (send / read / delete).
+    cool_down_until: [Option<Instant>; 3],
+}
+
+impl RouteLimitState {
+    fn idx(budget: RateBudget) -> Option<usize> {
+        match budget {
+            RateBudget::Send => Some(0),
+            RateBudget::Read => Some(1),
+            RateBudget::Delete => Some(2),
+            RateBudget::Download => None,
+        }
+    }
+
+    fn observe(&mut self, budget: RateBudget, headers: &HeaderMap) {
+        let Some(i) = Self::idx(budget) else {
+            return;
+        };
+        let remaining = headers
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let reset_after = headers
+            .get("x-ratelimit-reset-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<f64>().ok());
+        match (remaining, reset_after) {
+            (Some(0), Some(secs)) if secs > 0.0 => {
+                let until = Instant::now() + Duration::from_secs_f64(secs);
+                self.cool_down_until[i] = Some(match self.cool_down_until[i] {
+                    Some(prev) => prev.max(until),
+                    None => until,
+                });
+            }
+            (Some(r), _) if r > 0 => {
+                self.cool_down_until[i] = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn wait_secs(&self, budget: RateBudget) -> f64 {
+        let Some(i) = Self::idx(budget) else {
+            return 0.0;
+        };
+        match self.cool_down_until[i] {
+            Some(until) => {
+                let now = Instant::now();
+                if until > now {
+                    until.saturating_duration_since(now).as_secs_f64()
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
         }
     }
 }
@@ -130,11 +237,34 @@ impl DiscordClient {
                 .max_capacity(ATTACHMENT_URL_CACHE_CAP)
                 .time_to_live(ATTACHMENT_URL_TTL)
                 .build(),
+            route_limits: Arc::new(Mutex::new(RouteLimitState::default())),
         })
     }
 
     pub fn api_base(&self) -> &str {
         &self.api_base
+    }
+
+    /// Application id prefix from the bot token (`app_id.xxx.yyy`); never logs the secret.
+    pub fn app_id(&self) -> String {
+        self.bot_token
+            .split('.')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown")
+            .to_string()
+    }
+
+    /// Peek wait implied by last `X-RateLimit-*` observation for this budget.
+    pub fn route_wait_secs(&self, budget: RateBudget) -> f64 {
+        self.route_limits.lock().unwrap().wait_secs(budget)
+    }
+
+    fn observe_route_limits(&self, budget: RateBudget, headers: &HeaderMap) {
+        self.route_limits
+            .lock()
+            .unwrap()
+            .observe(budget, headers);
     }
 
     fn url(&self, path: &str) -> String {
@@ -204,8 +334,9 @@ impl DiscordClient {
             };
 
             let status = resp.status();
+            let headers = resp.headers().clone();
+            self.observe_route_limits(budget, &headers);
             if status.as_u16() == 429 {
-                let headers = resp.headers().clone();
                 let body: RateLimitBody = resp.json().await.unwrap_or(RateLimitBody {
                     retry_after: None,
                     message: Some("rate limited".into()),
@@ -275,8 +406,9 @@ impl DiscordClient {
             };
 
             let status = resp.status();
+            let headers = resp.headers().clone();
+            self.observe_route_limits(RateBudget::Send, &headers);
             if status.as_u16() == 429 {
-                let headers = resp.headers().clone();
                 let body: RateLimitBody = resp.json().await.unwrap_or(RateLimitBody {
                     retry_after: None,
                     message: Some("rate limited".into()),
@@ -525,6 +657,43 @@ impl DiscordClient {
         Ok(DeleteOutcome::Failed)
     }
 
+    /// `POST /channels/{channel_id}/messages/bulk-delete` (2–100 ids, each < 14 days old).
+    ///
+    /// Missing message ids are ignored by Discord; we treat 204 as success.
+    pub async fn bulk_delete_messages(
+        &self,
+        channel_id: &str,
+        message_ids: &[u64],
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<()> {
+        if message_ids.len() < 2 || message_ids.len() > 100 {
+            bail!(
+                "bulk-delete requires 2..=100 message ids, got {}",
+                message_ids.len()
+            );
+        }
+        let path = format!("channels/{channel_id}/messages/bulk-delete");
+        let body = serde_json::json!({
+            "messages": message_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        });
+        let resp = self
+            .request_with_rate_limit(limiter, RateBudget::Delete, || {
+                self.http
+                    .post(self.url(&path))
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&body)
+            })
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 204 || status.is_success() {
+            return Ok(());
+        }
+        let err_body = resp.text().await.unwrap_or_default();
+        // Do not echo request bodies / tokens; status + short API message only.
+        let snippet: String = err_body.chars().take(200).collect();
+        bail!("bulk-delete failed: {status} {snippet}");
+    }
+
     pub async fn send_text(
         &self,
         channel_id: &str,
@@ -718,8 +887,8 @@ impl DiscordClient {
     }
 }
 
-#[derive(Copy, Clone)]
-enum RateBudget {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RateBudget {
     Send,
     Read,
     Delete,
@@ -741,5 +910,33 @@ mod tests {
         assert_eq!(c.url, "https://cdn.example/a");
         dc.forget_attachment("aid").await;
         assert!(dc.cached_attachment("aid").await.is_none());
+    }
+
+    #[test]
+    fn app_id_from_token_prefix() {
+        let dc = DiscordClient::new("1234567890.abc.def".into()).unwrap();
+        assert_eq!(dc.app_id(), "1234567890");
+    }
+
+    #[test]
+    fn bulk_deletable_by_snowflake_age() {
+        let now_ms = DISCORD_EPOCH_MS + 30 * 24 * 60 * 60 * 1000;
+        let young_ts = now_ms - 2 * 24 * 60 * 60 * 1000;
+        let old_ts = now_ms - 20 * 24 * 60 * 60 * 1000;
+        let young_id = (young_ts - DISCORD_EPOCH_MS) << 22;
+        let old_id = (old_ts - DISCORD_EPOCH_MS) << 22;
+        assert!(snowflake_bulk_deletable(young_id, now_ms));
+        assert!(!snowflake_bulk_deletable(old_id, now_ms));
+    }
+
+    #[test]
+    fn route_limit_observe_remaining_zero() {
+        let mut st = RouteLimitState::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset-after", "1.5".parse().unwrap());
+        st.observe(RateBudget::Delete, &headers);
+        assert!(st.wait_secs(RateBudget::Delete) > 1.0);
+        assert_eq!(st.wait_secs(RateBudget::Send), 0.0);
     }
 }
