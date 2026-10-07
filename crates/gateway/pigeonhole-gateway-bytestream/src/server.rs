@@ -25,49 +25,68 @@ use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use prost::Message;
 use pigeonhole_blob_store::{BlobStore, Index};
+use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
+
+/// gRPC default is 4 MiB; ByteStream / Batch* need headroom above a single write frame.
+const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
+macro_rules! limit_svc {
+    ($svc:expr) => {
+        $svc.max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+    };
+}
 
 #[derive(Clone)]
 pub struct ReapiState {
     cas: CasStore,
     instance: String,
     max_batch_total_size_bytes: i64,
+    upload_ttl: Duration,
     uploads: Arc<Mutex<HashMap<String, PendingUpload>>>,
 }
 
-#[derive(Debug)]
 struct PendingUpload {
     hash_hex: String,
     size: i64,
-    buffer: Vec<u8>,
     committed_size: i64,
     complete: bool,
+    last_activity: Instant,
 }
 
-pub async fn serve(cfg: BytestreamConfig, index: Index, store: Arc<dyn BlobStore>, chat_id: String) -> Result<()> {
+fn make_state(cfg: &BytestreamConfig, index: Index, store: Arc<dyn BlobStore>, chat_id: String) -> ReapiState {
     let state = ReapiState {
         cas: CasStore::new(index.clone(), store.clone(), chat_id),
         instance: cfg.instance_name.clone(),
         max_batch_total_size_bytes: cfg.max_batch_total_size_bytes,
+        upload_ttl: Duration::from_secs(cfg.upload_ttl_secs.max(60)),
         uploads: Arc::new(Mutex::new(HashMap::new())),
     };
-
     spawn_cas_gc(state.clone(), index, store, cfg.gc_ttl_secs);
+    spawn_upload_gc(state.clone());
+    state
+}
+
+pub async fn serve(cfg: BytestreamConfig, index: Index, store: Arc<dyn BlobStore>, chat_id: String) -> Result<()> {
+    let state = make_state(&cfg, index, store, chat_id);
 
     let addr = cfg.listen_addr.parse().context("parse bytestream listen_addr")?;
     info!(%addr, instance = %cfg.instance_name, "REAPI bytestream listening");
 
     tonic::transport::Server::builder()
-        .add_service(CapabilitiesServer::new(state.clone()))
-        .add_service(ContentAddressableStorageServer::new(state.clone()))
-        .add_service(ActionCacheServer::new(state.clone()))
-        .add_service(ByteStreamServer::new(state))
+        .add_service(limit_svc!(CapabilitiesServer::new(state.clone())))
+        .add_service(limit_svc!(ContentAddressableStorageServer::new(
+            state.clone()
+        )))
+        .add_service(limit_svc!(ActionCacheServer::new(state.clone())))
+        .add_service(limit_svc!(ByteStreamServer::new(state)))
         .serve(addr)
         .await
         .context("bytestream serve")?;
@@ -88,12 +107,7 @@ pub async fn serve_ephemeral(
     let mut cfg = cfg;
     cfg.listen_addr = addr.to_string();
 
-    let state = ReapiState {
-        cas: CasStore::new(index.clone(), store.clone(), chat_id),
-        instance: cfg.instance_name.clone(),
-        max_batch_total_size_bytes: cfg.max_batch_total_size_bytes,
-        uploads: Arc::new(Mutex::new(HashMap::new())),
-    };
+    let state = make_state(&cfg, index, store, chat_id);
 
     let svc_cap = CapabilitiesServer::new(state.clone());
     let svc_cas = ContentAddressableStorageServer::new(state.clone());
@@ -102,10 +116,10 @@ pub async fn serve_ephemeral(
 
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(svc_cap)
-            .add_service(svc_cas)
-            .add_service(svc_ac)
-            .add_service(svc_bs)
+            .add_service(limit_svc!(svc_cap))
+            .add_service(limit_svc!(svc_cas))
+            .add_service(limit_svc!(svc_ac))
+            .add_service(limit_svc!(svc_bs))
             .serve_with_incoming(
                 tokio_stream::wrappers::TcpListenerStream::new(listener),
             )
@@ -114,6 +128,18 @@ pub async fn serve_ephemeral(
         Ok(())
     });
     Ok((addr, handle))
+}
+
+fn spawn_upload_gc(state: ReapiState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let ttl = state.upload_ttl;
+            let mut uploads = state.uploads.lock().await;
+            let now = Instant::now();
+            uploads.retain(|_, u| now.duration_since(u.last_activity) < ttl);
+        }
+    });
 }
 
 fn spawn_cas_gc(state: ReapiState, index: Index, store: Arc<dyn BlobStore>, ttl_secs: u64) {
@@ -133,16 +159,17 @@ fn spawn_cas_gc(state: ReapiState, index: Index, store: Arc<dyn BlobStore>, ttl_
             if let Ok(pending) = index.cas_list_pending_deletes(32).await {
                 for (hash, size) in pending {
                     match index.cas_release(&hash, size).await {
-                        Ok(Some((_chat, message_id, _fid))) => {
-                            let _ = store.delete_message(message_id).await;
+                        Ok(orphans) => {
+                            for (_chat, message_id, _fid) in orphans {
+                                let _ = store.delete_message(message_id).await;
+                            }
                         }
-                        Ok(None) => {}
                         Err(e) => warn!(error = %e, %hash, size, "cas gc release"),
                     }
                     let _ = index.cas_clear_pending_delete(&hash, size).await;
                 }
             }
-            let _ = state;
+            let _ = &state;
         }
     });
 }
@@ -411,41 +438,36 @@ impl ByteStream for ReapiState {
         let req = request.into_inner();
         let (hash_hex, size) = parse_blob_resource(&self.instance, &req.resource_name)
             .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
+        let offset = req.read_offset;
+        if offset < 0 || offset > size {
+            return Err(grpc_status(tonic::Code::OutOfRange, "read_offset out of range"));
+        }
         let data = self
             .cas
-            .get_bytes(&hash_hex, size)
+            .read_range(&hash_hex, size, offset, req.read_limit)
             .await
             .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?
             .ok_or_else(|| grpc_status(tonic::Code::NotFound, "blob not found"))?;
 
-        let offset = req.read_offset;
-        if offset < 0 || offset > data.len() as i64 {
-            return Err(grpc_status(tonic::Code::OutOfRange, "read_offset out of range"));
-        }
-        let mut end = data.len() as i64;
-        if req.read_limit > 0 {
-            end = offset.saturating_add(req.read_limit).min(end);
-        }
-        let slice = data.slice(offset as usize..end as usize);
-
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
         const CHUNK: usize = 256 * 1024;
-        let mut off = 0;
-        while off < slice.len() {
-            let end = (off + CHUNK).min(slice.len());
-            let chunk = slice.slice(off..end);
-            if tx
-                .send(Ok(ReadResponse {
-                    data: chunk.to_vec(),
-                }))
-                .await
-                .is_err()
-            {
-                break;
+        tokio::spawn(async move {
+            let mut off = 0;
+            while off < data.len() {
+                let end = (off + CHUNK).min(data.len());
+                let chunk = data.slice(off..end);
+                if tx
+                    .send(Ok(ReadResponse {
+                        data: chunk.to_vec(),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                off = end;
             }
-            off = end;
-        }
-        drop(tx);
+        });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -458,6 +480,14 @@ impl ByteStream for ReapiState {
         let mut upload_key = String::new();
         let mut expected_hash = String::new();
         let mut expected_size = 0i64;
+        let mut hasher = Sha256::new();
+        let mut committed_size = 0i64;
+        let mut finished = false;
+
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(8);
+        let mut body_tx = Some(body_tx);
+        let mut body_rx = Some(body_rx);
+        let mut ingest_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
 
         while let Some(msg) = stream.next().await {
             let req = msg.map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
@@ -468,6 +498,28 @@ impl ByteStream for ReapiState {
                 upload_key = parsed.upload_id;
                 expected_hash = parsed.hash_hex;
                 expected_size = parsed.size;
+
+                let cas = self.cas.clone();
+                let hash = expected_hash.clone();
+                let size = expected_size;
+                let rx = body_rx
+                    .take()
+                    .ok_or_else(|| grpc_status(tonic::Code::Internal, "duplicate upload init"))?;
+                ingest_handle = Some(tokio::spawn(async move {
+                    cas.put_stream(&hash, size, ReceiverStream::new(rx)).await
+                }));
+
+                let mut uploads = self.uploads.lock().await;
+                uploads.insert(
+                    upload_key.clone(),
+                    PendingUpload {
+                        hash_hex: expected_hash.clone(),
+                        size: expected_size,
+                        committed_size: 0,
+                        complete: false,
+                        last_activity: Instant::now(),
+                    },
+                );
             } else if req.resource_name != resource_name {
                 return Err(grpc_status(
                     tonic::Code::InvalidArgument,
@@ -475,54 +527,91 @@ impl ByteStream for ReapiState {
                 ));
             }
 
-            let mut uploads = self.uploads.lock().await;
-            let upload = uploads.entry(upload_key.clone()).or_insert_with(|| PendingUpload {
-                hash_hex: expected_hash.clone(),
-                size: expected_size,
-                buffer: Vec::new(),
-                committed_size: 0,
-                complete: false,
-            });
-
-            if req.write_offset != upload.buffer.len() as i64 {
+            if req.write_offset != committed_size {
                 return Err(grpc_status(
                     tonic::Code::InvalidArgument,
                     format!(
-                        "write_offset {} != committed {}",
-                        req.write_offset,
-                        upload.buffer.len()
+                        "write_offset {} != committed {committed_size}",
+                        req.write_offset
                     ),
                 ));
             }
-            upload.buffer.extend_from_slice(&req.data);
-            upload.committed_size = upload.buffer.len() as i64;
+
+            if !req.data.is_empty() {
+                hasher.update(&req.data);
+                committed_size += req.data.len() as i64;
+                let tx = body_tx.as_ref().ok_or_else(|| {
+                    grpc_status(tonic::Code::Internal, "ingest channel missing")
+                })?;
+                if tx.send(Ok(Bytes::from(req.data))).await.is_err() {
+                    return Err(grpc_status(
+                        tonic::Code::Internal,
+                        "ingest channel closed",
+                    ));
+                }
+            }
+
+            {
+                let mut uploads = self.uploads.lock().await;
+                if let Some(u) = uploads.get_mut(&upload_key) {
+                    u.committed_size = committed_size;
+                    u.last_activity = Instant::now();
+                    if req.finish_write {
+                        u.complete = true;
+                    }
+                }
+            }
+
             if req.finish_write {
-                upload.complete = true;
+                finished = true;
+                break;
             }
         }
 
-        let mut uploads = self.uploads.lock().await;
-        let upload = uploads
-            .remove(&upload_key)
-            .ok_or_else(|| grpc_status(tonic::Code::InvalidArgument, "empty write stream"))?;
+        // Close ingest body so put_stream can finish.
+        drop(body_tx.take());
 
-        if !upload.complete {
+        let Some(handle) = ingest_handle else {
+            return Err(grpc_status(
+                tonic::Code::InvalidArgument,
+                "empty write stream",
+            ));
+        };
+
+        if !finished {
+            let _ = handle.await;
+            let mut uploads = self.uploads.lock().await;
+            uploads.remove(&upload_key);
             return Err(grpc_status(
                 tonic::Code::InvalidArgument,
                 "finish_write not set",
             ));
         }
-        verify_sha256(&upload.buffer, &upload.hash_hex, upload.size)
-            .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
-        let committed_size = upload.committed_size;
-        self.cas
-            .put_bytes(
-                &upload.hash_hex,
-                upload.size,
-                Bytes::from(upload.buffer),
-            )
+
+        let digest = hex::encode(hasher.finalize());
+        if digest != expected_hash || committed_size != expected_size {
+            // Finish/cancel ingest; remove any CAS row written under the claimed digest.
+            let _ = handle.await;
+            if let Ok(orphans) = self.cas.index.cas_release(&expected_hash, expected_size).await {
+                for (_chat, message_id, _fid) in orphans {
+                    let _ = self.cas.store.delete_message(message_id).await;
+                }
+            }
+            let mut uploads = self.uploads.lock().await;
+            uploads.remove(&upload_key);
+            return Err(grpc_status(
+                tonic::Code::InvalidArgument,
+                "digest mismatch",
+            ));
+        }
+
+        handle
             .await
+            .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?
             .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
+
+        let mut uploads = self.uploads.lock().await;
+        uploads.remove(&upload_key);
 
         Ok(Response::new(WriteResponse { committed_size }))
     }

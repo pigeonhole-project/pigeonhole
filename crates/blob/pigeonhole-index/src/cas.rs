@@ -9,6 +9,14 @@ pub struct CasBlobRow {
     pub size: i64,
     pub file_id: String,
     pub last_access: String,
+    pub manifest: Option<String>,
+}
+
+/// Resolved CAS object: either a legacy single blob or a chunked manifest JSON.
+#[derive(Debug, Clone)]
+pub struct CasEntry {
+    pub file_id: String,
+    pub manifest: Option<String>,
 }
 
 impl Index {
@@ -33,14 +41,18 @@ impl Index {
     }
 
     pub async fn cas_lookup(&self, hash: &str, size: i64) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT file_id FROM cas_blobs WHERE hash = ? AND size = ?",
+        Ok(self.cas_get(hash, size).await?.map(|e| e.file_id))
+    }
+
+    pub async fn cas_get(&self, hash: &str, size: i64) -> Result<Option<CasEntry>> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT file_id, manifest FROM cas_blobs WHERE hash = ? AND size = ?",
         )
         .bind(hash)
         .bind(size)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| r.0))
+        Ok(row.map(|(file_id, manifest)| CasEntry { file_id, manifest }))
     }
 
     pub async fn cas_touch(&self, hash: &str, size: i64) -> Result<()> {
@@ -66,8 +78,8 @@ impl Index {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
-            INSERT INTO cas_blobs (hash, size, file_id, last_access)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO cas_blobs (hash, size, file_id, last_access, manifest)
+            VALUES (?, ?, ?, ?, NULL)
             ON CONFLICT(hash, size) DO UPDATE SET
                 last_access = excluded.last_access
             "#,
@@ -81,19 +93,19 @@ impl Index {
         Ok(())
     }
 
-    pub async fn cas_release(&self, hash: &str, size: i64) -> Result<Option<crate::OrphanMsg>> {
+    pub async fn cas_release(&self, hash: &str, size: i64) -> Result<Vec<crate::OrphanMsg>> {
         let mut tx = self.pool.begin().await?;
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT file_id FROM cas_blobs WHERE hash = ? AND size = ?",
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT file_id, manifest FROM cas_blobs WHERE hash = ? AND size = ?",
         )
         .bind(hash)
         .bind(size)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let Some((file_id,)) = row else {
+        let Some((file_id, manifest)) = row else {
             tx.commit().await?;
-            return Ok(None);
+            return Ok(Vec::new());
         };
 
         sqlx::query("DELETE FROM cas_blobs WHERE hash = ? AND size = ?")
@@ -102,16 +114,34 @@ impl Index {
             .execute(&mut *tx)
             .await?;
 
-        let orphan = super::index::release_blob(&mut tx, &file_id).await?;
+        let mut orphans = Vec::new();
+        if let Some(manifest) = manifest.as_deref().filter(|s| !s.is_empty()) {
+            // Manifest lists file_ids; release each. Gateway owns JSON shape.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(manifest) {
+                if let Some(chunks) = v.get("chunks").and_then(|c| c.as_array()) {
+                    for c in chunks {
+                        if let Some(fid) = c.get("file_id").and_then(|x| x.as_str()) {
+                            if let Some(o) = super::index::release_blob(&mut tx, fid).await? {
+                                orphans.push(o);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if !file_id.is_empty() && file_id != "-" {
+            if let Some(o) = super::index::release_blob(&mut tx, &file_id).await? {
+                orphans.push(o);
+            }
+        }
         tx.commit().await?;
-        Ok(orphan)
+        Ok(orphans)
     }
 
     /// Rows not accessed since `cutoff` (for TTL GC).
     pub async fn cas_stale_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<CasBlobRow>> {
         let cutoff = cutoff.to_rfc3339();
         let rows = sqlx::query_as::<_, CasBlobRow>(
-            "SELECT hash, size, file_id, last_access FROM cas_blobs WHERE last_access < ?",
+            "SELECT hash, size, file_id, last_access, manifest FROM cas_blobs WHERE last_access < ?",
         )
         .bind(cutoff)
         .fetch_all(&self.pool)
@@ -159,7 +189,9 @@ impl Index {
         Ok(())
     }
 
-    /// Bump blob refcount and insert CAS mapping (idempotent on hash+size).
+    /// Bump blob refcount(s) and insert CAS mapping (idempotent on hash+size).
+    ///
+    /// `manifest_json` when set stores chunked layout; `file_id` is then `"-"`.
     pub async fn cas_store_new_blob(
         &self,
         hash: &str,
@@ -169,6 +201,30 @@ impl Index {
         blob_size: i64,
         chat_id: &str,
         stored_crc32: Option<u32>,
+    ) -> Result<()> {
+        self.cas_store_entry(
+            hash,
+            size,
+            file_id,
+            message_id,
+            blob_size,
+            chat_id,
+            stored_crc32,
+            None,
+        )
+        .await
+    }
+
+    pub async fn cas_store_entry(
+        &self,
+        hash: &str,
+        size: i64,
+        file_id: &str,
+        message_id: i64,
+        blob_size: i64,
+        chat_id: &str,
+        stored_crc32: Option<u32>,
+        manifest_json: Option<&str>,
     ) -> Result<()> {
         if size != blob_size {
             bail!("CAS digest size {size} != payload length {blob_size}");
@@ -196,27 +252,85 @@ impl Index {
             return Ok(());
         }
 
-        super::index::bump_blob(
-            &mut tx,
-            file_id,
-            message_id,
-            blob_size,
-            chat_id,
-            stored_crc32,
-        )
-        .await?;
+        if manifest_json.is_none() {
+            super::index::bump_blob(
+                &mut tx,
+                file_id,
+                message_id,
+                blob_size,
+                chat_id,
+                stored_crc32,
+            )
+            .await?;
+        }
 
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
-            INSERT INTO cas_blobs (hash, size, file_id, last_access)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO cas_blobs (hash, size, file_id, last_access, manifest)
+            VALUES (?, ?, ?, ?, ?)
             "#,
         )
         .bind(hash)
         .bind(size)
         .bind(file_id)
         .bind(&now)
+        .bind(manifest_json)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Store a chunked CAS object: bump each chunk blob, write manifest JSON.
+    pub async fn cas_store_manifest(
+        &self,
+        hash: &str,
+        size: i64,
+        chat_id: &str,
+        chunks: &[(String, i64, i64, Option<u32>)], // file_id, message_id, blob_size, crc
+        manifest_json: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT file_id FROM cas_blobs WHERE hash = ? AND size = ?",
+        )
+        .bind(hash)
+        .bind(size)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if exists.is_some() {
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                "UPDATE cas_blobs SET last_access = ? WHERE hash = ? AND size = ?",
+            )
+            .bind(&now)
+            .bind(hash)
+            .bind(size)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        for (file_id, message_id, blob_size, crc) in chunks {
+            super::index::bump_blob(&mut tx, file_id, *message_id, *blob_size, chat_id, *crc)
+                .await?;
+        }
+
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO cas_blobs (hash, size, file_id, last_access, manifest)
+            VALUES (?, ?, '-', ?, ?)
+            "#,
+        )
+        .bind(hash)
+        .bind(size)
+        .bind(&now)
+        .bind(manifest_json)
         .execute(&mut *tx)
         .await?;
 

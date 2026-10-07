@@ -621,6 +621,13 @@ impl Index {
         .execute(&self.pool)
         .await?;
 
+        // Chunked CAS manifests (JSON). Legacy single-blob rows keep file_id and NULL manifest.
+        let _ = sqlx::query(
+            "ALTER TABLE cas_blobs ADD COLUMN manifest TEXT",
+        )
+        .execute(&self.pool)
+        .await;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS pending_cas_deletes (

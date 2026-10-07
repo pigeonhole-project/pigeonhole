@@ -17,6 +17,9 @@ prost-types = { workspace = true }
 pigeonhole-blob-store = { workspace = true }
 pigeonhole-types = { workspace = true }
 sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pigeonhole-codec = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }

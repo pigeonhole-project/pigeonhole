@@ -6,6 +6,8 @@ pub struct BytestreamConfig {
     pub max_batch_total_size_bytes: i64,
     /// TTL after last read before CAS entries are queued for GC.
     pub gc_ttl_secs: u64,
+    /// Incomplete ByteStream uploads older than this are dropped.
+    pub upload_ttl_secs: u64,
 }
 
 impl Default for BytestreamConfig {
@@ -16,6 +18,7 @@ impl Default for BytestreamConfig {
             instance_name: "s3gram".into(),
             max_batch_total_size_bytes: 4 * 1024 * 1024,
             gc_ttl_secs: 7 * 24 * 3600,
+            upload_ttl_secs: 3600,
         }
     }
 }
