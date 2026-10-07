@@ -1,5 +1,6 @@
 //! Ingest, snapshot push/restore, and shared runtime config.
 
+pub mod blob_db;
 pub mod config;
 pub mod frame_cache;
 pub mod ingest;
@@ -7,6 +8,7 @@ pub mod instances;
 pub mod read;
 pub mod snapshot;
 
+pub use blob_db::BlobDb;
 pub use config::{BackendKind, BytestreamSettings, Config, HttpSettings};
 pub use instances::{
     check_fingerprints, discord_fingerprint, discord_location, legacy_default_instance,

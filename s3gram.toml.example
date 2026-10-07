@@ -8,7 +8,23 @@
 # Telegram chat/channel for blobs + index snapshots (bot must be admin with pin rights).
 # Channels: enable "Edit messages". Groups: enable "Pin messages".
 # Pinning in groups also posts a service message.
+# Legacy single-backend form (synthesizes instance id="default"). Prefer [[instances]].
 chat_id = "-1001234567890"
+
+# Multi-backend instances (optional). Secrets via env names, never inline tokens.
+# [[instances]]
+# id = "tg-main"
+# kind = "telegram"
+# bot_token_env = "BOT_TOKEN"
+# chat_id = -1001234567890
+# role = "read-write"   # read-write | read-only | retired
+#
+# [[instances]]
+# id = "dc-backup"
+# kind = "discord"
+# bot_token_env = "DISCORD_BOT_TOKEN"
+# channel_id = 123456789012345678
+# role = "read-write"
 
 listen_addr = "0.0.0.0:8333"
 database_url = "sqlite:s3gram.db"
