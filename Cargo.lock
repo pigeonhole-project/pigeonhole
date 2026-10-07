@@ -2011,6 +2011,7 @@ dependencies = [
  "moka",
  "pigeonhole-types",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -2158,6 +2159,7 @@ dependencies = [
  "pigeonhole-blob",
  "pigeonhole-testkit",
  "pigeonhole-types",
+ "serde",
  "tokio",
 ]
 
