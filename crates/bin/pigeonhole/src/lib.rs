@@ -1,5 +1,7 @@
 //! Pigeonhole binary facade: re-exports used by tests and scripts.
 
+pub mod http_timeout;
+
 pub use pigeonhole_blob as storage;
 pub use pigeonhole_codec as chunker;
 pub use pigeonhole_codec::frames;

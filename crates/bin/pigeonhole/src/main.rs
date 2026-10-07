@@ -1,8 +1,9 @@
 use anyhow::{bail, Context};
-use axum::error_handling::{HandleError, HandleErrorLayer};
+use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
 use axum::Router;
 use pigeonhole::config::{BackendKind, Config};
+use pigeonhole::http_timeout::with_http_timeouts;
 use pigeonhole::index::{Index, IndexSnapshot};
 use pigeonhole::snapshot;
 use pigeonhole::memory::MemoryBlobStore;
@@ -16,8 +17,6 @@ use s3s::{Body, HttpError};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tower::ServiceBuilder;
-use tower::BoxError;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -238,26 +237,16 @@ async fn cmd_serve() -> anyhow::Result<()> {
     let max_headers = cfg.http.max_headers;
     let s3_service = build_s3_service(s3gram, &cfg.access_key, &cfg.secret_key);
     let s3_service = HandleError::new(s3_service, handle_s3_error);
-    let timeout = Duration::from_secs(cfg.http.request_timeout_secs);
+    let body_idle = Duration::from_secs(cfg.http.request_timeout_secs);
+    let headers_timeout = Duration::from_secs(cfg.http.headers_timeout_secs);
     let concurrency = cfg.http.max_concurrent_requests;
     let app = Router::new()
         .fallback_service(s3_service)
         .layer(axum::middleware::from_fn(move |req, next| {
             let max = max_headers;
             async move { limit_request_headers(max, req, next).await }
-        }))
-        .layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(|err: BoxError| async move {
-                    if err.is::<tower::timeout::error::Elapsed>() {
-                        StatusCode::REQUEST_TIMEOUT
-                    } else {
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    }
-                }))
-                .timeout(timeout)
-                .concurrency_limit(concurrency),
-        );
+        }));
+    let app = with_http_timeouts(app, headers_timeout, body_idle, concurrency);
 
     let addr = cfg.listen_addr.clone();
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -270,7 +259,8 @@ async fn cmd_serve() -> anyhow::Result<()> {
         chunk_size = cfg.chunk_size,
         chunk_codec = %cfg.chunk_codec,
         bytestream = cfg.bytestream.enabled,
-        request_timeout_secs = cfg.http.request_timeout_secs,
+        body_idle_timeout_secs = cfg.http.request_timeout_secs,
+        headers_timeout_secs = cfg.http.headers_timeout_secs,
         max_concurrent = cfg.http.max_concurrent_requests,
         max_headers = cfg.http.max_headers,
         "s3gram (s3s) listening on http://{addr}"

@@ -82,8 +82,12 @@ gc_ttl_secs = 604800
 # # max_blob_size = 10485760
 
 [http]
-# Per-request timeout for the S3 HTTP server.
+# Idle timeout for request/response bodies (resets on each byte frame).
+# Large streaming PUT/GET may run longer than this while bytes keep flowing.
 request_timeout_secs = 300
+# Time to produce response headers after the request body is fully received.
+# Defaults to request_timeout_secs when omitted; set 0 to disable.
+headers_timeout_secs = 300
 # Cap concurrent in-flight HTTP requests (tower ConcurrencyLimitLayer).
 max_concurrent_requests = 256
 # Reject requests with more headers than this (431).

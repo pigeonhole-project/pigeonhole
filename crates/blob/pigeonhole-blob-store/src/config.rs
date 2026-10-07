@@ -46,8 +46,13 @@ pub struct Config {
 /// Axum/tower HTTP server knobs.
 #[derive(Clone, Debug)]
 pub struct HttpSettings {
-    /// Per-request timeout (seconds).
+    /// Idle timeout for request/response bodies (seconds). Resets on each frame.
+    /// Replaces the former whole-request timeout so large streaming PUT/GET can
+    /// run longer than this as long as bytes keep flowing.
     pub request_timeout_secs: u64,
+    /// Max time to produce response headers after the request body reaches EOF.
+    /// `0` disables. Default matches [`Self::request_timeout_secs`].
+    pub headers_timeout_secs: u64,
     /// Max concurrent in-flight HTTP requests.
     pub max_concurrent_requests: usize,
     /// Max HTTP/1 headers per request (hyper).
@@ -58,6 +63,7 @@ impl Default for HttpSettings {
     fn default() -> Self {
         Self {
             request_timeout_secs: 300,
+            headers_timeout_secs: 300,
             max_concurrent_requests: 256,
             max_headers: 100,
         }
@@ -307,6 +313,7 @@ impl Default for FileConfig {
 #[serde(default)]
 struct FileHttp {
     request_timeout_secs: u64,
+    headers_timeout_secs: Option<u64>,
     max_concurrent_requests: usize,
     max_headers: usize,
 }
@@ -316,6 +323,7 @@ impl Default for FileHttp {
         let d = HttpSettings::default();
         Self {
             request_timeout_secs: d.request_timeout_secs,
+            headers_timeout_secs: None,
             max_concurrent_requests: d.max_concurrent_requests,
             max_headers: d.max_headers,
         }
@@ -324,8 +332,11 @@ impl Default for FileHttp {
 
 impl FileHttp {
     fn into_settings(self) -> HttpSettings {
+        let idle = self.request_timeout_secs.max(1);
         HttpSettings {
-            request_timeout_secs: self.request_timeout_secs.max(1),
+            request_timeout_secs: idle,
+            // Absent key → same as idle; explicit 0 disables headers timeout.
+            headers_timeout_secs: self.headers_timeout_secs.unwrap_or(idle),
             max_concurrent_requests: self.max_concurrent_requests.max(1),
             max_headers: self.max_headers.max(16),
         }
