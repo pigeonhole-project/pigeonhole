@@ -8,6 +8,10 @@ use pigeonhole::index::{Index, IndexSnapshot};
 use pigeonhole::snapshot;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::storage::{BlobStore, DeleteOutcome};
+use pigeonhole_blob::InstanceKind;
+use pigeonhole_blob_store::{
+    default_instance_for_migrate, migrate_index_to_blob_db, BlobDb,
+};
 use pigeonhole::telegram::{PinnedContent, TelegramBlobStore, TelegramClient};
 use pigeonhole::{build_s3_service, build_s3gram};
 use pigeonhole_blob::{
@@ -73,8 +77,21 @@ async fn main() -> anyhow::Result<()> {
             }
             cmd_purge(yes, expect_messages, expect_chat.as_deref()).await
         }
+        Some("migrate") => {
+            let mut dry_run = false;
+            for a in args {
+                match a.as_str() {
+                    "--dry-run" => dry_run = true,
+                    other => bail!("unknown migrate flag {other}; usage: pigeonhole migrate [--dry-run]"),
+                }
+            }
+            cmd_migrate(dry_run).await
+        }
         Some(other) => {
-            bail!("unknown command {other:?}; usage: s3gram [restore [--force] [file_id] | purge --yes]")
+            bail!(
+                "unknown command {other:?}; usage: pigeonhole \
+                 [restore [--force] [file_id] | purge --yes | migrate [--dry-run]]"
+            )
         }
         None => cmd_serve().await,
     }
@@ -278,6 +295,56 @@ async fn limit_request_headers(
         return Err(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
     }
     Ok(next.run(req).await)
+}
+
+async fn cmd_migrate(dry_run: bool) -> anyhow::Result<()> {
+    let cfg = Config::load().context("load config")?;
+    let index = Index::connect(&cfg.database_url)
+        .await
+        .context("open index")?;
+    let blob_url = blob_db_url_from_index(&cfg.database_url);
+    info!(%blob_url, dry_run, "migrate legacy index → blob.db");
+    let blob_db = BlobDb::connect(&blob_url)
+        .await
+        .context("open blob.db")?;
+
+    let kind = if cfg.memory_store {
+        InstanceKind::Memory
+    } else {
+        match cfg.backend_kind {
+            BackendKind::Telegram => InstanceKind::Telegram,
+            BackendKind::Discord => InstanceKind::Discord,
+        }
+    };
+    let token = if cfg.memory_store {
+        ""
+    } else {
+        cfg.bot_token.as_str()
+    };
+    let inst = default_instance_for_migrate(kind, token, &cfg.chat_id)?;
+    let report = migrate_index_to_blob_db(&index, &blob_db, &inst, dry_run).await?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn blob_db_url_from_index(database_url: &str) -> String {
+    // sqlite:foo.db → sqlite:foo-blob.db (preserve query suffix).
+    if let Some(rest) = database_url.strip_prefix("sqlite:") {
+        let (path, query) = match rest.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (rest, None),
+        };
+        let path = if let Some(stem) = path.strip_suffix(".db") {
+            format!("{stem}-blob.db")
+        } else {
+            format!("{path}-blob.db")
+        };
+        return match query {
+            Some(q) => format!("sqlite:{path}?{q}"),
+            None => format!("sqlite:{path}?mode=rwc"),
+        };
+    }
+    format!("{database_url}-blob")
 }
 
 /// Thin Arc wrapper so [`CachingBackend`] can own a cloneable backend handle.

@@ -7,6 +7,7 @@ pub mod frame_cache;
 pub mod ingest;
 pub mod instances;
 pub mod layer;
+pub mod migrate;
 pub mod read;
 pub mod snapshot;
 
@@ -16,6 +17,7 @@ pub use durability::{
     commit_root, start_or_restore, CheckpointPayload, Durability, JournalOp, Superblock,
 };
 pub use layer::{default_layer_opts, BlobId, BlobLayer, ChunkRef, Ingested};
+pub use migrate::{default_instance_for_migrate, migrate_index_to_blob_db, MigrateReport};
 pub use instances::{
     check_fingerprints, discord_fingerprint, discord_location, legacy_default_instance,
     memory_fingerprint, memory_location, telegram_fingerprint, telegram_location, validate_instances,
