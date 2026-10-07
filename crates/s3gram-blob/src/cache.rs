@@ -170,7 +170,17 @@ impl<B: BlobBackend + 'static> CachingBackend<B> {
     }
 
     fn key_for(&self, loc: &Locator) -> BlobKey {
-        BlobKey::new(self.inner.id().clone(), loc.clone())
+        // CDN URLs are ephemeral — drop them from the cache key.
+        let loc = match loc {
+            Locator::Discord {
+                channel_id,
+                message_id,
+                attachment_id,
+                ..
+            } => Locator::discord(channel_id, *message_id, attachment_id, ""),
+            other => other.clone(),
+        };
+        BlobKey::new(self.inner.id().clone(), loc)
     }
 
     pub async fn invalidate_key(&self, key: &BlobKey) {
@@ -284,12 +294,9 @@ impl<B: BlobBackend + 'static> crate::BlobStore for CachingBackend<B> {
     }
 
     async fn invalidate_blob(&self, file_id: &str) {
-        let loc = if self.id().as_str().starts_with("memory:") {
-            Locator::memory(file_id, 0)
-        } else {
-            Locator::telegram(file_id, 0)
-        };
-        self.invalidate_locator(&loc).await;
+        if let Ok(loc) = crate::backend::locator_for_store_file_id(self, file_id) {
+            self.invalidate_locator(&loc).await;
+        }
     }
 }
 

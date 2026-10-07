@@ -23,6 +23,7 @@ Layout is a Cargo workspace under `crates/`:
 | `s3gram-chunk` | Codecs + `FrameWriter` |
 | `s3gram-blob` | `BlobBackend` / `BlobStore`, `MemoryBackend`, `ChatLimiter`, `BootstrapPointer` |
 | `s3gram-telegram` | Bot API client + `TelegramBackend` (Range best-effort) |
+| `s3gram-discord` | Discord Bot API backend (default feature) |
 | `s3gram-index` | SQLite index |
 | `s3gram-engine` | Ingest, snapshots, config (no Telegram dependency) |
 | `s3gram-s3` | `s3s::S3` impl |
@@ -70,6 +71,34 @@ cargo run --release
 
 Listens on `http://0.0.0.0:8333` by default (`listen_addr` in TOML).
 
+### Discord backend
+
+Discord is enabled by default (`--features discord`). Point the binary at a channel:
+
+```toml
+[backend]
+kind = "discord"
+
+[discord]
+channel_id = "123456789012345678"
+# optional: max_blob_size = 10485760
+```
+
+```bash
+# .env
+DISCORD_BOT_TOKEN=...
+AWS_ACCESS_KEY_ID=s3gram
+AWS_SECRET_ACCESS_KEY=s3gramsecret
+
+cargo run --release
+# manual live suite (not CI): make compat-discord
+```
+
+The bot needs permission to view the channel, send messages, attach files, read
+history, and pin messages. Attachment CDN URLs are cached (~50 min) and refreshed
+on 403/404. Default `max_blob_size` is ~10 MiB (Discord limit minus margin) —
+set `[chunk].size` accordingly.
+
 ### Bazel / Buck2 remote cache (REAPI)
 
 Build with the `bytestream` feature, enable `[bytestream]` in `s3gram.toml`, then
@@ -91,11 +120,13 @@ See [`s3gram.toml.example`](s3gram.toml.example):
 
 | TOML | Meaning |
 |---|---|
-| `chat_id` | Telegram chat/channel for blobs + snapshots |
+| `[backend].kind` | `telegram` (default) \| `discord` |
+| `chat_id` | Telegram chat/channel (or fallback Discord channel id) |
+| `[discord].channel_id` | Discord channel for blobs + pins |
 | `listen_addr` | Bind address |
 | `database_url` | SQLite URL |
 | `region` | SigV4 region string |
-| `memory` | `true` → MemoryBlobStore (no Telegram) |
+| `memory` | `true` → MemoryBlobStore (no Telegram/Discord) |
 | `[snapshot].interval_secs` | Auto snapshot period (`0` disables) |
 | `[chunk].size` | Max **on-wire** chunk size (`< 20 MiB`) |
 | `[chunk].codec` | `raw` \| `gzip` \| `zstd` |

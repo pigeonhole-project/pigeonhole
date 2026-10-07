@@ -131,11 +131,13 @@ impl Locator {
         format!("{message_id}:{attachment_id}")
     }
 
-    /// Parse a legacy store file id into `(message_id, attachment_id)`.
+    /// Parse a Discord store file id `{message_id}:{attachment_id}` (both snowflakes).
     pub fn parse_discord_store_file_id(file_id: &str) -> Option<(i64, &str)> {
         let (mid, aid) = file_id.split_once(':')?;
         let mid = mid.parse().ok()?;
-        if aid.is_empty() {
+        // Attachment ids are Discord snowflakes (decimal). Reject other `:` shapes
+        // so Telegram file_ids are never misclassified.
+        if aid.is_empty() || !aid.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
         Some((mid, aid))

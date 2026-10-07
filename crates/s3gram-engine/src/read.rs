@@ -12,6 +12,12 @@ use std::sync::Arc;
 fn blob_key_for(file_id: &str) -> BlobKey {
     let (backend, loc) = if file_id.starts_with("mem-") {
         (BackendId::memory(), Locator::memory(file_id, 0))
+    } else if let Some((message_id, attachment_id)) = Locator::parse_discord_store_file_id(file_id)
+    {
+        (
+            BackendId::new("discord", "cached"),
+            Locator::discord("cached", message_id, attachment_id, ""),
+        )
     } else {
         (BackendId::new("tg", "cached"), Locator::telegram(file_id, 0))
     };

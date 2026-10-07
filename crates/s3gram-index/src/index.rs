@@ -2156,16 +2156,23 @@ async fn upsert_replica_tx(
     message_id: i64,
     chat_id: &str,
 ) -> Result<()> {
-    let backend_id = if chat_id.is_empty() {
-        s3gram_core::BackendId::memory().0
+    let (backend_id, locator) = if chat_id.is_empty() {
+        (
+            s3gram_core::BackendId::memory(),
+            s3gram_core::Locator::memory(file_id, message_id),
+        )
+    } else if let Some((mid, aid)) = s3gram_core::Locator::parse_discord_store_file_id(file_id) {
+        (
+            s3gram_core::BackendId::discord(chat_id),
+            s3gram_core::Locator::discord(chat_id, mid, aid, ""),
+        )
     } else {
-        s3gram_core::BackendId::telegram(chat_id).0
+        (
+            s3gram_core::BackendId::telegram(chat_id),
+            s3gram_core::Locator::telegram(file_id, message_id),
+        )
     };
-    let locator = if chat_id.is_empty() {
-        s3gram_core::Locator::memory(file_id, message_id)
-    } else {
-        s3gram_core::Locator::telegram(file_id, message_id)
-    };
+    let backend_id = backend_id.0;
     let locator_json = locator.to_json()?;
     sqlx::query(
         r#"

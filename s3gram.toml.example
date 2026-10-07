@@ -74,12 +74,12 @@ max_batch_total_size_bytes = 4194304
 # 0 disables TTL GC for CAS entries.
 gc_ttl_secs = 604800
 
-# Optional Discord backend (build with `--features discord`).
+# Discord backend (default binary feature `discord`). Secret: DISCORD_BOT_TOKEN.
 # [backend]
 # kind = "discord"
 # [discord]
 # channel_id = "123456789012345678"
-# # DISCORD_BOT_TOKEN from env
+# # max_blob_size = 10485760
 
 [http]
 # Per-request timeout for the S3 HTTP server.

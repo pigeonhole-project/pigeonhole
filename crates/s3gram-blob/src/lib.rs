@@ -10,8 +10,8 @@ mod store;
 pub mod testkit;
 
 pub use backend::{
-    bytes_stream, collect_stream, slice_range, store_delete_message, store_get, store_put,
-    BlobBackend, BlobStore, BoxByteStream,
+    bytes_stream, collect_stream, locator_for_store_file_id, slice_range, store_delete_message,
+    store_get, store_put, BlobBackend, BlobStore, BoxByteStream,
 };
 pub use bootstrap::BootstrapPointer;
 pub use cache::{CacheConfig, CacheMetrics, CachedBlob, CachingBackend};

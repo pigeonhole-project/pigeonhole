@@ -213,6 +213,12 @@ impl BlobStore for DiscordBlobStore {
             )
             .await
     }
+
+    async fn invalidate_blob(&self, file_id: &str) {
+        if let Some((_mid, aid)) = Locator::parse_discord_store_file_id(file_id) {
+            self.dc.forget_attachment(aid).await;
+        }
+    }
 }
 
 #[async_trait]

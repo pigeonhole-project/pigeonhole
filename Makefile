@@ -1,7 +1,11 @@
-.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram test test-all
+.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all
 
 run:
 	cargo run --release
+
+# Same as `run` with Discord backend compiled in (default feature).
+run-discord:
+	cargo run --release --features discord
 
 smoke:
 	./scripts/smoke.sh
@@ -35,6 +39,10 @@ compat-rclone:
 # Extra args forwarded to compat.sh, e.g. `make compat-telegram ARGS=--all`
 compat-telegram:
 	./scripts/compat-telegram.sh $(ARGS)
+
+# Manual Discord Bot API suite (not in CI). Needs DISCORD_BOT_TOKEN + channel_id.
+compat-discord:
+	./scripts/compat-discord.sh $(ARGS)
 
 test:
 	cargo test --workspace
