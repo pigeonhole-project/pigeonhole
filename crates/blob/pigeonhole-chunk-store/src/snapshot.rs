@@ -574,13 +574,13 @@ pub fn spawn_pending_deletes(index: Index, store: Arc<dyn LegacyBlobStore>) {
     });
 }
 
-/// Stage 2.2: store a gateway index snapshot via [`BlobLayer`] + durable root.
+/// Stage 2.2: store a gateway index snapshot via [`ChunkStore`] + durable root.
 ///
 /// Does **not** pin a Telegram/Discord message itself — the blob-layer superblock
 /// (`commit_root`) is the single commit point for roots.
 pub async fn push_gateway_snapshot(
     index: &Index,
-    layer: &crate::layer::BlobLayer,
+    layer: &crate::layer::ChunkStore,
     dur: &crate::durability::Durability,
     root_name: &str,
 ) -> Result<PushOutcome> {
@@ -633,7 +633,7 @@ pub async fn push_gateway_snapshot(
 /// Load a gateway snapshot blob referenced by root and import into `index`.
 pub async fn restore_gateway_snapshot(
     index: &Index,
-    layer: &crate::layer::BlobLayer,
+    layer: &crate::layer::ChunkStore,
     root_name: &str,
 ) -> Result<()> {
     let blob_id = layer
@@ -696,7 +696,7 @@ mod tests {
     async fn gateway_snapshot_via_layer_roundtrip() {
         use crate::durability::{Durability, Superblock};
         use crate::ingest::IngestOptions;
-        use crate::layer::BlobLayer;
+        use crate::layer::ChunkStore;
         use async_trait::async_trait;
         use pigeonhole_blob::TypedBootstrapPointer;
         use pigeonhole_codec::ChunkCodec;
@@ -723,7 +723,7 @@ mod tests {
         let db = crate::BlobDb::connect(&blob_url).await.unwrap();
         let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
         opts.block_size = 64 * 1024;
-        let layer = BlobLayer::open(db, MemoryBlobStore::new(), opts)
+        let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
             .await
             .unwrap();
         let pin = Arc::new(MemPin {

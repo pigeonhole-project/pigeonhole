@@ -9,7 +9,7 @@ use pigeonhole::snapshot;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::storage::DeleteOutcome;
 use pigeonhole_blob::InstanceKind;
-use pigeonhole_blob_store::{
+use pigeonhole_chunk_store::{
     default_instance_for_migrate, migrate_index_to_blob_db, BlobDb,
 };
 use pigeonhole::telegram::{PinnedContent, TelegramBlobStore, TelegramClient};

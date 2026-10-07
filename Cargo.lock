@@ -1978,7 +1978,7 @@ dependencies = [
  "http",
  "http-body",
  "pigeonhole-blob",
- "pigeonhole-blob-store",
+ "pigeonhole-chunk-store",
  "pigeonhole-codec",
  "pigeonhole-gateway-bytestream",
  "pigeonhole-gateway-s3",
@@ -2018,7 +2018,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pigeonhole-blob-store"
+name = "pigeonhole-chunk-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2072,7 +2072,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
- "pigeonhole-blob-store",
+ "pigeonhole-chunk-store",
  "pigeonhole-codec",
  "pigeonhole-storage-memory",
  "pigeonhole-types",
@@ -2104,7 +2104,7 @@ dependencies = [
  "hex",
  "http",
  "md-5 0.10.6",
- "pigeonhole-blob-store",
+ "pigeonhole-chunk-store",
  "pigeonhole-codec",
  "pigeonhole-types",
  "s3s",

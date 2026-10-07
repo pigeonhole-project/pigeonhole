@@ -24,7 +24,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use prost::Message;
-use pigeonhole_blob_store::{store_delete_message, Index, LegacyBlobStore};
+use pigeonhole_chunk_store::{store_delete_message, Index, LegacyBlobStore};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;

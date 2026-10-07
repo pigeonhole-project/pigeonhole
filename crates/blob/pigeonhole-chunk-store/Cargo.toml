@@ -1,5 +1,5 @@
 [package]
-name = "pigeonhole-blob-store"
+name = "pigeonhole-chunk-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

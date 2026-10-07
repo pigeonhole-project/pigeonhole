@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use pigeonhole_blob_store::Index;
+use pigeonhole_chunk_store::Index;
 use sqlx::FromRow;
 
 #[derive(Debug, Clone, FromRow)]
@@ -78,7 +78,7 @@ impl CasIndex {
         Ok(())
     }
 
-    pub async fn release(&self, hash: &str, size: i64) -> Result<Vec<pigeonhole_blob_store::OrphanMsg>> {
+    pub async fn release(&self, hash: &str, size: i64) -> Result<Vec<pigeonhole_chunk_store::OrphanMsg>> {
         self.index.cas_release(hash, size).await
     }
 

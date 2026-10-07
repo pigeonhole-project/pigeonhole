@@ -25,7 +25,7 @@ serde_json = { workspace = true }
 pigeonhole-blob = { workspace = true }
 pigeonhole-types = { workspace = true }
 pigeonhole-codec = { workspace = true }
-pigeonhole-blob-store = { workspace = true }
+pigeonhole-chunk-store = { workspace = true }
 pigeonhole-index = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true }

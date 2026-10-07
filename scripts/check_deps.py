@@ -19,7 +19,7 @@ ROLE = {
     "s3gram-engine": "blob-store",
     "pigeonhole-index": "blob-store",
     "pigeonhole-engine": "blob-store",
-    "pigeonhole-blob-store": "blob-store",
+    "pigeonhole-chunk-store": "blob-store",
     # index remains a blob-store-layer crate until fully merged
     "s3gram-telegram": "storage",
     "s3gram-discord": "storage",

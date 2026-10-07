@@ -2,14 +2,14 @@
 
 use pigeonhole_codec::ChunkCodec;
 use pigeonhole_types::{BackendId, BlobKey, Locator};
-use pigeonhole_blob_store::config::Config;
-use pigeonhole_blob_store::block_cache::BlockCache;
-use pigeonhole_blob_store::ingest::{
+use pigeonhole_chunk_store::config::Config;
+use pigeonhole_chunk_store::block_cache::BlockCache;
+use pigeonhole_chunk_store::ingest::{
     decode_chunk_slice_async, ingest_stream_with_options, IngestHasher, IngestOptions,
     UploadedChunk,
 };
-use pigeonhole_blob_store::read::read_chunk_range_cached;
-use pigeonhole_blob_store::{
+use pigeonhole_chunk_store::read::read_chunk_range_cached;
+use pigeonhole_chunk_store::{
     parse_rfc3339, store_delete_message, store_get, Chunk, DeleteBucketResult, DeleteOutcome, Index,
     LegacyBlobStore, OrphanMsg,
 };

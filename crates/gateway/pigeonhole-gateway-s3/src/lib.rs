@@ -3,7 +3,7 @@
 mod service;
 
 pub use service::S3gram;
-pub use pigeonhole_blob_store::{LegacyBlobStore, DeleteOutcome, Config, Index};
+pub use pigeonhole_chunk_store::{LegacyBlobStore, DeleteOutcome, Config, Index};
 
 use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};

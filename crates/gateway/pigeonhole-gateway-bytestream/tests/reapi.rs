@@ -1,7 +1,7 @@
 //! In-process REAPI tests (localhost only, no external network).
 
 use bytes::Bytes;
-use pigeonhole_blob_store::{LegacyBlobStore, Index};
+use pigeonhole_chunk_store::{LegacyBlobStore, Index};
 use pigeonhole_storage_memory::MemoryBlobStore;
 use pigeonhole_gateway_bytestream::config::BytestreamConfig;
 use pigeonhole_gateway_bytestream::digest::sha256_hex;

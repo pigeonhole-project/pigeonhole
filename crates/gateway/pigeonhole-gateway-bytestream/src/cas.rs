@@ -3,7 +3,7 @@ use crate::digest::{digest_hash_hex, verify_sha256};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
-use pigeonhole_blob_store::{
+use pigeonhole_chunk_store::{
     collect_stream, ingest_stream_with_options, read_chunk_range_cached, store_delete_message,
     store_get, BoxByteStream, BlockRecord, ChunkCodec, Index, IngestOptions, LegacyBlobStore,
     UploadedChunk,
@@ -335,7 +335,7 @@ async fn stream_chunk_range(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use pigeonhole_blob_store::DeleteOutcome;
+    use pigeonhole_chunk_store::DeleteOutcome;
     use pigeonhole_storage_memory::MemoryBlobStore;
     use sha2::{Digest as _, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};

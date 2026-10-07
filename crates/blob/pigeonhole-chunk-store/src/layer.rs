@@ -34,7 +34,7 @@ pub struct Ingested {
 }
 
 /// Blob layer: metadata (`blob.db`) + typed backends behind [`DynBlobBackend`].
-pub struct BlobLayer {
+pub struct ChunkStore {
     db: BlobDb,
     write: SharedBackend,
     /// Instance id used for new replicas (must exist in `instances`).
@@ -45,7 +45,7 @@ pub struct BlobLayer {
     memory_budget: Option<ByteBudget>,
 }
 
-impl BlobLayer {
+impl ChunkStore {
     pub async fn open<B: Sweepable>(
         db: BlobDb,
         backend: B,
@@ -339,14 +339,14 @@ pub fn default_layer_opts() -> IngestOptions {
 
 /// Test helper: open a memory-backed layer with a temp `blob.db`.
 #[cfg(test)]
-pub async fn open_memory_layer(db_url: &str) -> Result<BlobLayer> {
+pub async fn open_memory_chunk_store(db_url: &str) -> Result<ChunkStore> {
     use pigeonhole_codec::DEFAULT_BLOCK_SIZE;
     use pigeonhole_storage_memory::MemoryBlobStore;
     let db = BlobDb::connect(db_url).await?;
     let mut opts = default_layer_opts();
     opts.chunk_size = 64 * 1024;
     opts.block_size = DEFAULT_BLOCK_SIZE;
-    BlobLayer::open(db, MemoryBlobStore::new(), opts).await
+    ChunkStore::open(db, MemoryBlobStore::new(), opts).await
 }
 
 #[cfg(test)]
@@ -358,7 +358,7 @@ mod tests {
     async fn ingest_read_retain_release_root() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let layer = open_memory_layer(&url).await.unwrap();
+        let layer = open_memory_chunk_store(&url).await.unwrap();
 
         let body = Bytes::from(vec![7u8; 200_000]);
         let ingested = layer

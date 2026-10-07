@@ -22,12 +22,12 @@ pub struct DiscordId {
     pub attachment_id: String,
 }
 
-/// `dc:{app_id}:{channel_id}` — matches `pigeonhole_blob_store::instances::discord_fingerprint`.
+/// `dc:{app_id}:{channel_id}` — matches `pigeonhole_chunk_store::instances::discord_fingerprint`.
 pub fn discord_fingerprint(app_id: &str, channel_id: &str) -> String {
     format!("dc:{app_id}:{channel_id}")
 }
 
-/// `dc:channel:{channel_id}` — matches `pigeonhole_blob_store::instances::discord_location`.
+/// `dc:channel:{channel_id}` — matches `pigeonhole_chunk_store::instances::discord_location`.
 pub fn discord_location(channel_id: &str) -> String {
     format!("dc:channel:{channel_id}")
 }

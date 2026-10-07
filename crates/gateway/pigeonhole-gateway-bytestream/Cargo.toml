@@ -14,7 +14,7 @@ futures = { workspace = true }
 hex = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-pigeonhole-blob-store = { workspace = true }
+pigeonhole-chunk-store = { workspace = true }
 pigeonhole-types = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
@@ -31,7 +31,7 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
-pigeonhole-blob-store = { workspace = true }
+pigeonhole-chunk-store = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

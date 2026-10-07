@@ -558,7 +558,7 @@ pub async fn start_or_restore(
 mod tests {
     use super::*;
     use crate::ingest::IngestOptions;
-    use crate::layer::BlobLayer;
+    use crate::layer::ChunkStore;
     use async_trait::async_trait;
     use pigeonhole_codec::ChunkCodec;
     use pigeonhole_storage_memory::MemoryBlobStore;
@@ -587,7 +587,7 @@ mod tests {
         let mem = MemoryBlobStore::new();
         let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
         opts.block_size = 64 * 1024;
-        let layer = BlobLayer::open(db.clone(), mem, opts).await.unwrap();
+        let layer = ChunkStore::open(db.clone(), mem, opts).await.unwrap();
         let backend = layer.write_backend();
         let info = backend.instance().clone();
 
@@ -637,7 +637,7 @@ mod tests {
         let mem = MemoryBlobStore::new();
         let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
         opts.block_size = 64 * 1024;
-        let layer = BlobLayer::open(db.clone(), mem, opts).await.unwrap();
+        let layer = ChunkStore::open(db.clone(), mem, opts).await.unwrap();
         let backend = layer.write_backend();
         let info = backend.instance().clone();
         let pin = Arc::new(MemPin {

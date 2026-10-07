@@ -24,7 +24,7 @@ Layout is a Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 | `core/pigeonhole-codec` | Codecs + `BlockWriter` |
 | `blob/pigeonhole-blob` | `LegacyBlobStore` / `LegacyBlobStoreTg`, rate limits, `BootstrapPointer`, cache |
 | `blob/pigeonhole-index` | SQLite index (blob-store layer; merging into blob-store later) |
-| `blob/pigeonhole-blob-store` | Ingest, snapshots, config (no protocol crates) |
+| `blob/pigeonhole-chunk-store` | Ingest, snapshots, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
 | `storage/pigeonhole-storage-discord` | Discord Bot API storage |
 | `storage/pigeonhole-storage-memory` | In-memory storage for tests / `memory = true` |
