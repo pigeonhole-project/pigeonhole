@@ -577,6 +577,86 @@ pub fn spawn_pending_deletes(index: Index, store: Arc<dyn BlobStore>) {
     });
 }
 
+/// Stage 2.2: store a gateway index snapshot via [`BlobLayer`] + durable root.
+///
+/// Does **not** pin a Telegram/Discord message itself — the blob-layer superblock
+/// (`commit_root`) is the single commit point for roots.
+pub async fn push_gateway_snapshot(
+    index: &Index,
+    layer: &crate::layer::BlobLayer,
+    dur: &crate::durability::Durability,
+    root_name: &str,
+) -> Result<PushOutcome> {
+    let snap = index.export_snapshot().await.context("export snapshot")?;
+    let json = serde_json::to_vec(&snap).context("serialize snapshot")?;
+    let hash = hex::encode(Sha256::digest(&json));
+
+    if let Some(prev) = index.get_meta(META_HASH).await? {
+        if prev == hash {
+            return Ok(PushOutcome::Unchanged { hash });
+        }
+    }
+
+    let generation = index
+        .get_meta(META_GENERATION)
+        .await?
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+
+    let compressed = gzip_json(&json).context("gzip snapshot")?;
+    let blob_id = layer
+        .put_small(Bytes::from(compressed))
+        .await
+        .context("put_small gateway snapshot")?;
+    crate::durability::commit_root(layer.db(), dur, root_name, blob_id)
+        .await
+        .context("commit_root gateway snapshot")?;
+
+    index.set_meta(META_HASH, &hash).await?;
+    index
+        .set_meta(META_GENERATION, &generation.to_string())
+        .await?;
+    index
+        .set_meta(META_FILE_ID, &format!("blob:{blob_id}"))
+        .await?;
+    index
+        .set_meta(META_MESSAGE_ID, "0")
+        .await?;
+
+    info!(%hash, generation, %root_name, blob_id, "gateway snapshot stored via blob layer");
+    Ok(PushOutcome::Uploaded {
+        hash,
+        message_id: 0,
+        generation,
+        parts: 1,
+    })
+}
+
+/// Load a gateway snapshot blob referenced by root and import into `index`.
+pub async fn restore_gateway_snapshot(
+    index: &Index,
+    layer: &crate::layer::BlobLayer,
+    root_name: &str,
+) -> Result<()> {
+    let blob_id = layer
+        .get_root(root_name)
+        .await?
+        .with_context(|| format!("missing root {root_name}"))?;
+    let data = layer
+        .read(
+            &[crate::layer::ChunkRef { blob_id }],
+            None,
+        )
+        .await
+        .context("read gateway snapshot blob")?;
+    let json = gunzip_bytes(&data).context("gunzip gateway snapshot")?;
+    let snap: pigeonhole_index::IndexSnapshot =
+        serde_json::from_slice(&json).context("parse gateway snapshot")?;
+    index.import_snapshot(&snap).await.context("import snapshot")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +693,68 @@ mod tests {
         assert!(parse_pin_manifest(s).is_err());
         let bytes = br#"{"format":1,"generation":1,"created_at":"x","sha256":"abcd","parts":[{"message_id":1,"file_id":"f","size":1}]}"#;
         assert!(parse_pin_manifest_bytes(bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn gateway_snapshot_via_layer_roundtrip() {
+        use crate::durability::{Durability, Superblock};
+        use crate::ingest::IngestOptions;
+        use crate::layer::BlobLayer;
+        use async_trait::async_trait;
+        use pigeonhole_blob::TypedBootstrapPointer;
+        use pigeonhole_codec::ChunkCodec;
+        use pigeonhole_storage_memory::MemoryBlobStore;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        struct MemPin {
+            data: StdMutex<Option<Bytes>>,
+        }
+        #[async_trait]
+        impl TypedBootstrapPointer for MemPin {
+            async fn read(&self) -> Result<Option<Bytes>> {
+                Ok(self.data.lock().unwrap().clone())
+            }
+            async fn swap(&self, new: Bytes) -> Result<()> {
+                *self.data.lock().unwrap() = Some(new);
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob_url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+        let idx_url = format!("sqlite:{}?mode=rwc", dir.path().join("s3.db").display());
+        let db = crate::BlobDb::connect(&blob_url).await.unwrap();
+        let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
+        opts.frame_size = 64 * 1024;
+        let layer = BlobLayer::open(db, MemoryBlobStore::new(), opts)
+            .await
+            .unwrap();
+        let pin = Arc::new(MemPin {
+            data: StdMutex::new(None),
+        });
+        let info_id = layer.write_instance_id().to_string();
+        let fp = layer.write_backend().instance().fingerprint.clone();
+        let dur = Durability::new(
+            layer.write_backend(),
+            pin,
+            Superblock::new(0, info_id, fp),
+        );
+        dur.checkpoint(layer.db()).await.unwrap();
+
+        let index = Index::connect(&idx_url).await.unwrap();
+        index.create_bucket("demo", "").await.unwrap();
+
+        let out = push_gateway_snapshot(&index, &layer, &dur, "s3/index")
+            .await
+            .unwrap();
+        assert!(matches!(out, PushOutcome::Uploaded { .. }));
+
+        let idx2_url = format!("sqlite:{}?mode=rwc", dir.path().join("s3b.db").display());
+        let index2 = Index::connect(&idx2_url).await.unwrap();
+        restore_gateway_snapshot(&index2, &layer, "s3/index")
+            .await
+            .unwrap();
+        let buckets = index2.list_buckets().await.unwrap();
+        assert!(buckets.iter().any(|b| b.name == "demo"));
     }
 }
