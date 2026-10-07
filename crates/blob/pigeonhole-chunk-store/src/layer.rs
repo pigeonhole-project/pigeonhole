@@ -1,6 +1,6 @@
 //! Gateway-facing blob layer API (stage 1.6).
 //!
-//! Gateways see only [`BlobId`] / [`ChunkRef`] — not `DynBlobBackend`, locators, or instances.
+//! Gateways see only [`ChunkId`] / [`ChunkRef`] — not `DynBlobBackend`, locators, or instances.
 
 use crate::blob_db::BlobDb;
 use crate::ingest::IngestOptions;
@@ -16,18 +16,18 @@ use pigeonhole_types::ByteRange;
 use std::sync::Arc;
 
 /// Internal integer blob id (row in `blobs`).
-pub type BlobId = i64;
+pub type ChunkId = i64;
 
 /// Reference to an ingested chunk for ranged reads.
 #[derive(Debug, Clone)]
 pub struct ChunkRef {
-    pub blob_id: BlobId,
+    pub chunk_id: ChunkId,
 }
 
 /// Result of streaming ingest.
 #[derive(Debug)]
 pub struct Ingested {
-    pub blobs: Vec<BlobId>,
+    pub blobs: Vec<ChunkId>,
     pub size: i64,
     pub md5: [u8; 16],
     pub crc32: u32,
@@ -78,7 +78,7 @@ impl ChunkStore {
         &self.write_instance_id
     }
 
-    pub async fn put_small(&self, data: Bytes) -> Result<BlobId> {
+    pub async fn put_small(&self, data: Bytes) -> Result<ChunkId> {
         if data.is_empty() {
             bail!("put_small refuses empty payload");
         }
@@ -88,19 +88,19 @@ impl ChunkStore {
         self.register_blob(size, crc, &stored, &[]).await
     }
 
-    pub async fn set_root(&self, name: &str, id: BlobId) -> Result<()> {
+    pub async fn set_root(&self, name: &str, id: ChunkId) -> Result<()> {
         self.db.set_root(name, id).await
     }
 
-    pub async fn get_root(&self, name: &str) -> Result<Option<BlobId>> {
+    pub async fn get_root(&self, name: &str) -> Result<Option<ChunkId>> {
         self.db.get_root(name).await
     }
 
-    pub async fn retain(&self, ids: &[BlobId]) -> Result<()> {
+    pub async fn retain(&self, ids: &[ChunkId]) -> Result<()> {
         self.db.retain(ids).await
     }
 
-    pub async fn release(&self, ids: &[BlobId]) -> Result<()> {
+    pub async fn release(&self, ids: &[ChunkId]) -> Result<()> {
         self.db.release(ids).await
     }
 
@@ -133,9 +133,9 @@ impl ChunkStore {
         for ch in blobs {
             let meta = self
                 .db
-                .blob_meta(ch.blob_id)
+                .chunk_meta(ch.chunk_id)
                 .await?
-                .with_context(|| format!("unknown blob_id {}", ch.blob_id))?;
+                .with_context(|| format!("unknown chunk_id {}", ch.chunk_id))?;
             let logical = meta.0 as u64;
             let start = cursor;
             let end = cursor + logical;
@@ -155,7 +155,7 @@ impl ChunkStore {
             if local_from >= local_to {
                 continue;
             }
-            pieces.push(self.read_blob_range(ch.blob_id, local_from, local_to).await?);
+            pieces.push(self.read_blob_range(ch.chunk_id, local_from, local_to).await?);
         }
         if pieces.is_empty() {
             return Ok(Bytes::new());
@@ -170,18 +170,18 @@ impl ChunkStore {
         Ok(Bytes::from(out))
     }
 
-    async fn read_blob_range(&self, blob_id: BlobId, from: usize, to: usize) -> Result<Bytes> {
+    async fn read_blob_range(&self, chunk_id: ChunkId, from: usize, to: usize) -> Result<Bytes> {
         let (_inst, _key, locator) = self
             .db
-            .get_any_replica(blob_id)
+            .get_any_replica(chunk_id)
             .await?
-            .with_context(|| format!("no replica for blob {blob_id}"))?;
+            .with_context(|| format!("no replica for blob {chunk_id}"))?;
         let stored = BlobLocator {
             key: _key,
             locator,
         };
         let raw = collect_stream(self.write.get(&stored, None).await?).await?;
-        let frames = self.db.get_blocks(blob_id).await?;
+        let frames = self.db.get_blocks(chunk_id).await?;
         if frames.is_empty() {
             if from > to || to > raw.len() {
                 bail!("range {from}..{to} outside raw blob {}", raw.len());
@@ -197,20 +197,20 @@ impl ChunkStore {
         crc: u32,
         stored: &BlobLocator,
         blocks: &[BlockRecord],
-    ) -> Result<BlobId> {
-        let blob_id = self.db.insert_blob(size, crc).await?;
+    ) -> Result<ChunkId> {
+        let chunk_id = self.db.insert_chunk(size, crc).await?;
         self.db
             .add_replica(
-                blob_id,
+                chunk_id,
                 &self.write_instance_id,
                 &stored.key,
                 &stored.locator,
             )
             .await?;
         if !blocks.is_empty() {
-            self.db.replace_blocks(blob_id, blocks).await?;
+            self.db.replace_blocks(chunk_id, blocks).await?;
         }
-        Ok(blob_id)
+        Ok(chunk_id)
     }
 
     async fn ingest_raw<S>(&self, stream: &mut S, chunk_size: usize) -> Result<Ingested>
@@ -252,7 +252,7 @@ impl ChunkStore {
         })
     }
 
-    async fn put_raw_piece(&self, piece: Vec<u8>) -> Result<BlobId> {
+    async fn put_raw_piece(&self, piece: Vec<u8>) -> Result<ChunkId> {
         let logical = piece.len() as i64;
         let crc = crc32fast::hash(&piece);
         let stored = self
@@ -319,7 +319,7 @@ impl ChunkStore {
         })
     }
 
-    async fn put_completed(&self, mut done: pigeonhole_codec::CompletedChunk) -> Result<BlobId> {
+    async fn put_completed(&self, mut done: pigeonhole_codec::CompletedChunk) -> Result<ChunkId> {
         let logical = done.logical_size;
         let frames = std::mem::take(&mut done.blocks);
         let payload = std::mem::take(&mut done.payload);
@@ -371,7 +371,7 @@ mod tests {
         let refs: Vec<ChunkRef> = ingested
             .blobs
             .iter()
-            .map(|&blob_id| ChunkRef { blob_id })
+            .map(|&chunk_id| ChunkRef { chunk_id })
             .collect();
         let got = layer.read(&refs, None).await.unwrap();
         assert_eq!(got, body);

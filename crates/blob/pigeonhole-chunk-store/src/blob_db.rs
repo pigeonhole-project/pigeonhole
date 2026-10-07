@@ -1,7 +1,7 @@
 //! Separate `blob.db` metadata for the blob layer (stage 1.4).
 //!
 //! Gateways keep their own SQLite indexes; this DB owns instances, blobs,
-//! replicas, chunk frames (by blob_id), roots, and sweeper state.
+//! replicas, chunk frames (by chunk_id), roots, and sweeper state.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -42,6 +42,13 @@ impl BlobDb {
             .execute(&self.pool)
             .await?;
 
+        // Stage B renames for existing DBs.
+        Self::rename_table_if_exists(&self.pool, "blobs", "chunks").await?;
+        Self::rename_table_if_exists(&self.pool, "replicas", "chunk_replicas").await?;
+        Self::rename_column_if_exists(&self.pool, "chunk_replicas", "blob_id", "chunk_id").await?;
+        Self::rename_column_if_exists(&self.pool, "chunk_blocks", "blob_id", "chunk_id").await?;
+        Self::rename_column_if_exists(&self.pool, "roots", "blob_id", "chunk_id").await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS instances (
@@ -70,7 +77,7 @@ impl BlobDb {
 
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS blobs (
+            CREATE TABLE IF NOT EXISTS chunks (
                 id INTEGER PRIMARY KEY NOT NULL,
                 size INTEGER NOT NULL,
                 crc32 INTEGER NOT NULL,
@@ -84,12 +91,12 @@ impl BlobDb {
 
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS replicas (
-                blob_id INTEGER NOT NULL REFERENCES blobs(id),
+            CREATE TABLE IF NOT EXISTS chunk_replicas (
+                chunk_id INTEGER NOT NULL REFERENCES chunks(id),
                 instance_id TEXT NOT NULL REFERENCES instances(id),
                 sort_key BLOB NOT NULL,
                 locator BLOB NOT NULL,
-                PRIMARY KEY (blob_id, instance_id),
+                PRIMARY KEY (chunk_id, instance_id),
                 UNIQUE (instance_id, sort_key)
             )
             "#,
@@ -104,14 +111,14 @@ impl BlobDb {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS chunk_blocks (
-                blob_id INTEGER NOT NULL REFERENCES blobs(id),
+                chunk_id INTEGER NOT NULL REFERENCES chunks(id),
                 block_no INTEGER NOT NULL,
                 stored_off INTEGER NOT NULL,
                 stored_len INTEGER NOT NULL,
                 logical_off INTEGER NOT NULL,
                 logical_len INTEGER NOT NULL,
                 codec TEXT NOT NULL,
-                PRIMARY KEY (blob_id, block_no)
+                PRIMARY KEY (chunk_id, block_no)
             )
             "#,
         )
@@ -122,7 +129,7 @@ impl BlobDb {
             r#"
             CREATE TABLE IF NOT EXISTS roots (
                 name TEXT PRIMARY KEY NOT NULL,
-                blob_id INTEGER NOT NULL REFERENCES blobs(id)
+                chunk_id INTEGER NOT NULL REFERENCES chunks(id)
             )
             "#,
         )
@@ -265,11 +272,11 @@ impl BlobDb {
             .collect())
     }
 
-    /// Insert a blob row with refs=1; returns blob_id.
-    pub async fn insert_blob(&self, size: i64, crc32: u32) -> Result<i64> {
+    /// Insert a blob row with refs=1; returns chunk_id.
+    pub async fn insert_chunk(&self, size: i64, crc32: u32) -> Result<i64> {
         let at = Utc::now().to_rfc3339();
         let res = sqlx::query(
-            "INSERT INTO blobs (size, crc32, refs, created_at) VALUES (?, ?, 1, ?)",
+            "INSERT INTO chunks (size, crc32, refs, created_at) VALUES (?, ?, 1, ?)",
         )
         .bind(size)
         .bind(i64::from(crc32))
@@ -281,18 +288,18 @@ impl BlobDb {
 
     pub async fn add_replica(
         &self,
-        blob_id: i64,
+        chunk_id: i64,
         instance_id: &str,
         sort_key: &[u8],
         locator: &[u8],
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO replicas (blob_id, instance_id, sort_key, locator)
+            INSERT INTO chunk_replicas (chunk_id, instance_id, sort_key, locator)
             VALUES (?, ?, ?, ?)
             "#,
         )
-        .bind(blob_id)
+        .bind(chunk_id)
         .bind(instance_id)
         .bind(sort_key)
         .bind(locator)
@@ -301,22 +308,22 @@ impl BlobDb {
         Ok(())
     }
 
-    pub async fn set_root(&self, name: &str, blob_id: i64) -> Result<()> {
+    pub async fn set_root(&self, name: &str, chunk_id: i64) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO roots (name, blob_id) VALUES (?, ?)
-            ON CONFLICT(name) DO UPDATE SET blob_id = excluded.blob_id
+            INSERT INTO roots (name, chunk_id) VALUES (?, ?)
+            ON CONFLICT(name) DO UPDATE SET chunk_id = excluded.chunk_id
             "#,
         )
         .bind(name)
-        .bind(blob_id)
+        .bind(chunk_id)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     pub async fn get_root(&self, name: &str) -> Result<Option<i64>> {
-        let row: Option<(i64,)> = sqlx::query_as("SELECT blob_id FROM roots WHERE name = ?")
+        let row: Option<(i64,)> = sqlx::query_as("SELECT chunk_id FROM roots WHERE name = ?")
             .bind(name)
             .fetch_optional(&self.pool)
             .await?;
@@ -325,7 +332,7 @@ impl BlobDb {
 
     pub async fn retain(&self, ids: &[i64]) -> Result<()> {
         for id in ids {
-            sqlx::query("UPDATE blobs SET refs = refs + 1 WHERE id = ?")
+            sqlx::query("UPDATE chunks SET refs = refs + 1 WHERE id = ?")
                 .bind(id)
                 .execute(&self.pool)
                 .await?;
@@ -335,7 +342,7 @@ impl BlobDb {
 
     pub async fn release(&self, ids: &[i64]) -> Result<()> {
         for id in ids {
-            sqlx::query("UPDATE blobs SET refs = MAX(refs - 1, 0) WHERE id = ?")
+            sqlx::query("UPDATE chunks SET refs = MAX(refs - 1, 0) WHERE id = ?")
                 .bind(id)
                 .execute(&self.pool)
                 .await?;
@@ -343,10 +350,10 @@ impl BlobDb {
         Ok(())
     }
 
-    pub async fn blob_meta(&self, blob_id: i64) -> Result<Option<(i64, u32, i64)>> {
+    pub async fn chunk_meta(&self, chunk_id: i64) -> Result<Option<(i64, u32, i64)>> {
         let row: Option<(i64, i64, i64)> =
-            sqlx::query_as("SELECT size, crc32, refs FROM blobs WHERE id = ?")
-                .bind(blob_id)
+            sqlx::query_as("SELECT size, crc32, refs FROM chunks WHERE id = ?")
+                .bind(chunk_id)
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.map(|(size, crc, refs)| (size, crc as u32, refs)))
@@ -354,23 +361,23 @@ impl BlobDb {
 
     pub async fn replace_blocks(
         &self,
-        blob_id: i64,
+        chunk_id: i64,
         blocks: &[pigeonhole_codec::BlockRecord],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM chunk_blocks WHERE blob_id = ?")
-            .bind(blob_id)
+        sqlx::query("DELETE FROM chunk_blocks WHERE chunk_id = ?")
+            .bind(chunk_id)
             .execute(&mut *tx)
             .await?;
         for fr in blocks {
             sqlx::query(
                 r#"
                 INSERT INTO chunk_blocks
-                  (blob_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
+                  (chunk_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
-            .bind(blob_id)
+            .bind(chunk_id)
             .bind(fr.block_no)
             .bind(fr.stored_off)
             .bind(fr.stored_len)
@@ -384,14 +391,14 @@ impl BlobDb {
         Ok(())
     }
 
-    pub async fn get_blocks(&self, blob_id: i64) -> Result<Vec<pigeonhole_codec::BlockRecord>> {
+    pub async fn get_blocks(&self, chunk_id: i64) -> Result<Vec<pigeonhole_codec::BlockRecord>> {
         let rows: Vec<(i64, i64, i64, i64, i64, String)> = sqlx::query_as(
             r#"
             SELECT block_no, stored_off, stored_len, logical_off, logical_len, codec
-            FROM chunk_blocks WHERE blob_id = ? ORDER BY block_no
+            FROM chunk_blocks WHERE chunk_id = ? ORDER BY block_no
             "#,
         )
-        .bind(blob_id)
+        .bind(chunk_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -412,11 +419,11 @@ impl BlobDb {
     }
 
     /// First ready replica for a blob (any instance).
-    pub async fn get_any_replica(&self, blob_id: i64) -> Result<Option<(String, Vec<u8>, Vec<u8>)>> {
+    pub async fn get_any_replica(&self, chunk_id: i64) -> Result<Option<(String, Vec<u8>, Vec<u8>)>> {
         let row: Option<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-            "SELECT instance_id, sort_key, locator FROM replicas WHERE blob_id = ? LIMIT 1",
+            "SELECT instance_id, sort_key, locator FROM chunk_replicas WHERE chunk_id = ? LIMIT 1",
         )
-        .bind(blob_id)
+        .bind(chunk_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
@@ -444,14 +451,14 @@ mod tests {
         let fps = db.list_instance_fingerprints().await.unwrap();
         assert_eq!(fps, vec![("tg-main".into(), "tg:1:-100".into())]);
 
-        let blob_id = db.insert_blob(32, 0xdeadbeef).await.unwrap();
-        db.add_replica(blob_id, "tg-main", &[0, 0, 0, 1], b"loc")
+        let chunk_id = db.insert_chunk(32, 0xdeadbeef).await.unwrap();
+        db.add_replica(chunk_id, "tg-main", &[0, 0, 0, 1], b"loc")
             .await
             .unwrap();
-        db.set_root("s3/index", blob_id).await.unwrap();
-        assert_eq!(db.get_root("s3/index").await.unwrap(), Some(blob_id));
-        db.release(&[blob_id]).await.unwrap();
-        db.retain(&[blob_id]).await.unwrap();
+        db.set_root("s3/index", chunk_id).await.unwrap();
+        assert_eq!(db.get_root("s3/index").await.unwrap(), Some(chunk_id));
+        db.release(&[chunk_id]).await.unwrap();
+        db.retain(&[chunk_id]).await.unwrap();
     }
 
     #[tokio::test]

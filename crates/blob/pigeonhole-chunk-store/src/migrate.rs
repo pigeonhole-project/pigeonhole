@@ -49,7 +49,7 @@ pub async fn migrate_index_to_blob_db(
     }
     report.instances = 1;
 
-    // Map legacy file_id → new blob_id for root wiring.
+    // Map legacy file_id → new chunk_id for root wiring.
     let mut file_to_blob: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
     for b in &snap.blobs {
@@ -59,14 +59,14 @@ pub async fn migrate_index_to_blob_db(
             continue;
         }
         let crc = 0u32;
-        let blob_id = blob_db.insert_blob(b.size, crc).await?;
-        // Adjust refs to match legacy refcount (insert_blob starts at 1).
+        let chunk_id = blob_db.insert_chunk(b.size, crc).await?;
+        // Adjust refs to match legacy refcount (insert_chunk starts at 1).
         if b.refcount > 1 {
             let extra = (b.refcount - 1) as usize;
-            let ids = vec![blob_id; extra];
+            let ids = vec![chunk_id; extra];
             blob_db.retain(&ids).await?;
         } else if b.refcount == 0 {
-            blob_db.release(&[blob_id]).await?;
+            blob_db.release(&[chunk_id]).await?;
         }
         let stored = BlobLocator {
             key: (b.message_id as u64).to_be_bytes().to_vec(),
@@ -77,16 +77,16 @@ pub async fn migrate_index_to_blob_db(
         };
         blob_db
             .add_replica(
-                blob_id,
+                chunk_id,
                 &instance.info.id,
                 &stored.key,
                 &stored.locator,
             )
             .await?;
-        file_to_blob.insert(b.file_id.clone(), blob_id);
+        file_to_blob.insert(b.file_id.clone(), chunk_id);
     }
 
-    // Frames keyed by file_id in legacy → blob_id.
+    // Frames keyed by file_id in legacy → chunk_id.
     let mut by_file: std::collections::HashMap<String, Vec<pigeonhole_codec::BlockRecord>> =
         std::collections::HashMap::new();
     for fr in &snap.chunk_blocks {
@@ -105,8 +105,8 @@ pub async fn migrate_index_to_blob_db(
     if !dry_run {
         for (file_id, mut frames) in by_file {
             frames.sort_by_key(|f| f.block_no);
-            if let Some(&blob_id) = file_to_blob.get(&file_id) {
-                blob_db.replace_blocks(blob_id, &frames).await?;
+            if let Some(&chunk_id) = file_to_blob.get(&file_id) {
+                blob_db.replace_blocks(chunk_id, &frames).await?;
             } else {
                 report.notes.push(format!(
                     "orphan frames for file_id {file_id} (no blobs row); skipped"
@@ -119,13 +119,13 @@ pub async fn migrate_index_to_blob_db(
     if let Some(fid) = index.get_meta("snapshot_file_id").await? {
         if fid.is_empty() || fid == "-" {
             report.notes.push("no snapshot_file_id meta".into());
-        } else if let Some(&blob_id) = file_to_blob.get(&fid) {
+        } else if let Some(&chunk_id) = file_to_blob.get(&fid) {
             report.roots += 1;
             report.notes.push(format!(
-                "map snapshot_file_id {fid} → root s3/index blob_id={blob_id}"
+                "map snapshot_file_id {fid} → root s3/index chunk_id={chunk_id}"
             ));
             if !dry_run {
-                blob_db.set_root("s3/index", blob_id).await?;
+                blob_db.set_root("s3/index", chunk_id).await?;
             }
         } else {
             report.notes.push(format!(

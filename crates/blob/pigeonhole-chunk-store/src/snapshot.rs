@@ -602,11 +602,11 @@ pub async fn push_gateway_snapshot(
         .saturating_add(1);
 
     let compressed = gzip_json(&json).context("gzip snapshot")?;
-    let blob_id = layer
+    let chunk_id = layer
         .put_small(Bytes::from(compressed))
         .await
         .context("put_small gateway snapshot")?;
-    crate::durability::commit_root(layer.db(), dur, root_name, blob_id)
+    crate::durability::commit_root(layer.db(), dur, root_name, chunk_id)
         .await
         .context("commit_root gateway snapshot")?;
 
@@ -615,13 +615,13 @@ pub async fn push_gateway_snapshot(
         .set_meta(META_GENERATION, &generation.to_string())
         .await?;
     index
-        .set_meta(META_FILE_ID, &format!("blob:{blob_id}"))
+        .set_meta(META_FILE_ID, &format!("blob:{chunk_id}"))
         .await?;
     index
         .set_meta(META_MESSAGE_ID, "0")
         .await?;
 
-    info!(%hash, generation, %root_name, blob_id, "gateway snapshot stored via blob layer");
+    info!(%hash, generation, %root_name, chunk_id, "gateway snapshot stored via blob layer");
     Ok(PushOutcome::Uploaded {
         hash,
         message_id: 0,
@@ -636,13 +636,13 @@ pub async fn restore_gateway_snapshot(
     layer: &crate::layer::ChunkStore,
     root_name: &str,
 ) -> Result<()> {
-    let blob_id = layer
+    let chunk_id = layer
         .get_root(root_name)
         .await?
         .with_context(|| format!("missing root {root_name}"))?;
     let data = layer
         .read(
-            &[crate::layer::ChunkRef { blob_id }],
+            &[crate::layer::ChunkRef { chunk_id }],
             None,
         )
         .await

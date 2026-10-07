@@ -4,7 +4,7 @@
 //! superblock), not as rows in `blobs` — so restore can bootstrap without a map.
 
 use crate::blob_db::BlobDb;
-use crate::layer::BlobId;
+use crate::layer::ChunkId;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use pigeonhole_blob::{collect_stream, SharedBackend, BlobLocator, TypedBootstrapPointer};
@@ -28,7 +28,7 @@ pub struct Superblock {
     /// Locators of journal segments since the checkpoint, oldest first.
     pub log: Vec<Vec<BlobLocator>>,
     /// Committed roots at this generation.
-    pub roots: BTreeMap<String, BlobId>,
+    pub roots: BTreeMap<String, ChunkId>,
     /// Hex sha256 of the canonical JSON without this field.
     pub sha256: String,
 }
@@ -87,7 +87,7 @@ struct CanonicalSuperblock<'a> {
     fingerprint: &'a str,
     checkpoint: &'a [BlobLocator],
     log: &'a [Vec<BlobLocator>],
-    roots: &'a BTreeMap<String, BlobId>,
+    roots: &'a BTreeMap<String, ChunkId>,
 }
 
 impl<'a> From<&'a Superblock> for CanonicalSuperblock<'a> {
@@ -107,7 +107,7 @@ impl<'a> From<&'a Superblock> for CanonicalSuperblock<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum JournalOp {
-    SetRoot { name: String, blob_id: BlobId },
+    SetRoot { name: String, chunk_id: ChunkId },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -124,7 +124,7 @@ pub struct CheckpointPayload {
     pub replicas: Vec<CheckpointReplica>,
     #[serde(alias = "frames")]
     pub blocks: Vec<CheckpointBlock>,
-    pub roots: Vec<(String, BlobId)>,
+    pub roots: Vec<(String, ChunkId)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,7 +138,7 @@ pub struct CheckpointInstance {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointBlob {
-    pub id: BlobId,
+    pub id: ChunkId,
     pub size: i64,
     pub crc32: i64,
     pub refs: i64,
@@ -147,7 +147,7 @@ pub struct CheckpointBlob {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointReplica {
-    pub blob_id: BlobId,
+    pub chunk_id: ChunkId,
     pub instance_id: String,
     pub sort_key: Vec<u8>,
     pub locator: Vec<u8>,
@@ -155,7 +155,7 @@ pub struct CheckpointReplica {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointBlock {
-    pub blob_id: BlobId,
+    pub chunk_id: ChunkId,
     #[serde(alias = "frame_no")]
     pub block_no: i64,
     pub stored_off: i64,
@@ -183,7 +183,7 @@ impl BlobDb {
         .collect();
 
         let blobs = sqlx::query_as::<_, (i64, i64, i64, i64, String)>(
-            "SELECT id, size, crc32, refs, created_at FROM blobs",
+            "SELECT id, size, crc32, refs, created_at FROM chunks",
         )
         .fetch_all(self.pool())
         .await?
@@ -198,13 +198,13 @@ impl BlobDb {
         .collect();
 
         let replicas = sqlx::query_as::<_, (i64, String, Vec<u8>, Vec<u8>)>(
-            "SELECT blob_id, instance_id, sort_key, locator FROM replicas",
+            "SELECT chunk_id, instance_id, sort_key, locator FROM chunk_replicas",
         )
         .fetch_all(self.pool())
         .await?
         .into_iter()
-        .map(|(blob_id, instance_id, sort_key, locator)| CheckpointReplica {
-            blob_id,
+        .map(|(chunk_id, instance_id, sort_key, locator)| CheckpointReplica {
+            chunk_id,
             instance_id,
             sort_key,
             locator,
@@ -213,7 +213,7 @@ impl BlobDb {
 
         let blocks = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, String)>(
             r#"
-            SELECT blob_id, block_no, stored_off, stored_len, logical_off, logical_len, codec
+            SELECT chunk_id, block_no, stored_off, stored_len, logical_off, logical_len, codec
             FROM chunk_blocks
             "#,
         )
@@ -221,9 +221,9 @@ impl BlobDb {
         .await?
         .into_iter()
         .map(
-            |(blob_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)| {
+            |(chunk_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)| {
                 CheckpointBlock {
-                    blob_id,
+                    chunk_id,
                     block_no,
                     stored_off,
                     stored_len,
@@ -235,7 +235,7 @@ impl BlobDb {
         )
         .collect();
 
-        let roots = sqlx::query_as::<_, (String, i64)>("SELECT name, blob_id FROM roots")
+        let roots = sqlx::query_as::<_, (String, i64)>("SELECT name, chunk_id FROM roots")
             .fetch_all(self.pool())
             .await?;
 
@@ -257,9 +257,9 @@ impl BlobDb {
         let mut tx = self.pool().begin().await?;
         for table in [
             "chunk_blocks",
-            "replicas",
+            "chunk_replicas",
             "roots",
-            "blobs",
+            "chunks",
             "put_watermarks",
             "sweep_cursor",
             "instances",
@@ -286,7 +286,7 @@ impl BlobDb {
         for b in &cp.blobs {
             sqlx::query(
                 r#"
-                INSERT INTO blobs (id, size, crc32, refs, created_at)
+                INSERT INTO chunks (id, size, crc32, refs, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 "#,
             )
@@ -301,11 +301,11 @@ impl BlobDb {
         for r in &cp.replicas {
             sqlx::query(
                 r#"
-                INSERT INTO replicas (blob_id, instance_id, sort_key, locator)
+                INSERT INTO chunk_replicas (chunk_id, instance_id, sort_key, locator)
                 VALUES (?, ?, ?, ?)
                 "#,
             )
-            .bind(r.blob_id)
+            .bind(r.chunk_id)
             .bind(&r.instance_id)
             .bind(&r.sort_key)
             .bind(&r.locator)
@@ -316,11 +316,11 @@ impl BlobDb {
             sqlx::query(
                 r#"
                 INSERT INTO chunk_blocks
-                  (blob_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
+                  (chunk_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
-            .bind(f.blob_id)
+            .bind(f.chunk_id)
             .bind(f.block_no)
             .bind(f.stored_off)
             .bind(f.stored_len)
@@ -330,10 +330,10 @@ impl BlobDb {
             .execute(&mut *tx)
             .await?;
         }
-        for (name, blob_id) in &cp.roots {
-            sqlx::query("INSERT INTO roots (name, blob_id) VALUES (?, ?)")
+        for (name, chunk_id) in &cp.roots {
+            sqlx::query("INSERT INTO roots (name, chunk_id) VALUES (?, ?)")
                 .bind(name)
-                .bind(blob_id)
+                .bind(chunk_id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -344,8 +344,8 @@ impl BlobDb {
     pub async fn apply_journal_ops(&self, ops: &[JournalOp]) -> Result<()> {
         for op in ops {
             match op {
-                JournalOp::SetRoot { name, blob_id } => {
-                    self.set_root(name, *blob_id).await?;
+                JournalOp::SetRoot { name, chunk_id } => {
+                    self.set_root(name, *chunk_id).await?;
                 }
             }
         }
@@ -403,8 +403,8 @@ impl Durability {
         sb.generation = sb.generation.saturating_add(1);
         // Refresh roots from set_root ops in this segment for the pin.
         for op in &seg.ops {
-            let JournalOp::SetRoot { name, blob_id } = op;
-            sb.roots.insert(name.clone(), *blob_id);
+            let JournalOp::SetRoot { name, chunk_id } = op;
+            sb.roots.insert(name.clone(), *chunk_id);
         }
         let sealed = sb.seal()?;
         self.pin.swap(sealed).await.context("swap superblock pin")?;
@@ -501,13 +501,13 @@ pub async fn commit_root(
     db: &BlobDb,
     dur: &Durability,
     name: &str,
-    blob_id: BlobId,
+    chunk_id: ChunkId,
 ) -> Result<()> {
     dur.ensure_not_fenced().await?;
-    db.set_root(name, blob_id).await?;
+    db.set_root(name, chunk_id).await?;
     dur.enqueue(JournalOp::SetRoot {
         name: name.to_string(),
-        blob_id,
+        chunk_id,
     })
     .await;
     dur.flush_journal().await?;
@@ -516,7 +516,7 @@ pub async fn commit_root(
 
 impl BlobDb {
     pub async fn is_empty_metadata(&self) -> Result<bool> {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs")
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunks")
             .fetch_one(self.pool())
             .await?;
         let (r,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM roots")
