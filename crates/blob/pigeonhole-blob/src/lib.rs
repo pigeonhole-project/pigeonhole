@@ -3,6 +3,7 @@
 mod backend;
 mod bootstrap;
 pub mod cache;
+pub mod erase;
 pub mod metrics;
 pub mod rate_limit;
 pub mod typed;
@@ -12,6 +13,7 @@ pub use backend::{
 };
 pub use bootstrap::BootstrapPointer;
 pub use cache::{CacheConfig, CacheMetrics, CachedBlob, CachingBackend};
+pub use erase::{erase, erase_sweep, DynBackend, DynSweep, Erased, ErasedSweep, SharedBackend};
 pub use metrics::{spawn_metrics_logger, BackendMetrics};
 pub use rate_limit::{ChatLimiter, ChatLimiterConfig};
 pub use typed::{
