@@ -1,34 +1,39 @@
-//! Journal segments + superblock for `blob.db` durability (stage 2.1).
+//! Journal segments + superblock for `blob.db` durability (stage E.5).
 //!
-//! Segments and checkpoints are stored as raw backend puts (locators in the
-//! superblock), not as rows in `blobs` — so restore can bootstrap without a map.
+//! Segments and checkpoints are stored as Replicated parts; the superblock
+//! keeps per-instance locator lists and is published to every read-write pin.
 
-use crate::blob_db::BlobDb;
-use crate::layer::ChunkId;
+use crate::blob_db::{BlobDb, ChunkId, Extent};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use pigeonhole_blob::{collect_stream, SharedBackend, BlobLocator, TypedBootstrapPointer};
+use pigeonhole_blob::{
+    collect_stream, EncodedBlock, Replicated, SharedBackend, TypedBootstrapPointer, BlobLocator,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const SUPERBLOCK_FORMAT: u32 = 1;
+const SUPERBLOCK_FORMAT: u32 = 2;
+
+/// Per-instance list of part locators (checkpoint segment or journal segment).
+pub type InstanceParts = BTreeMap<String, Vec<BlobLocator>>;
 
 /// Pin contents: generation fencing + pointers to checkpoint/log segments.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Superblock {
     pub format: u32,
     pub generation: u64,
+    /// Writer identity (primary instance id).
     pub instance_id: String,
     pub fingerprint: String,
-    /// Locators of checkpoint payload parts (usually one).
-    pub checkpoint: Vec<BlobLocator>,
-    /// Locators of journal segments since the checkpoint, oldest first.
-    pub log: Vec<Vec<BlobLocator>>,
-    /// Committed roots at this generation.
-    pub roots: BTreeMap<String, ChunkId>,
+    /// Per-instance checkpoint part locators.
+    pub checkpoint: InstanceParts,
+    /// Journal segments since checkpoint; each entry is per-instance parts.
+    pub log: Vec<InstanceParts>,
+    /// Committed roots (extent lists) at this generation.
+    pub roots: BTreeMap<String, Vec<Extent>>,
     /// Hex sha256 of the canonical JSON without this field.
     pub sha256: String,
 }
@@ -44,7 +49,7 @@ impl Superblock {
             generation,
             instance_id: instance_id.into(),
             fingerprint: fingerprint.into(),
-            checkpoint: Vec::new(),
+            checkpoint: BTreeMap::new(),
             log: Vec::new(),
             roots: BTreeMap::new(),
             sha256: String::new(),
@@ -63,8 +68,12 @@ impl Superblock {
 
     pub fn parse(data: &[u8]) -> Result<Self> {
         let sb: Superblock = serde_json::from_slice(data).context("parse superblock JSON")?;
-        if sb.format != SUPERBLOCK_FORMAT {
+        if sb.format != SUPERBLOCK_FORMAT && sb.format != 1 {
             bail!("unsupported superblock format {}", sb.format);
+        }
+        // Format 1 used flat locator lists + ChunkId roots — reject for E writers.
+        if sb.format == 1 {
+            bail!("superblock format 1 is no longer supported; restore via migrate");
         }
         let mut check = sb.clone();
         check.sha256.clear();
@@ -85,9 +94,9 @@ struct CanonicalSuperblock<'a> {
     generation: u64,
     instance_id: &'a str,
     fingerprint: &'a str,
-    checkpoint: &'a [BlobLocator],
-    log: &'a [Vec<BlobLocator>],
-    roots: &'a BTreeMap<String, ChunkId>,
+    checkpoint: &'a InstanceParts,
+    log: &'a [InstanceParts],
+    roots: &'a BTreeMap<String, Vec<Extent>>,
 }
 
 impl<'a> From<&'a Superblock> for CanonicalSuperblock<'a> {
@@ -107,7 +116,10 @@ impl<'a> From<&'a Superblock> for CanonicalSuperblock<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum JournalOp {
-    SetRoot { name: String, chunk_id: ChunkId },
+    SetRoot {
+        name: String,
+        extents: Vec<Extent>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -121,10 +133,10 @@ pub struct CheckpointPayload {
     pub format: u32,
     pub instances: Vec<CheckpointInstance>,
     pub blobs: Vec<CheckpointBlob>,
-    pub replicas: Vec<CheckpointReplica>,
+    pub parts: Vec<CheckpointPart>,
     #[serde(alias = "frames")]
     pub blocks: Vec<CheckpointBlock>,
-    pub roots: Vec<(String, ChunkId)>,
+    pub roots: Vec<(String, Vec<Extent>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,16 +151,20 @@ pub struct CheckpointInstance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointBlob {
     pub id: ChunkId,
-    pub size: i64,
+    pub logical_size: i64,
     pub crc32: i64,
     pub refs: i64,
+    pub block_count: i64,
     pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckpointReplica {
+pub struct CheckpointPart {
     pub chunk_id: ChunkId,
     pub instance_id: String,
+    pub part_no: i64,
+    pub first_block: i64,
+    pub block_count: i64,
     pub sort_key: Vec<u8>,
     pub locator: Vec<u8>,
 }
@@ -158,10 +174,9 @@ pub struct CheckpointBlock {
     pub chunk_id: ChunkId,
     #[serde(alias = "frame_no")]
     pub block_no: i64,
-    pub stored_off: i64,
-    pub stored_len: i64,
     pub logical_off: i64,
     pub logical_len: i64,
+    pub stored_len: i64,
     pub codec: String,
 }
 
@@ -182,38 +197,51 @@ impl BlobDb {
         })
         .collect();
 
-        let blobs = sqlx::query_as::<_, (i64, i64, i64, i64, String)>(
-            "SELECT id, size, crc32, refs, created_at FROM chunks",
+        let blobs = sqlx::query_as::<_, (i64, i64, i64, i64, i64, String)>(
+            "SELECT id, logical_size, crc32, refs, block_count, created_at FROM chunks",
         )
         .fetch_all(self.pool())
         .await?
         .into_iter()
-        .map(|(id, size, crc32, refs, created_at)| CheckpointBlob {
-            id,
-            size,
-            crc32,
-            refs,
-            created_at,
-        })
-        .collect();
-
-        let replicas = sqlx::query_as::<_, (i64, String, Vec<u8>, Vec<u8>)>(
-            "SELECT chunk_id, instance_id, sort_key, locator FROM chunk_replicas",
+        .map(
+            |(id, logical_size, crc32, refs, block_count, created_at)| CheckpointBlob {
+                id,
+                logical_size,
+                crc32,
+                refs,
+                block_count,
+                created_at,
+            },
         )
-        .fetch_all(self.pool())
-        .await?
-        .into_iter()
-        .map(|(chunk_id, instance_id, sort_key, locator)| CheckpointReplica {
-            chunk_id,
-            instance_id,
-            sort_key,
-            locator,
-        })
         .collect();
 
-        let blocks = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, String)>(
+        let parts = sqlx::query_as::<_, (i64, String, i64, i64, i64, Vec<u8>, Vec<u8>)>(
             r#"
-            SELECT chunk_id, block_no, stored_off, stored_len, logical_off, logical_len, codec
+            SELECT chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator
+            FROM chunk_parts
+            "#,
+        )
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(
+            |(chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)| {
+                CheckpointPart {
+                    chunk_id,
+                    instance_id,
+                    part_no,
+                    first_block,
+                    block_count,
+                    sort_key,
+                    locator,
+                }
+            },
+        )
+        .collect();
+
+        let blocks = sqlx::query_as::<_, (i64, i64, i64, i64, i64, String)>(
+            r#"
+            SELECT chunk_id, block_no, logical_off, logical_len, stored_len, codec
             FROM chunk_blocks
             "#,
         )
@@ -221,29 +249,32 @@ impl BlobDb {
         .await?
         .into_iter()
         .map(
-            |(chunk_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)| {
-                CheckpointBlock {
-                    chunk_id,
-                    block_no,
-                    stored_off,
-                    stored_len,
-                    logical_off,
-                    logical_len,
-                    codec,
-                }
+            |(chunk_id, block_no, logical_off, logical_len, stored_len, codec)| CheckpointBlock {
+                chunk_id,
+                block_no,
+                logical_off,
+                logical_len,
+                stored_len,
+                codec,
             },
         )
         .collect();
 
-        let roots = sqlx::query_as::<_, (String, i64)>("SELECT name, chunk_id FROM roots")
-            .fetch_all(self.pool())
-            .await?;
+        let root_rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, extents_json FROM roots")
+                .fetch_all(self.pool())
+                .await?;
+        let mut roots = Vec::new();
+        for (name, json) in root_rows {
+            let extents: Vec<Extent> = serde_json::from_str(&json)?;
+            roots.push((name, extents));
+        }
 
         Ok(CheckpointPayload {
-            format: 1,
+            format: 2,
             instances,
             blobs,
-            replicas,
+            parts,
             blocks,
             roots,
         })
@@ -251,12 +282,13 @@ impl BlobDb {
 
     /// Replace local tables with a checkpoint (empty DB or `--force` path).
     pub async fn import_checkpoint(&self, cp: &CheckpointPayload) -> Result<()> {
-        if cp.format != 1 {
+        if cp.format != 2 && cp.format != 1 {
             bail!("unsupported checkpoint format {}", cp.format);
         }
         let mut tx = self.pool().begin().await?;
         for table in [
             "chunk_blocks",
+            "chunk_parts",
             "chunk_replicas",
             "roots",
             "chunks",
@@ -264,9 +296,10 @@ impl BlobDb {
             "sweep_cursor",
             "instances",
         ] {
-            sqlx::query(&format!("DELETE FROM {table}"))
+            // chunk_replicas may be empty leftover; ignore missing.
+            let _ = sqlx::query(&format!("DELETE FROM {table}"))
                 .execute(&mut *tx)
-                .await?;
+                .await;
         }
         for i in &cp.instances {
             sqlx::query(
@@ -286,27 +319,32 @@ impl BlobDb {
         for b in &cp.blobs {
             sqlx::query(
                 r#"
-                INSERT INTO chunks (id, size, crc32, refs, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO chunks (id, logical_size, crc32, refs, block_count, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(b.id)
-            .bind(b.size)
+            .bind(b.logical_size)
             .bind(b.crc32)
             .bind(b.refs)
+            .bind(b.block_count)
             .bind(&b.created_at)
             .execute(&mut *tx)
             .await?;
         }
-        for r in &cp.replicas {
+        for r in &cp.parts {
             sqlx::query(
                 r#"
-                INSERT INTO chunk_replicas (chunk_id, instance_id, sort_key, locator)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO chunk_parts
+                  (chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(r.chunk_id)
             .bind(&r.instance_id)
+            .bind(r.part_no)
+            .bind(r.first_block)
+            .bind(r.block_count)
             .bind(&r.sort_key)
             .bind(&r.locator)
             .execute(&mut *tx)
@@ -316,24 +354,24 @@ impl BlobDb {
             sqlx::query(
                 r#"
                 INSERT INTO chunk_blocks
-                  (chunk_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                  (chunk_id, block_no, logical_off, logical_len, stored_len, codec)
+                VALUES (?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(f.chunk_id)
             .bind(f.block_no)
-            .bind(f.stored_off)
-            .bind(f.stored_len)
             .bind(f.logical_off)
             .bind(f.logical_len)
+            .bind(f.stored_len)
             .bind(&f.codec)
             .execute(&mut *tx)
             .await?;
         }
-        for (name, chunk_id) in &cp.roots {
-            sqlx::query("INSERT INTO roots (name, chunk_id) VALUES (?, ?)")
+        for (name, extents) in &cp.roots {
+            let json = serde_json::to_string(extents)?;
+            sqlx::query("INSERT INTO roots (name, extents_json) VALUES (?, ?)")
                 .bind(name)
-                .bind(chunk_id)
+                .bind(&json)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -344,8 +382,8 @@ impl BlobDb {
     pub async fn apply_journal_ops(&self, ops: &[JournalOp]) -> Result<()> {
         for op in ops {
             match op {
-                JournalOp::SetRoot { name, chunk_id } => {
-                    self.set_root(name, *chunk_id).await?;
+                JournalOp::SetRoot { name, extents } => {
+                    self.set_root(name, extents).await?;
                 }
             }
         }
@@ -353,24 +391,60 @@ impl BlobDb {
     }
 }
 
-/// In-memory journal buffer + flush/checkpoint against a write backend.
+/// One pin target (read-write instance bootstrap).
+pub struct PinTarget {
+    pub instance_id: String,
+    pub fingerprint: String,
+    pub pin: Arc<dyn TypedBootstrapPointer>,
+    /// Backend used to fetch parts belonging to this instance.
+    pub backend: SharedBackend,
+}
+
+/// In-memory journal buffer + flush/checkpoint against a replicated group.
 pub struct Durability {
-    backend: SharedBackend,
-    pin: Arc<dyn TypedBootstrapPointer>,
+    replicated: Arc<Replicated>,
+    pins: Vec<PinTarget>,
     pending: Mutex<Vec<JournalOp>>,
     /// Last sealed superblock (local view).
     current: Mutex<Superblock>,
 }
 
 impl Durability {
+    /// Single-backend convenience (tests / one-instance deployments).
     pub fn new(
         backend: SharedBackend,
         pin: Arc<dyn TypedBootstrapPointer>,
         genesis: Superblock,
     ) -> Self {
+        let info = backend.instance().clone();
+        let replicated = Arc::new(
+            Replicated::new(
+                vec![backend.clone()],
+                1,
+                Arc::new(pigeonhole_blob::CheapestFirst::new()),
+            )
+            .expect("single-member Replicated"),
+        );
+        Self::new_replicated(
+            replicated,
+            vec![PinTarget {
+                instance_id: info.id,
+                fingerprint: info.fingerprint,
+                pin,
+                backend,
+            }],
+            genesis,
+        )
+    }
+
+    pub fn new_replicated(
+        replicated: Arc<Replicated>,
+        pins: Vec<PinTarget>,
+        genesis: Superblock,
+    ) -> Self {
         Self {
-            backend,
-            pin,
+            replicated,
+            pins,
             pending: Mutex::new(Vec::new()),
             current: Mutex::new(genesis),
         }
@@ -380,7 +454,62 @@ impl Durability {
         self.pending.lock().await.push(op);
     }
 
-    /// Put pending ops as one journal segment, append to superblock, swap pin.
+    /// Put `data` via Replicated as one raw block; return per-instance locators.
+    async fn put_replicated_parts(&self, data: Bytes) -> Result<InstanceParts> {
+        let len = data.len() as u32;
+        let mut w = self.replicated.chunk_writer();
+        w.push(EncodedBlock {
+            stored: data,
+            logical_len: len,
+            codec: "raw".into(),
+        })
+        .await?;
+        let layouts = w.finish().await?;
+        let mut map = BTreeMap::new();
+        for layout in layouts {
+            let locs: Vec<BlobLocator> = layout.parts.into_iter().map(|p| p.locator).collect();
+            map.insert(layout.instance, locs);
+        }
+        Ok(map)
+    }
+
+    async fn fetch_instance_parts(&self, parts: &InstanceParts) -> Result<Bytes> {
+        let mut last_err = None;
+        for pin in &self.pins {
+            if let Some(locs) = parts.get(&pin.instance_id) {
+                match Self::download_parts(&pin.backend, locs).await {
+                    Ok(buf) => return Ok(buf),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+        for (inst, locs) in parts {
+            let Some(backend) = self
+                .replicated
+                .members()
+                .iter()
+                .find(|m| m.instance().id == *inst)
+            else {
+                continue;
+            };
+            match Self::download_parts(backend, locs).await {
+                Ok(buf) => return Ok(buf),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no available instance for parts")))
+    }
+
+    async fn download_parts(backend: &SharedBackend, locs: &[BlobLocator]) -> Result<Bytes> {
+        let mut buf = Vec::new();
+        for loc in locs {
+            let part = collect_stream(backend.get(loc, None).await?).await?;
+            buf.extend_from_slice(&part);
+        }
+        Ok(Bytes::from(buf))
+    }
+
+    /// Put pending ops as one journal segment, append to superblock, publish pins.
     pub async fn flush_journal(&self) -> Result<()> {
         self.ensure_not_fenced().await?;
         let ops = {
@@ -390,73 +519,68 @@ impl Durability {
         if ops.is_empty() {
             return Ok(());
         }
-        let seg = JournalSegment { ops };
+        let seg = JournalSegment { ops: ops.clone() };
         let bytes = Bytes::from(serde_json::to_vec(&seg).context("serialize journal segment")?);
-        let loc = self
-            .backend
-            .put(bytes)
+        let parts = self
+            .put_replicated_parts(bytes)
             .await
             .context("put journal segment")?;
 
-        let mut sb = self.current.lock().await;
-        sb.log.push(vec![loc]);
-        sb.generation = sb.generation.saturating_add(1);
-        // Refresh roots from set_root ops in this segment for the pin.
-        for op in &seg.ops {
-            let JournalOp::SetRoot { name, chunk_id } = op;
-            sb.roots.insert(name.clone(), *chunk_id);
-        }
-        let sealed = sb.seal()?;
-        self.pin.swap(sealed).await.context("swap superblock pin")?;
+        let sealed = {
+            let mut sb = self.current.lock().await;
+            sb.log.push(parts);
+            sb.generation = sb.generation.saturating_add(1);
+            for op in &ops {
+                let JournalOp::SetRoot { name, extents } = op;
+                sb.roots.insert(name.clone(), extents.clone());
+            }
+            sb.seal()?
+        };
+        self.publish_all(sealed).await?;
         Ok(())
     }
 
     /// Full checkpoint: export DB → put → new superblock with empty log.
     pub async fn checkpoint(&self, db: &BlobDb) -> Result<()> {
         self.ensure_not_fenced().await?;
-        // Drain journal into the DB first (caller should have applied ops locally).
         self.flush_journal().await?;
 
         let cp = db.export_checkpoint().await?;
         let bytes = Bytes::from(serde_json::to_vec(&cp).context("serialize checkpoint")?);
-        let loc = self.backend.put(bytes).await.context("put checkpoint")?;
+        let parts = self
+            .put_replicated_parts(bytes)
+            .await
+            .context("put checkpoint")?;
 
-        let mut sb = self.current.lock().await;
-        sb.checkpoint = vec![loc];
-        sb.log.clear();
-        sb.roots = cp.roots.iter().cloned().collect();
-        sb.generation = sb.generation.saturating_add(1);
-        let sealed = sb.seal()?;
-        self.pin.swap(sealed).await.context("swap superblock after checkpoint")?;
+        let sealed = {
+            let mut sb = self.current.lock().await;
+            sb.checkpoint = parts;
+            sb.log.clear();
+            sb.roots = cp.roots.iter().cloned().collect();
+            sb.generation = sb.generation.saturating_add(1);
+            sb.seal()?
+        };
+        self.publish_all(sealed).await?;
         Ok(())
     }
 
-    /// Read pin, verify, download checkpoint + log, rebuild `db`.
+    /// Read all pins, take max valid generation, download checkpoint + log, rebuild `db`.
     pub async fn restore_into(&self, db: &BlobDb) -> Result<Superblock> {
-        let Some(raw) = self.pin.read().await.context("read superblock pin")? else {
-            bail!("no superblock pin");
-        };
-        let sb = Superblock::parse(&raw)?;
-        // Fingerprint check is caller's responsibility against config.
+        let sb = self
+            .read_best_superblock()
+            .await?
+            .context("no superblock pin")?;
 
         if sb.checkpoint.is_empty() {
             bail!("superblock has empty checkpoint");
         }
-        let mut cp_bytes = Vec::new();
-        for loc in &sb.checkpoint {
-            let part = collect_stream(self.backend.get(loc, None).await?).await?;
-            cp_bytes.extend_from_slice(&part);
-        }
+        let cp_bytes = self.fetch_instance_parts(&sb.checkpoint).await?;
         let cp: CheckpointPayload =
             serde_json::from_slice(&cp_bytes).context("parse checkpoint payload")?;
         db.import_checkpoint(&cp).await?;
 
-        for segment_locs in &sb.log {
-            let mut seg_bytes = Vec::new();
-            for loc in segment_locs {
-                let part = collect_stream(self.backend.get(loc, None).await?).await?;
-                seg_bytes.extend_from_slice(&part);
-            }
+        for segment_parts in &sb.log {
+            let seg_bytes = self.fetch_instance_parts(segment_parts).await?;
             let seg: JournalSegment =
                 serde_json::from_slice(&seg_bytes).context("parse journal segment")?;
             db.apply_journal_ops(&seg.ops).await?;
@@ -466,31 +590,75 @@ impl Durability {
         Ok(sb)
     }
 
+    /// Among all readable pins, pick the highest generation with valid hash + fingerprint.
+    pub async fn read_best_superblock(&self) -> Result<Option<Superblock>> {
+        let mut best: Option<Superblock> = None;
+        for pin in &self.pins {
+            let Some(raw) = pin.pin.read().await.context("read pin")? else {
+                continue;
+            };
+            let sb = match Superblock::parse(&raw) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if sb.fingerprint != pin.fingerprint
+                && !self
+                    .pins
+                    .iter()
+                    .any(|p| p.fingerprint == sb.fingerprint)
+            {
+                continue;
+            }
+            match &best {
+                None => best = Some(sb),
+                Some(b) if sb.generation > b.generation => best = Some(sb),
+                _ => {}
+            }
+        }
+        Ok(best)
+    }
+
     pub async fn generation(&self) -> u64 {
         self.current.lock().await.generation
     }
 
+    async fn publish_all(&self, sealed: Bytes) -> Result<()> {
+        for pin in &self.pins {
+            pin.pin
+                .swap(sealed.clone())
+                .await
+                .with_context(|| format!("publish superblock to {}", pin.instance_id))?;
+        }
+        Ok(())
+    }
+
     /// Replace local + pinned superblock (fencing / explicit publish).
     pub async fn publish_superblock(&self, mut sb: Superblock) -> Result<()> {
+        self.ensure_not_fenced().await?;
         let sealed = sb.seal()?;
-        self.pin.swap(sealed).await.context("publish superblock")?;
+        self.publish_all(sealed).await?;
         *self.current.lock().await = sb;
         Ok(())
     }
 
-    /// Stop if the pin's generation is strictly greater than our local view.
+    /// Stop if any pin's generation is strictly greater than our local view.
     pub async fn ensure_not_fenced(&self) -> Result<()> {
         let local = self.generation().await;
-        let Some(raw) = self.pin.read().await? else {
-            return Ok(());
-        };
-        let remote = Superblock::parse(&raw)?;
-        if remote.generation > local {
-            bail!(
-                "fenced: remote superblock generation {} > local {}; refusing to write",
-                remote.generation,
-                local
-            );
+        for pin in &self.pins {
+            let Some(raw) = pin.pin.read().await? else {
+                continue;
+            };
+            let remote = match Superblock::parse(&raw) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if remote.generation > local {
+                bail!(
+                    "fenced: remote superblock generation {} > local {}; refusing to write",
+                    remote.generation,
+                    local
+                );
+            }
         }
         Ok(())
     }
@@ -501,13 +669,13 @@ pub async fn commit_root(
     db: &BlobDb,
     dur: &Durability,
     name: &str,
-    chunk_id: ChunkId,
+    extents: &[Extent],
 ) -> Result<()> {
     dur.ensure_not_fenced().await?;
-    db.set_root(name, chunk_id).await?;
+    db.set_root(name, extents).await?;
     dur.enqueue(JournalOp::SetRoot {
         name: name.to_string(),
-        chunk_id,
+        extents: extents.to_vec(),
     })
     .await;
     dur.flush_journal().await?;
@@ -527,8 +695,6 @@ impl BlobDb {
 }
 
 /// Stage 2.3: restore from pin into `db`, then fence by publishing generation+1.
-///
-/// Refuses a non-empty `db` unless `force` is set (same policy as legacy restore).
 pub async fn start_or_restore(
     db: &BlobDb,
     dur: &Durability,
@@ -539,7 +705,12 @@ pub async fn start_or_restore(
         bail!("blob.db is not empty; pass force=true to overwrite (like restore --force)");
     }
     let sb = dur.restore_into(db).await?;
-    if sb.fingerprint != expected_fingerprint {
+    let fp_ok = sb.fingerprint == expected_fingerprint
+        || dur
+            .pins
+            .iter()
+            .any(|p| p.fingerprint == sb.fingerprint);
+    if !fp_ok {
         bail!(
             "superblock fingerprint {:?} != config {:?}",
             sb.fingerprint,
@@ -547,7 +718,6 @@ pub async fn start_or_restore(
         );
     }
 
-    // Fencing: publish generation+1 so a stale writer with a lower generation stops.
     let mut next = sb.clone();
     next.generation = next.generation.saturating_add(1);
     dur.publish_superblock(next).await?;
@@ -560,6 +730,7 @@ mod tests {
     use crate::ingest::IngestOptions;
     use crate::layer::ChunkStore;
     use async_trait::async_trait;
+    use pigeonhole_blob::BlobBackend;
     use pigeonhole_codec::ChunkCodec;
     use pigeonhole_storage_memory::MemoryBlobStore;
     use std::sync::Mutex as StdMutex;
@@ -597,36 +768,49 @@ mod tests {
         let genesis = Superblock::new(0, info.id.clone(), info.fingerprint.clone());
         let dur = Durability::new(backend.clone(), pin.clone(), genesis);
 
-        // Seed: put_small + checkpoint so restore has a base.
-        let blob = layer.put_small(Bytes::from_static(b"hello-root")).await.unwrap();
+        let blob = layer
+            .put_small(Bytes::from_static(b"hello-root"))
+            .await
+            .unwrap();
         dur.checkpoint(layer.db()).await.unwrap();
         assert!(pin.read().await.unwrap().is_some());
 
-        commit_root(layer.db(), &dur, "s3/index", blob)
+        let extents = vec![Extent {
+            chunk: blob,
+            offset: 0,
+            len: 10,
+        }];
+        commit_root(layer.db(), &dur, "s3/index", &extents)
             .await
             .unwrap();
-        assert_eq!(layer.get_root("s3/index").await.unwrap(), Some(blob));
+        assert_eq!(layer.get_root("s3/index").await.unwrap(), Some(extents.clone()));
         let gen_after = dur.generation().await;
         assert!(gen_after >= 2);
 
-        // Fresh DB + same pin/backend → restore.
         let url2 = format!("sqlite:{}?mode=rwc", dir.path().join("b.db").display());
         let db2 = BlobDb::connect(&url2).await.unwrap();
         let genesis2 = Superblock::new(0, info.id, info.fingerprint);
         let dur2 = Durability::new(backend, pin, genesis2);
         let sb = dur2.restore_into(&db2).await.unwrap();
-        assert_eq!(sb.roots.get("s3/index"), Some(&blob));
-        assert_eq!(db2.get_root("s3/index").await.unwrap(), Some(blob));
+        assert_eq!(sb.roots.get("s3/index"), Some(&extents));
+        assert_eq!(db2.get_root("s3/index").await.unwrap(), Some(extents));
     }
 
     #[test]
     fn superblock_hash_roundtrip() {
         let mut sb = Superblock::new(3, "tg-main", "tg:1:-100");
-        sb.roots.insert("cas/index".into(), 9);
+        sb.roots.insert(
+            "cas/index".into(),
+            vec![Extent {
+                chunk: 9,
+                offset: 0,
+                len: 1,
+            }],
+        );
         let bytes = sb.seal().unwrap();
         let parsed = Superblock::parse(&bytes).unwrap();
         assert_eq!(parsed.generation, 3);
-        assert_eq!(parsed.roots.get("cas/index"), Some(&9));
+        assert_eq!(parsed.roots.get("cas/index").unwrap()[0].chunk, 9);
     }
 
     #[tokio::test]
@@ -652,7 +836,6 @@ mod tests {
         layer.put_small(Bytes::from_static(b"x")).await.unwrap();
         dur_a.checkpoint(layer.db()).await.unwrap();
 
-        // Process B restores and fences (generation bump).
         let url_b = format!("sqlite:{}?mode=rwc", dir.path().join("b.db").display());
         let db_b = BlobDb::connect(&url_b).await.unwrap();
         let dur_b = Durability::new(
@@ -666,14 +849,71 @@ mod tests {
         assert!(restored.generation >= 1);
         assert!(dur_b.generation().await > restored.generation);
 
-        // Stale A still thinks it has the old generation → fenced.
         let err = dur_a.ensure_not_fenced().await.unwrap_err();
         assert!(err.to_string().contains("fenced"));
 
-        // Non-empty refuse without force.
         let err = start_or_restore(&db_b, &dur_b, &info.fingerprint, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not empty"));
+    }
+
+    #[tokio::test]
+    async fn two_pins_take_higher_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("a.db").display());
+        let db = BlobDb::connect(&url).await.unwrap();
+        let a = MemoryBlobStore::new().with_instance_id("a");
+        let b = MemoryBlobStore::new().with_instance_id("b");
+        let fp_a = a.instance().fingerprint.clone();
+        let fp_b = b.instance().fingerprint.clone();
+        let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
+        opts.block_size = 32 * 1024;
+        let backend_a: SharedBackend = Arc::new(pigeonhole_blob::erase(a));
+        let backend_b: SharedBackend = Arc::new(pigeonhole_blob::erase(b));
+        let rep = Arc::new(
+            Replicated::new(
+                vec![backend_a.clone(), backend_b.clone()],
+                2,
+                Arc::new(pigeonhole_blob::CheapestFirst::new()),
+            )
+            .unwrap(),
+        );
+        let layer = ChunkStore::open_replicated(db.clone(), rep.clone(), opts)
+            .await
+            .unwrap();
+        let pin_a = Arc::new(MemPin {
+            data: StdMutex::new(None),
+        });
+        let pin_b = Arc::new(MemPin {
+            data: StdMutex::new(None),
+        });
+        let pins = vec![
+            PinTarget {
+                instance_id: "a".into(),
+                fingerprint: fp_a.clone(),
+                pin: pin_a.clone(),
+                backend: backend_a,
+            },
+            PinTarget {
+                instance_id: "b".into(),
+                fingerprint: fp_b,
+                pin: pin_b.clone(),
+                backend: backend_b,
+            },
+        ];
+        let dur = Durability::new_replicated(rep, pins, Superblock::new(0, "a", fp_a.clone()));
+        layer.put_small(Bytes::from_static(b"hi")).await.unwrap();
+        dur.checkpoint(layer.db()).await.unwrap();
+        let gen = dur.generation().await;
+
+        // Overwrite pin A with a stale lower generation; pin B keeps the higher one.
+        let mut stale = Superblock::new(0, "a", fp_a);
+        let stale_bytes = stale.seal().unwrap();
+        pin_a.swap(stale_bytes).await.unwrap();
+
+        let best = dur.read_best_superblock().await.unwrap().unwrap();
+        assert_eq!(best.generation, gen);
+        assert!(best.generation > 0);
     }
 }
