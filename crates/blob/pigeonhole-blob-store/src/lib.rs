@@ -12,7 +12,9 @@ pub mod snapshot;
 
 pub use blob_db::BlobDb;
 pub use config::{BackendKind, BytestreamSettings, Config, HttpSettings};
-pub use durability::{commit_root, CheckpointPayload, Durability, JournalOp, Superblock};
+pub use durability::{
+    commit_root, start_or_restore, CheckpointPayload, Durability, JournalOp, Superblock,
+};
 pub use layer::{default_layer_opts, BlobId, BlobLayer, ChunkRef, Ingested};
 pub use instances::{
     check_fingerprints, discord_fingerprint, discord_location, legacy_default_instance,

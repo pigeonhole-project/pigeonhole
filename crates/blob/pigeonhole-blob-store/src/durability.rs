@@ -380,6 +380,7 @@ impl Durability {
 
     /// Put pending ops as one journal segment, append to superblock, swap pin.
     pub async fn flush_journal(&self) -> Result<()> {
+        self.ensure_not_fenced().await?;
         let ops = {
             let mut g = self.pending.lock().await;
             std::mem::take(&mut *g)
@@ -410,6 +411,7 @@ impl Durability {
 
     /// Full checkpoint: export DB → put → new superblock with empty log.
     pub async fn checkpoint(&self, db: &BlobDb) -> Result<()> {
+        self.ensure_not_fenced().await?;
         // Drain journal into the DB first (caller should have applied ops locally).
         self.flush_journal().await?;
 
@@ -465,6 +467,31 @@ impl Durability {
     pub async fn generation(&self) -> u64 {
         self.current.lock().await.generation
     }
+
+    /// Replace local + pinned superblock (fencing / explicit publish).
+    pub async fn publish_superblock(&self, mut sb: Superblock) -> Result<()> {
+        let sealed = sb.seal()?;
+        self.pin.swap(sealed).await.context("publish superblock")?;
+        *self.current.lock().await = sb;
+        Ok(())
+    }
+
+    /// Stop if the pin's generation is strictly greater than our local view.
+    pub async fn ensure_not_fenced(&self) -> Result<()> {
+        let local = self.generation().await;
+        let Some(raw) = self.pin.read().await? else {
+            return Ok(());
+        };
+        let remote = Superblock::parse(&raw)?;
+        if remote.generation > local {
+            bail!(
+                "fenced: remote superblock generation {} > local {}; refusing to write",
+                remote.generation,
+                local
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Commit `set_root` as the durable point: local DB + journal flush + pin.
@@ -474,6 +501,7 @@ pub async fn commit_root(
     name: &str,
     blob_id: BlobId,
 ) -> Result<()> {
+    dur.ensure_not_fenced().await?;
     db.set_root(name, blob_id).await?;
     dur.enqueue(JournalOp::SetRoot {
         name: name.to_string(),
@@ -482,6 +510,46 @@ pub async fn commit_root(
     .await;
     dur.flush_journal().await?;
     Ok(())
+}
+
+impl BlobDb {
+    pub async fn is_empty_metadata(&self) -> Result<bool> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs")
+            .fetch_one(self.pool())
+            .await?;
+        let (r,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM roots")
+            .fetch_one(self.pool())
+            .await?;
+        Ok(n == 0 && r == 0)
+    }
+}
+
+/// Stage 2.3: restore from pin into `db`, then fence by publishing generation+1.
+///
+/// Refuses a non-empty `db` unless `force` is set (same policy as legacy restore).
+pub async fn start_or_restore(
+    db: &BlobDb,
+    dur: &Durability,
+    expected_fingerprint: &str,
+    force: bool,
+) -> Result<Superblock> {
+    if !force && !db.is_empty_metadata().await? {
+        bail!("blob.db is not empty; pass force=true to overwrite (like restore --force)");
+    }
+    let sb = dur.restore_into(db).await?;
+    if sb.fingerprint != expected_fingerprint {
+        bail!(
+            "superblock fingerprint {:?} != config {:?}",
+            sb.fingerprint,
+            expected_fingerprint
+        );
+    }
+
+    // Fencing: publish generation+1 so a stale writer with a lower generation stops.
+    let mut next = sb.clone();
+    next.generation = next.generation.saturating_add(1);
+    dur.publish_superblock(next).await?;
+    Ok(sb)
 }
 
 #[cfg(test)]
@@ -557,5 +625,53 @@ mod tests {
         let parsed = Superblock::parse(&bytes).unwrap();
         assert_eq!(parsed.generation, 3);
         assert_eq!(parsed.roots.get("cas/index"), Some(&9));
+    }
+
+    #[tokio::test]
+    async fn start_or_restore_fences_stale_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("a.db").display());
+        let db = BlobDb::connect(&url).await.unwrap();
+        let mem = MemoryBlobStore::new();
+        let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
+        opts.frame_size = 64 * 1024;
+        let layer = BlobLayer::open(db.clone(), mem, opts).await.unwrap();
+        let backend = layer.write_backend();
+        let info = backend.instance().clone();
+        let pin = Arc::new(MemPin {
+            data: StdMutex::new(None),
+        });
+
+        let dur_a = Durability::new(
+            backend.clone(),
+            pin.clone(),
+            Superblock::new(0, info.id.clone(), info.fingerprint.clone()),
+        );
+        layer.put_small(Bytes::from_static(b"x")).await.unwrap();
+        dur_a.checkpoint(layer.db()).await.unwrap();
+
+        // Process B restores and fences (generation bump).
+        let url_b = format!("sqlite:{}?mode=rwc", dir.path().join("b.db").display());
+        let db_b = BlobDb::connect(&url_b).await.unwrap();
+        let dur_b = Durability::new(
+            backend.clone(),
+            pin.clone(),
+            Superblock::new(0, info.id.clone(), info.fingerprint.clone()),
+        );
+        let restored = start_or_restore(&db_b, &dur_b, &info.fingerprint, false)
+            .await
+            .unwrap();
+        assert!(restored.generation >= 1);
+        assert!(dur_b.generation().await > restored.generation);
+
+        // Stale A still thinks it has the old generation → fenced.
+        let err = dur_a.ensure_not_fenced().await.unwrap_err();
+        assert!(err.to_string().contains("fenced"));
+
+        // Non-empty refuse without force.
+        let err = start_or_restore(&db_b, &dur_b, &info.fingerprint, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not empty"));
     }
 }
