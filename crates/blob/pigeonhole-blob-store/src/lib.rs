@@ -5,11 +5,13 @@ pub mod config;
 pub mod frame_cache;
 pub mod ingest;
 pub mod instances;
+pub mod layer;
 pub mod read;
 pub mod snapshot;
 
 pub use blob_db::BlobDb;
 pub use config::{BackendKind, BytestreamSettings, Config, HttpSettings};
+pub use layer::{default_layer_opts, BlobId, BlobLayer, ChunkRef, Ingested};
 pub use instances::{
     check_fingerprints, discord_fingerprint, discord_location, legacy_default_instance,
     memory_fingerprint, memory_location, telegram_fingerprint, telegram_location, validate_instances,

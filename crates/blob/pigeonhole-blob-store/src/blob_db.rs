@@ -280,6 +280,85 @@ impl BlobDb {
         }
         Ok(())
     }
+
+    pub async fn blob_meta(&self, blob_id: i64) -> Result<Option<(i64, u32, i64)>> {
+        let row: Option<(i64, i64, i64)> =
+            sqlx::query_as("SELECT size, crc32, refs FROM blobs WHERE id = ?")
+                .bind(blob_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(size, crc, refs)| (size, crc as u32, refs)))
+    }
+
+    pub async fn replace_frames(
+        &self,
+        blob_id: i64,
+        frames: &[pigeonhole_codec::FrameRecord],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM chunk_frames WHERE blob_id = ?")
+            .bind(blob_id)
+            .execute(&mut *tx)
+            .await?;
+        for fr in frames {
+            sqlx::query(
+                r#"
+                INSERT INTO chunk_frames
+                  (blob_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(blob_id)
+            .bind(fr.frame_no)
+            .bind(fr.stored_off)
+            .bind(fr.stored_len)
+            .bind(fr.logical_off)
+            .bind(fr.logical_len)
+            .bind(&fr.codec)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn get_frames(&self, blob_id: i64) -> Result<Vec<pigeonhole_codec::FrameRecord>> {
+        let rows: Vec<(i64, i64, i64, i64, i64, String)> = sqlx::query_as(
+            r#"
+            SELECT frame_no, stored_off, stored_len, logical_off, logical_len, codec
+            FROM chunk_frames WHERE blob_id = ? ORDER BY frame_no
+            "#,
+        )
+        .bind(blob_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(frame_no, stored_off, stored_len, logical_off, logical_len, codec)| {
+                    pigeonhole_codec::FrameRecord {
+                        frame_no,
+                        stored_off,
+                        stored_len,
+                        logical_off,
+                        logical_len,
+                        codec,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// First ready replica for a blob (any instance).
+    pub async fn get_any_replica(&self, blob_id: i64) -> Result<Option<(String, Vec<u8>, Vec<u8>)>> {
+        let row: Option<(String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT instance_id, sort_key, locator FROM replicas WHERE blob_id = ? LIMIT 1",
+        )
+        .bind(blob_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
 }
 
 #[cfg(test)]
