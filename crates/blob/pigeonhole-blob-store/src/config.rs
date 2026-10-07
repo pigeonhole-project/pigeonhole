@@ -174,7 +174,13 @@ impl Config {
         if frame_size > chunker::MAX_LOGICAL_CHUNK {
             bail!("chunk.frame_size exceeds MAX_LOGICAL_CHUNK");
         }
-        let memory_budget = file.ingest.memory_budget.max(frame_size);
+        let memory_budget = file.ingest.memory_budget;
+        if memory_budget < frame_size.saturating_mul(2) {
+            bail!(
+                "ingest.memory_budget ({memory_budget}) must be >= 2 * chunk.frame_size ({})",
+                frame_size.saturating_mul(2)
+            );
+        }
         let ingest_budget = Some(ByteBudget::new(memory_budget));
 
         let tg = file.telegram.into_limiter_config();
@@ -669,5 +675,27 @@ rate_burst = 2.0
         let cfg = Config::load_from_path(f.path()).unwrap();
         assert_eq!(cfg.tg.send_rate_per_sec, 0.25);
         assert_eq!(cfg.tg.send_burst, 2.0);
+    }
+
+    #[test]
+    fn rejects_memory_budget_below_two_frames() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"
+memory = true
+[chunk]
+frame_size = 1048576
+[ingest]
+memory_budget = 1048576
+"#
+        )
+        .unwrap();
+        let err = Config::load_from_path(f.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ingest.memory_budget"),
+            "unexpected error: {msg}"
+        );
     }
 }

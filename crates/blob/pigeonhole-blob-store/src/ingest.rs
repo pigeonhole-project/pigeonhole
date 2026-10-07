@@ -665,6 +665,48 @@ mod tests {
         assert_eq!(budget.available_permits(), budget.capacity());
     }
 
+    /// 64 parallel 8 MiB PUTs sharing a budget of only `4 * frame_size` must
+    /// finish (whole-frame acquire prevents fragment deadlock).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn parallel_puts_whole_frame_budget_no_deadlock() {
+        let frame = 512 * 1024;
+        let budget = ByteBudget::new(4 * frame);
+        let mut joins = Vec::new();
+        for _ in 0..64 {
+            let budget = budget.clone();
+            joins.push(tokio::spawn(async move {
+                let mem = Arc::new(MemoryBlobStore::new());
+                let store: Arc<dyn BlobStore> = mem;
+                let n = 8 * 1024 * 1024;
+                let piece = 256 * 1024;
+                let body = futures::stream::unfold(0usize, move |off| async move {
+                    if off >= n {
+                        return None;
+                    }
+                    let len = (n - off).min(piece);
+                    Some((Ok::<_, anyhow::Error>(Bytes::from(vec![3u8; len])), off + len))
+                });
+                let mut opts = IngestOptions::new(2 * 1024 * 1024, ChunkCodec::Raw);
+                opts.frame_size = frame;
+                opts.memory_budget = Some(budget);
+                ingest_stream_with_options(&store, Box::pin(body), None, opts).await
+            }));
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            for j in joins {
+                j.await
+                    .expect("join")
+                    .expect("parallel 8 MiB ingest under 4*frame_size budget");
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "64 parallel 8 MiB PUTs under 4*frame_size budget timed out"
+        );
+        assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
     #[tokio::test]
     async fn cancel_mid_put_returns_budget() {
         let budget = ByteBudget::new(16 * 1024 * 1024);

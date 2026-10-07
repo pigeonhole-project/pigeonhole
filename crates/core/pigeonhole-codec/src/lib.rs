@@ -10,6 +10,6 @@ pub use chunker::{
     MAX_CHUNK_SIZE, MAX_LOGICAL_CHUNK,
 };
 pub use frames::{
-    decode_frames_range, ByteBudget, CompletedChunk, FrameRecord, FrameWriter,
+    decode_frames_range, BudgetPermit, ByteBudget, CompletedChunk, FrameRecord, FrameWriter,
 };
 pub use types::{codec_from_sql, codec_to_sql, UploadedChunk};
