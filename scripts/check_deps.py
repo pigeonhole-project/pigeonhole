@@ -107,6 +107,12 @@ def main() -> int:
                             f"{name} (gateway) → {dep_name} ({dr}); "
                             f"allowed: {sorted(allowed)}"
                         )
+                    # Gateways must not take a direct dependency on pigeonhole-index;
+                    # S3/CAS indexes live in the gateway or behind blob-store APIs.
+                    if dep_name in ("pigeonhole-index", "s3gram-index"):
+                        errors.append(
+                            f"{name} (gateway) must not depend on {dep_name} directly"
+                        )
             else:
                 for dep_name in dep_names:
                     dr = ROLE.get(dep_name)

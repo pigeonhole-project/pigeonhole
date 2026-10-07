@@ -63,13 +63,13 @@ struct PendingUpload {
 
 fn make_state(cfg: &BytestreamConfig, index: Index, store: Arc<dyn BlobStore>, chat_id: String) -> ReapiState {
     let state = ReapiState {
-        cas: CasStore::new(index.clone(), store.clone(), chat_id),
+        cas: CasStore::new(index, store.clone(), chat_id),
         instance: cfg.instance_name.clone(),
         max_batch_total_size_bytes: cfg.max_batch_total_size_bytes,
         upload_ttl: Duration::from_secs(cfg.upload_ttl_secs.max(60)),
         uploads: Arc::new(Mutex::new(HashMap::new())),
     };
-    spawn_cas_gc(state.clone(), index, store, cfg.gc_ttl_secs);
+    spawn_cas_gc(state.clone(), store, cfg.gc_ttl_secs);
     spawn_upload_gc(state.clone());
     state
 }
@@ -142,23 +142,24 @@ fn spawn_upload_gc(state: ReapiState) {
     });
 }
 
-fn spawn_cas_gc(state: ReapiState, index: Index, store: Arc<dyn BlobStore>, ttl_secs: u64) {
+fn spawn_cas_gc(state: ReapiState, store: Arc<dyn BlobStore>, ttl_secs: u64) {
     if ttl_secs == 0 {
         return;
     }
     tokio::spawn(async move {
         let ttl = ChronoDuration::seconds(ttl_secs as i64);
+        let cas = state.cas.cas.clone();
         loop {
             tokio::time::sleep(Duration::from_secs(300)).await;
             let cutoff = Utc::now() - ttl;
-            if let Ok(stale) = index.cas_stale_before(cutoff).await {
+            if let Ok(stale) = cas.stale_before(cutoff).await {
                 for row in stale {
-                    let _ = index.cas_queue_delete(&row.hash, row.size).await;
+                    let _ = cas.queue_delete(&row.hash, row.size).await;
                 }
             }
-            if let Ok(pending) = index.cas_list_pending_deletes(32).await {
+            if let Ok(pending) = cas.list_pending_deletes(32).await {
                 for (hash, size) in pending {
-                    match index.cas_release(&hash, size).await {
+                    match cas.release(&hash, size).await {
                         Ok(orphans) => {
                             for (_chat, message_id, _fid) in orphans {
                                 let _ = store.delete_message(message_id).await;
@@ -166,10 +167,9 @@ fn spawn_cas_gc(state: ReapiState, index: Index, store: Arc<dyn BlobStore>, ttl_
                         }
                         Err(e) => warn!(error = %e, %hash, size, "cas gc release"),
                     }
-                    let _ = index.cas_clear_pending_delete(&hash, size).await;
+                    let _ = cas.clear_pending_delete(&hash, size).await;
                 }
             }
-            let _ = &state;
         }
     });
 }
@@ -592,7 +592,7 @@ impl ByteStream for ReapiState {
         if digest != expected_hash || committed_size != expected_size {
             // Finish/cancel ingest; remove any CAS row written under the claimed digest.
             let _ = handle.await;
-            if let Ok(orphans) = self.cas.index.cas_release(&expected_hash, expected_size).await {
+            if let Ok(orphans) = self.cas.cas.release(&expected_hash, expected_size).await {
                 for (_chat, message_id, _fid) in orphans {
                     let _ = self.cas.store.delete_message(message_id).await;
                 }

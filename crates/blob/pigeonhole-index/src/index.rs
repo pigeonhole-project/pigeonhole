@@ -196,6 +196,11 @@ pub struct IndexSnapshot {
 }
 
 impl Index {
+    /// Shared SQLite pool (gateway CAS index wraps this until blob.db owns refs).
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self> {
         // sqlx sqlite URLs: sqlite:path or sqlite://path
         let url = if database_url == "sqlite:s3gram.db" {

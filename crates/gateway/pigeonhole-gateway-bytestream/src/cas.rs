@@ -1,3 +1,4 @@
+use crate::cas_index::CasIndex;
 use crate::digest::{digest_hash_hex, verify_sha256};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -36,10 +37,10 @@ impl From<&UploadedChunk> for CasChunkMeta {
     }
 }
 
-/// Store and fetch CAS payloads through the index + chunked [`BlobStore`] ingest.
+/// Store and fetch CAS payloads through [`CasIndex`] + chunked [`BlobStore`] ingest.
 #[derive(Clone)]
 pub struct CasStore {
-    pub index: Index,
+    pub cas: CasIndex,
     pub store: Arc<dyn BlobStore>,
     pub chat_id: String,
     pub chunk_size: usize,
@@ -48,7 +49,7 @@ pub struct CasStore {
 impl CasStore {
     pub fn new(index: Index, store: Arc<dyn BlobStore>, chat_id: String) -> Self {
         Self {
-            index,
+            cas: CasIndex::new(index),
             store,
             chat_id,
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -63,7 +64,7 @@ impl CasStore {
         for d in digests {
             pairs.push((digest_hash_hex(d)?, d.size_bytes));
         }
-        let missing = self.index.cas_find_missing(&pairs).await?;
+        let missing = self.cas.find_missing(&pairs).await?;
         Ok(missing
             .into_iter()
             .map(|(hash, size)| crate::reapi::Digest {
@@ -85,7 +86,7 @@ impl CasStore {
         offset: i64,
         limit: i64,
     ) -> Result<Option<Bytes>> {
-        let Some(entry) = self.index.cas_get(hash_hex, size).await? else {
+        let Some(entry) = self.cas.get(hash_hex, size).await? else {
             return Ok(None);
         };
         let from = offset.max(0) as usize;
@@ -98,7 +99,7 @@ impl CasStore {
             size as usize
         };
         if from == to {
-            let _ = self.index.cas_touch(hash_hex, size).await;
+            let _ = self.cas.touch(hash_hex, size).await;
             return Ok(Some(Bytes::new()));
         }
 
@@ -118,14 +119,14 @@ impl CasStore {
             }
             raw.slice(from..to)
         };
-        let _ = self.index.cas_touch(hash_hex, size).await;
+        let _ = self.cas.touch(hash_hex, size).await;
         Ok(Some(data))
     }
 
     pub async fn put_bytes(&self, hash_hex: &str, size: i64, data: Bytes) -> Result<()> {
         verify_sha256(&data, hash_hex, size)?;
-        if self.index.cas_get(hash_hex, size).await?.is_some() {
-            let _ = self.index.cas_touch(hash_hex, size).await;
+        if self.cas.get(hash_hex, size).await?.is_some() {
+            let _ = self.cas.touch(hash_hex, size).await;
             return Ok(());
         }
         let stream = futures::stream::iter(std::iter::once(Ok::<_, anyhow::Error>(data)));
@@ -137,8 +138,8 @@ impl CasStore {
     where
         S: futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin + Send,
     {
-        if self.index.cas_get(hash_hex, size).await?.is_some() {
-            let _ = self.index.cas_touch(hash_hex, size).await;
+        if self.cas.get(hash_hex, size).await?.is_some() {
+            let _ = self.cas.touch(hash_hex, size).await;
             // Drain stream so callers do not hang.
             let mut stream = stream;
             while stream.next().await.is_some() {}
@@ -182,8 +183,8 @@ impl CasStore {
             .collect();
 
         if let Err(e) = self
-            .index
-            .cas_store_manifest(hash_hex, size, &self.chat_id, &bump, &manifest_json)
+            .cas
+            .store_manifest(hash_hex, size, &self.chat_id, &bump, &manifest_json)
             .await
         {
             self.abort_chunks(&ingested.chunks).await;

@@ -1,6 +1,7 @@
 //! REAPI v2 remote cache (CAS + ActionCache + ByteStream) for Bazel/Buck2.
 
 pub mod cas;
+pub mod cas_index;
 pub mod config;
 pub mod digest;
 pub mod server;
