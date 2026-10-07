@@ -1,9 +1,8 @@
 //! In-memory [`LegacyBlobStore`] / [`LegacyBlobStore`] for tests and `memory = true`.
 
 use pigeonhole_blob::{
-    bytes_stream, slice_range, store_delete_message, store_get, store_put, LegacyBlobStore,
-    BoxByteStream, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, Sweepable,
-    BlobBackend, TypedBootstrapPointer,
+    bytes_stream, slice_range, LegacyBlobStore, BoxByteStream, CostHint, InstanceInfo,
+    InstanceKind, InstanceRole, OpKind, Sweepable, BlobBackend, TypedBootstrapPointer,
 };
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -13,8 +12,8 @@ use pigeonhole_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Typed identity for the memory backend (stage 1.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +33,8 @@ pub struct MemoryBlobStore {
     messages: Mutex<HashMap<i64, String>>,
     /// Bootstrap pin payload (TypedBootstrapPointer).
     pin: Mutex<Option<Bytes>>,
+    /// When set and true, get/put fail (failover tests).
+    unavailable: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Alias matching Stage 3 naming.
@@ -61,6 +62,7 @@ impl MemoryBlobStore {
             files: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             pin: Mutex::new(None),
+            unavailable: None,
         }
     }
 
@@ -71,6 +73,29 @@ impl MemoryBlobStore {
         self.instance.fingerprint = format!("memory:{id}");
         self.instance.location = format!("memory:{id}");
         self
+    }
+
+    /// Attach a shared unavailable flag for failover tests.
+    pub fn with_unavailable_flag(mut self) -> Self {
+        self.unavailable = Some(Arc::new(AtomicBool::new(false)));
+        self
+    }
+
+    pub fn unavailable_flag(&self) -> Arc<AtomicBool> {
+        self.unavailable
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
+    }
+
+    fn check_available(&self) -> Result<()> {
+        if self
+            .unavailable
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            bail!("503 service unavailable");
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -105,6 +130,7 @@ impl LegacyBlobStore for MemoryBlobStore {
     }
 
     async fn put(&self, data: Bytes, _hint: PutHint) -> Result<Locator> {
+        self.check_available()?;
         if data.is_empty() {
             bail!("refusing empty blob upload (Telegram rejects empty documents)");
         }
@@ -126,6 +152,7 @@ impl LegacyBlobStore for MemoryBlobStore {
     }
 
     async fn get(&self, loc: &Locator, range: Option<ByteRange>) -> Result<BoxByteStream> {
+        self.check_available()?;
         let file_id = loc
             .file_id()
             .filter(|s| !s.is_empty())
@@ -244,7 +271,9 @@ impl TypedBootstrapPointer for MemoryBlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pigeonhole_blob::{collect_stream, LegacyBlobStore};
+    use pigeonhole_blob::{
+        collect_stream, store_delete_message, store_get, store_put, LegacyBlobStore,
+    };
     use pigeonhole_types::PutHint;
 
     #[tokio::test]

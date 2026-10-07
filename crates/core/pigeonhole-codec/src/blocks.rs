@@ -353,6 +353,22 @@ impl BlockWriter {
     }
 }
 
+/// Encode one logical block to stored bytes (raw fallback when compression does not shrink).
+pub fn encode_block_bytes(logical: &[u8], policy: ChunkCodec) -> Result<(Bytes, String)> {
+    let (v, c) = encode_block(logical, policy)?;
+    Ok((Bytes::from(v), c.as_str().to_string()))
+}
+
+/// Decode one stored block to logical bytes.
+pub fn decode_block_slice(stored: &[u8], codec: &str, max_logical: usize) -> Result<Bytes> {
+    let c = match codec {
+        "gzip" => ChunkCodec::Gzip,
+        "zstd" => ChunkCodec::Zstd,
+        _ => ChunkCodec::Raw,
+    };
+    Ok(Bytes::from(decode_block(stored, c, max_logical)?))
+}
+
 fn encode_block(logical: &[u8], policy: ChunkCodec) -> Result<(Vec<u8>, ChunkCodec)> {
     if logical.is_empty() {
         return Ok((Vec::new(), ChunkCodec::Raw));

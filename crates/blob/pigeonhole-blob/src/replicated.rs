@@ -331,6 +331,16 @@ pub struct ChunkReplicaWriter {
 }
 
 impl ChunkReplicaWriter {
+    /// Sum of unfilled open-part buffers across live members (memory budget).
+    pub fn open_part_bytes(&self) -> usize {
+        self.writers
+            .iter()
+            .filter(|w| !w.failed)
+            .filter_map(|w| w.packer.as_ref())
+            .map(|p| p.open_bytes())
+            .sum()
+    }
+
     /// Fan-out one encoded block to all live members (`Bytes` clone is refcounted).
     pub async fn push(&mut self, block: EncodedBlock) -> Result<()> {
         let timeout = self.timeout;

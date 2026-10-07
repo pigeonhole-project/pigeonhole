@@ -64,6 +64,11 @@ impl PartPacker {
         self.next_block
     }
 
+    /// Bytes buffered in the open (unfilled) part.
+    pub fn open_bytes(&self) -> usize {
+        self.open_total
+    }
+
     /// Push one block. Returns a sealed part when the open part was flushed.
     pub async fn push(&mut self, block: EncodedBlock) -> Result<Option<PartUploaded>> {
         let stored_len = block.stored.len();
