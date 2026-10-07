@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// Hard ceiling: stored payload must be downloadable via getFile (< 20 MiB).
 pub const MAX_CHUNK_SIZE: usize = 20 * 1024 * 1024 - 1;
-/// Default max **stored** (on-wire) chunk size (legacy LegacyBlobStore ingest).
+/// Default max **stored** (on-wire) chunk size.
 pub const DEFAULT_CHUNK_SIZE: usize = 19 * 1024 * 1024;
 /// Default max **logical** chunk size for ChunkStore part packing (stage E).
 pub const DEFAULT_LOGICAL_CHUNK_SIZE: usize = 64 * 1024 * 1024;

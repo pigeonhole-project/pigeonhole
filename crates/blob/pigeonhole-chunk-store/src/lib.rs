@@ -8,7 +8,7 @@ pub mod ingest;
 pub mod instances;
 pub mod layer;
 pub mod migrate;
-pub mod read;
+pub mod sweep;
 
 pub use blob_db::{BlobDb, StoredBlock};
 pub use config::{BackendKind, BytestreamSettings, Config, HttpSettings, PlacementConfig};
@@ -31,12 +31,11 @@ pub use block_cache::BlockCache;
 pub use pigeonhole_blob::CacheConfig;
 pub use ingest::{
     codec_from_sql, codec_to_sql, decode_chunk, decode_chunk_async, decode_chunk_slice_async,
-    encode_chunk, ingest_stream_to_store, ingest_stream_with_options, IngestError, IngestHasher,
-    IngestOptions, IngestResult, UploadedChunk,
+    encode_chunk, IngestHasher, IngestOptions,
 };
-pub use read::read_chunk_range_cached;
-pub use pigeonhole_blob::{
-    collect_stream, store_delete_message, store_get, store_put, BootstrapPointer, BoxByteStream,
-    DeleteOutcome, PinnedContent,
+pub use sweep::{
+    SweepConfig, SweepStats, Sweeper, WatermarkBackend, DEFAULT_SWEEP_GRACE, DEFAULT_SWEEP_INTERVAL,
+    SWEEP_BATCH_SIZE,
 };
+pub use pigeonhole_blob::{collect_stream, BootstrapPointer, BoxByteStream, DeleteOutcome, PinnedContent};
 pub use pigeonhole_codec::{ByteBudget, ChunkCodec, BlockRecord};

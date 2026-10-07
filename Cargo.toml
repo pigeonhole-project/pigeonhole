@@ -31,7 +31,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 crc32fast = "1"
 dotenvy = "0.15"
 flate2 = "1"
-foyer = { version = "0.22", features = ["serde"] }
 futures = "0.3"
 hex = "0.4"
 moka = { version = "0.12", features = ["future"] }

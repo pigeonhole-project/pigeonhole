@@ -1,6 +1,5 @@
 use bytes::Bytes;
-use pigeonhole_testkit::run_conformance;
-use pigeonhole_blob::{LegacyBlobStore, ChatLimiter, ChatLimiterConfig, PutHint};
+use pigeonhole_blob::{collect_stream, ChatLimiter, ChatLimiterConfig, BlobBackend};
 use pigeonhole_storage_discord::{DiscordBlobStore, DiscordClient};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,7 +171,24 @@ async fn wiremock_conformance_suite() {
         download_concurrency: 8,
     }));
     let store = DiscordBlobStore::new(dc, CHANNEL.into(), limiter, None);
-    run_conformance(&store).await.unwrap();
+
+    assert!(BlobBackend::put(&store, Bytes::new()).await.is_err());
+
+    let id = BlobBackend::put(&store, Bytes::from_static(b"hello-conformance"))
+        .await
+        .unwrap();
+    let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(got.as_ref(), b"hello-conformance");
+
+    let mid = collect_stream(BlobBackend::get(&store, &id, Some(6..12)).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(mid.as_ref(), b"confor");
+
+    BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
+    assert!(BlobBackend::get(&store, &id, None).await.is_err());
 }
 
 #[tokio::test]
@@ -237,14 +253,10 @@ async fn wiremock_expired_url_refresh_and_429_retry() {
     let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
     let store = DiscordBlobStore::new(dc, CHANNEL.into(), limiter, None);
 
-    let loc = store
-        .put(
-            Bytes::from_static(b"payload-bytes"),
-            PutHint::new("x.bin", ""),
-        )
+    let id = BlobBackend::put(&store, Bytes::from_static(b"payload-bytes"))
         .await
         .unwrap();
-    let got = pigeonhole_blob::collect_stream(store.get(&loc, None).await.unwrap())
+    let got = pigeonhole_blob::collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
         .await
         .unwrap();
     assert_eq!(got.as_ref(), b"payload-bytes");

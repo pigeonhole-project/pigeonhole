@@ -815,4 +815,165 @@ mod tests {
         let got = layer.read(&ingested.extents, None).await.unwrap();
         assert_eq!(got, data);
     }
+
+    /// Object larger than the ingest budget must still complete (budget covers
+    /// only the open chunk + block, not the whole object).
+    #[tokio::test]
+    async fn large_put_under_small_budget_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+        let budget = ByteBudget::new(32 * 1024 * 1024);
+        let mut opts = IngestOptions::new(8 * 1024 * 1024, ChunkCodec::Zstd);
+        opts.block_size = 1024 * 1024;
+        opts.memory_budget = Some(budget.clone());
+        let db = BlobDb::connect(&url).await.unwrap();
+        let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
+            .await
+            .unwrap();
+        let n = 300 * 1024 * 1024;
+        let piece = 4 * 1024 * 1024;
+        let body = futures::stream::unfold(0usize, move |off| async move {
+            if off >= n {
+                return None;
+            }
+            let len = (n - off).min(piece);
+            Some((Ok::<_, anyhow::Error>(Bytes::from(vec![0u8; len])), off + len))
+        });
+        let r = layer
+            .ingest(Box::pin(body), None)
+            .await
+            .expect("300 MiB ingest under 32 MiB budget");
+        assert_eq!(r.size, n as i64);
+        assert!(!r.extents.is_empty());
+        assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
+    #[tokio::test]
+    async fn parallel_puts_share_budget_without_deadlock() {
+        let budget = ByteBudget::new(64 * 1024 * 1024);
+        let mut joins = Vec::new();
+        for i in 0..8 {
+            let budget = budget.clone();
+            joins.push(tokio::spawn(async move {
+                let dir = tempfile::tempdir().unwrap();
+                let url = format!(
+                    "sqlite:{}?mode=rwc",
+                    dir.path().join(format!("blob-{i}.db")).display()
+                );
+                let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
+                opts.block_size = 512 * 1024;
+                opts.memory_budget = Some(budget);
+                let db = BlobDb::connect(&url).await.unwrap();
+                let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
+                    .await
+                    .unwrap();
+                let n = 64 * 1024 * 1024;
+                let piece = 2 * 1024 * 1024;
+                let body = futures::stream::unfold(0usize, move |off| async move {
+                    if off >= n {
+                        return None;
+                    }
+                    let len = (n - off).min(piece);
+                    Some((Ok::<_, anyhow::Error>(Bytes::from(vec![1u8; len])), off + len))
+                });
+                layer.ingest(Box::pin(body), None).await
+            }));
+        }
+        for j in joins {
+            j.await
+                .expect("join")
+                .expect("parallel 64 MiB ingest under 64 MiB shared budget");
+        }
+        assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
+    /// 64 parallel 8 MiB PUTs sharing a budget of only `4 * block_size` must
+    /// finish (whole-frame acquire prevents fragment deadlock).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn parallel_puts_whole_frame_budget_no_deadlock() {
+        let frame = 512 * 1024;
+        let budget = ByteBudget::new(4 * frame);
+        let mut joins = Vec::new();
+        for i in 0..64 {
+            let budget = budget.clone();
+            joins.push(tokio::spawn(async move {
+                let dir = tempfile::tempdir().unwrap();
+                let url = format!(
+                    "sqlite:{}?mode=rwc",
+                    dir.path().join(format!("blob-{i}.db")).display()
+                );
+                let mut opts = IngestOptions::new(2 * 1024 * 1024, ChunkCodec::Raw);
+                opts.block_size = frame;
+                opts.memory_budget = Some(budget);
+                let db = BlobDb::connect(&url).await.unwrap();
+                let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
+                    .await
+                    .unwrap();
+                let n = 8 * 1024 * 1024;
+                let piece = 256 * 1024;
+                let body = futures::stream::unfold(0usize, move |off| async move {
+                    if off >= n {
+                        return None;
+                    }
+                    let len = (n - off).min(piece);
+                    Some((Ok::<_, anyhow::Error>(Bytes::from(vec![3u8; len])), off + len))
+                });
+                layer.ingest(Box::pin(body), None).await
+            }));
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            for j in joins {
+                j.await
+                    .expect("join")
+                    .expect("parallel 8 MiB ingest under 4*block_size budget");
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "64 parallel 8 MiB PUTs under 4*block_size budget timed out"
+        );
+        assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_put_returns_budget() {
+        let budget = ByteBudget::new(16 * 1024 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+        let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
+        opts.block_size = 512 * 1024;
+        opts.memory_budget = Some(budget.clone());
+        let db = BlobDb::connect(&url).await.unwrap();
+        let layer = Arc::new(
+            ChunkStore::open(db, MemoryBlobStore::new(), opts)
+                .await
+                .unwrap(),
+        );
+        let budget_c = budget.clone();
+        let layer_c = layer.clone();
+        let handle = tokio::spawn(async move {
+            let n = 128 * 1024 * 1024;
+            let piece = 1024 * 1024;
+            let body = futures::stream::unfold(0usize, move |off| async move {
+                if off >= n {
+                    return None;
+                }
+                tokio::task::yield_now().await;
+                let len = (n - off).min(piece);
+                Some((Ok::<_, anyhow::Error>(Bytes::from(vec![2u8; len])), off + len))
+            });
+            let _ = budget_c;
+            layer_c.ingest(Box::pin(body), None).await
+        });
+        for _ in 0..200 {
+            if budget.available_permits() < budget.capacity() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(budget.available_permits(), budget.capacity());
+    }
 }

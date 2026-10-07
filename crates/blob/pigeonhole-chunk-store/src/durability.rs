@@ -622,6 +622,32 @@ impl Durability {
         self.current.lock().await.generation
     }
 
+    /// Sort keys of checkpoint / journal parts for `instance_id`, plus the pin message key.
+    pub async fn system_keys(&self, instance_id: &str) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        {
+            let sb = self.current.lock().await;
+            if let Some(locs) = sb.checkpoint.get(instance_id) {
+                for loc in locs {
+                    keys.push(loc.key.clone());
+                }
+            }
+            for seg in &sb.log {
+                if let Some(locs) = seg.get(instance_id) {
+                    for loc in locs {
+                        keys.push(loc.key.clone());
+                    }
+                }
+            }
+        }
+        if let Some(pin) = self.pins.iter().find(|p| p.instance_id == instance_id) {
+            if let Some(k) = pin.pin.pin_key().await.context("pin_key")? {
+                keys.push(k);
+            }
+        }
+        Ok(keys)
+    }
+
     async fn publish_all(&self, sealed: Bytes) -> Result<()> {
         for pin in &self.pins {
             pin.pin

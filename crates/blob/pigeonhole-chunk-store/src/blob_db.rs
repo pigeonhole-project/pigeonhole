@@ -799,6 +799,126 @@ impl BlobDb {
             .map(|(instance, parts)| ReplicaLayout { instance, parts })
             .collect())
     }
+
+    /// Record the highest sort key observed from a successful backend put.
+    pub async fn record_put_watermark(&self, instance_id: &str, max_key: &[u8]) -> Result<()> {
+        self.record_put_watermark_at(instance_id, max_key, Utc::now())
+            .await
+    }
+
+    /// Test / restore helper: record a watermark at an explicit timestamp.
+    pub async fn record_put_watermark_at(
+        &self,
+        instance_id: &str,
+        max_key: &[u8],
+        at: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO put_watermarks (instance_id, at, max_key)
+            VALUES (?, ?, ?)
+            "#,
+        )
+        .bind(instance_id)
+        .bind(at.to_rfc3339())
+        .bind(max_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Max sort key among watermarks with `at <= now - grace` (sweep upper bound).
+    pub async fn sweep_watermark(
+        &self,
+        instance_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<Option<Vec<u8>>> {
+        let cutoff = Utc::now() - chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::zero());
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            r#"
+            SELECT max_key FROM put_watermarks
+            WHERE instance_id = ? AND at <= ?
+            ORDER BY max_key DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(instance_id)
+        .bind(cutoff.to_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(k,)| k))
+    }
+
+    pub async fn get_sweep_cursor(&self, instance_id: &str) -> Result<Option<Vec<u8>>> {
+        let row: Option<(Option<Vec<u8>>,)> =
+            sqlx::query_as("SELECT after FROM sweep_cursor WHERE instance_id = ?")
+                .bind(instance_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(a,)| a))
+    }
+
+    pub async fn set_sweep_cursor(
+        &self,
+        instance_id: &str,
+        after: Option<&[u8]>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO sweep_cursor (instance_id, after) VALUES (?, ?)
+            ON CONFLICT(instance_id) DO UPDATE SET after = excluded.after
+            "#,
+        )
+        .bind(instance_id)
+        .bind(after)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Sort keys of parts belonging to chunks with `refs > 0` on this instance.
+    pub async fn live_part_keys(&self, instance_id: &str) -> Result<Vec<Vec<u8>>> {
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+            r#"
+            SELECT p.sort_key
+            FROM chunk_parts p
+            INNER JOIN chunks c ON c.id = p.chunk_id
+            WHERE p.instance_id = ? AND c.refs > 0
+            "#,
+        )
+        .bind(instance_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(k,)| k).collect())
+    }
+
+    /// Chunk ids with `refs = 0` (physical reclaim candidates).
+    pub async fn list_zero_ref_chunks(&self) -> Result<Vec<ChunkId>> {
+        let rows: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM chunks WHERE refs = 0 ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Delete chunk_parts, chunk_blocks, and the chunk row (after backend deletes).
+    pub async fn delete_chunk_metadata(&self, chunk_id: ChunkId) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM chunk_parts WHERE chunk_id = ?")
+            .bind(chunk_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chunk_blocks WHERE chunk_id = ?")
+            .bind(chunk_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chunks WHERE id = ?")
+            .bind(chunk_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

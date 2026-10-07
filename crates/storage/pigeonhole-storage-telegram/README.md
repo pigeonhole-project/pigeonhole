@@ -1,7 +1,6 @@
 # pigeonhole-storage-telegram
 
-Telegram Bot API blob backend (`LegacyBlobStoreTg` / `LegacyBlobStore` and typed
-`BlobBackend` + `Sweepable` + `TypedBootstrapPointer`).
+Telegram Bot API blob backend (`BlobBackend` + `Sweepable` + `TypedBootstrapPointer`).
 
 ## `deleteMessage` / `deleteMessages` age limits
 

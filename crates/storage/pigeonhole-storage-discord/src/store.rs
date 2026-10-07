@@ -4,13 +4,11 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    bytes_stream, collect_stream, slice_range, LegacyBlobStore, BootstrapPointer,
-    BoxByteStream, ChatLimiter, CostHint, DeleteOutcome, InstanceInfo, InstanceKind, InstanceRole,
-    OpKind, PinnedContent, Sweepable, BlobBackend, TypedBootstrapPointer,
+    bytes_stream, slice_range, BootstrapPointer, BoxByteStream, ChatLimiter, CostHint,
+    DeleteOutcome, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey, PinnedContent,
+    Sweepable, BlobBackend, TypedBootstrapPointer,
 };
-use pigeonhole_types::{
-    BackendId, BackendLimits, ByteRange, Locator, PutHint, RangeSupport,
-};
+use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,7 +34,6 @@ const DC_TEXT_MAX: usize = 2000;
 
 /// Production adapter: blobs live as message attachments in one Discord channel.
 pub struct DiscordBlobStore {
-    id: BackendId,
     limits: BackendLimits,
     instance: InstanceInfo,
     dc: DiscordClient,
@@ -78,7 +75,6 @@ impl DiscordBlobStore {
         instance: InstanceInfo,
     ) -> Self {
         Self {
-            id: BackendId::discord(&channel_id),
             limits: BackendLimits::discord(max_blob_size),
             instance,
             dc,
@@ -97,33 +93,6 @@ impl DiscordBlobStore {
 
     pub fn limiter(&self) -> &ChatLimiter {
         &self.limiter
-    }
-
-    fn locator_from_store_file_id(&self, file_id: &str) -> Result<Locator> {
-        let (message_id, attachment_id) = Locator::parse_discord_store_file_id(file_id)
-            .ok_or_else(|| anyhow::anyhow!("invalid discord store file_id {file_id:?}"))?;
-        Ok(Locator::discord(
-            &self.channel_id,
-            message_id,
-            attachment_id,
-            "",
-        ))
-    }
-
-    fn resolve_discord_loc<'a>(&self, loc: &'a Locator) -> Result<(&'a str, i64, &'a str)> {
-        match loc {
-            Locator::Discord {
-                channel_id,
-                message_id,
-                attachment_id,
-                ..
-            } => Ok((
-                channel_id.as_str(),
-                *message_id,
-                attachment_id.as_str(),
-            )),
-            _ => bail!("discord get/delete requires Discord locator"),
-        }
     }
 
     fn unix_now_ms() -> u64 {
@@ -203,105 +172,6 @@ impl DiscordBlobStore {
 }
 
 #[async_trait]
-impl LegacyBlobStore for DiscordBlobStore {
-    fn id(&self) -> &BackendId {
-        &self.id
-    }
-
-    fn limits(&self) -> &BackendLimits {
-        &self.limits
-    }
-
-    async fn put(&self, data: Bytes, hint: PutHint) -> Result<Locator> {
-        if data.is_empty() {
-            bail!("refusing empty blob upload");
-        }
-        if data.len() > self.limits.max_blob_size {
-            bail!(
-                "blob size {} exceeds backend max {}",
-                data.len(),
-                self.limits.max_blob_size
-            );
-        }
-        let (message_id, attachment_id, url) = self
-            .dc
-            .send_attachment(
-                &self.channel_id,
-                data,
-                &hint.filename,
-                &hint.caption,
-                Some(self.limiter.as_ref()),
-            )
-            .await?;
-        Ok(Locator::discord(
-            &self.channel_id,
-            message_id,
-            attachment_id,
-            url,
-        ))
-    }
-
-    async fn get(&self, loc: &Locator, range: Option<ByteRange>) -> Result<BoxByteStream> {
-        let (channel_id, message_id, attachment_id) = self.resolve_discord_loc(loc)?;
-
-        if let Some(ref r) = range {
-            if self.limits.supports_range == RangeSupport::BestEffort {
-                match self
-                    .dc
-                    .download_bytes_range(
-                        channel_id,
-                        message_id,
-                        attachment_id,
-                        r.start,
-                        r.end,
-                        Some(self.limiter.as_ref()),
-                    )
-                    .await
-                {
-                    Ok(bytes) => return Ok(bytes_stream(bytes)),
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            start = r.start,
-                            end = r.end,
-                            "discord ranged get failed; falling back to full download"
-                        );
-                    }
-                }
-            }
-        }
-
-        let data = self
-            .dc
-            .download_bytes(
-                channel_id,
-                message_id,
-                attachment_id,
-                Some(self.limiter.as_ref()),
-            )
-            .await?;
-        let sliced = slice_range(data, range)?;
-        Ok(bytes_stream(sliced))
-    }
-
-    async fn delete(&self, loc: &Locator) -> Result<DeleteOutcome> {
-        let (_, message_id, attachment_id) = self.resolve_discord_loc(loc)?;
-        let out = self
-            .dc
-            .delete_message(
-                &self.channel_id,
-                message_id,
-                Some(self.limiter.as_ref()),
-            )
-            .await?;
-        if matches!(out, DeleteOutcome::Deleted | DeleteOutcome::Gone) {
-            self.dc.forget_attachment(attachment_id).await;
-        }
-        Ok(out)
-    }
-}
-
-#[async_trait]
 impl BlobBackend for DiscordBlobStore {
     type Id = DiscordId;
     type Key = u64;
@@ -332,28 +202,74 @@ impl BlobBackend for DiscordBlobStore {
     }
 
     async fn put(&self, data: Bytes) -> Result<Self::Id> {
-        let loc = LegacyBlobStore::put(self, data, PutHint::default()).await?;
-        match loc {
-            Locator::Discord {
-                message_id,
-                attachment_id,
-                ..
-            } => Ok(DiscordId {
-                message_id: message_id as u64,
-                attachment_id,
-            }),
-            other => bail!("discord put returned unexpected locator {other:?}"),
+        if data.is_empty() {
+            bail!("refusing empty blob upload");
         }
+        if data.len() > self.limits.max_blob_size {
+            bail!(
+                "blob size {} exceeds backend max {}",
+                data.len(),
+                self.limits.max_blob_size
+            );
+        }
+        let (message_id, attachment_id, _url) = self
+            .dc
+            .send_attachment(
+                &self.channel_id,
+                data,
+                "blob.bin",
+                "",
+                Some(self.limiter.as_ref()),
+            )
+            .await?;
+        Ok(DiscordId {
+            message_id: message_id as u64,
+            attachment_id,
+        })
     }
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
-        let loc = Locator::discord(
-            &self.channel_id,
-            id.message_id as i64,
-            &id.attachment_id,
-            "",
-        );
-        LegacyBlobStore::get(self, &loc, range).await
+        let message_id = id.message_id as i64;
+        let attachment_id = id.attachment_id.as_str();
+
+        if let Some(ref r) = range {
+            if self.limits.supports_range == RangeSupport::BestEffort {
+                match self
+                    .dc
+                    .download_bytes_range(
+                        &self.channel_id,
+                        message_id,
+                        attachment_id,
+                        r.start,
+                        r.end,
+                        Some(self.limiter.as_ref()),
+                    )
+                    .await
+                {
+                    Ok(bytes) => return Ok(bytes_stream(bytes)),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            start = r.start,
+                            end = r.end,
+                            "discord ranged get failed; falling back to full download"
+                        );
+                    }
+                }
+            }
+        }
+
+        let data = self
+            .dc
+            .download_bytes(
+                &self.channel_id,
+                message_id,
+                attachment_id,
+                Some(self.limiter.as_ref()),
+            )
+            .await?;
+        let sliced = slice_range(data, range)?;
+        Ok(bytes_stream(sliced))
     }
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
@@ -491,6 +407,16 @@ impl TypedBootstrapPointer for DiscordBlobStore {
         }
     }
 
+    async fn pin_key(&self) -> Result<Option<Vec<u8>>> {
+        match BootstrapPointer::get_pinned(self).await? {
+            Some(PinnedContent::Text { message_id, .. })
+            | Some(PinnedContent::Document { message_id, .. }) => {
+                Ok(Some((message_id as u64).to_bytes()))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn swap(&self, new: Bytes) -> Result<()> {
         let old = BootstrapPointer::get_pinned(self).await?;
         let new_mid = if new.len() <= DC_TEXT_MAX {
@@ -498,14 +424,17 @@ impl TypedBootstrapPointer for DiscordBlobStore {
                 .map_err(|_| anyhow::anyhow!("bootstrap pin payload is not valid UTF-8"))?;
             BootstrapPointer::send_text(self, text).await?
         } else {
-            let loc = LegacyBlobStore::put(
-                self,
-                new,
-                PutHint::new("superblock.bin", "pigeonhole-superblock"),
-            )
-            .await?;
-            loc.message_id()
-                .ok_or_else(|| anyhow::anyhow!("put missing message_id for pin swap"))?
+            let (message_id, _attachment_id, _url) = self
+                .dc
+                .send_attachment(
+                    &self.channel_id,
+                    new,
+                    "superblock.bin",
+                    "pigeonhole-superblock",
+                    Some(self.limiter.as_ref()),
+                )
+                .await?;
+            message_id
         };
         BootstrapPointer::pin_message(self, new_mid).await?;
         if let Some(prev) = old {

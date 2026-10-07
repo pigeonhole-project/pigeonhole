@@ -1,6 +1,7 @@
 use crate::instances::{
     legacy_default_instance, resolve_instances, FileInstance, InstanceConfig,
 };
+use crate::sweep::{SweepConfig, DEFAULT_SWEEP_GRACE, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};
 use pigeonhole_blob::{
     CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind, InstanceRole,
 };
@@ -12,6 +13,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::warn;
 
 /// Placement group: which instances receive chunk replicas and the write quorum.
@@ -58,6 +60,8 @@ pub struct Config {
     pub instances: Vec<InstanceConfig>,
     /// Replica placement (`[placement]`); defaults to a single read-write instance.
     pub placement: PlacementConfig,
+    /// Stage H sweeper (`[sweep]`).
+    pub sweep: SweepConfig,
     pub config_path: PathBuf,
 }
 
@@ -262,6 +266,7 @@ impl Config {
             http: file.http.into_settings(),
             instances,
             placement,
+            sweep: file.sweep.into_sweep_config(),
             config_path,
         })
     }
@@ -310,6 +315,7 @@ impl Config {
                 group: vec!["default".into()],
                 write_quorum: 1,
             },
+            sweep: SweepConfig::default(),
             config_path: PathBuf::from("(test)"),
         }
     }
@@ -378,6 +384,8 @@ struct FileConfig {
     instances: Vec<FileInstance>,
     #[serde(default)]
     placement: Option<FilePlacement>,
+    #[serde(default)]
+    sweep: FileSweep,
 }
 
 impl Default for FileConfig {
@@ -399,6 +407,35 @@ impl Default for FileConfig {
             http: FileHttp::default(),
             instances: Vec::new(),
             placement: None,
+            sweep: FileSweep::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct FileSweep {
+    grace_secs: u64,
+    interval_secs: u64,
+    batch_size: usize,
+}
+
+impl Default for FileSweep {
+    fn default() -> Self {
+        Self {
+            grace_secs: DEFAULT_SWEEP_GRACE.as_secs(),
+            interval_secs: DEFAULT_SWEEP_INTERVAL.as_secs(),
+            batch_size: SWEEP_BATCH_SIZE,
+        }
+    }
+}
+
+impl FileSweep {
+    fn into_sweep_config(self) -> SweepConfig {
+        SweepConfig {
+            grace: Duration::from_secs(self.grace_secs),
+            batch_size: self.batch_size.max(1),
+            interval: Duration::from_secs(self.interval_secs.max(1)),
         }
     }
 }

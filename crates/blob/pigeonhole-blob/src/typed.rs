@@ -1,8 +1,7 @@
-//! Typed blob backend model (stage 1).
+//! Typed blob backend model.
 //!
-//! Gateways will eventually see only [`crate::LegacyBlobStore`] / blob-store APIs.
 //! Storage crates implement [`BlobBackend`] with concrete `Id` / `Key`;
-//! stage 1.2 erases them behind `DynBlobBackend`.
+//! erasure lives behind [`crate::DynBlobBackend`].
 
 use crate::BoxByteStream;
 use anyhow::{bail, Result};
@@ -172,6 +171,12 @@ pub trait Sweepable: BlobBackend {
 pub trait TypedBootstrapPointer: Send + Sync {
     async fn read(&self) -> Result<Option<Bytes>>;
     async fn swap(&self, new: Bytes) -> Result<()>;
+    /// Sort key of the pinned bootstrap message in this instance's key space.
+    ///
+    /// Memory pins that are not real backend messages return `None`.
+    async fn pin_key(&self) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 /// Share one backend instance as both [`SharedBackend`](crate::SharedBackend) member and pin.
@@ -222,6 +227,9 @@ impl<B: TypedBootstrapPointer + ?Sized> TypedBootstrapPointer for std::sync::Arc
     }
     async fn swap(&self, new: Bytes) -> Result<()> {
         (**self).swap(new).await
+    }
+    async fn pin_key(&self) -> Result<Option<Vec<u8>>> {
+        (**self).pin_key().await
     }
 }
 

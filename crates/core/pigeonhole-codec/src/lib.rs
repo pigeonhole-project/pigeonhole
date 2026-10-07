@@ -13,4 +13,4 @@ pub use blocks::{
     decode_block_slice, decode_blocks_range, encode_block_bytes, BudgetPermit, ByteBudget,
     CompletedChunk, BlockRecord, BlockWriter,
 };
-pub use types::{codec_from_sql, codec_to_sql, UploadedChunk};
+pub use types::{codec_from_sql, codec_to_sql};

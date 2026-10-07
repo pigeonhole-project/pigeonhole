@@ -82,65 +82,11 @@ pub enum Locator {
 }
 
 impl Locator {
-    pub fn telegram(file_id: impl Into<String>, message_id: i64) -> Self {
-        Self::Telegram {
-            file_id: file_id.into(),
-            message_id,
-        }
-    }
-
     pub fn memory(file_id: impl Into<String>, message_id: i64) -> Self {
         Self::Memory {
             file_id: file_id.into(),
             message_id,
         }
-    }
-
-    pub fn discord(
-        channel_id: impl Into<String>,
-        message_id: i64,
-        attachment_id: impl Into<String>,
-        url: impl Into<String>,
-    ) -> Self {
-        Self::Discord {
-            channel_id: channel_id.into(),
-            message_id,
-            attachment_id: attachment_id.into(),
-            url: url.into(),
-        }
-    }
-
-    pub fn file_id(&self) -> Option<&str> {
-        match self {
-            Self::Telegram { file_id, .. } | Self::Memory { file_id, .. } => Some(file_id),
-            Self::Discord { attachment_id, .. } => Some(attachment_id),
-            Self::Other(v) => v.get("file_id").and_then(|x| x.as_str()),
-        }
-    }
-
-    pub fn message_id(&self) -> Option<i64> {
-        match self {
-            Self::Telegram { message_id, .. } | Self::Memory { message_id, .. } => Some(*message_id),
-            Self::Discord { message_id, .. } => Some(*message_id),
-            Self::Other(v) => v.get("message_id").and_then(|x| x.as_i64()),
-        }
-    }
-
-    /// Legacy [`LegacyBlobStore::get`] key: `{message_id}:{attachment_id}`.
-    pub fn discord_store_file_id(message_id: i64, attachment_id: &str) -> String {
-        format!("{message_id}:{attachment_id}")
-    }
-
-    /// Parse a Discord store file id `{message_id}:{attachment_id}` (both snowflakes).
-    pub fn parse_discord_store_file_id(file_id: &str) -> Option<(i64, &str)> {
-        let (mid, aid) = file_id.split_once(':')?;
-        let mid = mid.parse().ok()?;
-        // Attachment ids are Discord snowflakes (decimal). Reject other `:` shapes
-        // so Telegram file_ids are never misclassified.
-        if aid.is_empty() || !aid.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        Some((mid, aid))
     }
 
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
@@ -173,22 +119,6 @@ impl BlobKey {
 
 /// Optional byte range for [`crate`]-adjacent blob gets.
 pub type ByteRange = Range<u64>;
-
-/// Hints passed to backend `put` (filename / caption for Telegram documents).
-#[derive(Debug, Clone, Default)]
-pub struct PutHint {
-    pub filename: String,
-    pub caption: String,
-}
-
-impl PutHint {
-    pub fn new(filename: impl Into<String>, caption: impl Into<String>) -> Self {
-        Self {
-            filename: filename.into(),
-            caption: caption.into(),
-        }
-    }
-}
 
 /// Whether the backend can honour HTTP Range on download.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

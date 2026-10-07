@@ -3,14 +3,11 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    bytes_stream, slice_range, store_delete_message, store_get, store_put, LegacyBlobStore,
-    BootstrapPointer, BoxByteStream, ChatLimiter, CostHint, DeleteOutcome, InstanceInfo,
-    InstanceKind, InstanceRole, LimitBudget, OpKind, PinnedContent, Sweepable, BlobBackend,
-    TypedBootstrapPointer,
+    bytes_stream, slice_range, BootstrapPointer, BoxByteStream, ChatLimiter, CostHint,
+    InstanceInfo, InstanceKind, InstanceRole, LimitBudget, OpKind, OrderedKey, PinnedContent,
+    Sweepable, BlobBackend, TypedBootstrapPointer,
 };
-use pigeonhole_types::{
-    BackendId, BackendLimits, ByteRange, Locator, PutHint, RangeSupport,
-};
+use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -26,7 +23,6 @@ pub struct TelegramId {
 
 /// Production adapter: all blobs go to a single Telegram chat.
 pub struct TelegramBlobStore {
-    id: BackendId,
     limits: BackendLimits,
     instance: InstanceInfo,
     tg: TelegramClient,
@@ -74,7 +70,6 @@ impl TelegramBlobStore {
         instance: InstanceInfo,
     ) -> Self {
         Self {
-            id: BackendId::telegram(&chat_id),
             limits: BackendLimits::telegram(),
             instance,
             tg,
@@ -93,85 +88,6 @@ impl TelegramBlobStore {
 
     pub fn limiter(&self) -> &ChatLimiter {
         &self.limiter
-    }
-}
-
-#[async_trait]
-impl LegacyBlobStore for TelegramBlobStore {
-    fn id(&self) -> &BackendId {
-        &self.id
-    }
-
-    fn limits(&self) -> &BackendLimits {
-        &self.limits
-    }
-
-    async fn put(&self, data: Bytes, hint: PutHint) -> Result<Locator> {
-        if data.is_empty() {
-            bail!("refusing empty blob upload (Telegram rejects empty documents)");
-        }
-        if data.len() > self.limits.max_blob_size {
-            bail!(
-                "blob size {} exceeds backend max {}",
-                data.len(),
-                self.limits.max_blob_size
-            );
-        }
-        let _upload = self.limiter.acquire_upload().await;
-        let (file_id, message_id) = self
-            .tg
-            .send_document(
-                &self.chat_id,
-                data,
-                &hint.filename,
-                &hint.caption,
-                Some(self.limiter.as_ref()),
-            )
-            .await?;
-        Ok(Locator::telegram(file_id, message_id))
-    }
-
-    async fn get(&self, loc: &Locator, range: Option<ByteRange>) -> Result<BoxByteStream> {
-        let file_id = loc
-            .file_id()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("telegram get requires file_id"))?;
-
-        if let Some(ref r) = range {
-            if self.limits.supports_range == RangeSupport::BestEffort {
-                match self
-                    .tg
-                    .download_file_range(file_id, r.start, r.end, Some(self.limiter.as_ref()))
-                    .await
-                {
-                    Ok(bytes) => return Ok(bytes_stream(bytes)),
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            start = r.start,
-                            end = r.end,
-                            "telegram ranged get failed; falling back to full download"
-                        );
-                    }
-                }
-            }
-        }
-
-        let data = self
-            .tg
-            .download_file(file_id, Some(self.limiter.as_ref()))
-            .await?;
-        let sliced = slice_range(data, range)?;
-        Ok(bytes_stream(sliced))
-    }
-
-    async fn delete(&self, loc: &Locator) -> Result<DeleteOutcome> {
-        let message_id = loc
-            .message_id()
-            .ok_or_else(|| anyhow::anyhow!("telegram delete requires message_id"))?;
-        self.tg
-            .delete_message(&self.chat_id, message_id, Some(self.limiter.as_ref()))
-            .await
     }
 }
 
@@ -213,22 +129,65 @@ impl BlobBackend for TelegramBlobStore {
     }
 
     async fn put(&self, data: Bytes) -> Result<Self::Id> {
-        let loc = LegacyBlobStore::put(self, data, PutHint::default()).await?;
-        match loc {
-            Locator::Telegram {
-                file_id,
-                message_id,
-            } => Ok(TelegramId {
-                file_id,
-                message_id,
-            }),
-            other => bail!("telegram put returned unexpected locator {other:?}"),
+        if data.is_empty() {
+            bail!("refusing empty blob upload (Telegram rejects empty documents)");
         }
+        if data.len() > self.limits.max_blob_size {
+            bail!(
+                "blob size {} exceeds backend max {}",
+                data.len(),
+                self.limits.max_blob_size
+            );
+        }
+        let _upload = self.limiter.acquire_upload().await;
+        let (file_id, message_id) = self
+            .tg
+            .send_document(
+                &self.chat_id,
+                data,
+                "blob.bin",
+                "",
+                Some(self.limiter.as_ref()),
+            )
+            .await?;
+        Ok(TelegramId {
+            file_id,
+            message_id,
+        })
     }
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
-        let loc = Locator::telegram(&id.file_id, id.message_id);
-        LegacyBlobStore::get(self, &loc, range).await
+        let file_id = id.file_id.as_str();
+        if file_id.is_empty() {
+            bail!("telegram get requires file_id");
+        }
+
+        if let Some(ref r) = range {
+            if self.limits.supports_range == RangeSupport::BestEffort {
+                match self
+                    .tg
+                    .download_file_range(file_id, r.start, r.end, Some(self.limiter.as_ref()))
+                    .await
+                {
+                    Ok(bytes) => return Ok(bytes_stream(bytes)),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            start = r.start,
+                            end = r.end,
+                            "telegram ranged get failed; falling back to full download"
+                        );
+                    }
+                }
+            }
+        }
+
+        let data = self
+            .tg
+            .download_file(file_id, Some(self.limiter.as_ref()))
+            .await?;
+        let sliced = slice_range(data, range)?;
+        Ok(bytes_stream(sliced))
     }
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
@@ -314,6 +273,16 @@ impl TypedBootstrapPointer for TelegramBlobStore {
                     .await?;
                 Ok(Some(data))
             }
+        }
+    }
+
+    async fn pin_key(&self) -> Result<Option<Vec<u8>>> {
+        match self.tg.get_pinned_content(&self.chat_id).await? {
+            Some(PinnedContent::Text { message_id, .. })
+            | Some(PinnedContent::Document { message_id, .. }) => {
+                Ok(Some(message_id.to_bytes()))
+            }
+            None => Ok(None),
         }
     }
 

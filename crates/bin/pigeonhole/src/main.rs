@@ -15,6 +15,7 @@ use pigeonhole_blob::{
 use pigeonhole_chunk_store::{
     check_fingerprints, legacy_index_has_blobs, migrate_index_to_blob_db, start_or_restore,
     BlockCache, BlobDb, ChunkStore, Durability, IngestOptions, JournalOp, PinTarget, Superblock,
+    Sweeper, WatermarkBackend,
 };
 use pigeonhole_gateway_s3::snapshot::{
     push_index_snapshot_durable, restore_index_snapshot,
@@ -244,8 +245,22 @@ fn spawn_background_tasks(
         });
     }
 
-    // Stage H (sweeper) / Stage I (repair): not wired yet.
-    info!("sweeper/repair background tasks deferred (stages H/I)");
+    let members: Vec<_> = rt.store.replicated().members().to_vec();
+    let sweeper = Sweeper::new(
+        rt.store.db().clone(),
+        rt.durability.clone(),
+        members,
+        cfg.sweep.clone(),
+    );
+    tokio::spawn(async move {
+        sweeper.run_loop().await;
+    });
+    info!(
+        grace_secs = cfg.sweep.grace.as_secs(),
+        interval_secs = cfg.sweep.interval.as_secs(),
+        "sweeper background task started"
+    );
+    // Stage I (repair): not wired yet.
 }
 
 async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
@@ -278,7 +293,7 @@ async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     }
 
     let (replicated, pins, primary_fingerprint, primary_id) =
-        build_placement(cfg).await.context("build placement group")?;
+        build_placement(cfg, &blob_db).await.context("build placement group")?;
 
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
@@ -301,10 +316,12 @@ async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
 
 async fn build_placement(
     cfg: &Config,
+    blob_db: &BlobDb,
 ) -> anyhow::Result<(Arc<Replicated>, Vec<PinTarget>, String, String)> {
     let limiter = cfg.chat_limiter();
     let mut members: Vec<SharedBackend> = Vec::new();
     let mut pins: Vec<PinTarget> = Vec::new();
+    let grace = cfg.sweep.grace;
 
     for id in &cfg.placement.group {
         let inst = cfg
@@ -320,7 +337,11 @@ async fn build_placement(
                     MemoryBlobStore::new().with_instance_info(inst.info.clone()),
                 );
                 let pin: Arc<dyn TypedBootstrapPointer> = mem.clone();
-                let backend: SharedBackend = Arc::new(erase_sweep(mem));
+                let backend = WatermarkBackend::wrap(
+                    Arc::new(erase_sweep(mem)),
+                    blob_db.clone(),
+                    grace,
+                );
                 pins.push(PinTarget {
                     instance_id: inst.info.id.clone(),
                     fingerprint: inst.info.fingerprint.clone(),
@@ -341,7 +362,11 @@ async fn build_placement(
                     inst.info.clone(),
                 ));
                 let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
-                let backend: SharedBackend = Arc::new(erase_sweep(store));
+                let backend = WatermarkBackend::wrap(
+                    Arc::new(erase_sweep(store)),
+                    blob_db.clone(),
+                    grace,
+                );
                 pins.push(PinTarget {
                     instance_id: inst.info.id.clone(),
                     fingerprint: inst.info.fingerprint.clone(),
@@ -366,7 +391,11 @@ async fn build_placement(
                         inst.info.clone(),
                     ));
                     let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
-                    let backend: SharedBackend = Arc::new(erase_sweep(store));
+                    let backend = WatermarkBackend::wrap(
+                        Arc::new(erase_sweep(store)),
+                        blob_db.clone(),
+                        grace,
+                    );
                     pins.push(PinTarget {
                         instance_id: inst.info.id.clone(),
                         fingerprint: inst.info.fingerprint.clone(),
@@ -537,7 +566,24 @@ async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<()> {
     }
 
     index.wipe_all().await.context("wipe sqlite index")?;
-    warn!("sweeper (stage H) not yet implemented; unreclaimed backend blobs may remain");
+
+    // Immediate reclaim pass (background sweeper uses the same path; grace still applies).
+    let members: Vec<_> = rt.store.replicated().members().to_vec();
+    // Purge reclaim pass; grace still protects in-flight puts.
+    let sweeper = Sweeper::new(
+        rt.store.db().clone(),
+        rt.durability.clone(),
+        members,
+        cfg.sweep.clone(),
+    );
+    match sweeper.sweep_once().await {
+        Ok(stats) => info!(
+            zero_ref_chunks = stats.zero_ref_chunks,
+            keys_deleted = stats.keys_deleted,
+            "purge sweeper pass complete"
+        ),
+        Err(e) => warn!(error = %e, "purge sweeper pass failed; background sweeper will retry"),
+    }
     info!("purge complete: roots released, gateway index wiped");
     Ok(())
 }

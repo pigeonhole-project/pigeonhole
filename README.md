@@ -12,9 +12,9 @@ block is compressed once; on-wire size stays ≤ `chunk.size` (logical ≤ 256�
 Legacy single-blob `raw`/`gzip`/`zstd` chunks remain readable. Object metadata
 lives in a local SQLite index.
 
-Storage I/O goes through `LegacyBlobStore` / typed `BlobBackend` (`storage-telegram` or
-`storage-discord` in production, `storage-memory` in tests) so unit tests never
-hit a real Bot API. Roadmap gateways: Kafka, WebDAV.
+Storage I/O goes through typed `BlobBackend` / `DynBlobBackend` / `Replicated`
+(`storage-telegram` or `storage-discord` in production, `storage-memory` in
+tests) so unit tests never hit a real Bot API. Roadmap gateways: Kafka, WebDAV.
 
 Architecture terms: see [docs/glossary.md](docs/glossary.md) (Instance, Blob, Block, Chunk, Replica, Extent, …).
 
@@ -24,7 +24,7 @@ Layout is a Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 |---|---|
 | `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
 | `core/pigeonhole-codec` | Codecs + `BlockWriter` |
-| `blob/pigeonhole-blob` | `BlobBackend` / `LegacyBlobStore`, rate limits, `BootstrapPointer`, cache |
+| `blob/pigeonhole-blob` | `BlobBackend`, `Replicated`, rate limits, `BootstrapPointer`, cache knobs |
 | `blob/pigeonhole-chunk-store` | `ChunkStore`, ingest, roots, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
 | `storage/pigeonhole-storage-discord` | Discord Bot API storage |
@@ -238,7 +238,7 @@ unpin/delete the previous parts. You can also copy the local `s3gram.db` file.
 | User metadata (`x-amz-meta-*`) | yes |
 | Zero-byte objects (no Telegram upload) | yes |
 | Blob refcount in SQLite | yes |
-| `memory = true` (in-memory LegacyBlobStoreTg, no Telegram) | yes |
+| `memory = true` (in-memory MemoryBlobStore, no Telegram) | yes |
 | Separate send / getFile / delete budgets + upload/download semaphores | yes |
 | In-memory LRU cache for Telegram `file_path` | yes |
 | Presigned URLs / ACL / bucket versioning | later |
