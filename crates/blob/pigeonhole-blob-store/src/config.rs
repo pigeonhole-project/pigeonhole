@@ -10,6 +10,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::warn;
 
 /// Which chat blob backend backs non-memory mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,8 +35,8 @@ pub struct Config {
     /// Max on-wire chunk size in bytes (`< 20 MiB`).
     pub chunk_size: usize,
     pub chunk_codec: ChunkCodec,
-    /// Independent frame size for `frames` packing.
-    pub frame_size: usize,
+    /// Independent block size for `blocks` packing.
+    pub block_size: usize,
     /// Process-wide ingest buffer budget (shared across PUTs).
     pub ingest_budget: Option<ByteBudget>,
     pub tg: ChatLimiterConfig,
@@ -170,15 +171,15 @@ impl Config {
         let chunk_size = file.chunk.size;
         chunker::validate_chunk_size(chunk_size).context("chunk.size")?;
         let chunk_codec = file.chunk.codec;
-        let frame_size = file.chunk.frame_size.max(1024);
-        if frame_size > chunker::MAX_LOGICAL_CHUNK {
-            bail!("chunk.frame_size exceeds MAX_LOGICAL_CHUNK");
+        let block_size = file.chunk.resolve_block_size()?;
+        if block_size > chunker::MAX_LOGICAL_CHUNK {
+            bail!("chunk.block_size exceeds MAX_LOGICAL_CHUNK");
         }
         let memory_budget = file.ingest.memory_budget;
-        if memory_budget < frame_size.saturating_mul(2) {
+        if memory_budget < block_size.saturating_mul(2) {
             bail!(
-                "ingest.memory_budget ({memory_budget}) must be >= 2 * chunk.frame_size ({})",
-                frame_size.saturating_mul(2)
+                "ingest.memory_budget ({memory_budget}) must be >= 2 * chunk.block_size ({})",
+                block_size.saturating_mul(2)
             );
         }
         let ingest_budget = Some(ByteBudget::new(memory_budget));
@@ -233,7 +234,7 @@ impl Config {
             snapshot_interval_secs: file.snapshot.interval_secs,
             chunk_size,
             chunk_codec,
-            frame_size,
+            block_size,
             ingest_budget,
             tg,
             memory_store,
@@ -259,7 +260,7 @@ impl Config {
             snapshot_interval_secs: 0,
             chunk_size: chunker::DEFAULT_CHUNK_SIZE,
             chunk_codec: ChunkCodec::Zstd,
-            frame_size: chunker::DEFAULT_FRAME_SIZE,
+            block_size: chunker::DEFAULT_BLOCK_SIZE,
             ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
             tg: ChatLimiterConfig {
                 send_rate_per_sec: 1000.0,
@@ -446,8 +447,12 @@ struct FileCache {
     memory_bytes: usize,
     disk_path: String,
     disk_bytes: Option<usize>,
-    frame_memory_bytes: usize,
-    readahead_frames: usize,
+    block_memory_bytes: Option<usize>,
+    /// Deprecated alias for [`Self::block_memory_bytes`].
+    frame_memory_bytes: Option<usize>,
+    readahead_blocks: Option<usize>,
+    /// Deprecated alias for [`Self::readahead_blocks`].
+    readahead_frames: Option<usize>,
     write_through: bool,
     max_object_bytes: usize,
     metrics_interval_secs: u64,
@@ -461,8 +466,10 @@ impl Default for FileCache {
             memory_bytes: d.memory_bytes,
             disk_path: String::new(),
             disk_bytes: None,
-            frame_memory_bytes: d.frame_memory_bytes,
-            readahead_frames: d.readahead_frames,
+            block_memory_bytes: None,
+            frame_memory_bytes: None,
+            readahead_blocks: None,
+            readahead_frames: None,
             write_through: d.write_through,
             max_object_bytes: d.max_object_bytes,
             metrics_interval_secs: d.metrics_interval_secs,
@@ -480,13 +487,38 @@ impl FileCache {
         if disk_path.is_some() && self.disk_bytes.is_none() {
             bail!("cache.disk_bytes is required when cache.disk_path is set");
         }
+        let defaults = CacheConfig::default();
+        let block_memory_bytes = match (self.block_memory_bytes, self.frame_memory_bytes) {
+            (Some(b), Some(_)) => {
+                warn!("cache.frame_memory_bytes ignored; using cache.block_memory_bytes");
+                b
+            }
+            (Some(b), None) => b,
+            (None, Some(f)) => {
+                warn!("cache.frame_memory_bytes is deprecated; use cache.block_memory_bytes");
+                f
+            }
+            (None, None) => defaults.block_memory_bytes,
+        };
+        let readahead_blocks = match (self.readahead_blocks, self.readahead_frames) {
+            (Some(b), Some(_)) => {
+                warn!("cache.readahead_frames ignored; using cache.readahead_blocks");
+                b
+            }
+            (Some(b), None) => b,
+            (None, Some(f)) => {
+                warn!("cache.readahead_frames is deprecated; use cache.readahead_blocks");
+                f
+            }
+            (None, None) => defaults.readahead_blocks,
+        };
         Ok(CacheConfig {
             enabled: self.enabled,
             memory_bytes: self.memory_bytes.max(1024 * 1024),
             disk_path,
             disk_bytes: self.disk_bytes,
-            frame_memory_bytes: self.frame_memory_bytes.max(1024 * 1024),
-            readahead_frames: self.readahead_frames,
+            block_memory_bytes: block_memory_bytes.max(1024 * 1024),
+            readahead_blocks,
             write_through: self.write_through,
             max_object_bytes: self.max_object_bytes.max(1024),
             metrics_interval_secs: self.metrics_interval_secs,
@@ -513,7 +545,9 @@ impl Default for FileSnapshot {
 struct FileChunk {
     size: usize,
     codec: ChunkCodec,
-    frame_size: usize,
+    block_size: Option<usize>,
+    /// Deprecated alias for [`Self::block_size`].
+    frame_size: Option<usize>,
 }
 
 impl Default for FileChunk {
@@ -521,7 +555,27 @@ impl Default for FileChunk {
         Self {
             size: chunker::DEFAULT_CHUNK_SIZE,
             codec: ChunkCodec::Zstd,
-            frame_size: chunker::DEFAULT_FRAME_SIZE,
+            block_size: None,
+            frame_size: None,
+        }
+    }
+}
+
+impl FileChunk {
+    fn resolve_block_size(&self) -> Result<usize> {
+        match (self.block_size, self.frame_size) {
+            (Some(b), Some(f)) if b != f => {
+                warn!(
+                    "chunk.frame_size ({f}) ignored; using chunk.block_size ({b})"
+                );
+                Ok(b.max(1024))
+            }
+            (Some(b), _) => Ok(b.max(1024)),
+            (None, Some(f)) => {
+                warn!("chunk.frame_size is deprecated; use chunk.block_size");
+                Ok(f.max(1024))
+            }
+            (None, None) => Ok(chunker::DEFAULT_BLOCK_SIZE),
         }
     }
 }
@@ -685,7 +739,7 @@ rate_burst = 2.0
             r#"
 memory = true
 [chunk]
-frame_size = 1048576
+block_size = 1048576
 [ingest]
 memory_budget = 1048576
 "#

@@ -4,7 +4,7 @@ pub mod http_timeout;
 
 pub use pigeonhole_blob as storage;
 pub use pigeonhole_codec as chunker;
-pub use pigeonhole_codec::frames;
+pub use pigeonhole_codec::blocks;
 pub use pigeonhole_blob_store::config;
 pub use pigeonhole_blob_store::ingest;
 pub use pigeonhole_blob_store::snapshot;

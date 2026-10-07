@@ -3,7 +3,7 @@
 pub mod blob_db;
 pub mod config;
 pub mod durability;
-pub mod frame_cache;
+pub mod block_cache;
 pub mod ingest;
 pub mod instances;
 pub mod layer;
@@ -23,7 +23,7 @@ pub use instances::{
     memory_fingerprint, memory_location, telegram_fingerprint, telegram_location, validate_instances,
     InstanceConfig,
 };
-pub use frame_cache::FrameCache;
+pub use block_cache::BlockCache;
 pub use pigeonhole_blob::CacheConfig;
 pub use ingest::{
     codec_from_sql, codec_to_sql, decode_chunk, decode_chunk_async, decode_chunk_slice_async,
@@ -34,7 +34,7 @@ pub use read::read_chunk_range_cached;
 pub use pigeonhole_blob::{
     collect_stream, BlobStore, BootstrapPointer, BoxByteStream, DeleteOutcome, PinnedContent,
 };
-pub use pigeonhole_codec::{ByteBudget, ChunkCodec, FrameRecord};
+pub use pigeonhole_codec::{ByteBudget, ChunkCodec, BlockRecord};
 pub use pigeonhole_index::{Index, IndexSnapshot};
 // Re-export index helpers gateways need without taking a direct index dep.
 pub use pigeonhole_index::{parse_rfc3339, DeleteBucketResult, OrphanMsg, Chunk};

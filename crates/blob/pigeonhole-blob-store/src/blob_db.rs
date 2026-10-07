@@ -97,17 +97,21 @@ impl BlobDb {
         .execute(&self.pool)
         .await?;
 
+        // Legacy name from pre-rename DBs.
+        Self::rename_table_if_exists(&self.pool, "chunk_frames", "chunk_blocks").await?;
+        Self::rename_column_if_exists(&self.pool, "chunk_blocks", "frame_no", "block_no").await?;
+
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS chunk_frames (
+            CREATE TABLE IF NOT EXISTS chunk_blocks (
                 blob_id INTEGER NOT NULL REFERENCES blobs(id),
-                frame_no INTEGER NOT NULL,
+                block_no INTEGER NOT NULL,
                 stored_off INTEGER NOT NULL,
                 stored_len INTEGER NOT NULL,
                 logical_off INTEGER NOT NULL,
                 logical_len INTEGER NOT NULL,
                 codec TEXT NOT NULL,
-                PRIMARY KEY (blob_id, frame_no)
+                PRIMARY KEY (blob_id, block_no)
             )
             "#,
         )
@@ -148,6 +152,64 @@ impl BlobDb {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    async fn rename_table_if_exists(
+        pool: &SqlitePool,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(from)
+        .fetch_optional(pool)
+        .await?;
+        if exists.is_none() {
+            return Ok(());
+        }
+        let dest_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(to)
+        .fetch_optional(pool)
+        .await?;
+        if dest_exists.is_some() {
+            return Ok(());
+        }
+        sqlx::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn rename_column_if_exists(
+        pool: &SqlitePool,
+        table: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let table_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_optional(pool)
+        .await?;
+        if table_exists.is_none() {
+            return Ok(());
+        }
+        let cols: Vec<(i64, String)> =
+            sqlx::query_as(&format!("SELECT cid, name FROM pragma_table_info('{table}')"))
+                .fetch_all(pool)
+                .await?;
+        let names: Vec<&str> = cols.iter().map(|(_, n)| n.as_str()).collect();
+        if !names.contains(&from) || names.contains(&to) {
+            return Ok(());
+        }
+        sqlx::query(&format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}"))
+            .execute(pool)
+            .await?;
         Ok(())
     }
 
@@ -290,26 +352,26 @@ impl BlobDb {
         Ok(row.map(|(size, crc, refs)| (size, crc as u32, refs)))
     }
 
-    pub async fn replace_frames(
+    pub async fn replace_blocks(
         &self,
         blob_id: i64,
-        frames: &[pigeonhole_codec::FrameRecord],
+        blocks: &[pigeonhole_codec::BlockRecord],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM chunk_frames WHERE blob_id = ?")
+        sqlx::query("DELETE FROM chunk_blocks WHERE blob_id = ?")
             .bind(blob_id)
             .execute(&mut *tx)
             .await?;
-        for fr in frames {
+        for fr in blocks {
             sqlx::query(
                 r#"
-                INSERT INTO chunk_frames
-                  (blob_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec)
+                INSERT INTO chunk_blocks
+                  (blob_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(blob_id)
-            .bind(fr.frame_no)
+            .bind(fr.block_no)
             .bind(fr.stored_off)
             .bind(fr.stored_len)
             .bind(fr.logical_off)
@@ -322,11 +384,11 @@ impl BlobDb {
         Ok(())
     }
 
-    pub async fn get_frames(&self, blob_id: i64) -> Result<Vec<pigeonhole_codec::FrameRecord>> {
+    pub async fn get_blocks(&self, blob_id: i64) -> Result<Vec<pigeonhole_codec::BlockRecord>> {
         let rows: Vec<(i64, i64, i64, i64, i64, String)> = sqlx::query_as(
             r#"
-            SELECT frame_no, stored_off, stored_len, logical_off, logical_len, codec
-            FROM chunk_frames WHERE blob_id = ? ORDER BY frame_no
+            SELECT block_no, stored_off, stored_len, logical_off, logical_len, codec
+            FROM chunk_blocks WHERE blob_id = ? ORDER BY block_no
             "#,
         )
         .bind(blob_id)
@@ -335,9 +397,9 @@ impl BlobDb {
         Ok(rows
             .into_iter()
             .map(
-                |(frame_no, stored_off, stored_len, logical_off, logical_len, codec)| {
-                    pigeonhole_codec::FrameRecord {
-                        frame_no,
+                |(block_no, stored_off, stored_len, logical_off, logical_len, codec)| {
+                    pigeonhole_codec::BlockRecord {
+                        block_no,
                         stored_off,
                         stored_len,
                         logical_off,

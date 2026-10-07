@@ -9,32 +9,32 @@ pub const MAX_CHUNK_SIZE: usize = 20 * 1024 * 1024 - 1;
 pub const DEFAULT_CHUNK_SIZE: usize = 19 * 1024 * 1024;
 /// Probe window before committing to compression for a chunk.
 pub const COMPRESS_PROBE_BYTES: usize = 128 * 1024;
-/// Leave headroom under `chunk.size` so a final encode frame fits.
+/// Leave headroom under `chunk.size` so a final encode block fits.
 pub const COMPRESS_SIZE_MARGIN: usize = 256 * 1024;
 /// Cap uncompressed bytes buffered / decoded per chunk.
 pub const MAX_LOGICAL_CHUNK: usize = 256 * 1024 * 1024;
-/// Default independent frame size for `frames` codec packing.
-pub const DEFAULT_FRAME_SIZE: usize = 1024 * 1024;
+/// Default independent block size for `blocks` codec packing.
+pub const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
 /// Default process-wide ingest buffer budget.
 pub const DEFAULT_INGEST_MEMORY_BUDGET: usize = 256 * 1024 * 1024;
 
 /// How new object chunks are encoded before `sendDocument`.
 ///
 /// Stored per-chunk codec may still be `raw` under a compress policy when the
-/// probe shows no gain. New compressible uploads use [`ChunkCodec::Frames`].
+/// probe shows no gain. New compressible uploads use [`ChunkCodec::Blocks`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChunkCodec {
     /// Store bytes as-is (no compression attempt).
     Raw,
-    /// Opportunistic gzip (legacy single-frame chunk). Prefer zstd/frames.
+    /// Opportunistic gzip (legacy single-block chunk). Prefer zstd/blocks.
     Gzip,
-    /// Opportunistic zstd (legacy single-frame chunk). Prefer [`ChunkCodec::Frames`].
+    /// Opportunistic zstd (legacy single-block chunk). Prefer [`ChunkCodec::Blocks`].
     Zstd,
-    /// Concatenated independent frames (see `chunk_frames` table). Default for new
+    /// Concatenated independent blocks (see `chunk_blocks` table). Default for new
     /// compressible uploads when config codec is `zstd` or `gzip`.
     #[default]
-    Frames,
+    Blocks,
 }
 
 impl ChunkCodec {
@@ -43,7 +43,7 @@ impl ChunkCodec {
             Self::Raw => "raw",
             Self::Gzip => "gzip",
             Self::Zstd => "zstd",
-            Self::Frames => "frames",
+            Self::Blocks => "blocks",
         }
     }
 
@@ -52,25 +52,25 @@ impl ChunkCodec {
             "raw" | "none" | "off" => Ok(Self::Raw),
             "gzip" | "gz" => Ok(Self::Gzip),
             "zstd" | "zst" => Ok(Self::Zstd),
-            "frames" | "frame" => Ok(Self::Frames),
-            other => bail!("unknown chunk codec {other:?}; expected raw|gzip|zstd|frames"),
+            "blocks" | "block" | "frames" | "frame" => Ok(Self::Blocks),
+            other => bail!("unknown chunk codec {other:?}; expected raw|gzip|zstd|blocks"),
         }
     }
 
-    /// Config policy that should pack with independent frames.
-    pub fn uses_frame_packing(self) -> bool {
-        matches!(self, Self::Gzip | Self::Zstd | Self::Frames)
+    /// Config policy that should pack with independent blocks.
+    pub fn uses_block_packing(self) -> bool {
+        matches!(self, Self::Gzip | Self::Zstd | Self::Blocks)
     }
 
     pub fn is_compressing(self) -> bool {
-        matches!(self, Self::Gzip | Self::Zstd | Self::Frames)
+        matches!(self, Self::Gzip | Self::Zstd | Self::Blocks)
     }
 
-    /// Per-frame compression algorithm for a packing policy.
-    pub fn frame_codec(self) -> Self {
+    /// Per-block compression algorithm for a packing policy.
+    pub fn block_codec(self) -> Self {
         match self {
             Self::Gzip => Self::Gzip,
-            Self::Zstd | Self::Frames => Self::Zstd,
+            Self::Zstd | Self::Blocks => Self::Zstd,
             Self::Raw => Self::Raw,
         }
     }
@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(ChunkCodec::parse("raw").unwrap(), ChunkCodec::Raw);
         assert_eq!(ChunkCodec::parse("GZIP").unwrap(), ChunkCodec::Gzip);
         assert_eq!(ChunkCodec::parse("zstd").unwrap(), ChunkCodec::Zstd);
-        assert_eq!(ChunkCodec::parse("frames").unwrap(), ChunkCodec::Frames);
+        assert_eq!(ChunkCodec::parse("frames").unwrap(), ChunkCodec::Blocks);
         assert_eq!(ChunkCodec::parse("none").unwrap(), ChunkCodec::Raw);
         assert!(ChunkCodec::parse("lz4").is_err());
     }

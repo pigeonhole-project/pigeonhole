@@ -18,7 +18,7 @@ pub struct MigrateReport {
     pub notes: Vec<String>,
 }
 
-/// Copy `blobs` / `chunk_frames` / snapshot root from a legacy Index into BlobDb.
+/// Copy `blobs` / `chunk_blocks` / snapshot root from a legacy Index into BlobDb.
 ///
 /// Each `(file_id, message_id)` becomes one `blobs` row + `replicas` for `instance`.
 /// The current snapshot meta (`snapshot_file_id`) becomes root `s3/index` when present
@@ -39,7 +39,7 @@ pub async fn migrate_index_to_blob_db(
         "legacy snapshot: {} objects, {} blob rows, {} frame rows",
         snap.objects.len(),
         snap.blobs.len(),
-        snap.chunk_frames.len()
+        snap.chunk_blocks.len()
     ));
 
     if !dry_run {
@@ -87,13 +87,13 @@ pub async fn migrate_index_to_blob_db(
     }
 
     // Frames keyed by file_id in legacy → blob_id.
-    let mut by_file: std::collections::HashMap<String, Vec<pigeonhole_codec::FrameRecord>> =
+    let mut by_file: std::collections::HashMap<String, Vec<pigeonhole_codec::BlockRecord>> =
         std::collections::HashMap::new();
-    for fr in &snap.chunk_frames {
+    for fr in &snap.chunk_blocks {
         report.frames += 1;
         by_file.entry(fr.file_id.clone()).or_default().push(
-            pigeonhole_codec::FrameRecord {
-                frame_no: fr.frame_no,
+            pigeonhole_codec::BlockRecord {
+                block_no: fr.block_no,
                 stored_off: fr.stored_off,
                 stored_len: fr.stored_len,
                 logical_off: fr.logical_off,
@@ -104,9 +104,9 @@ pub async fn migrate_index_to_blob_db(
     }
     if !dry_run {
         for (file_id, mut frames) in by_file {
-            frames.sort_by_key(|f| f.frame_no);
+            frames.sort_by_key(|f| f.block_no);
             if let Some(&blob_id) = file_to_blob.get(&file_id) {
-                blob_db.replace_frames(blob_id, &frames).await?;
+                blob_db.replace_blocks(blob_id, &frames).await?;
             } else {
                 report.notes.push(format!(
                     "orphan frames for file_id {file_id} (no blobs row); skipped"

@@ -122,7 +122,8 @@ pub struct CheckpointPayload {
     pub instances: Vec<CheckpointInstance>,
     pub blobs: Vec<CheckpointBlob>,
     pub replicas: Vec<CheckpointReplica>,
-    pub frames: Vec<CheckpointFrame>,
+    #[serde(alias = "frames")]
+    pub blocks: Vec<CheckpointBlock>,
     pub roots: Vec<(String, BlobId)>,
 }
 
@@ -153,9 +154,10 @@ pub struct CheckpointReplica {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckpointFrame {
+pub struct CheckpointBlock {
     pub blob_id: BlobId,
-    pub frame_no: i64,
+    #[serde(alias = "frame_no")]
+    pub block_no: i64,
     pub stored_off: i64,
     pub stored_len: i64,
     pub logical_off: i64,
@@ -209,20 +211,20 @@ impl BlobDb {
         })
         .collect();
 
-        let frames = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, String)>(
+        let blocks = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, String)>(
             r#"
-            SELECT blob_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec
-            FROM chunk_frames
+            SELECT blob_id, block_no, stored_off, stored_len, logical_off, logical_len, codec
+            FROM chunk_blocks
             "#,
         )
         .fetch_all(self.pool())
         .await?
         .into_iter()
         .map(
-            |(blob_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec)| {
-                CheckpointFrame {
+            |(blob_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)| {
+                CheckpointBlock {
                     blob_id,
-                    frame_no,
+                    block_no,
                     stored_off,
                     stored_len,
                     logical_off,
@@ -242,7 +244,7 @@ impl BlobDb {
             instances,
             blobs,
             replicas,
-            frames,
+            blocks,
             roots,
         })
     }
@@ -254,7 +256,7 @@ impl BlobDb {
         }
         let mut tx = self.pool().begin().await?;
         for table in [
-            "chunk_frames",
+            "chunk_blocks",
             "replicas",
             "roots",
             "blobs",
@@ -310,16 +312,16 @@ impl BlobDb {
             .execute(&mut *tx)
             .await?;
         }
-        for f in &cp.frames {
+        for f in &cp.blocks {
             sqlx::query(
                 r#"
-                INSERT INTO chunk_frames
-                  (blob_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec)
+                INSERT INTO chunk_blocks
+                  (blob_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(f.blob_id)
-            .bind(f.frame_no)
+            .bind(f.block_no)
             .bind(f.stored_off)
             .bind(f.stored_len)
             .bind(f.logical_off)
@@ -584,7 +586,7 @@ mod tests {
         let db = BlobDb::connect(&url).await.unwrap();
         let mem = MemoryBlobStore::new();
         let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
-        opts.frame_size = 64 * 1024;
+        opts.block_size = 64 * 1024;
         let layer = BlobLayer::open(db.clone(), mem, opts).await.unwrap();
         let backend = layer.write_backend();
         let info = backend.instance().clone();
@@ -634,7 +636,7 @@ mod tests {
         let db = BlobDb::connect(&url).await.unwrap();
         let mem = MemoryBlobStore::new();
         let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
-        opts.frame_size = 64 * 1024;
+        opts.block_size = 64 * 1024;
         let layer = BlobLayer::open(db.clone(), mem, opts).await.unwrap();
         let backend = layer.write_backend();
         let info = backend.instance().clone();

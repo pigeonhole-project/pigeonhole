@@ -1,4 +1,4 @@
-//! L1 cache of unpacked frames keyed by ([`BlobKey`], frame_no).
+//! L1 cache of unpacked frames keyed by ([`BlobKey`], block_no).
 
 use bytes::Bytes;
 use moka::future::Cache;
@@ -9,13 +9,13 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
 #[derive(Clone, Hash, Eq, PartialEq)]
-struct FrameKey {
+struct BlockKey {
     blob: BlobKey,
-    frame_no: u32,
+    block_no: u32,
 }
 
-pub struct FrameCache {
-    cache: Cache<FrameKey, Bytes>,
+pub struct BlockCache {
+    cache: Cache<BlockKey, Bytes>,
     /// Secondary index for GC invalidation by file_id / blob key.
     by_blob: Mutex<HashMap<BlobKey, Vec<u32>>>,
     hits: AtomicU64,
@@ -23,27 +23,27 @@ pub struct FrameCache {
     collapsed: AtomicU64,
     /// Caps concurrent readahead getFile / decode work.
     readahead_sem: Arc<Semaphore>,
-    readahead_frames: usize,
+    readahead_blocks: usize,
 }
 
-impl FrameCache {
-    pub fn new(capacity_bytes: usize, readahead_frames: usize) -> Self {
+impl BlockCache {
+    pub fn new(capacity_bytes: usize, readahead_blocks: usize) -> Self {
         Self {
             cache: Cache::builder()
                 .max_capacity(capacity_bytes as u64)
-                .weigher(|_k: &FrameKey, v: &Bytes| v.len().min(u32::MAX as usize) as u32)
+                .weigher(|_k: &BlockKey, v: &Bytes| v.len().min(u32::MAX as usize) as u32)
                 .build(),
             by_blob: Mutex::new(HashMap::new()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             collapsed: AtomicU64::new(0),
             readahead_sem: Arc::new(Semaphore::new(2)),
-            readahead_frames,
+            readahead_blocks,
         }
     }
 
-    pub fn readahead_frames(&self) -> usize {
-        self.readahead_frames
+    pub fn readahead_blocks(&self) -> usize {
+        self.readahead_blocks
     }
 
     pub fn readahead_sem(&self) -> Arc<Semaphore> {
@@ -61,16 +61,16 @@ impl FrameCache {
     pub async fn get_or_load<F, Fut>(
         &self,
         blob: BlobKey,
-        frame_no: u32,
+        block_no: u32,
         loader: F,
     ) -> anyhow::Result<Bytes>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<Bytes>>,
     {
-        let key = FrameKey {
+        let key = BlockKey {
             blob: blob.clone(),
-            frame_no,
+            block_no,
         };
         if self.cache.contains_key(&key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -92,18 +92,18 @@ impl FrameCache {
             self.collapsed.fetch_add(1, Ordering::Relaxed);
         } else {
             let mut map = by_blob.lock().unwrap();
-            map.entry(blob).or_default().push(frame_no);
+            map.entry(blob).or_default().push(block_no);
         }
         Ok(out)
     }
 
-    pub async fn insert(&self, blob: BlobKey, frame_no: u32, data: Bytes) {
+    pub async fn insert(&self, blob: BlobKey, block_no: u32, data: Bytes) {
         {
             let mut map = self.by_blob.lock().unwrap();
-            map.entry(blob.clone()).or_default().push(frame_no);
+            map.entry(blob.clone()).or_default().push(block_no);
         }
         self.cache
-            .insert(FrameKey { blob, frame_no }, data)
+            .insert(BlockKey { blob, block_no }, data)
             .await;
     }
 
@@ -112,11 +112,11 @@ impl FrameCache {
             let mut map = self.by_blob.lock().unwrap();
             map.remove(blob).unwrap_or_default()
         };
-        for frame_no in frames {
+        for block_no in frames {
             self.cache
-                .invalidate(&FrameKey {
+                .invalidate(&BlockKey {
                     blob: blob.clone(),
-                    frame_no,
+                    block_no,
                 })
                 .await;
         }

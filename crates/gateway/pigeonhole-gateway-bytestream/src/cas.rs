@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use pigeonhole_blob_store::{
     collect_stream, ingest_stream_with_options, read_chunk_range_cached, BlobStore, BoxByteStream,
-    ChunkCodec, FrameRecord, Index, IngestOptions, UploadedChunk,
+    ChunkCodec, BlockRecord, Index, IngestOptions, UploadedChunk,
 };
 use pigeonhole_codec::DEFAULT_CHUNK_SIZE;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,8 @@ pub struct CasChunkMeta {
     pub message_id: i64,
     pub logical_size: i64,
     pub codec: String,
-    pub frames: Vec<FrameRecord>,
+    #[serde(alias = "frames")]
+    pub blocks: Vec<BlockRecord>,
 }
 
 impl From<&UploadedChunk> for CasChunkMeta {
@@ -34,7 +35,7 @@ impl From<&UploadedChunk> for CasChunkMeta {
             message_id: u.message_id,
             logical_size: u.logical_size,
             codec: u.codec.as_str().to_string(),
-            frames: u.frames.clone(),
+            blocks: u.blocks.clone(),
         }
     }
 }
@@ -173,7 +174,7 @@ impl CasStore {
         }
 
         let mut opts = IngestOptions::new(self.chunk_size, ChunkCodec::Zstd);
-        opts.frame_size = 1024 * 1024;
+        opts.block_size = 1024 * 1024;
         let ingested = match ingest_stream_with_options(&self.store, stream, None, opts).await {
             Ok(v) => v,
             Err(e) => {
@@ -249,14 +250,14 @@ async fn stream_manifest_range(
         let codec = match ch.codec.as_str() {
             "gzip" => ChunkCodec::Gzip,
             "zstd" => ChunkCodec::Zstd,
-            "frames" => ChunkCodec::Frames,
+            "frames" => ChunkCodec::Blocks,
             _ => ChunkCodec::Raw,
         };
         stream_chunk_range(
             store.clone(),
             &ch.file_id,
             codec,
-            &ch.frames,
+            &ch.blocks,
             local_from,
             local_to,
             clen,
@@ -281,32 +282,32 @@ async fn stream_chunk_range(
     store: Arc<dyn BlobStore>,
     file_id: &str,
     codec: ChunkCodec,
-    frames: &[FrameRecord],
+    blocks: &[BlockRecord],
     from: usize,
     to: usize,
     logical_size: usize,
     tx: &mpsc::Sender<Result<Bytes, anyhow::Error>>,
 ) -> Result<()> {
-    if codec == ChunkCodec::Frames && !frames.is_empty() {
-        let stored = store.get(file_id).await.context("blob get for frames")?;
+    if codec == ChunkCodec::Blocks && !blocks.is_empty() {
+        let stored = store.get(file_id).await.context("blob get for blocks")?;
         let mut logical_cursor = 0usize;
-        for fr in frames {
+        for fr in blocks {
             let flen = fr.logical_len as usize;
-            let frame_start = logical_cursor;
-            let frame_end = logical_cursor + flen;
-            logical_cursor = frame_end;
-            if frame_end <= from || frame_start >= to {
+            let block_start = logical_cursor;
+            let block_end = logical_cursor + flen;
+            logical_cursor = block_end;
+            if block_end <= from || block_start >= to {
                 continue;
             }
-            let local_from = from.saturating_sub(frame_start).min(flen);
-            let local_to = to.saturating_sub(frame_start).min(flen);
-            let piece = pigeonhole_codec::decode_frames_range(
+            let local_from = from.saturating_sub(block_start).min(flen);
+            let local_to = to.saturating_sub(block_start).min(flen);
+            let piece = pigeonhole_codec::decode_blocks_range(
                 stored.as_ref(),
                 std::slice::from_ref(fr),
                 local_from,
                 local_to,
             )
-            .with_context(|| format!("decode frame {} of {file_id}", fr.frame_no))?;
+            .with_context(|| format!("decode block {} of {file_id}", fr.block_no))?;
             if tx.send(Ok(piece)).await.is_err() {
                 return Ok(());
             }
@@ -318,7 +319,7 @@ async fn stream_chunk_range(
         store,
         file_id,
         codec,
-        frames,
+        blocks,
         from,
         to,
         logical_size,
@@ -398,7 +399,7 @@ mod tests {
             Some((Ok::<_, anyhow::Error>(Bytes::from(vec![0u8; len])), off + len))
         });
         let mut opts = IngestOptions::new(cas.chunk_size, ChunkCodec::Raw);
-        opts.frame_size = 1024 * 1024;
+        opts.block_size = 1024 * 1024;
         let ingested = ingest_stream_with_options(&cas.store, Box::pin(body), None, opts)
             .await
             .expect("ingest 512 MiB");

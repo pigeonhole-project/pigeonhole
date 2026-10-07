@@ -1,13 +1,13 @@
 //! Stream an S3 request body into Telegram-sized BlobStore chunks.
 //!
 //! With compressing policies (`zstd` / `gzip`), data is packed as independent
-//! fixed-size frames ([`pigeonhole_codec::FrameWriter`]) so each block is compressed
-//! once. Chunk codec stored in the index is [`ChunkCodec::Frames`]. Legacy
+//! fixed-size frames ([`pigeonhole_codec::BlockWriter`]) so each block is compressed
+//! once. Chunk codec stored in the index is [`ChunkCodec::Blocks`]. Legacy
 //! single-blob `raw` / `gzip` / `zstd` chunks remain readable.
 
 use pigeonhole_blob::{BlobStore, DeleteOutcome};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
-use pigeonhole_codec::{self as frames, ByteBudget, CompletedChunk, FrameRecord, FrameWriter};
+use pigeonhole_codec::{ByteBudget, CompletedChunk, BlockRecord, BlockWriter};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use flate2::read::GzDecoder;
@@ -65,7 +65,7 @@ impl std::error::Error for IngestError {
 pub struct IngestOptions {
     pub chunk_size: usize,
     pub codec: ChunkCodec,
-    pub frame_size: usize,
+    pub block_size: usize,
     pub memory_budget: Option<ByteBudget>,
     /// Optional shared counter for tests.
     pub compress_calls: Option<Arc<AtomicU64>>,
@@ -76,7 +76,7 @@ impl IngestOptions {
         Self {
             chunk_size,
             codec,
-            frame_size: chunker::DEFAULT_FRAME_SIZE,
+            block_size: chunker::DEFAULT_BLOCK_SIZE,
             memory_budget: None,
             compress_calls: None,
         }
@@ -123,8 +123,8 @@ async fn ingest_framed(
     let calls = opts
         .compress_calls
         .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-    let mut writer = FrameWriter::new(
-        opts.frame_size,
+    let mut writer = BlockWriter::new(
+        opts.block_size,
         max_stored,
         max_logical,
         opts.codec,
@@ -325,10 +325,10 @@ async fn put_completed(
         bail!("refusing empty framed chunk");
     }
     let payload = std::mem::replace(&mut done.payload, Bytes::new());
-    let frames = std::mem::take(&mut done.frames);
+    let blocks = std::mem::take(&mut done.blocks);
     let logical_size = done.logical_size;
     let stored_crc32 = Some(crc32fast::hash(payload.as_ref()));
-    let filename = format!("{:x}.bin.frames", Md5::digest(&payload));
+    let filename = format!("{:x}.bin.blocks", Md5::digest(&payload));
     let put_result = store.put(payload, &filename, "").await;
     // Release ingest-budget permits only after put attempt finishes.
     drop(done);
@@ -338,8 +338,8 @@ async fn put_completed(
         file_id,
         message_id,
         logical_size,
-        codec: ChunkCodec::Frames,
-        frames,
+        codec: ChunkCodec::Blocks,
+        blocks,
         stored_crc32,
     })
 }
@@ -362,7 +362,7 @@ async fn put_raw_piece(
         message_id,
         logical_size,
         codec: ChunkCodec::Raw,
-        frames: Vec::new(),
+        blocks: Vec::new(),
         stored_crc32,
     })
 }
@@ -420,7 +420,7 @@ pub fn decode_chunk(stored: Bytes, codec: ChunkCodec, max_logical: usize) -> Res
             }
             Ok(Bytes::from(out))
         }
-        ChunkCodec::Frames => bail!("decode_chunk does not handle frames; use decode_frames_range"),
+        ChunkCodec::Blocks => bail!("decode_chunk does not handle frames; use decode_blocks_range"),
     }
 }
 
@@ -441,19 +441,19 @@ pub async fn decode_chunk_async(
 pub async fn decode_chunk_slice_async(
     stored: Bytes,
     codec: ChunkCodec,
-    frames: &[FrameRecord],
+    blocks: &[BlockRecord],
     from: usize,
     to: usize,
     logical_size: usize,
 ) -> Result<Bytes> {
     match codec {
-        ChunkCodec::Frames => {
-            let frames = frames.to_vec();
+        ChunkCodec::Blocks => {
+            let blocks = blocks.to_vec();
             tokio::task::spawn_blocking(move || {
-                frames::decode_frames_range(stored.as_ref(), &frames, from, to)
+                pigeonhole_codec::decode_blocks_range(stored.as_ref(), &blocks, from, to)
             })
             .await
-            .context("spawn_blocking frames decode")?
+            .context("spawn_blocking blocks decode")?
         }
         other => {
             let logical = decode_chunk_async(stored, other, logical_size.max(1)).await?;
@@ -470,7 +470,7 @@ pub fn encode_chunk(logical: Bytes, policy: ChunkCodec) -> (Bytes, ChunkCodec) {
     if policy == ChunkCodec::Raw || logical.is_empty() {
         return (logical, ChunkCodec::Raw);
     }
-    let fc = policy.frame_codec();
+    let fc = policy.block_codec();
     match compress_slice(&logical, fc) {
         Ok(c) if c.len() < logical.len() => (Bytes::from(c), fc),
         _ => (logical, ChunkCodec::Raw),
@@ -479,7 +479,7 @@ pub fn encode_chunk(logical: Bytes, policy: ChunkCodec) -> (Bytes, ChunkCodec) {
 
 fn compress_slice(data: &[u8], codec: ChunkCodec) -> Result<Vec<u8>> {
     match codec {
-        ChunkCodec::Raw | ChunkCodec::Frames => Ok(data.to_vec()),
+        ChunkCodec::Raw | ChunkCodec::Blocks => Ok(data.to_vec()),
         ChunkCodec::Gzip => {
             let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
             enc.write_all(data).context("gzip write")?;
@@ -516,28 +516,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.chunks[0].codec, ChunkCodec::Raw);
-        assert!(r.chunks[0].frames.is_empty());
+        assert!(r.chunks[0].blocks.is_empty());
         assert_eq!(store.get(&r.chunks[0].file_id).await.unwrap(), data);
     }
 
     #[tokio::test]
-    async fn zstd_policy_stores_frames_codec() {
+    async fn zstd_policy_stores_blocks_codec() {
         let mem = Arc::new(MemoryBlobStore::new());
         let store: Arc<dyn BlobStore> = mem.clone();
         let data = Bytes::from(vec![b'a'; 128 * 1024]);
         let body = stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]);
         let mut opts = IngestOptions::new(256 * 1024, ChunkCodec::Zstd);
-        opts.frame_size = 64 * 1024;
+        opts.block_size = 64 * 1024;
         let r = ingest_stream_with_options(&store, body, None, opts)
             .await
             .unwrap();
-        assert_eq!(r.chunks[0].codec, ChunkCodec::Frames);
-        assert!(!r.chunks[0].frames.is_empty());
+        assert_eq!(r.chunks[0].codec, ChunkCodec::Blocks);
+        assert!(!r.chunks[0].blocks.is_empty());
         assert!(r.compress_calls <= 2);
         let stored = store.get(&r.chunks[0].file_id).await.unwrap();
-        let got = frames::decode_frames_range(
+        let got = pigeonhole_codec::decode_blocks_range(
             stored.as_ref(),
-            &r.chunks[0].frames,
+            &r.chunks[0].blocks,
             0,
             data.len(),
         )
@@ -554,7 +554,7 @@ mod tests {
         let data = Bytes::from(vec![0u8; n]);
         let body = stream::iter(vec![Ok::<_, anyhow::Error>(data)]);
         let mut opts = IngestOptions::new(128 * 1024, ChunkCodec::Zstd);
-        opts.frame_size = frame;
+        opts.block_size = frame;
         let r = ingest_stream_with_options(&store, body, None, opts)
             .await
             .unwrap();
@@ -573,7 +573,7 @@ mod tests {
         }
         let body = stream::iter(vec![Ok::<_, anyhow::Error>(Bytes::from(data.clone()))]);
         let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Zstd);
-        opts.frame_size = 16 * 1024;
+        opts.block_size = 16 * 1024;
         let r = ingest_stream_with_options(&store, body, None, opts)
             .await
             .unwrap();
@@ -581,7 +581,7 @@ mod tests {
         for c in &r.chunks {
             let stored = store.get(&c.file_id).await.unwrap();
             out.extend_from_slice(
-                &frames::decode_frames_range(stored.as_ref(), &c.frames, 0, c.logical_size as usize)
+                &pigeonhole_codec::decode_blocks_range(stored.as_ref(), &c.blocks, 0, c.logical_size as usize)
                     .unwrap(),
             );
         }
@@ -623,7 +623,7 @@ mod tests {
             Some((Ok::<_, anyhow::Error>(Bytes::from(vec![0u8; len])), off + len))
         });
         let mut opts = IngestOptions::new(8 * 1024 * 1024, ChunkCodec::Zstd);
-        opts.frame_size = 1024 * 1024;
+        opts.block_size = 1024 * 1024;
         opts.memory_budget = Some(budget.clone());
         let r = ingest_stream_with_options(&store, Box::pin(body), None, opts)
             .await
@@ -652,7 +652,7 @@ mod tests {
                     Some((Ok::<_, anyhow::Error>(Bytes::from(vec![1u8; len])), off + len))
                 });
                 let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
-                opts.frame_size = 512 * 1024;
+                opts.block_size = 512 * 1024;
                 opts.memory_budget = Some(budget);
                 ingest_stream_with_options(&store, Box::pin(body), None, opts).await
             }));
@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(budget.available_permits(), budget.capacity());
     }
 
-    /// 64 parallel 8 MiB PUTs sharing a budget of only `4 * frame_size` must
+    /// 64 parallel 8 MiB PUTs sharing a budget of only `4 * block_size` must
     /// finish (whole-frame acquire prevents fragment deadlock).
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn parallel_puts_whole_frame_budget_no_deadlock() {
@@ -687,7 +687,7 @@ mod tests {
                     Some((Ok::<_, anyhow::Error>(Bytes::from(vec![3u8; len])), off + len))
                 });
                 let mut opts = IngestOptions::new(2 * 1024 * 1024, ChunkCodec::Raw);
-                opts.frame_size = frame;
+                opts.block_size = frame;
                 opts.memory_budget = Some(budget);
                 ingest_stream_with_options(&store, Box::pin(body), None, opts).await
             }));
@@ -696,13 +696,13 @@ mod tests {
             for j in joins {
                 j.await
                     .expect("join")
-                    .expect("parallel 8 MiB ingest under 4*frame_size budget");
+                    .expect("parallel 8 MiB ingest under 4*block_size budget");
             }
         })
         .await;
         assert!(
             result.is_ok(),
-            "64 parallel 8 MiB PUTs under 4*frame_size budget timed out"
+            "64 parallel 8 MiB PUTs under 4*block_size budget timed out"
         );
         assert_eq!(budget.available_permits(), budget.capacity());
     }
@@ -726,7 +726,7 @@ mod tests {
                 Some((Ok::<_, anyhow::Error>(Bytes::from(vec![2u8; len])), off + len))
             });
             let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
-            opts.frame_size = 512 * 1024;
+            opts.block_size = 512 * 1024;
             opts.memory_budget = Some(budget_c);
             ingest_stream_with_options(&store, Box::pin(body), None, opts).await
         });
@@ -739,7 +739,7 @@ mod tests {
         }
         handle.abort();
         let _ = handle.await;
-        // Abort drops the task's FrameWriter / CompletedChunks → permits return.
+        // Abort drops the task's BlockWriter / CompletedChunks → permits return.
         assert_eq!(budget.available_permits(), budget.capacity());
     }
 }

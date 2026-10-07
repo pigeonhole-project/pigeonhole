@@ -1,5 +1,5 @@
 use pigeonhole_codec::ChunkCodec;
-use pigeonhole_codec::FrameRecord;
+use pigeonhole_codec::BlockRecord;
 use pigeonhole_codec::{codec_from_sql, codec_to_sql, UploadedChunk};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -43,9 +43,9 @@ pub struct Chunk {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct ChunkFrameRow {
+pub struct ChunkBlockRow {
     pub file_id: String,
-    pub frame_no: i64,
+    pub block_no: i64,
     pub stored_off: i64,
     pub stored_len: i64,
     pub logical_off: i64,
@@ -53,10 +53,10 @@ pub struct ChunkFrameRow {
     pub codec: String,
 }
 
-impl ChunkFrameRow {
-    pub fn to_record(&self) -> FrameRecord {
-        FrameRecord {
-            frame_no: self.frame_no,
+impl ChunkBlockRow {
+    pub fn to_record(&self) -> BlockRecord {
+        BlockRecord {
+            block_no: self.block_no,
             stored_off: self.stored_off,
             stored_len: self.stored_len,
             logical_off: self.logical_off,
@@ -189,7 +189,7 @@ pub struct IndexSnapshot {
     pub metadata: Vec<UserMeta>,
     /// Optional: present in snapshots after frame packing landed.
     #[serde(default)]
-    pub chunk_frames: Vec<ChunkFrameRow>,
+    pub chunk_blocks: Vec<ChunkBlockRow>,
     /// Optional: backend placement rows (Stage 3+).
     #[serde(default)]
     pub blob_replicas: Vec<BlobReplica>,
@@ -230,6 +230,39 @@ impl Index {
         .fetch_one(&self.pool)
         .await?;
         Ok(n > 0)
+    }
+
+    async fn table_exists(&self, table: &str) -> Result<bool> {
+        let n: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(n.is_some())
+    }
+
+    async fn rename_table_if_exists(&self, from: &str, to: &str) -> Result<()> {
+        if !self.table_exists(from).await? || self.table_exists(to).await? {
+            return Ok(());
+        }
+        sqlx::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn rename_column_if_exists(&self, table: &str, from: &str, to: &str) -> Result<()> {
+        if !self.table_exists(table).await? {
+            return Ok(());
+        }
+        if !self.column_exists(table, from).await? || self.column_exists(table, to).await? {
+            return Ok(());
+        }
+        sqlx::query(&format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}"))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn migrate(&self) -> Result<()> {
@@ -318,17 +351,22 @@ impl Index {
             }
         }
 
+        self.rename_table_if_exists("chunk_frames", "chunk_blocks")
+            .await?;
+        self.rename_column_if_exists("chunk_blocks", "frame_no", "block_no")
+            .await?;
+
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS chunk_frames (
+            CREATE TABLE IF NOT EXISTS chunk_blocks (
                 file_id TEXT NOT NULL,
-                frame_no INTEGER NOT NULL,
+                block_no INTEGER NOT NULL,
                 stored_off INTEGER NOT NULL,
                 stored_len INTEGER NOT NULL,
                 logical_off INTEGER NOT NULL,
                 logical_len INTEGER NOT NULL,
                 codec TEXT NOT NULL,
-                PRIMARY KEY (file_id, frame_no)
+                PRIMARY KEY (file_id, block_no)
             );
             "#,
         )
@@ -867,8 +905,8 @@ impl Index {
             .execute(&mut *tx)
             .await?;
             // Shallow copies pass empty frames and must not wipe existing rows.
-            if !c.frames.is_empty() {
-                replace_chunk_frames(&mut tx, &c.file_id, &c.frames).await?;
+            if !c.blocks.is_empty() {
+                replace_chunk_blocks(&mut tx, &c.file_id, &c.blocks).await?;
             }
         }
 
@@ -1054,7 +1092,7 @@ impl Index {
                 logical_size: c.size,
                 codec: c.stored_codec(),
                 // Frames stay keyed by file_id; shallow copy reuses them.
-                frames: Vec::new(),
+                blocks: Vec::new(),
                 stored_crc32: None,
             })
             .collect();
@@ -1347,7 +1385,7 @@ impl Index {
         sqlx::query("DELETE FROM object_metadata")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM chunk_frames")
+        sqlx::query("DELETE FROM chunk_blocks")
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM chunks")
@@ -1376,11 +1414,11 @@ impl Index {
         Ok(())
     }
 
-    pub async fn get_chunk_frames(&self, file_id: &str) -> Result<Vec<FrameRecord>> {
-        let rows = sqlx::query_as::<_, ChunkFrameRow>(
+    pub async fn get_chunk_blocks(&self, file_id: &str) -> Result<Vec<BlockRecord>> {
+        let rows = sqlx::query_as::<_, ChunkBlockRow>(
             r#"
-            SELECT file_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec
-            FROM chunk_frames WHERE file_id = ? ORDER BY frame_no
+            SELECT file_id, block_no, stored_off, stored_len, logical_off, logical_len, codec
+            FROM chunk_blocks WHERE file_id = ? ORDER BY block_no
             "#,
         )
         .bind(file_id)
@@ -1496,10 +1534,10 @@ impl Index {
         )
         .fetch_all(&mut *tx)
         .await?;
-        let chunk_frames = sqlx::query_as::<_, ChunkFrameRow>(
+        let chunk_blocks = sqlx::query_as::<_, ChunkBlockRow>(
             r#"
-            SELECT file_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec
-            FROM chunk_frames ORDER BY file_id, frame_no
+            SELECT file_id, block_no, stored_off, stored_len, logical_off, logical_len, codec
+            FROM chunk_blocks ORDER BY file_id, block_no
             "#,
         )
         .fetch_all(&mut *tx)
@@ -1519,7 +1557,7 @@ impl Index {
             chunks,
             blobs,
             metadata,
-            chunk_frames,
+            chunk_blocks,
             blob_replicas,
         })
     }
@@ -1538,7 +1576,7 @@ impl Index {
         sqlx::query("DELETE FROM object_metadata")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM chunk_frames")
+        sqlx::query("DELETE FROM chunk_blocks")
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM chunks").execute(&mut *tx).await?;
@@ -1584,16 +1622,16 @@ impl Index {
             .execute(&mut *tx)
             .await?;
         }
-        for f in &snap.chunk_frames {
+        for f in &snap.chunk_blocks {
             sqlx::query(
                 r#"
-                INSERT INTO chunk_frames
-                    (file_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec)
+                INSERT INTO chunk_blocks
+                    (file_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&f.file_id)
-            .bind(f.frame_no)
+            .bind(f.block_no)
             .bind(f.stored_off)
             .bind(f.stored_len)
             .bind(f.logical_off)
@@ -1794,8 +1832,8 @@ impl Index {
             .bind(codec_to_sql(c.codec))
             .execute(&mut *tx)
             .await?;
-            if !c.frames.is_empty() {
-                replace_chunk_frames(&mut tx, &c.file_id, &c.frames).await?;
+            if !c.blocks.is_empty() {
+                replace_chunk_blocks(&mut tx, &c.file_id, &c.blocks).await?;
             }
         }
 
@@ -1880,7 +1918,7 @@ impl Index {
                     message_id: c.message_id,
                     logical_size: c.size,
                     codec: c.stored_codec(),
-                    frames: Vec::new(),
+                    blocks: Vec::new(),
                     stored_crc32: None,
                 });
                 part_chunks.push(c);
@@ -2219,7 +2257,7 @@ pub(crate) async fn release_blob(
     };
 
     if refcount <= 1 {
-        sqlx::query("DELETE FROM chunk_frames WHERE file_id = ?")
+        sqlx::query("DELETE FROM chunk_blocks WHERE file_id = ?")
             .bind(file_id)
             .execute(&mut **tx)
             .await?;
@@ -2241,25 +2279,25 @@ pub(crate) async fn release_blob(
     }
 }
 
-async fn replace_chunk_frames(
+async fn replace_chunk_blocks(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     file_id: &str,
-    frames: &[FrameRecord],
+    blocks: &[BlockRecord],
 ) -> Result<()> {
-    sqlx::query("DELETE FROM chunk_frames WHERE file_id = ?")
+    sqlx::query("DELETE FROM chunk_blocks WHERE file_id = ?")
         .bind(file_id)
         .execute(&mut **tx)
         .await?;
-    for f in frames {
+    for f in blocks {
         sqlx::query(
             r#"
-            INSERT INTO chunk_frames
-                (file_id, frame_no, stored_off, stored_len, logical_off, logical_len, codec)
+            INSERT INTO chunk_blocks
+                (file_id, block_no, stored_off, stored_len, logical_off, logical_len, codec)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(file_id)
-        .bind(f.frame_no)
+        .bind(f.block_no)
         .bind(f.stored_off)
         .bind(f.stored_len)
         .bind(f.logical_off)

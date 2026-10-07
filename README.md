@@ -7,7 +7,7 @@ The S3 surface uses [s3s](https://github.com/s3s-project/s3s). Objects are split
 into configurable chunks (default on-wire ≤19 MiB, hard cap `< 20 MiB` for
 Telegram `getFile`) and stored as documents in **one** private chat/channel.
 Chunk encoding is `raw` | `gzip` | `zstd` (default `zstd`): compressing policies
-pack independent 1 MiB frames into documents (stored codec `frames`) so each
+pack independent 1 MiB blocks into documents (stored codec `blocks`) so each
 block is compressed once; on-wire size stays ≤ `chunk.size` (logical ≤ 256 MiB).
 Legacy single-blob `raw`/`gzip`/`zstd` chunks remain readable. Object metadata
 lives in a local SQLite index.
@@ -21,7 +21,7 @@ Layout is a Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 | Crate | Role |
 |---|---|
 | `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
-| `core/pigeonhole-codec` | Codecs + `FrameWriter` |
+| `core/pigeonhole-codec` | Codecs + `BlockWriter` |
 | `blob/pigeonhole-blob` | `BlobBackend` / `BlobStore`, rate limits, `BootstrapPointer`, cache |
 | `blob/pigeonhole-index` | SQLite index (blob-store layer; merging into blob-store later) |
 | `blob/pigeonhole-blob-store` | Ingest, snapshots, config (no protocol crates) |

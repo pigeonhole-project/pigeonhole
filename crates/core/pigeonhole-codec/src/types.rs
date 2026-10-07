@@ -1,5 +1,5 @@
 use crate::chunker::ChunkCodec;
-use crate::frames::FrameRecord;
+use crate::blocks::BlockRecord;
 use anyhow::{Context, Result};
 
 /// One uploaded backend document (object/multipart part slice).
@@ -10,7 +10,7 @@ pub struct UploadedChunk {
     pub message_id: i64,
     pub logical_size: i64,
     pub codec: ChunkCodec,
-    pub frames: Vec<FrameRecord>,
+    pub blocks: Vec<BlockRecord>,
     /// CRC32 of on-wire (stored) bytes; filled at upload for L2 integrity.
     pub stored_crc32: Option<u32>,
 }

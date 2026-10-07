@@ -10,7 +10,7 @@ use futures::StreamExt;
 use md5::{Digest, Md5};
 use pigeonhole_blob::{collect_stream, erase_sweep, SharedBackend, StoredId, Sweepable};
 use pigeonhole_codec::{
-    decode_frames_range, ByteBudget, ChunkCodec, FrameRecord, FrameWriter, DEFAULT_CHUNK_SIZE,
+    decode_blocks_range, ByteBudget, ChunkCodec, BlockRecord, BlockWriter, DEFAULT_CHUNK_SIZE,
 };
 use pigeonhole_types::ByteRange;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ pub struct BlobLayer {
     /// Instance id used for new replicas (must exist in `instances`).
     write_instance_id: String,
     chunk_size: usize,
-    frame_size: usize,
+    block_size: usize,
     codec: ChunkCodec,
     memory_budget: Option<ByteBudget>,
 }
@@ -59,7 +59,7 @@ impl BlobLayer {
             write: Arc::new(erase_sweep(backend)),
             write_instance_id,
             chunk_size: opts.chunk_size.max(1024),
-            frame_size: opts.frame_size.max(1024),
+            block_size: opts.block_size.max(1024),
             codec: opts.codec,
             memory_budget: opts.memory_budget,
         })
@@ -111,7 +111,7 @@ impl BlobLayer {
     {
         let opts = opts.unwrap_or_else(|| {
             let mut o = IngestOptions::new(self.chunk_size, self.codec);
-            o.frame_size = self.frame_size;
+            o.block_size = self.block_size;
             o.memory_budget = self.memory_budget.clone();
             o
         });
@@ -181,14 +181,14 @@ impl BlobLayer {
             locator,
         };
         let raw = collect_stream(self.write.get(&stored, None).await?).await?;
-        let frames = self.db.get_frames(blob_id).await?;
+        let frames = self.db.get_blocks(blob_id).await?;
         if frames.is_empty() {
             if from > to || to > raw.len() {
                 bail!("range {from}..{to} outside raw blob {}", raw.len());
             }
             return Ok(raw.slice(from..to));
         }
-        decode_frames_range(raw.as_ref(), &frames, from, to).context("decode frames range")
+        decode_blocks_range(raw.as_ref(), &frames, from, to).context("decode frames range")
     }
 
     async fn register_blob(
@@ -196,7 +196,7 @@ impl BlobLayer {
         size: i64,
         crc: u32,
         stored: &StoredId,
-        frames: &[FrameRecord],
+        blocks: &[BlockRecord],
     ) -> Result<BlobId> {
         let blob_id = self.db.insert_blob(size, crc).await?;
         self.db
@@ -207,8 +207,8 @@ impl BlobLayer {
                 &stored.locator,
             )
             .await?;
-        if !frames.is_empty() {
-            self.db.replace_frames(blob_id, frames).await?;
+        if !blocks.is_empty() {
+            self.db.replace_blocks(blob_id, blocks).await?;
         }
         Ok(blob_id)
     }
@@ -272,8 +272,8 @@ impl BlobLayer {
         let calls = opts
             .compress_calls
             .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
-        let mut writer = FrameWriter::new(
-            opts.frame_size,
+        let mut writer = BlockWriter::new(
+            opts.block_size,
             max_stored,
             max_logical,
             opts.codec,
@@ -321,7 +321,7 @@ impl BlobLayer {
 
     async fn put_completed(&self, mut done: pigeonhole_codec::CompletedChunk) -> Result<BlobId> {
         let logical = done.logical_size;
-        let frames = std::mem::take(&mut done.frames);
+        let frames = std::mem::take(&mut done.blocks);
         let payload = std::mem::take(&mut done.payload);
         let crc = crc32fast::hash(payload.as_ref());
         let put = self.write.put(payload).await.context("backend put framed");
@@ -340,12 +340,12 @@ pub fn default_layer_opts() -> IngestOptions {
 /// Test helper: open a memory-backed layer with a temp `blob.db`.
 #[cfg(test)]
 pub async fn open_memory_layer(db_url: &str) -> Result<BlobLayer> {
-    use pigeonhole_codec::DEFAULT_FRAME_SIZE;
+    use pigeonhole_codec::DEFAULT_BLOCK_SIZE;
     use pigeonhole_storage_memory::MemoryBlobStore;
     let db = BlobDb::connect(db_url).await?;
     let mut opts = default_layer_opts();
     opts.chunk_size = 64 * 1024;
-    opts.frame_size = DEFAULT_FRAME_SIZE;
+    opts.block_size = DEFAULT_BLOCK_SIZE;
     BlobLayer::open(db, MemoryBlobStore::new(), opts).await
 }
 

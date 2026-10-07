@@ -3,7 +3,7 @@
 use pigeonhole_codec::ChunkCodec;
 use pigeonhole_types::{BackendId, BlobKey, Locator};
 use pigeonhole_blob_store::config::Config;
-use pigeonhole_blob_store::frame_cache::FrameCache;
+use pigeonhole_blob_store::block_cache::BlockCache;
 use pigeonhole_blob_store::ingest::{
     decode_chunk_slice_async, ingest_stream_with_options, IngestHasher, IngestOptions,
     UploadedChunk,
@@ -41,17 +41,17 @@ pub struct S3gram {
     pub store: Arc<dyn BlobStore>,
     pub snapshot_gate: Arc<Mutex<()>>,
     /// L1 unpacked-frame cache (None when `[cache] enabled = false`).
-    pub frame_cache: Option<Arc<FrameCache>>,
+    pub block_cache: Option<Arc<BlockCache>>,
     /// Last exclusive end offset per object for sequential readahead detection.
     pub(crate) sequential_ends: Arc<Mutex<HashMap<(String, String), u64>>>,
 }
 
 impl S3gram {
     pub fn new(cfg: Config, index: Index, store: Arc<dyn BlobStore>) -> Self {
-        let frame_cache = if cfg.cache.enabled {
-            Some(Arc::new(FrameCache::new(
-                cfg.cache.frame_memory_bytes,
-                cfg.cache.readahead_frames,
+        let block_cache = if cfg.cache.enabled {
+            Some(Arc::new(BlockCache::new(
+                cfg.cache.block_memory_bytes,
+                cfg.cache.readahead_blocks,
             )))
         } else {
             None
@@ -61,7 +61,7 @@ impl S3gram {
             index,
             store,
             snapshot_gate: Arc::new(Mutex::new(())),
-            frame_cache,
+            block_cache,
             sequential_ends: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -72,7 +72,7 @@ impl S3gram {
 
     fn ingest_options(&self) -> IngestOptions {
         let mut opts = IngestOptions::new(self.cfg.chunk_size, self.cfg.chunk_codec);
-        opts.frame_size = self.cfg.frame_size;
+        opts.block_size = self.cfg.block_size;
         opts.memory_budget = self.cfg.ingest_budget.clone();
         opts
     }
@@ -105,28 +105,28 @@ impl S3gram {
 
     async fn invalidate_caches_for_file(&self, file_id: &str) {
         self.store.invalidate_blob(file_id).await;
-        if let Some(fc) = &self.frame_cache {
+        if let Some(fc) = &self.block_cache {
             let key = blob_key_for_file(file_id);
             fc.invalidate_blob(&key).await;
         }
     }
 
     async fn warm_l1_frames(&self, chunks: &[UploadedChunk]) {
-        let Some(fc) = &self.frame_cache else {
+        let Some(fc) = &self.block_cache else {
             return;
         };
         if !self.cfg.cache.write_through {
             return;
         }
         for c in chunks {
-            if c.codec != ChunkCodec::Frames || c.frames.is_empty() {
+            if c.codec != ChunkCodec::Blocks || c.blocks.is_empty() {
                 continue;
             }
             let Ok(stored) = self.store.get(&c.file_id).await else {
                 continue;
             };
             let key = blob_key_for_file(&c.file_id);
-            for fr in &c.frames {
+            for fr in &c.blocks {
                 let soff = fr.stored_off as usize;
                 let slen = fr.stored_len as usize;
                 if soff + slen > stored.len() {
@@ -135,13 +135,13 @@ impl S3gram {
                 let slice = stored.slice(soff..soff + slen);
                 let mut rec = fr.clone();
                 rec.stored_off = 0;
-                if let Ok(decoded) = pigeonhole_codec::decode_frames_range(
+                if let Ok(decoded) = pigeonhole_codec::decode_blocks_range(
                     slice.as_ref(),
                     &[rec],
                     0,
                     fr.logical_len as usize,
                 ) {
-                    fc.insert(key.clone(), fr.frame_no as u32, decoded).await;
+                    fc.insert(key.clone(), fr.block_no as u32, decoded).await;
                 }
             }
         }
@@ -647,7 +647,7 @@ fn try_aligned_part_chunks(
             message_id: c.message_id,
             logical_size: c.size,
             codec: c.stored_codec(),
-            frames: Vec::new(),
+            blocks: Vec::new(),
             stored_crc32: None,
         });
         chunk_no += 1;
@@ -681,15 +681,15 @@ fn stream_object_body(
     chunks: Vec<Chunk>,
     start: u64,
     length: u64,
-    frame_cache: Option<Arc<FrameCache>>,
+    block_cache: Option<Arc<BlockCache>>,
     readahead: bool,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + 'static {
     let plan = plan_chunk_slices(&chunks, start, length);
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
     tokio::spawn(async move {
         for slice in plan {
-            let frames = if slice.codec == ChunkCodec::Frames {
-                match index.get_chunk_frames(&slice.file_id).await {
+            let frames = if slice.codec == ChunkCodec::Blocks {
+                match index.get_chunk_blocks(&slice.file_id).await {
                     Ok(f) => f,
                     Err(e) => {
                         let _ = tx
@@ -709,7 +709,7 @@ fn stream_object_body(
                 slice.from,
                 slice.to,
                 slice.logical_size.max(1),
-                frame_cache.clone(),
+                block_cache.clone(),
                 readahead,
             )
             .await
@@ -1229,7 +1229,7 @@ impl S3 for S3gram {
                 chunks,
                 start,
                 length,
-                self.frame_cache.clone(),
+                self.block_cache.clone(),
                 readahead,
             );
             Some(StreamingBlob::wrap(body_stream))
@@ -1671,9 +1671,9 @@ impl S3 for S3gram {
                             .get(&c.file_id)
                             .await
                             .map_err(Self::map_err)?;
-                        let frames = if c.codec == ChunkCodec::Frames {
+                        let frames = if c.codec == ChunkCodec::Blocks {
                             self.index
-                                .get_chunk_frames(&c.file_id)
+                                .get_chunk_blocks(&c.file_id)
                                 .await
                                 .map_err(Self::map_err)?
                         } else {
@@ -1707,7 +1707,7 @@ impl S3 for S3gram {
                     chunks,
                     start,
                     length,
-                    self.frame_cache.clone(),
+                    self.block_cache.clone(),
                     true,
                 )
                 .map(|r| r.map_err(|e| anyhow::anyhow!(e)));

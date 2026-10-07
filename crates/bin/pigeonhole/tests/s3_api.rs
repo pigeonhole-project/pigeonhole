@@ -160,11 +160,11 @@ async fn compressible_object_roundtrip_and_snapshot_flag() {
         .await
         .unwrap();
     assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].codec, "frames");
+    assert_eq!(chunks[0].codec, "blocks");
     assert_eq!(chunks[0].size, data.len() as i64);
     let stored = mem.get(&chunks[0].file_id).await.unwrap();
     assert!(stored.len() < data.len());
-    let frames = s3.index.get_chunk_frames(&chunks[0].file_id).await.unwrap();
+    let frames = s3.index.get_chunk_blocks(&chunks[0].file_id).await.unwrap();
     assert!(!frames.is_empty());
 
     let got = s3
@@ -184,8 +184,8 @@ async fn compressible_object_roundtrip_and_snapshot_flag() {
         .iter()
         .find(|c| c.key == "zeros.bin")
         .unwrap();
-    assert_eq!(sc.codec, "frames");
-    assert!(!snap.chunk_frames.is_empty());
+    assert_eq!(sc.codec, "blocks");
+    assert!(!snap.chunk_blocks.is_empty());
 }
 
 #[tokio::test]

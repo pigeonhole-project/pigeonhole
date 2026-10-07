@@ -1,7 +1,7 @@
 //! Independent fixed-size frames packed into Telegram documents.
 //!
-//! Each frame compresses exactly once (`FRAME_SIZE` logical bytes). Frames are
-//! concatenated on the wire; the `chunk_frames` index table maps stored/logical
+//! Each frame compresses exactly once (`BLOCK_SIZE` logical bytes). Frames are
+//! concatenated on the wire; the `chunk_blocks` index table maps stored/logical
 //! ranges so Range reads decompress only the needed frames.
 
 use crate::chunker::{self, ChunkCodec};
@@ -17,8 +17,9 @@ use tokio::sync::Semaphore;
 
 /// One independent frame inside a `frames` chunk document.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FrameRecord {
-    pub frame_no: i64,
+pub struct BlockRecord {
+    #[serde(alias = "frame_no")]
+    pub block_no: i64,
     pub stored_off: i64,
     pub stored_len: i64,
     pub logical_off: i64,
@@ -27,8 +28,8 @@ pub struct FrameRecord {
     pub codec: String,
 }
 
-impl FrameRecord {
-    pub fn frame_codec(&self) -> ChunkCodec {
+impl BlockRecord {
+    pub fn block_codec(&self) -> ChunkCodec {
         match self.codec.as_str() {
             "gzip" => ChunkCodec::Gzip,
             "zstd" => ChunkCodec::Zstd,
@@ -44,7 +45,7 @@ impl FrameRecord {
 pub struct CompletedChunk {
     pub payload: Bytes,
     pub logical_size: i64,
-    pub frames: Vec<FrameRecord>,
+    pub blocks: Vec<BlockRecord>,
     _permits: Vec<BudgetPermit>,
 }
 
@@ -53,7 +54,7 @@ impl std::fmt::Debug for CompletedChunk {
         f.debug_struct("CompletedChunk")
             .field("payload_len", &self.payload.len())
             .field("logical_size", &self.logical_size)
-            .field("frames", &self.frames.len())
+            .field("blocks", &self.blocks.len())
             .field(
                 "permits",
                 &self._permits.iter().map(|p| p.bytes()).sum::<usize>(),
@@ -155,15 +156,15 @@ impl ByteBudget {
 }
 
 /// Packs a logical stream into Telegram-sized documents of independent frames.
-pub struct FrameWriter {
-    frame_size: usize,
+pub struct BlockWriter {
+    block_size: usize,
     max_stored: usize,
     max_logical: usize,
-    frame_codec: ChunkCodec,
+    block_codec: ChunkCodec,
     block: Vec<u8>,
     chunk_stored: Vec<u8>,
     chunk_logical: usize,
-    frames: Vec<FrameRecord>,
+    blocks: Vec<BlockRecord>,
     compress_calls: Arc<AtomicU64>,
     budget: Option<ByteBudget>,
     /// Whole-frame permit for the current incomplete `block` (released early on
@@ -173,27 +174,27 @@ pub struct FrameWriter {
     chunk_permits: Vec<BudgetPermit>,
 }
 
-impl FrameWriter {
+impl BlockWriter {
     pub fn new(
-        frame_size: usize,
+        block_size: usize,
         max_stored: usize,
         max_logical: usize,
         policy: ChunkCodec,
         budget: Option<ByteBudget>,
         compress_calls: Arc<AtomicU64>,
     ) -> Self {
-        let frame_size = frame_size.clamp(1024, max_logical);
+        let block_size = block_size.clamp(1024, max_logical);
         let max_stored = max_stored.clamp(1024, chunker::MAX_CHUNK_SIZE);
-        let max_logical = max_logical.max(frame_size);
+        let max_logical = max_logical.max(block_size);
         Self {
-            frame_size,
+            block_size,
             max_stored,
             max_logical,
-            frame_codec: policy.frame_codec(),
-            block: Vec::with_capacity(frame_size),
+            block_codec: policy.block_codec(),
+            block: Vec::with_capacity(block_size),
             chunk_stored: Vec::new(),
             chunk_logical: 0,
-            frames: Vec::new(),
+            blocks: Vec::new(),
             compress_calls,
             budget,
             block_permit: None,
@@ -212,7 +213,7 @@ impl FrameWriter {
     /// chunks are sealed so the caller can upload/drop them (freeing permits)
     /// before more input is reserved. Callers must loop until `consumed == data.len()`.
     ///
-    /// Budget permits are acquired for a whole [`frame_size`] at the start of each
+    /// Budget permits are acquired for a whole [`block_size`] at the start of each
     /// block so concurrent PUTs cannot each hold a fragment of a frame and deadlock.
     pub async fn push(&mut self, mut data: &[u8]) -> Result<(Vec<CompletedChunk>, usize)> {
         let total = data.len();
@@ -222,7 +223,7 @@ impl FrameWriter {
                 // Seal the open chunk before waiting for another whole frame so
                 // the caller can free permits under a tight shared budget.
                 if let Some(budget) = &self.budget {
-                    if budget.available_permits() < self.frame_size && !self.chunk_stored.is_empty()
+                    if budget.available_permits() < self.block_size && !self.chunk_stored.is_empty()
                     {
                         if let Some(c) = self.seal_chunk() {
                             out.push(c);
@@ -230,14 +231,14 @@ impl FrameWriter {
                         }
                     }
                 }
-                self.acquire_frame_budget().await?;
+                self.acquire_block_budget().await?;
             }
-            let need = self.frame_size - self.block.len();
+            let need = self.block_size - self.block.len();
             let take = need.min(data.len());
             self.block.extend_from_slice(&data[..take]);
             data = &data[take..];
-            if self.block.len() >= self.frame_size {
-                let sealed = self.emit_frame().await?;
+            if self.block.len() >= self.block_size {
+                let sealed = self.emit_block().await?;
                 if !sealed.is_empty() {
                     out.extend(sealed);
                     // With a budget, stop so the caller can free permits via put/drop.
@@ -254,7 +255,7 @@ impl FrameWriter {
     pub async fn finish(mut self) -> Result<Vec<CompletedChunk>> {
         let mut out = Vec::new();
         if !self.block.is_empty() {
-            out.extend(self.emit_frame().await?);
+            out.extend(self.emit_block().await?);
         }
         if let Some(c) = self.seal_chunk() {
             out.push(c);
@@ -264,7 +265,7 @@ impl FrameWriter {
     }
 
     /// Compress current `block` into one frame; may seal the previous chunk first.
-    async fn emit_frame(&mut self) -> Result<Vec<CompletedChunk>> {
+    async fn emit_block(&mut self) -> Result<Vec<CompletedChunk>> {
         if self.block.is_empty() {
             return Ok(Vec::new());
         }
@@ -275,14 +276,14 @@ impl FrameWriter {
             // Short last block: return unused whole-frame reservation.
             permit.release_excess(permit.bytes().saturating_sub(logical_len));
         }
-        let frame_codec = self.frame_codec;
+        let block_codec = self.block_codec;
         let calls = self.compress_calls.clone();
         let (payload, stored_codec) = tokio::task::spawn_blocking(move || {
             calls.fetch_add(1, Ordering::Relaxed);
-            encode_frame(&logical, frame_codec)
+            encode_block(&logical, block_codec)
         })
         .await
-        .context("spawn_blocking encode_frame")??;
+        .context("spawn_blocking encode_block")??;
 
         let mut sealed = Vec::new();
         let would_stored = self.chunk_stored.len() + payload.len();
@@ -296,7 +297,7 @@ impl FrameWriter {
         }
 
         // Single frame larger than max_stored: still emit (should not happen for
-        // frame_size << max_stored); if it does, seal as its own chunk.
+        // block_size << max_stored); if it does, seal as its own chunk.
         if self.chunk_stored.is_empty() && payload.len() > self.max_stored {
             bail!(
                 "encoded frame {} exceeds max_stored {}",
@@ -305,7 +306,7 @@ impl FrameWriter {
             );
         }
 
-        let frame_no = self.frames.len() as i64;
+        let block_no = self.blocks.len() as i64;
         let stored_off = self.chunk_stored.len() as i64;
         let logical_off = self.chunk_logical as i64;
         self.chunk_stored.extend_from_slice(&payload);
@@ -313,8 +314,8 @@ impl FrameWriter {
         if let Some(permit) = frame_permit {
             self.chunk_permits.push(permit);
         }
-        self.frames.push(FrameRecord {
-            frame_no,
+        self.blocks.push(BlockRecord {
+            block_no,
             stored_off,
             stored_len: payload.len() as i64,
             logical_off,
@@ -330,36 +331,36 @@ impl FrameWriter {
         }
         let payload = Bytes::from(std::mem::take(&mut self.chunk_stored));
         let logical_size = self.chunk_logical as i64;
-        let frames = std::mem::take(&mut self.frames);
+        let blocks = std::mem::take(&mut self.blocks);
         let permits = std::mem::take(&mut self.chunk_permits);
         self.chunk_logical = 0;
         Some(CompletedChunk {
             payload,
             logical_size,
-            frames,
+            blocks,
             _permits: permits,
         })
     }
 
-    async fn acquire_frame_budget(&mut self) -> Result<()> {
+    async fn acquire_block_budget(&mut self) -> Result<()> {
         if self.block_permit.is_some() {
             return Ok(());
         }
         if let Some(budget) = &self.budget {
-            self.block_permit = Some(budget.acquire(self.frame_size).await?);
+            self.block_permit = Some(budget.acquire(self.block_size).await?);
         }
         Ok(())
     }
 }
 
-fn encode_frame(logical: &[u8], policy: ChunkCodec) -> Result<(Vec<u8>, ChunkCodec)> {
+fn encode_block(logical: &[u8], policy: ChunkCodec) -> Result<(Vec<u8>, ChunkCodec)> {
     if logical.is_empty() {
         return Ok((Vec::new(), ChunkCodec::Raw));
     }
     if policy == ChunkCodec::Raw {
         return Ok((logical.to_vec(), ChunkCodec::Raw));
     }
-    let stored_codec = policy.frame_codec();
+    let stored_codec = policy.block_codec();
     let compressed = match stored_codec {
         ChunkCodec::Gzip => {
             let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
@@ -367,7 +368,7 @@ fn encode_frame(logical: &[u8], policy: ChunkCodec) -> Result<(Vec<u8>, ChunkCod
             enc.finish().context("gzip finish")?
         }
         ChunkCodec::Zstd => zstd::bulk::compress(logical, 1).context("zstd frame")?,
-        ChunkCodec::Raw | ChunkCodec::Frames => logical.to_vec(),
+        ChunkCodec::Raw | ChunkCodec::Blocks => logical.to_vec(),
     };
     if compressed.len() < logical.len() {
         Ok((compressed, stored_codec))
@@ -376,9 +377,9 @@ fn encode_frame(logical: &[u8], policy: ChunkCodec) -> Result<(Vec<u8>, ChunkCod
     }
 }
 
-fn decode_frame(stored: &[u8], codec: ChunkCodec, max_logical: usize) -> Result<Vec<u8>> {
+fn decode_block(stored: &[u8], codec: ChunkCodec, max_logical: usize) -> Result<Vec<u8>> {
     match codec {
-        ChunkCodec::Raw | ChunkCodec::Frames => {
+        ChunkCodec::Raw | ChunkCodec::Blocks => {
             if stored.len() > max_logical {
                 bail!("raw frame {} exceeds max {max_logical}", stored.len());
             }
@@ -413,9 +414,9 @@ fn gunzip_capped(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
 }
 
 /// Decode a byte range `[from, to)` within one `frames` chunk document.
-pub fn decode_frames_range(
+pub fn decode_blocks_range(
     stored: &[u8],
-    frames: &[FrameRecord],
+    blocks: &[BlockRecord],
     from: usize,
     to: usize,
 ) -> Result<Bytes> {
@@ -427,7 +428,7 @@ pub fn decode_frames_range(
     }
     let mut out = Vec::with_capacity(to - from);
     let mut logical_cursor = 0usize;
-    for fr in frames {
+    for fr in blocks {
         let flen = fr.logical_len as usize;
         let frame_start = logical_cursor;
         let frame_end = logical_cursor + flen;
@@ -446,7 +447,7 @@ pub fn decode_frames_range(
                 stored.len()
             );
         }
-        let decoded = decode_frame(&stored[soff..end], fr.frame_codec(), flen.max(1))?;
+        let decoded = decode_block(&stored[soff..end], fr.block_codec(), flen.max(1))?;
         if decoded.len() != flen {
             bail!(
                 "frame logical length mismatch: index {flen}, decoded {}",
@@ -478,7 +479,7 @@ mod tests {
         let calls = Arc::new(AtomicU64::new(0));
         let frame = 64 * 1024;
         let max_stored = 256 * 1024;
-        let mut w = FrameWriter::new(
+        let mut w = BlockWriter::new(
             frame,
             max_stored,
             8 * 1024 * 1024,
@@ -497,7 +498,7 @@ mod tests {
         let mut out = Vec::new();
         for c in &chunks {
             out.extend_from_slice(
-                &decode_frames_range(&c.payload, &c.frames, 0, c.logical_size as usize).unwrap(),
+                &decode_blocks_range(&c.payload, &c.blocks, 0, c.logical_size as usize).unwrap(),
             );
         }
         assert_eq!(out, data);
@@ -506,22 +507,22 @@ mod tests {
 
     #[test]
     fn range_across_frame_boundary() {
-        let f0 = encode_frame(&[1u8; 100], ChunkCodec::Raw).unwrap();
-        let f1 = encode_frame(&[2u8; 100], ChunkCodec::Raw).unwrap();
+        let f0 = encode_block(&[1u8; 100], ChunkCodec::Raw).unwrap();
+        let f1 = encode_block(&[2u8; 100], ChunkCodec::Raw).unwrap();
         let mut stored = f0.0;
         let off1 = stored.len();
         stored.extend_from_slice(&f1.0);
         let frames = vec![
-            FrameRecord {
-                frame_no: 0,
+            BlockRecord {
+                block_no: 0,
                 stored_off: 0,
                 stored_len: off1 as i64,
                 logical_off: 0,
                 logical_len: 100,
                 codec: "raw".into(),
             },
-            FrameRecord {
-                frame_no: 1,
+            BlockRecord {
+                block_no: 1,
                 stored_off: off1 as i64,
                 stored_len: f1.0.len() as i64,
                 logical_off: 100,
@@ -529,7 +530,7 @@ mod tests {
                 codec: "raw".into(),
             },
         ];
-        let mid = decode_frames_range(&stored, &frames, 90, 110).unwrap();
+        let mid = decode_blocks_range(&stored, &frames, 90, 110).unwrap();
         let mut expect = vec![1u8; 10];
         expect.extend(std::iter::repeat(2u8).take(10));
         assert_eq!(mid.as_ref(), expect.as_slice());
@@ -539,7 +540,7 @@ mod tests {
     async fn budget_push_returns_early_so_caller_can_free_permits() {
         let budget = ByteBudget::new(64 * 1024);
         let calls = Arc::new(AtomicU64::new(0));
-        let mut w = FrameWriter::new(
+        let mut w = BlockWriter::new(
             16 * 1024,
             32 * 1024,
             1024 * 1024,
@@ -565,7 +566,7 @@ mod tests {
     async fn budget_returns_on_writer_drop_mid_stream() {
         let budget = ByteBudget::new(32 * 1024);
         let calls = Arc::new(AtomicU64::new(0));
-        let mut w = FrameWriter::new(
+        let mut w = BlockWriter::new(
             8 * 1024,
             16 * 1024,
             1024 * 1024,
@@ -586,7 +587,7 @@ mod tests {
         let frame = 16 * 1024;
         let budget = ByteBudget::new(2 * frame);
         let calls = Arc::new(AtomicU64::new(0));
-        let mut w = FrameWriter::new(
+        let mut w = BlockWriter::new(
             frame,
             64 * 1024,
             1024 * 1024,
@@ -620,7 +621,7 @@ mod tests {
             let budget = budget.clone();
             joins.push(tokio::spawn(async move {
                 let calls = Arc::new(AtomicU64::new(0));
-                let mut w = FrameWriter::new(
+                let mut w = BlockWriter::new(
                     frame,
                     256 * 1024,
                     8 * 1024 * 1024,
@@ -653,7 +654,7 @@ mod tests {
         .await;
         assert!(
             result.is_ok(),
-            "64 parallel 8 MiB writers under 4*frame_size budget timed out"
+            "64 parallel 8 MiB writers under 4*block_size budget timed out"
         );
         assert_eq!(budget.available_permits(), budget.capacity());
     }

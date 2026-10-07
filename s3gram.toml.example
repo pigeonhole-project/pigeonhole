@@ -39,14 +39,14 @@ interval_secs = 300
 
 [chunk]
 # Max on-wire chunk size in bytes (Telegram getFile < 20 MiB). Default 19 MiB.
-# Max on-wire document size. With codec zstd/gzip, independent 1 MiB frames are
+# Max on-wire document size. With codec zstd/gzip, independent 1 MiB blocks are
 # packed until this size (or 256 MiB logical) is reached.
 size = 19922944
 # Encoding policy for new uploads: "raw" | "gzip" | "zstd" (default zstd).
-# Compressing policies store chunks as codec "frames" (see chunk_frames table).
+# Compressing policies store chunks as codec "blocks" (see chunk_blocks table).
 codec = "zstd"
-# Logical frame size for frame packing (default 1 MiB).
-frame_size = 1048576
+# Logical block size for block packing (default 1 MiB). Legacy key: frame_size.
+block_size = 1048576
 
 [ingest]
 # Process-wide cap on ingest buffers across concurrent PUTs (default 256 MiB).
@@ -65,7 +65,7 @@ download_concurrency = 8
 # Legacy aliases (map to send_*): rate_per_sec, rate_burst
 
 [cache]
-# L0 (Telegram file_path) + L1 frames + L2 compressed blobs.
+# L0 (Telegram file_path) + L1 blocks + L2 compressed blobs.
 enabled = true
 # L2 in-memory capacity (bytes).
 memory_bytes = 268435456
@@ -73,9 +73,9 @@ memory_bytes = 268435456
 disk_path = ""
 # Required when disk_path is set (do not rely on foyer free-space defaults).
 # disk_bytes = 1073741824
-# L1 unpacked-frame memory budget.
-frame_memory_bytes = 134217728
-readahead_frames = 2
+# L1 unpacked-block memory budget. Legacy keys: frame_memory_bytes, readahead_frames.
+block_memory_bytes = 134217728
+readahead_blocks = 2
 write_through = true
 # Blobs larger than this are not admitted to L2 disk.
 max_object_bytes = 20971520

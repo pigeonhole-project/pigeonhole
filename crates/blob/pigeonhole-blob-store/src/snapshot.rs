@@ -725,7 +725,7 @@ mod tests {
         let idx_url = format!("sqlite:{}?mode=rwc", dir.path().join("s3.db").display());
         let db = crate::BlobDb::connect(&blob_url).await.unwrap();
         let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
-        opts.frame_size = 64 * 1024;
+        opts.block_size = 64 * 1024;
         let layer = BlobLayer::open(db, MemoryBlobStore::new(), opts)
             .await
             .unwrap();
