@@ -13,7 +13,13 @@ pub use backend::{bytes_stream, collect_stream, slice_range, BoxByteStream};
 pub use bootstrap::BootstrapPointer;
 pub use cache::CacheConfig;
 pub use erase::{erase, erase_sweep, DynBlobBackend, DynSweep, Erased, ErasedSweep, SharedBackend};
-pub use metrics::{spawn_metrics_logger, BackendMetrics};
+pub use metrics::{
+    describe_metrics, inflight_dec, inflight_inc, record_429, record_bytes_from_backend,
+    record_bytes_to_clients, record_cache, record_compression_ratio, record_gateway_request,
+    record_ingest_budget_wait, record_instance_call, record_limiter_wait, record_parts_per_chunk,
+    record_repair, record_replica_selected, record_sweep, set_checkpoint_age, set_repair_queue_depth,
+    set_superblock_age, MetricsBackend,
+};
 pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
 pub use rate_limit::{ChatLimiter, ChatLimiterConfig, LimitBudget};
 pub use replicated::{

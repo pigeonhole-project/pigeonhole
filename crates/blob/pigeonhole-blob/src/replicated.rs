@@ -307,6 +307,11 @@ impl Replicated {
             })
             .collect();
         let order = self.selector.rank(replicas, &costs);
+        if let Some(&first) = order.first() {
+            if let Some(r) = replicas.get(first) {
+                crate::metrics::record_replica_selected(&r.instance);
+            }
+        }
 
         let state = ReadState {
             backends: self.by_id.clone(),
@@ -434,6 +439,7 @@ impl ChunkReplicaWriter {
         let mut ok = Vec::new();
         for w in self.writers {
             if !w.failed {
+                crate::metrics::record_parts_per_chunk(&w.instance, w.parts.len());
                 ok.push(ReplicaLayout {
                     instance: w.instance,
                     parts: w.parts,

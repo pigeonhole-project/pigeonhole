@@ -97,7 +97,8 @@ impl TokenBucket {
         }
     }
 
-    async fn acquire(&self) {
+    async fn acquire(&self) -> Duration {
+        let started = Instant::now();
         loop {
             let action = {
                 let mut st = self.state.lock().unwrap();
@@ -126,7 +127,7 @@ impl TokenBucket {
                 }
             };
             match action {
-                Ok(()) => return,
+                Ok(()) => return started.elapsed(),
                 Err(d) => {
                     tokio::select! {
                         _ = tokio::time::sleep(d) => {}
@@ -204,7 +205,8 @@ impl ChatLimiter {
 
     /// `sendDocument` / `sendMessage` / pin / unpin.
     pub async fn acquire_send(&self) {
-        self.send.acquire().await;
+        let waited = self.send.acquire().await;
+        crate::metrics::record_limiter_wait("send", waited);
     }
 
     pub fn penalize_send(&self, retry_after: Duration) {
@@ -214,7 +216,8 @@ impl ChatLimiter {
 
     /// `getFile` only (not the CDN byte stream).
     pub async fn acquire_get_file(&self) {
-        self.get_file.acquire().await;
+        let waited = self.get_file.acquire().await;
+        crate::metrics::record_limiter_wait("get_file", waited);
     }
 
     pub fn penalize_get_file(&self, retry_after: Duration) {
@@ -224,7 +227,8 @@ impl ChatLimiter {
 
     /// `deleteMessage`.
     pub async fn acquire_delete(&self) {
-        self.delete.acquire().await;
+        let waited = self.delete.acquire().await;
+        crate::metrics::record_limiter_wait("delete", waited);
     }
 
     pub fn penalize_delete(&self, retry_after: Duration) {

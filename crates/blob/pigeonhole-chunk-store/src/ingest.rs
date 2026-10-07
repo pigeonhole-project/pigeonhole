@@ -145,8 +145,14 @@ pub fn encode_chunk(logical: Bytes, policy: ChunkCodec) -> (Bytes, ChunkCodec) {
     }
     let fc = policy.block_codec();
     match compress_slice(&logical, fc) {
-        Ok(c) if c.len() < logical.len() => (Bytes::from(c), fc),
-        _ => (logical, ChunkCodec::Raw),
+        Ok(c) if c.len() < logical.len() => {
+            pigeonhole_blob::record_compression_ratio(c.len(), logical.len());
+            (Bytes::from(c), fc)
+        }
+        _ => {
+            pigeonhole_blob::record_compression_ratio(logical.len(), logical.len());
+            (logical, ChunkCodec::Raw)
+        }
     }
 }
 

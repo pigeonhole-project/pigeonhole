@@ -12,7 +12,9 @@ pub mod repair;
 pub mod sweep;
 
 pub use blob_db::{BlobDb, StoredBlock};
-pub use config::{BackendKind, BytestreamSettings, Config, HttpSettings, PlacementConfig};
+pub use config::{
+    BackendKind, BytestreamSettings, Config, HttpSettings, MetricsSettings, PlacementConfig,
+};
 pub use durability::{
     commit_root, start_or_restore, CheckpointPayload, Durability, JournalOp, PinTarget,
     Superblock,

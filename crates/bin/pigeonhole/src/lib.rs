@@ -1,6 +1,9 @@
 //! Pigeonhole binary facade: re-exports used by tests and scripts.
 
+pub mod gateway_metrics;
 pub mod http_timeout;
+#[cfg(feature = "metrics-prometheus")]
+pub mod prometheus;
 
 pub use pigeonhole_blob as storage;
 pub use pigeonhole_codec as chunker;

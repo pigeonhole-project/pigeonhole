@@ -67,7 +67,27 @@ pub struct Config {
     pub sweep: SweepConfig,
     /// Stage I repair / backfill (`[repair]`).
     pub repair: RepairConfig,
+    /// Prometheus scrape endpoint (`[metrics]`); off by default.
+    pub metrics: MetricsSettings,
     pub config_path: PathBuf,
+}
+
+/// Optional Prometheus metrics exporter (`[metrics]`).
+#[derive(Clone, Debug)]
+pub struct MetricsSettings {
+    /// When false (default), no recorder / `/metrics` route is installed.
+    pub enabled: bool,
+    /// Optional dedicated listen address. Empty = `GET /metrics` on the main HTTP server.
+    pub listen_addr: Option<String>,
+}
+
+impl Default for MetricsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: None,
+        }
+    }
 }
 
 /// Axum/tower HTTP server knobs.
@@ -273,6 +293,7 @@ impl Config {
             placement,
             sweep: file.sweep.into_sweep_config(),
             repair: file.repair.into_repair_config(),
+            metrics: file.metrics.into_settings(),
             config_path,
         })
     }
@@ -323,6 +344,7 @@ impl Config {
             },
             sweep: SweepConfig::default(),
             repair: RepairConfig::default(),
+            metrics: MetricsSettings::default(),
             config_path: PathBuf::from("(test)"),
         }
     }
@@ -395,6 +417,8 @@ struct FileConfig {
     sweep: FileSweep,
     #[serde(default)]
     repair: FileRepair,
+    #[serde(default)]
+    metrics: FileMetrics,
 }
 
 impl Default for FileConfig {
@@ -418,6 +442,37 @@ impl Default for FileConfig {
             placement: None,
             sweep: FileSweep::default(),
             repair: FileRepair::default(),
+            metrics: FileMetrics::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct FileMetrics {
+    enabled: bool,
+    /// Empty / omitted → scrape on the main listen address at `GET /metrics`.
+    listen_addr: Option<String>,
+}
+
+impl Default for FileMetrics {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: None,
+        }
+    }
+}
+
+impl FileMetrics {
+    fn into_settings(self) -> MetricsSettings {
+        let listen_addr = self
+            .listen_addr
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        MetricsSettings {
+            enabled: self.enabled,
+            listen_addr,
         }
     }
 }

@@ -127,3 +127,10 @@ headers_timeout_secs = 300
 max_concurrent_requests = 256
 # Reject requests with more headers than this (431).
 max_headers = 100
+
+# Prometheus scrape (requires binary feature `metrics-prometheus`, on by default).
+[metrics]
+enabled = false
+# Empty = serve GET /metrics on listen_addr. Set e.g. "127.0.0.1:9090" for a
+# dedicated scrape port.
+# listen_addr = ""

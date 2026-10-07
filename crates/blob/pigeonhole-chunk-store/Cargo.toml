@@ -19,6 +19,7 @@ md-5 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+metrics = { workspace = true }
 moka = { workspace = true }
 pigeonhole-blob = { workspace = true }
 pigeonhole-codec = { workspace = true }

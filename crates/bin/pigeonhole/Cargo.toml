@@ -38,11 +38,14 @@ http-body = { workspace = true }
 pin-project-lite = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [features]
-default = ["discord"]
+default = ["discord", "metrics-prometheus"]
 discord = ["dep:pigeonhole-storage-discord"]
 bytestream = ["dep:pigeonhole-gateway-bytestream"]
+metrics-prometheus = ["dep:metrics-exporter-prometheus"]
 
 [dev-dependencies]
 bytes = { workspace = true }

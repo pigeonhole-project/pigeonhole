@@ -9,6 +9,7 @@ description = "Chunk codecs and frame packing for pigeonhole"
 anyhow = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
+metrics = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -140,12 +140,18 @@ impl ByteBudget {
                 self.capacity
             );
         }
+        let t0 = std::time::Instant::now();
         let permit = self
             .sem
             .clone()
             .acquire_many_owned(n as u32)
             .await
             .context("ingest memory budget closed")?;
+        let waited = t0.elapsed();
+        if !waited.is_zero() {
+            metrics::histogram!("pigeonhole_ingest_budget_wait_seconds")
+                .record(waited.as_secs_f64());
+        }
         // Manage accounting ourselves so we can release_excess on short frames.
         permit.forget();
         Ok(BudgetPermit {

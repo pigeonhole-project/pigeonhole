@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use moka::future::Cache;
+use pigeonhole_blob::record_cache;
 use pigeonhole_types::BlobKey;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,8 +75,10 @@ impl BlockCache {
         };
         if self.cache.contains_key(&key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
+            record_cache("l1", "hit");
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
+            record_cache("l1", "miss");
         }
         let collapsed = Arc::new(AtomicU64::new(0));
         let c = collapsed.clone();
@@ -90,6 +93,7 @@ impl BlockCache {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if collapsed.load(Ordering::Relaxed) == 0 {
             self.collapsed.fetch_add(1, Ordering::Relaxed);
+            record_cache("l1", "collapsed");
         } else {
             let mut map = by_blob.lock().unwrap();
             map.entry(blob).or_default().push(block_no);

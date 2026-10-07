@@ -148,6 +148,9 @@ impl Sweeper {
             tokio::time::sleep(period).await;
             match self.sweep_once().await {
                 Ok(stats) => {
+                    pigeonhole_blob::record_sweep("deleted", stats.keys_deleted);
+                    pigeonhole_blob::record_sweep("skipped_live", stats.keys_skipped_live);
+                    pigeonhole_blob::record_sweep("zero_ref", stats.zero_ref_chunks);
                     if stats.keys_deleted > 0 || stats.zero_ref_chunks > 0 {
                         info!(
                             zero_ref_chunks = stats.zero_ref_chunks,

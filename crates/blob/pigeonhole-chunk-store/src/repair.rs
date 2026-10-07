@@ -74,6 +74,14 @@ impl Repairer {
         loop {
             match self.repair_once().await {
                 Ok(stats) => {
+                    pigeonhole_blob::record_repair("repaired", stats.repaired);
+                    pigeonhole_blob::record_repair("scrub_enqueued", stats.scrub_enqueued);
+                    pigeonhole_blob::record_repair("skipped_budget", stats.skipped_budget);
+                    pigeonhole_blob::record_repair("skipped_noop", stats.skipped_noop);
+                    pigeonhole_blob::record_repair("failed", stats.failed);
+                    if let Ok(depth) = self.db.repair_queue_len().await {
+                        pigeonhole_blob::set_repair_queue_depth(depth);
+                    }
                     if stats.repaired > 0 || stats.scrub_enqueued > 0 || stats.failed > 0 {
                         info!(
                             repaired = stats.repaired,

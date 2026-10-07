@@ -534,6 +534,7 @@ impl ChunkStore {
         })
         .await
         .context("spawn_blocking encode")??;
+        pigeonhole_blob::record_compression_ratio(stored.len(), logical_len);
 
         // Memory budget: hold open parts of all members + this block until pushed.
         if let Some(b) = budget {

@@ -3,14 +3,15 @@ use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
 use axum::Router;
 use pigeonhole::config::Config;
+use pigeonhole::gateway_metrics::track_gateway;
 use pigeonhole::http_timeout::with_http_timeouts;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::telegram::{TelegramBlobStore, TelegramClient};
 use pigeonhole::{build_s3_service, build_s3gram};
 use pigeonhole_blob::{
-    erase_sweep, spawn_metrics_logger, BackendMetrics, CheapestFirst, InstanceKind, Replicated,
-    SharedBackend, TypedBootstrapPointer,
+    erase_sweep, set_checkpoint_age, set_superblock_age, CheapestFirst, InstanceKind,
+    MetricsBackend, Replicated, SharedBackend, TypedBootstrapPointer,
 };
 use pigeonhole_chunk_store::{
     check_fingerprints, legacy_index_has_blobs, migrate_index_to_blob_db, start_or_restore,
@@ -152,8 +153,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
         });
     }
 
-    let metrics = Arc::new(BackendMetrics::default());
-    spawn_metrics_logger(metrics, cfg.cache.metrics_interval_secs);
+    let metrics_on_main = setup_metrics(&cfg)?;
 
     let max_headers = cfg.http.max_headers;
     let s3_service = build_s3_service(s3gram, &cfg.access_key, &cfg.secret_key);
@@ -161,11 +161,21 @@ async fn cmd_serve() -> anyhow::Result<()> {
     let body_idle = Duration::from_secs(cfg.http.request_timeout_secs);
     let headers_timeout = Duration::from_secs(cfg.http.headers_timeout_secs);
     let concurrency = cfg.http.max_concurrent_requests;
-    let app = Router::new()
+    let mut app = Router::new();
+    #[cfg(feature = "metrics-prometheus")]
+    if metrics_on_main {
+        app = pigeonhole::prometheus::layer_metrics_route(app);
+    }
+    #[cfg(not(feature = "metrics-prometheus"))]
+    let _ = metrics_on_main;
+    let app = app
         .fallback_service(s3_service)
         .layer(axum::middleware::from_fn(move |req, next| {
             let max = max_headers;
             async move { limit_request_headers(max, req, next).await }
+        }))
+        .layer(axum::middleware::from_fn(|req, next| {
+            track_gateway("s3", req, next)
         }));
     let app = with_http_timeouts(app, headers_timeout, body_idle, concurrency);
 
@@ -183,6 +193,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
         chunk_size = cfg.chunk_size,
         chunk_codec = %cfg.chunk_codec,
         bytestream = cfg.bytestream.enabled,
+        metrics = cfg.metrics.enabled,
         body_idle_timeout_secs = cfg.http.request_timeout_secs,
         headers_timeout_secs = cfg.http.headers_timeout_secs,
         max_concurrent = cfg.http.max_concurrent_requests,
@@ -191,6 +202,32 @@ async fn cmd_serve() -> anyhow::Result<()> {
     );
     axum::serve(listener, app).await.context("serve")?;
     Ok(())
+}
+
+/// Returns true when `/metrics` should be mounted on the main HTTP router.
+fn setup_metrics(cfg: &Config) -> anyhow::Result<bool> {
+    if !cfg.metrics.enabled {
+        return Ok(false);
+    }
+    #[cfg(feature = "metrics-prometheus")]
+    {
+        pigeonhole::prometheus::install_recorder()?;
+        match &cfg.metrics.listen_addr {
+            Some(addr) => {
+                let sock: std::net::SocketAddr = addr
+                    .parse()
+                    .with_context(|| format!("parse metrics.listen_addr {addr}"))?;
+                pigeonhole::prometheus::spawn_dedicated_listener(sock);
+                Ok(false)
+            }
+            None => Ok(true),
+        }
+    }
+    #[cfg(not(feature = "metrics-prometheus"))]
+    {
+        warn!("[metrics] enabled but binary built without feature metrics-prometheus");
+        Ok(false)
+    }
 }
 
 fn spawn_background_tasks(
@@ -275,6 +312,22 @@ fn spawn_background_tasks(
         scrub = cfg.repair.scrub,
         "repair background task started"
     );
+
+    if cfg.metrics.enabled {
+        let dur = rt.durability.clone();
+        tokio::spawn(async move {
+            let period = Duration::from_secs(15);
+            loop {
+                tokio::time::sleep(period).await;
+                if let Some(age) = dur.superblock_age().await {
+                    set_superblock_age(age);
+                }
+                if let Some(age) = dur.checkpoint_age().await {
+                    set_checkpoint_age(age);
+                }
+            }
+        });
+    }
 }
 
 async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
@@ -351,11 +404,11 @@ async fn build_placement(
                     MemoryBlobStore::new().with_instance_info(inst.info.clone()),
                 );
                 let pin: Arc<dyn TypedBootstrapPointer> = mem.clone();
-                let backend = WatermarkBackend::wrap(
+                let backend = MetricsBackend::wrap(WatermarkBackend::wrap(
                     Arc::new(erase_sweep(mem)),
                     blob_db.clone(),
                     grace,
-                );
+                ));
                 pins.push(PinTarget {
                     instance_id: inst.info.id.clone(),
                     fingerprint: inst.info.fingerprint.clone(),
@@ -376,11 +429,11 @@ async fn build_placement(
                     inst.info.clone(),
                 ));
                 let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
-                let backend = WatermarkBackend::wrap(
+                let backend = MetricsBackend::wrap(WatermarkBackend::wrap(
                     Arc::new(erase_sweep(store)),
                     blob_db.clone(),
                     grace,
-                );
+                ));
                 pins.push(PinTarget {
                     instance_id: inst.info.id.clone(),
                     fingerprint: inst.info.fingerprint.clone(),
@@ -405,11 +458,11 @@ async fn build_placement(
                         inst.info.clone(),
                     ));
                     let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
-                    let backend = WatermarkBackend::wrap(
+                    let backend = MetricsBackend::wrap(WatermarkBackend::wrap(
                         Arc::new(erase_sweep(store)),
                         blob_db.clone(),
                         grace,
-                    );
+                    ));
                     pins.push(PinTarget {
                         instance_id: inst.info.id.clone(),
                         fingerprint: inst.info.fingerprint.clone(),

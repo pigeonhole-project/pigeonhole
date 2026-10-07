@@ -407,6 +407,10 @@ pub struct Durability {
     pending: Mutex<Vec<JournalOp>>,
     /// Last sealed superblock (local view).
     current: Mutex<Superblock>,
+    /// When the last superblock was published (for age gauges).
+    last_superblock_at: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// When the last full checkpoint completed.
+    last_checkpoint_at: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Durability {
@@ -447,7 +451,25 @@ impl Durability {
             pins,
             pending: Mutex::new(Vec::new()),
             current: Mutex::new(genesis),
+            last_superblock_at: tokio::sync::Mutex::new(None),
+            last_checkpoint_at: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Age of the last published superblock, if any.
+    pub async fn superblock_age(&self) -> Option<std::time::Duration> {
+        self.last_superblock_at
+            .lock()
+            .await
+            .map(|t| t.elapsed())
+    }
+
+    /// Age of the last full checkpoint, if any.
+    pub async fn checkpoint_age(&self) -> Option<std::time::Duration> {
+        self.last_checkpoint_at
+            .lock()
+            .await
+            .map(|t| t.elapsed())
     }
 
     pub async fn enqueue(&self, op: JournalOp) {
@@ -561,6 +583,7 @@ impl Durability {
             sb.seal()?
         };
         self.publish_all(sealed).await?;
+        *self.last_checkpoint_at.lock().await = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -655,6 +678,7 @@ impl Durability {
                 .await
                 .with_context(|| format!("publish superblock to {}", pin.instance_id))?;
         }
+        *self.last_superblock_at.lock().await = Some(std::time::Instant::now());
         Ok(())
     }
 
