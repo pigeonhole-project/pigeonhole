@@ -1,7 +1,9 @@
 use crate::instances::{
     legacy_default_instance, resolve_instances, FileInstance, InstanceConfig,
 };
-use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind};
+use pigeonhole_blob::{
+    CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind, InstanceRole,
+};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
 use anyhow::{bail, Context, Result};
@@ -11,6 +13,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::warn;
+
+/// Placement group: which instances receive chunk replicas and the write quorum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementConfig {
+    /// Instance ids in the write group (read-write members).
+    pub group: Vec<String>,
+    pub write_quorum: usize,
+}
 
 /// Which chat blob backend backs non-memory mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +56,8 @@ pub struct Config {
     pub http: HttpSettings,
     /// Resolved backend instances (`[[instances]]` or legacy single default).
     pub instances: Vec<InstanceConfig>,
+    /// Replica placement (`[placement]`); defaults to a single read-write instance.
+    pub placement: PlacementConfig,
     pub config_path: PathBuf,
 }
 
@@ -221,6 +233,8 @@ impl Config {
             )?]
         };
 
+        let placement = resolve_placement(file.placement, &instances)?;
+
         Ok(Self {
             backend_kind,
             bot_token,
@@ -242,6 +256,7 @@ impl Config {
             bytestream: file.bytestream.into_settings(),
             http: file.http.into_settings(),
             instances,
+            placement,
             config_path,
         })
     }
@@ -286,6 +301,10 @@ impl Config {
                 "",
             )
             .expect("memory instance")],
+            placement: PlacementConfig {
+                group: vec!["default".into()],
+                write_quorum: 1,
+            },
             config_path: PathBuf::from("(test)"),
         }
     }
@@ -334,6 +353,8 @@ struct FileConfig {
     http: FileHttp,
     #[serde(default)]
     instances: Vec<FileInstance>,
+    #[serde(default)]
+    placement: Option<FilePlacement>,
 }
 
 impl Default for FileConfig {
@@ -354,6 +375,75 @@ impl Default for FileConfig {
             bytestream: FileBytestream::default(),
             http: FileHttp::default(),
             instances: Vec::new(),
+            placement: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FilePlacement {
+    group: Vec<String>,
+    write_quorum: usize,
+}
+
+fn resolve_placement(
+    raw: Option<FilePlacement>,
+    instances: &[InstanceConfig],
+) -> Result<PlacementConfig> {
+    match raw {
+        None => {
+            // Without [placement]: single read-write instance group.
+            let rw: Vec<&InstanceConfig> = instances
+                .iter()
+                .filter(|i| i.info.role == InstanceRole::ReadWrite)
+                .collect();
+            let chosen = match rw.as_slice() {
+                [] => bail!("placement: no read-write instance available"),
+                [one] => one,
+                many => {
+                    // Prefer the legacy `default` id when present; else first RW.
+                    many.iter()
+                        .find(|i| i.info.id == "default")
+                        .copied()
+                        .unwrap_or(many[0])
+                }
+            };
+            Ok(PlacementConfig {
+                group: vec![chosen.info.id.clone()],
+                write_quorum: 1,
+            })
+        }
+        Some(p) => {
+            if p.group.is_empty() {
+                bail!("placement.group must not be empty");
+            }
+            if p.write_quorum == 0 || p.write_quorum > p.group.len() {
+                bail!(
+                    "placement.write_quorum {} out of range for group of {}",
+                    p.write_quorum,
+                    p.group.len()
+                );
+            }
+            let known: std::collections::HashSet<&str> =
+                instances.iter().map(|i| i.info.id.as_str()).collect();
+            for id in &p.group {
+                if !known.contains(id.as_str()) {
+                    bail!("placement.group references unknown instance {id:?}");
+                }
+            }
+            for id in &p.group {
+                let inst = instances.iter().find(|i| i.info.id == *id).unwrap();
+                if inst.info.role != InstanceRole::ReadWrite {
+                    bail!(
+                        "placement.group member {id:?} is {:?}; write group requires read-write",
+                        inst.info.role
+                    );
+                }
+            }
+            Ok(PlacementConfig {
+                group: p.group,
+                write_quorum: p.write_quorum,
+            })
         }
     }
 }
@@ -688,6 +778,71 @@ upload_concurrency = 4
         assert_eq!(cfg.tg.send_rate_per_sec, 1.0);
         assert_eq!(cfg.tg.get_file_rate_per_sec, 20.0);
         assert_eq!(cfg.tg.upload_concurrency, 4);
+        assert_eq!(cfg.placement.group, vec!["default".to_string()]);
+        assert_eq!(cfg.placement.write_quorum, 1);
+    }
+
+    #[test]
+    fn parses_placement_section() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"
+memory = true
+[[instances]]
+id = "mem-a"
+kind = "memory"
+role = "read-write"
+[placement]
+group = ["mem-a"]
+write_quorum = 1
+"#
+        )
+        .unwrap();
+        let cfg = Config::load_from_path(f.path()).unwrap();
+        assert_eq!(cfg.placement.group, vec!["mem-a".to_string()]);
+        assert_eq!(cfg.placement.write_quorum, 1);
+    }
+
+    #[test]
+    fn resolve_placement_group_and_quorum() {
+        use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole};
+        let instances = vec![
+            InstanceConfig {
+                info: InstanceInfo {
+                    id: "a".into(),
+                    kind: InstanceKind::Memory,
+                    fingerprint: "memory:a".into(),
+                    location: "memory:a".into(),
+                    role: InstanceRole::ReadWrite,
+                },
+                bot_token_env: String::new(),
+                bot_token: String::new(),
+                scope_id: "a".into(),
+            },
+            InstanceConfig {
+                info: InstanceInfo {
+                    id: "b".into(),
+                    kind: InstanceKind::Memory,
+                    fingerprint: "memory:b".into(),
+                    location: "memory:b".into(),
+                    role: InstanceRole::ReadWrite,
+                },
+                bot_token_env: String::new(),
+                bot_token: String::new(),
+                scope_id: "b".into(),
+            },
+        ];
+        let p = resolve_placement(
+            Some(FilePlacement {
+                group: vec!["a".into(), "b".into()],
+                write_quorum: 2,
+            }),
+            &instances,
+        )
+        .unwrap();
+        assert_eq!(p.group, vec!["a", "b"]);
+        assert_eq!(p.write_quorum, 2);
     }
 
     #[test]

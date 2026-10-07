@@ -12,7 +12,7 @@ pub mod read;
 pub mod snapshot;
 
 pub use blob_db::BlobDb;
-pub use config::{BackendKind, BytestreamSettings, Config, HttpSettings};
+pub use config::{BackendKind, BytestreamSettings, Config, HttpSettings, PlacementConfig};
 pub use durability::{
     commit_root, start_or_restore, CheckpointPayload, Durability, JournalOp, Superblock,
 };

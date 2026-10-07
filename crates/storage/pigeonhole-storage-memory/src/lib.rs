@@ -41,9 +41,14 @@ pub type MemoryBackend = MemoryBlobStore;
 
 impl MemoryBlobStore {
     pub fn new() -> Self {
+        Self::with_limits(BackendLimits::memory())
+    }
+
+    /// In-memory store with a custom blob size limit (tests / multi-instance groups).
+    pub fn with_limits(limits: BackendLimits) -> Self {
         Self {
             id: BackendId::memory(),
-            limits: BackendLimits::memory(),
+            limits,
             instance: InstanceInfo {
                 id: "memory".into(),
                 kind: InstanceKind::Memory,
@@ -57,6 +62,15 @@ impl MemoryBlobStore {
             messages: Mutex::new(HashMap::new()),
             pin: Mutex::new(None),
         }
+    }
+
+    /// Override stable instance id (for multi-member Replicated tests).
+    pub fn with_instance_id(mut self, id: impl Into<String>) -> Self {
+        let id = id.into();
+        self.instance.id = id.clone();
+        self.instance.fingerprint = format!("memory:{id}");
+        self.instance.location = format!("memory:{id}");
+        self
     }
 
     pub fn len(&self) -> usize {
