@@ -3,7 +3,7 @@
 use pigeonhole_blob::{
     bytes_stream, slice_range, store_delete_message, store_get, store_put, BlobBackend, BlobStore,
     BoxByteStream, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, Sweepable,
-    TypedBlobBackend,
+    TypedBlobBackend, TypedBootstrapPointer,
 };
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -32,6 +32,8 @@ pub struct MemoryBlobStore {
     next_fid: AtomicU64,
     files: Mutex<HashMap<String, Bytes>>,
     messages: Mutex<HashMap<i64, String>>,
+    /// Bootstrap pin payload (TypedBootstrapPointer).
+    pin: Mutex<Option<Bytes>>,
 }
 
 /// Alias matching Stage 3 naming.
@@ -53,6 +55,7 @@ impl MemoryBlobStore {
             next_fid: AtomicU64::new(1),
             files: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
+            pin: Mutex::new(None),
         }
     }
 
@@ -208,6 +211,18 @@ impl Sweepable for MemoryBlobStore {
         keys.sort_unstable();
         keys.truncate(limit);
         Ok(keys)
+    }
+}
+
+#[async_trait]
+impl TypedBootstrapPointer for MemoryBlobStore {
+    async fn read(&self) -> Result<Option<Bytes>> {
+        Ok(self.pin.lock().unwrap().clone())
+    }
+
+    async fn swap(&self, new: Bytes) -> Result<()> {
+        *self.pin.lock().unwrap() = Some(new);
+        Ok(())
     }
 }
 
