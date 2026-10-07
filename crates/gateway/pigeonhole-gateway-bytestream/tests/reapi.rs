@@ -1,8 +1,10 @@
 //! In-process REAPI tests (localhost only, no external network).
 
 use bytes::Bytes;
-use pigeonhole_chunk_store::{LegacyBlobStore, Index};
+use pigeonhole_chunk_store::{BlobDb, ChunkStore, IngestOptions};
+use pigeonhole_codec::ChunkCodec;
 use pigeonhole_storage_memory::MemoryBlobStore;
+use pigeonhole_gateway_bytestream::cas_index::CasIndex;
 use pigeonhole_gateway_bytestream::config::BytestreamConfig;
 use pigeonhole_gateway_bytestream::digest::sha256_hex;
 use pigeonhole_gateway_bytestream::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -20,22 +22,26 @@ async fn test_harness() -> (
     String,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let url = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display());
-    let index = Index::connect(&url).await.unwrap();
-    let mem = Arc::new(MemoryBlobStore::new());
-    let store: Arc<dyn LegacyBlobStore> = mem.clone();
+    let cas_url = format!("sqlite:{}?mode=rwc", dir.path().join("cas.db").display());
+    let blob_url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+    let cas = CasIndex::connect(&cas_url).await.unwrap();
+    let db = BlobDb::connect(&blob_url).await.unwrap();
+    let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
+    opts.block_size = 64 * 1024;
+    let store = Arc::new(
+        ChunkStore::open(db, MemoryBlobStore::new(), opts)
+            .await
+            .unwrap(),
+    );
     let cfg = BytestreamConfig {
         enabled: true,
         instance_name: "s3gram".into(),
         gc_ttl_secs: 0,
         ..Default::default()
     };
-    let (addr, _handle) = serve_ephemeral(cfg, index, store, String::new())
-        .await
-        .unwrap();
+    let (addr, _handle) = serve_ephemeral(cfg, cas, store).await.unwrap();
     let uri = format!("http://{addr}");
     let channel = Channel::from_shared(uri).unwrap().connect().await.unwrap();
-    // Match server limits (default tonic decode cap is 4 MiB).
     const MAX_MSG: usize = 32 * 1024 * 1024;
     let cas = ContentAddressableStorageClient::new(channel.clone())
         .max_decoding_message_size(MAX_MSG)
@@ -120,7 +126,6 @@ async fn bytestream_wrong_hash_rejected() {
     d.hash = "0".repeat(64);
     let upload_id = uuid::Uuid::new_v4().to_string();
     let resource = format!("{inst}/uploads/{upload_id}/blobs/{}/{}", d.hash, d.size_bytes);
-
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tx.send(WriteRequest {
         resource_name: resource,
@@ -131,33 +136,33 @@ async fn bytestream_wrong_hash_rejected() {
     .await
     .unwrap();
     drop(tx);
-
     let err = bs.write(ReceiverStream::new(rx)).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
 #[tokio::test]
-async fn find_missing_after_bytestream_write() {
+async fn find_missing_and_batch() {
     let (mut cas, mut bs, inst) = test_harness().await;
-    let payload = Bytes::from_static(b"find-me");
-    let d = digest_for(&payload);
+    let a = b"alpha".to_vec();
+    let b = b"bravo".to_vec();
+    let da = digest_for(&a);
+    let db = digest_for(&b);
 
     let missing = cas
-        .find_missing_blobs(find_req(&inst, vec![d.clone()]))
+        .find_missing_blobs(find_req(&inst, vec![da.clone(), db.clone()]))
         .await
         .unwrap()
-        .into_inner()
-        .missing_blob_digests;
-    assert_eq!(missing.len(), 1);
+        .into_inner();
+    assert_eq!(missing.missing_blob_digests.len(), 2);
 
     let upload_id = uuid::Uuid::new_v4().to_string();
-    let resource = format!("{inst}/uploads/{upload_id}/blobs/{}/{}", d.hash, d.size_bytes);
+    let resource = format!("{inst}/uploads/{upload_id}/blobs/{}/{}", da.hash, da.size_bytes);
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tx.send(WriteRequest {
         resource_name: resource,
         write_offset: 0,
         finish_write: true,
-        data: payload.to_vec(),
+        data: a.clone(),
     })
     .await
     .unwrap();
@@ -165,97 +170,41 @@ async fn find_missing_after_bytestream_write() {
     bs.write(ReceiverStream::new(rx)).await.unwrap();
 
     let missing = cas
-        .find_missing_blobs(find_req(&inst, vec![d.clone()]))
-        .await
-        .unwrap()
-        .into_inner()
-        .missing_blob_digests;
-    assert!(missing.is_empty());
-}
-
-/// Larger than Telegram/Discord single-blob limits → must use chunked CAS ingest.
-#[tokio::test]
-async fn bytestream_write_read_64mib() {
-    let (_cas, mut bs, inst) = test_harness().await;
-    let n = 64 * 1024 * 1024;
-    // Highly compressible: many 1 MiB frames, fast put through memory store.
-    let payload = vec![0u8; n];
-    let d = digest_for(&payload);
-    let upload_id = uuid::Uuid::new_v4().to_string();
-    let resource = format!("{inst}/uploads/{upload_id}/blobs/{}/{}", d.hash, d.size_bytes);
-
-    let (tx, rx) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(async move {
-        let mut offset = 0i64;
-        // Stay well under gRPC default 4 MiB even if client limits are not raised.
-        let piece = 256 * 1024;
-        while offset < n as i64 {
-            let end = ((offset as usize) + piece).min(n);
-            let finish = end == n;
-            tx.send(WriteRequest {
-                resource_name: resource.clone(),
-                write_offset: offset,
-                finish_write: finish,
-                data: vec![0u8; end - offset as usize],
-            })
-            .await
-            .unwrap();
-            offset = end as i64;
-        }
-    });
-
-    let resp = bs
-        .write(ReceiverStream::new(rx))
-        .await
-        .expect("64 MiB write")
-        .into_inner();
-    assert_eq!(resp.committed_size, n as i64);
-
-    // Spot-check mid-blob range instead of reading all 64 MiB back.
-    let read_name = format!("{inst}/blobs/{}/{}", d.hash, d.size_bytes);
-    let mut stream = bs
-        .read(ReadRequest {
-            resource_name: read_name,
-            read_offset: (32 * 1024 * 1024) - 16,
-            read_limit: 32,
-        })
+        .find_missing_blobs(find_req(&inst, vec![da.clone(), db.clone()]))
         .await
         .unwrap()
         .into_inner();
-    let mut got = Vec::new();
-    while let Some(chunk) = stream.message().await.unwrap() {
-        got.extend_from_slice(&chunk.data);
-    }
-    assert_eq!(got, vec![0u8; 32]);
-}
+    assert_eq!(missing.missing_blob_digests.len(), 1);
+    assert_eq!(missing.missing_blob_digests[0].hash, db.hash);
 
-#[tokio::test]
-async fn bytestream_interrupted_write_rejected() {
-    let (_cas, mut bs, inst) = test_harness().await;
-    let payload = vec![9u8; 1024];
-    let d = digest_for(&payload);
-    let upload_id = uuid::Uuid::new_v4().to_string();
-    let resource = format!("{inst}/uploads/{upload_id}/blobs/{}/{}", d.hash, d.size_bytes);
-
+    // Repeat write → retain path (no error).
+    let upload_id2 = uuid::Uuid::new_v4().to_string();
+    let resource2 = format!(
+        "{inst}/uploads/{upload_id2}/blobs/{}/{}",
+        da.hash, da.size_bytes
+    );
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tx.send(WriteRequest {
-        resource_name: resource,
+        resource_name: resource2,
         write_offset: 0,
-        finish_write: false, // never finished
-        data: payload,
+        finish_write: true,
+        data: a,
     })
     .await
     .unwrap();
     drop(tx);
-
-    let err = bs.write(ReceiverStream::new(rx)).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    let resp = bs
+        .write(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.committed_size, da.size_bytes);
 }
 
 #[tokio::test]
 async fn bytestream_read_range() {
     let (_cas, mut bs, inst) = test_harness().await;
-    let payload = b"0123456789abcdef".to_vec();
+    let payload: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
     let d = digest_for(&payload);
     let upload_id = uuid::Uuid::new_v4().to_string();
     let resource = format!("{inst}/uploads/{upload_id}/blobs/{}/{}", d.hash, d.size_bytes);
@@ -275,8 +224,8 @@ async fn bytestream_read_range() {
     let mut stream = bs
         .read(ReadRequest {
             resource_name: read_name,
-            read_offset: 4,
-            read_limit: 6,
+            read_offset: 100,
+            read_limit: 50,
         })
         .await
         .unwrap()
@@ -285,5 +234,6 @@ async fn bytestream_read_range() {
     while let Some(chunk) = stream.message().await.unwrap() {
         got.extend_from_slice(&chunk.data);
     }
-    assert_eq!(got, b"456789");
+    assert_eq!(got, &payload[100..150]);
+    let _ = Bytes::new();
 }

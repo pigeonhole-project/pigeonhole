@@ -1,69 +1,38 @@
-//! S3 API implementation on top of SQLite index + LegacyBlobStore (via s3s).
+//! S3 API implementation on top of gateway index + ChunkStore (via s3s).
 
-use pigeonhole_codec::ChunkCodec;
-use pigeonhole_types::{BackendId, BlobKey, Locator};
-use pigeonhole_chunk_store::config::Config;
-use pigeonhole_chunk_store::block_cache::BlockCache;
-use pigeonhole_chunk_store::ingest::{
-    decode_chunk_slice_async, ingest_stream_with_options, IngestHasher, IngestOptions,
-    UploadedChunk,
+use crate::index::{
+    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index,
 };
-use pigeonhole_chunk_store::read::read_chunk_range_cached;
-use pigeonhole_chunk_store::{
-    parse_rfc3339, store_delete_message, store_get, Chunk, DeleteBucketResult, DeleteOutcome, Index,
-    LegacyBlobStore, OrphanMsg,
-};
+use pigeonhole_chunk_store::{config::Config, ChunkStore, IngestOptions};
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
 use futures::StreamExt;
+use md5::Digest;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::{S3, S3Request, S3Response, S3Result};
-use std::collections::HashMap;
 use std::ops::Not;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{info, warn};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Mutex;
+use tracing::info;
 
-struct S3IngestHasher(s3s::checksum::ChecksumHasher);
-
-impl IngestHasher for S3IngestHasher {
-    fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-}
 
 #[derive(Clone)]
 pub struct S3gram {
     pub cfg: Config,
     pub index: Index,
-    pub store: Arc<dyn LegacyBlobStore>,
+    pub store: Arc<ChunkStore>,
     pub snapshot_gate: Arc<Mutex<()>>,
-    /// L1 unpacked-frame cache (None when `[cache] enabled = false`).
-    pub block_cache: Option<Arc<BlockCache>>,
-    /// Last exclusive end offset per object for sequential readahead detection.
-    pub(crate) sequential_ends: Arc<Mutex<HashMap<(String, String), u64>>>,
 }
 
 impl S3gram {
-    pub fn new(cfg: Config, index: Index, store: Arc<dyn LegacyBlobStore>) -> Self {
-        let block_cache = if cfg.cache.enabled {
-            Some(Arc::new(BlockCache::new(
-                cfg.cache.block_memory_bytes,
-                cfg.cache.readahead_blocks,
-            )))
-        } else {
-            None
-        };
+    pub fn new(cfg: Config, index: Index, store: Arc<ChunkStore>) -> Self {
         Self {
             cfg,
             index,
             store,
             snapshot_gate: Arc::new(Mutex::new(())),
-            block_cache,
-            sequential_ends: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -78,98 +47,28 @@ impl S3gram {
         opts
     }
 
-    async fn cleanup_orphans(&self, orphans: Vec<OrphanMsg>) {
-        let mut seen = std::collections::HashSet::new();
-        for (_chat, message_id, file_id) in orphans {
-            if !seen.insert(message_id) {
-                continue;
-            }
-            self.invalidate_caches_for_file(&file_id).await;
-            match store_delete_message(self.store.as_ref(), message_id).await {
-                Ok(DeleteOutcome::Deleted | DeleteOutcome::Gone) => {}
-                Ok(DeleteOutcome::Failed) => {
-                    let _ = self
-                        .index
-                        .queue_tg_delete(self.chat_id(), message_id)
-                        .await;
-                }
-                Err(e) => {
-                    warn!(error = %e, message_id, "orphan delete failed");
-                    let _ = self
-                        .index
-                        .queue_tg_delete(self.chat_id(), message_id)
-                        .await;
-                }
-            }
-        }
-    }
-
-    async fn invalidate_caches_for_file(&self, file_id: &str) {
-        self.store.invalidate_blob(file_id).await;
-        if let Some(fc) = &self.block_cache {
-            let key = blob_key_for_file(file_id);
-            fc.invalidate_blob(&key).await;
-        }
-    }
-
-    async fn warm_l1_frames(&self, chunks: &[UploadedChunk]) {
-        let Some(fc) = &self.block_cache else {
-            return;
-        };
-        if !self.cfg.cache.write_through {
+    async fn release_ids(&self, ids: &[i64]) {
+        if ids.is_empty() {
             return;
         }
-        for c in chunks {
-            if c.codec != ChunkCodec::Blocks || c.blocks.is_empty() {
-                continue;
-            }
-            let Ok(stored) = store_get(self.store.as_ref(), &c.file_id).await else {
-                continue;
-            };
-            let key = blob_key_for_file(&c.file_id);
-            for fr in &c.blocks {
-                let soff = fr.stored_off as usize;
-                let slen = fr.stored_len as usize;
-                if soff + slen > stored.len() {
-                    continue;
-                }
-                let slice = stored.slice(soff..soff + slen);
-                let mut rec = fr.clone();
-                rec.stored_off = 0;
-                if let Ok(decoded) = pigeonhole_codec::decode_blocks_range(
-                    slice.as_ref(),
-                    &[rec],
-                    0,
-                    fr.logical_len as usize,
-                ) {
-                    fc.insert(key.clone(), fr.block_no as u32, decoded).await;
-                }
-            }
+        if let Err(e) = self.store.release(ids).await {
+            tracing::warn!(error = %e, "chunk release failed");
         }
     }
 
-    async fn note_sequential(&self, bucket: &str, key: &str, start: u64, end_excl: u64) -> bool {
-        let mut map = self.sequential_ends.lock().await;
-        let k = (bucket.to_string(), key.to_string());
-        let readahead = match map.get(&k) {
-            None => start == 0,
-            Some(&prev) => start == prev || start == 0,
-        };
-        map.insert(k, end_excl);
-        readahead
-    }
-
-    async fn queue_pending_deletes(&self, message_ids: Vec<i64>) {
-        for message_id in message_ids {
-            let _ = self
-                .index
-                .queue_tg_delete(self.chat_id(), message_id)
-                .await;
+    async fn retain_ids(&self, ids: &[i64]) -> S3Result<()> {
+        if ids.is_empty() {
+            return Ok(());
         }
+        self.store.retain(ids).await.map_err(Self::map_err)
     }
 
     fn map_err(e: impl std::fmt::Display) -> s3s::S3Error {
         s3_error!(InternalError, "{}", e)
+    }
+
+    fn etag_of(md5: &[u8; 16]) -> String {
+        hex::encode(md5)
     }
 }
 
@@ -185,6 +84,25 @@ fn clamp_max_keys(requested: Option<i32>) -> (i64, i32) {
     let req = i64::from(requested.unwrap_or(1000));
     let clamped = req.clamp(1, 1000);
     (clamped, clamped as i32)
+}
+
+/// Wrap a byte stream so an optional S3 checksum hasher sees every frame.
+fn maybe_hash_stream<S>(
+    stream: S,
+    hasher: Option<Arc<StdMutex<s3s::checksum::ChecksumHasher>>>,
+) -> impl futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin
+where
+    S: futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
+{
+    stream.map(move |item| {
+        let b = item?;
+        if let Some(h) = &hasher {
+            if let Ok(mut guard) = h.lock() {
+                guard.update(&b);
+            }
+        }
+        Ok(b)
+    })
 }
 
 /// Parse Content-MD5 header: missing → None; empty/malformed → InvalidDigest; ok → digest.
@@ -572,156 +490,6 @@ fn apply_checksum_to_upload_part(output: &mut UploadPartOutput, c: &Checksum) {
     output.checksum_xxhash128 = c.checksum_xxhash128.clone();
 }
 
-struct ChunkSlice {
-    file_id: String,
-    codec: ChunkCodec,
-    /// Full logical size of the Telegram chunk (decode bound).
-    logical_size: usize,
-    from: usize,
-    to: usize,
-}
-
-fn plan_chunk_slices(
-    chunks: &[Chunk],
-    mut start: u64,
-    mut remaining: u64,
-) -> Vec<ChunkSlice> {
-    let mut plan = Vec::new();
-    let mut offset = 0u64;
-    for chunk in chunks {
-        if remaining == 0 {
-            break;
-        }
-        let chunk_size = chunk.size as u64;
-        let chunk_end = offset + chunk_size;
-        if chunk_end <= start {
-            offset = chunk_end;
-            continue;
-        }
-        let local_start = start.saturating_sub(offset) as usize;
-        let take = (chunk_size - local_start as u64).min(remaining) as usize;
-        plan.push(ChunkSlice {
-            file_id: chunk.file_id.clone(),
-            codec: chunk.stored_codec(),
-            logical_size: chunk.size.max(0) as usize,
-            from: local_start,
-            to: local_start + take,
-        });
-        remaining -= take as u64;
-        start += take as u64;
-        offset = chunk_end;
-    }
-    plan
-}
-
-/// If `[start, start+length)` covers whole Telegram chunks only, return them
-/// renumbered as multipart part chunks. Misaligned ranges return `None`.
-fn try_aligned_part_chunks(
-    chunks: &[Chunk],
-    start: u64,
-    length: u64,
-) -> Option<Vec<UploadedChunk>> {
-    if length == 0 {
-        return Some(Vec::new());
-    }
-    let end = start.checked_add(length)?;
-    let mut offset = 0u64;
-    let mut out = Vec::new();
-    let mut chunk_no: i64 = 0;
-    for c in chunks {
-        let csize = c.size as u64;
-        let cend = offset + csize;
-        if cend <= start {
-            offset = cend;
-            continue;
-        }
-        if offset >= end {
-            break;
-        }
-        // Partial overlap with the requested range → not chunk-aligned.
-        if offset < start || cend > end {
-            return None;
-        }
-        out.push(UploadedChunk {
-            part_no: chunk_no,
-            file_id: c.file_id.clone(),
-            message_id: c.message_id,
-            logical_size: c.size,
-            codec: c.stored_codec(),
-            blocks: Vec::new(),
-            stored_crc32: None,
-        });
-        chunk_no += 1;
-        offset = cend;
-    }
-    let covered: u64 = out.iter().map(|c| c.logical_size as u64).sum();
-    if covered != length {
-        return None;
-    }
-    Some(out)
-}
-
-fn blob_key_for_file(file_id: &str) -> BlobKey {
-    let (backend, loc) = if file_id.starts_with("mem-") {
-        (BackendId::memory(), Locator::memory(file_id, 0))
-    } else if let Some((message_id, attachment_id)) = Locator::parse_discord_store_file_id(file_id)
-    {
-        (
-            BackendId::new("discord", "cached"),
-            Locator::discord("cached", message_id, attachment_id, ""),
-        )
-    } else {
-        (BackendId::new("tg", "cached"), Locator::telegram(file_id, 0))
-    };
-    BlobKey::new(backend, loc)
-}
-
-fn stream_object_body(
-    store: Arc<dyn LegacyBlobStore>,
-    index: Index,
-    chunks: Vec<Chunk>,
-    start: u64,
-    length: u64,
-    block_cache: Option<Arc<BlockCache>>,
-    readahead: bool,
-) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + 'static {
-    let plan = plan_chunk_slices(&chunks, start, length);
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
-    tokio::spawn(async move {
-        for slice in plan {
-            let frames = if slice.codec == ChunkCodec::Blocks {
-                match index.get_chunk_blocks(&slice.file_id).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(std::io::Error::other(e.to_string())))
-                            .await;
-                        break;
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-            let result = read_chunk_range_cached(
-                store.clone(),
-                &slice.file_id,
-                slice.codec,
-                &frames,
-                slice.from,
-                slice.to,
-                slice.logical_size.max(1),
-                block_cache.clone(),
-                readahead,
-            )
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()));
-            if tx.send(result).await.is_err() {
-                break; // client disconnected
-            }
-        }
-    });
-    ReceiverStream::new(rx)
-}
 
 #[async_trait]
 impl S3 for S3gram {
@@ -1030,6 +798,7 @@ impl S3 for S3gram {
         }))
     }
 
+
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,
@@ -1065,57 +834,62 @@ impl S3 for S3gram {
             ..Default::default()
         };
 
-        let mut hasher = S3IngestHasher(s3s::checksum::ChecksumHasher::default());
-        enable_expected_checksums(&mut hasher.0, &expected_checksum);
+        let mut hasher_state = s3s::checksum::ChecksumHasher::default();
+        enable_expected_checksums(&mut hasher_state, &expected_checksum);
         if let Some(alg) = input.checksum_algorithm.as_ref() {
-            enable_checksum_algorithm(&mut hasher.0, alg.as_str())?;
+            enable_checksum_algorithm(&mut hasher_state, alg.as_str())?;
         }
-        let use_hasher = hasher_is_active(&hasher.0);
+        let use_hasher = hasher_is_active(&hasher_state);
+        let hasher = if use_hasher {
+            Some(Arc::new(StdMutex::new(hasher_state)))
+        } else {
+            None
+        };
 
         let stream = match input.body.take() {
             Some(body) => body.map(|r| r.map_err(|e| anyhow::anyhow!(e))).left_stream(),
             None => futures::stream::empty().right_stream(),
         };
+        let stream = maybe_hash_stream(stream, hasher.clone());
 
-        let hasher_ref: Option<&mut dyn IngestHasher> =
-            if use_hasher { Some(&mut hasher) } else { None };
-        let ingested = match ingest_stream_with_options(
-            &self.store,
-            stream,
-            hasher_ref,
-            self.ingest_options(),
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                self.queue_pending_deletes(e.pending_deletes).await;
-                return Err(Self::map_err(e.source));
-            }
-        };
+        let ingested = self
+            .store
+            .ingest(stream, Some(self.ingest_options()))
+            .await
+            .map_err(Self::map_err)?;
 
         if let Some(exp) = expected_md5 {
-            verify_content_md5_digest(exp, &ingested.md5)?;
+            if let Err(e) = verify_content_md5_digest(exp, &ingested.md5) {
+                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                return Err(e);
+            }
         }
 
-        let computed = if use_hasher {
-            hasher.0.finalize()
+        let computed = if let Some(h) = hasher {
+            let mut guard = h.lock().map_err(|e| Self::map_err(e))?;
+            std::mem::take(&mut *guard).finalize()
         } else {
             Checksum::default()
         };
 
         if let Some(trailers) = trailing_headers {
             if let Some(trailers) = trailers.take() {
-                merge_trailer_checksums(&mut expected_checksum, &trailers)?;
+                if let Err(e) = merge_trailer_checksums(&mut expected_checksum, &trailers) {
+                    self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                    return Err(e);
+                }
             }
         }
 
         if let Some(field) = checksum_mismatch(&computed, &expected_checksum) {
+            self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
             return Err(s3_error!(BadDigest, "{} mismatch", field));
         }
-        // Fallback for legacy CRC32 header when hasher was not enabled.
         if !use_hasher {
-            verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32)?;
+            if let Err(e) = verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32) {
+                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                return Err(e);
+            }
         }
 
         let content_type = input.content_type.as_deref();
@@ -1129,24 +903,23 @@ impl S3 for S3gram {
         } else {
             "{}".to_string()
         };
+        let etag = Self::etag_of(&ingested.md5);
 
-        let orphans = self
+        let old = self
             .index
             .put_object(
                 &input.bucket,
                 &input.key,
-                &ingested.etag,
+                &etag,
                 ingested.size,
                 content_type,
-                &ingested.chunks,
-                self.chat_id(),
+                &ingested.extents,
                 &user_meta,
                 &checksums_json,
             )
             .await
             .map_err(Self::map_err)?;
-        self.cleanup_orphans(orphans).await;
-        self.warm_l1_frames(&ingested.chunks).await;
+        self.release_ids(&old).await;
 
         if !tags.is_empty() {
             self.index
@@ -1159,12 +932,12 @@ impl S3 for S3gram {
             bucket = %input.bucket,
             key = %input.key,
             size = ingested.size,
-            parts = ingested.chunks.len(),
+            extents = ingested.extents.len(),
             "PutObject ok"
         );
 
         let mut output = PutObjectOutput {
-            e_tag: Some(etag_hex(&ingested.etag)),
+            e_tag: Some(etag_hex(&etag)),
             ..Default::default()
         };
         if use_hasher {
@@ -1185,11 +958,12 @@ impl S3 for S3gram {
             .map_err(Self::map_err)?
             .ok_or_else(|| s3_error!(NoSuchKey))?;
 
-        let chunks = self
+        let extents = self
             .index
-            .get_chunks(&input.bucket, &input.key)
+            .get_extents(&input.bucket, &input.key)
             .await
-            .map_err(Self::map_err)?;
+            .map_err(Self::map_err)?
+            .unwrap_or_default();
 
         let total = meta.size as u64;
         let (start, end_inclusive) = match input.range {
@@ -1220,20 +994,13 @@ impl S3 for S3gram {
         let body = if length == 0 {
             Some(StreamingBlob::from_bytes(Bytes::new()))
         } else {
-            let end_excl = start.saturating_add(length);
-            let readahead = self
-                .note_sequential(&input.bucket, &input.key, start, end_excl)
-                .await;
-            let body_stream = stream_object_body(
-                self.store.clone(),
-                self.index.clone(),
-                chunks,
-                start,
-                length,
-                self.block_cache.clone(),
-                readahead,
-            );
-            Some(StreamingBlob::wrap(body_stream))
+            let range = start..(start.saturating_add(length));
+            let data = self
+                .store
+                .read(&extents, Some(range))
+                .await
+                .map_err(Self::map_err)?;
+            Some(StreamingBlob::from_bytes(data))
         };
         let content_range = input
             .range
@@ -1277,11 +1044,11 @@ impl S3 for S3gram {
             body,
             content_length: Some(length as i64),
             content_range,
-            content_type: meta.content_type,
             e_tag: Some(etag_hex(&meta.etag)),
+            content_type: meta.content_type,
             last_modified: Some(ts(&meta.mtime)),
             metadata,
-            tag_count: (tag_count > 0).then_some(tag_count),
+            tag_count: Some(tag_count),
             ..Default::default()
         };
         if checksum_enabled && full_object {
@@ -1301,6 +1068,12 @@ impl S3 for S3gram {
             .await
             .map_err(Self::map_err)?
             .ok_or_else(|| s3_error!(NoSuchKey))?;
+        let tag_count = self
+            .index
+            .get_object_tags(&input.bucket, &input.key)
+            .await
+            .map_err(Self::map_err)?
+            .len() as i32;
         let user_meta = self
             .index
             .get_user_metadata(&input.bucket, &input.key)
@@ -1311,19 +1084,13 @@ impl S3 for S3gram {
         } else {
             Some(user_meta.into_iter().collect())
         };
-        let tag_count = self
-            .index
-            .get_object_tags(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?
-            .len() as i32;
         Ok(S3Response::new(HeadObjectOutput {
+            e_tag: Some(etag_hex(&meta.etag)),
             content_length: Some(meta.size),
             content_type: meta.content_type,
-            e_tag: Some(etag_hex(&meta.etag)),
             last_modified: Some(ts(&meta.mtime)),
             metadata,
-            tag_count: (tag_count > 0).then_some(tag_count),
+            tag_count: Some(tag_count),
             ..Default::default()
         }))
     }
@@ -1333,13 +1100,13 @@ impl S3 for S3gram {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
-        if let Some(orphans) = self
+        if let Some(ids) = self
             .index
             .delete_object(&input.bucket, &input.key)
             .await
             .map_err(Self::map_err)?
         {
-            self.cleanup_orphans(orphans).await;
+            self.release_ids(&ids).await;
         }
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
@@ -1349,30 +1116,23 @@ impl S3 for S3gram {
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let input = req.input;
-        let quiet = input.delete.quiet.unwrap_or(false);
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
-        let mut all_orphans = Vec::new();
-
         for obj in input.delete.objects {
             let key = obj.key;
             match self.index.delete_object(&input.bucket, &key).await {
-                Ok(Some(orphans)) => {
-                    all_orphans.extend(orphans);
-                    if !quiet {
-                        deleted.push(DeletedObject {
-                            key: Some(key),
-                            ..Default::default()
-                        });
-                    }
+                Ok(Some(ids)) => {
+                    self.release_ids(&ids).await;
+                    deleted.push(DeletedObject {
+                        key: Some(key),
+                        ..Default::default()
+                    });
                 }
                 Ok(None) => {
-                    if !quiet {
-                        deleted.push(DeletedObject {
-                            key: Some(key),
-                            ..Default::default()
-                        });
-                    }
+                    deleted.push(DeletedObject {
+                        key: Some(key),
+                        ..Default::default()
+                    });
                 }
                 Err(e) => {
                     errors.push(Error {
@@ -1384,7 +1144,6 @@ impl S3 for S3gram {
                 }
             }
         }
-        self.cleanup_orphans(all_orphans).await;
         Ok(S3Response::new(DeleteObjectsOutput {
             deleted: deleted.is_empty().not().then_some(deleted),
             errors: errors.is_empty().not().then_some(errors),
@@ -1401,15 +1160,6 @@ impl S3 for S3gram {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
             _ => return Err(s3_error!(NotImplemented)),
         };
-
-        if !self
-            .index
-            .bucket_exists(&input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
         if self
             .index
             .get_object(&src_bucket, &src_key)
@@ -1418,6 +1168,14 @@ impl S3 for S3gram {
             .is_none()
         {
             return Err(s3_error!(NoSuchKey));
+        }
+        if !self
+            .index
+            .bucket_exists(&input.bucket)
+            .await
+            .map_err(Self::map_err)?
+        {
+            return Err(s3_error!(NoSuchBucket));
         }
 
         let copy_source_meta = input
@@ -1436,7 +1194,7 @@ impl S3 for S3gram {
             input.metadata.unwrap_or_default().into_iter().collect()
         };
 
-        let (dst, orphans) = self
+        let (dst, extents, old) = self
             .index
             .copy_object(
                 &src_bucket,
@@ -1449,7 +1207,9 @@ impl S3 for S3gram {
             )
             .await
             .map_err(Self::map_err)?;
-        self.cleanup_orphans(orphans).await;
+
+        self.retain_ids(&unique_chunk_ids(&extents)).await?;
+        self.release_ids(&old).await;
 
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
@@ -1474,17 +1234,16 @@ impl S3 for S3gram {
         {
             return Err(s3_error!(NoSuchBucket));
         }
-        let user_meta: Vec<(String, String)> =
-            input.metadata.unwrap_or_default().into_iter().collect();
         let tags = match input.tagging.as_deref() {
             Some(h) => parse_tagging_header(h)?,
             None => Vec::new(),
         };
+        let user_meta: Vec<(String, String)> = input
+            .metadata
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let upload_id = uuid::Uuid::new_v4().to_string();
-        let checksum_algorithm = input
-            .checksum_algorithm
-            .as_ref()
-            .map(|a| a.as_str().to_owned());
         self.index
             .create_multipart_upload(
                 &upload_id,
@@ -1493,7 +1252,7 @@ impl S3 for S3gram {
                 input.content_type.as_deref(),
                 &user_meta,
                 &tags,
-                checksum_algorithm.as_deref(),
+                input.checksum_algorithm.as_ref().map(|a| a.as_str()),
             )
             .await
             .map_err(Self::map_err)?;
@@ -1536,75 +1295,83 @@ impl S3 for S3gram {
             ..Default::default()
         };
 
-        let mut hasher = S3IngestHasher(s3s::checksum::ChecksumHasher::default());
-        enable_expected_checksums(&mut hasher.0, &expected_checksum);
+        let mut hasher_state = s3s::checksum::ChecksumHasher::default();
+        enable_expected_checksums(&mut hasher_state, &expected_checksum);
         if let Some(alg) = upload.checksum_algorithm.as_deref() {
-            enable_checksum_algorithm(&mut hasher.0, alg)?;
+            enable_checksum_algorithm(&mut hasher_state, alg)?;
         }
         if let Some(alg) = input.checksum_algorithm.as_ref() {
-            enable_checksum_algorithm(&mut hasher.0, alg.as_str())?;
+            enable_checksum_algorithm(&mut hasher_state, alg.as_str())?;
         }
-        let use_hasher = hasher_is_active(&hasher.0);
+        let use_hasher = hasher_is_active(&hasher_state);
+        let hasher = if use_hasher {
+            Some(Arc::new(StdMutex::new(hasher_state)))
+        } else {
+            None
+        };
 
         let stream = match input.body.take() {
             Some(body) => body.map(|r| r.map_err(|e| anyhow::anyhow!(e))).left_stream(),
             None => futures::stream::empty().right_stream(),
         };
-        let hasher_ref: Option<&mut dyn IngestHasher> =
-            if use_hasher { Some(&mut hasher) } else { None };
-        let ingested = match ingest_stream_with_options(
-            &self.store,
-            stream,
-            hasher_ref,
-            self.ingest_options(),
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                self.queue_pending_deletes(e.pending_deletes).await;
-                return Err(Self::map_err(e.source));
-            }
-        };
+        let stream = maybe_hash_stream(stream, hasher.clone());
+
+        let ingested = self
+            .store
+            .ingest(stream, Some(self.ingest_options()))
+            .await
+            .map_err(Self::map_err)?;
+
         if let Some(exp) = expected_md5 {
-            verify_content_md5_digest(exp, &ingested.md5)?;
+            if let Err(e) = verify_content_md5_digest(exp, &ingested.md5) {
+                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                return Err(e);
+            }
         }
 
-        let computed = if use_hasher {
-            hasher.0.finalize()
+        let computed = if let Some(h) = hasher {
+            let mut guard = h.lock().map_err(|e| Self::map_err(e))?;
+            std::mem::take(&mut *guard).finalize()
         } else {
             Checksum::default()
         };
 
         if let Some(trailers) = trailing_headers {
             if let Some(trailers) = trailers.take() {
-                merge_trailer_checksums(&mut expected_checksum, &trailers)?;
+                if let Err(e) = merge_trailer_checksums(&mut expected_checksum, &trailers) {
+                    self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                    return Err(e);
+                }
             }
         }
 
         if let Some(field) = checksum_mismatch(&computed, &expected_checksum) {
+            self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
             return Err(s3_error!(BadDigest, "{} mismatch", field));
         }
         if !use_hasher {
-            verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32)?;
+            if let Err(e) = verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32) {
+                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                return Err(e);
+            }
         }
 
-        let orphans = self
+        let etag = Self::etag_of(&ingested.md5);
+        let old = self
             .index
             .put_multipart_part(
                 &upload_id,
                 part_number,
-                &ingested.etag,
+                &etag,
                 ingested.size,
-                &ingested.chunks,
-                self.chat_id(),
+                &ingested.extents,
             )
             .await
             .map_err(Self::map_err)?;
-        self.cleanup_orphans(orphans).await;
+        self.release_ids(&old).await;
 
         let mut output = UploadPartOutput {
-            e_tag: Some(etag_hex(&ingested.etag)),
+            e_tag: Some(etag_hex(&etag)),
             ..Default::default()
         };
         if use_hasher {
@@ -1638,11 +1405,12 @@ impl S3 for S3gram {
             .await
             .map_err(Self::map_err)?
             .ok_or_else(|| s3_error!(NoSuchKey))?;
-        let chunks = self
+        let src_extents = self
             .index
-            .get_chunks(&src_bucket, &src_key)
+            .get_extents(&src_bucket, &src_key)
             .await
-            .map_err(Self::map_err)?;
+            .map_err(Self::map_err)?
+            .unwrap_or_default();
 
         let total = src.size as u64;
         let (start, length) = match input.copy_source_range.as_deref() {
@@ -1651,100 +1419,34 @@ impl S3 for S3gram {
         };
 
         let part_number = i64::from(input.part_number);
+        let part_extents = slice_extents(&src_extents, start, length);
 
-        // Chunk-aligned ranges: reuse Telegram file_ids (refcount++), like CopyObject.
-        // Misaligned byte ranges still download + re-upload.
-        let (etag, size, part_chunks, chat_for_blobs) =
-            if let Some(aligned) = try_aligned_part_chunks(&chunks, start, length) {
-                let etag = if start == 0
-                    && length == total
-                    && !src.etag.contains('-')
-                {
-                    // Single-shot PutObject etag is content-MD5; safe to reuse.
-                    src.etag.clone()
-                } else {
-                    // Hash logical bytes via getFile only — no sendDocument.
-                    use md5::Digest;
-                    let mut md5 = md5::Md5::new();
-                    for c in &aligned {
-                        let data = store_get(self.store.as_ref(), &c.file_id)
-                            .await
-                            .map_err(Self::map_err)?;
-                        let frames = if c.codec == ChunkCodec::Blocks {
-                            self.index
-                                .get_chunk_blocks(&c.file_id)
-                                .await
-                                .map_err(Self::map_err)?
-                        } else {
-                            Vec::new()
-                        };
-                        let logical = decode_chunk_slice_async(
-                            data,
-                            c.codec,
-                            &frames,
-                            0,
-                            c.logical_size as usize,
-                            c.logical_size.max(1) as usize,
-                        )
-                        .await
-                        .map_err(Self::map_err)?;
-                        md5.update(&logical);
-                    }
-                    format!("{:x}", md5.finalize())
-                };
-                let src_chat = self
-                    .index
-                    .bucket_chat_id(&src_bucket)
-                    .await
-                    .map_err(Self::map_err)?
-                    .unwrap_or_else(|| self.chat_id().to_string());
-                (etag, length as i64, aligned, src_chat)
-            } else {
-                let body_stream = stream_object_body(
-                    self.store.clone(),
-                    self.index.clone(),
-                    chunks,
-                    start,
-                    length,
-                    self.block_cache.clone(),
-                    true,
-                )
-                .map(|r| r.map_err(|e| anyhow::anyhow!(e)));
-                let ingested = match ingest_stream_with_options(
-                    &self.store,
-                    body_stream,
-                    None,
-                    self.ingest_options(),
-                )
+        let etag = if start == 0 && length == total && !src.etag.contains('-') {
+            src.etag.clone()
+        } else {
+            let data = self
+                .store
+                .read(&part_extents, None)
                 .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.queue_pending_deletes(e.pending_deletes).await;
-                        return Err(Self::map_err(e.source));
-                    }
-                };
-                (
-                    ingested.etag,
-                    ingested.size,
-                    ingested.chunks,
-                    self.chat_id().to_string(),
-                )
-            };
+                .map_err(Self::map_err)?;
+            let mut md5 = md5::Md5::new();
+            md5.update(&data);
+            format!("{:x}", md5.finalize())
+        };
 
-        let orphans = self
+        self.retain_ids(&unique_chunk_ids(&part_extents)).await?;
+        let old = self
             .index
             .put_multipart_part(
                 &input.upload_id,
                 part_number,
                 &etag,
-                size,
-                &part_chunks,
-                &chat_for_blobs,
+                length as i64,
+                &part_extents,
             )
             .await
             .map_err(Self::map_err)?;
-        self.cleanup_orphans(orphans).await;
+        self.release_ids(&old).await;
 
         let part = self
             .index
@@ -1762,7 +1464,6 @@ impl S3 for S3gram {
             ..Default::default()
         }))
     }
-
     async fn put_object_tagging(
         &self,
         req: S3Request<PutObjectTaggingInput>,
@@ -1941,6 +1642,7 @@ impl S3 for S3gram {
         }))
     }
 
+
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
@@ -1963,7 +1665,6 @@ impl S3 for S3gram {
         }
 
         let mut md5_concat = md5::Md5::new();
-        use md5::Digest;
         let mut total_size: i64 = 0;
         let mut part_numbers = Vec::new();
         for p in &parts {
@@ -1992,12 +1693,12 @@ impl S3 for S3gram {
         }
         let etag = format!("{:x}-{}", md5_concat.finalize(), part_numbers.len());
 
-        let orphans = self
+        let old = self
             .index
             .complete_multipart_upload(&upload, &part_numbers, &etag, total_size)
             .await
             .map_err(Self::map_err)?;
-        self.cleanup_orphans(orphans).await;
+        self.release_ids(&old).await;
 
         Ok(S3Response::new(CompleteMultipartUploadOutput {
             bucket: Some(upload.bucket),
@@ -2020,8 +1721,8 @@ impl S3 for S3gram {
             .map_err(Self::map_err)?
         {
             None => Err(s3_error!(NoSuchUpload)),
-            Some(orphans) => {
-                self.cleanup_orphans(orphans).await;
+            Some(ids) => {
+                self.release_ids(&ids).await;
                 Ok(S3Response::new(AbortMultipartUploadOutput::default()))
             }
         }

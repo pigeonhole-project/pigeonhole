@@ -26,7 +26,6 @@ pigeonhole-blob = { workspace = true }
 pigeonhole-types = { workspace = true }
 pigeonhole-codec = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
-pigeonhole-index = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }

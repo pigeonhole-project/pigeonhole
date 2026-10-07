@@ -12,7 +12,6 @@ ROLE = {
     "pigeonhole-types": "types",
     "pigeonhole-codec": "codec",
     "pigeonhole-blob": "blob",
-    "pigeonhole-index": "chunk-store",  # until stage F merges it away
     "pigeonhole-chunk-store": "chunk-store",
     "pigeonhole-storage-telegram": "storage",
     "pigeonhole-storage-discord": "storage",
@@ -94,12 +93,6 @@ def main() -> int:
                         errors.append(
                             f"{name} (gateway) → {dep_name} ({dr}); "
                             f"allowed: {sorted(allowed)}"
-                        )
-                    # Gateways must not take a direct dependency on pigeonhole-index;
-                    # S3/CAS indexes live in the gateway or behind chunk-store APIs.
-                    if dep_name == "pigeonhole-index":
-                        errors.append(
-                            f"{name} (gateway) must not depend on {dep_name} directly"
                         )
             else:
                 for dep_name in dep_names:

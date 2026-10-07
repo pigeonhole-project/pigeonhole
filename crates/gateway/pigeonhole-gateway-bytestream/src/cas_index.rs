@@ -1,42 +1,98 @@
-//! CAS mapping index owned by the bytestream gateway (stage 1.5).
+//! CAS mapping index owned by the bytestream gateway (stage F).
 //!
-//! Today this shares the SQLite pool with the S3 [`Index`] for blob refcounts
-//! (`bump_blob` / `release_blob`). Stage 1.6 moves refcounts into `blob.db`.
+//! Stores `CasEntry { hash, size, extents }` rows; chunk refs live in blob.db.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
-use pigeonhole_chunk_store::Index;
-use sqlx::FromRow;
+use pigeonhole_chunk_store::{ChunkId, Extent};
+use serde::{Deserialize, Serialize};
+use sqlx::{sqlite::SqlitePoolOptions, FromRow, SqlitePool};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CasEntry {
+    pub hash: String,
+    pub size: i64,
+    pub extents: Vec<Extent>,
+}
 
 #[derive(Debug, Clone, FromRow)]
 pub struct CasBlobRow {
     pub hash: String,
     pub size: i64,
-    pub file_id: String,
+    pub extents_json: String,
     pub last_access: String,
-    pub manifest: Option<String>,
 }
 
-/// Resolved CAS object: legacy single blob or chunked manifest JSON.
-#[derive(Debug, Clone)]
-pub struct CasIndexEntry {
-    pub file_id: String,
-    pub manifest: Option<String>,
-}
-
-/// Gateway-owned CAS index (wrapper over the shared pool until blob.db owns refs).
 #[derive(Clone)]
 pub struct CasIndex {
-    index: Index,
+    pool: SqlitePool,
 }
 
 impl CasIndex {
-    pub fn new(index: Index) -> Self {
-        Self { index }
+    pub async fn connect(database_url: &str) -> Result<Self> {
+        let url = if database_url.starts_with("sqlite:") && !database_url.contains('?') {
+            format!("{database_url}?mode=rwc")
+        } else {
+            database_url.to_string()
+        };
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await?;
+        let idx = Self { pool };
+        idx.migrate().await?;
+        Ok(idx)
     }
 
-    pub fn index(&self) -> &Index {
-        &self.index
+    async fn migrate(&self) -> Result<()> {
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout = 5000")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cas_blobs (
+                hash TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                extents_json TEXT NOT NULL,
+                last_access TEXT NOT NULL,
+                PRIMARY KEY (hash, size)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Legacy columns from pre-F schema (ignore if absent).
+        let _ = sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_cas_deletes (
+                hash TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                queued_at TEXT NOT NULL,
+                PRIMARY KEY (hash, size)
+            )",
+        )
+        .execute(&self.pool)
+        .await;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn find_missing(&self, digests: &[(String, i64)]) -> Result<Vec<(String, i64)>> {
@@ -47,7 +103,7 @@ impl CasIndex {
             )
             .bind(hash)
             .bind(size)
-            .fetch_optional(self.index.pool())
+            .fetch_optional(&self.pool)
             .await?;
             if row.is_none() {
                 missing.push((hash.clone(), *size));
@@ -56,15 +112,25 @@ impl CasIndex {
         Ok(missing)
     }
 
-    pub async fn get(&self, hash: &str, size: i64) -> Result<Option<CasIndexEntry>> {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT file_id, manifest FROM cas_blobs WHERE hash = ? AND size = ?",
+    pub async fn get(&self, hash: &str, size: i64) -> Result<Option<CasEntry>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT extents_json FROM cas_blobs WHERE hash = ? AND size = ?",
         )
         .bind(hash)
         .bind(size)
-        .fetch_optional(self.index.pool())
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(file_id, manifest)| CasIndexEntry { file_id, manifest }))
+        match row {
+            None => Ok(None),
+            Some((json,)) => {
+                let extents: Vec<Extent> = serde_json::from_str(&json)?;
+                Ok(Some(CasEntry {
+                    hash: hash.to_string(),
+                    size,
+                    extents,
+                }))
+            }
+        }
     }
 
     pub async fn touch(&self, hash: &str, size: i64) -> Result<()> {
@@ -73,22 +139,103 @@ impl CasIndex {
             .bind(&now)
             .bind(hash)
             .bind(size)
-            .execute(self.index.pool())
+            .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    pub async fn release(&self, hash: &str, size: i64) -> Result<Vec<pigeonhole_chunk_store::OrphanMsg>> {
-        self.index.cas_release(hash, size).await
+    /// Insert entry. Returns `true` if newly inserted (caller owns ingest refs).
+    pub async fn insert(&self, entry: &CasEntry) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let json = serde_json::to_string(&entry.extents)?;
+        let res = sqlx::query(
+            r#"
+            INSERT INTO cas_blobs (hash, size, extents_json, last_access)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(hash, size) DO UPDATE SET
+                last_access = excluded.last_access
+            "#,
+        )
+        .bind(&entry.hash)
+        .bind(entry.size)
+        .bind(&json)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        // rows_affected == 1 for insert; SQLite ON CONFLICT UPDATE also reports 1.
+        // Detect prior existence separately.
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Store a new CAS entry. If the digest already exists, returns existing extents
+    /// so the caller can `release` the newly ingested chunks and `retain` existing ones.
+    pub async fn store_or_get_existing(
+        &self,
+        entry: &CasEntry,
+    ) -> Result<Option<Vec<Extent>>> {
+        if let Some(existing) = self.get(&entry.hash, entry.size).await? {
+            let _ = self.touch(&entry.hash, entry.size).await;
+            return Ok(Some(existing.extents));
+        }
+        let now = Utc::now().to_rfc3339();
+        let json = serde_json::to_string(&entry.extents)?;
+        let res = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO cas_blobs (hash, size, extents_json, last_access)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(&entry.hash)
+        .bind(entry.size)
+        .bind(&json)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            // Lost race — return the winner's extents.
+            let existing = self
+                .get(&entry.hash, entry.size)
+                .await?
+                .expect("cas row after conflict");
+            return Ok(Some(existing.extents));
+        }
+        Ok(None)
+    }
+
+    /// Remove CAS row; returns chunk ids to `release`.
+    pub async fn release(&self, hash: &str, size: i64) -> Result<Vec<ChunkId>> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT extents_json FROM cas_blobs WHERE hash = ? AND size = ?",
+        )
+        .bind(hash)
+        .bind(size)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((json,)) = row else {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        };
+        let extents: Vec<Extent> = serde_json::from_str(&json).unwrap_or_default();
+        let mut ids: Vec<_> = extents.iter().map(|e| e.chunk).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        sqlx::query("DELETE FROM cas_blobs WHERE hash = ? AND size = ?")
+            .bind(hash)
+            .bind(size)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(ids)
     }
 
     pub async fn stale_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<CasBlobRow>> {
         let cutoff = cutoff.to_rfc3339();
         let rows = sqlx::query_as::<_, CasBlobRow>(
-            "SELECT hash, size, file_id, last_access, manifest FROM cas_blobs WHERE last_access < ?",
+            "SELECT hash, size, extents_json, last_access FROM cas_blobs WHERE last_access < ?",
         )
         .bind(cutoff)
-        .fetch_all(self.index.pool())
+        .fetch_all(&self.pool)
         .await?;
         Ok(rows)
     }
@@ -105,7 +252,7 @@ impl CasIndex {
         .bind(hash)
         .bind(size)
         .bind(queued_at)
-        .execute(self.index.pool())
+        .execute(&self.pool)
         .await?;
         Ok(())
     }
@@ -119,7 +266,7 @@ impl CasIndex {
             "#,
         )
         .bind(limit)
-        .fetch_all(self.index.pool())
+        .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
     }
@@ -128,49 +275,67 @@ impl CasIndex {
         sqlx::query("DELETE FROM pending_cas_deletes WHERE hash = ? AND size = ?")
             .bind(hash)
             .bind(size)
-            .execute(self.index.pool())
+            .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    pub async fn store_manifest(
-        &self,
-        hash: &str,
-        size: i64,
-        chat_id: &str,
-        chunks: &[(String, i64, i64, Option<u32>)],
-        manifest_json: &str,
-    ) -> Result<()> {
-        self.index
-            .cas_store_manifest(hash, size, chat_id, chunks, manifest_json)
-            .await
+    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.0))
     }
 
-    pub async fn store_entry(
-        &self,
-        hash: &str,
-        size: i64,
-        file_id: &str,
-        message_id: i64,
-        blob_size: i64,
-        chat_id: &str,
-        stored_crc32: Option<u32>,
-        manifest_json: Option<&str>,
-    ) -> Result<()> {
-        if size != blob_size && manifest_json.is_none() {
-            bail!("CAS digest size {size} != payload length {blob_size}");
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn export_entries(&self) -> Result<Vec<CasEntry>> {
+        let rows = sqlx::query_as::<_, CasBlobRow>(
+            "SELECT hash, size, extents_json, last_access FROM cas_blobs ORDER BY hash, size",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let extents: Vec<Extent> = serde_json::from_str(&r.extents_json)?;
+            out.push(CasEntry {
+                hash: r.hash,
+                size: r.size,
+                extents,
+            });
         }
-        self.index
-            .cas_store_entry(
-                hash,
-                size,
-                file_id,
-                message_id,
-                blob_size,
-                chat_id,
-                stored_crc32,
-                manifest_json,
+        Ok(out)
+    }
+
+    pub async fn import_entries(&self, entries: &[CasEntry]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM cas_blobs")
+            .execute(&mut *tx)
+            .await?;
+        let now = Utc::now().to_rfc3339();
+        for e in entries {
+            let json = serde_json::to_string(&e.extents)?;
+            sqlx::query(
+                "INSERT INTO cas_blobs (hash, size, extents_json, last_access) VALUES (?, ?, ?, ?)",
             )
-            .await
+            .bind(&e.hash)
+            .bind(e.size)
+            .bind(&json)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }

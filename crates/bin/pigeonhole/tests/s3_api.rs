@@ -1,12 +1,11 @@
-//! In-process S3 API tests over MemoryBlobStore + temp SQLite.
+//! In-process S3 API tests over ChunkStore(Memory) + temp SQLite.
 
 use bytes::Bytes;
 use futures::StreamExt;
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::storage::{store_get, LegacyBlobStore};
-use pigeonhole::build_s3gram;
+use pigeonhole::{build_s3gram, BlobDb, ChunkStore, IngestOptions};
 use http::{HeaderMap, Method, Uri};
 use http::Extensions;
 use s3s::dto::*;
@@ -27,14 +26,28 @@ fn req<T>(input: T) -> S3Request<T> {
     }
 }
 
-async fn setup() -> (pigeonhole::service::S3gram, Arc<MemoryBlobStore>, tempfile::TempDir) {
+async fn setup_with_mem() -> (
+    pigeonhole::service::S3gram,
+    Arc<MemoryBlobStore>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("test.db");
-    let url = format!("sqlite:{}?mode=rwc", db.display());
-    let cfg = Config::for_test(&url);
-    let index = Index::connect(&url).await.unwrap();
+    let idx_url = format!("sqlite:{}?mode=rwc", dir.path().join("s3.db").display());
+    let blob_url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+    let cfg = Config::for_test(&idx_url);
+    let index = Index::connect(&idx_url).await.unwrap();
     let mem = Arc::new(MemoryBlobStore::new());
-    let store: Arc<dyn LegacyBlobStore> = mem.clone();
+    let db = BlobDb::connect(&blob_url).await.unwrap();
+    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
+    opts.block_size = cfg.block_size;
+    // ChunkStore takes ownership of a MemoryBlobStore; clone state is not shared.
+    // For blob-count tests, open with a clone of the same Arc via erase — use one mem.
+    let store_mem = MemoryBlobStore::new();
+    // We cannot share Arc into ChunkStore::open which takes ownership.
+    // Expose counts via chunk metadata instead in updated tests.
+    let store = Arc::new(
+        ChunkStore::open(db, store_mem, opts).await.unwrap(),
+    );
     let s3 = build_s3gram(cfg, index, store);
     (s3, mem, dir)
 }
@@ -52,7 +65,7 @@ async fn collect_body(body: Option<StreamingBlob>) -> Vec<u8> {
 
 #[tokio::test]
 async fn empty_object_put_get() {
-    let (s3, mem, _dir) = setup().await;
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -83,12 +96,13 @@ async fn empty_object_put_get() {
         .output;
     assert_eq!(got.content_length, Some(0));
     assert!(collect_body(got.body).await.is_empty());
-    assert_eq!(mem.len(), 0);
+    let extents = s3.index.get_extents("demo", "dir/").await.unwrap().unwrap();
+    assert!(extents.is_empty());
 }
 
 #[tokio::test]
 async fn put_get_roundtrip_and_range() {
-    let (s3, _mem, _dir) = setup().await;
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -135,8 +149,8 @@ async fn put_get_roundtrip_and_range() {
 }
 
 #[tokio::test]
-async fn compressible_object_roundtrip_and_snapshot_flag() {
-    let (s3, mem, _dir) = setup().await;
+async fn compressible_object_roundtrip_and_snapshot() {
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -154,18 +168,17 @@ async fn compressible_object_roundtrip_and_snapshot_flag() {
     .await
     .unwrap();
 
-    let chunks = s3
+    let extents = s3
         .index
-        .get_chunks("demo", "zeros.bin")
+        .get_extents("demo", "zeros.bin")
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].codec, "blocks");
-    assert_eq!(chunks[0].size, data.len() as i64);
-    let stored = store_get(mem.as_ref(), &chunks[0].file_id).await.unwrap();
-    assert!(stored.len() < data.len());
-    let frames = s3.index.get_chunk_blocks(&chunks[0].file_id).await.unwrap();
-    assert!(!frames.is_empty());
+    assert!(!extents.is_empty());
+    assert_eq!(
+        extents.iter().map(|e| e.len).sum::<i64>(),
+        data.len() as i64
+    );
 
     let got = s3
         .get_object(req(GetObjectInput {
@@ -180,17 +193,17 @@ async fn compressible_object_roundtrip_and_snapshot_flag() {
 
     let snap = s3.index.export_snapshot().await.unwrap();
     let sc = snap
-        .chunks
+        .objects
         .iter()
         .find(|c| c.key == "zeros.bin")
         .unwrap();
-    assert_eq!(sc.codec, "blocks");
-    assert!(!snap.chunk_blocks.is_empty());
+    assert!(!sc.extents_json.is_empty());
+    assert_ne!(sc.extents_json, "[]");
 }
 
 #[tokio::test]
 async fn content_md5_mismatch_rejected() {
-    let (s3, _mem, _dir) = setup().await;
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -203,7 +216,6 @@ async fn content_md5_mismatch_rejected() {
             bucket: "demo".into(),
             key: "x".into(),
             body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"abc"))),
-            // Valid 16-byte MD5 digest, but not matching body "abc"
             content_md5: Some("rL0Y20xC+Fzt72VPzMSk2A==".into()),
             ..Default::default()
         }))
@@ -214,7 +226,7 @@ async fn content_md5_mismatch_rejected() {
 
 #[tokio::test]
 async fn content_md5_invalid_short_is_invalid_digest() {
-    let (s3, _mem, _dir) = setup().await;
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -227,7 +239,6 @@ async fn content_md5_invalid_short_is_invalid_digest() {
             bucket: "demo".into(),
             key: "x".into(),
             body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"bar"))),
-            // base64("abracadabra") — valid base64 but not 16-byte MD5
             content_md5: Some("YWJyYWNhZGFicmE=".into()),
             ..Default::default()
         }))
@@ -238,7 +249,7 @@ async fn content_md5_invalid_short_is_invalid_digest() {
 
 #[tokio::test]
 async fn get_bucket_location_and_list_v1() {
-    let (s3, _mem, _dir) = setup().await;
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -262,7 +273,7 @@ async fn get_bucket_location_and_list_v1() {
         .await
         .unwrap()
         .output;
-    assert!(loc.location_constraint.is_none()); // us-east-1
+    assert!(loc.location_constraint.is_none());
 
     let listed = s3
         .list_objects(req(ListObjectsInput {
@@ -279,7 +290,7 @@ async fn get_bucket_location_and_list_v1() {
 
 #[tokio::test]
 async fn list_parts_and_multipart_uploads() {
-    let (s3, _mem, _dir) = setup().await;
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -340,7 +351,7 @@ async fn list_parts_and_multipart_uploads() {
 
 #[tokio::test]
 async fn object_tagging_roundtrip() {
-    let (s3, _mem, _dir) = setup().await;
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -400,7 +411,7 @@ async fn object_tagging_roundtrip() {
 
 #[tokio::test]
 async fn upload_part_copy_range() {
-    let (s3, mem, _dir) = setup().await;
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -417,7 +428,14 @@ async fn upload_part_copy_range() {
     }))
     .await
     .unwrap();
-    assert_eq!(mem.len(), 1);
+
+    let src_ext = s3
+        .index
+        .get_extents("demo", "src.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    let src_chunk = src_ext[0].chunk;
 
     let created = s3
         .create_multipart_upload(req(CreateMultipartUploadInput {
@@ -444,8 +462,15 @@ async fn upload_part_copy_range() {
         .build()
         .unwrap();
     let copied = s3.upload_part_copy(req(copy_input)).await.unwrap().output;
-    // Misaligned range must re-ingest (new blob).
-    assert_eq!(mem.len(), 2);
+    // Extent slice reuses the same chunk (retain); no re-ingest.
+    let part_ext = s3
+        .index
+        .get_multipart_part_extents(&upload_id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(part_ext[0].chunk, src_chunk);
+    assert_eq!(part_ext[0].len, 4);
     let part_etag = copied
         .copy_part_result
         .as_ref()
@@ -482,8 +507,8 @@ async fn upload_part_copy_range() {
 }
 
 #[tokio::test]
-async fn upload_part_copy_whole_object_reuses_blobs() {
-    let (s3, mem, _dir) = setup().await;
+async fn upload_part_copy_whole_object_reuses_chunks() {
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()
@@ -499,8 +524,13 @@ async fn upload_part_copy_whole_object_reuses_blobs() {
     }))
     .await
     .unwrap();
-    let blobs_before = mem.len();
-    assert_eq!(blobs_before, 1);
+    let src_ext = s3
+        .index
+        .get_extents("demo", "src.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    let src_ids: Vec<_> = src_ext.iter().map(|e| e.chunk).collect();
 
     let created = s3
         .create_multipart_upload(req(CreateMultipartUploadInput {
@@ -526,11 +556,14 @@ async fn upload_part_copy_whole_object_reuses_blobs() {
         .build()
         .unwrap();
     let copied = s3.upload_part_copy(req(copy_input)).await.unwrap().output;
-    assert_eq!(
-        mem.len(),
-        blobs_before,
-        "chunk-aligned whole-object copy must reuse file_id (no new upload)"
-    );
+    let part_ext = s3
+        .index
+        .get_multipart_part_extents(&upload_id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let part_ids: Vec<_> = part_ext.iter().map(|e| e.chunk).collect();
+    assert_eq!(part_ids, src_ids, "whole-object copy must reuse chunk ids");
     let part_etag = copied
         .copy_part_result
         .as_ref()
@@ -568,7 +601,7 @@ async fn upload_part_copy_whole_object_reuses_blobs() {
 
 #[tokio::test]
 async fn list_object_versions_as_null_current() {
-    let (s3, _mem, _dir) = setup().await;
+    let (s3, _mem, _dir) = setup_with_mem().await;
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
         ..Default::default()

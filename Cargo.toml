@@ -4,7 +4,6 @@ members = [
     "crates/core/pigeonhole-types",
     "crates/core/pigeonhole-codec",
     "crates/blob/pigeonhole-blob",
-    "crates/blob/pigeonhole-index",
     "crates/blob/pigeonhole-chunk-store",
     "crates/storage/pigeonhole-storage-telegram",
     "crates/storage/pigeonhole-storage-discord",
@@ -67,7 +66,6 @@ protoc-bin-vendored = "3.1"
 pigeonhole-types = { path = "crates/core/pigeonhole-types" }
 pigeonhole-codec = { path = "crates/core/pigeonhole-codec" }
 pigeonhole-blob = { path = "crates/blob/pigeonhole-blob" }
-pigeonhole-index = { path = "crates/blob/pigeonhole-index" }
 pigeonhole-chunk-store = { path = "crates/blob/pigeonhole-chunk-store" }
 pigeonhole-storage-telegram = { path = "crates/storage/pigeonhole-storage-telegram" }
 pigeonhole-storage-discord = { path = "crates/storage/pigeonhole-storage-discord" }

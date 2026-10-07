@@ -39,6 +39,3 @@ pub use pigeonhole_blob::{
     DeleteOutcome, LegacyBlobStore, PinnedContent,
 };
 pub use pigeonhole_codec::{ByteBudget, ChunkCodec, BlockRecord};
-pub use pigeonhole_index::{Index, IndexSnapshot};
-// Re-export index helpers gateways need without taking a direct index dep.
-pub use pigeonhole_index::{parse_rfc3339, DeleteBucketResult, OrphanMsg, Chunk};

@@ -1,11 +1,11 @@
-//! Migrate legacy s3gram index rows into `blob.db` (stage 2.4 / E).
+//! Migrate legacy s3gram index blob rows into `blob.db` (stage E / F).
 
 use crate::blob_db::{BlobDb, Extent, StoredBlock};
 use crate::instances::{telegram_fingerprint, telegram_location, InstanceConfig};
 use anyhow::{Context, Result};
 use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole, BlobLocator};
-use pigeonhole_index::Index;
 use serde::Serialize;
+use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 
 #[derive(Debug, Default, Serialize)]
 pub struct MigrateReport {
@@ -18,12 +18,28 @@ pub struct MigrateReport {
     pub notes: Vec<String>,
 }
 
-/// Copy `blobs` / `chunk_blocks` / snapshot root from a legacy Index into BlobDb.
-///
-/// Each `(file_id, message_id)` becomes one `chunks` row + one `chunk_parts` row
-/// (`part_no = 0`) for `instance`.
+#[derive(sqlx::FromRow)]
+struct LegacyBlob {
+    file_id: String,
+    message_id: i64,
+    size: i64,
+    refcount: i64,
+    chat_id: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct LegacyFrame {
+    file_id: String,
+    block_no: i64,
+    stored_len: i64,
+    logical_off: i64,
+    logical_len: i64,
+    codec: String,
+}
+
+/// Copy `blobs` / `chunk_blocks` / snapshot root from a legacy index DB into BlobDb.
 pub async fn migrate_index_to_blob_db(
-    index: &Index,
+    legacy_database_url: &str,
     blob_db: &BlobDb,
     instance: &InstanceConfig,
     dry_run: bool,
@@ -33,12 +49,38 @@ pub async fn migrate_index_to_blob_db(
         ..Default::default()
     };
 
-    let snap = index.export_snapshot().await.context("export legacy index")?;
+    let url = if legacy_database_url.starts_with("sqlite:") && !legacy_database_url.contains('?') {
+        format!("{legacy_database_url}?mode=rwc")
+    } else {
+        legacy_database_url.to_string()
+    };
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .with_context(|| format!("connect legacy index {url}"))?;
+
+    let blobs = sqlx::query_as::<_, LegacyBlob>(
+        "SELECT file_id, message_id, size, refcount, chat_id FROM blobs",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+
+    let frames = sqlx::query_as::<_, LegacyFrame>(
+        r#"
+        SELECT file_id, block_no, stored_len, logical_off, logical_len, codec
+        FROM chunk_blocks
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+
     report.notes.push(format!(
-        "legacy snapshot: {} objects, {} blob rows, {} frame rows",
-        snap.objects.len(),
-        snap.blobs.len(),
-        snap.chunk_blocks.len()
+        "legacy: {} blob rows, {} frame rows",
+        blobs.len(),
+        frames.len()
     ));
 
     if !dry_run {
@@ -50,7 +92,7 @@ pub async fn migrate_index_to_blob_db(
 
     let mut file_to_blob: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
-    for b in &snap.blobs {
+    for b in &blobs {
         report.blobs += 1;
         report.replicas += 1;
         if dry_run {
@@ -78,7 +120,7 @@ pub async fn migrate_index_to_blob_db(
                 &instance.info.id,
                 0,
                 0,
-                0, // updated after blocks
+                0,
                 &stored.key,
                 &stored.locator,
             )
@@ -88,7 +130,7 @@ pub async fn migrate_index_to_blob_db(
 
     let mut by_file: std::collections::HashMap<String, Vec<StoredBlock>> =
         std::collections::HashMap::new();
-    for fr in &snap.chunk_blocks {
+    for fr in &frames {
         report.frames += 1;
         by_file.entry(fr.file_id.clone()).or_default().push(StoredBlock {
             block_no: fr.block_no,
@@ -119,7 +161,7 @@ pub async fn migrate_index_to_blob_db(
         }
     }
 
-    if let Some(fid) = index.get_meta("snapshot_file_id").await? {
+    if let Some(fid) = get_meta(&pool, "snapshot_file_id").await? {
         if fid.is_empty() || fid == "-" {
             report.notes.push("no snapshot_file_id meta".into());
         } else if let Some(&chunk_id) = file_to_blob.get(&fid) {
@@ -151,6 +193,15 @@ pub async fn migrate_index_to_blob_db(
     }
 
     Ok(report)
+}
+
+async fn get_meta(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+    Ok(row.map(|r| r.0))
 }
 
 /// Build a default telegram/memory instance for migration from legacy config fields.
@@ -190,27 +241,49 @@ pub fn default_instance_for_migrate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pigeonhole_index::Index;
+
+    async fn legacy_pool(url: &str) -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .connect(url)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE blobs (
+                file_id TEXT PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                refcount INTEGER NOT NULL,
+                chat_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
 
     #[tokio::test]
     async fn dry_run_counts_legacy_blobs() {
         let dir = tempfile::tempdir().unwrap();
         let idx_url = format!("sqlite:{}?mode=rwc", dir.path().join("i.db").display());
         let blob_url = format!("sqlite:{}?mode=rwc", dir.path().join("b.db").display());
-        let index = Index::connect(&idx_url).await.unwrap();
+        let pool = legacy_pool(&idx_url).await;
         sqlx::query(
             r#"
             INSERT INTO blobs (file_id, message_id, size, refcount, chat_id)
             VALUES ('fid-1', 42, 100, 1, '-100')
             "#,
         )
-        .execute(index.pool())
+        .execute(&pool)
         .await
         .unwrap();
 
         let blob_db = BlobDb::connect(&blob_url).await.unwrap();
         let inst = default_instance_for_migrate(InstanceKind::Memory, "", "local").unwrap();
-        let report = migrate_index_to_blob_db(&index, &blob_db, &inst, true)
+        let report = migrate_index_to_blob_db(&idx_url, &blob_db, &inst, true)
             .await
             .unwrap();
         assert_eq!(report.blobs, 1);
@@ -223,21 +296,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let idx_url = format!("sqlite:{}?mode=rwc", dir.path().join("i.db").display());
         let blob_url = format!("sqlite:{}?mode=rwc", dir.path().join("b.db").display());
-        let index = Index::connect(&idx_url).await.unwrap();
+        let pool = legacy_pool(&idx_url).await;
         sqlx::query(
             r#"
             INSERT INTO blobs (file_id, message_id, size, refcount, chat_id)
             VALUES ('snap-fid', 7, 50, 1, '')
             "#,
         )
-        .execute(index.pool())
+        .execute(&pool)
         .await
         .unwrap();
-        index.set_meta("snapshot_file_id", "snap-fid").await.unwrap();
+        sqlx::query("INSERT INTO meta (key, value) VALUES ('snapshot_file_id', 'snap-fid')")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let blob_db = BlobDb::connect(&blob_url).await.unwrap();
         let inst = default_instance_for_migrate(InstanceKind::Memory, "", "local").unwrap();
-        let report = migrate_index_to_blob_db(&index, &blob_db, &inst, false)
+        let report = migrate_index_to_blob_db(&idx_url, &blob_db, &inst, false)
             .await
             .unwrap();
         assert_eq!(report.blobs, 1);

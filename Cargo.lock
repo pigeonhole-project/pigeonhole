@@ -1982,7 +1982,6 @@ dependencies = [
  "pigeonhole-codec",
  "pigeonhole-gateway-bytestream",
  "pigeonhole-gateway-s3",
- "pigeonhole-index",
  "pigeonhole-storage-discord",
  "pigeonhole-storage-memory",
  "pigeonhole-storage-telegram",
@@ -2034,7 +2033,6 @@ dependencies = [
  "moka",
  "pigeonhole-blob",
  "pigeonhole-codec",
- "pigeonhole-index",
  "pigeonhole-storage-memory",
  "pigeonhole-types",
  "serde",
@@ -2070,6 +2068,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "flate2",
  "futures",
  "hex",
  "pigeonhole-chunk-store",
@@ -2100,36 +2099,25 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "chrono",
+ "flate2",
  "futures",
  "hex",
  "http",
  "md-5 0.10.6",
  "pigeonhole-chunk-store",
  "pigeonhole-codec",
+ "pigeonhole-storage-memory",
  "pigeonhole-types",
  "s3s",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "pigeonhole-index"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "pigeonhole-codec",
- "pigeonhole-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
