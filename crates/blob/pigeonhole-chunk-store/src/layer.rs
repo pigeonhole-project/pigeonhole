@@ -669,6 +669,32 @@ mod tests {
     use pigeonhole_storage_memory::MemoryBlobStore;
     use pigeonhole_types::BackendLimits;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_ingests_do_not_collide_sort_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+        let layer = Arc::new(open_memory_chunk_store(&url).await.unwrap());
+        let mut joins = Vec::new();
+        for i in 0..32u8 {
+            let layer = layer.clone();
+            joins.push(tokio::spawn(async move {
+                let body = Bytes::from(vec![i; 256 * 1024]);
+                layer
+                    .ingest(
+                        stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]),
+                        None,
+                    )
+                    .await
+                    .map(|ing| (ing, body))
+            }));
+        }
+        for j in joins {
+            let (ing, body) = j.await.unwrap().expect("concurrent ingest");
+            let got = layer.read(&ing.extents, None).await.unwrap();
+            assert_eq!(got, body);
+        }
+    }
+
     #[tokio::test]
     async fn ingest_read_retain_release_root() {
         let dir = tempfile::tempdir().unwrap();
