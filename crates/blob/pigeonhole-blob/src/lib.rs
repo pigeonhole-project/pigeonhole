@@ -5,7 +5,9 @@ mod bootstrap;
 pub mod cache;
 pub mod erase;
 pub mod metrics;
+pub mod part_packer;
 pub mod rate_limit;
+pub mod replicated;
 pub mod typed;
 pub use backend::{
     bytes_stream, collect_stream, locator_for_store_file_id, slice_range, store_delete_message,
@@ -15,7 +17,12 @@ pub use bootstrap::BootstrapPointer;
 pub use cache::{CacheConfig, CacheMetrics, CachedBlob, CachingBackend};
 pub use erase::{erase, erase_sweep, DynBlobBackend, DynSweep, Erased, ErasedSweep, SharedBackend};
 pub use metrics::{spawn_metrics_logger, BackendMetrics};
+pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
 pub use rate_limit::{ChatLimiter, ChatLimiterConfig, LimitBudget};
+pub use replicated::{
+    CheapestFirst, ChunkReplicaWriter, InstanceId, PartLayout, ReplicaLayout, ReplicaSelector,
+    Replicated,
+};
 pub use typed::{
     load_id, store_id, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
     BlobLocator, Sweepable, BlobBackend, TypedBootstrapPointer,
