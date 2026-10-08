@@ -14,6 +14,30 @@ use std::collections::HashSet;
 /// Internal integer chunk id (row in `chunks`).
 pub type ChunkId = i64;
 
+/// Chunk lifecycle for reclaim races with `retain`.
+pub const CHUNK_STATE_LIVE: &str = "live";
+pub const CHUNK_STATE_RECLAIMING: &str = "reclaiming";
+
+/// `retain` failed because the chunk is missing, `refs = 0`, or already reclaiming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkGone {
+    pub chunk_id: ChunkId,
+}
+
+impl std::fmt::Display for ChunkGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "chunk {} gone", self.chunk_id)
+    }
+}
+
+impl std::error::Error for ChunkGone {}
+
+/// True when `err` (or a cause) is [`ChunkGone`].
+pub fn is_chunk_gone(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ChunkGone>().is_some()
+        || err.chain().any(|c| c.downcast_ref::<ChunkGone>().is_some())
+}
+
 /// Logical byte range within a chunk (`offset`/`len` are logical bytes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Extent {
@@ -105,20 +129,28 @@ impl BlobDb {
                 crc32 INTEGER NOT NULL,
                 refs INTEGER NOT NULL DEFAULT 0,
                 block_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'live'
             )
             "#,
         )
         .execute(&self.pool)
         .await?;
 
-        // Upgrade pre-E chunks: size → logical_size, add block_count.
+        // Upgrade pre-E chunks: size → logical_size, add block_count / state.
         Self::rename_column_if_exists(&self.pool, "chunks", "size", "logical_size").await?;
         Self::add_column_if_missing(
             &self.pool,
             "chunks",
             "block_count",
             "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        Self::add_column_if_missing(
+            &self.pool,
+            "chunks",
+            "state",
+            "TEXT NOT NULL DEFAULT 'live'",
         )
         .await?;
 
@@ -697,23 +729,59 @@ impl BlobDb {
         Ok(())
     }
 
+    /// Atomically bump refs for every id. Fails with [`ChunkGone`] (and rolls back)
+    /// if any chunk is missing, has `refs = 0`, or is `reclaiming`.
     pub async fn retain(&self, ids: &[i64]) -> Result<()> {
-        for id in ids {
-            sqlx::query("UPDATE chunks SET refs = refs + 1 WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        if ids.is_empty() {
+            return Ok(());
         }
+        let mut tx = self.pool.begin().await?;
+        for &id in ids {
+            let res = sqlx::query(
+                r#"
+                UPDATE chunks
+                SET refs = refs + 1
+                WHERE id = ? AND refs > 0 AND state = 'live'
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() != 1 {
+                // Explicit rollback before returning typed error.
+                tx.rollback().await.ok();
+                pigeonhole_blob::record_chunk_gone();
+                return Err(anyhow::Error::new(ChunkGone { chunk_id: id }));
+            }
+        }
+        tx.commit().await?;
         Ok(())
     }
 
+    /// Decrement refs; errors on double-release (`refs` already 0 / missing / reclaiming).
     pub async fn release(&self, ids: &[i64]) -> Result<()> {
-        for id in ids {
-            sqlx::query("UPDATE chunks SET refs = MAX(refs - 1, 0) WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        if ids.is_empty() {
+            return Ok(());
         }
+        let mut tx = self.pool.begin().await?;
+        for &id in ids {
+            let res = sqlx::query(
+                r#"
+                UPDATE chunks
+                SET refs = refs - 1
+                WHERE id = ? AND refs > 0 AND state = 'live'
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() != 1 {
+                tx.rollback().await.ok();
+                pigeonhole_blob::record_double_release();
+                anyhow::bail!("double release or missing chunk {id}");
+            }
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -922,7 +990,7 @@ impl BlobDb {
             SELECT p.sort_key
             FROM chunk_parts p
             INNER JOIN chunks c ON c.id = p.chunk_id
-            WHERE p.instance_id = ? AND c.refs > 0
+            WHERE p.instance_id = ? AND c.refs > 0 AND c.state = 'live'
             "#,
         )
         .bind(instance_id)
@@ -931,7 +999,7 @@ impl BlobDb {
         Ok(rows.into_iter().map(|(k,)| k).collect())
     }
 
-    /// Which of `keys` belong to live (`refs > 0`) chunks on this instance.
+    /// Which of `keys` belong to live (`refs > 0`, `state = live`) chunks on this instance.
     /// Used by the sweeper per-batch (never cache across batches).
     pub async fn live_part_keys_among(
         &self,
@@ -954,7 +1022,8 @@ impl BlobDb {
             SELECT p.sort_key
             FROM chunk_parts p
             INNER JOIN chunks c ON c.id = p.chunk_id
-            WHERE p.instance_id = ? AND c.refs > 0 AND p.sort_key IN ({placeholders})
+            WHERE p.instance_id = ? AND c.refs > 0 AND c.state = 'live'
+              AND p.sort_key IN ({placeholders})
             "#
         );
         let mut q = sqlx::query_as::<_, (Vec<u8>,)>(&sql).bind(instance_id);
@@ -965,13 +1034,44 @@ impl BlobDb {
         Ok(rows.into_iter().map(|(k,)| k).collect())
     }
 
-    /// Chunk ids with `refs = 0` (physical reclaim candidates).
+    /// Chunk ids ready for reclaim: `refs = 0` and still `live`, plus crash leftovers
+    /// already marked `reclaiming`.
     pub async fn list_zero_ref_chunks(&self) -> Result<Vec<ChunkId>> {
-        let rows: Vec<(i64,)> =
-            sqlx::query_as("SELECT id FROM chunks WHERE refs = 0 ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT id FROM chunks
+            WHERE (refs = 0 AND state = 'live') OR state = 'reclaiming'
+            ORDER BY id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Atomically mark a zero-ref live chunk as reclaiming. Returns false if another
+    /// worker won the race or `retain` revived the chunk.
+    pub async fn try_begin_reclaim(&self, chunk_id: ChunkId) -> Result<bool> {
+        let res = sqlx::query(
+            r#"
+            UPDATE chunks
+            SET state = 'reclaiming'
+            WHERE id = ? AND refs = 0 AND state = 'live'
+            "#,
+        )
+        .bind(chunk_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 1 {
+            return Ok(true);
+        }
+        // Already reclaiming (restart path)?
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT state FROM chunks WHERE id = ?")
+                .bind(chunk_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(matches!(row.as_ref().map(|(s,)| s.as_str()), Some(CHUNK_STATE_RECLAIMING)))
     }
 
     /// Delete chunk_parts, chunk_blocks, and the chunk row (after backend deletes).
@@ -1167,8 +1267,9 @@ mod tests {
         .unwrap();
         let root = db.get_root("s3/index").await.unwrap().unwrap();
         assert_eq!(root[0].chunk, id2);
-        db.release(&[id2]).await.unwrap();
         db.retain(&[id2]).await.unwrap();
+        db.release(&[id2]).await.unwrap();
+        assert_eq!(db.chunk_meta(id2).await.unwrap().unwrap().2, 1);
     }
 
     #[tokio::test]
@@ -1345,5 +1446,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn reclaim_then_retain_returns_chunk_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+        let db = BlobDb::connect(&url).await.unwrap();
+        let info = InstanceInfo {
+            id: "mem".into(),
+            kind: InstanceKind::Memory,
+            fingerprint: "memory:mem".into(),
+            location: "memory:mem".into(),
+            role: InstanceRole::ReadWrite,
+        };
+        db.sync_instances(&[info]).await.unwrap();
+        let id = db
+            .commit_chunk(
+                8,
+                1,
+                &[],
+                &[ReplicaLayout {
+                    instance: "mem".into(),
+                    parts: vec![PartLayout {
+                        first_block: 0,
+                        block_count: 1,
+                        locator: BlobLocator {
+                            key: vec![0, 0, 0, 0, 0, 0, 0, 1],
+                            locator: b"{}".to_vec(),
+                        },
+                        block_stored_lens: vec![8],
+                    }],
+                }],
+            )
+            .await
+            .unwrap();
+        db.release(&[id]).await.unwrap();
+        assert!(db.try_begin_reclaim(id).await.unwrap());
+        let err = db.retain(&[id]).await.unwrap_err();
+        assert!(is_chunk_gone(&err), "{err}");
+        // Multi-id: one reclaiming → none retained.
+        let id2 = db
+            .commit_chunk(
+                4,
+                2,
+                &[],
+                &[ReplicaLayout {
+                    instance: "mem".into(),
+                    parts: vec![PartLayout {
+                        first_block: 0,
+                        block_count: 1,
+                        locator: BlobLocator {
+                            key: vec![0, 0, 0, 0, 0, 0, 0, 2],
+                            locator: b"{}".to_vec(),
+                        },
+                        block_stored_lens: vec![4],
+                    }],
+                }],
+            )
+            .await
+            .unwrap();
+        let err = db.retain(&[id2, id]).await.unwrap_err();
+        assert!(is_chunk_gone(&err), "{err}");
+        let meta = db.chunk_meta(id2).await.unwrap().unwrap();
+        assert_eq!(meta.2, 1, "id2 refs must be unchanged after rolled-back retain");
+    }
+
+    #[tokio::test]
+    async fn double_release_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+        let db = BlobDb::connect(&url).await.unwrap();
+        let info = InstanceInfo {
+            id: "mem".into(),
+            kind: InstanceKind::Memory,
+            fingerprint: "memory:mem".into(),
+            location: "memory:mem".into(),
+            role: InstanceRole::ReadWrite,
+        };
+        db.sync_instances(&[info]).await.unwrap();
+        let id = db
+            .commit_chunk(
+                1,
+                1,
+                &[],
+                &[ReplicaLayout {
+                    instance: "mem".into(),
+                    parts: vec![PartLayout {
+                        first_block: 0,
+                        block_count: 0,
+                        locator: BlobLocator {
+                            key: vec![1],
+                            locator: b"{}".to_vec(),
+                        },
+                        block_stored_lens: vec![],
+                    }],
+                }],
+            )
+            .await
+            .unwrap();
+        db.release(&[id]).await.unwrap();
+        let err = db.release(&[id]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("double release"),
+            "{err}"
+        );
     }
 }

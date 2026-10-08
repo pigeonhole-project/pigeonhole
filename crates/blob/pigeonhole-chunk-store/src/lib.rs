@@ -11,7 +11,7 @@ pub mod migrate;
 pub mod repair;
 pub mod sweep;
 
-pub use blob_db::{BlobDb, StoredBlock};
+pub use blob_db::{is_chunk_gone, BlobDb, ChunkGone, StoredBlock};
 pub use config::{
     BackendKind, BytestreamSettings, Config, HttpSettings, MetricsSettings, PlacementConfig,
 };

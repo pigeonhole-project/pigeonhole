@@ -95,17 +95,24 @@ impl CasStore {
 
     pub async fn put_bytes(&self, hash_hex: &str, size: i64, data: Bytes) -> Result<()> {
         verify_sha256(&data, hash_hex, size)?;
-        if self.cas.get(hash_hex, size).await?.is_some() {
-            let entry = self.cas.get(hash_hex, size).await?.unwrap();
+        if let Some(entry) = self.cas.get(hash_hex, size).await? {
             let ids: Vec<_> = {
                 let mut ids: Vec<_> = entry.extents.iter().map(|e| e.chunk).collect();
                 ids.sort_unstable();
                 ids.dedup();
                 ids
             };
-            self.store.retain(&ids).await?;
-            let _ = self.cas.touch(hash_hex, size).await;
-            return Ok(());
+            match self.store.retain(&ids).await {
+                Ok(()) => {
+                    let _ = self.cas.touch(hash_hex, size).await;
+                    return Ok(());
+                }
+                Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) => {
+                    // Index pointed at a reclaiming/gone chunk — drop stale row and re-ingest.
+                    let _ = self.cas.release(hash_hex, size).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
         let stream = futures::stream::iter(std::iter::once(Ok::<_, anyhow::Error>(data)));
         self.put_stream(hash_hex, size, stream).await
@@ -119,17 +126,25 @@ impl CasStore {
         S: futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin + Send,
     {
         if let Some(existing) = self.cas.get(hash_hex, size).await? {
-            let mut stream = stream;
-            while stream.next().await.is_some() {}
             let ids: Vec<_> = {
                 let mut ids: Vec<_> = existing.extents.iter().map(|e| e.chunk).collect();
                 ids.sort_unstable();
                 ids.dedup();
                 ids
             };
-            self.store.retain(&ids).await?;
-            let _ = self.cas.touch(hash_hex, size).await;
-            return Ok(());
+            match self.store.retain(&ids).await {
+                Ok(()) => {
+                    let mut stream = stream;
+                    while stream.next().await.is_some() {}
+                    let _ = self.cas.touch(hash_hex, size).await;
+                    return Ok(());
+                }
+                Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) => {
+                    let _ = self.cas.release(hash_hex, size).await;
+                    // Fall through: consume is deferred — re-ingest from the same stream.
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let mut opts = IngestOptions::new(self.chunk_size, ChunkCodec::Zstd);

@@ -206,6 +206,9 @@ impl Sweeper {
         let chunks = self.db.list_zero_ref_chunks().await?;
         let mut n = 0u64;
         for chunk_id in chunks {
+            if !self.db.try_begin_reclaim(chunk_id).await? {
+                continue;
+            }
             let layouts = self.db.get_replica_layouts(chunk_id).await?;
             for layout in &layouts {
                 let Some(backend) = self

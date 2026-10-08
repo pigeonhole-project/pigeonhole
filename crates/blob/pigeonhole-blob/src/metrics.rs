@@ -78,6 +78,18 @@ pub fn describe_metrics() {
         "pigeonhole_replica_selected_total",
         "Replica instances chosen for reads"
     );
+    metrics::describe_counter!(
+        "pigeonhole_sweep_inflight_protected_total",
+        "Sweep candidates skipped because InflightParts held them"
+    );
+    metrics::describe_counter!(
+        "pigeonhole_chunk_gone_total",
+        "retain failed because chunk was reclaiming or missing"
+    );
+    metrics::describe_counter!(
+        "pigeonhole_double_release_total",
+        "release called on a chunk with refs already 0"
+    );
 }
 
 pub fn record_gateway_request(gateway: &str, outcome: &str, d: Duration) {
@@ -191,7 +203,18 @@ pub fn record_parts_per_chunk(instance: &str, parts: usize) {
     .record(parts as f64);
 }
 
+pub fn record_chunk_gone() {
+    metrics::counter!("pigeonhole_chunk_gone_total").increment(1);
+}
+
+pub fn record_double_release() {
+    metrics::counter!("pigeonhole_double_release_total").increment(1);
+}
+
 pub fn record_sweep(outcome: &str, n: u64) {
+    if outcome == "inflight_protected" {
+        metrics::counter!("pigeonhole_sweep_inflight_protected_total").increment(n);
+    }
     if n == 0 {
         return;
     }

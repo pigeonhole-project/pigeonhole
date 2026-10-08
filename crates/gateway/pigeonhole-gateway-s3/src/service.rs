@@ -62,10 +62,18 @@ impl S3gram {
         if ids.is_empty() {
             return Ok(());
         }
-        self.store.retain(ids).await.map_err(Self::map_err)
+        self.store.retain(ids).await.map_err(Self::map_retain_err)
     }
 
     fn map_err(e: impl std::fmt::Display) -> s3s::S3Error {
+        s3_error!(InternalError, "{}", e)
+    }
+
+    /// Copy / UploadPartCopy: a chunk reclaimed under us looks like a missing source.
+    fn map_retain_err(e: anyhow::Error) -> s3s::S3Error {
+        if pigeonhole_chunk_store::is_chunk_gone(&e) {
+            return s3_error!(NoSuchKey, "source chunk gone during copy");
+        }
         s3_error!(InternalError, "{}", e)
     }
 

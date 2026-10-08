@@ -156,6 +156,13 @@ pub struct CheckpointBlob {
     pub refs: i64,
     pub block_count: i64,
     pub created_at: String,
+    /// `live` | `reclaiming`; absent in format-1 checkpoints → treated as live.
+    #[serde(default = "default_chunk_state")]
+    pub state: String,
+}
+
+fn default_chunk_state() -> String {
+    "live".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,20 +204,21 @@ impl BlobDb {
         })
         .collect();
 
-        let blobs = sqlx::query_as::<_, (i64, i64, i64, i64, i64, String)>(
-            "SELECT id, logical_size, crc32, refs, block_count, created_at FROM chunks",
+        let blobs = sqlx::query_as::<_, (i64, i64, i64, i64, i64, String, String)>(
+            "SELECT id, logical_size, crc32, refs, block_count, created_at, state FROM chunks",
         )
         .fetch_all(self.pool())
         .await?
         .into_iter()
         .map(
-            |(id, logical_size, crc32, refs, block_count, created_at)| CheckpointBlob {
+            |(id, logical_size, crc32, refs, block_count, created_at, state)| CheckpointBlob {
                 id,
                 logical_size,
                 crc32,
                 refs,
                 block_count,
                 created_at,
+                state,
             },
         )
         .collect();
@@ -317,10 +325,15 @@ impl BlobDb {
             .await?;
         }
         for b in &cp.blobs {
+            let state = if b.state.is_empty() {
+                "live"
+            } else {
+                b.state.as_str()
+            };
             sqlx::query(
                 r#"
-                INSERT INTO chunks (id, logical_size, crc32, refs, block_count, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO chunks (id, logical_size, crc32, refs, block_count, created_at, state)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(b.id)
@@ -329,6 +342,7 @@ impl BlobDb {
             .bind(b.refs)
             .bind(b.block_count)
             .bind(&b.created_at)
+            .bind(state)
             .execute(&mut *tx)
             .await?;
         }
