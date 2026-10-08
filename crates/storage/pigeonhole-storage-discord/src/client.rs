@@ -791,7 +791,7 @@ impl DiscordClient {
         if let Some(att) = msg.attachments.into_iter().next() {
             return Ok(Some(PinnedContent::Document {
                 message_id: msg.id.as_i64(),
-                file_id: att.id.to_string(),
+                document_ref: att.id.to_string(),
             }));
         }
         Ok(None)

@@ -683,7 +683,7 @@ impl TelegramClient {
         if let Some(doc) = msg.document {
             return Ok(Some(PinnedContent::Document {
                 message_id: msg.message_id,
-                file_id: doc.file_id,
+                document_ref: doc.file_id,
             }));
         }
         Ok(None)

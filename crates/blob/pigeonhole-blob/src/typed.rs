@@ -88,7 +88,7 @@ pub struct InstanceInfo {
     /// Stable config name, e.g. `tg-main`.
     pub id: String,
     pub kind: InstanceKind,
-    /// Opaque fingerprint string, e.g. `tg:{bot_id}:{chat_id}`.
+    /// Opaque fingerprint string, e.g. `tg:{bot_id}:{scope}`.
     pub fingerprint: String,
     /// Location key for uniqueness of writers, e.g. `tg:chat:-100…`.
     pub location: String,

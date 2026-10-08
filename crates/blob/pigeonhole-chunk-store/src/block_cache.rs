@@ -17,7 +17,7 @@ struct BlockKey {
 
 pub struct BlockCache {
     cache: Cache<BlockKey, Bytes>,
-    /// Secondary index for GC invalidation by file_id / blob key.
+    /// Secondary index for GC invalidation by blob key.
     by_blob: Mutex<HashMap<BlobKey, Vec<u32>>>,
     hits: AtomicU64,
     misses: AtomicU64,

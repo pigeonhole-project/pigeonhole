@@ -14,13 +14,6 @@ pub enum DeleteOutcome {
     Failed,
 }
 
-/// Content of a chat/channel bootstrap pin (manifest pointer).
-#[derive(Debug, Clone)]
-pub enum PinnedContent {
-    Text { message_id: i64, text: String },
-    Document { message_id: i64, file_id: String },
-}
-
 /// Stable backend identity, e.g. `tg:-100123` or `discord:987`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BackendId(pub String);
@@ -34,12 +27,12 @@ impl BackendId {
         &self.0
     }
 
-    pub fn telegram(chat_id: &str) -> Self {
-        Self::new("tg", chat_id)
+    pub fn telegram(scope: &str) -> Self {
+        Self::new("tg", scope)
     }
 
-    pub fn discord(channel_id: &str) -> Self {
-        Self::new("discord", channel_id)
+    pub fn discord(scope: &str) -> Self {
+        Self::new("discord", scope)
     }
 
     pub fn memory() -> Self {
@@ -59,65 +52,26 @@ impl AsRef<str> for BackendId {
     }
 }
 
-/// Opaque serializable blob locator for a specific backend.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Locator {
-    Telegram {
-        file_id: String,
-        message_id: i64,
-    },
-    Memory {
-        file_id: String,
-        message_id: i64,
-    },
-    Discord {
-        channel_id: String,
-        message_id: i64,
-        attachment_id: String,
-        url: String,
-    },
-    /// Forward-compatible opaque JSON for unknown backends / snapshots.
-    Other(serde_json::Value),
-}
-
-impl Locator {
-    pub fn memory(file_id: impl Into<String>, message_id: i64) -> Self {
-        Self::Memory {
-            file_id: file_id.into(),
-            message_id,
-        }
-    }
-
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
-    }
-
-    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(s)
-    }
-}
-
-/// Immutable blob identity used by caches (Stage 3.5+) and replica tables.
+/// Immutable cache key used by block caches (L1/L2).
 ///
-/// Today: `(backend_id, locator)`. Later: content-addressed `(sha256, size)`
-/// without changing cache key surfaces that store [`BlobKey`].
+/// Opaque `key` is backend-agnostic (e.g. `chunk-{id}`); physical blob
+/// addresses live in the blob layer (`BlobLocator`), not here.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlobKey {
     pub backend_id: BackendId,
-    pub locator: Locator,
+    pub key: String,
 }
 
 impl BlobKey {
-    pub fn new(backend_id: BackendId, locator: Locator) -> Self {
+    pub fn new(backend_id: BackendId, key: impl Into<String>) -> Self {
         Self {
             backend_id,
-            locator,
+            key: key.into(),
         }
     }
 }
 
-/// Optional byte range for [`crate`]-adjacent blob gets.
+/// Optional byte range for blob gets.
 pub type ByteRange = Range<u64>;
 
 /// Whether the backend can honour HTTP Range on download.

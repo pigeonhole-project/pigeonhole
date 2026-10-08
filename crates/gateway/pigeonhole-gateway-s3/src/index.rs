@@ -18,8 +18,8 @@ pub struct Index {
 pub struct Bucket {
     pub name: String,
     pub created_at: String,
-    #[serde(default)]
-    pub chat_id: String,
+    #[serde(default, alias = "chat_id")]
+    pub scope_id: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -139,12 +139,18 @@ impl Index {
             CREATE TABLE IF NOT EXISTS buckets (
                 name TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
-                chat_id TEXT NOT NULL DEFAULT ''
+                scope_id TEXT NOT NULL DEFAULT ''
             )
             "#,
         )
         .execute(&self.pool)
         .await?;
+        // Pre-F.3 column name.
+        if self.column_exists("buckets", "chat_id").await? {
+            let _ = sqlx::query("ALTER TABLE buckets RENAME COLUMN chat_id TO scope_id")
+                .execute(&self.pool)
+                .await;
+        }
 
         sqlx::query(
             r#"
@@ -276,38 +282,38 @@ impl Index {
         Ok(n > 0)
     }
 
-    pub async fn create_bucket(&self, name: &str, chat_id: &str) -> Result<bool> {
+    pub async fn create_bucket(&self, name: &str, scope_id: &str) -> Result<bool> {
         let created_at = Utc::now().to_rfc3339();
         let res = sqlx::query(
-            "INSERT OR IGNORE INTO buckets (name, created_at, chat_id) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO buckets (name, created_at, scope_id) VALUES (?, ?, ?)",
         )
         .bind(name)
         .bind(created_at)
-        .bind(chat_id)
+        .bind(scope_id)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
     }
 
-    pub async fn upsert_bucket(&self, name: &str, chat_id: &str) -> Result<()> {
+    pub async fn upsert_bucket(&self, name: &str, scope_id: &str) -> Result<()> {
         let created_at = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
-            INSERT INTO buckets (name, created_at, chat_id) VALUES (?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET chat_id = excluded.chat_id
+            INSERT INTO buckets (name, created_at, scope_id) VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET scope_id = excluded.scope_id
             "#,
         )
         .bind(name)
         .bind(created_at)
-        .bind(chat_id)
+        .bind(scope_id)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn bucket_chat_id(&self, name: &str) -> Result<Option<String>> {
+    pub async fn bucket_scope_id(&self, name: &str) -> Result<Option<String>> {
         let row: Option<(String,)> =
-            sqlx::query_as("SELECT chat_id FROM buckets WHERE name = ?")
+            sqlx::query_as("SELECT scope_id FROM buckets WHERE name = ?")
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -336,7 +342,7 @@ impl Index {
 
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>> {
         let rows = sqlx::query_as::<_, Bucket>(
-            "SELECT name, created_at, chat_id FROM buckets ORDER BY name",
+            "SELECT name, created_at, scope_id FROM buckets ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -862,11 +868,11 @@ impl Index {
 
         for b in &snap.buckets {
             sqlx::query(
-                "INSERT INTO buckets (name, created_at, chat_id) VALUES (?, ?, ?)",
+                "INSERT INTO buckets (name, created_at, scope_id) VALUES (?, ?, ?)",
             )
             .bind(&b.name)
             .bind(&b.created_at)
-            .bind(&b.chat_id)
+            .bind(&b.scope_id)
             .execute(&mut *tx)
             .await?;
         }

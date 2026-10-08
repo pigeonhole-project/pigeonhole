@@ -11,7 +11,7 @@ pub mod rate_limit;
 pub mod replicated;
 pub mod typed;
 pub use backend::{bytes_stream, collect_stream, slice_range, BoxByteStream};
-pub use bootstrap::BootstrapPointer;
+pub use bootstrap::{BootstrapPointer, PinnedContent};
 pub use cache::CacheConfig;
 pub use erase::{erase, erase_sweep, DynBlobBackend, DynSweep, Erased, ErasedSweep, SharedBackend};
 pub use inflight::{InflightGuard, InflightParts};
@@ -33,6 +33,5 @@ pub use typed::{
     BlobLocator, Sweepable, BlobBackend, TypedBootstrapPointer,
 };
 pub use pigeonhole_types::{
-    BackendId, BackendLimits, BlobKey, ByteRange, DeleteOutcome, Locator, PinnedContent,
-    RangeSupport,
+    BackendId, BackendLimits, BlobKey, ByteRange, DeleteOutcome, RangeSupport,
 };

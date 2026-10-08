@@ -391,14 +391,14 @@ impl TypedBootstrapPointer for DiscordBlobStore {
             Some(PinnedContent::Text { text, .. }) => Ok(Some(Bytes::from(text))),
             Some(PinnedContent::Document {
                 message_id,
-                file_id,
+                document_ref,
             }) => {
                 let data = self
                     .dc
                     .download_bytes(
                         &self.channel_id,
                         message_id,
-                        &file_id,
+                        &document_ref,
                         Some(self.limiter.as_ref()),
                     )
                     .await?;

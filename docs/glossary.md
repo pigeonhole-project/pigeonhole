@@ -17,6 +17,8 @@ Terms used in code, comments, and docs (Stage B onward).
 
 In code, **blob** means only a physical backend message. REAPI CAS “blobs” in the gateway are `CasEntry`.
 
+See also [sweep invariants](sweep-invariants.md) (`live` / `reclaiming`, in-flight parts, per-batch liveness).
+
 ```
 chunk (ChunkId, refs)
   ├─ blocks 0..N

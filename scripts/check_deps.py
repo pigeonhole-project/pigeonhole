@@ -131,6 +131,9 @@ def main() -> int:
                         f"allowed: {sorted(allowed) or 'crates.io only'}"
                     )
 
+    if strict:
+        errors.extend(scan_forbidden_lexemes())
+
     mode = "strict" if strict else "soft"
     if errors:
         print(f"check-deps ({mode}): FAILED", file=sys.stderr)
@@ -140,6 +143,58 @@ def main() -> int:
 
     print(f"check-deps ({mode}): ok ({len(packages)} workspace packages)")
     return 0
+
+
+# Backend-specific identifiers must stay inside storage-* (and bin/config).
+FORBIDDEN_LEXEMES = ("file_id", "chat_id", "channel_id")
+LEXEME_ALLOW_DIR_PREFIXES = (
+    "crates/storage/",
+    "crates/bin/",
+    "scripts/",
+    "docs/",
+    "compat/",
+    "tests/",
+)
+# Legacy config / migrate bridges still parse old TOML keys and s3gram columns.
+LEXEME_ALLOW_FILES = {
+    "crates/blob/pigeonhole-chunk-store/src/config.rs",
+    "crates/blob/pigeonhole-chunk-store/src/instances.rs",
+    "crates/blob/pigeonhole-chunk-store/src/migrate.rs",
+    # Only remaining mentions are ALTER RENAME of the legacy column + serde alias.
+    "crates/gateway/pigeonhole-gateway-s3/src/index.rs",
+}
+
+
+def scan_forbidden_lexemes() -> list[str]:
+    """Grep workspace Rust (non-storage) for Telegram/Discord field names."""
+    import os
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    crates = root / "crates"
+    found: list[str] = []
+    # Word-ish boundaries so we don't match e.g. unmatched_chat_identity in comments poorly;
+    # keep it simple: substring match on token-ish patterns.
+    patterns = {lex: re.compile(rf"\b{re.escape(lex)}\b") for lex in FORBIDDEN_LEXEMES}
+
+    for path in crates.rglob("*.rs"):
+        rel = path.relative_to(root).as_posix()
+        if any(rel.startswith(p) for p in LEXEME_ALLOW_DIR_PREFIXES):
+            continue
+        if rel in LEXEME_ALLOW_FILES:
+            continue
+        if "/target/" in rel:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for lex, rx in patterns.items():
+            if rx.search(text):
+                found.append(f"{rel}: forbidden lexeme `{lex}` outside storage-*/bin")
+                break
+    return found
 
 
 if __name__ == "__main__":

@@ -266,10 +266,10 @@ impl TypedBootstrapPointer for TelegramBlobStore {
         match self.tg.get_pinned_content(&self.chat_id).await? {
             None => Ok(None),
             Some(PinnedContent::Text { text, .. }) => Ok(Some(Bytes::from(text))),
-            Some(PinnedContent::Document { file_id, .. }) => {
+            Some(PinnedContent::Document { document_ref, .. }) => {
                 let data = self
                     .tg
-                    .download_file(&file_id, Some(self.limiter.as_ref()))
+                    .download_file(&document_ref, Some(self.limiter.as_ref()))
                     .await?;
                 Ok(Some(data))
             }

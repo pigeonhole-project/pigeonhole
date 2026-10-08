@@ -623,10 +623,10 @@ impl OpenChunk {
 }
 
 fn chunk_cache_key(chunk_id: ChunkId) -> pigeonhole_types::BlobKey {
-    use pigeonhole_types::{BackendId, Locator};
+    use pigeonhole_types::BackendId;
     pigeonhole_types::BlobKey::new(
         BackendId::new("chunk", &chunk_id.to_string()),
-        Locator::memory(format!("chunk-{chunk_id}"), chunk_id),
+        format!("chunk-{chunk_id}"),
     )
 }
 

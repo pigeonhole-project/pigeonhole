@@ -37,9 +37,10 @@ impl S3gram {
     }
 
     fn scope_id(&self) -> &str {
+        // Gateways use placement primary scope only (no legacy chat fallback).
         self.cfg
             .primary_scope_id()
-            .unwrap_or(self.cfg.chat_id.as_str())
+            .expect("config placement primary scope_id")
     }
 
     fn ingest_options(&self) -> IngestOptions {

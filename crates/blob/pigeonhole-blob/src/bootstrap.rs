@@ -1,6 +1,15 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use pigeonhole_types::PinnedContent;
+
+/// Content of a chat/channel bootstrap pin (legacy [`BootstrapPointer`] path).
+///
+/// Prefer [`crate::TypedBootstrapPointer`] (`Bytes` payloads) for new code.
+#[derive(Debug, Clone)]
+pub enum PinnedContent {
+    Text { message_id: i64, text: String },
+    /// `document_ref` is the opaque backend document handle (storage-specific).
+    Document { message_id: i64, document_ref: String },
+}
 
 /// Backend-agnostic bootstrap pin (Telegram pin / Discord pin).
 ///
@@ -8,7 +17,7 @@ use pigeonhole_types::PinnedContent;
 /// depends on a concrete chat backend.
 #[async_trait]
 pub trait BootstrapPointer: Send + Sync {
-    /// Stable scope id for pending-delete queues (`chat_id` / `channel_id`).
+    /// Stable scope id for pending-delete queues (instance scope).
     fn scope_id(&self) -> &str;
 
     async fn get_pinned(&self) -> Result<Option<PinnedContent>>;
