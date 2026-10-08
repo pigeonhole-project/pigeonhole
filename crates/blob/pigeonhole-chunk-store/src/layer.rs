@@ -132,7 +132,7 @@ impl ChunkStore {
             codec: "raw".into(),
         })
         .await?;
-        let layouts = w.finish().await?;
+        let sealed = w.finish().await?;
         let blocks = vec![StoredBlock {
             block_no: 0,
             logical_off: 0,
@@ -142,9 +142,11 @@ impl ChunkStore {
         }];
         let chunk_id = self
             .db
-            .commit_chunk(logical, crc, &blocks, &layouts)
+            .commit_chunk(logical, crc, &blocks, &sealed.layouts)
             .await?;
-        self.enqueue_missing_replicas(chunk_id, &layouts).await?;
+        self.enqueue_missing_replicas(chunk_id, &sealed.layouts)
+            .await?;
+        drop(sealed.inflight);
         Ok(chunk_id)
     }
 
@@ -579,7 +581,7 @@ impl ChunkStore {
         let logical = open.logical;
         open.logical = 0;
         let writer = std::mem::replace(&mut open.writer, self.replicated.chunk_writer());
-        let layouts = writer.finish().await.context("replicated finish chunk")?;
+        let sealed = writer.finish().await.context("replicated finish chunk")?;
         // CRC over stored concatenation is not the object CRC; use logical stream CRC
         // at ingest level. Per-chunk crc32: hash of block stored bytes.
         let mut h = crc32fast::Hasher::new();
@@ -590,9 +592,12 @@ impl ChunkStore {
         let crc = h.finalize();
         let chunk_id = self
             .db
-            .commit_chunk(logical, crc, &blocks, &layouts)
+            .commit_chunk(logical, crc, &blocks, &sealed.layouts)
             .await?;
-        self.enqueue_missing_replicas(chunk_id, &layouts).await?;
+        self.enqueue_missing_replicas(chunk_id, &sealed.layouts)
+            .await?;
+        // Release inflight protection only after chunk_parts are durable.
+        drop(sealed.inflight);
         Ok(Extent {
             chunk: chunk_id,
             offset: 0,

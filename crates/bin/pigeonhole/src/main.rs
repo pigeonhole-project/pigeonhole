@@ -283,11 +283,12 @@ fn spawn_background_tasks(
     }
 
     let members: Vec<_> = rt.store.replicated().members().to_vec();
-    let sweeper = Sweeper::new(
+    let sweeper = Sweeper::with_inflight(
         rt.store.db().clone(),
         rt.durability.clone(),
         members,
         cfg.sweep.clone(),
+        rt.store.replicated().inflight().clone(),
     );
     tokio::spawn(async move {
         sweeper.run_loop().await;

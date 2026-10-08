@@ -44,5 +44,8 @@ pub use sweep::{
     SweepConfig, SweepStats, Sweeper, WatermarkBackend, DEFAULT_SWEEP_GRACE, DEFAULT_SWEEP_INTERVAL,
     SWEEP_BATCH_SIZE,
 };
-pub use pigeonhole_blob::{collect_stream, BootstrapPointer, BoxByteStream, DeleteOutcome, PinnedContent};
+pub use pigeonhole_blob::{
+    collect_stream, BootstrapPointer, BoxByteStream, DeleteOutcome, InflightGuard, InflightParts,
+    PinnedContent,
+};
 pub use pigeonhole_codec::{ByteBudget, ChunkCodec, BlockRecord};

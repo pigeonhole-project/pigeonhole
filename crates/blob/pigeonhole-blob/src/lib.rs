@@ -4,6 +4,7 @@ mod backend;
 mod bootstrap;
 pub mod cache;
 pub mod erase;
+pub mod inflight;
 pub mod metrics;
 pub mod part_packer;
 pub mod rate_limit;
@@ -13,6 +14,7 @@ pub use backend::{bytes_stream, collect_stream, slice_range, BoxByteStream};
 pub use bootstrap::BootstrapPointer;
 pub use cache::CacheConfig;
 pub use erase::{erase, erase_sweep, DynBlobBackend, DynSweep, Erased, ErasedSweep, SharedBackend};
+pub use inflight::{InflightGuard, InflightParts};
 pub use metrics::{
     describe_metrics, inflight_dec, inflight_inc, record_429, record_bytes_from_backend,
     record_bytes_to_clients, record_cache, record_compression_ratio, record_gateway_request,
@@ -24,7 +26,7 @@ pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
 pub use rate_limit::{ChatLimiter, ChatLimiterConfig, LimitBudget};
 pub use replicated::{
     CheapestFirst, ChunkReplicaWriter, InstanceId, PartLayout, ReplicaLayout, ReplicaSelector,
-    Replicated,
+    Replicated, SealedChunk,
 };
 pub use typed::{
     load_id, store_id, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,

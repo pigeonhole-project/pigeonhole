@@ -476,8 +476,12 @@ impl Durability {
         self.pending.lock().await.push(op);
     }
 
-    /// Put `data` via Replicated as one raw block; return per-instance locators.
-    async fn put_replicated_parts(&self, data: Bytes) -> Result<InstanceParts> {
+    /// Put `data` via Replicated as one raw block; return locators + inflight guards.
+    /// Caller must hold guards until the superblock referencing these parts is published.
+    async fn put_replicated_parts(
+        &self,
+        data: Bytes,
+    ) -> Result<(InstanceParts, Vec<pigeonhole_blob::InflightGuard>)> {
         let len = data.len() as u32;
         let mut w = self.replicated.chunk_writer();
         w.push(EncodedBlock {
@@ -486,13 +490,13 @@ impl Durability {
             codec: "raw".into(),
         })
         .await?;
-        let layouts = w.finish().await?;
+        let sealed = w.finish().await?;
         let mut map = BTreeMap::new();
-        for layout in layouts {
+        for layout in sealed.layouts {
             let locs: Vec<BlobLocator> = layout.parts.into_iter().map(|p| p.locator).collect();
             map.insert(layout.instance, locs);
         }
-        Ok(map)
+        Ok((map, sealed.inflight))
     }
 
     async fn fetch_instance_parts(&self, parts: &InstanceParts) -> Result<Bytes> {
@@ -543,7 +547,7 @@ impl Durability {
         }
         let seg = JournalSegment { ops: ops.clone() };
         let bytes = Bytes::from(serde_json::to_vec(&seg).context("serialize journal segment")?);
-        let parts = self
+        let (parts, inflight) = self
             .put_replicated_parts(bytes)
             .await
             .context("put journal segment")?;
@@ -559,6 +563,7 @@ impl Durability {
             sb.seal()?
         };
         self.publish_all(sealed).await?;
+        drop(inflight);
         Ok(())
     }
 
@@ -569,7 +574,7 @@ impl Durability {
 
         let cp = db.export_checkpoint().await?;
         let bytes = Bytes::from(serde_json::to_vec(&cp).context("serialize checkpoint")?);
-        let parts = self
+        let (parts, inflight) = self
             .put_replicated_parts(bytes)
             .await
             .context("put checkpoint")?;
@@ -583,6 +588,7 @@ impl Durability {
             sb.seal()?
         };
         self.publish_all(sealed).await?;
+        drop(inflight);
         *self.last_checkpoint_at.lock().await = Some(std::time::Instant::now());
         Ok(())
     }

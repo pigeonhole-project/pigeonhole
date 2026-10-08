@@ -2,6 +2,7 @@
 
 use crate::backend::{bytes_stream, BoxByteStream};
 use crate::erase::DynBlobBackend;
+use crate::inflight::{InflightGuard, InflightParts};
 use crate::part_packer::{EncodedBlock, PartPacker, PartUploaded};
 use crate::typed::{BlobLocator, CostHint, OpKind};
 use anyhow::{bail, Result};
@@ -194,6 +195,16 @@ pub struct Replicated {
     write_quorum: usize,
     selector: Arc<dyn ReplicaSelector>,
     member_timeout: Duration,
+    /// Protects uploaded-but-not-yet-committed part keys from the sweeper.
+    inflight: Arc<InflightParts>,
+}
+
+/// Result of sealing one chunk: layouts plus guards held until DB / superblock commit.
+#[derive(Debug)]
+pub struct SealedChunk {
+    pub layouts: Vec<ReplicaLayout>,
+    /// Drop only after `commit_chunk` / superblock publish (or on failure → orphans).
+    pub inflight: Vec<InflightGuard>,
 }
 
 impl Replicated {
@@ -224,12 +235,23 @@ impl Replicated {
             write_quorum,
             selector,
             member_timeout: Duration::from_secs(60),
+            inflight: InflightParts::shared(),
         })
     }
 
     pub fn with_member_timeout(mut self, timeout: Duration) -> Self {
         self.member_timeout = timeout;
         self
+    }
+
+    /// Share an existing in-flight registry (binary: one per process with Sweeper).
+    pub fn with_inflight(mut self, inflight: Arc<InflightParts>) -> Self {
+        self.inflight = inflight;
+        self
+    }
+
+    pub fn inflight(&self) -> &Arc<InflightParts> {
+        &self.inflight
     }
 
     pub fn members(&self) -> &[Arc<dyn DynBlobBackend>] {
@@ -270,6 +292,8 @@ impl Replicated {
                 .collect(),
             write_quorum: self.write_quorum,
             timeout: self.member_timeout,
+            inflight: Arc::clone(&self.inflight),
+            guards: Vec::new(),
         }
     }
 
@@ -349,6 +373,8 @@ pub struct ChunkReplicaWriter {
     writers: Vec<MemberWriter>,
     write_quorum: usize,
     timeout: Duration,
+    inflight: Arc<InflightParts>,
+    guards: Vec<InflightGuard>,
 }
 
 impl ChunkReplicaWriter {
@@ -385,18 +411,22 @@ impl ChunkReplicaWriter {
         }
 
         for (i, packer, result) in futures::future::join_all(tasks).await {
-            let w = &mut self.writers[i];
-            w.packer = Some(packer);
+            let instance = self.writers[i].instance.clone();
+            self.writers[i].packer = Some(packer);
             match result {
-                Ok(Ok(Some(part))) => w.parts.push(part.into()),
+                Ok(Ok(Some(part))) => {
+                    let guard = self.inflight.guard(&instance, part.locator.key.clone());
+                    self.guards.push(guard);
+                    self.writers[i].parts.push(part.into());
+                }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
-                    debug!(instance = %w.instance, error = %e, "member push failed");
-                    w.failed = true;
+                    debug!(instance = %instance, error = %e, "member push failed");
+                    self.writers[i].failed = true;
                 }
                 Err(_) => {
-                    debug!(instance = %w.instance, "member push timed out");
-                    w.failed = true;
+                    debug!(instance = %instance, "member push timed out");
+                    self.writers[i].failed = true;
                 }
             }
         }
@@ -404,7 +434,10 @@ impl ChunkReplicaWriter {
     }
 
     /// Flush remaining parts; return layouts only for members that uploaded all parts.
-    pub async fn finish(mut self) -> Result<Vec<ReplicaLayout>> {
+    ///
+    /// Hold [`SealedChunk::inflight`] until the chunk metadata (or superblock) is
+    /// committed; dropping early exposes parts to the sweeper as orphans.
+    pub async fn finish(mut self) -> Result<SealedChunk> {
         let timeout = self.timeout;
         let mut tasks = Vec::new();
         for (i, w) in self.writers.iter_mut().enumerate() {
@@ -421,17 +454,21 @@ impl ChunkReplicaWriter {
         }
 
         for (i, result) in futures::future::join_all(tasks).await {
-            let w = &mut self.writers[i];
+            let instance = self.writers[i].instance.clone();
             match result {
-                Ok(Ok(Some(part))) => w.parts.push(part.into()),
+                Ok(Ok(Some(part))) => {
+                    let guard = self.inflight.guard(&instance, part.locator.key.clone());
+                    self.guards.push(guard);
+                    self.writers[i].parts.push(part.into());
+                }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
-                    debug!(instance = %w.instance, error = %e, "member finish failed");
-                    w.failed = true;
+                    debug!(instance = %instance, error = %e, "member finish failed");
+                    self.writers[i].failed = true;
                 }
                 Err(_) => {
-                    debug!(instance = %w.instance, "member finish timed out");
-                    w.failed = true;
+                    debug!(instance = %instance, "member finish timed out");
+                    self.writers[i].failed = true;
                 }
             }
         }
@@ -447,13 +484,17 @@ impl ChunkReplicaWriter {
             }
         }
         if ok.len() < self.write_quorum {
+            // Drop guards → parts become sweep orphans.
             bail!(
                 "write quorum not met: {} successful replicas, need {}",
                 ok.len(),
                 self.write_quorum
             );
         }
-        Ok(ok)
+        Ok(SealedChunk {
+            layouts: ok,
+            inflight: self.guards,
+        })
     }
 }
 
@@ -877,7 +918,7 @@ mod tests {
         for b in blocks {
             w.push(b.clone()).await?;
         }
-        w.finish().await
+        Ok(w.finish().await?.layouts)
     }
 
     #[tokio::test]
@@ -977,9 +1018,9 @@ mod tests {
         let mut w = rep.chunk_writer();
         w.push(block(1, 6000)).await.unwrap();
         w.push(block(2, 6000)).await.unwrap(); // b fails on 2nd put
-        let layouts = w.finish().await.unwrap();
-        assert_eq!(layouts.len(), 1);
-        assert_eq!(layouts[0].instance, "a");
+        let sealed = w.finish().await.unwrap();
+        assert_eq!(sealed.layouts.len(), 1);
+        assert_eq!(sealed.layouts[0].instance, "a");
     }
 
     #[tokio::test]

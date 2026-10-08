@@ -208,12 +208,16 @@ impl Repairer {
 
         let mut packer = PartPacker::new(target.clone());
         let mut parts: Vec<PartLayout> = Vec::new();
+        let mut inflight = Vec::new();
+        let inflight_reg = self.replicated.inflight().clone();
         for block in encoded {
             if let Some(part) = packer.push(block).await.context("repair packer push")? {
+                inflight.push(inflight_reg.guard(instance_id, part.locator.key.clone()));
                 parts.push(part.into());
             }
         }
         if let Some(part) = packer.finish().await.context("repair packer finish")? {
+            inflight.push(inflight_reg.guard(instance_id, part.locator.key.clone()));
             parts.push(part.into());
         }
         if parts.is_empty() {
@@ -229,6 +233,7 @@ impl Repairer {
             .await
             .context("commit repaired replica")?;
         self.db.dequeue_repair(chunk_id, instance_id).await?;
+        drop(inflight);
         debug!(
             chunk_id,
             instance = %instance_id,

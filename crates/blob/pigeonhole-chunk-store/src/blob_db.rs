@@ -9,6 +9,7 @@ use pigeonhole_blob::{InstanceInfo, PartLayout, ReplicaLayout, BlobLocator};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
+use std::collections::HashSet;
 
 /// Internal integer chunk id (row in `chunks`).
 pub type ChunkId = i64;
@@ -927,6 +928,40 @@ impl BlobDb {
         .bind(instance_id)
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows.into_iter().map(|(k,)| k).collect())
+    }
+
+    /// Which of `keys` belong to live (`refs > 0`) chunks on this instance.
+    /// Used by the sweeper per-batch (never cache across batches).
+    pub async fn live_part_keys_among(
+        &self,
+        instance_id: &str,
+        keys: &[Vec<u8>],
+    ) -> Result<HashSet<Vec<u8>>> {
+        if keys.is_empty() {
+            return Ok(HashSet::new());
+        }
+        // SQLite: bind each key; chunk size is sweep batch (≤100).
+        let mut placeholders = String::new();
+        for i in 0..keys.len() {
+            if i > 0 {
+                placeholders.push(',');
+            }
+            placeholders.push('?');
+        }
+        let sql = format!(
+            r#"
+            SELECT p.sort_key
+            FROM chunk_parts p
+            INNER JOIN chunks c ON c.id = p.chunk_id
+            WHERE p.instance_id = ? AND c.refs > 0 AND p.sort_key IN ({placeholders})
+            "#
+        );
+        let mut q = sqlx::query_as::<_, (Vec<u8>,)>(&sql).bind(instance_id);
+        for k in keys {
+            q = q.bind(k);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|(k,)| k).collect())
     }
 
