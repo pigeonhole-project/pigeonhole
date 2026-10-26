@@ -293,7 +293,7 @@ impl BlobDb {
         if cp.format != 2 && cp.format != 1 {
             bail!("unsupported checkpoint format {}", cp.format);
         }
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         for table in [
             "chunk_blocks",
             "chunk_parts",

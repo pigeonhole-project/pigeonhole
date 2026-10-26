@@ -480,7 +480,7 @@ impl BlobDb {
 
     /// Upsert configured instances; rows missing from config become `retired`.
     pub async fn sync_instances(&self, configured: &[InstanceInfo]) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing: Vec<(String,)> = sqlx::query_as("SELECT id FROM instances")
             .fetch_all(&mut *tx)
             .await?;
@@ -592,7 +592,7 @@ impl BlobDb {
         replicas: &[ReplicaLayout],
     ) -> Result<ChunkId> {
         let at = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let res = sqlx::query(
             r#"
             INSERT INTO chunks (logical_size, crc32, refs, block_count, created_at)
@@ -735,7 +735,7 @@ impl BlobDb {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for &id in ids {
             let res = sqlx::query(
                 r#"
@@ -763,7 +763,7 @@ impl BlobDb {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for &id in ids {
             let res = sqlx::query(
                 r#"
@@ -804,7 +804,7 @@ impl BlobDb {
     }
 
     pub async fn replace_blocks(&self, chunk_id: i64, blocks: &[StoredBlock]) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM chunk_blocks WHERE chunk_id = ?")
             .bind(chunk_id)
             .execute(&mut *tx)
@@ -1076,7 +1076,7 @@ impl BlobDb {
 
     /// Delete chunk_parts, chunk_blocks, and the chunk row (after backend deletes).
     pub async fn delete_chunk_metadata(&self, chunk_id: ChunkId) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM chunk_parts WHERE chunk_id = ?")
             .bind(chunk_id)
             .execute(&mut *tx)
@@ -1173,7 +1173,7 @@ impl BlobDb {
         chunk_id: ChunkId,
         layout: &ReplicaLayout,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM chunk_parts WHERE chunk_id = ? AND instance_id = ?")
             .bind(chunk_id)
             .bind(&layout.instance)

@@ -369,7 +369,7 @@ impl Index {
         user_meta: &[(String, String)],
         checksums_json: &str,
     ) -> Result<Vec<ChunkId>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let old_json: Option<(String,)> = sqlx::query_as(
             "SELECT extents_json FROM objects WHERE bucket = ? AND key = ?",
         )
@@ -512,7 +512,7 @@ impl Index {
         key: &str,
         tags: &[(String, String)],
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
             .bind(bucket)
             .bind(key)
@@ -544,7 +544,7 @@ impl Index {
 
     /// Delete object; returns extents' chunk ids to `release`, or `None` if missing.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<ChunkId>>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT extents_json FROM objects WHERE bucket = ? AND key = ?",
         )
@@ -855,7 +855,7 @@ impl Index {
     }
 
     pub async fn import_snapshot(&self, snap: &IndexSnapshot) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM multipart_uploads")
             .execute(&mut *tx)
             .await?;
@@ -978,7 +978,7 @@ impl Index {
         size: i64,
         extents: &[Extent],
     ) -> Result<Vec<ChunkId>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let old: Option<(String,)> = sqlx::query_as(
             "SELECT extents_json FROM multipart_parts WHERE upload_id = ? AND part_number = ?",
         )
@@ -1062,7 +1062,7 @@ impl Index {
         let tags: Vec<(String, String)> =
             serde_json::from_str(&upload.tagging_json).unwrap_or_default();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut assembled: Vec<Extent> = Vec::new();
         for pn in part_numbers {
             let row: Option<(String,)> = sqlx::query_as(
@@ -1166,7 +1166,7 @@ impl Index {
         if self.get_multipart_upload(upload_id).await?.is_none() {
             return Ok(None);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT extents_json FROM multipart_parts WHERE upload_id = ?",
         )

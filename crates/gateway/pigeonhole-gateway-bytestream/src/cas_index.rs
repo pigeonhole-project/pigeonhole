@@ -197,7 +197,7 @@ impl CasIndex {
 
     /// Remove CAS row; returns chunk ids to `release`.
     pub async fn release(&self, hash: &str, size: i64) -> Result<Vec<ChunkId>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT extents_json FROM cas_blobs WHERE hash = ? AND size = ?",
         )
@@ -271,7 +271,7 @@ impl CasIndex {
     }
 
     pub async fn import_entries(&self, entries: &[CasEntry]) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM cas_blobs")
             .execute(&mut *tx)
             .await?;
