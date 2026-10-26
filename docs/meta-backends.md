@@ -33,7 +33,8 @@ None of this is configurable: every deployment pays the send budget and gets the
 5. The sweeper's safety does not depend on which strategy is configured.
 
 Non-goals for the first iteration: engines other than SQLite; multiple writer
-processes; replicating metadata between nodes for availability.
+processes; replicating metadata between nodes for availability; backward
+compatibility with current configs or on-disk / in-chat formats.
 
 ## Model / Модель
 
@@ -160,14 +161,18 @@ ack = "local"
 meta = "cache"
 ```
 
-Legacy keys (`database_url`, `[snapshot].interval_secs`) map to a single backend `main`
-with `snapshot.to = "blob"` so existing configs keep working; the 5 s blob journal is
-dropped.
+No backward compatibility: `database_url`, `[snapshot]`, the superblock / checkpoint
+formats and the per-layer index snapshots are replaced, not aliased. Existing data
+directories and chats are not migrated.
 
 ## Migration plan / План переезда
 
 Each step is a separate commit with tests green.
 
+0. **Drop legacy compatibility code** that the new layout would otherwise drag along:
+   `migrate.rs` (pre-chunk-store index import, `pigeonhole migrate`), legacy config
+   aliases (`rate_per_sec`, `frame_*`, single-backend `chat_id` form), `serde` aliases
+   and defaults for old checkpoint / superblock formats, Stage-B table renames.
 1. **`MetaBackend` + namespaces.** Introduce the backend type (SQLite engine, commit
    mark, `durable_mark`, `wait_durable`); open `BlobDb`, S3 `Index`, `CasIndex` through
    it with prefixes. One shared file by default; `wal = none`, no snapshot.
