@@ -18,7 +18,6 @@ use tokio::sync::Semaphore;
 /// One independent frame inside a `frames` chunk document.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockRecord {
-    #[serde(alias = "frame_no")]
     pub block_no: i64,
     pub stored_off: i64,
     pub stored_len: i64,

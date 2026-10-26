@@ -159,8 +159,6 @@ LEXEME_ALLOW_DIR_PREFIXES = (
 LEXEME_ALLOW_FILES = {
     "crates/blob/pigeonhole-chunk-store/src/config.rs",
     "crates/blob/pigeonhole-chunk-store/src/instances.rs",
-    # Only remaining mentions are ALTER RENAME of the legacy column + serde alias.
-    "crates/gateway/pigeonhole-gateway-s3/src/index.rs",
 }
 
 

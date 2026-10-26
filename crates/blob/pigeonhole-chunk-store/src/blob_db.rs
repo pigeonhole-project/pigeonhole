@@ -62,6 +62,95 @@ pub struct StoredBlock {
     pub codec: String,
 }
 
+/// Current `blob.db` schema. No upgrades: an incompatible file is recreated by hand.
+const SCHEMA: &[&str] = &[
+    r#"
+    CREATE TABLE IF NOT EXISTS instances (
+        id TEXT PRIMARY KEY NOT NULL,
+        kind TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        location TEXT NOT NULL,
+        state TEXT NOT NULL
+    )
+    "#,
+    r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_instances_location_active
+    ON instances(location)
+    WHERE state = 'read-write'
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS chunks (
+        id INTEGER PRIMARY KEY NOT NULL,
+        logical_size INTEGER NOT NULL,
+        crc32 INTEGER NOT NULL,
+        refs INTEGER NOT NULL DEFAULT 0,
+        block_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'live'
+    )
+    "#,
+    // High-water mark for chunk ids. `chunks.id` is a plain INTEGER PRIMARY KEY,
+    // which SQLite re-issues once the highest row is deleted; ids must never be
+    // reused (block cache and extents are keyed by chunk id).
+    r#"
+    CREATE TABLE IF NOT EXISTS chunk_id_seq (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+        last INTEGER NOT NULL
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS chunk_blocks (
+        chunk_id INTEGER NOT NULL REFERENCES chunks(id),
+        block_no INTEGER NOT NULL,
+        logical_off INTEGER NOT NULL,
+        logical_len INTEGER NOT NULL,
+        stored_len INTEGER NOT NULL,
+        codec TEXT NOT NULL,
+        PRIMARY KEY (chunk_id, block_no)
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS chunk_parts (
+        chunk_id INTEGER NOT NULL REFERENCES chunks(id),
+        instance_id TEXT NOT NULL REFERENCES instances(id),
+        part_no INTEGER NOT NULL,
+        first_block INTEGER NOT NULL,
+        block_count INTEGER NOT NULL,
+        sort_key BLOB NOT NULL,
+        locator BLOB NOT NULL,
+        PRIMARY KEY (chunk_id, instance_id, part_no),
+        UNIQUE (instance_id, sort_key)
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS roots (
+        name TEXT PRIMARY KEY NOT NULL,
+        extents_json TEXT NOT NULL DEFAULT '[]'
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS put_watermarks (
+        instance_id TEXT NOT NULL,
+        at TEXT NOT NULL,
+        max_key BLOB NOT NULL
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS sweep_cursor (
+        instance_id TEXT PRIMARY KEY NOT NULL,
+        after BLOB
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS repair_queue (
+        chunk_id INTEGER NOT NULL REFERENCES chunks(id),
+        instance_id TEXT NOT NULL,
+        enqueued_at TEXT NOT NULL,
+        PRIMARY KEY (chunk_id, instance_id)
+    )
+    "#,
+];
+
 /// Allocate the next chunk id inside `tx` (which must hold the write lock).
 async fn next_chunk_id(tx: &mut sqlx::SqliteConnection) -> Result<ChunkId> {
     let (next,): (i64,) = sqlx::query_as(
@@ -103,420 +192,19 @@ impl BlobDb {
     }
 
     async fn migrate(&self) -> Result<()> {
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA busy_timeout = 5000")
-            .execute(&self.pool)
-            .await?;
-
-        // Stage B renames for existing DBs.
-        Self::rename_table_if_exists(&self.pool, "blobs", "chunks").await?;
-        Self::rename_table_if_exists(&self.pool, "replicas", "chunk_replicas").await?;
-        Self::rename_column_if_exists(&self.pool, "chunk_replicas", "blob_id", "chunk_id").await?;
-        Self::rename_column_if_exists(&self.pool, "chunk_blocks", "blob_id", "chunk_id").await?;
-        Self::rename_column_if_exists(&self.pool, "roots", "blob_id", "chunk_id").await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS instances (
-                id TEXT PRIMARY KEY NOT NULL,
-                kind TEXT NOT NULL,
-                fingerprint TEXT NOT NULL,
-                location TEXT NOT NULL,
-                state TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_instances_location_active
-            ON instances(location)
-            WHERE state = 'read-write'
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Create chunks with the stage-E shape when missing.
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY NOT NULL,
-                logical_size INTEGER NOT NULL,
-                crc32 INTEGER NOT NULL,
-                refs INTEGER NOT NULL DEFAULT 0,
-                block_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                state TEXT NOT NULL DEFAULT 'live'
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // High-water mark for chunk ids. `chunks.id` is a plain INTEGER PRIMARY KEY,
-        // which SQLite re-issues once the highest row is deleted; ids must never be
-        // reused (block cache and extents are keyed by chunk id).
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS chunk_id_seq (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
-                last INTEGER NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Upgrade pre-E chunks: size → logical_size, add block_count / state.
-        Self::rename_column_if_exists(&self.pool, "chunks", "size", "logical_size").await?;
-        Self::add_column_if_missing(
-            &self.pool,
-            "chunks",
-            "block_count",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-        .await?;
-        Self::add_column_if_missing(
-            &self.pool,
-            "chunks",
-            "state",
-            "TEXT NOT NULL DEFAULT 'live'",
-        )
-        .await?;
-
-        // Legacy single-replica table (migrated → chunk_parts below).
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS chunk_replicas (
-                chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-                instance_id TEXT NOT NULL REFERENCES instances(id),
-                sort_key BLOB NOT NULL,
-                locator BLOB NOT NULL,
-                PRIMARY KEY (chunk_id, instance_id),
-                UNIQUE (instance_id, sort_key)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Self::rename_table_if_exists(&self.pool, "chunk_frames", "chunk_blocks").await?;
-        Self::rename_column_if_exists(&self.pool, "chunk_blocks", "frame_no", "block_no").await?;
-
-        // Pre-E tables may still have a unused `stored_off` column; new installs omit it.
-        // Offsets inside a part are derived from sum(stored_len), not from this column.
-        if !Self::table_exists(&self.pool, "chunk_blocks").await? {
-            sqlx::query(
-                r#"
-                CREATE TABLE chunk_blocks (
-                    chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-                    block_no INTEGER NOT NULL,
-                    logical_off INTEGER NOT NULL,
-                    logical_len INTEGER NOT NULL,
-                    stored_len INTEGER NOT NULL,
-                    codec TEXT NOT NULL,
-                    PRIMARY KEY (chunk_id, block_no)
-                )
-                "#,
-            )
-            .execute(&self.pool)
-            .await?;
+        for pragma in [
+            "PRAGMA foreign_keys = ON",
+            "PRAGMA journal_mode = WAL",
+            "PRAGMA busy_timeout = 5000",
+        ] {
+            sqlx::query(pragma).execute(&self.pool).await?;
         }
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS chunk_parts (
-                chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-                instance_id TEXT NOT NULL REFERENCES instances(id),
-                part_no INTEGER NOT NULL,
-                first_block INTEGER NOT NULL,
-                block_count INTEGER NOT NULL,
-                sort_key BLOB NOT NULL,
-                locator BLOB NOT NULL,
-                PRIMARY KEY (chunk_id, instance_id, part_no),
-                UNIQUE (instance_id, sort_key)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        self.migrate_replicas_to_parts().await?;
-
-        // Fill block_count on chunks from chunk_blocks when still zero.
-        sqlx::query(
-            r#"
-            UPDATE chunks SET block_count = (
-                SELECT COUNT(*) FROM chunk_blocks b WHERE b.chunk_id = chunks.id
-            )
-            WHERE block_count = 0
-              AND EXISTS (SELECT 1 FROM chunk_blocks b WHERE b.chunk_id = chunks.id)
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        self.migrate_roots_to_extents().await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS put_watermarks (
-                instance_id TEXT NOT NULL,
-                at TEXT NOT NULL,
-                max_key BLOB NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS sweep_cursor (
-                instance_id TEXT PRIMARY KEY NOT NULL,
-                after BLOB
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS repair_queue (
-                chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-                instance_id TEXT NOT NULL,
-                enqueued_at TEXT NOT NULL,
-                PRIMARY KEY (chunk_id, instance_id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    async fn migrate_replicas_to_parts(&self) -> Result<()> {
-        let replicas_exist = Self::table_exists(&self.pool, "chunk_replicas").await?;
-        if !replicas_exist {
-            return Ok(());
-        }
-        let rows: Vec<(i64, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-            "SELECT chunk_id, instance_id, sort_key, locator FROM chunk_replicas",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        if rows.is_empty() {
-            return Ok(());
-        }
-        for (chunk_id, instance_id, sort_key, locator) in rows {
-            let block_count: (i64,) = sqlx::query_as(
-                "SELECT COALESCE((SELECT block_count FROM chunks WHERE id = ?), 0)",
-            )
-            .bind(chunk_id)
-            .fetch_one(&self.pool)
-            .await?;
-            let mut bc = block_count.0;
-            if bc == 0 {
-                let counted: (i64,) = sqlx::query_as(
-                    "SELECT COUNT(*) FROM chunk_blocks WHERE chunk_id = ?",
-                )
-                .bind(chunk_id)
-                .fetch_one(&self.pool)
-                .await?;
-                bc = counted.0;
-            }
-            // Legacy: one replica blob held all blocks → part_no 0.
-            sqlx::query(
-                r#"
-                INSERT OR IGNORE INTO chunk_parts
-                  (chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)
-                VALUES (?, ?, 0, 0, ?, ?, ?)
-                "#,
-            )
-            .bind(chunk_id)
-            .bind(&instance_id)
-            .bind(bc)
-            .bind(&sort_key)
-            .bind(&locator)
-            .execute(&self.pool)
-            .await?;
-        }
-        sqlx::query("DELETE FROM chunk_replicas")
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn migrate_roots_to_extents(&self) -> Result<()> {
-        if !Self::table_exists(&self.pool, "roots").await? {
-            sqlx::query(
-                r#"
-                CREATE TABLE roots (
-                    name TEXT PRIMARY KEY NOT NULL,
-                    extents_json TEXT NOT NULL DEFAULT '[]'
-                )
-                "#,
-            )
-            .execute(&self.pool)
-            .await?;
-            return Ok(());
-        }
-
-        if Self::column_exists(&self.pool, "roots", "extents_json").await?
-            && !Self::column_exists(&self.pool, "roots", "chunk_id").await?
-        {
-            return Ok(());
-        }
-
-        // In-place: add extents_json; legacy chunk_id column may remain unused.
-        Self::add_column_if_missing(
-            &self.pool,
-            "roots",
-            "extents_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )
-        .await?;
-
-        if Self::column_exists(&self.pool, "roots", "chunk_id").await? {
-            let rows: Vec<(String, i64, String)> = sqlx::query_as(
-                "SELECT name, chunk_id, extents_json FROM roots",
-            )
-            .fetch_all(&self.pool)
-            .await?;
-            for (name, chunk_id, json) in rows {
-                if json != "[]" && !json.is_empty() {
-                    continue;
-                }
-                let size: Option<(i64,)> =
-                    sqlx::query_as("SELECT logical_size FROM chunks WHERE id = ?")
-                        .bind(chunk_id)
-                        .fetch_optional(&self.pool)
-                        .await?;
-                let size = size.map(|s| s.0).unwrap_or(0);
-                let extents = vec![Extent {
-                    chunk: chunk_id,
-                    offset: 0,
-                    len: size,
-                }];
-                let new_json = serde_json::to_string(&extents)?;
-                sqlx::query("UPDATE roots SET extents_json = ? WHERE name = ?")
-                    .bind(&new_json)
-                    .bind(&name)
-                    .execute(&self.pool)
-                    .await?;
-            }
+        for ddl in SCHEMA {
+            sqlx::query(ddl).execute(&self.pool).await?;
         }
         Ok(())
     }
 
-    async fn table_exists(pool: &SqlitePool, name: &str) -> Result<bool> {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(name)
-        .fetch_optional(pool)
-        .await?;
-        Ok(exists.is_some())
-    }
-
-    async fn column_exists(pool: &SqlitePool, table: &str, col: &str) -> Result<bool> {
-        if !Self::table_exists(pool, table).await? {
-            return Ok(false);
-        }
-        let cols: Vec<(i64, String)> =
-            sqlx::query_as(&format!("SELECT cid, name FROM pragma_table_info('{table}')"))
-                .fetch_all(pool)
-                .await?;
-        Ok(cols.iter().any(|(_, n)| n == col))
-    }
-
-    async fn add_column_if_missing(
-        pool: &SqlitePool,
-        table: &str,
-        col: &str,
-        decl: &str,
-    ) -> Result<()> {
-        if Self::column_exists(pool, table, col).await? {
-            return Ok(());
-        }
-        if !Self::table_exists(pool, table).await? {
-            return Ok(());
-        }
-        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))
-            .execute(pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn rename_table_if_exists(
-        pool: &SqlitePool,
-        from: &str,
-        to: &str,
-    ) -> Result<()> {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(from)
-        .fetch_optional(pool)
-        .await?;
-        if exists.is_none() {
-            return Ok(());
-        }
-        let dest_exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(to)
-        .fetch_optional(pool)
-        .await?;
-        if dest_exists.is_some() {
-            return Ok(());
-        }
-        sqlx::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
-            .execute(pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn rename_column_if_exists(
-        pool: &SqlitePool,
-        table: &str,
-        from: &str,
-        to: &str,
-    ) -> Result<()> {
-        let table_exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(table)
-        .fetch_optional(pool)
-        .await?;
-        if table_exists.is_none() {
-            return Ok(());
-        }
-        let cols: Vec<(i64, String)> =
-            sqlx::query_as(&format!("SELECT cid, name FROM pragma_table_info('{table}')"))
-                .fetch_all(pool)
-                .await?;
-        let names: Vec<&str> = cols.iter().map(|(_, n)| n.as_str()).collect();
-        if !names.contains(&from) || names.contains(&to) {
-            return Ok(());
-        }
-        sqlx::query(&format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}"))
-            .execute(pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Upsert configured instances; rows missing from config become `retired`.
     pub async fn sync_instances(&self, configured: &[InstanceInfo]) -> Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing: Vec<(String,)> = sqlx::query_as("SELECT id FROM instances")
@@ -1334,161 +1022,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.0, "retired");
-    }
-
-    #[tokio::test]
-    async fn migrates_legacy_replicas_to_parts() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.db");
-        // Build a pre-E schema manually.
-        let url = format!("sqlite:{}?mode=rwc", path.display());
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE instances (
-                id TEXT PRIMARY KEY, kind TEXT, fingerprint TEXT, location TEXT, state TEXT
-            );
-            CREATE TABLE chunks (
-                id INTEGER PRIMARY KEY, size INTEGER, crc32 INTEGER, refs INTEGER, created_at TEXT
-            );
-            CREATE TABLE chunk_replicas (
-                chunk_id INTEGER, instance_id TEXT, sort_key BLOB, locator BLOB,
-                PRIMARY KEY (chunk_id, instance_id)
-            );
-            CREATE TABLE chunk_blocks (
-                chunk_id INTEGER, block_no INTEGER, stored_off INTEGER, stored_len INTEGER,
-                logical_off INTEGER, logical_len INTEGER, codec TEXT,
-                PRIMARY KEY (chunk_id, block_no)
-            );
-            CREATE TABLE roots (name TEXT PRIMARY KEY, chunk_id INTEGER);
-            INSERT INTO instances VALUES ('mem','memory','memory:m','memory:m','read-write');
-            INSERT INTO chunks VALUES (1, 100, 0, 1, 't');
-            INSERT INTO chunk_replicas VALUES (1, 'mem', x'01', x'02');
-            INSERT INTO chunk_blocks VALUES (1, 0, 0, 50, 0, 50, 'raw');
-            INSERT INTO chunk_blocks VALUES (1, 1, 50, 50, 50, 50, 'raw');
-            INSERT INTO roots VALUES ('s3/index', 1);
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        drop(pool);
-
-        let db = BlobDb::connect(&url).await.unwrap();
-        let layouts = db.get_replica_layouts(1).await.unwrap();
-        assert_eq!(layouts.len(), 1);
-        assert_eq!(layouts[0].parts.len(), 1);
-        assert_eq!(layouts[0].parts[0].first_block, 0);
-        assert_eq!(layouts[0].parts[0].block_count, 2);
-        assert_eq!(layouts[0].parts[0].block_stored_lens, vec![50, 50]);
-        let root = db.get_root("s3/index").await.unwrap().unwrap();
-        assert_eq!(root[0].chunk, 1);
-        assert_eq!(root[0].len, 100);
-        let blocks = db.get_blocks(1).await.unwrap();
-        assert_eq!(blocks.len(), 2);
-        // Legacy stored_off may remain; readers ignore it.
-    }
-
-    #[tokio::test]
-    async fn migrated_parts_are_readable_via_layer() {
-        use crate::ingest::IngestOptions;
-        use crate::layer::ChunkStore;
-        use pigeonhole_blob::{erase, CheapestFirst, Replicated};
-        use pigeonhole_codec::ChunkCodec;
-        use pigeonhole_storage_memory::MemoryBlobStore;
-        use pigeonhole_types::{BackendLimits, RangeSupport};
-        use std::sync::Arc;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.db");
-        let url = format!("sqlite:{}?mode=rwc", path.display());
-
-        // Seed legacy schema + one replica blob in memory store.
-        let store = MemoryBlobStore::with_limits(BackendLimits {
-            max_blob_size: 1024 * 1024,
-            supports_range: RangeSupport::BestEffort,
-            can_list: false,
-        })
-        .with_instance_id("mem");
-        let payload = bytes::Bytes::from(vec![3u8; 200]);
-        let id = {
-            use pigeonhole_blob::BlobBackend;
-            BlobBackend::put(&store, payload.clone()).await.unwrap()
-        };
-        let loc = pigeonhole_blob::store_id::<MemoryBlobStore>(&id).unwrap();
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE instances (
-                id TEXT PRIMARY KEY, kind TEXT, fingerprint TEXT, location TEXT, state TEXT
-            );
-            CREATE TABLE chunks (
-                id INTEGER PRIMARY KEY, size INTEGER, crc32 INTEGER, refs INTEGER, created_at TEXT
-            );
-            CREATE TABLE chunk_replicas (
-                chunk_id INTEGER, instance_id TEXT, sort_key BLOB, locator BLOB,
-                PRIMARY KEY (chunk_id, instance_id)
-            );
-            CREATE TABLE chunk_blocks (
-                chunk_id INTEGER, block_no INTEGER, stored_off INTEGER, stored_len INTEGER,
-                logical_off INTEGER, logical_len INTEGER, codec TEXT,
-                PRIMARY KEY (chunk_id, block_no)
-            );
-            CREATE TABLE roots (name TEXT PRIMARY KEY, chunk_id INTEGER);
-            INSERT INTO instances VALUES ('mem','memory','memory:mem','memory:mem','read-write');
-            INSERT INTO chunks VALUES (1, 200, 0, 1, 't');
-            INSERT INTO chunk_blocks VALUES (1, 0, 0, 200, 0, 200, 'raw');
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO chunk_replicas (chunk_id, instance_id, sort_key, locator) VALUES (1, 'mem', ?, ?)",
-        )
-        .bind(&loc.key)
-        .bind(&loc.locator)
-        .execute(&pool)
-        .await
-        .unwrap();
-        drop(pool);
-
-        let db = BlobDb::connect(&url).await.unwrap();
-        let layouts = db.get_replica_layouts(1).await.unwrap();
-        assert_eq!(layouts[0].parts.len(), 1);
-
-        let rep = Arc::new(
-            Replicated::new(
-                vec![Arc::new(erase(store))],
-                1,
-                Arc::new(CheapestFirst::new()),
-            )
-            .unwrap(),
-        );
-        let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
-        opts.block_size = 64 * 1024;
-        let layer = ChunkStore::open_replicated(db, rep, opts).await.unwrap();
-        let got = layer
-            .read(
-                &[Extent {
-                    chunk: 1,
-                    offset: 0,
-                    len: 200,
-                }],
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(got, payload);
     }
 
     #[tokio::test]

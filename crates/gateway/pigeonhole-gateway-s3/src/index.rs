@@ -18,7 +18,6 @@ pub struct Index {
 pub struct Bucket {
     pub name: String,
     pub created_at: String,
-    #[serde(default, alias = "chat_id")]
     pub scope_id: String,
 }
 
@@ -159,13 +158,6 @@ impl Index {
         )
         .execute(&self.pool)
         .await?;
-        // Pre-F.3 column name.
-        if self.column_exists("buckets", "chat_id").await? {
-            let _ = sqlx::query("ALTER TABLE buckets RENAME COLUMN chat_id TO scope_id")
-                .execute(&self.pool)
-                .await;
-        }
-
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS objects (
@@ -184,21 +176,6 @@ impl Index {
         )
         .execute(&self.pool)
         .await?;
-
-        if !self.column_exists("objects", "extents_json").await? {
-            sqlx::query(
-                "ALTER TABLE objects ADD COLUMN extents_json TEXT NOT NULL DEFAULT '[]'",
-            )
-            .execute(&self.pool)
-            .await?;
-        }
-        if !self.column_exists("objects", "checksums_json").await? {
-            sqlx::query(
-                "ALTER TABLE objects ADD COLUMN checksums_json TEXT NOT NULL DEFAULT '{}'",
-            )
-            .execute(&self.pool)
-            .await?;
-        }
 
         sqlx::query(
             r#"
@@ -264,14 +241,6 @@ impl Index {
         .execute(&self.pool)
         .await?;
 
-        if !self.column_exists("multipart_parts", "extents_json").await? {
-            sqlx::query(
-                "ALTER TABLE multipart_parts ADD COLUMN extents_json TEXT NOT NULL DEFAULT '[]'",
-            )
-            .execute(&self.pool)
-            .await?;
-        }
-
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS meta (
@@ -284,16 +253,6 @@ impl Index {
         .await?;
 
         Ok(())
-    }
-
-    async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
-        let (n,): (i64,) = sqlx::query_as(&format!(
-            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?"
-        ))
-        .bind(column)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(n > 0)
     }
 
     pub async fn create_bucket(&self, name: &str, scope_id: &str) -> Result<bool> {

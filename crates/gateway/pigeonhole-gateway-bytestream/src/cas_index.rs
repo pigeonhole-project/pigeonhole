@@ -69,11 +69,6 @@ impl CasIndex {
         .execute(&self.pool)
         .await?;
 
-        // Drop legacy pending-delete queue (stage G: GC releases directly).
-        let _ = sqlx::query("DROP TABLE IF EXISTS pending_cas_deletes")
-            .execute(&self.pool)
-            .await;
-
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS meta (

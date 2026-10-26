@@ -54,7 +54,7 @@ impl ChunkCodec {
             "raw" | "none" | "off" => Ok(Self::Raw),
             "gzip" | "gz" => Ok(Self::Gzip),
             "zstd" | "zst" => Ok(Self::Zstd),
-            "blocks" | "block" | "frames" | "frame" => Ok(Self::Blocks),
+            "blocks" => Ok(Self::Blocks),
             other => bail!("unknown chunk codec {other:?}; expected raw|gzip|zstd|blocks"),
         }
     }
@@ -129,7 +129,6 @@ mod tests {
         assert_eq!(ChunkCodec::parse("raw").unwrap(), ChunkCodec::Raw);
         assert_eq!(ChunkCodec::parse("GZIP").unwrap(), ChunkCodec::Gzip);
         assert_eq!(ChunkCodec::parse("zstd").unwrap(), ChunkCodec::Zstd);
-        assert_eq!(ChunkCodec::parse("frames").unwrap(), ChunkCodec::Blocks);
         assert_eq!(ChunkCodec::parse("none").unwrap(), ChunkCodec::Raw);
         assert!(ChunkCodec::parse("lz4").is_err());
     }

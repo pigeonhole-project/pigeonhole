@@ -68,12 +68,8 @@ impl Superblock {
 
     pub fn parse(data: &[u8]) -> Result<Self> {
         let sb: Superblock = serde_json::from_slice(data).context("parse superblock JSON")?;
-        if sb.format != SUPERBLOCK_FORMAT && sb.format != 1 {
+        if sb.format != SUPERBLOCK_FORMAT {
             bail!("unsupported superblock format {}", sb.format);
-        }
-        // Format 1 used flat locator lists + ChunkId roots — reject for E writers.
-        if sb.format == 1 {
-            bail!("superblock format 1 is no longer supported; restore via migrate");
         }
         let mut check = sb.clone();
         check.sha256.clear();
@@ -134,12 +130,10 @@ pub struct CheckpointPayload {
     pub instances: Vec<CheckpointInstance>,
     pub blobs: Vec<CheckpointBlob>,
     pub parts: Vec<CheckpointPart>,
-    #[serde(alias = "frames")]
     pub blocks: Vec<CheckpointBlock>,
     pub roots: Vec<(String, Vec<Extent>)>,
     /// Highest chunk id ever issued (`chunk_id_seq`), so a restore never re-issues
-    /// ids of chunks reclaimed before the checkpoint. 0 in older checkpoints.
-    #[serde(default)]
+    /// ids of chunks reclaimed before the checkpoint.
     pub chunk_id_seq: i64,
 }
 
@@ -160,13 +154,8 @@ pub struct CheckpointBlob {
     pub refs: i64,
     pub block_count: i64,
     pub created_at: String,
-    /// `live` | `reclaiming`; absent in format-1 checkpoints → treated as live.
-    #[serde(default = "default_chunk_state")]
+    /// `live` | `reclaiming`.
     pub state: String,
-}
-
-fn default_chunk_state() -> String {
-    "live".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,7 +172,6 @@ pub struct CheckpointPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointBlock {
     pub chunk_id: ChunkId,
-    #[serde(alias = "frame_no")]
     pub block_no: i64,
     pub logical_off: i64,
     pub logical_len: i64,
@@ -300,24 +288,22 @@ impl BlobDb {
 
     /// Replace local tables with a checkpoint (empty DB or `--force` path).
     pub async fn import_checkpoint(&self, cp: &CheckpointPayload) -> Result<()> {
-        if cp.format != 2 && cp.format != 1 {
+        if cp.format != 2 {
             bail!("unsupported checkpoint format {}", cp.format);
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         for table in [
             "chunk_blocks",
             "chunk_parts",
-            "chunk_replicas",
             "roots",
             "chunks",
             "put_watermarks",
             "sweep_cursor",
             "instances",
         ] {
-            // chunk_replicas may be empty leftover; ignore missing.
-            let _ = sqlx::query(&format!("DELETE FROM {table}"))
+            sqlx::query(&format!("DELETE FROM {table}"))
                 .execute(&mut *tx)
-                .await;
+                .await?;
         }
         for i in &cp.instances {
             sqlx::query(
@@ -335,11 +321,6 @@ impl BlobDb {
             .await?;
         }
         for b in &cp.blobs {
-            let state = if b.state.is_empty() {
-                "live"
-            } else {
-                b.state.as_str()
-            };
             sqlx::query(
                 r#"
                 INSERT INTO chunks (id, logical_size, crc32, refs, block_count, created_at, state)
@@ -352,7 +333,7 @@ impl BlobDb {
             .bind(b.refs)
             .bind(b.block_count)
             .bind(&b.created_at)
-            .bind(state)
+            .bind(&b.state)
             .execute(&mut *tx)
             .await?;
         }
