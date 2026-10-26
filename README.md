@@ -23,8 +23,8 @@ Objects are split into **chunks** (default on-wire ≤ 19 MiB, hard cap
 `< 20 MiB` for Telegram `getFile`). Chunk encoding is `raw` | `gzip` | `zstd`
 (default `zstd`): compressing policies pack independent 1 MiB **blocks** into
 backend messages so each block is compressed once and Range reads only touch
-the blocks they need. Chunks are content-addressed and refcounted, so
-`CopyObject` and repeated uploads do not re-send bytes.
+the blocks they need. Chunks are refcounted, so `CopyObject` shares the
+source's chunks instead of re-sending bytes (there is no content dedup).
 
 A chunk can have **replicas** on several **instances** (bot + chat/channel,
 Telegram and/or Discord). A background repair task re-replicates
