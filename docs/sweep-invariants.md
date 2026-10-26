@@ -28,7 +28,7 @@ drop both land between the two reads, and a live part is deleted.
 
 `WatermarkBackend`’s per-`put` grace timeout only bounds a single upload; it does **not** replace `InflightParts` for the window from the first part of a chunk until commit.
 
-The guard is registered only after the part's `put` returns, while the put watermark is recorded inside the put. The sweep grace must therefore be non-zero: it covers the gap between the watermark and the guard.
+The guard is registered only after the part's `put` returns, and that return waits for the put watermark to be written to SQLite. Meanwhile a *later* key's watermark (stamped before its own write waited on the lock) can already make this key a sweep candidate. The sweep grace must therefore exceed upload latency plus watermark-write latency; the default 15 minutes does by a wide margin, a few milliseconds does not.
 
 ## Chunk refcount lifecycle / Жизненный цикл чанка
 
