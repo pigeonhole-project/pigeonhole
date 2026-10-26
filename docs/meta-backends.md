@@ -1,6 +1,7 @@
-# Metadata backends / Бэкенды метаданных
+# Metadata as a replicated state machine / Метаданные как RSM
 
-Status: **proposal** (not implemented).
+Status: **proposal** (not implemented). No backward compatibility: configs, on-disk and
+in-chat formats are replaced, existing data is not migrated.
 
 ## Problem / Проблема
 
@@ -12,185 +13,198 @@ also carry **metadata durability**, hard-wired into the chunk store:
   Telegram chat whose whole budget is ~20/min;
 - the journal records only `SetRoot`, so chunk commits / retain / release are durable
   only at the next checkpoint. A restore after disk loss can find a root pointing at a
-  chunk that is not in the checkpoint, and the sweeper then deletes the parts of every
+  chunk missing from the checkpoint, and the sweeper then deletes the parts of every
   chunk committed after it;
-- the S3 index and the CAS index are snapshotted separately (roots `s3/index`,
-  `cas/index`) on their own schedule, so after a restore the layers disagree.
-
-None of this is configurable: every deployment pays the send budget and gets the same
-(weak) guarantees.
+- the S3 and CAS indexes are snapshotted separately (roots `s3/index`, `cas/index`) on
+  their own schedule, so after a restore the layers disagree.
 
 ## Goals / Цели
 
-1. Blob backends store data. Writing metadata there is an **option** of a metadata
-   backend, never a requirement of the chunk store.
-2. Durability of metadata (WAL or not, where it is shipped, snapshot period and
-   target) is configured per metadata backend.
-3. Each layer keeps its own metadata interface; layers stay independent
-   (`check-deps.sh --strict`).
-4. Several layers can be configured onto **one** metadata backend, and then they are
-   persisted and restored together, as of one point in time.
-5. The sweeper's safety does not depend on which strategy is configured.
+1. Blob backends store data only. Metadata durability is a property of the metadata
+   subsystem, configured independently.
+2. Every metadata change is a typed **command**; metadata state is the result of
+   applying the command log in order — a replicated state machine (RSM).
+3. One node first; adding nodes later is a membership change, not a redesign.
+4. Each layer keeps its own commands, schema and queries; layers stay independent
+   (`check-deps.sh --strict`). Several layers may share one state machine and are then
+   persisted and restored together.
+5. Sweeper safety is defined against the RSM commit index, independent of cluster size.
 
-Non-goals for the first iteration: engines other than SQLite; multiple writer
-processes; replicating metadata between nodes for availability; backward
-compatibility with current configs or on-disk / in-chat formats.
+Non-goals for now: storage engines other than SQLite; sharding metadata (multi-raft);
+follower reads.
 
 ## Model / Модель
 
 ```
- layer interfaces (unchanged ownership)          metadata backend (new)
- ┌──────────────────────────┐                    ┌─────────────────────────────┐
- │ chunk-store: ChunkMeta   │──┐                 │ engine: SQLite file         │
- │  chunks, parts, refs,    │  │  namespace      │ durability:                 │
- │  roots, sweep state      │  ├───────────────► │   wal:      none | ship(..) │
- ├──────────────────────────┤  │                 │   snapshot: none | every(..)│
- │ gateway-s3: S3Index      │──┤                 │             to = path | blob│
- ├──────────────────────────┤  │                 │ marks: current(), durable() │
- │ gateway-bytestream: Cas  │──┘                 └─────────────────────────────┘
- └──────────────────────────┘
+ gateway / chunk-store code
+   │  propose(Command)            read queries (SQL on local SQLite)
+   ▼                                   ▲
+ ┌───────────────────────── MetaGroup (one raft group) ──────────────────────────┐
+ │ OpenRaft                                                                      │
+ │  RaftLogStorage   — command log on local disk (proto-encoded entries)         │
+ │  RaftStateMachine — apply(entry) → SQL in one transaction per entry           │
+ │                     snapshot = consistent copy of the SQLite file             │
+ │  RaftNetwork      — gRPC (tonic) between nodes; unused with one node          │
+ └───────────────────────────────────────────────────────────────────────────────┘
+        │ snapshot export (optional): dir / S3 / blob backend (rare, e.g. hourly)
 ```
 
-- A **metadata backend** (`MetaBackend`) = one storage engine + one durability
-  strategy. It is named in config and opened once.
-- A **layer** opens its store on a backend under a **namespace** (table prefix or an
-  attached schema, e.g. `chunk_`, `s3_`, `cas_`; today S3 and CAS both own a `meta`
-  table). The layer still owns its schema, queries and migrations.
-- Layers that share a backend share one SQLite file and one durability stream, so a
-  snapshot or a WAL position covers all of them at once.
+- **Command** — a proto message, one per state transition, one SQLite transaction on
+  apply. Commands are **deterministic**: everything that must be identical on every
+  replica (chunk ids, timestamps, locators) is chosen by the proposer and carried in the
+  command; `apply` never generates ids or reads the clock.
+- **Namespaces** — each layer owns its tables under a prefix (`chunk_`, `s3_`, `cas_`;
+  today S3 and CAS both have a `meta` table) and its command set in its own proto
+  package. The group dispatches an entry to the layer that owns its command.
+- **Reads** go to the local SQLite of the node that serves the request. With one node
+  this is simply the database; with several, writes and reads go to the leader (see
+  Distribution).
+- **Durability** is "committed by a quorum of the group". With one node that is the
+  local log fsync; snapshot export adds a copy that survives losing the node.
 
-### Durability strategies / Стратегии
+### Commands / Команды (first cut)
 
-| Setting | Meaning | Typical use |
-|---|---|---|
-| `wal = none` | Only the local file. Durable on local disk, lost with it. | dev, caches (CAS) |
-| `wal = { ship_to = "<dir or s3 url>" }` | Ship SQLite WAL frames continuously (Litestream-style) to a target that is **not** the blob backend. | production |
-| `snapshot = { every_secs, to = "<dir or s3 url>" }` | Full consistent copy on a schedule. | backup, bounded WAL replay |
-| `snapshot = { every_secs, to = "blob", via = "<instance>" }` | Today's mechanism: snapshot as chunks + pinned pointer in a blob instance. Rare by design (e.g. hourly). | last-resort bootstrap from the chat alone |
+```proto
+// proto/pigeonhole/meta/v1/chunk.proto
+message CommitChunk { int64 chunk_id = 1; int64 logical_size = 2; uint32 crc32 = 3;
+                      repeated Block blocks = 4; repeated ReplicaLayout replicas = 5;
+                      int64 created_at_ms = 6; }
+message Retain      { repeated int64 chunk_ids = 1; }   // all-or-nothing
+message Release     { repeated int64 chunk_ids = 1; }
+message BeginReclaim{ int64 chunk_id = 1; }             // live, refs=0 → reclaiming
+message DropChunk   { int64 chunk_id = 1; }             // after backend deletes
+message AddReplica  { int64 chunk_id = 1; ReplicaLayout replica = 2; }  // repair
+message SetRoot     { string name = 1; repeated Extent extents = 2; }
+message SyncInstances { repeated Instance instances = 1; }
 
-Strategies combine: `wal.ship_to` + an hourly `snapshot.to = "blob"` gives ~1 s RPO from
-the WAL target and a fallback that needs nothing but the chat. There is no per-5 s
-journal in the blob backend any more.
+// proto/pigeonhole/meta/v1/s3.proto
+message PutObject   { ObjectRow object = 1; }           // returns old chunk ids
+message DeleteObject{ string bucket = 1; string key = 2; }
+message CopyObject  { ... }  message PutPart { ... }  message CompleteUpload { ... }
+message CreateBucket{ ... }  message DeleteBucket { ... }  message PutTags { ... }
 
-### Durability marks / Метки надёжности
+// proto/pigeonhole/meta/v1/cas.proto
+message PutCasEntry { ... }  message DropCasEntry { ... }  message TouchCasEntry { ... }
+```
 
-The backend keeps a monotonically increasing **commit mark** (one counter row bumped in
-every write transaction, shared by all namespaces on the backend).
+Commands that can fail on state (`Retain` on a reclaiming chunk, `Release` below zero,
+`CreateBucket` that exists) fail **deterministically** in `apply` and return a typed
+error in the response; every replica reaches the same result.
 
-- `current_mark()` — mark of the latest local commit.
-- `durable_mark()` — highest mark that would survive losing the local disk:
-  - `wal = none`, no snapshot → equals `current_mark()` (the disk is the durability);
-  - `wal.ship_to` → mark of the last shipped WAL frame;
-  - snapshot only → mark at the start of the last completed snapshot.
-- `wait_durable(mark)` — resolves once `durable_mark() ≥ mark` (immediate for `none`;
-  for snapshot-only it may wait for the next snapshot — callers use it only where that
-  is acceptable).
+Cross-layer atomicity stays as today (e.g. gateway `PutObject` and chunk `Release` of
+the old chunks are separate commands). On a shared group a batch command can make them
+atomic later.
 
 ## Contracts / Контракты
 
-### Sweeper (chunk store)
+### Sweeper and other side effects / Побочные эффекты
 
-Deleting backend data must never run ahead of the metadata that makes it garbage.
+Deleting from the blob backend is a side effect outside the state machine.
 
-- `release` that drops a chunk to `refs = 0` stores the commit mark in the chunk row
-  (`zero_mark`).
-- Reclaim considers only chunks with `zero_mark ≤ durable_mark()` of the chunk store's
-  backend. After a restore, a chunk is therefore either still referenced or its
-  zero-ref state was durable — its parts are never deleted while a durable reference
-  to them can come back.
-- Orphan sweep (keys on the blob backend unknown to metadata) runs only when the
-  metadata is known to be complete up to the listing: after a restore, the sweeper
-  stays in reclaim-only mode until reconciliation (below) has finished.
-
-With `wal = none` this degenerates to today's behaviour (marks are durable at commit).
+- Only the **leader** runs the sweeper and repair, and confirms it is still leader
+  (OpenRaft read-index / leader lease) before each delete batch. A deposed leader must
+  not delete on stale state.
+- Reclaim: propose `BeginReclaim`; only after it is **committed** delete the parts;
+  then propose `DropChunk`. A restore or failover therefore never brings back a
+  reference to deleted parts: the chunk was already `reclaiming` in the committed log.
+- Orphan sweep (keys on the backend unknown to metadata) needs the in-flight upload
+  registry (separate design: pins keyed by our own blob ids, assigned before upload).
+  Parts become known to metadata only through a committed `CommitChunk` / `AddReplica`;
+  a deposed leader cannot commit, so its in-flight parts are garbage after failover.
+- After restoring from an exported snapshot the log tail may be missing: sweeper runs
+  reclaim-only until reconciliation (below) has finished.
 
 ### Acknowledging writes / Подтверждение записи
 
-Per layer: `ack = "local" | "durable"`.
+A PUT is acknowledged after its commands are **committed** in the group (`client_write`
+returns). With one node this is a local fsync; with three it is a quorum. There is no
+separate `ack` setting: the group size is the knob.
 
-- `local` (default, also once WAL shipping exists): a PUT is acknowledged after the local commit. Losing the disk can
-  lose up to RPO of acknowledged objects.
-- `durable`: the gateway calls `wait_durable(mark)` before acknowledging. Cheap with
-  `wal.ship_to`; rejected at config load for snapshot-only backends.
+### Shared vs separate groups / Общая или раздельные группы
 
-### Shared vs separate backends / Общий или раздельные бэкенды
+- **Shared** (chunk store and a gateway in one group): one log, restored as of one
+  index. Refcounts match gateway references.
+- **Separate** groups restore independently; dangling extents fail with `ChunkGone`
+  (ids are never reused), leaked chunks wait for **reconciliation**: gateways enumerate
+  their chunk references, chunk refs are recomputed via commands, then orphan sweep is
+  re-enabled.
 
-- **Shared** (chunk store and a gateway on one backend): restore returns all layers as
-  of the same mark. Refcounts match gateway references; nothing to reconcile.
-- **Separate**: layers restore to different points in time. Supported, with
-  consequences handled explicitly:
-  - gateway extent → chunk missing in chunk metadata: read fails with `ChunkGone`
-    (never aliases, ids are not reused);
-  - chunk with `refs > 0` that no gateway references: leaked until **reconciliation** —
-    each gateway enumerates its chunk references, the chunk store recomputes `refs`
-    from them, and only then is orphan sweep re-enabled.
-  The config loader warns when the chunk store's RPO is worse than a gateway's on a
-  separate backend (gateway references would point at chunks that can be lost).
+## Distribution / Распределённость
 
-## Restore / Восстановление
+With N nodes each runs the gateways and a replica of the group.
 
-1. For each metadata backend: pick the newest source among WAL target and snapshots;
-   restore the SQLite file (snapshot + WAL replay up to the newest frame).
-2. Open layers on their backends (namespaced schemas migrate as usual).
-3. If any layer sits on a separate backend: run reconciliation.
-4. Start the sweeper (orphan sweep enabled only after step 3).
-
-`pigeonhole restore` keeps its CLI; what it reads comes from the backend config.
+- Writes are forwarded to the leader (or the client is redirected); reads are served by
+  the leader. Follower reads are a later step.
+- Blob backend rate limits are per **bot**, not per node: uploads go through the leader
+  (or the leader hands out send budget).
+- Telegram `file_id` is bot-bound: all nodes use the same bot token per instance.
+- Data replication across blob instances (`Replicated`, repair) is unchanged; Raft only
+  replicates metadata.
 
 ## Config / Конфигурация
 
 ```toml
-[meta.main]
-engine = "sqlite"
-path = "pigeonhole-meta.db"
-wal = { ship_to = "/mnt/backup/pigeonhole-wal" }
-snapshot = { every_secs = 3600, to = "blob", via = "tg-main" }
+[meta]
+node_id = 1
+data_dir = "/var/lib/pigeonhole/meta"   # raft log + SQLite state machine
+listen_addr = "0.0.0.0:7400"            # raft RPC; unused with one node
+members = { 1 = "node1:7400" }          # later: { 1 = ..., 2 = ..., 3 = ... }
 
-[meta.cache]
-engine = "sqlite"
-path = "pigeonhole-cas.db"          # no wal, no snapshot: a cache can be rebuilt
+[meta.snapshot]
+every_entries = 50000
+export = [
+  { to = "dir", path = "/mnt/backup/pigeonhole" },
+  { to = "blob", via = "tg-main", every_secs = 3600 },  # last resort: chat only
+]
 
 [chunk_store]
-meta = "main"
+group = "main"
 
 [gateway.s3]
-meta = "main"                       # same backend → restored together
-ack = "local"
+group = "main"
 
 [gateway.bytestream]
-meta = "cache"
+group = "cache"                         # separate group, no export: a cache
 ```
 
-No backward compatibility: `database_url`, `[snapshot]`, the superblock / checkpoint
-formats and the per-layer index snapshots are replaced, not aliased. Existing data
-directories and chats are not migrated.
+## Implementation choice / Выбор реализации
 
-## Migration plan / План переезда
+- **OpenRaft** (databendlabs): pluggable `RaftLogStorage` / `RaftStateMachine` /
+  network, tokio, deterministic simulation and Jepsen in CI, used by Databend's
+  meta-service. Still `0.10.0-alpha.*` — pin an exact version, expect API churn.
+  Storage implementations are checked with its `Suite::test_all()`.
+- Considered: `tikv/raft-rs` (tick-driven core only, we would write log / state machine
+  / transport ourselves); Hiqlite (embeddable raft SQLite on OpenRaft — replicates SQL,
+  not typed commands, and would hide the parts we want to build).
+
+## Plan / План
 
 Each step is a separate commit with tests green.
 
-0. **Drop legacy compatibility code** that the new layout would otherwise drag along:
-   `migrate.rs` (pre-chunk-store index import, `pigeonhole migrate`), legacy config
-   aliases (`rate_per_sec`, `frame_*`, single-backend `chat_id` form), `serde` aliases
-   and defaults for old checkpoint / superblock formats, Stage-B table renames.
-1. **`MetaBackend` + namespaces.** Introduce the backend type (SQLite engine, commit
-   mark, `durable_mark`, `wait_durable`); open `BlobDb`, S3 `Index`, `CasIndex` through
-   it with prefixes. One shared file by default; `wal = none`, no snapshot.
-2. **Snapshot strategy.** Move checkpoint + superblock + pin out of `chunk-store`
-   (`durability.rs`) into a `snapshot.to = "blob"` strategy that snapshots the whole
-   backend file. Remove the per-5 s journal and the per-layer index snapshots
-   (`s3/index`, `cas/index` roots).
-3. **Sweeper contract.** `zero_mark`, reclaim gated on `durable_mark()`, reclaim-only
-   mode after restore.
-4. **WAL shipping** to a directory, then to S3-compatible storage.
-5. **Separate backends:** reconciliation + config warnings; `ack = "durable"`.
-
-The unified pin registry for in-flight uploads and reads (replacing put watermarks,
-sweep grace, `InflightParts`) is independent of this document and comes after step 3.
+0. **Drop legacy compatibility code**: `migrate.rs` and `pigeonhole migrate`, legacy
+   config aliases (`rate_per_sec`, `frame_*`, single-backend `chat_id` form), `serde`
+   aliases/defaults for old checkpoint / superblock formats, Stage-B table renames.
+1. **Commands, in-process.** Proto packages per layer; every mutation of `BlobDb`,
+   S3 `Index`, `CasIndex` becomes `apply(Command)` in one transaction; callers build
+   commands (ids chosen by the proposer). Namespaced tables, one SQLite file. No raft
+   yet: `propose` applies directly.
+2. **Single-node OpenRaft group.** `RaftLogStorage` on local disk, `RaftStateMachine`
+   over the SQLite file, `Suite::test_all()` green. `propose` goes through
+   `client_write`.
+3. **Snapshots and export; remove the old durability.** Snapshot = SQLite file copy;
+   export to dir and to blob. Delete `durability.rs` (journal, checkpoint, superblock
+   pin), `s3/index` / `cas/index` roots. `pigeonhole restore` reads an export.
+4. **Sweeper contract.** `BeginReclaim` → delete → `DropChunk`; reclaim-only mode after
+   restore; reconciliation.
+5. **In-flight pin registry** (own blob ids before upload) replacing put watermarks,
+   sweep grace and `InflightParts`; read pins.
+6. **Multi-node:** gRPC raft network, membership changes, leader forwarding, leader
+   checks before side effects, shared send budget. Jepsen-style test with node kills.
 
 ## Open questions / Открытые вопросы
 
-- WAL shipping: implement in-process, or run Litestream next to the binary and only
-  read its position for `durable_mark()`?
-- Snapshot to blob: one SQLite file image (simple, larger) or a logical dump per
-  namespace (today's JSON, portable across engines)?
+- Raft log storage: a simple segmented file of our own, or an embedded KV (redb /
+  RocksDB)?
+- Snapshot transfer to joining nodes: stream the SQLite file as-is, or a logical dump?
+- Export to blob: whole SQLite file in chunks via the chunk store (needs a bootstrap
+  pointer — the pinned message), or a dedicated format?
