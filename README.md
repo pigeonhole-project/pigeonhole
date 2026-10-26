@@ -44,6 +44,7 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 |---|---|
 | `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
 | `core/pigeonhole-codec` | Codecs + `BlockWriter` |
+| `meta/pigeonhole-meta` | Metadata state machine: layer commands applied to SQLite (`MetaStore`, `Namespace`) |
 | `blob/pigeonhole-blob` | `BlobBackend`, `Replicated`, rate limits, `BootstrapPointer`, cache knobs |
 | `blob/pigeonhole-chunk-store` | `ChunkStore`, ingest, roots, durability, sweeper, repair, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |

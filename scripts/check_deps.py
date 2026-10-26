@@ -11,6 +11,7 @@ import sys
 ROLE = {
     "pigeonhole-types": "types",
     "pigeonhole-codec": "codec",
+    "pigeonhole-meta": "meta",
     "pigeonhole-blob": "blob",
     "pigeonhole-chunk-store": "chunk-store",
     "pigeonhole-storage-telegram": "storage",
@@ -84,7 +85,7 @@ def main() -> int:
 
         elif role == "gateway":
             if strict:
-                allowed = {"chunk-store", "codec", "types"}
+                allowed = {"chunk-store", "codec", "meta", "types"}
                 for dep_name in dep_names:
                     dr = ROLE.get(dep_name)
                     if dr is None:
@@ -115,10 +116,11 @@ def main() -> int:
                         f"{name} (chunk-store) must not depend on {dep['name']}"
                     )
 
-        elif role in ("blob", "codec", "types") and strict:
+        elif role in ("blob", "codec", "meta", "types") and strict:
             allowed = {
                 "blob": {"types"},
                 "codec": {"types"},
+                "meta": set(),
                 "types": set(),
             }[role]
             for dep_name in dep_names:

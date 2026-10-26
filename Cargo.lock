@@ -2010,6 +2010,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pigeonhole-meta"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "sqlx",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pigeonhole-storage-discord"
 version = "0.1.0"
 dependencies = [

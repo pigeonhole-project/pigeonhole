@@ -1,0 +1,15 @@
+[package]
+name = "pigeonhole-meta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Metadata state machine: layer commands applied to SQLite"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
