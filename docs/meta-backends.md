@@ -1,210 +1,257 @@
-# Metadata as a replicated state machine / Метаданные как RSM
+# Metadata as a tablet / Метаданные как таблетка
 
-Status: **proposal** (not implemented). No backward compatibility: configs, on-disk and
-in-chat formats are replaced, existing data is not migrated.
+Status: **step 1 implemented** (commands + one SQLite state machine); the rest is a
+proposal. No backward compatibility: configs, on-disk and in-chat formats are
+replaced, existing data is not migrated.
+
+The model follows YDB tablets: a replicated state machine over a **shared log**
+kept in a storage that can **fence** old writers; an external **arbiter** only
+restarts the tablet somewhere else. Correctness comes from the log store, not
+from the arbiter.
 
 ## Problem / Проблема
 
-Blob backends (Telegram, Discord) are slow, rate-limited stores for **data**. Today they
-also carry **metadata durability**, hard-wired into the chunk store:
+Today metadata durability is hard-wired into the chunk store
+(`durability.rs`): a checkpoint of chunk metadata plus a superblock pinned in
+each read-write chat, and a journal that records only `SetRoot`.
 
-- `blob.db` is checkpointed into the blob backend and a superblock is pinned there;
-- a journal segment is uploaded and the pin rewritten every 5 s — ~12 sends/min on a
-  Telegram chat whose whole budget is ~20/min;
-- the journal records only `SetRoot`, so chunk commits / retain / release are durable
-  only at the next checkpoint. A restore after disk loss can find a root pointing at a
-  chunk missing from the checkpoint, and the sweeper then deletes the parts of every
-  chunk committed after it;
-- the S3 and CAS indexes are snapshotted separately (roots `s3/index`, `cas/index`) on
-  their own schedule, so after a restore the layers disagree.
+- Chunk commits / retain / release are durable only at the next checkpoint. A
+  restore after disk loss can find a root pointing at a chunk missing from the
+  checkpoint, and the sweeper then deletes the parts of every chunk committed
+  after it.
+- The S3 and CAS indexes are snapshotted separately (`s3/index`, `cas/index`), so
+  after a restore the layers disagree.
+- Publishing the superblock is check-then-write on the pin: two writers can both
+  pass `ensure_not_fenced` and the later pin silently wins.
 
 ## Goals / Цели
 
-1. Blob backends store data only. Metadata durability is a property of the metadata
-   subsystem, configured independently.
-2. Every metadata change is a typed **command**; metadata state is the result of
-   applying the command log in order — a replicated state machine (RSM).
-3. One node first; adding nodes later is a membership change, not a redesign.
-4. Each layer keeps its own commands, schema and queries; layers stay independent
-   (`check-deps.sh --strict`). Several layers may share one state machine and are then
-   persisted and restored together.
-5. Sweeper safety is defined against the RSM commit index, independent of cluster size.
+1. Every metadata change is a typed command; state = commands applied in order
+   (done in step 1: `pigeonhole-meta`, `chunk` / `s3` / `cas` namespaces, one
+   SQLite file).
+2. The command log lives in a pluggable **`LogStore`** that fences old
+   generations. The node's SQLite file is a cache rebuilt from snapshot + log.
+3. A tablet can move to another node: boot = claim a generation, discover,
+   replay, write a zero entry.
+4. Side effects outside the state machine (deleting blobs) never run ahead of
+   the log and never come from a deposed writer.
+5. `LogStore` implementations are chosen in config: local file, Telegram, later
+   S3 with conditional writes.
 
-Non-goals for now: storage engines other than SQLite; sharding metadata (multi-raft);
-follower reads.
+Non-goals for now: several tablets / sharding metadata; follower reads.
 
 ## Model / Модель
 
 ```
- gateway / chunk-store code
-   │  propose(Command)            read queries (SQL on local SQLite)
-   ▼                                   ▲
- ┌───────────────────────── MetaGroup (one raft group) ──────────────────────────┐
- │ OpenRaft                                                                      │
- │  RaftLogStorage   — command log on local disk (proto-encoded entries)         │
- │  RaftStateMachine — apply(entry) → SQL in one transaction per entry           │
- │                     snapshot = consistent copy of the SQLite file             │
- │  RaftNetwork      — gRPC (tonic) between nodes; unused with one node          │
- └───────────────────────────────────────────────────────────────────────────────┘
-        │ snapshot export (optional): dir / S3 / blob backend (rare, e.g. hourly)
+                 arbiter (bootstrapper)                 liveness only
+                    │ starts / restarts the tablet
+                    ▼
+ ┌──────────────────────────── tablet (one per cluster) ───────────────────────────┐
+ │ propose(Command) ─► batch ─► LogStore.append(gen, batch) ─► apply to SQLite      │
+ │ reads ◄──────────────────────────────────────────────────────── SQLite (cache)  │
+ │ side effects (sweeper, repair) only while the tablet holds its generation       │
+ └──────────────────────────────────────────────────────────────────────────────────┘
+                    │                                             ▲
+                    ▼                                             │ replay on boot
+              LogStore: claim / append / discover / read / snapshot / collect
 ```
 
-- **Command** — a proto message, one per state transition, one SQLite transaction on
-  apply. Commands are **deterministic**: everything that must be identical on every
-  replica (chunk ids, timestamps, locators) is chosen by the proposer and carried in the
-  command; `apply` never generates ids or reads the clock.
-- **Namespaces** — each layer owns its tables under a prefix (`chunk_`, `s3_`, `cas_`;
-  today S3 and CAS both have a `meta` table) and its command set in its own proto
-  package. The group dispatches an entry to the layer that owns its command.
-- **Reads** go to the local SQLite of the node that serves the request. With one node
-  this is simply the database; with several, writes and reads go to the leader (see
-  Distribution).
-- **Durability** is "committed by a quorum of the group". With one node that is the
-  local log fsync; snapshot export adds a copy that survives losing the node.
+### Generations / Поколения
 
-### Commands / Команды (first cut)
+Every tablet incarnation runs under a **generation** `g`, strictly greater than
+every generation that ran before. All log writes carry `g`. After a newer
+generation has **claimed** the log, every `append` of an older one fails with
+`Fenced`; the older incarnation stops and never acknowledges again.
 
-```proto
-// proto/pigeonhole/meta/v1/chunk.proto
-message CommitChunk { int64 chunk_id = 1; int64 logical_size = 2; uint32 crc32 = 3;
-                      repeated Block blocks = 4; repeated ReplicaLayout replicas = 5;
-                      int64 created_at_ms = 6; }
-message Retain      { repeated int64 chunk_ids = 1; }   // all-or-nothing
-message Release     { repeated int64 chunk_ids = 1; }
-message BeginReclaim{ int64 chunk_id = 1; }             // live, refs=0 → reclaiming
-message DropChunk   { int64 chunk_id = 1; }             // after backend deletes
-message AddReplica  { int64 chunk_id = 1; ReplicaLayout replica = 2; }  // repair
-message SetRoot     { string name = 1; repeated Extent extents = 2; }
-message SyncInstances { repeated Instance instances = 1; }
+### LogStore contract / Контракт журнала
 
-// proto/pigeonhole/meta/v1/s3.proto
-message PutObject   { ObjectRow object = 1; }           // returns old chunk ids
-message DeleteObject{ string bucket = 1; string key = 2; }
-message CopyObject  { ... }  message PutPart { ... }  message CompleteUpload { ... }
-message CreateBucket{ ... }  message DeleteBucket { ... }  message PutTags { ... }
+```rust
+trait LogStore {
+    /// Become generation `gen` (> any earlier claim). Fences every older
+    /// generation and returns the log head they left behind: every entry
+    /// whose append was acknowledged to an older generation is ≤ that head.
+    async fn claim(&self, gen: u64) -> Result<Head, ClaimError>;
 
-// proto/pigeonhole/meta/v1/cas.proto
-message PutCasEntry { ... }  message DropCasEntry { ... }  message TouchCasEntry { ... }
+    /// Durably append a batch for `gen`. `Ok` = committed; `Fenced` = a newer
+    /// generation exists, nothing about this batch may be acknowledged.
+    async fn append(&self, gen: u64, batch: &[Entry]) -> Result<Position, AppendError>;
+
+    /// Newest snapshot + log head (bootstrap without any local state).
+    async fn discover(&self) -> Result<Option<Discovered>>;
+
+    /// Entries after `from` up to `head`, in order (replay).
+    fn read(&self, from: Position, head: Head) -> EntryStream;
+
+    /// Store a snapshot of the state as of `at` and drop entries ≤ `at` (collect).
+    async fn install_snapshot(&self, gen: u64, at: Position, snapshot: Snapshot) -> Result<()>;
+}
 ```
 
-Commands that can fail on state (`Retain` on a reclaiming chunk, `Release` below zero,
-`CreateBucket` that exists) fail **deterministically** in `apply` and return a typed
-error in the response; every replica reaches the same result.
+`Entry` = the existing envelope `{ namespace, command }` (proto), applied by
+`MetaStore` exactly as in step 1. A batch is one log write: commits are grouped
+(group commit) because some stores (Telegram) allow a write every few seconds.
 
-Cross-layer atomicity stays as today (e.g. gateway `PutObject` and chunk `Release` of
-the old chunks are separate commands). On a shared group a batch command can make them
-atomic later.
+### Tablet lifecycle / Жизненный цикл
+
+1. **Boot** (`claim`): `gen = 1 + max(known generations)`; `claim(gen)` → head.
+2. **Recover**: if the local SQLite file is behind (or absent), `discover` →
+   load snapshot → `read` and apply entries up to head.
+3. **Zero entry**: append an empty batch for `gen` — proves the claim took effect
+   and marks the start of this generation (as YDB's `WriteZeroEntry`).
+4. **Active**: `propose` buffers commands; a batch is appended, then applied to
+   SQLite, then callers get their responses. `Fenced` → stop the tablet
+   (responses fail, side effects stop, process exits or waits for the arbiter).
+5. **Snapshot**: periodically `install_snapshot` (SQLite file image) and collect
+   the log behind it.
+
+Responses are released only after `append` returned `Ok`, so a client never sees
+a result the next generation might not have.
+
+### Arbiter / Арбитр
+
+Liveness only, like YDB's Bootstrapper / Hive: watch the tablet's node, start it
+elsewhere when it is gone. It may be wrong (two incarnations at once) — the
+`LogStore` fence makes the older one fail. First implementation: none (single
+node; restart = process restart). Later: a small watcher over the same LogStore
+(e.g. the claim message's age).
+
+## LogStore implementations / Реализации
+
+### `local` — file on disk
+
+Segmented append-only files + a `claimed_gen` file updated with fsync before
+use; `append` checks the generation under a lock. Fences only processes on the
+same host; durability = the disk. Default, and the reference implementation the
+others are tested against.
+
+### `telegram` — a dedicated channel, Bot API only
+
+Uses three properties of the Bot API (see
+[Bot API](https://core.telegram.org/bots/api)):
+
+- `message_id` grows with sending time — Telegram is a **sequencer**;
+- `pinChatMessage` **adds** to a list of pinned messages, and
+  `getChat().pinned_message` is the full `Message` of the most recent pinned
+  message **by sending date** — a **max register over message ids**;
+- `getChat().description` is a readable register written with
+  `setChatDescription`.
+
+Layout in a channel used only for the log:
+
+- **Entries** — unpinned documents; each holds a batch, its generation, and a
+  link to the previous entry (`file_id` + hash). Read with `getFile`.
+- **Claim** of generation `g` — a message, pinned; its text is edited
+  (`editMessageText`) to carry the generation's current **head** (latest entry
+  link). Only claims are pinned, and claims of newer generations are sent later,
+  so `pinned_message` = the current generation's claim.
+- **Fence** — `description = "gen=<g>"`.
+
+`append(g, batch)`:
+1. send the entry document (link to previous head);
+2. edit own claim: head = this entry;
+3. `getChat`: `Ok` iff `pinned_message` is own claim **and** `description` is
+   `gen=g`; otherwise `Fenced`.
+
+`claim(g)`:
+1. `setChatDescription("gen=g")` — from now on every older `append` fails step 3;
+2. `getChat` — the previous claim is still pinned: read its final head;
+3. send own claim (text: base = that head) and pin it;
+4. `getChat` — if the pinned claim is not ours (a concurrent claimant sent later),
+   lose: `ClaimError::Lost`.
+
+Why it is safe: an older generation acknowledged an append only if its step 3
+saw `gen=old` in the description, i.e. before the new claimant's step 1; its head
+edit (step 2) happened even earlier. The claimant reads the head after its step 1,
+so every acknowledged entry is ≤ the head it adopts. Appends of the old
+generation after the claimant's step 1 fail. Racing claimants overwrite the
+description blindly; that can only make the winner see a foreign generation and
+re-claim (liveness), never lose an acknowledged entry — only the old generation
+had any.
+
+`discover`: `getChat` → pinned claim → head; walk entry links back to the newest
+snapshot reference, then replay forward.
+
+Costs and caveats:
+- an append is three calls (send, edit, `getChat`) under the chat's limits
+  (~20 sends/min in groups) → batch every few seconds; use a channel dedicated to
+  the log so data uploads do not compete;
+- `claim` needs the `can_change_info` admin right; chat-info edits are likely
+  rate-limited harder, but claims are rare;
+- to verify before building: how long a bot may edit its own channel messages;
+- chat admins can delete or unpin messages; hash links detect it, nothing
+  prevents it;
+- the project disclaimer applies even more: this uses a chat as a database log.
+
+### `s3` — conditional writes (later)
+
+Entries as objects `log/<position>` written with `If-None-Match: *`; a claim is
+an object at the next position, so two generations cannot both write it. Fast and
+cheap compared to Telegram; needs an S3-compatible store with conditional writes.
 
 ## Contracts / Контракты
 
-### Sweeper and other side effects / Побочные эффекты
+### Side effects / Побочные эффекты
 
-Deleting from the blob backend is a side effect outside the state machine.
+- Only the active tablet runs the sweeper and repair; on `Fenced` they stop
+  before the next backend call.
+- Reclaim: propose `BeginReclaim`, wait for it to be **committed** (appended),
+  then delete parts, then propose `DropChunk`. A restore or failover never brings
+  back a reference to deleted parts.
+- Orphan sweep needs the in-flight registry (own blob ids before upload, a later
+  step); parts become known only through committed `CommitChunk` / `AddReplica`,
+  and a fenced incarnation cannot commit, so its in-flight parts are garbage.
+- After recovering from a snapshot older than the log head nothing special is
+  needed: replay brings the state to the head before side effects start.
 
-- Only the **leader** runs the sweeper and repair, and confirms it is still leader
-  (OpenRaft read-index / leader lease) before each delete batch. A deposed leader must
-  not delete on stale state.
-- Reclaim: propose `BeginReclaim`; only after it is **committed** delete the parts;
-  then propose `DropChunk`. A restore or failover therefore never brings back a
-  reference to deleted parts: the chunk was already `reclaiming` in the committed log.
-- Orphan sweep (keys on the backend unknown to metadata) needs the in-flight upload
-  registry (separate design: pins keyed by our own blob ids, assigned before upload).
-  Parts become known to metadata only through a committed `CommitChunk` / `AddReplica`;
-  a deposed leader cannot commit, so its in-flight parts are garbage after failover.
-- After restoring from an exported snapshot the log tail may be missing: sweeper runs
-  reclaim-only until reconciliation (below) has finished.
+### Garbage of the log itself
 
-### Acknowledging writes / Подтверждение записи
-
-A PUT is acknowledged after its commands are **committed** in the group (`client_write`
-returns). With one node this is a local fsync; with three it is a quorum. There is no
-separate `ack` setting: the group size is the knob.
-
-### Shared vs separate groups / Общая или раздельные группы
-
-- **Shared** (chunk store and a gateway in one group): one log, restored as of one
-  index. Refcounts match gateway references.
-- **Separate** groups restore independently; dangling extents fail with `ChunkGone`
-  (ids are never reused), leaked chunks wait for **reconciliation**: gateways enumerate
-  their chunk references, chunk refs are recomputed via commands, then orphan sweep is
-  re-enabled.
-
-## Distribution / Распределённость
-
-With N nodes each runs the gateways and a replica of the group.
-
-- Writes are forwarded to the leader (or the client is redirected); reads are served by
-  the leader. Follower reads are a later step.
-- Blob backend rate limits are per **bot**, not per node: uploads go through the leader
-  (or the leader hands out send budget).
-- Telegram `file_id` is bot-bound: all nodes use the same bot token per instance.
-- Data replication across blob instances (`Replicated`, repair) is unchanged; Raft only
-  replicates metadata.
+The tablet decides what is garbage in its own log (entries ≤ the last snapshot),
+like YDB's `CollectGarbage` barrier on `generation:step`; ids of log objects are
+chosen by the writer, so collection needs no listing. Old Telegram messages are
+deleted by the tablet after a snapshot (`deleteMessage`).
 
 ## Config / Конфигурация
 
 ```toml
 [meta]
-node_id = 1
-data_dir = "/var/lib/pigeonhole/meta"   # raft log + SQLite state machine
-listen_addr = "0.0.0.0:7400"            # raft RPC; unused with one node
-members = { 1 = "node1:7400" }          # later: { 1 = ..., 2 = ..., 3 = ... }
+db_path = "pigeonhole-meta.db"      # local SQLite cache of the state
+batch_max_delay_ms = 2000           # group commit window
+
+[meta.log]
+kind = "local"                      # local | telegram | s3
+path = "pigeonhole-log"
+# kind = "telegram"
+# bot_token_env = "BOT_TOKEN"
+# chat_id = -1009876543210          # a channel used only for the log
 
 [meta.snapshot]
-every_entries = 50000
-export = [
-  { to = "dir", path = "/mnt/backup/pigeonhole" },
-  { to = "blob", via = "tg-main", every_secs = 3600 },  # last resort: chat only
-]
-
-[chunk_store]
-group = "main"
-
-[gateway.s3]
-group = "main"
-
-[gateway.bytestream]
-group = "cache"                         # separate group, no export: a cache
+every_entries = 10000
 ```
-
-## Implementation choice / Выбор реализации
-
-- **OpenRaft** (databendlabs): pluggable `RaftLogStorage` / `RaftStateMachine` /
-  network, tokio, deterministic simulation and Jepsen in CI, used by Databend's
-  meta-service. Still `0.10.0-alpha.*` — pin an exact version, expect API churn.
-  Storage implementations are checked with its `Suite::test_all()`.
-- Considered: `tikv/raft-rs` (tick-driven core only, we would write log / state machine
-  / transport ourselves); Hiqlite (embeddable raft SQLite on OpenRaft — replicates SQL,
-  not typed commands, and would hide the parts we want to build).
 
 ## Plan / План
 
 Each step is a separate commit with tests green.
 
-0. **Drop legacy compatibility code**: `migrate.rs` and `pigeonhole migrate`, legacy
-   config aliases (`rate_per_sec`, `frame_*`, single-backend `chat_id` form), `serde`
-   aliases/defaults for old checkpoint / superblock formats, Stage-B table renames.
-1. **Commands, in-process.** Proto packages per layer; every mutation of `BlobDb`,
-   S3 `Index`, `CasIndex` becomes `apply(Command)` in one transaction; callers build
-   commands (ids chosen by the proposer). Namespaced tables, one SQLite file. No raft
-   yet: `propose` applies directly.
-2. **Single-node OpenRaft group.** `RaftLogStorage` on local disk, `RaftStateMachine`
-   over the SQLite file, `Suite::test_all()` green. `propose` goes through
-   `client_write`.
-3. **Snapshots and export; remove the old durability.** Snapshot = SQLite file copy;
-   export to dir and to blob. Delete `durability.rs` (journal, checkpoint, superblock
-   pin), `s3/index` / `cas/index` roots. `pigeonhole restore` reads an export.
-4. **Sweeper contract.** `BeginReclaim` → delete → `DropChunk`; reclaim-only mode after
-   restore; reconciliation.
-5. **In-flight pin registry** (own blob ids before upload) replacing put watermarks,
-   sweep grace and `InflightParts`; read pins.
-6. **Multi-node:** gRPC raft network, membership changes, leader forwarding, leader
-   checks before side effects, shared send budget. Jepsen-style test with node kills.
+1. ~~Commands, in-process.~~ Done: `pigeonhole-meta`, `chunk` / `s3` / `cas`
+   namespaces, one SQLite file.
+2. **Tablet + `LogStore` (local).** `LogStore` trait and the `local`
+   implementation; `MetaStore::propose` appends a batch before applying; boot =
+   claim → discover → replay → zero entry; fenced → stop. Tests: replay rebuilds
+   identical SQLite state; a second incarnation fences the first.
+3. **Snapshots and removal of the old durability.** `install_snapshot` (SQLite
+   file image) + collect; delete `durability.rs` (checkpoint, superblock pin,
+   root journal) and the `s3/index` / `cas/index` snapshots; `pigeonhole restore`
+   = discover + replay.
+4. **Sweeper contract.** `BeginReclaim` committed before deletes; side effects
+   only while active.
+5. **In-flight pin registry** (own blob ids before upload) replacing put
+   watermarks, sweep grace and `InflightParts`; read pins.
+6. **`telegram` LogStore** (protocol above), tested against the same suite as
+   `local`, plus a fault-injection test with two concurrent incarnations.
+7. **Arbiter** and a second node; `s3` LogStore.
 
 ## Open questions / Открытые вопросы
 
-- Raft log storage: a simple segmented file of our own, or an embedded KV (redb /
-  RocksDB)?
-- Snapshot transfer to joining nodes: stream the SQLite file as-is, or a logical dump?
-- Export to blob: whole SQLite file in chunks via the chunk store (needs a bootstrap
-  pointer — the pinned message), or a dedicated format?
+- Snapshot format: SQLite file image (simple) or a logical dump per namespace?
+- Telegram: bot edit time limit in channels; rate limits of `setChatDescription`.
+- Batch size / delay defaults per LogStore kind.
