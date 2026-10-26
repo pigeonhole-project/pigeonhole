@@ -108,7 +108,7 @@ With `wal = none` this degenerates to today's behaviour (marks are durable at co
 
 Per layer: `ack = "local" | "durable"`.
 
-- `local` (default): a PUT is acknowledged after the local commit. Losing the disk can
+- `local` (default, also once WAL shipping exists): a PUT is acknowledged after the local commit. Losing the disk can
   lose up to RPO of acknowledged objects.
 - `durable`: the gateway calls `wait_durable(mark)` before acknowledging. Cheap with
   `wal.ship_to`; rejected at config load for snapshot-only backends.
@@ -194,4 +194,3 @@ sweep grace, `InflightParts`) is independent of this document and comes after st
   read its position for `durable_mark()`?
 - Snapshot to blob: one SQLite file image (simple, larger) or a logical dump per
   namespace (today's JSON, portable across engines)?
-- Should `ack = "durable"` be the default once WAL shipping exists?
