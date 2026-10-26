@@ -1,0 +1,48 @@
+// Commands of the REAPI CAS namespace ("cas"). Timestamps come from the proposer.
+syntax = "proto3";
+
+package pigeonhole.cas.v1;
+
+message Command {
+  oneof op {
+    PutEntry put_entry = 1;
+    TouchEntry touch_entry = 2;
+    DropEntry drop_entry = 3;
+  }
+}
+
+message Extent {
+  int64 chunk = 1;
+  int64 offset = 2;
+  int64 len = 3;
+}
+
+// Store (hash, size) → extents unless it exists; an existing entry is touched.
+message PutEntry {
+  string hash = 1;
+  int64 size = 2;
+  repeated Extent extents = 3;
+  string at = 4;
+}
+
+// Result of PutEntry: set when the digest was already stored.
+message PutResult {
+  bool existed = 1;
+  repeated Extent existing = 2;
+}
+
+message TouchEntry {
+  string hash = 1;
+  int64 size = 2;
+  string at = 3;
+}
+
+// Remove an entry; the result lists chunk ids to release (empty if missing).
+message DropEntry {
+  string hash = 1;
+  int64 size = 2;
+}
+
+message Released {
+  repeated int64 chunk_ids = 1;
+}

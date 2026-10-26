@@ -3,6 +3,7 @@
 pub mod cas;
 pub mod cas_index;
 pub mod cas_snapshot;
+mod commands;
 pub mod config;
 pub mod digest;
 pub mod server;

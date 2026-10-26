@@ -1966,6 +1966,7 @@ dependencies = [
  "hex",
  "pigeonhole-chunk-store",
  "pigeonhole-codec",
+ "pigeonhole-meta",
  "pigeonhole-storage-memory",
  "pigeonhole-types",
  "prost",
