@@ -38,7 +38,7 @@ impl S3Gateway {
     }
 
     fn scope_id(&self) -> &str {
-        // Gateways use placement primary scope only (no legacy chat fallback).
+        // Gateways use the placement primary scope.
         self.cfg
             .primary_scope_id()
             .expect("config placement primary scope_id")

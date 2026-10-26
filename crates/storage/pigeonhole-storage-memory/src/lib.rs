@@ -71,7 +71,7 @@ impl MemoryBlobStore {
         self
     }
 
-    /// Use a pre-resolved [`InstanceInfo`] (from `[[instances]]` / legacy default).
+    /// Use a pre-resolved [`InstanceInfo`] (from `[[instances]]`).
     pub fn with_instance_info(mut self, info: InstanceInfo) -> Self {
         self.instance = info;
         self

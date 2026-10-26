@@ -1,9 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Content of a chat/channel bootstrap pin (legacy [`BootstrapPointer`] path).
+/// Content of a chat/channel bootstrap pin (untyped [`BootstrapPointer`]).
 ///
-/// Prefer [`crate::TypedBootstrapPointer`] (`Bytes` payloads) for new code.
+/// Storage crates build [`crate::TypedBootstrapPointer`] (`Bytes` payloads) on top.
 #[derive(Debug, Clone)]
 pub enum PinnedContent {
     Text { message_id: i64, text: String },

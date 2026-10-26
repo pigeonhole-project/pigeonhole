@@ -256,36 +256,6 @@ impl BlobDb {
             .collect())
     }
 
-    /// Insert a single part row (legacy migrate / repair).
-    pub async fn add_part(
-        &self,
-        chunk_id: i64,
-        instance_id: &str,
-        part_no: i64,
-        first_block: i64,
-        block_count: i64,
-        sort_key: &[u8],
-        locator: &[u8],
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO chunk_parts
-              (chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(chunk_id)
-        .bind(instance_id)
-        .bind(part_no)
-        .bind(first_block)
-        .bind(block_count)
-        .bind(sort_key)
-        .bind(locator)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     /// Insert a chunk row with refs=1; returns chunk_id.
     pub async fn insert_chunk(
         &self,

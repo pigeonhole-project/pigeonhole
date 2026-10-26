@@ -275,7 +275,7 @@ impl ChunkStore {
         }
         let blocks = self.db.get_blocks(chunk_id).await?;
         if blocks.is_empty() {
-            // Single raw part covering the whole chunk (put_small / raw legacy).
+            // Single raw part covering the whole chunk (put_small).
             let hook = self.not_found_hook(chunk_id);
             let stored = collect_stream(
                 self.replicated
