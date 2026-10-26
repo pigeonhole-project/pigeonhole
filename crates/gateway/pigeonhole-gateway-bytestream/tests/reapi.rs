@@ -16,10 +16,13 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 
+/// The returned `TempDir` holds the server's SQLite files; keep it alive for the
+/// whole test (dropping it deletes the databases under the running server).
 async fn test_harness() -> (
     ContentAddressableStorageClient<Channel>,
     ByteStreamClient<Channel>,
     String,
+    tempfile::TempDir,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let cas_url = format!("sqlite:{}?mode=rwc", dir.path().join("cas.db").display());
@@ -49,7 +52,7 @@ async fn test_harness() -> (
     let bs = ByteStreamClient::new(channel)
         .max_decoding_message_size(MAX_MSG)
         .max_encoding_message_size(MAX_MSG);
-    (cas, bs, "pigeonhole".into())
+    (cas, bs, "pigeonhole".into(), dir)
 }
 
 fn digest_for(data: &[u8]) -> Digest {
@@ -69,7 +72,7 @@ fn find_req(instance: &str, blob_digests: Vec<Digest>) -> FindMissingBlobsReques
 
 #[tokio::test]
 async fn bytestream_write_read_large_blob() {
-    let (_cas, mut bs, inst) = test_harness().await;
+    let (_cas, mut bs, inst, _dir) = test_harness().await;
     let payload: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
     let d = digest_for(&payload);
     let upload_id = uuid::Uuid::new_v4().to_string();
@@ -120,7 +123,7 @@ async fn bytestream_write_read_large_blob() {
 
 #[tokio::test]
 async fn bytestream_wrong_hash_rejected() {
-    let (_cas, mut bs, inst) = test_harness().await;
+    let (_cas, mut bs, inst, _dir) = test_harness().await;
     let payload = b"hello cas".to_vec();
     let mut d = digest_for(&payload);
     d.hash = "0".repeat(64);
@@ -142,7 +145,7 @@ async fn bytestream_wrong_hash_rejected() {
 
 #[tokio::test]
 async fn find_missing_and_batch() {
-    let (mut cas, mut bs, inst) = test_harness().await;
+    let (mut cas, mut bs, inst, _dir) = test_harness().await;
     let a = b"alpha".to_vec();
     let b = b"bravo".to_vec();
     let da = digest_for(&a);
@@ -203,7 +206,7 @@ async fn find_missing_and_batch() {
 
 #[tokio::test]
 async fn bytestream_read_range() {
-    let (_cas, mut bs, inst) = test_harness().await;
+    let (_cas, mut bs, inst, _dir) = test_harness().await;
     let payload: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
     let d = digest_for(&payload);
     let upload_id = uuid::Uuid::new_v4().to_string();
