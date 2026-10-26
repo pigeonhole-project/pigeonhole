@@ -1,15 +1,21 @@
-//! Separate `blob.db` metadata for the blob layer (stage E schema).
+//! Chunk-store metadata: queries plus the proposer side of the `chunk` namespace.
 //!
-//! Gateways keep their own SQLite indexes; this DB owns instances, chunks,
-//! parts, chunk blocks, roots (extent lists), sweeper state, and repair queue.
+//! Chunk state (instances, chunks, blocks, parts, roots) changes only through
+//! commands applied by [`crate::commands::ChunkNamespace`]. Node-local
+//! operational tables (put watermarks, sweep cursor, repair queue) are written
+//! directly: they are progress of this node, not replicated state.
 
-use anyhow::{Context, Result};
+use crate::commands::{pb, ChunkNamespace, NAMESPACE};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use pigeonhole_blob::{InstanceInfo, PartLayout, ReplicaLayout, BlobLocator};
+use pigeonhole_meta::{Applied, MetaStore};
+use prost::Message;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 /// Internal integer chunk id (row in `chunks`).
 pub type ChunkId = i64;
@@ -46,10 +52,19 @@ pub struct Extent {
     pub len: i64,
 }
 
-/// Connection to the blob-layer metadata database.
-#[derive(Clone, Debug)]
+/// Chunk-store view of the metadata state machine.
+#[derive(Clone)]
 pub struct BlobDb {
     pool: SqlitePool,
+    meta: Arc<MetaStore>,
+    /// Next chunk id to hand out; ids are chosen by the proposer (see commands.rs).
+    next_chunk_id: Arc<AtomicI64>,
+}
+
+impl std::fmt::Debug for BlobDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobDb").finish_non_exhaustive()
+    }
 }
 
 /// One stored block row (offsets inside a part are derived from `stored_len`).
@@ -62,8 +77,8 @@ pub struct StoredBlock {
     pub codec: String,
 }
 
-/// Current `blob.db` schema. No upgrades: an incompatible file is recreated by hand.
-const SCHEMA: &[&str] = &[
+/// Current schema. No upgrades: an incompatible file is recreated by hand.
+pub(crate) const SCHEMA: &[&str] = &[
     r#"
     CREATE TABLE IF NOT EXISTS instances (
         id TEXT PRIMARY KEY NOT NULL,
@@ -151,39 +166,21 @@ const SCHEMA: &[&str] = &[
     "#,
 ];
 
-/// Allocate the next chunk id inside `tx` (which must hold the write lock).
-async fn next_chunk_id(tx: &mut sqlx::SqliteConnection) -> Result<ChunkId> {
-    let (next,): (i64,) = sqlx::query_as(
-        r#"
-        SELECT MAX(
-            COALESCE((SELECT last FROM chunk_id_seq WHERE singleton = 0), 0),
-            COALESCE((SELECT MAX(id) FROM chunks), 0)
-        ) + 1
-        "#,
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    sqlx::query(
-        r#"
-        INSERT INTO chunk_id_seq (singleton, last) VALUES (0, ?)
-        ON CONFLICT (singleton) DO UPDATE SET last = excluded.last
-        "#,
-    )
-    .bind(next)
-    .execute(&mut *tx)
-    .await?;
-    Ok(next)
-}
-
 impl BlobDb {
+    /// Open a standalone metadata store at `database_url` with only this namespace.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect(database_url)
-            .await
-            .with_context(|| format!("connect blob db {database_url}"))?;
-        let db = Self { pool };
-        db.migrate().await?;
+        Self::open(MetaStore::open(database_url).await?).await
+    }
+
+    /// Register the `chunk` namespace on `meta`.
+    pub async fn open(meta: Arc<MetaStore>) -> Result<Self> {
+        meta.register(Arc::new(ChunkNamespace)).await?;
+        let db = Self {
+            pool: meta.pool().clone(),
+            meta,
+            next_chunk_id: Arc::new(AtomicI64::new(0)),
+        };
+        db.reseed_chunk_ids().await?;
         Ok(db)
     }
 
@@ -191,59 +188,54 @@ impl BlobDb {
         &self.pool
     }
 
-    async fn migrate(&self) -> Result<()> {
-        for pragma in [
-            "PRAGMA foreign_keys = ON",
-            "PRAGMA journal_mode = WAL",
-            "PRAGMA busy_timeout = 5000",
-        ] {
-            sqlx::query(pragma).execute(&self.pool).await?;
-        }
-        for ddl in SCHEMA {
-            sqlx::query(ddl).execute(&self.pool).await?;
-        }
+    /// Restart id allocation above every id the state has seen (open / restore).
+    pub(crate) async fn reseed_chunk_ids(&self) -> Result<()> {
+        let (last,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT MAX(
+                COALESCE((SELECT last FROM chunk_id_seq WHERE singleton = 0), 0),
+                COALESCE((SELECT MAX(id) FROM chunks), 0)
+            )
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        self.next_chunk_id.fetch_max(last + 1, Ordering::SeqCst);
         Ok(())
     }
 
+    /// Propose one chunk command; `Err(reason)` is a deterministic rejection.
+    async fn propose(&self, op: pb::command::Op) -> Result<Result<(), pb::rejection::Reason>> {
+        let cmd = pb::Command { op: Some(op) }.encode_to_vec();
+        match self.meta.propose(NAMESPACE, &cmd).await?.applied {
+            Applied::Commit(_) => Ok(Ok(())),
+            Applied::Reject(bytes) => Ok(Err(pb::Rejection::decode(bytes.as_slice())?
+                .reason
+                .context("rejection without reason")?)),
+        }
+    }
+
+    /// Propose a command that has no state-dependent failure.
+    async fn propose_infallible(&self, op: pb::command::Op) -> Result<()> {
+        match self.propose(op).await? {
+            Ok(()) => Ok(()),
+            Err(reason) => bail!("unexpected rejection {reason:?}"),
+        }
+    }
+
     pub async fn sync_instances(&self, configured: &[InstanceInfo]) -> Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let existing: Vec<(String,)> = sqlx::query_as("SELECT id FROM instances")
-            .fetch_all(&mut *tx)
-            .await?;
-        let configured_ids: std::collections::HashSet<&str> =
-            configured.iter().map(|i| i.id.as_str()).collect();
-
-        for (id,) in &existing {
-            if !configured_ids.contains(id.as_str()) {
-                sqlx::query("UPDATE instances SET state = 'retired' WHERE id = ?")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
-
-        for inst in configured {
-            sqlx::query(
-                r#"
-                INSERT INTO instances (id, kind, fingerprint, location, state)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    kind = excluded.kind,
-                    fingerprint = excluded.fingerprint,
-                    location = excluded.location,
-                    state = excluded.state
-                "#,
-            )
-            .bind(&inst.id)
-            .bind(inst.kind.as_str())
-            .bind(&inst.fingerprint)
-            .bind(&inst.location)
-            .bind(inst.role.as_str())
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        let instances = configured
+            .iter()
+            .map(|i| pb::Instance {
+                id: i.id.clone(),
+                kind: i.kind.as_str().into(),
+                fingerprint: i.fingerprint.clone(),
+                location: i.location.clone(),
+                state: i.role.as_str().into(),
+            })
+            .collect();
+        self.propose_infallible(pb::command::Op::SyncInstances(pb::SyncInstances { instances }))
+            .await
     }
 
     pub async fn list_instance_fingerprints(&self) -> Result<Vec<(String, String)>> {
@@ -256,31 +248,10 @@ impl BlobDb {
             .collect())
     }
 
-    /// Insert a chunk row with refs=1; returns chunk_id.
-    pub async fn insert_chunk(
-        &self,
-        logical_size: i64,
-        crc32: u32,
-        block_count: i64,
-    ) -> Result<i64> {
-        let at = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let chunk_id = next_chunk_id(&mut tx).await?;
-        sqlx::query(
-            r#"
-            INSERT INTO chunks (id, logical_size, crc32, refs, block_count, created_at)
-            VALUES (?, ?, ?, 1, ?, ?)
-            "#,
-        )
-        .bind(chunk_id)
-        .bind(logical_size)
-        .bind(i64::from(crc32))
-        .bind(block_count)
-        .bind(&at)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(chunk_id)
+    /// Chunk row with refs = 1 and no blocks or parts (tests).
+    #[cfg(test)]
+    pub(crate) async fn insert_chunk(&self, logical_size: i64, crc32: u32) -> Result<ChunkId> {
+        self.commit_chunk(logical_size, crc32, &[], &[]).await
     }
 
     /// Atomically insert chunk + blocks + parts after a successful quorum write.
@@ -291,104 +262,25 @@ impl BlobDb {
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
     ) -> Result<ChunkId> {
-        let at = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let chunk_id = next_chunk_id(&mut tx).await?;
-        sqlx::query(
-            r#"
-            INSERT INTO chunks (id, logical_size, crc32, refs, block_count, created_at)
-            VALUES (?, ?, ?, 1, ?, ?)
-            "#,
-        )
-        .bind(chunk_id)
-        .bind(logical_size)
-        .bind(i64::from(crc32))
-        .bind(blocks.len() as i64)
-        .bind(&at)
-        .execute(&mut *tx)
+        let chunk_id = self.next_chunk_id.fetch_add(1, Ordering::SeqCst);
+        self.propose_infallible(pb::command::Op::CommitChunk(pb::CommitChunk {
+            chunk_id,
+            logical_size,
+            crc32,
+            blocks: blocks.iter().map(pb::Block::from).collect(),
+            replicas: replicas.iter().map(pb::Replica::from).collect(),
+            created_at: Utc::now().to_rfc3339(),
+        }))
         .await?;
-
-        for b in blocks {
-            sqlx::query(
-                r#"
-                INSERT INTO chunk_blocks
-                  (chunk_id, block_no, logical_off, logical_len, stored_len, codec)
-                VALUES (?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(chunk_id)
-            .bind(b.block_no)
-            .bind(b.logical_off)
-            .bind(b.logical_len)
-            .bind(b.stored_len)
-            .bind(&b.codec)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        // Reject duplicate sort keys inside one commit (would violate UNIQUE and
-        // indicate a packer / fan-out bug).
-        {
-            use std::collections::HashSet;
-            let mut seen = HashSet::new();
-            for rep in replicas {
-                for part in &rep.parts {
-                    let k = (rep.instance.as_str(), part.locator.key.as_slice());
-                    if !seen.insert(k) {
-                        anyhow::bail!(
-                            "duplicate sort_key in commit_chunk for instance {}",
-                            rep.instance
-                        );
-                    }
-                }
-            }
-        }
-
-        for rep in replicas {
-            for (part_no, part) in rep.parts.iter().enumerate() {
-                sqlx::query(
-                    r#"
-                    INSERT INTO chunk_parts
-                      (chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    "#,
-                )
-                .bind(chunk_id)
-                .bind(&rep.instance)
-                .bind(part_no as i64)
-                .bind(i64::from(part.first_block))
-                .bind(i64::from(part.block_count))
-                .bind(&part.locator.key)
-                .bind(&part.locator.locator)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "insert chunk_parts chunk={chunk_id} instance={} part={part_no} key_hex={}: {e}",
-                        rep.instance,
-                        hex::encode(&part.locator.key)
-                    )
-                })?;
-            }
-        }
-
-        tx.commit().await?;
         Ok(chunk_id)
     }
 
     pub async fn set_root(&self, name: &str, extents: &[Extent]) -> Result<()> {
-        let json = serde_json::to_string(extents).context("serialize root extents")?;
-        sqlx::query(
-            r#"
-            INSERT INTO roots (name, extents_json) VALUES (?, ?)
-            ON CONFLICT(name) DO UPDATE SET extents_json = excluded.extents_json
-            "#,
-        )
-        .bind(name)
-        .bind(&json)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.propose_infallible(pb::command::Op::SetRoot(pb::SetRoot {
+            name: name.into(),
+            extents: extents.iter().map(pb::Extent::from).collect(),
+        }))
+        .await
     }
 
     pub async fn get_root(&self, name: &str) -> Result<Option<Vec<Extent>>> {
@@ -423,40 +315,27 @@ impl BlobDb {
     }
 
     pub async fn delete_root(&self, name: &str) -> Result<()> {
-        sqlx::query("DELETE FROM roots WHERE name = ?")
-            .bind(name)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        self.propose_infallible(pb::command::Op::DeleteRoot(pb::DeleteRoot { name: name.into() }))
+            .await
     }
 
-    /// Atomically bump refs for every id. Fails with [`ChunkGone`] (and rolls back)
+    /// Atomically bump refs for every id. Fails with [`ChunkGone`] (nothing retained)
     /// if any chunk is missing, has `refs = 0`, or is `reclaiming`.
     pub async fn retain(&self, ids: &[i64]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        for &id in ids {
-            let res = sqlx::query(
-                r#"
-                UPDATE chunks
-                SET refs = refs + 1
-                WHERE id = ? AND refs > 0 AND state = 'live'
-                "#,
-            )
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-            if res.rows_affected() != 1 {
-                // Explicit rollback before returning typed error.
-                tx.rollback().await.ok();
+        match self
+            .propose(pb::command::Op::Retain(pb::Retain { chunk_ids: ids.to_vec() }))
+            .await?
+        {
+            Ok(()) => Ok(()),
+            Err(pb::rejection::Reason::ChunkGone(chunk_id)) => {
                 pigeonhole_blob::record_chunk_gone();
-                return Err(anyhow::Error::new(ChunkGone { chunk_id: id }));
+                Err(anyhow::Error::new(ChunkGone { chunk_id }))
             }
+            Err(other) => bail!("unexpected retain rejection {other:?}"),
         }
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Decrement refs; errors on double-release (`refs` already 0 / missing / reclaiming).
@@ -464,26 +343,17 @@ impl BlobDb {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        for &id in ids {
-            let res = sqlx::query(
-                r#"
-                UPDATE chunks
-                SET refs = refs - 1
-                WHERE id = ? AND refs > 0 AND state = 'live'
-                "#,
-            )
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-            if res.rows_affected() != 1 {
-                tx.rollback().await.ok();
+        match self
+            .propose(pb::command::Op::Release(pb::Release { chunk_ids: ids.to_vec() }))
+            .await?
+        {
+            Ok(()) => Ok(()),
+            Err(pb::rejection::Reason::DoubleRelease(id)) => {
                 pigeonhole_blob::record_double_release();
-                anyhow::bail!("double release or missing chunk {id}");
+                bail!("double release or missing chunk {id}")
             }
+            Err(other) => bail!("unexpected release rejection {other:?}"),
         }
-        tx.commit().await?;
-        Ok(())
     }
 
     pub async fn chunk_meta(&self, chunk_id: i64) -> Result<Option<(i64, u32, i64)>> {
@@ -502,38 +372,6 @@ impl BlobDb {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.map(|r| r.0))
-    }
-
-    pub async fn replace_blocks(&self, chunk_id: i64, blocks: &[StoredBlock]) -> Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM chunk_blocks WHERE chunk_id = ?")
-            .bind(chunk_id)
-            .execute(&mut *tx)
-            .await?;
-        for fr in blocks {
-            sqlx::query(
-                r#"
-                INSERT INTO chunk_blocks
-                  (chunk_id, block_no, logical_off, logical_len, stored_len, codec)
-                VALUES (?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(chunk_id)
-            .bind(fr.block_no)
-            .bind(fr.logical_off)
-            .bind(fr.logical_len)
-            .bind(fr.stored_len)
-            .bind(&fr.codec)
-            .execute(&mut *tx)
-            .await?;
-        }
-        sqlx::query("UPDATE chunks SET block_count = ? WHERE id = ?")
-            .bind(blocks.len() as i64)
-            .bind(chunk_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
     }
 
     pub async fn get_blocks(&self, chunk_id: i64) -> Result<Vec<StoredBlock>> {
@@ -753,49 +591,20 @@ impl BlobDb {
     /// Atomically mark a zero-ref live chunk as reclaiming. Returns false if another
     /// worker won the race or `retain` revived the chunk.
     pub async fn try_begin_reclaim(&self, chunk_id: ChunkId) -> Result<bool> {
-        let res = sqlx::query(
-            r#"
-            UPDATE chunks
-            SET state = 'reclaiming'
-            WHERE id = ? AND refs = 0 AND state = 'live'
-            "#,
-        )
-        .bind(chunk_id)
-        .execute(&self.pool)
-        .await?;
-        if res.rows_affected() == 1 {
-            return Ok(true);
+        match self
+            .propose(pb::command::Op::BeginReclaim(pb::BeginReclaim { chunk_id }))
+            .await?
+        {
+            Ok(()) => Ok(true),
+            Err(pb::rejection::Reason::NotReclaimable(_)) => Ok(false),
+            Err(other) => bail!("unexpected begin_reclaim rejection {other:?}"),
         }
-        // Already reclaiming (restart path)?
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT state FROM chunks WHERE id = ?")
-                .bind(chunk_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(matches!(row.as_ref().map(|(s,)| s.as_str()), Some(CHUNK_STATE_RECLAIMING)))
     }
 
     /// Delete chunk_parts, chunk_blocks, and the chunk row (after backend deletes).
     pub async fn delete_chunk_metadata(&self, chunk_id: ChunkId) -> Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM chunk_parts WHERE chunk_id = ?")
-            .bind(chunk_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM chunk_blocks WHERE chunk_id = ?")
-            .bind(chunk_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM repair_queue WHERE chunk_id = ?")
-            .bind(chunk_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM chunks WHERE id = ?")
-            .bind(chunk_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
+        self.propose_infallible(pb::command::Op::DropChunk(pb::DropChunk { chunk_id }))
+            .await
     }
 
     /// Enqueue `repair(chunk_id, instance_id)` (idempotent).
@@ -874,32 +683,11 @@ impl BlobDb {
         chunk_id: ChunkId,
         layout: &ReplicaLayout,
     ) -> Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM chunk_parts WHERE chunk_id = ? AND instance_id = ?")
-            .bind(chunk_id)
-            .bind(&layout.instance)
-            .execute(&mut *tx)
-            .await?;
-        for (part_no, part) in layout.parts.iter().enumerate() {
-            sqlx::query(
-                r#"
-                INSERT INTO chunk_parts
-                  (chunk_id, instance_id, part_no, first_block, block_count, sort_key, locator)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(chunk_id)
-            .bind(&layout.instance)
-            .bind(part_no as i64)
-            .bind(i64::from(part.first_block))
-            .bind(i64::from(part.block_count))
-            .bind(&part.locator.key)
-            .bind(&part.locator.locator)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        self.propose_infallible(pb::command::Op::AddReplica(pb::AddReplica {
+            chunk_id,
+            replica: Some(pb::Replica::from(layout)),
+        }))
+        .await
     }
 
     /// Pending repair queue depth (tests / metrics).
@@ -932,7 +720,7 @@ mod tests {
         let fps = db.list_instance_fingerprints().await.unwrap();
         assert_eq!(fps, vec![("tg-main".into(), "tg:1:-100".into())]);
 
-        let chunk_id = db.insert_chunk(32, 0xdeadbeef, 0).await.unwrap();
+        let chunk_id = db.insert_chunk(32, 0xdeadbeef).await.unwrap();
         let layouts = vec![ReplicaLayout {
             instance: "tg-main".into(),
             parts: vec![PartLayout {
@@ -1113,7 +901,7 @@ mod tests {
         let url2 = format!("sqlite:{}?mode=rwc", dir.path().join("restored.db").display());
         let restored = BlobDb::connect(&url2).await.unwrap();
         restored.import_checkpoint(&cp).await.unwrap();
-        let after = restored.insert_chunk(8, 1, 0).await.unwrap();
+        let after = restored.insert_chunk(8, 1).await.unwrap();
         assert!(after > new, "chunk id {new} reused as {after} after restore");
     }
 

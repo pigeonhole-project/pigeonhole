@@ -1,6 +1,7 @@
 //! Ingest, snapshot push/restore, and shared runtime config.
 
 pub mod blob_db;
+mod commands;
 pub mod config;
 pub mod durability;
 pub mod block_cache;

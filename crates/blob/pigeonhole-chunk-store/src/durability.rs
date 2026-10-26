@@ -391,7 +391,7 @@ impl BlobDb {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        self.reseed_chunk_ids().await
     }
 
     pub async fn apply_journal_ops(&self, ops: &[JournalOp]) -> Result<()> {

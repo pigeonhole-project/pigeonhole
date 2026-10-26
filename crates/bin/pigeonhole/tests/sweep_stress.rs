@@ -36,7 +36,7 @@ use std::time::Duration;
 const BUCKET: &str = "stress";
 const KEYS: u64 = 12;
 const WORKERS: u64 = 8;
-const OPS_PER_WORKER: u64 = 150;
+const OPS_PER_WORKER: u64 = 400;
 const CHUNK_SIZE: usize = 64 * 1024;
 const BLOCK_SIZE: usize = 16 * 1024;
 const MAX_OBJECT: u64 = 200 * 1024;
@@ -44,7 +44,7 @@ const HEADER: usize = 16;
 /// Must exceed the gap between a part landing on the backend and its InflightParts
 /// guard being registered, which includes waiting on SQLite for the put watermark
 /// (tens to hundreds of ms under this contention; see docs/sweep-invariants.md).
-const SWEEP_GRACE: Duration = Duration::from_millis(250);
+const SWEEP_GRACE: Duration = Duration::from_millis(1000);
 
 fn req<T>(input: T) -> S3Request<T> {
     S3Request {
