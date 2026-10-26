@@ -62,6 +62,30 @@ pub struct StoredBlock {
     pub codec: String,
 }
 
+/// Allocate the next chunk id inside `tx` (which must hold the write lock).
+async fn next_chunk_id(tx: &mut sqlx::SqliteConnection) -> Result<ChunkId> {
+    let (next,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT MAX(
+            COALESCE((SELECT last FROM chunk_id_seq WHERE singleton = 0), 0),
+            COALESCE((SELECT MAX(id) FROM chunks), 0)
+        ) + 1
+        "#,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO chunk_id_seq (singleton, last) VALUES (0, ?)
+        ON CONFLICT (singleton) DO UPDATE SET last = excluded.last
+        "#,
+    )
+    .bind(next)
+    .execute(&mut *tx)
+    .await?;
+    Ok(next)
+}
+
 impl BlobDb {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = SqlitePoolOptions::new()
@@ -131,6 +155,20 @@ impl BlobDb {
                 block_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'live'
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // High-water mark for chunk ids. `chunks.id` is a plain INTEGER PRIMARY KEY,
+        // which SQLite re-issues once the highest row is deleted; ids must never be
+        // reused (block cache and extents are keyed by chunk id).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS chunk_id_seq (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+                last INTEGER NOT NULL
             )
             "#,
         )
@@ -568,19 +606,23 @@ impl BlobDb {
         block_count: i64,
     ) -> Result<i64> {
         let at = Utc::now().to_rfc3339();
-        let res = sqlx::query(
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let chunk_id = next_chunk_id(&mut tx).await?;
+        sqlx::query(
             r#"
-            INSERT INTO chunks (logical_size, crc32, refs, block_count, created_at)
-            VALUES (?, ?, 1, ?, ?)
+            INSERT INTO chunks (id, logical_size, crc32, refs, block_count, created_at)
+            VALUES (?, ?, ?, 1, ?, ?)
             "#,
         )
+        .bind(chunk_id)
         .bind(logical_size)
         .bind(i64::from(crc32))
         .bind(block_count)
         .bind(&at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(res.last_insert_rowid())
+        tx.commit().await?;
+        Ok(chunk_id)
     }
 
     /// Atomically insert chunk + blocks + parts after a successful quorum write.
@@ -593,19 +635,20 @@ impl BlobDb {
     ) -> Result<ChunkId> {
         let at = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let res = sqlx::query(
+        let chunk_id = next_chunk_id(&mut tx).await?;
+        sqlx::query(
             r#"
-            INSERT INTO chunks (logical_size, crc32, refs, block_count, created_at)
-            VALUES (?, ?, 1, ?, ?)
+            INSERT INTO chunks (id, logical_size, crc32, refs, block_count, created_at)
+            VALUES (?, ?, ?, 1, ?, ?)
             "#,
         )
+        .bind(chunk_id)
         .bind(logical_size)
         .bind(i64::from(crc32))
         .bind(blocks.len() as i64)
         .bind(&at)
         .execute(&mut *tx)
         .await?;
-        let chunk_id = res.last_insert_rowid();
 
         for b in blocks {
             sqlx::query(
@@ -1510,6 +1553,65 @@ mod tests {
         assert!(is_chunk_gone(&err), "{err}");
         let meta = db.chunk_meta(id2).await.unwrap().unwrap();
         assert_eq!(meta.2, 1, "id2 refs must be unchanged after rolled-back retain");
+    }
+
+    #[tokio::test]
+    async fn reclaimed_chunk_ids_are_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+        let db = BlobDb::connect(&url).await.unwrap();
+        db.sync_instances(&[InstanceInfo {
+            id: "mem".into(),
+            kind: InstanceKind::Memory,
+            fingerprint: "memory:mem".into(),
+            location: "memory:mem".into(),
+            role: InstanceRole::ReadWrite,
+        }])
+        .await
+        .unwrap();
+        let commit = |key: u8| {
+            let db = db.clone();
+            async move {
+                db.commit_chunk(
+                    8,
+                    1,
+                    &[],
+                    &[ReplicaLayout {
+                        instance: "mem".into(),
+                        parts: vec![PartLayout {
+                            first_block: 0,
+                            block_count: 1,
+                            locator: BlobLocator {
+                                key: vec![0, 0, 0, 0, 0, 0, 0, key],
+                                locator: b"{}".to_vec(),
+                            },
+                            block_stored_lens: vec![8],
+                        }],
+                    }],
+                )
+                .await
+                .unwrap()
+            }
+        };
+        // Reclaim the highest id: plain INTEGER PRIMARY KEY would hand it out again,
+        // and anything keyed by chunk id (block cache, stale extents) would alias.
+        let old = commit(1).await;
+        db.release(&[old]).await.unwrap();
+        assert!(db.try_begin_reclaim(old).await.unwrap());
+        db.delete_chunk_metadata(old).await.unwrap();
+        let new = commit(2).await;
+        assert!(new > old, "chunk id {old} reused as {new}");
+
+        // Same after a restore: the high-water mark travels in the checkpoint.
+        db.release(&[new]).await.unwrap();
+        assert!(db.try_begin_reclaim(new).await.unwrap());
+        db.delete_chunk_metadata(new).await.unwrap();
+        let cp = db.export_checkpoint().await.unwrap();
+        let url2 = format!("sqlite:{}?mode=rwc", dir.path().join("restored.db").display());
+        let restored = BlobDb::connect(&url2).await.unwrap();
+        restored.import_checkpoint(&cp).await.unwrap();
+        let after = restored.insert_chunk(8, 1, 0).await.unwrap();
+        assert!(after > new, "chunk id {new} reused as {after} after restore");
     }
 
     #[tokio::test]

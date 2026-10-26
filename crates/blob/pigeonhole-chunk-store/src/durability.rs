@@ -137,6 +137,10 @@ pub struct CheckpointPayload {
     #[serde(alias = "frames")]
     pub blocks: Vec<CheckpointBlock>,
     pub roots: Vec<(String, Vec<Extent>)>,
+    /// Highest chunk id ever issued (`chunk_id_seq`), so a restore never re-issues
+    /// ids of chunks reclaimed before the checkpoint. 0 in older checkpoints.
+    #[serde(default)]
+    pub chunk_id_seq: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +282,11 @@ impl BlobDb {
             roots.push((name, extents));
         }
 
+        let (chunk_id_seq,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE((SELECT last FROM chunk_id_seq WHERE singleton = 0), 0)",
+        )
+        .fetch_one(self.pool())
+        .await?;
         Ok(CheckpointPayload {
             format: 2,
             instances,
@@ -285,6 +294,7 @@ impl BlobDb {
             parts,
             blocks,
             roots,
+            chunk_id_seq,
         })
     }
 
@@ -389,6 +399,16 @@ impl BlobDb {
                 .execute(&mut *tx)
                 .await?;
         }
+        // Never move the id high-water mark backwards (`--force` onto a used DB).
+        sqlx::query(
+            r#"
+            INSERT INTO chunk_id_seq (singleton, last) VALUES (0, ?)
+            ON CONFLICT (singleton) DO UPDATE SET last = MAX(last, excluded.last)
+            "#,
+        )
+        .bind(cp.chunk_id_seq)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
