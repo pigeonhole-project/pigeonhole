@@ -5,7 +5,7 @@ use futures::StreamExt;
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::{build_s3gram, BlobDb, ChunkStore, IngestOptions};
+use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use http::{HeaderMap, Method, Uri};
 use http::Extensions;
 use s3s::dto::*;
@@ -27,7 +27,7 @@ fn req<T>(input: T) -> S3Request<T> {
 }
 
 async fn setup_with_mem() -> (
-    pigeonhole::service::S3gram,
+    pigeonhole::service::S3Gateway,
     Arc<MemoryBlobStore>,
     tempfile::TempDir,
 ) {
@@ -48,7 +48,7 @@ async fn setup_with_mem() -> (
     let store = Arc::new(
         ChunkStore::open(db, store_mem, opts).await.unwrap(),
     );
-    let s3 = build_s3gram(cfg, index, store);
+    let s3 = build_s3_gateway(cfg, index, store);
     (s3, mem, dir)
 }
 

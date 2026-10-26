@@ -1,4 +1,4 @@
-//! Stage G: migrate checked-in legacy s3gram index fixture into blob.db.
+//! Stage G: migrate checked-in legacy index fixture into blob.db.
 
 use pigeonhole_blob::InstanceKind;
 use pigeonhole_chunk_store::{
@@ -9,12 +9,12 @@ use pigeonhole_storage_memory::MemoryBlobStore;
 use std::path::PathBuf;
 
 fn fixture_path() -> PathBuf {
-    // workspace root / tests/fixtures/legacy_s3gram.db
+    // workspace root / tests/fixtures/legacy_index.db
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // pigeonhole-chunk-store
     p.pop(); // blob
     p.pop(); // crates
-    p.push("tests/fixtures/legacy_s3gram.db");
+    p.push("tests/fixtures/legacy_index.db");
     p
 }
 

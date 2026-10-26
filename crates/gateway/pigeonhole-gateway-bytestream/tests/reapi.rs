@@ -35,7 +35,7 @@ async fn test_harness() -> (
     );
     let cfg = BytestreamConfig {
         enabled: true,
-        instance_name: "s3gram".into(),
+        instance_name: "pigeonhole".into(),
         gc_ttl_secs: 0,
         ..Default::default()
     };
@@ -49,7 +49,7 @@ async fn test_harness() -> (
     let bs = ByteStreamClient::new(channel)
         .max_decoding_message_size(MAX_MSG)
         .max_encoding_message_size(MAX_MSG);
-    (cas, bs, "s3gram".into())
+    (cas, bs, "pigeonhole".into())
 }
 
 fn digest_for(data: &[u8]) -> Digest {

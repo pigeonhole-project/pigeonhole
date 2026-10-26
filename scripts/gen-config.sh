@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Write a temporary s3gram.toml for compat / CI runs.
+# Write a temporary pigeonhole.toml for compat / CI runs.
 # Usage: source this after setting vars, or call:
 #   CONFIG_OUT=... ./scripts/gen-config.sh
 #
@@ -8,7 +8,7 @@
 #   CONFIG_MEMORY       true|false (default false)
 #   CONFIG_CHAT_ID      telegram chat id (required when memory=false)
 #   CONFIG_LISTEN_ADDR  default 0.0.0.0:8333
-#   CONFIG_DATABASE_URL default sqlite:s3gram.db / memory variant
+#   CONFIG_DATABASE_URL default sqlite:pigeonhole.db / memory variant
 #   CONFIG_REGION       default us-east-1
 #   CONFIG_SNAPSHOT_SECS default 300 (0 for memory suites)
 #   CONFIG_CHUNK_SIZE   default 19922944
@@ -26,13 +26,13 @@ CHUNK_CODEC="${CONFIG_CHUNK_CODEC:-zstd}"
 
 if [[ "$MEMORY" == "true" || "$MEMORY" == "1" ]]; then
   SNAPSHOT_SECS="${CONFIG_SNAPSHOT_SECS:-0}"
-  DATABASE_URL="${CONFIG_DATABASE_URL:-sqlite:s3gram-memory.db}"
+  DATABASE_URL="${CONFIG_DATABASE_URL:-sqlite:pigeonhole-memory.db}"
   CHAT_LINE=""
   # MemoryBlobStore is process-local; quiet background tasks under heavy suites.
   EXTRA_BG=$'\n[repair]\nscrub = false\ninterval_secs = 3600\n\n[sweep]\ninterval_secs = 3600\n'
 else
   SNAPSHOT_SECS="${CONFIG_SNAPSHOT_SECS:-300}"
-  DATABASE_URL="${CONFIG_DATABASE_URL:-sqlite:s3gram.db}"
+  DATABASE_URL="${CONFIG_DATABASE_URL:-sqlite:pigeonhole.db}"
   : "${CONFIG_CHAT_ID:?CONFIG_CHAT_ID required when memory=false}"
   CHAT_LINE="chat_id = \"${CONFIG_CHAT_ID}\""
   EXTRA_BG=""

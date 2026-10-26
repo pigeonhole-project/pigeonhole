@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Quick AWS CLI smoke against a running s3gram instance.
+# Quick AWS CLI smoke against a running pigeonhole instance.
 set -euo pipefail
 
 ENDPOINT="${ENDPOINT:-http://127.0.0.1:8333}"
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-s3gram}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-s3gramsecret}"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-pigeonhole}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-pigeonholesecret}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 export AWS_EC2_METADATA_DISABLED=true
 
@@ -28,7 +28,7 @@ OUT="$(mktemp)"
 BIG="$(mktemp)"
 trap 'rm -f "$TMP" "$OUT" "$BIG"' EXIT
 
-echo "hello s3gram $(date)" >"$TMP"
+echo "hello pigeonhole $(date)" >"$TMP"
 dd if=/dev/urandom of="$BIG" bs=1m count=12 status=none
 
 echo "== basic put/get/list/rm =="
@@ -46,10 +46,10 @@ cmp -s "$BIG" "$OUT"
 echo "== copy + metadata =="
 aws --endpoint-url "$ENDPOINT" s3api put-object \
   --bucket demo --key meta.txt --body "$TMP" \
-  --metadata "author=s3gram,env=smoke" >/dev/null
+  --metadata "author=pigeonhole,env=smoke" >/dev/null
 aws --endpoint-url "$ENDPOINT" s3 cp "s3://demo/meta.txt" "s3://demo/meta-copy.txt"
 meta="$(aws --endpoint-url "$ENDPOINT" s3api head-object --bucket demo --key meta-copy.txt)"
-echo "$meta" | grep -q '"author": "s3gram"'
+echo "$meta" | grep -q '"author": "pigeonhole"'
 echo "$meta" | grep -q '"env": "smoke"'
 
 echo "== cleanup =="

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Purge the real Discord backend + run the full client suite against it once.
 #
-# Requires DISCORD_BOT_TOKEN + discord channel_id in s3gram.toml (or .env).
+# Requires DISCORD_BOT_TOKEN + discord channel_id in pigeonhole.toml (or .env).
 # Build with: cargo build --release --features discord
 #
 # Usage:
@@ -11,9 +11,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LOG="${S3GRAM_DC_LOG:-$ROOT/.cache/pigeonhole-storage-discord.log}"
-PIDFILE="${S3GRAM_DC_PID:-$ROOT/.cache/pigeonhole-storage-discord.pid}"
-REPORT="${S3GRAM_DC_REPORT:-$ROOT/.cache/discord-suite-report.txt}"
+LOG="${PIGEONHOLE_DC_LOG:-$ROOT/.cache/pigeonhole-storage-discord.log}"
+PIDFILE="${PIGEONHOLE_DC_PID:-$ROOT/.cache/pigeonhole-storage-discord.pid}"
+REPORT="${PIGEONHOLE_DC_REPORT:-$ROOT/.cache/discord-suite-report.txt}"
 
 COMPAT_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -44,16 +44,16 @@ fi
 : "${DISCORD_BOT_TOKEN:?DISCORD_BOT_TOKEN required in .env}"
 
 CHANNEL_ID="${DISCORD_CHANNEL_ID:-}"
-if [[ -z "$CHANNEL_ID" && -f s3gram.toml ]]; then
-  CHANNEL_ID="$(sed -n 's/^channel_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' s3gram.toml | head -1)"
+if [[ -z "$CHANNEL_ID" && -f pigeonhole.toml ]]; then
+  CHANNEL_ID="$(sed -n 's/^channel_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pigeonhole.toml | head -1)"
   if [[ -z "$CHANNEL_ID" ]]; then
-    CHANNEL_ID="$(sed -n '/^\[discord\]/,/^\[/ s/^channel_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' s3gram.toml | head -1)"
+    CHANNEL_ID="$(sed -n '/^\[discord\]/,/^\[/ s/^channel_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pigeonhole.toml | head -1)"
   fi
   if [[ -z "$CHANNEL_ID" ]]; then
-    CHANNEL_ID="$(sed -n 's/^chat_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' s3gram.toml | head -1)"
+    CHANNEL_ID="$(sed -n 's/^chat_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pigeonhole.toml | head -1)"
   fi
 fi
-: "${CHANNEL_ID:?discord channel_id required in s3gram.toml [discord] or chat_id}"
+: "${CHANNEL_ID:?discord channel_id required in pigeonhole.toml [discord] or chat_id}"
 
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:8333}"
 PORT="${LISTEN_ADDR##*:}"
@@ -100,9 +100,9 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 CFG="$ROOT/.cache/pigeonhole-storage-discord-config.toml"
-DB_URL="sqlite:s3gram.db"
-if [[ -f s3gram.toml ]]; then
-  parsed="$(sed -n 's/^database_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' s3gram.toml | head -1 || true)"
+DB_URL="sqlite:pigeonhole.db"
+if [[ -f pigeonhole.toml ]]; then
+  parsed="$(sed -n 's/^database_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pigeonhole.toml | head -1 || true)"
   [[ -n "$parsed" ]] && DB_URL="$parsed"
 fi
 
@@ -141,22 +141,22 @@ upload_concurrency = 2
 download_concurrency = 8
 EOF
 
-export S3GRAM_CONFIG="$CFG"
+export PIGEONHOLE_CONFIG="$CFG"
 export DISCORD_BOT_TOKEN
 
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-s3gram}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-s3gramsecret}"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-pigeonhole}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-pigeonholesecret}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 export AWS_REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
 export AWS_ENDPOINT_URL="$ENDPOINT_URL"
 export AWS_EC2_METADATA_DISABLED=1
 export AWS_CONFIG_FILE=/dev/null
 export AWS_SHARED_CREDENTIALS_FILE=/dev/null
-export S3GRAM_HOST=127.0.0.1
-export S3GRAM_PORT="$PORT"
+export PIGEONHOLE_HOST=127.0.0.1
+export PIGEONHOLE_PORT="$PORT"
 export ENDPOINT="$ENDPOINT_URL"
 
-./target/release/s3gram >"$LOG" 2>&1 &
+./target/release/pigeonhole >"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
 
 for _ in $(seq 1 80); do
@@ -170,7 +170,7 @@ if [[ -z "${code:-}" || "$code" == "000" ]]; then
   echo "discord server failed to start; see $LOG" >&2
   exit 1
 fi
-log_step "s3gram DiscordBlobStore listening on $ENDPOINT_URL (pid $(cat "$PIDFILE"))"
+log_step "pigeonhole DiscordBlobStore listening on $ENDPOINT_URL (pid $(cat "$PIDFILE"))"
 
 log_step "smoke"
 set +e

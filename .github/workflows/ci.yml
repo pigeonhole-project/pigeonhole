@@ -8,8 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  AWS_ACCESS_KEY_ID: s3gram
-  AWS_SECRET_ACCESS_KEY: s3gramsecret
+  AWS_ACCESS_KEY_ID: pigeonhole
+  AWS_SECRET_ACCESS_KEY: pigeonholesecret
   AWS_DEFAULT_REGION: us-east-1
 
 jobs:

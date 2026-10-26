@@ -1,4 +1,4 @@
-//! Migrate legacy s3gram index blob rows into `blob.db` (stage E / F).
+//! Migrate legacy index blob rows into `blob.db` (stage E / F).
 
 use crate::blob_db::{BlobDb, Extent, StoredBlock};
 use crate::instances::{telegram_fingerprint, telegram_location, InstanceConfig};
@@ -204,7 +204,7 @@ async fn get_meta(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
     Ok(row.map(|r| r.0))
 }
 
-/// True when a legacy s3gram index still has `blobs` rows (needs migrate → blob.db).
+/// True when a legacy index still has `blobs` rows (needs migrate → blob.db).
 pub async fn legacy_index_has_blobs(legacy_database_url: &str) -> Result<bool> {
     let url = if legacy_database_url.starts_with("sqlite:") && !legacy_database_url.contains('?') {
         format!("{legacy_database_url}?mode=rwc")

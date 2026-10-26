@@ -9,7 +9,7 @@ pub use index::{
     ObjectMeta,
 };
 pub use pigeonhole_chunk_store::{ChunkStore, Config, Extent};
-pub use service::S3gram;
+pub use service::S3Gateway;
 pub use snapshot::{
     push_index_snapshot, push_index_snapshot_durable, restore_index_snapshot, PushOutcome, ROOT_NAME,
 };
@@ -18,14 +18,14 @@ use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use std::sync::Arc;
 
-/// Build an [`S3gram`] backend from an existing index + chunk store.
-pub fn build_s3gram(cfg: Config, index: Index, store: Arc<ChunkStore>) -> S3gram {
-    S3gram::new(cfg, index, store)
+/// Build an [`S3Gateway`] backend from an existing index + chunk store.
+pub fn build_s3_gateway(cfg: Config, index: Index, store: Arc<ChunkStore>) -> S3Gateway {
+    S3Gateway::new(cfg, index, store)
 }
 
-/// Wrap [`S3gram`] in an authenticated s3s HTTP service.
-pub fn build_s3_service(s3gram: S3gram, access_key: &str, secret_key: &str) -> S3Service {
-    let mut builder = S3ServiceBuilder::new(s3gram);
+/// Wrap [`S3Gateway`] in an authenticated s3s HTTP service.
+pub fn build_s3_service(gateway: S3Gateway, access_key: &str, secret_key: &str) -> S3Service {
+    let mut builder = S3ServiceBuilder::new(gateway);
     builder.set_auth(SimpleAuth::from_single(
         access_key.to_string(),
         secret_key.to_string(),

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run s3s upstream rclone S3 e2e against s3gram MemoryBlobStore (no Telegram).
+# Run s3s upstream rclone S3 e2e against pigeonhole MemoryBlobStore (no Telegram).
 #
 # Downloads a pinned rclone binary into .cache/ (no Docker required), starts a
 # temporary MemoryBlobStore server, then runs tests/rclone/e2e.sh from the
@@ -7,15 +7,15 @@
 #
 # Usage:
 #   ./scripts/compat-rclone.sh
-#   S3GRAM_PORT=18335 ./scripts/compat-rclone.sh
+#   PIGEONHOLE_PORT=18335 ./scripts/compat-rclone.sh
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PORT="${S3GRAM_PORT:-18335}"
-DB="${S3GRAM_MEMORY_DB:-$ROOT/.cache/s3gram-rclone.db}"
-LOG="${S3GRAM_MEMORY_LOG:-$ROOT/.cache/s3gram-rclone.log}"
-PIDFILE="${S3GRAM_MEMORY_PID:-$ROOT/.cache/s3gram-rclone.pid}"
+PORT="${PIGEONHOLE_PORT:-18335}"
+DB="${PIGEONHOLE_MEMORY_DB:-$ROOT/.cache/pigeonhole-rclone.db}"
+LOG="${PIGEONHOLE_MEMORY_LOG:-$ROOT/.cache/pigeonhole-rclone.log}"
+PIDFILE="${PIGEONHOLE_MEMORY_PID:-$ROOT/.cache/pigeonhole-rclone.pid}"
 S3S_DIR="${S3S_DIR:-$ROOT/.cache/s3s-upstream}"
 S3S_REPO="${S3S_REPO:-https://github.com/s3s-project/s3s.git}"
 S3S_REF="${S3S_REF:-main}"
@@ -132,16 +132,16 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   exit 1
 fi
 
-CFG="$ROOT/.cache/s3gram-rclone-config.toml"
+CFG="$ROOT/.cache/pigeonhole-rclone-config.toml"
 CONFIG_OUT="$CFG" \
   CONFIG_MEMORY=true \
   CONFIG_LISTEN_ADDR="127.0.0.1:${PORT}" \
   CONFIG_DATABASE_URL="sqlite:${DB}?mode=rwc" \
   CONFIG_SNAPSHOT_SECS=0 \
   "$ROOT/scripts/gen-config.sh"
-export S3GRAM_CONFIG="$CFG"
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-s3gram}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-s3gramsecret}"
+export PIGEONHOLE_CONFIG="$CFG"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-pigeonhole}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-pigeonholesecret}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 export AWS_REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
 export AWS_ENDPOINT_URL="http://127.0.0.1:${PORT}"
@@ -153,7 +153,7 @@ export AWS_EC2_METADATA_DISABLED=1
 export AWS_CONFIG_FILE=/dev/null
 export AWS_SHARED_CREDENTIALS_FILE=/dev/null
 
-./target/release/s3gram >"$LOG" 2>&1 &
+./target/release/pigeonhole >"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
 
 for _ in $(seq 1 50); do
@@ -167,7 +167,7 @@ if [[ -z "${code:-}" || "$code" == "000" ]]; then
   echo "memory server failed to start; see $LOG" >&2
   exit 1
 fi
-echo "s3gram MemoryBlobStore listening on :$PORT (pid $(cat "$PIDFILE"))"
+echo "pigeonhole MemoryBlobStore listening on :$PORT (pid $(cat "$PIDFILE"))"
 
 E2E_SH="$S3S_DIR/tests/rclone/e2e.sh"
 if [[ ! -f "$E2E_SH" ]]; then

@@ -1,4 +1,4 @@
-# Curated ceph/s3-tests that pass against s3gram MemoryBlobStore.
+# Curated ceph/s3-tests that pass against pigeonhole MemoryBlobStore.
 # One pytest node id per line. Comments and blank lines ignored.
 #
 # Regenerated from a discovery run against MemoryBlobStore after ListObjectVersions

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Enforce workspace layering rules via `cargo metadata`.
 #
-# Soft mode (default): rules that already hold on the legacy s3gram-* layout.
+# Soft mode (default): rules that already hold on the legacy flat-crate layout.
 # Strict mode (--strict): full pigeonhole target rules (blob-store must not
 # pull s3s/tonic/storage/gateway; gateways only blob-store/codec/types).
 set -euo pipefail

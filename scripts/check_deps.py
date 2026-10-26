@@ -155,7 +155,7 @@ LEXEME_ALLOW_DIR_PREFIXES = (
     "compat/",
     "tests/",
 )
-# Legacy config / migrate bridges still parse old TOML keys and s3gram columns.
+# Legacy config / migrate bridges still parse old TOML keys and legacy columns.
 LEXEME_ALLOW_FILES = {
     "crates/blob/pigeonhole-chunk-store/src/config.rs",
     "crates/blob/pigeonhole-chunk-store/src/instances.rs",

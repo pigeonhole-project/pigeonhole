@@ -19,14 +19,14 @@ use tracing::info;
 
 
 #[derive(Clone)]
-pub struct S3gram {
+pub struct S3Gateway {
     pub cfg: Config,
     pub index: Index,
     pub store: Arc<ChunkStore>,
     pub snapshot_gate: Arc<Mutex<()>>,
 }
 
-impl S3gram {
+impl S3Gateway {
     pub fn new(cfg: Config, index: Index, store: Arc<ChunkStore>) -> Self {
         Self {
             cfg,
@@ -503,7 +503,7 @@ fn apply_checksum_to_upload_part(output: &mut UploadPartOutput, c: &Checksum) {
 
 
 #[async_trait]
-impl S3 for S3gram {
+impl S3 for S3Gateway {
     async fn list_buckets(
         &self,
         _req: S3Request<ListBucketsInput>,
@@ -520,8 +520,8 @@ impl S3 for S3gram {
         Ok(S3Response::new(ListBucketsOutput {
             buckets: Some(buckets),
             owner: Some(Owner {
-                display_name: Some("s3gram".into()),
-                id: Some("s3gram".into()),
+                display_name: Some("pigeonhole".into()),
+                id: Some("pigeonhole".into()),
             }),
             ..Default::default()
         }))
@@ -757,8 +757,8 @@ impl S3 for S3gram {
             .map_err(Self::map_err)?;
 
         let owner = Owner {
-            display_name: Some("s3gram".into()),
-            id: Some("s3gram".into()),
+            display_name: Some("pigeonhole".into()),
+            id: Some("pigeonhole".into()),
         };
         let versions = objects
             .into_iter()

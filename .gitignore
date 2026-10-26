@@ -1,11 +1,11 @@
 /target
 /tg3.db
-/s3gram.db
-/s3gram.db-*
-s3gram-*.db
+/pigeonhole.db
+/pigeonhole.db-*
+pigeonhole-*.db
 .env
 .env.bak*
-s3gram.toml
+pigeonhole.toml
 *.bin
 out.bin
 *.mp4

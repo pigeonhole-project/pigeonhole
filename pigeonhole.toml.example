@@ -1,9 +1,9 @@
-# Copy to s3gram.toml and adjust. Secrets stay in .env (see .env.example).
+# Copy to pigeonhole.toml and adjust. Secrets stay in .env (see .env.example).
 #
-#   cp s3gram.toml.example s3gram.toml
+#   cp pigeonhole.toml.example pigeonhole.toml
 #   cp .env.example .env
 #
-# Override path with S3GRAM_CONFIG=/path/to.toml
+# Override path with PIGEONHOLE_CONFIG=/path/to.toml
 
 # Telegram chat/channel for blobs + index snapshots (bot must be admin with pin rights).
 # Channels: enable "Edit messages". Groups: enable "Pin messages".
@@ -27,7 +27,7 @@ chat_id = "-1001234567890"
 # role = "read-write"
 
 listen_addr = "0.0.0.0:8333"
-database_url = "sqlite:s3gram.db"
+database_url = "sqlite:pigeonhole.db"
 region = "us-east-1"
 
 # true = MemoryBlobStore (no Telegram). For local suites / CI.
@@ -80,12 +80,12 @@ write_through = true
 # Blobs larger than this are not admitted to L2 disk.
 max_object_bytes = 20971520
 
-# Bazel/Buck2 remote cache (REAPI v2 + ByteStream). Requires building s3gram with
+# Bazel/Buck2 remote cache (REAPI v2 + ByteStream). Requires building pigeonhole with
 # `--features bytestream`. Disabled by default.
 [bytestream]
 enabled = false
 listen_addr = "127.0.0.1:8980"
-instance_name = "s3gram"
+instance_name = "pigeonhole"
 max_batch_total_size_bytes = 4194304
 # 0 disables TTL GC for CAS entries.
 gc_ttl_secs = 604800

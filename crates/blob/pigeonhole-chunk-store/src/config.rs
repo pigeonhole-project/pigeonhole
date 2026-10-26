@@ -132,7 +132,7 @@ impl Default for BytestreamSettings {
         Self {
             enabled: false,
             listen_addr: "127.0.0.1:8980".into(),
-            instance_name: "s3gram".into(),
+            instance_name: "pigeonhole".into(),
             max_batch_total_size_bytes: 4 * 1024 * 1024,
             gc_ttl_secs: 7 * 24 * 3600,
         }
@@ -163,7 +163,7 @@ impl Config {
             match file.backend.kind.as_deref() {
                 Some("discord") => BackendKind::Discord,
                 Some("telegram") | Some("") | None => BackendKind::Telegram,
-                Some(other) => bail!("s3gram.toml: unknown backend.kind {other:?}"),
+                Some(other) => bail!("pigeonhole.toml: unknown backend.kind {other:?}"),
             }
         };
 
@@ -184,28 +184,28 @@ impl Config {
                 .or_else(|| file.chat_id.clone())
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
-                    anyhow::anyhow!("s3gram.toml: discord.channel_id or chat_id required for discord backend")
+                    anyhow::anyhow!("pigeonhole.toml: discord.channel_id or chat_id required for discord backend")
                 })?
         } else {
             match file.chat_id.filter(|s| !s.is_empty()) {
                 Some(id) => id,
-                None => bail!("s3gram.toml: chat_id is required when memory = false"),
+                None => bail!("pigeonhole.toml: chat_id is required when memory = false"),
             }
         };
 
         let discord_max_blob_size = file.discord.max_blob_size;
 
-        let access_key = env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "s3gram".into());
-        let secret_key = env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "s3gramsecret".into());
+        let access_key = env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "pigeonhole".into());
+        let secret_key = env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "pigeonholesecret".into());
         if access_key.is_empty() || secret_key.is_empty() {
             bail!("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY must not be empty");
         }
 
         let database_url = file.database_url.unwrap_or_else(|| {
             if memory_store {
-                "sqlite:s3gram-memory.db".into()
+                "sqlite:pigeonhole-memory.db".into()
             } else {
-                "sqlite:s3gram.db".into()
+                "sqlite:pigeonhole.db".into()
             }
         });
 
@@ -306,8 +306,8 @@ impl Config {
             discord_max_blob_size: None,
             listen_addr: "127.0.0.1:0".into(),
             database_url: database_url.into(),
-            access_key: "s3gram".into(),
-            secret_key: "s3gramsecret".into(),
+            access_key: "pigeonhole".into(),
+            secret_key: "pigeonholesecret".into(),
             region: "us-east-1".into(),
             snapshot_interval_secs: 0,
             chunk_size: chunker::DEFAULT_CHUNK_SIZE,
@@ -373,9 +373,9 @@ impl Config {
 }
 
 fn config_path_from_env() -> PathBuf {
-    env::var("S3GRAM_CONFIG")
+    env::var("PIGEONHOLE_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("s3gram.toml"))
+        .unwrap_or_else(|_| PathBuf::from("pigeonhole.toml"))
 }
 
 fn require_secret(key: &str) -> Result<String> {

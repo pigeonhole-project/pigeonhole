@@ -9,10 +9,6 @@ description.workspace = true
 name = "pigeonhole"
 path = "src/main.rs"
 
-[[bin]]
-name = "s3gram"
-path = "src/main.rs"
-
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

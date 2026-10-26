@@ -8,7 +8,7 @@ use pigeonhole::http_timeout::with_http_timeouts;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::telegram::{TelegramBlobStore, TelegramClient};
-use pigeonhole::{build_s3_service, build_s3gram};
+use pigeonhole::{build_s3_service, build_s3_gateway};
 use pigeonhole_blob::{
     erase_sweep, set_checkpoint_age, set_superblock_age, CheapestFirst, InstanceKind,
     MetricsBackend, Replicated, SharedBackend, TypedBootstrapPointer,
@@ -124,8 +124,8 @@ async fn cmd_serve() -> anyhow::Result<()> {
     .await
     .context("start_or_restore")?;
 
-    let s3gram = build_s3gram(cfg.clone(), index.clone(), rt.store.clone());
-    spawn_background_tasks(&cfg, &rt, &index, &s3gram);
+    let s3_gateway = build_s3_gateway(cfg.clone(), index.clone(), rt.store.clone());
+    spawn_background_tasks(&cfg, &rt, &index, &s3_gateway);
 
     #[cfg(feature = "bytestream")]
     if cfg.bytestream.enabled {
@@ -156,7 +156,7 @@ async fn cmd_serve() -> anyhow::Result<()> {
     let metrics_on_main = setup_metrics(&cfg)?;
 
     let max_headers = cfg.http.max_headers;
-    let s3_service = build_s3_service(s3gram, &cfg.access_key, &cfg.secret_key);
+    let s3_service = build_s3_service(s3_gateway, &cfg.access_key, &cfg.secret_key);
     let s3_service = HandleError::new(s3_service, handle_s3_error);
     let body_idle = Duration::from_secs(cfg.http.request_timeout_secs);
     let headers_timeout = Duration::from_secs(cfg.http.headers_timeout_secs);
@@ -234,7 +234,7 @@ fn spawn_background_tasks(
     cfg: &Config,
     rt: &Runtime,
     index: &Index,
-    s3gram: &pigeonhole::S3gram,
+    s3_gateway: &pigeonhole::S3Gateway,
 ) {
     let dur = rt.durability.clone();
     tokio::spawn(async move {
@@ -268,7 +268,7 @@ fn spawn_background_tasks(
         let idx = index.clone();
         let st = rt.store.clone();
         let dur = rt.durability.clone();
-        let gate = s3gram.snapshot_gate.clone();
+        let gate = s3_gateway.snapshot_gate.clone();
         let interval = cfg.snapshot_interval_secs;
         tokio::spawn(async move {
             let period = Duration::from_secs(interval);
@@ -349,7 +349,7 @@ async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
             .context("probe legacy index")?
         {
             let primary = cfg.primary_instance()?;
-            info!("legacy s3gram index has blobs; migrating into blob.db");
+            info!("legacy index has blobs; migrating into blob.db");
             let report =
                 migrate_index_to_blob_db(&cfg.database_url, &blob_db, primary, false).await?;
             info!(

@@ -6,8 +6,8 @@
 #
 # Steps:
 #   1. cargo test
-#   2. s3gram purge  (delete tracked TG messages, wipe SQLite)
-#   3. start s3gram on LISTEN_ADDR
+#   2. pigeonhole purge  (delete tracked TG messages, wipe SQLite)
+#   3. start pigeonhole on LISTEN_ADDR
 #   4. smoke + ceph/s3-tests + s3s boto3 + s3s-e2e + rclone
 #
 # Usage:
@@ -17,9 +17,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LOG="${S3GRAM_TG_LOG:-$ROOT/.cache/pigeonhole-storage-telegram.log}"
-PIDFILE="${S3GRAM_TG_PID:-$ROOT/.cache/pigeonhole-storage-telegram.pid}"
-REPORT="${S3GRAM_TG_REPORT:-$ROOT/.cache/telegram-suite-report.txt}"
+LOG="${PIGEONHOLE_TG_LOG:-$ROOT/.cache/pigeonhole-storage-telegram.log}"
+PIDFILE="${PIGEONHOLE_TG_PID:-$ROOT/.cache/pigeonhole-storage-telegram.pid}"
+REPORT="${PIGEONHOLE_TG_REPORT:-$ROOT/.cache/telegram-suite-report.txt}"
 S3S_DIR="${S3S_DIR:-$ROOT/.cache/s3s-upstream}"
 S3S_REPO="${S3S_REPO:-https://github.com/s3s-project/s3s.git}"
 S3S_REF="${S3S_REF:-main}"
@@ -55,11 +55,11 @@ if [[ -f .env ]]; then
 fi
 : "${BOT_TOKEN:?BOT_TOKEN required in .env}"
 
-# chat_id from existing s3gram.toml, or CHAT_ID leftover in .env for migration.
-if [[ -z "${CHAT_ID:-}" && -f s3gram.toml ]]; then
-  CHAT_ID="$(sed -n 's/^chat_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' s3gram.toml | head -1)"
+# chat_id from existing pigeonhole.toml, or CHAT_ID leftover in .env for migration.
+if [[ -z "${CHAT_ID:-}" && -f pigeonhole.toml ]]; then
+  CHAT_ID="$(sed -n 's/^chat_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pigeonhole.toml | head -1)"
 fi
-: "${CHAT_ID:?chat_id required in s3gram.toml (or CHAT_ID in .env for migration)}"
+: "${CHAT_ID:?chat_id required in pigeonhole.toml (or CHAT_ID in .env for migration)}"
 
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:8333}"
 PORT="${LISTEN_ADDR##*:}"
@@ -107,10 +107,10 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 CFG="$ROOT/.cache/pigeonhole-storage-telegram-config.toml"
-# Prefer database_url from local s3gram.toml if present.
-DB_URL="sqlite:s3gram.db"
-if [[ -f s3gram.toml ]]; then
-  parsed="$(sed -n 's/^database_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' s3gram.toml | head -1 || true)"
+# Prefer database_url from local pigeonhole.toml if present.
+DB_URL="sqlite:pigeonhole.db"
+if [[ -f pigeonhole.toml ]]; then
+  parsed="$(sed -n 's/^database_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pigeonhole.toml | head -1 || true)"
   [[ -n "$parsed" ]] && DB_URL="$parsed"
 fi
 CONFIG_OUT="$CFG" \
@@ -120,24 +120,24 @@ CONFIG_OUT="$CFG" \
   CONFIG_DATABASE_URL="$DB_URL" \
   CONFIG_SNAPSHOT_SECS=0 \
   "$ROOT/scripts/gen-config.sh"
-export S3GRAM_CONFIG="$CFG"
+export PIGEONHOLE_CONFIG="$CFG"
 
 log_step "purge Telegram + wipe index"
-./target/release/s3gram purge --yes --expect-chat "$CHAT_ID" 2>&1 | tee -a "$REPORT"
+./target/release/pigeonhole purge --yes --expect-chat "$CHAT_ID" 2>&1 | tee -a "$REPORT"
 
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-s3gram}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-s3gramsecret}"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-pigeonhole}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-pigeonholesecret}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 export AWS_REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
 export AWS_ENDPOINT_URL="$ENDPOINT_URL"
 export AWS_EC2_METADATA_DISABLED=1
 export AWS_CONFIG_FILE=/dev/null
 export AWS_SHARED_CREDENTIALS_FILE=/dev/null
-export S3GRAM_HOST=127.0.0.1
-export S3GRAM_PORT="$PORT"
+export PIGEONHOLE_HOST=127.0.0.1
+export PIGEONHOLE_PORT="$PORT"
 export ENDPOINT="$ENDPOINT_URL"
 
-./target/release/s3gram >"$LOG" 2>&1 &
+./target/release/pigeonhole >"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
 
 for _ in $(seq 1 80); do
@@ -151,7 +151,7 @@ if [[ -z "${code:-}" || "$code" == "000" ]]; then
   echo "telegram server failed to start; see $LOG" >&2
   exit 1
 fi
-log_step "s3gram TelegramBlobStore listening on $ENDPOINT_URL (pid $(cat "$PIDFILE"))"
+log_step "pigeonhole TelegramBlobStore listening on $ENDPOINT_URL (pid $(cat "$PIDFILE"))"
 
 log_step "smoke"
 set +e

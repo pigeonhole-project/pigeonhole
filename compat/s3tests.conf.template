@@ -5,51 +5,51 @@ is_secure = False
 ssl_verify = False
 
 [fixtures]
-bucket prefix = s3gram-{random}-
-iam name prefix = s3gram-
-iam path prefix = /s3gram/
+bucket prefix = pigeonhole-{random}-
+iam name prefix = pigeonhole-
+iam path prefix = /pigeonhole/
 
 [s3 main]
-display_name = s3gram
-user_id = s3gram
-email = s3gram@example.com
+display_name = pigeonhole
+user_id = pigeonhole
+email = pigeonhole@example.com
 api_name = default
 access_key = __ACCESS_KEY__
 secret_key = __SECRET_KEY__
 
 [s3 alt]
-# Same credentials: s3gram is single-tenant. ACL/alt-user tests will fail.
-display_name = s3gram-alt
-user_id = s3gram-alt
-email = s3gram-alt@example.com
+# Same credentials: pigeonhole is single-tenant. ACL/alt-user tests will fail.
+display_name = pigeonhole-alt
+user_id = pigeonhole-alt
+email = pigeonhole-alt@example.com
 access_key = __ACCESS_KEY__
 secret_key = __SECRET_KEY__
 
 [s3 tenant]
-display_name = s3gram-tenant
-user_id = s3gram-tenant
-email = s3gram-tenant@example.com
+display_name = pigeonhole-tenant
+user_id = pigeonhole-tenant
+email = pigeonhole-tenant@example.com
 access_key = __ACCESS_KEY__
 secret_key = __SECRET_KEY__
-tenant = s3gram
+tenant = pigeonhole
 
 [iam]
-display_name = s3gram-iam
-user_id = s3gram-iam
-email = s3gram-iam@example.com
+display_name = pigeonhole-iam
+user_id = pigeonhole-iam
+email = pigeonhole-iam@example.com
 access_key = __ACCESS_KEY__
 secret_key = __SECRET_KEY__
 
 [iam root]
 access_key = __ACCESS_KEY__
 secret_key = __SECRET_KEY__
-account_id = s3gram
-user_id = s3gram
-email = s3gram@example.com
+account_id = pigeonhole
+user_id = pigeonhole
+email = pigeonhole@example.com
 
 [iam alt root]
 access_key = __ACCESS_KEY__
 secret_key = __SECRET_KEY__
-account_id = s3gram-alt
-user_id = s3gram-alt
-email = s3gram-alt@example.com
+account_id = pigeonhole-alt
+user_id = pigeonhole-alt
+email = pigeonhole-alt@example.com

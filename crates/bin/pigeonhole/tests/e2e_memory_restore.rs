@@ -7,7 +7,7 @@ use http::Extensions;
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::{build_s3gram, BlobDb, ChunkStore, Durability, IngestOptions, Superblock};
+use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, Durability, IngestOptions, Superblock};
 use pigeonhole_blob::{
     erase_sweep, BlobBackend, CheapestFirst, Replicated, SharedBackend, TypedBootstrapPointer,
 };
@@ -48,7 +48,7 @@ async fn open_with_shared_mem(
     idx_url: &str,
     blob_url: &str,
     mem: Arc<MemoryBlobStore>,
-) -> (pigeonhole::S3gram, Arc<ChunkStore>, Arc<Durability>, String) {
+) -> (pigeonhole::S3Gateway, Arc<ChunkStore>, Arc<Durability>, String) {
     let cfg = Config::for_test(idx_url);
     let index = Index::connect(idx_url).await.unwrap();
     let db = BlobDb::connect(blob_url).await.unwrap();
@@ -83,7 +83,7 @@ async fn open_with_shared_mem(
     start_or_restore(store.db(), dur.as_ref(), &fp, false)
         .await
         .unwrap();
-    let s3 = build_s3gram(cfg, index, store.clone());
+    let s3 = build_s3_gateway(cfg, index, store.clone());
     (s3, store, dur, fp)
 }
 
@@ -150,7 +150,7 @@ async fn memory_put_wipe_restore_get() {
     let _ = fp;
 }
 
-async fn s3s2_get(s3: &pigeonhole::S3gram) -> Vec<u8> {
+async fn s3s2_get(s3: &pigeonhole::S3Gateway) -> Vec<u8> {
     let got = s3
         .get_object(req(GetObjectInput {
             bucket: "demo".into(),

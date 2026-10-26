@@ -714,14 +714,14 @@ mod resource_parse {
 
     #[test]
     fn blob_path() {
-        let (h, s) = parse_blob_resource("s3gram", "s3gram/blobs/abc/42").unwrap();
+        let (h, s) = parse_blob_resource("pigeonhole", "pigeonhole/blobs/abc/42").unwrap();
         assert_eq!(h, "abc");
         assert_eq!(s, 42);
     }
 
     #[test]
     fn upload_path() {
-        let u = parse_upload_resource("s3gram", "s3gram/uploads/u1/blobs/dead/9").unwrap();
+        let u = parse_upload_resource("pigeonhole", "pigeonhole/uploads/u1/blobs/dead/9").unwrap();
         assert_eq!(u.upload_id, "u1");
         assert_eq!(u.hash_hex, "dead");
         assert_eq!(u.size, 9);

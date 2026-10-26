@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run ceph/s3-tests against a local s3gram instance.
+# Run ceph/s3-tests against a local pigeonhole instance.
 #
 # Prerequisites:
-#   - s3gram listening (cargo run --release)
+#   - pigeonhole listening (cargo run --release)
 #   - python3, tox, git
 #   - AWS keys matching the running server (.env)
 #
@@ -18,8 +18,8 @@ CACHE="${S3TESTS_DIR:-$ROOT/.cache/s3-tests}"
 REPO="${S3TESTS_REPO:-https://github.com/ceph/s3-tests.git}"
 REF="${S3TESTS_REF:-master}"
 CONF_OUT="${S3TEST_CONF:-$ROOT/.cache/s3tests.conf}"
-ENDPOINT_HOST="${S3GRAM_HOST:-127.0.0.1}"
-ENDPOINT_PORT="${S3GRAM_PORT:-8333}"
+ENDPOINT_HOST="${PIGEONHOLE_HOST:-127.0.0.1}"
+ENDPOINT_PORT="${PIGEONHOLE_PORT:-8333}"
 
 cd "$ROOT"
 if [[ -f .env ]]; then
@@ -29,8 +29,8 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-ACCESS_KEY="${AWS_ACCESS_KEY_ID:-s3gram}"
-SECRET_KEY="${AWS_SECRET_ACCESS_KEY:-s3gramsecret}"
+ACCESS_KEY="${AWS_ACCESS_KEY_ID:-pigeonhole}"
+SECRET_KEY="${AWS_SECRET_ACCESS_KEY:-pigeonholesecret}"
 
 mode="known-good"
 pytest_args=()
@@ -51,7 +51,7 @@ if ! curl -sf "http://${ENDPOINT_HOST}:${ENDPOINT_PORT}/" >/dev/null 2>&1; then
   # Unsigned GET / may 403; treat any HTTP response as "up"
   code="$(curl -s -o /dev/null -w '%{http_code}' "http://${ENDPOINT_HOST}:${ENDPOINT_PORT}/" || true)"
   if [[ -z "$code" || "$code" == "000" ]]; then
-    echo "s3gram does not appear to be running at ${ENDPOINT_HOST}:${ENDPOINT_PORT}" >&2
+    echo "pigeonhole does not appear to be running at ${ENDPOINT_HOST}:${ENDPOINT_PORT}" >&2
     echo "start it with: cargo run --release" >&2
     exit 1
   fi
