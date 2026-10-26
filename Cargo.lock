@@ -1915,7 +1915,6 @@ dependencies = [
  "chrono",
  "crc32fast",
  "dotenvy",
- "flate2",
  "futures",
  "hex",
  "md-5 0.10.6",
@@ -1933,7 +1932,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "zstd",
 ]
 
 [[package]]

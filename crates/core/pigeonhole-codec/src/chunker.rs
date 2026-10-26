@@ -29,9 +29,9 @@ pub const DEFAULT_INGEST_MEMORY_BUDGET: usize = 256 * 1024 * 1024;
 pub enum ChunkCodec {
     /// Store bytes as-is (no compression attempt).
     Raw,
-    /// Opportunistic gzip (legacy single-block chunk). Prefer zstd/blocks.
+    /// gzip policy / per-block codec.
     Gzip,
-    /// Opportunistic zstd (legacy single-block chunk). Prefer [`ChunkCodec::Blocks`].
+    /// zstd policy / per-block codec.
     Zstd,
     /// Concatenated independent blocks (see `chunk_blocks` table). Default for new
     /// compressible uploads when config codec is `zstd` or `gzip`.
