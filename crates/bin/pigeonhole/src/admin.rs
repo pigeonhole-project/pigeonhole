@@ -13,8 +13,12 @@ use tracing::{info, warn};
 /// Release all roots + wipe gateway index. Backend object reclaim is stage H (sweeper).
 pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
-    if cfg.memory_store {
-        bail!("refuse to purge when memory = true");
+    if cfg
+        .instances
+        .iter()
+        .all(|i| i.info.kind == pigeonhole_blob::InstanceKind::Memory)
+    {
+        bail!("refuse to purge: only memory instances are configured");
     }
     let scope = cfg.primary_scope_id().context("primary scope_id")?;
     if let Some(expected) = expect_chat {

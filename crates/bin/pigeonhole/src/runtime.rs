@@ -128,7 +128,7 @@ async fn build_placement(
                         dc,
                         inst.scope_id.clone(),
                         limiter.clone(),
-                        cfg.discord_max_blob_size,
+                        inst.max_blob_size,
                         inst.info.clone(),
                     ));
                     let pin: Arc<dyn TypedBootstrapPointer> = store.clone();

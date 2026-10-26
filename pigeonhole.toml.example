@@ -5,33 +5,36 @@
 #
 # Override path with PIGEONHOLE_CONFIG=/path/to.toml
 
-# Telegram chat/channel for blobs + index snapshots (bot must be admin with pin rights).
-# Channels: enable "Edit messages". Groups: enable "Pin messages".
-# Pinning in groups also posts a service message.
-# Legacy single-backend form (synthesizes instance id="default"). Prefer [[instances]].
-chat_id = "-1001234567890"
-
-# Multi-backend instances (optional). Secrets via env names, never inline tokens.
-# [[instances]]
-# id = "tg-main"
-# kind = "telegram"
-# bot_token_env = "BOT_TOKEN"
-# chat_id = -1001234567890
-# role = "read-write"   # read-write | read-only | retired
-#
-# [[instances]]
-# id = "dc-backup"
-# kind = "discord"
-# bot_token_env = "DISCORD_BOT_TOKEN"
-# channel_id = 123456789012345678
-# role = "read-write"
-
 listen_addr = "0.0.0.0:8333"
 database_url = "sqlite:pigeonhole.db"
 region = "us-east-1"
 
-# true = MemoryBlobStore (no Telegram). For local suites / CI.
-memory = false
+# Backend instances (at least one). Secrets come from the env var named in
+# bot_token_env (defaults: BOT_TOKEN / DISCORD_BOT_TOKEN), never inline.
+# Telegram: the bot must be admin with pin rights (channels: "Edit messages",
+# groups: "Pin messages"; pinning in groups also posts a service message).
+[[instances]]
+id = "tg-main"
+kind = "telegram"
+chat_id = -1001234567890
+role = "read-write"   # read-write | read-only | retired
+
+# [[instances]]
+# id = "dc-backup"
+# kind = "discord"
+# channel_id = 123456789012345678
+# max_blob_size = 10485760   # optional, default ~10 MiB
+# role = "read-write"
+
+# Local runs / tests without any chat:
+# [[instances]]
+# id = "mem"
+# kind = "memory"
+
+# With more than one read-write instance, list the write group explicitly:
+# [placement]
+# group = ["tg-main", "dc-backup"]
+# write_quorum = 1
 
 [snapshot]
 # Seconds between automatic index snapshots. 0 disables.
@@ -45,7 +48,7 @@ size = 19922944
 # Encoding policy for new uploads: "raw" | "gzip" | "zstd" (default zstd).
 # Compressing policies store chunks as codec "blocks" (see chunk_blocks table).
 codec = "zstd"
-# Logical block size for block packing (default 1 MiB). Legacy key: frame_size.
+# Logical block size for block packing (default 1 MiB).
 block_size = 1048576
 
 [ingest]
@@ -62,7 +65,6 @@ delete_rate_per_sec = 1.0
 delete_burst = 5.0
 upload_concurrency = 2
 download_concurrency = 8
-# Legacy aliases (map to send_*): rate_per_sec, rate_burst
 
 [cache]
 # L0 (Telegram file_path) + L1 blocks + L2 compressed blobs.
@@ -73,7 +75,7 @@ memory_bytes = 268435456
 disk_path = ""
 # Required when disk_path is set (do not rely on foyer free-space defaults).
 # disk_bytes = 1073741824
-# L1 unpacked-block memory budget. Legacy keys: frame_memory_bytes, readahead_frames.
+# L1 unpacked-block memory budget.
 block_memory_bytes = 134217728
 readahead_blocks = 2
 write_through = true
@@ -89,13 +91,6 @@ instance_name = "pigeonhole"
 max_batch_total_size_bytes = 4194304
 # 0 disables TTL GC for CAS entries.
 gc_ttl_secs = 604800
-
-# Discord backend (default binary feature `discord`). Secret: DISCORD_BOT_TOKEN.
-# [backend]
-# kind = "discord"
-# [discord]
-# channel_id = "123456789012345678"
-# # max_blob_size = 10485760
 
 [sweep]
 # Keys from puts newer than grace are not deleted. Default 15 minutes.

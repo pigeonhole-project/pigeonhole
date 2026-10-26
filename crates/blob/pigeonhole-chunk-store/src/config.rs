@@ -1,13 +1,9 @@
-use crate::instances::{
-    legacy_default_instance, resolve_instances, FileInstance, InstanceConfig,
-};
+use crate::instances::{memory_instance, resolve_instances, FileInstance, InstanceConfig};
 use crate::repair::{
     RepairConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
 };
 use crate::sweep::{SweepConfig, DEFAULT_SWEEP_GRACE, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};
-use pigeonhole_blob::{
-    CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind, InstanceRole,
-};
+use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind, InstanceRole};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
 use anyhow::{bail, Context, Result};
@@ -17,7 +13,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::warn;
 
 /// Placement group: which instances receive chunk replicas and the write quorum.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,20 +22,9 @@ pub struct PlacementConfig {
     pub write_quorum: usize,
 }
 
-/// Which chat blob backend backs non-memory mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackendKind {
-    Telegram,
-    Discord,
-}
-
 /// Runtime config: non-secrets from TOML, secrets from environment / `.env`.
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub backend_kind: BackendKind,
-    pub bot_token: String,
-    pub chat_id: String,
-    pub discord_max_blob_size: Option<usize>,
     pub listen_addr: String,
     pub database_url: String,
     pub access_key: String,
@@ -55,11 +39,10 @@ pub struct Config {
     /// Process-wide ingest buffer budget (shared across PUTs).
     pub ingest_budget: Option<ByteBudget>,
     pub tg: ChatLimiterConfig,
-    pub memory_store: bool,
     pub cache: CacheConfig,
     pub bytestream: BytestreamSettings,
     pub http: HttpSettings,
-    /// Resolved backend instances (`[[instances]]` or legacy single default).
+    /// Resolved backend instances (`[[instances]]`).
     pub instances: Vec<InstanceConfig>,
     /// Replica placement (`[placement]`); defaults to a single read-write instance.
     pub placement: PlacementConfig,
@@ -156,63 +139,20 @@ impl Config {
     }
 
     fn from_file(file: FileConfig, config_path: PathBuf) -> Result<Self> {
-        let memory_store = file.memory;
-        let backend_kind = if memory_store {
-            BackendKind::Telegram
-        } else {
-            match file.backend.kind.as_deref() {
-                Some("discord") => BackendKind::Discord,
-                Some("telegram") | Some("") | None => BackendKind::Telegram,
-                Some(other) => bail!("pigeonhole.toml: unknown backend.kind {other:?}"),
-            }
-        };
-
-        let bot_token = if memory_store {
-            env::var("BOT_TOKEN").unwrap_or_else(|_| "unused".into())
-        } else if backend_kind == BackendKind::Discord {
-            require_secret("DISCORD_BOT_TOKEN")?
-        } else {
-            require_secret("BOT_TOKEN")?
-        };
-
-        let chat_id = if memory_store {
-            "-100memory".into()
-        } else if backend_kind == BackendKind::Discord {
-            file.discord
-                .channel_id
-                .clone()
-                .or_else(|| file.chat_id.clone())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("pigeonhole.toml: discord.channel_id or chat_id required for discord backend")
-                })?
-        } else {
-            match file.chat_id.filter(|s| !s.is_empty()) {
-                Some(id) => id,
-                None => bail!("pigeonhole.toml: chat_id is required when memory = false"),
-            }
-        };
-
-        let discord_max_blob_size = file.discord.max_blob_size;
-
         let access_key = env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "pigeonhole".into());
         let secret_key = env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "pigeonholesecret".into());
         if access_key.is_empty() || secret_key.is_empty() {
             bail!("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY must not be empty");
         }
 
-        let database_url = file.database_url.unwrap_or_else(|| {
-            if memory_store {
-                "sqlite:pigeonhole-memory.db".into()
-            } else {
-                "sqlite:pigeonhole.db".into()
-            }
-        });
+        let database_url = file
+            .database_url
+            .unwrap_or_else(|| "sqlite:pigeonhole.db".into());
 
         let chunk_size = file.chunk.size;
         chunker::validate_chunk_size(chunk_size).context("chunk.size")?;
         let chunk_codec = file.chunk.codec;
-        let block_size = file.chunk.resolve_block_size()?;
+        let block_size = file.chunk.resolve_block_size();
         if block_size > chunker::MAX_LOGICAL_CHUNK {
             bail!("chunk.block_size exceeds MAX_LOGICAL_CHUNK");
         }
@@ -236,44 +176,15 @@ impl Config {
             bail!("telegram upload/download concurrency must be >= 1");
         }
 
-        let instances = if !file.instances.is_empty() {
-            resolve_instances(&file.instances)?
-        } else if memory_store {
-            vec![legacy_default_instance(
-                InstanceKind::Memory,
-                "",
-                "local",
-                "",
-            )?]
-        } else {
-            let kind = match backend_kind {
-                BackendKind::Telegram => InstanceKind::Telegram,
-                BackendKind::Discord => InstanceKind::Discord,
-            };
-            let env_name = match backend_kind {
-                BackendKind::Telegram => "BOT_TOKEN",
-                BackendKind::Discord => "DISCORD_BOT_TOKEN",
-            };
-            vec![legacy_default_instance(
-                kind,
-                &bot_token,
-                &chat_id,
-                env_name,
-            )?]
-        };
+        if file.instances.is_empty() {
+            bail!("pigeonhole.toml: at least one [[instances]] entry is required");
+        }
+        let instances = resolve_instances(&file.instances)?;
 
         let placement = resolve_placement(file.placement, &instances)?;
-        check_block_size_against_instances(
-            block_size,
-            &instances,
-            discord_max_blob_size,
-        )?;
+        check_block_size_against_instances(block_size, &instances)?;
 
         Ok(Self {
-            backend_kind,
-            bot_token,
-            chat_id,
-            discord_max_blob_size,
             listen_addr: file.listen_addr,
             database_url,
             access_key,
@@ -285,7 +196,6 @@ impl Config {
             block_size,
             ingest_budget,
             tg,
-            memory_store,
             cache: file.cache.into_cache_config()?,
             bytestream: file.bytestream.into_settings(),
             http: file.http.into_settings(),
@@ -300,10 +210,6 @@ impl Config {
 
     pub fn for_test(database_url: &str) -> Self {
         Self {
-            backend_kind: BackendKind::Telegram,
-            bot_token: "test-token".into(),
-            chat_id: "-100test".into(),
-            discord_max_blob_size: None,
             listen_addr: "127.0.0.1:0".into(),
             database_url: database_url.into(),
             access_key: "pigeonhole".into(),
@@ -324,22 +230,15 @@ impl Config {
                 upload_concurrency: 8,
                 download_concurrency: 8,
             },
-            memory_store: true,
             cache: CacheConfig {
                 enabled: false,
                 ..CacheConfig::default()
             },
             bytestream: BytestreamSettings::default(),
             http: HttpSettings::default(),
-            instances: vec![legacy_default_instance(
-                InstanceKind::Memory,
-                "",
-                "local",
-                "",
-            )
-            .expect("memory instance")],
+            instances: vec![memory_instance("mem")],
             placement: PlacementConfig {
-                group: vec!["default".into()],
+                group: vec!["mem".into()],
                 write_quorum: 1,
             },
             sweep: SweepConfig::default(),
@@ -366,7 +265,7 @@ impl Config {
             .with_context(|| format!("placement primary instance {id:?} not in [[instances]]"))
     }
 
-    /// Scope id (chat/channel) of the primary write instance — replaces runtime `chat_id`.
+    /// Scope id (chat/channel) of the primary write instance.
     pub fn primary_scope_id(&self) -> Result<&str> {
         Ok(self.primary_instance()?.scope_id.as_str())
     }
@@ -378,31 +277,17 @@ fn config_path_from_env() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("pigeonhole.toml"))
 }
 
-fn require_secret(key: &str) -> Result<String> {
-    let v = env::var(key).with_context(|| format!("missing required secret env var {key}"))?;
-    if v.is_empty() {
-        bail!("missing required secret env var {key}");
-    }
-    Ok(v)
-}
-
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileConfig {
-    #[serde(default)]
-    backend: FileBackendSection,
-    chat_id: Option<String>,
     listen_addr: String,
     database_url: Option<String>,
     region: String,
-    memory: bool,
     snapshot: FileSnapshot,
     chunk: FileChunk,
     #[serde(default)]
     ingest: FileIngest,
     telegram: FileTelegram,
-    #[serde(default)]
-    discord: FileDiscord,
     #[serde(default)]
     cache: FileCache,
     #[serde(default)]
@@ -424,17 +309,13 @@ struct FileConfig {
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
-            backend: FileBackendSection::default(),
-            chat_id: None,
             listen_addr: "0.0.0.0:8333".into(),
             database_url: None,
             region: "us-east-1".into(),
-            memory: false,
             snapshot: FileSnapshot::default(),
             chunk: FileChunk::default(),
             ingest: FileIngest::default(),
             telegram: FileTelegram::default(),
-            discord: FileDiscord::default(),
             cache: FileCache::default(),
             bytestream: FileBytestream::default(),
             http: FileHttp::default(),
@@ -448,7 +329,7 @@ impl Default for FileConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileMetrics {
     enabled: bool,
     /// Empty / omitted → scrape on the main listen address at `GET /metrics`.
@@ -478,7 +359,7 @@ impl FileMetrics {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileSweep {
     grace_secs: u64,
     interval_secs: u64,
@@ -506,7 +387,7 @@ impl FileSweep {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileRepair {
     interval_secs: u64,
     batch_size: usize,
@@ -537,6 +418,7 @@ impl FileRepair {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FilePlacement {
     group: Vec<String>,
     write_quorum: usize,
@@ -547,7 +429,6 @@ struct FilePlacement {
 pub fn check_block_size_against_instances(
     block_size: usize,
     instances: &[InstanceConfig],
-    discord_max_blob_size: Option<usize>,
 ) -> Result<()> {
     if instances.is_empty() {
         return Ok(());
@@ -557,7 +438,7 @@ pub fn check_block_size_against_instances(
         let max = match inst.info.kind {
             InstanceKind::Telegram | InstanceKind::Memory => 20 * 1024 * 1024 - 1,
             InstanceKind::Discord => {
-                pigeonhole_types::BackendLimits::discord(discord_max_blob_size).max_blob_size
+                pigeonhole_types::BackendLimits::discord(inst.max_blob_size).max_blob_size
             }
         };
         min_max = min_max.min(max);
@@ -571,7 +452,7 @@ pub fn check_block_size_against_instances(
     let need = block_size.saturating_add(64);
     if need >= min_max {
         bail!(
-            "chunk.block_size ({block_size}) with frame margin exceeds min(max_blob_size) ({min_max})"
+            "chunk.block_size ({block_size}) with block margin exceeds min(max_blob_size) ({min_max})"
         );
     }
     Ok(())
@@ -591,13 +472,7 @@ fn resolve_placement(
             let chosen = match rw.as_slice() {
                 [] => bail!("placement: no read-write instance available"),
                 [one] => one,
-                many => {
-                    // Prefer the legacy `default` id when present; else first RW.
-                    many.iter()
-                        .find(|i| i.info.id == "default")
-                        .copied()
-                        .unwrap_or(many[0])
-                }
+                _ => bail!("placement: several read-write instances; set [placement].group"),
             };
             Ok(PlacementConfig {
                 group: vec![chosen.info.id.clone()],
@@ -640,7 +515,7 @@ fn resolve_placement(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileHttp {
     request_timeout_secs: u64,
     headers_timeout_secs: Option<u64>,
@@ -674,7 +549,7 @@ impl FileHttp {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileBytestream {
     enabled: bool,
     listen_addr: String,
@@ -708,32 +583,15 @@ impl FileBytestream {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
-#[serde(default)]
-struct FileBackendSection {
-    kind: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(default)]
-struct FileDiscord {
-    channel_id: Option<String>,
-    max_blob_size: Option<usize>,
-}
-
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileCache {
     enabled: bool,
     memory_bytes: usize,
     disk_path: String,
     disk_bytes: Option<usize>,
     block_memory_bytes: Option<usize>,
-    /// Deprecated alias for [`Self::block_memory_bytes`].
-    frame_memory_bytes: Option<usize>,
     readahead_blocks: Option<usize>,
-    /// Deprecated alias for [`Self::readahead_blocks`].
-    readahead_frames: Option<usize>,
     write_through: bool,
     max_object_bytes: usize,
     metrics_interval_secs: u64,
@@ -748,9 +606,7 @@ impl Default for FileCache {
             disk_path: String::new(),
             disk_bytes: None,
             block_memory_bytes: None,
-            frame_memory_bytes: None,
             readahead_blocks: None,
-            readahead_frames: None,
             write_through: d.write_through,
             max_object_bytes: d.max_object_bytes,
             metrics_interval_secs: d.metrics_interval_secs,
@@ -769,30 +625,10 @@ impl FileCache {
             bail!("cache.disk_bytes is required when cache.disk_path is set");
         }
         let defaults = CacheConfig::default();
-        let block_memory_bytes = match (self.block_memory_bytes, self.frame_memory_bytes) {
-            (Some(b), Some(_)) => {
-                warn!("cache.frame_memory_bytes ignored; using cache.block_memory_bytes");
-                b
-            }
-            (Some(b), None) => b,
-            (None, Some(f)) => {
-                warn!("cache.frame_memory_bytes is deprecated; use cache.block_memory_bytes");
-                f
-            }
-            (None, None) => defaults.block_memory_bytes,
-        };
-        let readahead_blocks = match (self.readahead_blocks, self.readahead_frames) {
-            (Some(b), Some(_)) => {
-                warn!("cache.readahead_frames ignored; using cache.readahead_blocks");
-                b
-            }
-            (Some(b), None) => b,
-            (None, Some(f)) => {
-                warn!("cache.readahead_frames is deprecated; use cache.readahead_blocks");
-                f
-            }
-            (None, None) => defaults.readahead_blocks,
-        };
+        let block_memory_bytes = self
+            .block_memory_bytes
+            .unwrap_or(defaults.block_memory_bytes);
+        let readahead_blocks = self.readahead_blocks.unwrap_or(defaults.readahead_blocks);
         Ok(CacheConfig {
             enabled: self.enabled,
             memory_bytes: self.memory_bytes.max(1024 * 1024),
@@ -808,7 +644,7 @@ impl FileCache {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileSnapshot {
     interval_secs: u64,
 }
@@ -822,13 +658,11 @@ impl Default for FileSnapshot {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileChunk {
     size: usize,
     codec: ChunkCodec,
     block_size: Option<usize>,
-    /// Deprecated alias for [`Self::block_size`].
-    frame_size: Option<usize>,
 }
 
 impl Default for FileChunk {
@@ -837,32 +671,20 @@ impl Default for FileChunk {
             size: chunker::DEFAULT_CHUNK_SIZE,
             codec: ChunkCodec::Zstd,
             block_size: None,
-            frame_size: None,
         }
     }
 }
 
 impl FileChunk {
-    fn resolve_block_size(&self) -> Result<usize> {
-        match (self.block_size, self.frame_size) {
-            (Some(b), Some(f)) if b != f => {
-                warn!(
-                    "chunk.frame_size ({f}) ignored; using chunk.block_size ({b})"
-                );
-                Ok(b.max(1024))
-            }
-            (Some(b), _) => Ok(b.max(1024)),
-            (None, Some(f)) => {
-                warn!("chunk.frame_size is deprecated; use chunk.block_size");
-                Ok(f.max(1024))
-            }
-            (None, None) => Ok(chunker::DEFAULT_BLOCK_SIZE),
-        }
+    fn resolve_block_size(&self) -> usize {
+        self.block_size
+            .map(|b| b.max(1024))
+            .unwrap_or(chunker::DEFAULT_BLOCK_SIZE)
     }
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileIngest {
     memory_budget: usize,
 }
@@ -876,11 +698,8 @@ impl Default for FileIngest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FileTelegram {
-    /// Legacy alias for `send_rate_per_sec`.
-    rate_per_sec: Option<f64>,
-    rate_burst: Option<f64>,
     send_rate_per_sec: Option<f64>,
     send_burst: Option<f64>,
     get_file_rate_per_sec: Option<f64>,
@@ -895,8 +714,6 @@ impl Default for FileTelegram {
     fn default() -> Self {
         let d = ChatLimiterConfig::default();
         Self {
-            rate_per_sec: None,
-            rate_burst: None,
             send_rate_per_sec: None,
             send_burst: None,
             get_file_rate_per_sec: None,
@@ -913,14 +730,8 @@ impl FileTelegram {
     fn into_limiter_config(self) -> ChatLimiterConfig {
         let d = ChatLimiterConfig::default();
         ChatLimiterConfig {
-            send_rate_per_sec: self
-                .send_rate_per_sec
-                .or(self.rate_per_sec)
-                .unwrap_or(d.send_rate_per_sec),
-            send_burst: self
-                .send_burst
-                .or(self.rate_burst)
-                .unwrap_or(d.send_burst),
+            send_rate_per_sec: self.send_rate_per_sec.unwrap_or(d.send_rate_per_sec),
+            send_burst: self.send_burst.unwrap_or(d.send_burst),
             get_file_rate_per_sec: self
                 .get_file_rate_per_sec
                 .unwrap_or(d.get_file_rate_per_sec),
@@ -940,15 +751,23 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn load(toml: &str) -> Result<Config> {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        Config::load_from_path(f.path())
+    }
+
+    const MEM: &str = r#"
+[[instances]]
+id = "mem"
+kind = "memory"
+"#;
+
     #[test]
     fn parses_example_shape() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
+        let cfg = load(&format!(
             r#"
-chat_id = "-1001"
 listen_addr = "127.0.0.1:9"
-memory = true
 [snapshot]
 interval_secs = 0
 [chunk]
@@ -959,143 +778,84 @@ send_rate_per_sec = 1.0
 send_burst = 2.0
 get_file_rate_per_sec = 20.0
 upload_concurrency = 4
-"#
-        )
+{MEM}"#
+        ))
         .unwrap();
-        let cfg = Config::load_from_path(f.path()).unwrap();
-        assert!(cfg.memory_store);
         assert_eq!(cfg.chunk_size, 1024);
         assert_eq!(cfg.chunk_codec, ChunkCodec::Raw);
         assert_eq!(cfg.tg.send_rate_per_sec, 1.0);
         assert_eq!(cfg.tg.get_file_rate_per_sec, 20.0);
         assert_eq!(cfg.tg.upload_concurrency, 4);
-        assert_eq!(cfg.placement.group, vec!["default".to_string()]);
+        assert_eq!(cfg.placement.group, vec!["mem".to_string()]);
         assert_eq!(cfg.placement.write_quorum, 1);
     }
 
     #[test]
-    fn parses_placement_section() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            r#"
-memory = true
+    fn example_config_loads() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../pigeonhole.toml.example");
+        std::env::set_var("BOT_TOKEN", "123:example");
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert_eq!(cfg.primary_instance().unwrap().info.id, "tg-main");
+    }
+
+    #[test]
+    fn requires_instances() {
+        let msg = format!("{:#}", load("listen_addr = \"127.0.0.1:9\"\n").unwrap_err());
+        assert!(msg.contains("[[instances]]"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn rejects_unknown_keys() {
+        for stale in ["memory = true\n", "chat_id = \"-1001\"\n", "[telegram]\nrate_per_sec = 1.0\n"] {
+            let err = load(&format!("{stale}{MEM}")).unwrap_err();
+            assert!(format!("{err:#}").contains("unknown field"), "{stale:?} accepted");
+        }
+    }
+
+    #[test]
+    fn several_read_write_instances_need_placement() {
+        let two = r#"
 [[instances]]
-id = "mem-a"
+id = "a"
 kind = "memory"
-role = "read-write"
-[placement]
-group = ["mem-a"]
-write_quorum = 1
-"#
-        )
-        .unwrap();
-        let cfg = Config::load_from_path(f.path()).unwrap();
-        assert_eq!(cfg.placement.group, vec!["mem-a".to_string()]);
-        assert_eq!(cfg.placement.write_quorum, 1);
+[[instances]]
+id = "b"
+kind = "memory"
+"#;
+        let msg = format!("{:#}", load(two).unwrap_err());
+        assert!(msg.contains("[placement]"), "unexpected error: {msg}");
+        let cfg = load(&format!("{two}[placement]\ngroup = [\"a\", \"b\"]\nwrite_quorum = 2\n")).unwrap();
+        assert_eq!(cfg.placement.group, vec!["a", "b"]);
+        assert_eq!(cfg.placement.write_quorum, 2);
     }
 
     #[test]
-    fn resolve_placement_group_and_quorum() {
-        use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole};
-        let instances = vec![
-            InstanceConfig {
-                info: InstanceInfo {
-                    id: "a".into(),
-                    kind: InstanceKind::Memory,
-                    fingerprint: "memory:a".into(),
-                    location: "memory:a".into(),
-                    role: InstanceRole::ReadWrite,
-                },
-                bot_token_env: String::new(),
-                bot_token: String::new(),
-                scope_id: "a".into(),
-            },
-            InstanceConfig {
-                info: InstanceInfo {
-                    id: "b".into(),
-                    kind: InstanceKind::Memory,
-                    fingerprint: "memory:b".into(),
-                    location: "memory:b".into(),
-                    role: InstanceRole::ReadWrite,
-                },
-                bot_token_env: String::new(),
-                bot_token: String::new(),
-                scope_id: "b".into(),
-            },
-        ];
-        let p = resolve_placement(
-            Some(FilePlacement {
-                group: vec!["a".into(), "b".into()],
-                write_quorum: 2,
-            }),
-            &instances,
-        )
-        .unwrap();
-        assert_eq!(p.group, vec!["a", "b"]);
-        assert_eq!(p.write_quorum, 2);
-    }
-
-    #[test]
-    fn parses_discord_backend() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            r#"
-memory = false
-[backend]
-kind = "discord"
-[discord]
-channel_id = "123456789"
-max_blob_size = 8388608
-"#
-        )
-        .unwrap();
+    fn parses_discord_instance() {
         std::env::set_var("DISCORD_BOT_TOKEN", "discord-test-token");
-        let cfg = Config::load_from_path(f.path()).unwrap();
-        assert_eq!(cfg.backend_kind, BackendKind::Discord);
-        assert_eq!(cfg.chat_id, "123456789");
-        assert_eq!(cfg.discord_max_blob_size, Some(8388608));
+        let cfg = load(
+            r#"
+[[instances]]
+id = "dc"
+kind = "discord"
+channel_id = 123456789
+max_blob_size = 8388608
+"#,
+        )
+        .unwrap();
         std::env::remove_var("DISCORD_BOT_TOKEN");
+        let inst = cfg.primary_instance().unwrap();
+        assert_eq!(inst.info.kind, InstanceKind::Discord);
+        assert_eq!(inst.scope_id, "123456789");
+        assert_eq!(inst.max_blob_size, Some(8388608));
     }
 
     #[test]
-    fn legacy_rate_per_sec_maps_to_send() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            r#"
-memory = true
-[telegram]
-rate_per_sec = 0.25
-rate_burst = 2.0
-"#
-        )
-        .unwrap();
-        let cfg = Config::load_from_path(f.path()).unwrap();
-        assert_eq!(cfg.tg.send_rate_per_sec, 0.25);
-        assert_eq!(cfg.tg.send_burst, 2.0);
-    }
-
-    #[test]
-    fn rejects_memory_budget_below_two_frames() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            r#"
-memory = true
-[chunk]
-block_size = 1048576
-[ingest]
-memory_budget = 1048576
-"#
-        )
-        .unwrap();
-        let err = Config::load_from_path(f.path()).unwrap_err();
+    fn rejects_memory_budget_below_two_blocks() {
+        let err = load(&format!(
+            "[chunk]\nblock_size = 1048576\n[ingest]\nmemory_budget = 1048576\n{MEM}"
+        ))
+        .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("ingest.memory_budget"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("ingest.memory_budget"), "unexpected error: {msg}");
     }
 }

@@ -71,7 +71,7 @@ fi
 
 CFG="$ROOT/.cache/pigeonhole-gateway-s3s-boto3-config.toml"
 CONFIG_OUT="$CFG" \
-  CONFIG_MEMORY=true \
+  CONFIG_INSTANCE=memory \
   CONFIG_LISTEN_ADDR="127.0.0.1:${PORT}" \
   CONFIG_DATABASE_URL="sqlite:${DB}?mode=rwc" \
   CONFIG_SNAPSHOT_SECS=0 \

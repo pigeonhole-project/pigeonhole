@@ -11,7 +11,7 @@
 > [Discord Developer Policy](https://discord.com/developers/docs/policies-and-agreements/developer-policy).
 > If you run it against a real bot, keep it to small, short-lived test data in
 > a private chat you own, and make sure your usage complies with those terms.
-> For tests and development use `memory = true` — no external service involved.
+> For tests and development use a `kind = "memory"` instance — no external service involved.
 > The authors take no responsibility for misuse.
 
 Pluggable blob storage with protocol gateways, written in Rust. The main
@@ -48,7 +48,7 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 | `blob/pigeonhole-chunk-store` | `ChunkStore`, ingest, roots, durability, sweeper, repair, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
 | `storage/pigeonhole-storage-discord` | Discord Bot API storage |
-| `storage/pigeonhole-storage-memory` | In-memory storage for tests / `memory = true` |
+| `storage/pigeonhole-storage-memory` | In-memory storage for tests / `kind = "memory"` instances |
 | `gateway/pigeonhole-gateway-s3` | S3 (`s3s`) gateway |
 | `gateway/pigeonhole-gateway-bytestream` | REAPI v2 remote cache |
 | `testing/pigeonhole-testkit` | Storage conformance suites |
@@ -61,7 +61,10 @@ Dependency layering is enforced by `./scripts/check-deps.sh --strict` in CI.
 ```bash
 cp pigeonhole.toml.example pigeonhole.toml
 cp .env.example .env
-# in pigeonhole.toml: memory = true
+# in pigeonhole.toml replace the telegram [[instances]] entry with:
+#   [[instances]]
+#   id = "mem"
+#   kind = "memory"
 cargo run --release
 ```
 
@@ -94,7 +97,7 @@ Read the disclaimer at the top first.
    - **Channel:** permission to **edit messages** (needed to pin).
    - **Group / supergroup:** permission to **pin messages**.
    - Pinning in a group also posts a Telegram service message — expected noise.
-3. Set `chat_id` (and `memory = false`) in `pigeonhole.toml`, `BOT_TOKEN` in `.env`.
+3. Set the instance `chat_id` in `pigeonhole.toml` (see the example), `BOT_TOKEN` in `.env`.
 
 On startup pigeonhole calls `getMe` + `getChatMember` and exits if the bot is not
 an admin with the pin/edit rights above.
@@ -113,15 +116,14 @@ Bot API limits that shape the design:
 Discord is enabled by default (`--features discord`):
 
 ```toml
-[backend]
+[[instances]]
+id = "dc"
 kind = "discord"
-
-[discord]
-channel_id = "123456789012345678"
+channel_id = 123456789012345678
 # optional: max_blob_size = 10485760
 ```
 
-Secret: `DISCORD_BOT_TOKEN` in `.env`. The bot needs permission to view the
+Secret: `DISCORD_BOT_TOKEN` in `.env` (or the env var named by `bot_token_env`). The bot needs permission to view the
 channel, send messages, attach files, read history, and pin messages.
 Attachment CDN URLs are cached (~50 min) and refreshed on 403/404. Default
 `max_blob_size` is ~10 MiB (Discord limit minus margin) — set `[chunk].size`
@@ -129,8 +131,8 @@ accordingly.
 
 ## Multiple instances / replication
 
-Instead of the single-backend `chat_id` / `[backend]` form, declare several
-`[[instances]]` (tokens are referenced by env var name, never inline):
+Declare several `[[instances]]` (tokens are referenced by env var name, never
+inline) and list the write group in `[placement]`:
 
 ```toml
 [[instances]]
@@ -146,6 +148,10 @@ kind = "discord"
 bot_token_env = "DISCORD_BOT_TOKEN"
 channel_id = 123456789012345678
 role = "read-write"
+
+[placement]
+group = ["tg-main", "dc-backup"]
+write_quorum = 1
 ```
 
 Writes go to the read-write instances; reads pick the cheapest available
@@ -174,11 +180,10 @@ comments. Sections:
 
 | TOML | Meaning |
 |---|---|
-| `chat_id`, `[backend]`, `[discord]` | Single-backend form (synthesizes instance `default`) |
-| `[[instances]]` | Multi-backend form: id, kind, token env, chat/channel, role |
+| `[[instances]]` | Backends (≥ 1): id, kind (`telegram` / `discord` / `memory`), token env, chat/channel, role, `max_blob_size` |
+| `[placement]` | Write group + quorum; required with several read-write instances |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
 | `database_url` | SQLite URL of the S3 index (chunk metadata lives in a sibling `*-blob.db`) |
-| `memory` | `true` → in-memory backend (no Telegram/Discord) |
 | `[snapshot]` | `interval_secs`: S3 index snapshot / checkpoint period (`0` disables snapshots) |
 | `[chunk]` | `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
@@ -190,7 +195,8 @@ comments. Sections:
 | `[metrics]` | Prometheus `/metrics` (feature `metrics-prometheus`, on by default) |
 | `[bytestream]` | REAPI gRPC remote cache (feature `bytestream`) |
 
-Legacy `[telegram].rate_per_sec` / `rate_burst` map to `send_*`.
+Unknown keys are rejected, so a stale config fails at startup instead of being
+half-applied.
 
 ## Durability and restore
 
@@ -267,7 +273,8 @@ make compat-rclone             # rclone S3 e2e (downloads pinned rclone)
 ```
 
 Manual live suites (not in CI; they purge the chat first — use a throwaway test
-chat/channel and see the disclaimer):
+chat/channel and see the disclaimer). They read `CHAT_ID` / `DISCORD_CHANNEL_ID`
+from `.env`:
 
 ```bash
 make compat-telegram

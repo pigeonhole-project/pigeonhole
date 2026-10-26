@@ -19,7 +19,7 @@ pub use pigeonhole_blob::{ChatLimiter, DeleteOutcome};
 pub use pigeonhole_storage_memory::{MemoryBackend, MemoryBlobStore};
 pub use pigeonhole_types::{BackendId, BackendLimits, BlobKey, RangeSupport};
 pub use pigeonhole_chunk_store::{
-    start_or_restore, BackendKind, BlobDb, ChunkStore, Config, Durability, IngestOptions,
+    start_or_restore, BlobDb, ChunkStore, Config, Durability, IngestOptions,
     Superblock,
 };
 #[cfg(feature = "discord")]

@@ -12,7 +12,7 @@ pub mod sweep;
 
 pub use blob_db::{is_chunk_gone, BlobDb, ChunkGone, StoredBlock};
 pub use config::{
-    BackendKind, BytestreamSettings, Config, HttpSettings, MetricsSettings, PlacementConfig,
+    BytestreamSettings, Config, HttpSettings, MetricsSettings, PlacementConfig,
 };
 pub use durability::{
     commit_root, start_or_restore, CheckpointPayload, Durability, JournalOp, PinTarget,
@@ -22,7 +22,7 @@ pub use layer::{
     check_block_fits_members, default_layer_opts, ChunkId, ChunkStore, Extent, Ingested,
 };
 pub use instances::{
-    check_fingerprints, discord_fingerprint, discord_location, legacy_default_instance,
+    check_fingerprints, discord_fingerprint, discord_location, memory_instance,
     memory_fingerprint, memory_location, telegram_fingerprint, telegram_location, validate_instances,
     InstanceConfig,
 };

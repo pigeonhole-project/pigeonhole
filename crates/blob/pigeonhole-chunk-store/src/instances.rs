@@ -1,13 +1,9 @@
-//! Multi-instance config (stage 1.3).
-//!
-//! Parses `[[instances]]` from TOML or synthesizes one `default` instance from
-//! legacy `[telegram]` / `[discord]` / `chat_id` sections.
+//! Backend instances from `[[instances]]`.
 
 use anyhow::{bail, Context, Result};
 use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use tracing::warn;
 
 /// One configured backend instance after secret resolution.
 #[derive(Debug, Clone)]
@@ -19,6 +15,8 @@ pub struct InstanceConfig {
     pub bot_token: String,
     /// Telegram chat id or Discord channel id (string form).
     pub scope_id: String,
+    /// Per-message size limit override (Discord); `None` = backend default.
+    pub max_blob_size: Option<usize>,
 }
 
 /// Telegram fingerprint: `{bot_id}:{chat_id}` where bot_id is the token prefix.
@@ -43,12 +41,13 @@ pub fn discord_location(channel_id: &str) -> String {
     format!("dc:channel:{channel_id}")
 }
 
-pub fn memory_fingerprint() -> String {
-    "memory:local".into()
+/// Each memory instance is its own in-process store, so id = identity.
+pub fn memory_fingerprint(id: &str) -> String {
+    format!("memory:{id}")
 }
 
-pub fn memory_location() -> String {
-    "memory:local".into()
+pub fn memory_location(id: &str) -> String {
+    format!("memory:{id}")
 }
 
 /// Discord bot tokens are `app_id.xxx.yyy` or just use full token prefix before `.`.
@@ -62,12 +61,14 @@ pub fn discord_app_id_from_token(token: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FileInstance {
     pub id: String,
     pub kind: String,
     pub bot_token_env: Option<String>,
     pub chat_id: Option<i64>,
     pub channel_id: Option<u64>,
+    pub max_blob_size: Option<usize>,
     #[serde(default = "default_role")]
     pub role: String,
 }
@@ -109,8 +110,8 @@ pub(crate) fn resolve_instances(raw: &[FileInstance]) -> Result<Vec<InstanceConf
                 String::new(),
                 String::new(),
                 "local".into(),
-                memory_fingerprint(),
-                memory_location(),
+                memory_fingerprint(id),
+                memory_location(id),
             ),
             InstanceKind::Telegram => {
                 let chat = f
@@ -119,7 +120,7 @@ pub(crate) fn resolve_instances(raw: &[FileInstance]) -> Result<Vec<InstanceConf
                 let env_name = f
                     .bot_token_env
                     .clone()
-                    .unwrap_or_else(|| "TELEGRAM_BOT_TOKEN".into());
+                    .unwrap_or_else(|| "BOT_TOKEN".into());
                 let token = std::env::var(&env_name).with_context(|| {
                     format!("instance {id}: missing env {env_name}")
                 })?;
@@ -157,48 +158,28 @@ pub(crate) fn resolve_instances(raw: &[FileInstance]) -> Result<Vec<InstanceConf
             bot_token_env,
             bot_token,
             scope_id,
+            max_blob_size: f.max_blob_size,
         });
     }
     validate_instances(&out)?;
     Ok(out)
 }
 
-/// Legacy single-backend → one `default` instance.
-pub fn legacy_default_instance(
-    kind: InstanceKind,
-    bot_token: &str,
-    scope_id: &str,
-    bot_token_env: &str,
-) -> Result<InstanceConfig> {
-    warn!(
-        "config uses legacy [telegram]/[discord]/chat_id; \
-         treating as single instance id=\"default\". Prefer [[instances]]."
-    );
-    let (fingerprint, location) = match kind {
-        InstanceKind::Telegram => (
-            telegram_fingerprint(bot_token, scope_id)?,
-            telegram_location(scope_id),
-        ),
-        InstanceKind::Discord => (
-            discord_fingerprint(&discord_app_id_from_token(bot_token), scope_id),
-            discord_location(scope_id),
-        ),
-        InstanceKind::Memory => (memory_fingerprint(), memory_location()),
-    };
-    let cfg = InstanceConfig {
+/// In-process memory instance (tests, local runs).
+pub fn memory_instance(id: &str) -> InstanceConfig {
+    InstanceConfig {
         info: InstanceInfo {
-            id: "default".into(),
-            kind,
-            fingerprint,
-            location,
+            id: id.into(),
+            kind: InstanceKind::Memory,
+            fingerprint: memory_fingerprint(id),
+            location: memory_location(id),
             role: InstanceRole::ReadWrite,
         },
-        bot_token_env: bot_token_env.into(),
-        bot_token: bot_token.into(),
-        scope_id: scope_id.into(),
-    };
-    validate_instances(std::slice::from_ref(&cfg))?;
-    Ok(cfg)
+        bot_token_env: String::new(),
+        bot_token: String::new(),
+        scope_id: "local".into(),
+        max_blob_size: None,
+    }
 }
 
 /// At most one read-write instance per location; unique instance ids.
@@ -265,6 +246,7 @@ mod tests {
             bot_token_env: "T".into(),
             bot_token: "1:x".into(),
             scope_id: "-100".into(),
+            max_blob_size: None,
         };
         let mut b = a.clone();
         b.info.id = "b".into();
@@ -284,6 +266,7 @@ mod tests {
             bot_token_env: "T".into(),
             bot_token: "1:x".into(),
             scope_id: "-100".into(),
+            max_blob_size: None,
         };
         let mut b = a.clone();
         b.info.id = "ro".into();
@@ -305,6 +288,7 @@ mod tests {
             bot_token_env: "T".into(),
             bot_token: "1:x".into(),
             scope_id: "-100".into(),
+            max_blob_size: None,
         };
         let err = check_fingerprints(
             &[cfg],

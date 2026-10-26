@@ -55,11 +55,7 @@ if [[ -f .env ]]; then
 fi
 : "${BOT_TOKEN:?BOT_TOKEN required in .env}"
 
-# chat_id from existing pigeonhole.toml, or CHAT_ID leftover in .env for migration.
-if [[ -z "${CHAT_ID:-}" && -f pigeonhole.toml ]]; then
-  CHAT_ID="$(sed -n 's/^chat_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pigeonhole.toml | head -1)"
-fi
-: "${CHAT_ID:?chat_id required in pigeonhole.toml (or CHAT_ID in .env for migration)}"
+: "${CHAT_ID:?CHAT_ID (telegram chat id) required in .env}"
 
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:8333}"
 PORT="${LISTEN_ADDR##*:}"
@@ -107,15 +103,10 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 CFG="$ROOT/.cache/pigeonhole-storage-telegram-config.toml"
-# Prefer database_url from local pigeonhole.toml if present.
-DB_URL="sqlite:pigeonhole.db"
-if [[ -f pigeonhole.toml ]]; then
-  parsed="$(sed -n 's/^database_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' pigeonhole.toml | head -1 || true)"
-  [[ -n "$parsed" ]] && DB_URL="$parsed"
-fi
+DB_URL="sqlite:$ROOT/.cache/pigeonhole-telegram.db"
 CONFIG_OUT="$CFG" \
-  CONFIG_MEMORY=false \
-  CONFIG_CHAT_ID="$CHAT_ID" \
+  CONFIG_INSTANCE=telegram \
+  CONFIG_SCOPE_ID="$CHAT_ID" \
   CONFIG_LISTEN_ADDR="$LISTEN_ADDR" \
   CONFIG_DATABASE_URL="$DB_URL" \
   CONFIG_SNAPSHOT_SECS=0 \

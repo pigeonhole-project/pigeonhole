@@ -757,6 +757,7 @@ mod tests {
             bot_token_env: String::new(),
             bot_token: String::new(),
             scope_id: "a".into(),
+            max_blob_size: None,
         };
         let mut b = a.clone();
         b.info.id = "b".into();

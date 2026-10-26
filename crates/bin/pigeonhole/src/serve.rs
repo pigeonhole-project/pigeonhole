@@ -94,12 +94,13 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    let scope = cfg.primary_scope_id().unwrap_or("?");
+    let instances: Vec<String> = cfg
+        .instances
+        .iter()
+        .map(|i| format!("{}:{}", i.info.id, i.info.kind.as_str()))
+        .collect();
     info!(
-        memory = cfg.memory_store,
-        backend = ?cfg.backend_kind,
-        scope_id = %scope,
-        instances = cfg.instances.len(),
+        ?instances,
         placement = ?cfg.placement.group,
         chunk_size = cfg.chunk_size,
         chunk_codec = %cfg.chunk_codec,
