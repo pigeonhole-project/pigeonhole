@@ -32,6 +32,20 @@ pub struct ObjectMeta {
     pub mtime: String,
 }
 
+/// `(bucket, key, size, content_type, etag, extents_json, checksums_json)`.
+type SourceRow = (String, String, i64, Option<String>, String, String, String);
+
+/// Snapshot of a copy source, see [`Index::get_copy_source`].
+#[derive(Debug, Clone)]
+pub struct SourceSnapshot {
+    pub etag: String,
+    pub size: i64,
+    pub content_type: Option<String>,
+    pub extents: Vec<Extent>,
+    pub user_meta: Vec<(String, String)>,
+    pub checksums_json: String,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct UserMeta {
     pub bucket: String,
@@ -566,36 +580,62 @@ impl Index {
         Ok(Some(ids))
     }
 
-    /// Shallow copy: same extents, caller must `retain` returned chunk ids.
+    /// Consistent view of a copy source: object row, extents, user metadata, and
+    /// checksums from one read transaction (no mix of two versions).
+    pub async fn get_copy_source(&self, bucket: &str, key: &str) -> Result<Option<SourceSnapshot>> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<SourceRow> =
+            sqlx::query_as(
+                r#"
+                SELECT bucket, key, size, content_type, etag, extents_json, checksums_json
+                FROM objects WHERE bucket = ? AND key = ?
+                "#,
+            )
+            .bind(bucket)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some((bucket, key, size, content_type, etag, extents_json, checksums_json)) = row
+        else {
+            return Ok(None);
+        };
+        let user_meta = sqlx::query_as::<_, (String, String)>(
+            "SELECT name, value FROM object_metadata WHERE bucket = ? AND key = ? ORDER BY name",
+        )
+        .bind(&bucket)
+        .bind(&key)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(SourceSnapshot {
+            etag,
+            size,
+            content_type,
+            extents: serde_json::from_str(&extents_json)?,
+            user_meta,
+            checksums_json,
+        }))
+    }
+
+    /// Shallow copy of `src` (from [`Self::get_copy_source`]) to `dst`. The caller must
+    /// `retain` the source extents' chunks **before** calling this, so the new object
+    /// never points at chunks it does not hold a ref on. Returns the destination row
+    /// and the previous destination chunk ids to `release`.
     pub async fn copy_object(
         &self,
-        src_bucket: &str,
-        src_key: &str,
+        src: &SourceSnapshot,
         dst_bucket: &str,
         dst_key: &str,
         content_type: Option<&str>,
         user_meta: &[(String, String)],
         copy_source_meta: bool,
-    ) -> Result<(ObjectMeta, Vec<Extent>, Vec<ChunkId>)> {
-        let src = self
-            .get_object(src_bucket, src_key)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("source object not found"))?;
-        let extents = self
-            .get_extents(src_bucket, src_key)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("source extents missing"))?;
+    ) -> Result<(ObjectMeta, Vec<ChunkId>)> {
         let ct = content_type.or(src.content_type.as_deref());
-        let meta: Vec<(String, String)> = if copy_source_meta {
-            self.get_user_metadata(src_bucket, src_key).await?
+        let meta = if copy_source_meta {
+            &src.user_meta[..]
         } else {
-            user_meta.to_vec()
+            user_meta
         };
-        let checksums_json = self
-            .get_object_checksums_json(src_bucket, src_key)
-            .await?
-            .unwrap_or_else(|| "{}".to_string());
-
         let old = self
             .put_object(
                 dst_bucket,
@@ -603,9 +643,9 @@ impl Index {
                 &src.etag,
                 src.size,
                 ct,
-                &extents,
-                &meta,
-                &checksums_json,
+                &src.extents,
+                meta,
+                &src.checksums_json,
             )
             .await?;
 
@@ -613,7 +653,7 @@ impl Index {
             .get_object(dst_bucket, dst_key)
             .await?
             .ok_or_else(|| anyhow::anyhow!("destination missing after copy"))?;
-        Ok((dst, extents, old))
+        Ok((dst, old))
     }
 
     pub async fn list_objects(

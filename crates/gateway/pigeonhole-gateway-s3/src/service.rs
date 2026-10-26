@@ -1,8 +1,9 @@
 //! S3 API implementation on top of gateway index + ChunkStore (via s3s).
 
 use crate::index::{
-    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index,
+    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, SourceSnapshot,
 };
+use pigeonhole_chunk_store::Extent;
 use pigeonhole_chunk_store::{config::Config, ChunkStore, IngestOptions};
 use async_trait::async_trait;
 use base64::Engine;
@@ -59,23 +60,45 @@ impl S3Gateway {
         }
     }
 
-    async fn retain_ids(&self, ids: &[i64]) -> S3Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        self.store.retain(ids).await.map_err(Self::map_retain_err)
-    }
-
     fn map_err(e: impl std::fmt::Display) -> s3s::S3Error {
         s3_error!(InternalError, "{}", e)
     }
 
-    /// Copy / UploadPartCopy: a chunk reclaimed under us looks like a missing source.
-    fn map_retain_err(e: anyhow::Error) -> s3s::S3Error {
-        if pigeonhole_chunk_store::is_chunk_gone(&e) {
-            return s3_error!(NoSuchKey, "source chunk gone during copy");
+    /// Snapshot a copy source and take a ref on the chunks `select` picks from it.
+    ///
+    /// The ref is taken before the caller publishes anything that points at those
+    /// chunks. If the source is deleted or overwritten between the snapshot and
+    /// `retain`, its chunks may already be unreferenced (`ChunkGone`); re-read and
+    /// retry, and report `NoSuchKey` only when the source is really gone.
+    async fn pin_copy_source<F>(
+        &self,
+        bucket: &str,
+        key: &str,
+        select: F,
+    ) -> S3Result<(SourceSnapshot, Vec<Extent>)>
+    where
+        F: Fn(&SourceSnapshot) -> S3Result<Vec<Extent>>,
+    {
+        const ATTEMPTS: usize = 3;
+        for _ in 0..ATTEMPTS {
+            let src = self
+                .index
+                .get_copy_source(bucket, key)
+                .await
+                .map_err(Self::map_err)?
+                .ok_or_else(|| s3_error!(NoSuchKey))?;
+            let extents = select(&src)?;
+            let ids = unique_chunk_ids(&extents);
+            if ids.is_empty() {
+                return Ok((src, extents));
+            }
+            match self.store.retain(&ids).await {
+                Ok(()) => return Ok((src, extents)),
+                Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) => continue,
+                Err(e) => return Err(Self::map_err(e)),
+            }
         }
-        s3_error!(InternalError, "{}", e)
+        Err(s3_error!(NoSuchKey, "source changed during copy"))
     }
 
     fn etag_of(md5: &[u8; 16]) -> String {
@@ -1205,11 +1228,14 @@ impl S3 for S3Gateway {
             input.metadata.unwrap_or_default().into_iter().collect()
         };
 
-        let (dst, extents, old) = self
+        let (src, extents) = self
+            .pin_copy_source(&src_bucket, &src_key, |src| Ok(src.extents.clone()))
+            .await?;
+        let held = unique_chunk_ids(&extents);
+        let (dst, old) = match self
             .index
             .copy_object(
-                &src_bucket,
-                &src_key,
+                &src,
                 &input.bucket,
                 &input.key,
                 content_type,
@@ -1217,9 +1243,13 @@ impl S3 for S3Gateway {
                 copy_source_meta,
             )
             .await
-            .map_err(Self::map_err)?;
-
-        self.retain_ids(&unique_chunk_ids(&extents)).await?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.release_ids(&held).await;
+                return Err(Self::map_err(e));
+            }
+        };
         self.release_ids(&old).await;
 
         Ok(S3Response::new(CopyObjectOutput {
@@ -1410,43 +1440,38 @@ impl S3 for S3Gateway {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
             _ => return Err(s3_error!(NotImplemented)),
         };
-        let src = self
-            .index
-            .get_object(&src_bucket, &src_key)
-            .await
-            .map_err(Self::map_err)?
-            .ok_or_else(|| s3_error!(NoSuchKey))?;
-        let src_extents = self
-            .index
-            .get_extents(&src_bucket, &src_key)
-            .await
-            .map_err(Self::map_err)?
-            .unwrap_or_default();
-
+        let range = input.copy_source_range.as_deref();
+        let (src, part_extents) = self
+            .pin_copy_source(&src_bucket, &src_key, |src| {
+                let (start, length) = match range {
+                    None => (0u64, src.size as u64),
+                    Some(r) => parse_copy_source_range(r, src.size as u64)?,
+                };
+                Ok(slice_extents(&src.extents, start, length))
+            })
+            .await?;
+        let held = unique_chunk_ids(&part_extents);
         let total = src.size as u64;
-        let (start, length) = match input.copy_source_range.as_deref() {
-            None => (0u64, total),
-            Some(r) => parse_copy_source_range(r, total)?,
-        };
-
+        let length = part_extents.iter().map(|e| e.len).sum::<i64>() as u64;
         let part_number = i64::from(input.part_number);
-        let part_extents = slice_extents(&src_extents, start, length);
 
-        let etag = if start == 0 && length == total && !src.etag.contains('-') {
+        let etag = if length == total && !src.etag.contains('-') {
             src.etag.clone()
         } else {
-            let data = self
-                .store
-                .read(&part_extents, None)
-                .await
-                .map_err(Self::map_err)?;
-            let mut md5 = md5::Md5::new();
-            md5.update(&data);
-            format!("{:x}", md5.finalize())
+            match self.store.read(&part_extents, None).await {
+                Ok(data) => {
+                    let mut md5 = md5::Md5::new();
+                    md5.update(&data);
+                    format!("{:x}", md5.finalize())
+                }
+                Err(e) => {
+                    self.release_ids(&held).await;
+                    return Err(Self::map_err(e));
+                }
+            }
         };
 
-        self.retain_ids(&unique_chunk_ids(&part_extents)).await?;
-        let old = self
+        let old = match self
             .index
             .put_multipart_part(
                 &input.upload_id,
@@ -1456,7 +1481,13 @@ impl S3 for S3Gateway {
                 &part_extents,
             )
             .await
-            .map_err(Self::map_err)?;
+        {
+            Ok(old) => old,
+            Err(e) => {
+                self.release_ids(&held).await;
+                return Err(Self::map_err(e));
+            }
+        };
         self.release_ids(&old).await;
 
         let part = self
