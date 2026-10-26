@@ -9,11 +9,11 @@ use pigeonhole_blob::{
     TypedBootstrapPointer,
 };
 use pigeonhole_chunk_store::{
-    check_fingerprints, legacy_index_has_blobs, migrate_index_to_blob_db, BlockCache, BlobDb,
+    check_fingerprints, BlockCache, BlobDb,
     ChunkStore, Durability, IngestOptions, PinTarget, Superblock, WatermarkBackend,
 };
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub struct Runtime {
     pub store: Arc<ChunkStore>,
@@ -32,23 +32,6 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
         .await
         .context("list instance fingerprints")?;
     check_fingerprints(&cfg.instances, &stored).context("fingerprint check")?;
-
-    if blob_db.is_empty_metadata().await? {
-        if legacy_index_has_blobs(&cfg.database_url)
-            .await
-            .context("probe legacy index")?
-        {
-            let primary = cfg.primary_instance()?;
-            info!("legacy index has blobs; migrating into blob.db");
-            let report =
-                migrate_index_to_blob_db(&cfg.database_url, &blob_db, primary, false).await?;
-            info!(
-                blobs = report.blobs,
-                roots = report.roots,
-                "legacy index migrated"
-            );
-        }
-    }
 
     let (replicated, pins, primary_fingerprint, primary_id) =
         build_placement(cfg, &blob_db).await.context("build placement group")?;

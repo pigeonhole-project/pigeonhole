@@ -5,7 +5,7 @@ mod background;
 mod runtime;
 mod serve;
 
-use admin::{cmd_migrate, cmd_purge, cmd_restore};
+use admin::{cmd_purge, cmd_restore};
 use anyhow::{bail, Context};
 use serve::cmd_serve;
 use tracing::warn;
@@ -60,22 +60,10 @@ async fn main() -> anyhow::Result<()> {
             }
             cmd_purge(yes, expect_chat.as_deref()).await
         }
-        Some("migrate") => {
-            let mut dry_run = false;
-            for a in args {
-                match a.as_str() {
-                    "--dry-run" => dry_run = true,
-                    other => {
-                        bail!("unknown migrate flag {other}; usage: pigeonhole migrate [--dry-run]")
-                    }
-                }
-            }
-            cmd_migrate(dry_run).await
-        }
         Some(other) => {
             bail!(
                 "unknown command {other:?}; usage: pigeonhole \
-                 [restore [--force] | purge --yes | migrate [--dry-run]]"
+                 [restore [--force] | purge --yes]"
             )
         }
         None => cmd_serve().await,

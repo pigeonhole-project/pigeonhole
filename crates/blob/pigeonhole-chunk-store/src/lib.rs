@@ -7,7 +7,6 @@ pub mod block_cache;
 pub mod ingest;
 pub mod instances;
 pub mod layer;
-pub mod migrate;
 pub mod repair;
 pub mod sweep;
 
@@ -21,9 +20,6 @@ pub use durability::{
 };
 pub use layer::{
     check_block_fits_members, default_layer_opts, ChunkId, ChunkStore, Extent, Ingested,
-};
-pub use migrate::{
-    default_instance_for_migrate, legacy_index_has_blobs, migrate_index_to_blob_db, MigrateReport,
 };
 pub use instances::{
     check_fingerprints, discord_fingerprint, discord_location, legacy_default_instance,

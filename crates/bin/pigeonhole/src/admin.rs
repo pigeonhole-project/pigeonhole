@@ -1,27 +1,14 @@
-//! Binary-only: offline maintenance subcommands (`restore`, `purge`, `migrate`).
+//! Binary-only: offline maintenance subcommands (`restore`, `purge`).
 
-use crate::runtime::{open_runtime, sibling_db_url};
+use crate::runtime::open_runtime;
 use anyhow::{bail, Context};
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole_chunk_store::{
-    migrate_index_to_blob_db, start_or_restore, BlobDb, JournalOp, Sweeper,
+    start_or_restore, JournalOp, Sweeper,
 };
 use pigeonhole_gateway_s3::snapshot::restore_index_snapshot;
 use tracing::{info, warn};
-
-pub async fn cmd_migrate(dry_run: bool) -> anyhow::Result<()> {
-    let cfg = Config::load().context("load config")?;
-    let blob_url = sibling_db_url(&cfg.database_url, "blob");
-    info!(%blob_url, dry_run, "migrate legacy index → blob.db");
-    let blob_db = BlobDb::connect(&blob_url)
-        .await
-        .context("open blob.db")?;
-    let primary = cfg.primary_instance()?;
-    let report = migrate_index_to_blob_db(&cfg.database_url, &blob_db, primary, dry_run).await?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
-}
 
 /// Release all roots + wipe gateway index. Backend object reclaim is stage H (sweeper).
 pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<()> {

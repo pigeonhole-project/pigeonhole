@@ -223,14 +223,10 @@ cargo run --release -- restore
 restores `blob.db` automatically (when it is empty and a superblock is pinned);
 the S3 index needs an explicit `restore`.
 
-Other commands:
+Delete every backend message tracked by the local index (server must be stopped):
 
 ```bash
-# delete every backend message tracked by the local index (server must be stopped)
 cargo run --release -- purge --yes [--expect-chat CHAT_ID]
-
-# one-off migration of a pre-chunk-store index into blob.db (also done on startup)
-cargo run --release -- migrate [--dry-run]
 ```
 
 ## Supported S3 ops (subset)
