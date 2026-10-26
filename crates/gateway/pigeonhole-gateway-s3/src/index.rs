@@ -1,17 +1,23 @@
-//! S3 gateway index: buckets/objects/multipart with extent lists (stage F).
+//! S3 gateway index: buckets/objects/multipart with extent lists.
 //!
-//! Chunk refcounts live in `blob.db` via [`ChunkStore::retain`] / [`release`];
-//! this SQLite DB only stores gateway metadata and serialized extent lists.
+//! Queries read SQLite directly; every change goes through an `s3` command
+//! (see [`crate::commands`]). Chunk refcounts live in the chunk store
+//! ([`ChunkStore::retain`] / [`release`]).
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePoolOptions, FromRow, SqlitePool};
+use crate::commands::{pb, S3Namespace, NAMESPACE};
+use pigeonhole_meta::{Applied, MetaStore};
+use prost::Message;
+use sqlx::{FromRow, SqlitePool};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Index {
     pool: SqlitePool,
+    meta: Arc<MetaStore>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -111,55 +117,16 @@ pub enum DeleteBucketResult {
     NotEmpty,
 }
 
-impl Index {
-    pub async fn connect(database_url: &str) -> Result<Self> {
-        let url = if database_url == "sqlite:pigeonhole.db" {
-            "sqlite:pigeonhole.db?mode=rwc".to_string()
-        } else if database_url.starts_with("sqlite:") && !database_url.contains('?') {
-            format!("{database_url}?mode=rwc")
-        } else {
-            database_url.to_string()
-        };
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(&url)
-            .await
-            .with_context(|| format!("connect sqlite {url}"))?;
-
-        let idx = Self { pool };
-        idx.migrate().await?;
-        Ok(idx)
-    }
-
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
-    }
-
-    async fn migrate(&self) -> Result<()> {
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA busy_timeout = 5000")
-            .execute(&self.pool)
-            .await?;
-
-        sqlx::query(
-            r#"
+/// Current schema of the `s3` namespace. No upgrades.
+pub(crate) const SCHEMA: &[&str] = &[
+    r#"
             CREATE TABLE IF NOT EXISTS buckets (
                 name TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
                 scope_id TEXT NOT NULL DEFAULT ''
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            r#"
+    "#,
+    r#"
             CREATE TABLE IF NOT EXISTS objects (
                 bucket TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -172,13 +139,8 @@ impl Index {
                 PRIMARY KEY (bucket, key),
                 FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
+    "#,
+    r#"
             CREATE TABLE IF NOT EXISTS object_metadata (
                 bucket TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -187,13 +149,8 @@ impl Index {
                 PRIMARY KEY (bucket, key, name),
                 FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
+    "#,
+    r#"
             CREATE TABLE IF NOT EXISTS object_tags (
                 bucket TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -202,13 +159,8 @@ impl Index {
                 PRIMARY KEY (bucket, key, tag_key),
                 FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
+    "#,
+    r#"
             CREATE TABLE IF NOT EXISTS multipart_uploads (
                 upload_id TEXT PRIMARY KEY,
                 bucket TEXT NOT NULL,
@@ -220,13 +172,8 @@ impl Index {
                 initiated_at TEXT NOT NULL,
                 FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
+    "#,
+    r#"
             CREATE TABLE IF NOT EXISTS multipart_parts (
                 upload_id TEXT NOT NULL,
                 part_number INTEGER NOT NULL,
@@ -236,52 +183,67 @@ impl Index {
                 PRIMARY KEY (upload_id, part_number),
                 FOREIGN KEY (upload_id) REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
+    "#,
+    r#"
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+    "#,
+];
 
-        Ok(())
+impl Index {
+    /// Open a standalone metadata store at `database_url` with only this namespace.
+    pub async fn connect(database_url: &str) -> Result<Self> {
+        Self::open(MetaStore::open(database_url).await?).await
     }
 
+    /// Register the `s3` namespace on `meta`.
+    pub async fn open(meta: Arc<MetaStore>) -> Result<Self> {
+        meta.register(Arc::new(S3Namespace)).await?;
+        Ok(Self {
+            pool: meta.pool().clone(),
+            meta,
+        })
+    }
+
+    /// Propose one s3 command; `Ok(Err(reason))` is a deterministic rejection.
+    async fn propose(
+        &self,
+        op: pb::command::Op,
+    ) -> Result<std::result::Result<Vec<ChunkId>, pb::rejection::Reason>> {
+        let cmd = pb::Command { op: Some(op) }.encode_to_vec();
+        match self.meta.propose(NAMESPACE, &cmd).await?.applied {
+            Applied::Commit(bytes) => Ok(Ok(pb::Released::decode(bytes.as_slice())?.chunk_ids)),
+            Applied::Reject(bytes) => Ok(Err(pb::Rejection::decode(bytes.as_slice())?
+                .reason
+                .context("rejection without reason")?)),
+        }
+    }
+
+    async fn propose_infallible(&self, op: pb::command::Op) -> Result<Vec<ChunkId>> {
+        match self.propose(op).await? {
+            Ok(ids) => Ok(ids),
+            Err(reason) => anyhow::bail!("unexpected s3 rejection {reason:?}"),
+        }
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Returns false when the bucket already exists.
     pub async fn create_bucket(&self, name: &str, scope_id: &str) -> Result<bool> {
-        let created_at = Utc::now().to_rfc3339();
-        let res = sqlx::query(
-            "INSERT OR IGNORE INTO buckets (name, created_at, scope_id) VALUES (?, ?, ?)",
-        )
-        .bind(name)
-        .bind(created_at)
-        .bind(scope_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    pub async fn upsert_bucket(&self, name: &str, scope_id: &str) -> Result<()> {
-        let created_at = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            INSERT INTO buckets (name, created_at, scope_id) VALUES (?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET scope_id = excluded.scope_id
-            "#,
-        )
-        .bind(name)
-        .bind(created_at)
-        .bind(scope_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let op = pb::command::Op::CreateBucket(pb::CreateBucket {
+            name: name.into(),
+            scope_id: scope_id.into(),
+            created_at: Utc::now().to_rfc3339(),
+        });
+        match self.propose(op).await? {
+            Ok(_) => Ok(true),
+            Err(pb::rejection::Reason::BucketExists(_)) => Ok(false),
+            Err(other) => anyhow::bail!("unexpected create_bucket rejection {other:?}"),
+        }
     }
 
     pub async fn bucket_scope_id(&self, name: &str) -> Result<Option<String>> {
@@ -294,23 +256,14 @@ impl Index {
     }
 
     pub async fn delete_bucket(&self, name: &str) -> Result<DeleteBucketResult> {
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM objects WHERE bucket = ?")
-                .bind(name)
-                .fetch_one(&self.pool)
-                .await?;
-        if count.0 > 0 {
-            return Ok(DeleteBucketResult::NotEmpty);
-        }
-        let res = sqlx::query("DELETE FROM buckets WHERE name = ?")
-            .bind(name)
-            .execute(&self.pool)
-            .await?;
-        if res.rows_affected() == 0 {
-            Ok(DeleteBucketResult::NotFound)
-        } else {
-            Ok(DeleteBucketResult::Deleted)
-        }
+        use pb::rejection::Reason;
+        let op = pb::command::Op::DeleteBucket(pb::DeleteBucket { name: name.into() });
+        Ok(match self.propose(op).await? {
+            Ok(_) => DeleteBucketResult::Deleted,
+            Err(Reason::BucketNotFound(_)) => DeleteBucketResult::NotFound,
+            Err(Reason::BucketNotEmpty(_)) => DeleteBucketResult::NotEmpty,
+            Err(other) => anyhow::bail!("unexpected delete_bucket rejection {other:?}"),
+        })
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>> {
@@ -331,6 +284,7 @@ impl Index {
     }
 
     /// Insert/replace object. Returns previous extent chunk ids (caller should `release`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -342,71 +296,18 @@ impl Index {
         user_meta: &[(String, String)],
         checksums_json: &str,
     ) -> Result<Vec<ChunkId>> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let old_json: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM objects WHERE bucket = ? AND key = ?",
-        )
-        .bind(bucket)
-        .bind(key)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let old_ids = old_json
-            .map(|(j,)| chunk_ids_from_json(&j))
-            .transpose()?
-            .unwrap_or_default();
-
-        sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ?")
-            .bind(bucket)
-            .bind(key)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
-            .bind(bucket)
-            .bind(key)
-            .execute(&mut *tx)
-            .await?;
-
-        let mtime = Utc::now().to_rfc3339();
-        let extents_json = serde_json::to_string(extents)?;
-        sqlx::query(
-            r#"
-            INSERT INTO objects
-                (bucket, key, etag, size, content_type, mtime, checksums_json, extents_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(bucket, key) DO UPDATE SET
-                etag = excluded.etag,
-                size = excluded.size,
-                content_type = excluded.content_type,
-                mtime = excluded.mtime,
-                checksums_json = excluded.checksums_json,
-                extents_json = excluded.extents_json
-            "#,
-        )
-        .bind(bucket)
-        .bind(key)
-        .bind(etag)
-        .bind(size)
-        .bind(content_type)
-        .bind(&mtime)
-        .bind(checksums_json)
-        .bind(&extents_json)
-        .execute(&mut *tx)
-        .await?;
-
-        for (name, value) in user_meta {
-            sqlx::query(
-                "INSERT INTO object_metadata (bucket, key, name, value) VALUES (?, ?, ?, ?)",
-            )
-            .bind(bucket)
-            .bind(key)
-            .bind(name)
-            .bind(value)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(old_ids)
+        self.propose_infallible(pb::command::Op::PutObject(pb::PutObject {
+            bucket: bucket.into(),
+            key: key.into(),
+            etag: etag.into(),
+            size,
+            content_type: content_type.map(Into::into),
+            extents: pb_extents(extents),
+            user_meta: pb_pairs(user_meta),
+            checksums_json: checksums_json.into(),
+            mtime: Utc::now().to_rfc3339(),
+        }))
+        .await
     }
 
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
@@ -485,58 +386,35 @@ impl Index {
         key: &str,
         tags: &[(String, String)],
     ) -> Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
-            .bind(bucket)
-            .bind(key)
-            .execute(&mut *tx)
-            .await?;
-        for (k, v) in tags {
-            sqlx::query(
-                "INSERT INTO object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
-            )
-            .bind(bucket)
-            .bind(key)
-            .bind(k)
-            .bind(v)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
+        self.propose_infallible(pb::command::Op::PutObjectTags(pb::PutObjectTags {
+            bucket: bucket.into(),
+            key: key.into(),
+            tags: pb_pairs(tags),
+        }))
+        .await?;
         Ok(())
     }
 
     pub async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<()> {
-        sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
-            .bind(bucket)
-            .bind(key)
-            .execute(&self.pool)
-            .await?;
+        self.propose_infallible(pb::command::Op::DeleteObjectTags(pb::DeleteObjectTags {
+            bucket: bucket.into(),
+            key: key.into(),
+        }))
+        .await?;
         Ok(())
     }
 
     /// Delete object; returns extents' chunk ids to `release`, or `None` if missing.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<ChunkId>>> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM objects WHERE bucket = ? AND key = ?",
-        )
-        .bind(bucket)
-        .bind(key)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((extents_json,)) = row else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-        let ids = chunk_ids_from_json(&extents_json)?;
-        sqlx::query("DELETE FROM objects WHERE bucket = ? AND key = ?")
-            .bind(bucket)
-            .bind(key)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(Some(ids))
+        let op = pb::command::Op::DeleteObject(pb::DeleteObject {
+            bucket: bucket.into(),
+            key: key.into(),
+        });
+        match self.propose(op).await? {
+            Ok(ids) => Ok(Some(ids)),
+            Err(pb::rejection::Reason::NoSuchKey(_)) => Ok(None),
+            Err(other) => anyhow::bail!("unexpected delete_object rejection {other:?}"),
+        }
     }
 
     /// Consistent view of a copy source: object row, extents, user metadata, and
@@ -920,6 +798,7 @@ impl Index {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_multipart_upload(
         &self,
         upload_id: &str,
@@ -930,26 +809,16 @@ impl Index {
         tags: &[(String, String)],
         checksum_algorithm: Option<&str>,
     ) -> Result<()> {
-        let initiated_at = Utc::now().to_rfc3339();
-        let user_meta_json = serde_json::to_string(user_meta)?;
-        let tagging_json = serde_json::to_string(tags)?;
-        sqlx::query(
-            r#"
-            INSERT INTO multipart_uploads
-                (upload_id, bucket, key, content_type, user_meta_json, tagging_json,
-                 checksum_algorithm, initiated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(upload_id)
-        .bind(bucket)
-        .bind(key)
-        .bind(content_type)
-        .bind(user_meta_json)
-        .bind(tagging_json)
-        .bind(checksum_algorithm)
-        .bind(initiated_at)
-        .execute(&self.pool)
+        self.propose_infallible(pb::command::Op::CreateUpload(pb::CreateUpload {
+            upload_id: upload_id.into(),
+            bucket: bucket.into(),
+            key: key.into(),
+            content_type: content_type.map(Into::into),
+            user_meta: pb_pairs(user_meta),
+            tags: pb_pairs(tags),
+            checksum_algorithm: checksum_algorithm.map(Into::into),
+            initiated_at: Utc::now().to_rfc3339(),
+        }))
         .await?;
         Ok(())
     }
@@ -977,42 +846,14 @@ impl Index {
         size: i64,
         extents: &[Extent],
     ) -> Result<Vec<ChunkId>> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let old: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM multipart_parts WHERE upload_id = ? AND part_number = ?",
-        )
-        .bind(upload_id)
-        .bind(part_number)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let old_ids = old
-            .map(|(j,)| chunk_ids_from_json(&j))
-            .transpose()?
-            .unwrap_or_default();
-
-        sqlx::query("DELETE FROM multipart_parts WHERE upload_id = ? AND part_number = ?")
-            .bind(upload_id)
-            .bind(part_number)
-            .execute(&mut *tx)
-            .await?;
-
-        let extents_json = serde_json::to_string(extents)?;
-        sqlx::query(
-            r#"
-            INSERT INTO multipart_parts (upload_id, part_number, etag, size, extents_json)
-            VALUES (?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(upload_id)
-        .bind(part_number)
-        .bind(etag)
-        .bind(size)
-        .bind(&extents_json)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(old_ids)
+        self.propose_infallible(pb::command::Op::PutPart(pb::PutPart {
+            upload_id: upload_id.into(),
+            part_number,
+            etag: etag.into(),
+            size,
+            extents: pb_extents(extents),
+        }))
+        .await
     }
 
     pub async fn get_multipart_part(
@@ -1056,134 +897,30 @@ impl Index {
         etag: &str,
         total_size: i64,
     ) -> Result<Vec<ChunkId>> {
-        let user_meta: Vec<(String, String)> =
-            serde_json::from_str(&upload.user_meta_json).unwrap_or_default();
-        let tags: Vec<(String, String)> =
-            serde_json::from_str(&upload.tagging_json).unwrap_or_default();
-
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let mut assembled: Vec<Extent> = Vec::new();
-        for pn in part_numbers {
-            let row: Option<(String,)> = sqlx::query_as(
-                "SELECT extents_json FROM multipart_parts WHERE upload_id = ? AND part_number = ?",
-            )
-            .bind(&upload.upload_id)
-            .bind(pn)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((j,)) = row else {
-                anyhow::bail!("missing part {pn}");
-            };
-            let mut part_ext: Vec<Extent> = serde_json::from_str(&j)?;
-            assembled.append(&mut part_ext);
+        let op = pb::command::Op::CompleteUpload(pb::CompleteUpload {
+            upload_id: upload.upload_id.clone(),
+            part_numbers: part_numbers.to_vec(),
+            etag: etag.into(),
+            total_size,
+            mtime: Utc::now().to_rfc3339(),
+        });
+        match self.propose(op).await? {
+            Ok(ids) => Ok(ids),
+            Err(pb::rejection::Reason::MissingPart(pn)) => anyhow::bail!("missing part {pn}"),
+            Err(other) => anyhow::bail!("complete_multipart_upload rejected: {other:?}"),
         }
-
-        let old_json: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM objects WHERE bucket = ? AND key = ?",
-        )
-        .bind(&upload.bucket)
-        .bind(&upload.key)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let old_ids = old_json
-            .map(|(j,)| chunk_ids_from_json(&j))
-            .transpose()?
-            .unwrap_or_default();
-
-        sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ?")
-            .bind(&upload.bucket)
-            .bind(&upload.key)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
-            .bind(&upload.bucket)
-            .bind(&upload.key)
-            .execute(&mut *tx)
-            .await?;
-
-        let mtime = Utc::now().to_rfc3339();
-        let extents_json = serde_json::to_string(&assembled)?;
-        sqlx::query(
-            r#"
-            INSERT INTO objects
-                (bucket, key, etag, size, content_type, mtime, checksums_json, extents_json)
-            VALUES (?, ?, ?, ?, ?, ?, '{}', ?)
-            ON CONFLICT(bucket, key) DO UPDATE SET
-                etag = excluded.etag,
-                size = excluded.size,
-                content_type = excluded.content_type,
-                mtime = excluded.mtime,
-                checksums_json = excluded.checksums_json,
-                extents_json = excluded.extents_json
-            "#,
-        )
-        .bind(&upload.bucket)
-        .bind(&upload.key)
-        .bind(etag)
-        .bind(total_size)
-        .bind(&upload.content_type)
-        .bind(&mtime)
-        .bind(&extents_json)
-        .execute(&mut *tx)
-        .await?;
-
-        for (name, value) in &user_meta {
-            sqlx::query(
-                "INSERT INTO object_metadata (bucket, key, name, value) VALUES (?, ?, ?, ?)",
-            )
-            .bind(&upload.bucket)
-            .bind(&upload.key)
-            .bind(name)
-            .bind(value)
-            .execute(&mut *tx)
-            .await?;
-        }
-        for (tag_key, tag_value) in &tags {
-            sqlx::query(
-                "INSERT INTO object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
-            )
-            .bind(&upload.bucket)
-            .bind(&upload.key)
-            .bind(tag_key)
-            .bind(tag_value)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        // Drop multipart rows without releasing part extents (ownership transferred).
-        sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?")
-            .bind(&upload.upload_id)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-        Ok(old_ids)
     }
 
     /// Abort upload; returns all part chunk ids to `release`, or `None` if missing.
     pub async fn abort_multipart_upload(&self, upload_id: &str) -> Result<Option<Vec<ChunkId>>> {
-        if self.get_multipart_upload(upload_id).await?.is_none() {
-            return Ok(None);
+        let op = pb::command::Op::AbortUpload(pb::AbortUpload {
+            upload_id: upload_id.into(),
+        });
+        match self.propose(op).await? {
+            Ok(ids) => Ok(Some(ids)),
+            Err(pb::rejection::Reason::NoSuchUpload(_)) => Ok(None),
+            Err(other) => anyhow::bail!("unexpected abort rejection {other:?}"),
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM multipart_parts WHERE upload_id = ?",
-        )
-        .bind(upload_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut ids = Vec::new();
-        for (j,) in rows {
-            ids.extend(chunk_ids_from_json(&j)?);
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?")
-            .bind(upload_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(Some(ids))
     }
 
     pub async fn list_multipart_uploads(
@@ -1311,10 +1048,6 @@ pub fn slice_extents(extents: &[Extent], start: u64, length: u64) -> Vec<Extent>
     out
 }
 
-fn chunk_ids_from_json(json: &str) -> Result<Vec<ChunkId>> {
-    let extents: Vec<Extent> = serde_json::from_str(json).unwrap_or_default();
-    Ok(unique_chunk_ids(&extents))
-}
 
 enum DelimEntry {
     Object(ObjectMeta),
@@ -1364,4 +1097,25 @@ pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+fn pb_extents(extents: &[Extent]) -> Vec<pb::Extent> {
+    extents
+        .iter()
+        .map(|e| pb::Extent {
+            chunk: e.chunk,
+            offset: e.offset,
+            len: e.len,
+        })
+        .collect()
+}
+
+fn pb_pairs(pairs: &[(String, String)]) -> Vec<pb::Pair> {
+    pairs
+        .iter()
+        .map(|(name, value)| pb::Pair {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect()
 }

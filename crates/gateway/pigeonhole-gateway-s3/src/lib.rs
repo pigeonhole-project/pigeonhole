@@ -1,5 +1,6 @@
 //! s3s [`S3`](s3s::S3) backend over the pigeonhole chunk store.
 
+mod commands;
 pub mod index;
 mod service;
 pub mod snapshot;
