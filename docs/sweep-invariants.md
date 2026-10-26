@@ -14,13 +14,21 @@ After process restart, `InflightParts` is empty: uncommitted parts of a dead wri
 
 The sweeper must **not** snapshot the full live-key set at the start of a pass. Between listing candidates and deleting a batch, another task may `commit_chunk` or publish a superblock. For each batch, immediately before `delete`:
 
-- `SELECT sort_key FROM chunk_parts … WHERE sort_key IN (…)` (live chunks only);
-- refresh durability `system_keys`;
-- consult `InflightParts::contains`.
+1. consult `InflightParts::contains` (snapshot, **first**);
+2. `SELECT sort_key FROM chunk_parts … WHERE sort_key IN (…)` (live chunks only);
+3. refresh durability `system_keys`.
 
 Only keys absent from all three sets are deleted.
 
+The order matters. An `InflightGuard` is dropped only **after** its chunk is committed
+(or its segment is in the published superblock), so a key that is not in flight at
+step 1 but is committed afterwards is visible at steps 2–3. Querying the database
+first and `InflightParts` second loses exactly those keys: the commit and the guard
+drop both land between the two reads, and a live part is deleted.
+
 `WatermarkBackend`’s per-`put` grace timeout only bounds a single upload; it does **not** replace `InflightParts` for the window from the first part of a chunk until commit.
+
+The guard is registered only after the part's `put` returns, while the put watermark is recorded inside the put. The sweep grace must therefore be non-zero: it covers the gap between the watermark and the guard.
 
 ## Chunk refcount lifecycle / Жизненный цикл чанка
 

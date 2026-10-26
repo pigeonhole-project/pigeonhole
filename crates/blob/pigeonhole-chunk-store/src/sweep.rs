@@ -310,6 +310,13 @@ impl Sweeper {
         instance_id: &str,
         keys: &[Vec<u8>],
     ) -> Result<(Vec<Vec<u8>>, u64, u64)> {
+        // Snapshot in-flight membership *before* reading committed state: guards are
+        // dropped only after commit, so a key absent here but committed later is
+        // visible to the queries below. The reverse order loses keys committed in between.
+        let inflight: Vec<bool> = keys
+            .iter()
+            .map(|k| self.inflight.contains(instance_id, k))
+            .collect();
         let committed = self.db.live_part_keys_among(instance_id, keys).await?;
         let system: HashSet<Vec<u8>> = self
             .durability
@@ -321,10 +328,10 @@ impl Sweeper {
         let mut to_delete = Vec::new();
         let mut skipped = 0u64;
         let mut protected = 0u64;
-        for k in keys {
+        for (k, inflight) in keys.iter().zip(inflight) {
             if committed.contains(k) || system.contains(k) {
                 skipped += 1;
-            } else if self.inflight.contains(instance_id, k) {
+            } else if inflight {
                 protected += 1;
                 skipped += 1;
             } else {
