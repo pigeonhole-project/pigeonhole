@@ -184,7 +184,7 @@ comments. Sections:
 | `[[instances]]` | Backends (≥ 1): id, kind (`telegram` / `discord` / `memory`), token env, chat/channel, role, `max_blob_size` |
 | `[placement]` | Write group + quorum; required with several read-write instances |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `database_url` | SQLite URL of the S3 index (chunk metadata lives in a sibling `*-blob.db`) |
+| `database_url` | SQLite metadata database shared by all layers (tables prefixed `chunk_` / `s3_` / `cas_`) |
 | `[snapshot]` | `interval_secs`: S3 index snapshot / checkpoint period (`0` disables snapshots) |
 | `[chunk]` | `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
@@ -201,11 +201,14 @@ half-applied.
 
 ## Durability and restore
 
-Two pieces of state are made durable in the backend:
+All metadata lives in one SQLite database (`database_url`); every change is a
+layer command applied by `pigeonhole-meta` (see
+[docs/meta-backends.md](docs/meta-backends.md) for where this is heading). Today
+two copies are pushed into the blob backend:
 
-- **Chunk metadata** (`blob.db`: chunks, parts, refcounts, roots) — changes are
-  appended to a journal flushed every **5 s**, and a full checkpoint is written
-  every `[snapshot].interval_secs` (min 60 s; 300 s when snapshots are off).
+- **Chunk metadata** (chunks, parts, refcounts, roots) — a full checkpoint every
+  `[snapshot].interval_secs` (min 60 s; 300 s when snapshots are off). A journal
+  flushed every 5 s records only root changes.
 - **S3 index** (buckets, keys, object metadata → extent lists) — exported as a
   gzip snapshot stored as an ordinary chunk-store object and published as the
   `s3/index` root every `[snapshot].interval_secs` (only when it changed).
@@ -215,9 +218,10 @@ journal locations, roots); that pin is the bootstrap pointer, so no `file_id`s
 need to be remembered after disk loss. Publishing is fenced by generation so a
 stale writer cannot overwrite a newer superblock.
 
-**RPO:** chunk metadata ≈ 5 s; the S3 namespace ≈ `[snapshot].interval_secs`.
-Objects written after the last index snapshot lose their keys on a crash; their
-chunks stay referenced in `blob.db` and are currently leaked (not reclaimed).
+**RPO after losing the disk:** ≈ `[snapshot].interval_secs` for both. Known gap:
+a root journaled after the last checkpoint can point at a chunk the checkpoint
+does not have, and chunks committed after it are lost — the redesign replaces
+this mechanism.
 
 Restore on a stopped server / clean machine (tokens in `.env`, instances in TOML):
 
@@ -226,9 +230,9 @@ Restore on a stopped server / clean machine (tokens in `.env`, instances in TOML
 cargo run --release -- restore
 ```
 
-`restore` rebuilds both `blob.db` and the S3 index. Normal startup only
-restores `blob.db` automatically (when it is empty and a superblock is pinned);
-the S3 index needs an explicit `restore`.
+`restore` rebuilds chunk metadata and the S3 index. Normal startup only restores
+chunk metadata automatically (when it is empty and a superblock is pinned); the
+S3 index needs an explicit `restore`.
 
 Delete every backend message tracked by the local index (server must be stopped):
 

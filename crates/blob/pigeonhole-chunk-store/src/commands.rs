@@ -65,14 +65,14 @@ fn reject(reason: pb::rejection::Reason) -> Result<Applied> {
 }
 
 async fn sync_instances(conn: &mut SqliteConnection, c: pb::SyncInstances) -> Result<Applied> {
-    let existing: Vec<(String,)> = sqlx::query_as("SELECT id FROM instances")
+    let existing: Vec<(String,)> = sqlx::query_as("SELECT id FROM chunk_instances")
         .fetch_all(&mut *conn)
         .await?;
     let configured: std::collections::HashSet<&str> =
         c.instances.iter().map(|i| i.id.as_str()).collect();
     for (id,) in &existing {
         if !configured.contains(id.as_str()) {
-            sqlx::query("UPDATE instances SET state = 'retired' WHERE id = ?")
+            sqlx::query("UPDATE chunk_instances SET state = 'retired' WHERE id = ?")
                 .bind(id)
                 .execute(&mut *conn)
                 .await?;
@@ -81,7 +81,7 @@ async fn sync_instances(conn: &mut SqliteConnection, c: pb::SyncInstances) -> Re
     for i in &c.instances {
         sqlx::query(
             r#"
-            INSERT INTO instances (id, kind, fingerprint, location, state)
+            INSERT INTO chunk_instances (id, kind, fingerprint, location, state)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
@@ -224,7 +224,7 @@ async fn set_root(conn: &mut SqliteConnection, c: pb::SetRoot) -> Result<Applied
     let json = serde_json::to_string(&extents).context("serialize root extents")?;
     sqlx::query(
         r#"
-        INSERT INTO roots (name, extents_json) VALUES (?, ?)
+        INSERT INTO chunk_roots (name, extents_json) VALUES (?, ?)
         ON CONFLICT(name) DO UPDATE SET extents_json = excluded.extents_json
         "#,
     )
@@ -236,7 +236,7 @@ async fn set_root(conn: &mut SqliteConnection, c: pb::SetRoot) -> Result<Applied
 }
 
 async fn delete_root(conn: &mut SqliteConnection, name: &str) -> Result<Applied> {
-    sqlx::query("DELETE FROM roots WHERE name = ?")
+    sqlx::query("DELETE FROM chunk_roots WHERE name = ?")
         .bind(name)
         .execute(&mut *conn)
         .await?;
@@ -268,7 +268,7 @@ async fn drop_chunk(conn: &mut SqliteConnection, id: ChunkId) -> Result<Applied>
     for sql in [
         "DELETE FROM chunk_parts WHERE chunk_id = ?",
         "DELETE FROM chunk_blocks WHERE chunk_id = ?",
-        "DELETE FROM repair_queue WHERE chunk_id = ?",
+        "DELETE FROM chunk_repair_queue WHERE chunk_id = ?",
         "DELETE FROM chunks WHERE id = ?",
     ] {
         sqlx::query(sql).bind(id).execute(&mut *conn).await?;

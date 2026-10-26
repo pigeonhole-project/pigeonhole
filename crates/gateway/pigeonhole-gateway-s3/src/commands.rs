@@ -91,7 +91,7 @@ pub(crate) fn extents_json(extents: &[pb::Extent]) -> Result<String> {
 
 async fn create_bucket(conn: &mut SqliteConnection, c: pb::CreateBucket) -> Result<Applied> {
     let res = sqlx::query(
-        "INSERT OR IGNORE INTO buckets (name, created_at, scope_id) VALUES (?, ?, ?)",
+        "INSERT OR IGNORE INTO s3_buckets (name, created_at, scope_id) VALUES (?, ?, ?)",
     )
     .bind(&c.name)
     .bind(&c.created_at)
@@ -105,14 +105,14 @@ async fn create_bucket(conn: &mut SqliteConnection, c: pb::CreateBucket) -> Resu
 }
 
 async fn delete_bucket(conn: &mut SqliteConnection, name: &str) -> Result<Applied> {
-    let (objects,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM objects WHERE bucket = ?")
+    let (objects,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM s3_objects WHERE bucket = ?")
         .bind(name)
         .fetch_one(&mut *conn)
         .await?;
     if objects > 0 {
         return reject(Reason::BucketNotEmpty(true));
     }
-    let res = sqlx::query("DELETE FROM buckets WHERE name = ?")
+    let res = sqlx::query("DELETE FROM s3_buckets WHERE name = ?")
         .bind(name)
         .execute(&mut *conn)
         .await?;
@@ -138,7 +138,7 @@ async fn write_object(
     mtime: &str,
 ) -> Result<Vec<ChunkId>> {
     let old: Option<(String,)> =
-        sqlx::query_as("SELECT extents_json FROM objects WHERE bucket = ? AND key = ?")
+        sqlx::query_as("SELECT extents_json FROM s3_objects WHERE bucket = ? AND key = ?")
             .bind(bucket)
             .bind(key)
             .fetch_optional(&mut *conn)
@@ -149,14 +149,14 @@ async fn write_object(
         .unwrap_or_default();
 
     for sql in [
-        "DELETE FROM object_metadata WHERE bucket = ? AND key = ?",
-        "DELETE FROM object_tags WHERE bucket = ? AND key = ?",
+        "DELETE FROM s3_object_metadata WHERE bucket = ? AND key = ?",
+        "DELETE FROM s3_object_tags WHERE bucket = ? AND key = ?",
     ] {
         sqlx::query(sql).bind(bucket).bind(key).execute(&mut *conn).await?;
     }
     sqlx::query(
         r#"
-        INSERT INTO objects
+        INSERT INTO s3_objects
             (bucket, key, etag, size, content_type, mtime, checksums_json, extents_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(bucket, key) DO UPDATE SET
@@ -179,7 +179,7 @@ async fn write_object(
     .execute(&mut *conn)
     .await?;
     for m in user_meta {
-        sqlx::query("INSERT INTO object_metadata (bucket, key, name, value) VALUES (?, ?, ?, ?)")
+        sqlx::query("INSERT INTO s3_object_metadata (bucket, key, name, value) VALUES (?, ?, ?, ?)")
             .bind(bucket)
             .bind(key)
             .bind(&m.name)
@@ -199,7 +199,7 @@ async fn insert_tags(
 ) -> Result<()> {
     for t in tags {
         sqlx::query(
-            "INSERT INTO object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
+            "INSERT INTO s3_object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
         )
         .bind(bucket)
         .bind(key)
@@ -231,7 +231,7 @@ async fn put_object(conn: &mut SqliteConnection, c: pb::PutObject) -> Result<App
 
 async fn delete_object(conn: &mut SqliteConnection, bucket: &str, key: &str) -> Result<Applied> {
     let row: Option<(String,)> =
-        sqlx::query_as("SELECT extents_json FROM objects WHERE bucket = ? AND key = ?")
+        sqlx::query_as("SELECT extents_json FROM s3_objects WHERE bucket = ? AND key = ?")
             .bind(bucket)
             .bind(key)
             .fetch_optional(&mut *conn)
@@ -239,7 +239,7 @@ async fn delete_object(conn: &mut SqliteConnection, bucket: &str, key: &str) -> 
     let Some((json,)) = row else {
         return reject(Reason::NoSuchKey(true));
     };
-    sqlx::query("DELETE FROM objects WHERE bucket = ? AND key = ?")
+    sqlx::query("DELETE FROM s3_objects WHERE bucket = ? AND key = ?")
         .bind(bucket)
         .bind(key)
         .execute(&mut *conn)
@@ -253,7 +253,7 @@ async fn put_tags(
     key: &str,
     tags: &[pb::Pair],
 ) -> Result<Applied> {
-    sqlx::query("DELETE FROM object_tags WHERE bucket = ? AND key = ?")
+    sqlx::query("DELETE FROM s3_object_tags WHERE bucket = ? AND key = ?")
         .bind(bucket)
         .bind(key)
         .execute(&mut *conn)
@@ -278,7 +278,7 @@ fn pairs_from_json(json: &str) -> Vec<pb::Pair> {
 async fn create_upload(conn: &mut SqliteConnection, c: pb::CreateUpload) -> Result<Applied> {
     sqlx::query(
         r#"
-        INSERT INTO multipart_uploads
+        INSERT INTO s3_uploads
             (upload_id, bucket, key, content_type, user_meta_json, tagging_json,
              checksum_algorithm, initiated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -299,7 +299,7 @@ async fn create_upload(conn: &mut SqliteConnection, c: pb::CreateUpload) -> Resu
 
 async fn put_part(conn: &mut SqliteConnection, c: pb::PutPart) -> Result<Applied> {
     let old: Option<(String,)> = sqlx::query_as(
-        "SELECT extents_json FROM multipart_parts WHERE upload_id = ? AND part_number = ?",
+        "SELECT extents_json FROM s3_parts WHERE upload_id = ? AND part_number = ?",
     )
     .bind(&c.upload_id)
     .bind(c.part_number)
@@ -311,7 +311,7 @@ async fn put_part(conn: &mut SqliteConnection, c: pb::PutPart) -> Result<Applied
         .unwrap_or_default();
     sqlx::query(
         r#"
-        INSERT INTO multipart_parts (upload_id, part_number, etag, size, extents_json)
+        INSERT INTO s3_parts (upload_id, part_number, etag, size, extents_json)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(upload_id, part_number) DO UPDATE SET
             etag = excluded.etag,
@@ -333,7 +333,7 @@ async fn complete_upload(conn: &mut SqliteConnection, c: pb::CompleteUpload) -> 
     let upload: Option<(String, String, Option<String>, String, String)> = sqlx::query_as(
         r#"
         SELECT bucket, key, content_type, user_meta_json, tagging_json
-        FROM multipart_uploads WHERE upload_id = ?
+        FROM s3_uploads WHERE upload_id = ?
         "#,
     )
     .bind(&c.upload_id)
@@ -346,7 +346,7 @@ async fn complete_upload(conn: &mut SqliteConnection, c: pb::CompleteUpload) -> 
     let mut assembled: Vec<Extent> = Vec::new();
     for &pn in &c.part_numbers {
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM multipart_parts WHERE upload_id = ? AND part_number = ?",
+            "SELECT extents_json FROM s3_parts WHERE upload_id = ? AND part_number = ?",
         )
         .bind(&c.upload_id)
         .bind(pn)
@@ -374,7 +374,7 @@ async fn complete_upload(conn: &mut SqliteConnection, c: pb::CompleteUpload) -> 
     )
     .await?;
     // Part extents now belong to the object: drop the upload without releasing them.
-    sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?")
+    sqlx::query("DELETE FROM s3_uploads WHERE upload_id = ?")
         .bind(&c.upload_id)
         .execute(&mut *conn)
         .await?;
@@ -383,11 +383,11 @@ async fn complete_upload(conn: &mut SqliteConnection, c: pb::CompleteUpload) -> 
 
 async fn abort_upload(conn: &mut SqliteConnection, upload_id: &str) -> Result<Applied> {
     let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT extents_json FROM multipart_parts WHERE upload_id = ?")
+        sqlx::query_as("SELECT extents_json FROM s3_parts WHERE upload_id = ?")
             .bind(upload_id)
             .fetch_all(&mut *conn)
             .await?;
-    let res = sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?")
+    let res = sqlx::query("DELETE FROM s3_uploads WHERE upload_id = ?")
         .bind(upload_id)
         .execute(&mut *conn)
         .await?;

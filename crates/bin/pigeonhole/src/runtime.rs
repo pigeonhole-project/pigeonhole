@@ -12,20 +12,25 @@ use pigeonhole_chunk_store::{
     check_fingerprints, BlockCache, BlobDb,
     ChunkStore, Durability, IngestOptions, PinTarget, Superblock, WatermarkBackend,
 };
+use pigeonhole_meta::MetaStore;
 use std::sync::Arc;
 use tracing::warn;
 
 pub struct Runtime {
+    /// The one metadata store every layer registers its namespace on.
+    pub meta: Arc<MetaStore>,
     pub store: Arc<ChunkStore>,
     pub durability: Arc<Durability>,
     pub primary_fingerprint: String,
 }
 
 pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
-    let blob_url = sibling_db_url(&cfg.database_url, "blob");
-    let blob_db = BlobDb::connect(&blob_url)
+    let meta = MetaStore::open(&cfg.database_url)
         .await
-        .context("open blob.db")?;
+        .context("open metadata store")?;
+    let blob_db = BlobDb::open(meta.clone())
+        .await
+        .context("open chunk metadata")?;
 
     let stored = blob_db
         .list_instance_fingerprints()
@@ -49,6 +54,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     let durability = Arc::new(Durability::new_replicated(replicated, pins, genesis));
 
     Ok(Runtime {
+        meta,
         store,
         durability,
         primary_fingerprint,
@@ -185,24 +191,4 @@ fn with_optional_caches(layer: ChunkStore, cfg: &Config) -> ChunkStore {
     } else {
         layer
     }
-}
-
-/// SQLite URL of a database stored next to the S3 index: `x.db` → `x-{suffix}.db`.
-pub fn sibling_db_url(database_url: &str, suffix: &str) -> String {
-    if let Some(rest) = database_url.strip_prefix("sqlite:") {
-        let (path, query) = match rest.split_once('?') {
-            Some((p, q)) => (p, Some(q)),
-            None => (rest, None),
-        };
-        let path = if let Some(stem) = path.strip_suffix(".db") {
-            format!("{stem}-{suffix}.db")
-        } else {
-            format!("{path}-{suffix}.db")
-        };
-        return match query {
-            Some(q) => format!("sqlite:{path}?{q}"),
-            None => format!("sqlite:{path}?mode=rwc"),
-        };
-    }
-    format!("{database_url}-{suffix}")
 }

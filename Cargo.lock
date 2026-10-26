@@ -1874,6 +1874,7 @@ dependencies = [
  "pigeonhole-codec",
  "pigeonhole-gateway-bytestream",
  "pigeonhole-gateway-s3",
+ "pigeonhole-meta",
  "pigeonhole-storage-discord",
  "pigeonhole-storage-memory",
  "pigeonhole-storage-telegram",

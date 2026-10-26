@@ -46,7 +46,7 @@ pub(crate) const SCHEMA: &[&str] = &[
     )
     "#,
     r#"
-    CREATE TABLE IF NOT EXISTS meta (
+    CREATE TABLE IF NOT EXISTS cas_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )
@@ -162,7 +162,7 @@ impl CasIndex {
     }
 
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = ?")
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM cas_meta WHERE key = ?")
             .bind(key)
             .fetch_optional(&self.pool)
             .await?;
@@ -171,7 +171,7 @@ impl CasIndex {
 
     pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         sqlx::query(
-            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "INSERT INTO cas_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .bind(key)
         .bind(value)

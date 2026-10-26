@@ -182,7 +182,7 @@ pub struct CheckpointBlock {
 impl BlobDb {
     pub async fn export_checkpoint(&self) -> Result<CheckpointPayload> {
         let instances = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "SELECT id, kind, fingerprint, location, state FROM instances",
+            "SELECT id, kind, fingerprint, location, state FROM chunk_instances",
         )
         .fetch_all(self.pool())
         .await?
@@ -261,7 +261,7 @@ impl BlobDb {
         .collect();
 
         let root_rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT name, extents_json FROM roots")
+            sqlx::query_as("SELECT name, extents_json FROM chunk_roots")
                 .fetch_all(self.pool())
                 .await?;
         let mut roots = Vec::new();
@@ -295,11 +295,11 @@ impl BlobDb {
         for table in [
             "chunk_blocks",
             "chunk_parts",
-            "roots",
+            "chunk_roots",
             "chunks",
-            "put_watermarks",
-            "sweep_cursor",
-            "instances",
+            "chunk_put_watermarks",
+            "chunk_sweep_cursor",
+            "chunk_instances",
         ] {
             sqlx::query(&format!("DELETE FROM {table}"))
                 .execute(&mut *tx)
@@ -308,7 +308,7 @@ impl BlobDb {
         for i in &cp.instances {
             sqlx::query(
                 r#"
-                INSERT INTO instances (id, kind, fingerprint, location, state)
+                INSERT INTO chunk_instances (id, kind, fingerprint, location, state)
                 VALUES (?, ?, ?, ?, ?)
                 "#,
             )
@@ -374,7 +374,7 @@ impl BlobDb {
         }
         for (name, extents) in &cp.roots {
             let json = serde_json::to_string(extents)?;
-            sqlx::query("INSERT INTO roots (name, extents_json) VALUES (?, ?)")
+            sqlx::query("INSERT INTO chunk_roots (name, extents_json) VALUES (?, ?)")
                 .bind(name)
                 .bind(&json)
                 .execute(&mut *tx)
@@ -758,7 +758,7 @@ impl BlobDb {
         let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunks")
             .fetch_one(self.pool())
             .await?;
-        let (r,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM roots")
+        let (r,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunk_roots")
             .fetch_one(self.pool())
             .await?;
         Ok(n == 0 && r == 0)

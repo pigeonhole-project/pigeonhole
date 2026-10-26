@@ -21,11 +21,10 @@ use tracing::warn;
 pub async fn cmd_serve() -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     info!(path = %cfg.config_path.display(), "loaded config");
-    let index = Index::connect(&cfg.database_url)
+    let rt = open_runtime(&cfg).await.context("open runtime")?;
+    let index = Index::open(rt.meta.clone())
         .await
         .context("open s3 index")?;
-
-    let rt = open_runtime(&cfg).await.context("open runtime")?;
     start_or_restore(
         rt.store.db(),
         rt.durability.as_ref(),
@@ -50,8 +49,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
             gc_ttl_secs: cfg.bytestream.gc_ttl_secs,
             ..Default::default()
         };
-        let cas_url = crate::runtime::sibling_db_url(&cfg.database_url, "cas");
-        let cas = CasIndex::connect(&cas_url)
+        let cas = CasIndex::open(rt.meta.clone())
             .await
             .context("open cas index")?;
         let bs_store = rt.store.clone();

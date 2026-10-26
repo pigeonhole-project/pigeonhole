@@ -80,7 +80,7 @@ pub struct StoredBlock {
 /// Current schema. No upgrades: an incompatible file is recreated by hand.
 pub(crate) const SCHEMA: &[&str] = &[
     r#"
-    CREATE TABLE IF NOT EXISTS instances (
+    CREATE TABLE IF NOT EXISTS chunk_instances (
         id TEXT PRIMARY KEY NOT NULL,
         kind TEXT NOT NULL,
         fingerprint TEXT NOT NULL,
@@ -89,8 +89,8 @@ pub(crate) const SCHEMA: &[&str] = &[
     )
     "#,
     r#"
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_instances_location_active
-    ON instances(location)
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_instances_location_active
+    ON chunk_instances(location)
     WHERE state = 'read-write'
     "#,
     r#"
@@ -127,7 +127,7 @@ pub(crate) const SCHEMA: &[&str] = &[
     r#"
     CREATE TABLE IF NOT EXISTS chunk_parts (
         chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-        instance_id TEXT NOT NULL REFERENCES instances(id),
+        instance_id TEXT NOT NULL REFERENCES chunk_instances(id),
         part_no INTEGER NOT NULL,
         first_block INTEGER NOT NULL,
         block_count INTEGER NOT NULL,
@@ -138,26 +138,26 @@ pub(crate) const SCHEMA: &[&str] = &[
     )
     "#,
     r#"
-    CREATE TABLE IF NOT EXISTS roots (
+    CREATE TABLE IF NOT EXISTS chunk_roots (
         name TEXT PRIMARY KEY NOT NULL,
         extents_json TEXT NOT NULL DEFAULT '[]'
     )
     "#,
     r#"
-    CREATE TABLE IF NOT EXISTS put_watermarks (
+    CREATE TABLE IF NOT EXISTS chunk_put_watermarks (
         instance_id TEXT NOT NULL,
         at TEXT NOT NULL,
         max_key BLOB NOT NULL
     )
     "#,
     r#"
-    CREATE TABLE IF NOT EXISTS sweep_cursor (
+    CREATE TABLE IF NOT EXISTS chunk_sweep_cursor (
         instance_id TEXT PRIMARY KEY NOT NULL,
         after BLOB
     )
     "#,
     r#"
-    CREATE TABLE IF NOT EXISTS repair_queue (
+    CREATE TABLE IF NOT EXISTS chunk_repair_queue (
         chunk_id INTEGER NOT NULL REFERENCES chunks(id),
         instance_id TEXT NOT NULL,
         enqueued_at TEXT NOT NULL,
@@ -239,7 +239,7 @@ impl BlobDb {
     }
 
     pub async fn list_instance_fingerprints(&self) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query("SELECT id, fingerprint FROM instances")
+        let rows = sqlx::query("SELECT id, fingerprint FROM chunk_instances")
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
@@ -285,7 +285,7 @@ impl BlobDb {
 
     pub async fn get_root(&self, name: &str) -> Result<Option<Vec<Extent>>> {
         let row: Option<(String,)> =
-            sqlx::query_as("SELECT extents_json FROM roots WHERE name = ?")
+            sqlx::query_as("SELECT extents_json FROM chunk_roots WHERE name = ?")
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -302,7 +302,7 @@ impl BlobDb {
     /// All named roots (for purge / release-all).
     pub async fn list_roots(&self) -> Result<Vec<(String, Vec<Extent>)>> {
         let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT name, extents_json FROM roots ORDER BY name")
+            sqlx::query_as("SELECT name, extents_json FROM chunk_roots ORDER BY name")
                 .fetch_all(&self.pool)
                 .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -461,7 +461,7 @@ impl BlobDb {
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO put_watermarks (instance_id, at, max_key)
+            INSERT INTO chunk_put_watermarks (instance_id, at, max_key)
             VALUES (?, ?, ?)
             "#,
         )
@@ -482,7 +482,7 @@ impl BlobDb {
         let cutoff = Utc::now() - chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::zero());
         let row: Option<(Vec<u8>,)> = sqlx::query_as(
             r#"
-            SELECT max_key FROM put_watermarks
+            SELECT max_key FROM chunk_put_watermarks
             WHERE instance_id = ? AND at <= ?
             ORDER BY max_key DESC
             LIMIT 1
@@ -497,7 +497,7 @@ impl BlobDb {
 
     pub async fn get_sweep_cursor(&self, instance_id: &str) -> Result<Option<Vec<u8>>> {
         let row: Option<(Option<Vec<u8>>,)> =
-            sqlx::query_as("SELECT after FROM sweep_cursor WHERE instance_id = ?")
+            sqlx::query_as("SELECT after FROM chunk_sweep_cursor WHERE instance_id = ?")
                 .bind(instance_id)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -511,7 +511,7 @@ impl BlobDb {
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO sweep_cursor (instance_id, after) VALUES (?, ?)
+            INSERT INTO chunk_sweep_cursor (instance_id, after) VALUES (?, ?)
             ON CONFLICT(instance_id) DO UPDATE SET after = excluded.after
             "#,
         )
@@ -612,7 +612,7 @@ impl BlobDb {
         let at = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
-            INSERT INTO repair_queue (chunk_id, instance_id, enqueued_at)
+            INSERT INTO chunk_repair_queue (chunk_id, instance_id, enqueued_at)
             VALUES (?, ?, ?)
             ON CONFLICT(chunk_id, instance_id) DO NOTHING
             "#,
@@ -627,7 +627,7 @@ impl BlobDb {
 
     /// Remove a completed / cancelled repair job.
     pub async fn dequeue_repair(&self, chunk_id: ChunkId, instance_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM repair_queue WHERE chunk_id = ? AND instance_id = ?")
+        sqlx::query("DELETE FROM chunk_repair_queue WHERE chunk_id = ? AND instance_id = ?")
             .bind(chunk_id)
             .bind(instance_id)
             .execute(&self.pool)
@@ -641,7 +641,7 @@ impl BlobDb {
         let rows: Vec<(i64, String)> = sqlx::query_as(
             r#"
             SELECT q.chunk_id, q.instance_id
-            FROM repair_queue q
+            FROM chunk_repair_queue q
             LEFT JOIN (
                 SELECT chunk_id, COUNT(DISTINCT instance_id) AS n
                 FROM chunk_parts
@@ -692,7 +692,7 @@ impl BlobDb {
 
     /// Pending repair queue depth (tests / metrics).
     pub async fn repair_queue_len(&self) -> Result<u64> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM repair_queue")
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunk_repair_queue")
             .fetch_one(&self.pool)
             .await?;
         Ok(row.0.max(0) as u64)
@@ -775,7 +775,7 @@ mod tests {
         };
         db.sync_instances(&[a.clone()]).await.unwrap();
         db.sync_instances(&[]).await.unwrap();
-        let state: (String,) = sqlx::query_as("SELECT state FROM instances WHERE id = 'a'")
+        let state: (String,) = sqlx::query_as("SELECT state FROM chunk_instances WHERE id = 'a'")
             .fetch_one(db.pool())
             .await
             .unwrap();

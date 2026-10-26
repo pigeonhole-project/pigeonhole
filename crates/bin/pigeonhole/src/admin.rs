@@ -26,13 +26,10 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
             bail!("--expect-chat mismatch: config scope_id={scope} got {expected}");
         }
     }
-    let index = Index::connect(&cfg.database_url)
-        .await
-        .context("open index")?;
+    let rt = open_runtime(&cfg).await.context("open runtime")?;
+    let index = Index::open(rt.meta.clone()).await.context("open index")?;
     let objects = index.count_objects().await.unwrap_or(0);
     let buckets = index.count_buckets().await.unwrap_or(0);
-
-    let rt = open_runtime(&cfg).await.context("open runtime")?;
     let roots = rt.store.db().list_roots().await.context("list roots")?;
     info!(
         scope_id = %scope,
@@ -96,9 +93,8 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
 /// Restore blob.db (+ gateway index) from superblock pins.
 pub async fn cmd_restore(force: bool) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
-    let index = Index::connect(&cfg.database_url)
-        .await
-        .context("open index")?;
+    let rt = open_runtime(&cfg).await.context("open runtime")?;
+    let index = Index::open(rt.meta.clone()).await.context("open index")?;
     if index.has_data().await.context("check index")? && !force {
         bail!(
             "index is not empty (buckets={}, objects={}); pass --force to overwrite",
@@ -107,7 +103,6 @@ pub async fn cmd_restore(force: bool) -> anyhow::Result<()> {
         );
     }
 
-    let rt = open_runtime(&cfg).await.context("open runtime")?;
     start_or_restore(
         rt.store.db(),
         rt.durability.as_ref(),

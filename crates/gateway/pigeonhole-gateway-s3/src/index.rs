@@ -120,14 +120,14 @@ pub enum DeleteBucketResult {
 /// Current schema of the `s3` namespace. No upgrades.
 pub(crate) const SCHEMA: &[&str] = &[
     r#"
-            CREATE TABLE IF NOT EXISTS buckets (
+            CREATE TABLE IF NOT EXISTS s3_buckets (
                 name TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
                 scope_id TEXT NOT NULL DEFAULT ''
             )
     "#,
     r#"
-            CREATE TABLE IF NOT EXISTS objects (
+            CREATE TABLE IF NOT EXISTS s3_objects (
                 bucket TEXT NOT NULL,
                 key TEXT NOT NULL,
                 etag TEXT NOT NULL,
@@ -137,31 +137,31 @@ pub(crate) const SCHEMA: &[&str] = &[
                 checksums_json TEXT NOT NULL DEFAULT '{}',
                 extents_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (bucket, key),
-                FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
+                FOREIGN KEY (bucket) REFERENCES s3_buckets(name) ON DELETE CASCADE
             )
     "#,
     r#"
-            CREATE TABLE IF NOT EXISTS object_metadata (
+            CREATE TABLE IF NOT EXISTS s3_object_metadata (
                 bucket TEXT NOT NULL,
                 key TEXT NOT NULL,
                 name TEXT NOT NULL,
                 value TEXT NOT NULL,
                 PRIMARY KEY (bucket, key, name),
-                FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
+                FOREIGN KEY (bucket, key) REFERENCES s3_objects(bucket, key) ON DELETE CASCADE
             )
     "#,
     r#"
-            CREATE TABLE IF NOT EXISTS object_tags (
+            CREATE TABLE IF NOT EXISTS s3_object_tags (
                 bucket TEXT NOT NULL,
                 key TEXT NOT NULL,
                 tag_key TEXT NOT NULL,
                 tag_value TEXT NOT NULL,
                 PRIMARY KEY (bucket, key, tag_key),
-                FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
+                FOREIGN KEY (bucket, key) REFERENCES s3_objects(bucket, key) ON DELETE CASCADE
             )
     "#,
     r#"
-            CREATE TABLE IF NOT EXISTS multipart_uploads (
+            CREATE TABLE IF NOT EXISTS s3_uploads (
                 upload_id TEXT PRIMARY KEY,
                 bucket TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -170,22 +170,22 @@ pub(crate) const SCHEMA: &[&str] = &[
                 tagging_json TEXT NOT NULL DEFAULT '[]',
                 checksum_algorithm TEXT,
                 initiated_at TEXT NOT NULL,
-                FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
+                FOREIGN KEY (bucket) REFERENCES s3_buckets(name) ON DELETE CASCADE
             )
     "#,
     r#"
-            CREATE TABLE IF NOT EXISTS multipart_parts (
+            CREATE TABLE IF NOT EXISTS s3_parts (
                 upload_id TEXT NOT NULL,
                 part_number INTEGER NOT NULL,
                 etag TEXT NOT NULL,
                 size INTEGER NOT NULL,
                 extents_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (upload_id, part_number),
-                FOREIGN KEY (upload_id) REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE
+                FOREIGN KEY (upload_id) REFERENCES s3_uploads(upload_id) ON DELETE CASCADE
             )
     "#,
     r#"
-            CREATE TABLE IF NOT EXISTS meta (
+            CREATE TABLE IF NOT EXISTS s3_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
@@ -248,7 +248,7 @@ impl Index {
 
     pub async fn bucket_scope_id(&self, name: &str) -> Result<Option<String>> {
         let row: Option<(String,)> =
-            sqlx::query_as("SELECT scope_id FROM buckets WHERE name = ?")
+            sqlx::query_as("SELECT scope_id FROM s3_buckets WHERE name = ?")
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -268,7 +268,7 @@ impl Index {
 
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>> {
         let rows = sqlx::query_as::<_, Bucket>(
-            "SELECT name, created_at, scope_id FROM buckets ORDER BY name",
+            "SELECT name, created_at, scope_id FROM s3_buckets ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -276,7 +276,7 @@ impl Index {
     }
 
     pub async fn bucket_exists(&self, name: &str) -> Result<bool> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT name FROM buckets WHERE name = ?")
+        let row: Option<(String,)> = sqlx::query_as("SELECT name FROM s3_buckets WHERE name = ?")
             .bind(name)
             .fetch_optional(&self.pool)
             .await?;
@@ -312,7 +312,7 @@ impl Index {
 
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         let row = sqlx::query_as::<_, ObjectMeta>(
-            "SELECT bucket, key, etag, size, content_type, mtime FROM objects WHERE bucket = ? AND key = ?",
+            "SELECT bucket, key, etag, size, content_type, mtime FROM s3_objects WHERE bucket = ? AND key = ?",
         )
         .bind(bucket)
         .bind(key)
@@ -323,7 +323,7 @@ impl Index {
 
     pub async fn get_extents(&self, bucket: &str, key: &str) -> Result<Option<Vec<Extent>>> {
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM objects WHERE bucket = ? AND key = ?",
+            "SELECT extents_json FROM s3_objects WHERE bucket = ? AND key = ?",
         )
         .bind(bucket)
         .bind(key)
@@ -341,7 +341,7 @@ impl Index {
         key: &str,
     ) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT checksums_json FROM objects WHERE bucket = ? AND key = ?",
+            "SELECT checksums_json FROM s3_objects WHERE bucket = ? AND key = ?",
         )
         .bind(bucket)
         .bind(key)
@@ -356,7 +356,7 @@ impl Index {
         key: &str,
     ) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT name, value FROM object_metadata WHERE bucket = ? AND key = ? ORDER BY name",
+            "SELECT name, value FROM s3_object_metadata WHERE bucket = ? AND key = ? ORDER BY name",
         )
         .bind(bucket)
         .bind(key)
@@ -371,7 +371,7 @@ impl Index {
         key: &str,
     ) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT tag_key, tag_value FROM object_tags WHERE bucket = ? AND key = ? ORDER BY tag_key",
+            "SELECT tag_key, tag_value FROM s3_object_tags WHERE bucket = ? AND key = ? ORDER BY tag_key",
         )
         .bind(bucket)
         .bind(key)
@@ -425,7 +425,7 @@ impl Index {
             sqlx::query_as(
                 r#"
                 SELECT bucket, key, size, content_type, etag, extents_json, checksums_json
-                FROM objects WHERE bucket = ? AND key = ?
+                FROM s3_objects WHERE bucket = ? AND key = ?
                 "#,
             )
             .bind(bucket)
@@ -437,7 +437,7 @@ impl Index {
             return Ok(None);
         };
         let user_meta = sqlx::query_as::<_, (String, String)>(
-            "SELECT name, value FROM object_metadata WHERE bucket = ? AND key = ? ORDER BY name",
+            "SELECT name, value FROM s3_object_metadata WHERE bucket = ? AND key = ? ORDER BY name",
         )
         .bind(&bucket)
         .bind(&key)
@@ -520,7 +520,7 @@ impl Index {
                 let mut q = String::from(
                     r#"
                     SELECT bucket, key, etag, size, content_type, mtime
-                    FROM objects
+                    FROM s3_objects
                     WHERE bucket = ?
                     "#,
                 );
@@ -613,7 +613,7 @@ impl Index {
         let mut q = String::from(
             r#"
             SELECT bucket, key, etag, size, content_type, mtime
-            FROM objects
+            FROM s3_objects
             WHERE bucket = ?
             "#,
         );
@@ -653,7 +653,7 @@ impl Index {
     }
 
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = ?")
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM s3_meta WHERE key = ?")
             .bind(key)
             .fetch_optional(&self.pool)
             .await?;
@@ -662,7 +662,7 @@ impl Index {
 
     pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         sqlx::query(
-            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "INSERT INTO s3_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .bind(key)
         .bind(value)
@@ -672,14 +672,14 @@ impl Index {
     }
 
     pub async fn count_objects(&self) -> Result<i64> {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM objects")
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM s3_objects")
             .fetch_one(&self.pool)
             .await?;
         Ok(n)
     }
 
     pub async fn count_buckets(&self) -> Result<i64> {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM buckets")
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM s3_buckets")
             .fetch_one(&self.pool)
             .await?;
         Ok(n)
@@ -690,16 +690,16 @@ impl Index {
     }
 
     pub async fn wipe_all(&self) -> Result<()> {
-        sqlx::query("DELETE FROM multipart_uploads")
+        sqlx::query("DELETE FROM s3_uploads")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM objects")
+        sqlx::query("DELETE FROM s3_objects")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM buckets")
+        sqlx::query("DELETE FROM s3_buckets")
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM meta").execute(&self.pool).await?;
+        sqlx::query("DELETE FROM s3_meta").execute(&self.pool).await?;
         Ok(())
     }
 
@@ -708,18 +708,18 @@ impl Index {
         let objects = sqlx::query_as::<_, ObjectRow>(
             r#"
             SELECT bucket, key, etag, size, content_type, mtime, checksums_json, extents_json
-            FROM objects ORDER BY bucket, key
+            FROM s3_objects ORDER BY bucket, key
             "#,
         )
         .fetch_all(&self.pool)
         .await?;
         let metadata = sqlx::query_as::<_, UserMeta>(
-            "SELECT bucket, key, name, value FROM object_metadata ORDER BY bucket, key, name",
+            "SELECT bucket, key, name, value FROM s3_object_metadata ORDER BY bucket, key, name",
         )
         .fetch_all(&self.pool)
         .await?;
         let tags = sqlx::query_as::<_, ObjectTagRow>(
-            "SELECT bucket, key, tag_key, tag_value FROM object_tags ORDER BY bucket, key, tag_key",
+            "SELECT bucket, key, tag_key, tag_value FROM s3_object_tags ORDER BY bucket, key, tag_key",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -733,19 +733,19 @@ impl Index {
 
     pub async fn import_snapshot(&self, snap: &IndexSnapshot) -> Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM multipart_uploads")
+        sqlx::query("DELETE FROM s3_uploads")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM objects")
+        sqlx::query("DELETE FROM s3_objects")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM buckets")
+        sqlx::query("DELETE FROM s3_buckets")
             .execute(&mut *tx)
             .await?;
 
         for b in &snap.buckets {
             sqlx::query(
-                "INSERT INTO buckets (name, created_at, scope_id) VALUES (?, ?, ?)",
+                "INSERT INTO s3_buckets (name, created_at, scope_id) VALUES (?, ?, ?)",
             )
             .bind(&b.name)
             .bind(&b.created_at)
@@ -756,7 +756,7 @@ impl Index {
         for o in &snap.objects {
             sqlx::query(
                 r#"
-                INSERT INTO objects
+                INSERT INTO s3_objects
                     (bucket, key, etag, size, content_type, mtime, checksums_json, extents_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
@@ -774,7 +774,7 @@ impl Index {
         }
         for m in &snap.metadata {
             sqlx::query(
-                "INSERT INTO object_metadata (bucket, key, name, value) VALUES (?, ?, ?, ?)",
+                "INSERT INTO s3_object_metadata (bucket, key, name, value) VALUES (?, ?, ?, ?)",
             )
             .bind(&m.bucket)
             .bind(&m.key)
@@ -785,7 +785,7 @@ impl Index {
         }
         for t in &snap.tags {
             sqlx::query(
-                "INSERT INTO object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
+                "INSERT INTO s3_object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
             )
             .bind(&t.bucket)
             .bind(&t.key)
@@ -828,7 +828,7 @@ impl Index {
             r#"
             SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json,
                    checksum_algorithm, initiated_at
-            FROM multipart_uploads WHERE upload_id = ?
+            FROM s3_uploads WHERE upload_id = ?
             "#,
         )
         .bind(upload_id)
@@ -862,7 +862,7 @@ impl Index {
         part_number: i64,
     ) -> Result<Option<MultipartPart>> {
         let row = sqlx::query_as::<_, MultipartPart>(
-            "SELECT upload_id, part_number, etag, size FROM multipart_parts WHERE upload_id = ? AND part_number = ?",
+            "SELECT upload_id, part_number, etag, size FROM s3_parts WHERE upload_id = ? AND part_number = ?",
         )
         .bind(upload_id)
         .bind(part_number)
@@ -877,7 +877,7 @@ impl Index {
         part_number: i64,
     ) -> Result<Option<Vec<Extent>>> {
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM multipart_parts WHERE upload_id = ? AND part_number = ?",
+            "SELECT extents_json FROM s3_parts WHERE upload_id = ? AND part_number = ?",
         )
         .bind(upload_id)
         .bind(part_number)
@@ -936,7 +936,7 @@ impl Index {
             r#"
             SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json,
                    checksum_algorithm, initiated_at
-            FROM multipart_uploads
+            FROM s3_uploads
             WHERE bucket = ?
             "#,
         );
@@ -989,7 +989,7 @@ impl Index {
         let mut rows = sqlx::query_as::<_, MultipartPart>(
             r#"
             SELECT upload_id, part_number, etag, size
-            FROM multipart_parts
+            FROM s3_parts
             WHERE upload_id = ? AND part_number > ?
             ORDER BY part_number
             LIMIT ?
