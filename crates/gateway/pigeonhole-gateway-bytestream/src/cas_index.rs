@@ -161,7 +161,7 @@ impl CasIndex {
     }
 
     /// Store a new CAS entry. If the digest already exists, returns existing extents
-    /// so the caller can `release` the newly ingested chunks and `retain` existing ones.
+    /// so the caller can `release` the newly ingested chunks (the existing row keeps its ref).
     pub async fn store_or_get_existing(
         &self,
         entry: &CasEntry,

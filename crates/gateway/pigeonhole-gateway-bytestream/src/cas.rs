@@ -93,26 +93,37 @@ impl CasStore {
         Ok(Some(Box::pin(ReceiverStream::new(rx))))
     }
 
+    /// True when a CAS row for `(hash, size)` exists and its chunks are live (row is
+    /// touched). A row pointing at reclaimed chunks is dropped so the caller re-ingests.
+    ///
+    /// The row owns exactly one ref, released by GC; a repeat write must not add
+    /// another. `retain` succeeds only for live chunks, so retain + release is a
+    /// liveness check that leaves the refcount unchanged.
+    async fn existing_is_live(&self, hash_hex: &str, size: i64) -> Result<bool> {
+        let Some(entry) = self.cas.get(hash_hex, size).await? else {
+            return Ok(false);
+        };
+        let mut ids: Vec<_> = entry.extents.iter().map(|e| e.chunk).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        match self.store.retain(&ids).await {
+            Ok(()) => {
+                self.store.release(&ids).await?;
+                let _ = self.cas.touch(hash_hex, size).await;
+                Ok(true)
+            }
+            Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) => {
+                let _ = self.cas.release(hash_hex, size).await;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn put_bytes(&self, hash_hex: &str, size: i64, data: Bytes) -> Result<()> {
         verify_sha256(&data, hash_hex, size)?;
-        if let Some(entry) = self.cas.get(hash_hex, size).await? {
-            let ids: Vec<_> = {
-                let mut ids: Vec<_> = entry.extents.iter().map(|e| e.chunk).collect();
-                ids.sort_unstable();
-                ids.dedup();
-                ids
-            };
-            match self.store.retain(&ids).await {
-                Ok(()) => {
-                    let _ = self.cas.touch(hash_hex, size).await;
-                    return Ok(());
-                }
-                Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) => {
-                    // Index pointed at a reclaiming/gone chunk — drop stale row and re-ingest.
-                    let _ = self.cas.release(hash_hex, size).await;
-                }
-                Err(e) => return Err(e),
-            }
+        if self.existing_is_live(hash_hex, size).await? {
+            return Ok(());
         }
         let stream = futures::stream::iter(std::iter::once(Ok::<_, anyhow::Error>(data)));
         self.put_stream(hash_hex, size, stream).await
@@ -120,31 +131,15 @@ impl CasStore {
 
     /// Ingest a body stream into chunked CAS storage (SHA-256 already verified by caller).
     ///
-    /// Repeat Write of the same `(hash, size)` → `retain` without uploading again.
+    /// Repeat Write of the same `(hash, size)` is a no-op when the stored entry is live.
     pub async fn put_stream<S>(&self, hash_hex: &str, size: i64, stream: S) -> Result<()>
     where
         S: futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin + Send,
     {
-        if let Some(existing) = self.cas.get(hash_hex, size).await? {
-            let ids: Vec<_> = {
-                let mut ids: Vec<_> = existing.extents.iter().map(|e| e.chunk).collect();
-                ids.sort_unstable();
-                ids.dedup();
-                ids
-            };
-            match self.store.retain(&ids).await {
-                Ok(()) => {
-                    let mut stream = stream;
-                    while stream.next().await.is_some() {}
-                    let _ = self.cas.touch(hash_hex, size).await;
-                    return Ok(());
-                }
-                Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) => {
-                    let _ = self.cas.release(hash_hex, size).await;
-                    // Fall through: consume is deferred — re-ingest from the same stream.
-                }
-                Err(e) => return Err(e),
-            }
+        if self.existing_is_live(hash_hex, size).await? {
+            let mut stream = stream;
+            while stream.next().await.is_some() {}
+            return Ok(());
         }
 
         let mut opts = IngestOptions::new(self.chunk_size, ChunkCodec::Zstd);
@@ -154,14 +149,14 @@ impl CasStore {
             .ingest(stream, Some(opts))
             .await
             .context("CAS ingest")?;
+        let new_ids: Vec<_> = {
+            let mut ids: Vec<_> = ingested.extents.iter().map(|e| e.chunk).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
         if ingested.size != size {
-            let ids: Vec<_> = {
-                let mut ids: Vec<_> = ingested.extents.iter().map(|e| e.chunk).collect();
-                ids.sort_unstable();
-                ids.dedup();
-                ids
-            };
-            let _ = self.store.release(&ids).await;
+            let _ = self.store.release(&new_ids).await;
             anyhow::bail!(
                 "CAS ingest size {} != digest size {size}",
                 ingested.size
@@ -173,25 +168,18 @@ impl CasStore {
             size,
             extents: ingested.extents.clone(),
         };
-        match self.cas.store_or_get_existing(&entry).await? {
-            None => Ok(()),
-            Some(existing_extents) => {
-                // Race: another writer won. Keep their extents; drop ours; retain winner.
-                let new_ids: Vec<_> = {
-                    let mut ids: Vec<_> = ingested.extents.iter().map(|e| e.chunk).collect();
-                    ids.sort_unstable();
-                    ids.dedup();
-                    ids
-                };
+        match self.cas.store_or_get_existing(&entry).await {
+            Ok(None) => Ok(()),
+            // Another writer already stored this digest. Its row holds the one ref
+            // that `CasIndex::release` drops on GC; drop ours and leave theirs as is
+            // (an extra retain here would never be released).
+            Ok(Some(_existing)) => {
                 let _ = self.store.release(&new_ids).await;
-                let keep: Vec<_> = {
-                    let mut ids: Vec<_> = existing_extents.iter().map(|e| e.chunk).collect();
-                    ids.sort_unstable();
-                    ids.dedup();
-                    ids
-                };
-                self.store.retain(&keep).await?;
                 Ok(())
+            }
+            Err(e) => {
+                let _ = self.store.release(&new_ids).await;
+                Err(e)
             }
         }
     }
@@ -230,7 +218,7 @@ mod tests {
         let got = cas.get_bytes(&hash, size).await.unwrap().unwrap();
         assert_eq!(got, payload);
 
-        // Duplicate write retains without creating a second logical object.
+        // Duplicate write is a no-op: one logical object, one ref (released by GC).
         cas.put_bytes(&hash, size, payload.clone()).await.unwrap();
         let entry = cas.cas.get(&hash, size).await.unwrap().unwrap();
         assert!(!entry.extents.is_empty());
@@ -241,6 +229,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(meta.2 >= 2, "refs should be >= 2 after retain, got {}", meta.2);
+        assert_eq!(meta.2, 1, "duplicate write must not add a ref");
     }
 }
