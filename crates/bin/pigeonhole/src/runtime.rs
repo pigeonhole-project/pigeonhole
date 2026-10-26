@@ -1,0 +1,225 @@
+//! Binary-only: open blob.db, build the placement group, and wire `ChunkStore` + `Durability`.
+
+use anyhow::{bail, Context};
+use pigeonhole::config::Config;
+use pigeonhole::memory::MemoryBlobStore;
+use pigeonhole::telegram::{TelegramBlobStore, TelegramClient};
+use pigeonhole_blob::{
+    erase_sweep, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
+    TypedBootstrapPointer,
+};
+use pigeonhole_chunk_store::{
+    check_fingerprints, legacy_index_has_blobs, migrate_index_to_blob_db, BlockCache, BlobDb,
+    ChunkStore, Durability, IngestOptions, PinTarget, Superblock, WatermarkBackend,
+};
+use std::sync::Arc;
+use tracing::{info, warn};
+
+pub struct Runtime {
+    pub store: Arc<ChunkStore>,
+    pub durability: Arc<Durability>,
+    pub primary_fingerprint: String,
+}
+
+pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
+    let blob_url = sibling_db_url(&cfg.database_url, "blob");
+    let blob_db = BlobDb::connect(&blob_url)
+        .await
+        .context("open blob.db")?;
+
+    let stored = blob_db
+        .list_instance_fingerprints()
+        .await
+        .context("list instance fingerprints")?;
+    check_fingerprints(&cfg.instances, &stored).context("fingerprint check")?;
+
+    if blob_db.is_empty_metadata().await? {
+        if legacy_index_has_blobs(&cfg.database_url)
+            .await
+            .context("probe legacy index")?
+        {
+            let primary = cfg.primary_instance()?;
+            info!("legacy index has blobs; migrating into blob.db");
+            let report =
+                migrate_index_to_blob_db(&cfg.database_url, &blob_db, primary, false).await?;
+            info!(
+                blobs = report.blobs,
+                roots = report.roots,
+                "legacy index migrated"
+            );
+        }
+    }
+
+    let (replicated, pins, primary_fingerprint, primary_id) =
+        build_placement(cfg, &blob_db).await.context("build placement group")?;
+
+    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
+    opts.block_size = cfg.block_size;
+    opts.memory_budget = cfg.ingest_budget.clone();
+
+    let layer = ChunkStore::open_replicated(blob_db, replicated.clone(), opts)
+        .await
+        .context("open ChunkStore")?;
+    let store = Arc::new(with_optional_caches(layer, cfg));
+
+    let genesis = Superblock::new(0, primary_id, primary_fingerprint.clone());
+    let durability = Arc::new(Durability::new_replicated(replicated, pins, genesis));
+
+    Ok(Runtime {
+        store,
+        durability,
+        primary_fingerprint,
+    })
+}
+
+async fn build_placement(
+    cfg: &Config,
+    blob_db: &BlobDb,
+) -> anyhow::Result<(Arc<Replicated>, Vec<PinTarget>, String, String)> {
+    let limiter = cfg.chat_limiter();
+    let mut members: Vec<SharedBackend> = Vec::new();
+    let mut pins: Vec<PinTarget> = Vec::new();
+    let grace = cfg.sweep.grace;
+
+    for id in &cfg.placement.group {
+        let inst = cfg
+            .instances
+            .iter()
+            .find(|i| i.info.id == *id)
+            .with_context(|| format!("placement member {id:?} missing from instances"))?;
+
+        match inst.info.kind {
+            InstanceKind::Memory => {
+                warn!("memory instance {id}: in-process MemoryBlobStore (no durable pin across processes)");
+                let mem = Arc::new(
+                    MemoryBlobStore::new().with_instance_info(inst.info.clone()),
+                );
+                let pin: Arc<dyn TypedBootstrapPointer> = mem.clone();
+                let backend = MetricsBackend::wrap(WatermarkBackend::wrap(
+                    Arc::new(erase_sweep(mem)),
+                    blob_db.clone(),
+                    grace,
+                ));
+                pins.push(PinTarget {
+                    instance_id: inst.info.id.clone(),
+                    fingerprint: inst.info.fingerprint.clone(),
+                    pin,
+                    backend: backend.clone(),
+                });
+                members.push(backend);
+            }
+            InstanceKind::Telegram => {
+                let tg = TelegramClient::new(inst.bot_token.clone()).context("telegram client")?;
+                tg.ensure_chat_admin(&inst.scope_id)
+                    .await
+                    .context("chat_id access check")?;
+                let store = Arc::new(TelegramBlobStore::with_instance(
+                    tg,
+                    inst.scope_id.clone(),
+                    limiter.clone(),
+                    inst.info.clone(),
+                ));
+                let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
+                let backend = MetricsBackend::wrap(WatermarkBackend::wrap(
+                    Arc::new(erase_sweep(store)),
+                    blob_db.clone(),
+                    grace,
+                ));
+                pins.push(PinTarget {
+                    instance_id: inst.info.id.clone(),
+                    fingerprint: inst.info.fingerprint.clone(),
+                    pin,
+                    backend: backend.clone(),
+                });
+                members.push(backend);
+            }
+            InstanceKind::Discord => {
+                #[cfg(feature = "discord")]
+                {
+                    use pigeonhole_storage_discord::{DiscordBlobStore, DiscordClient};
+                    let dc = DiscordClient::new(inst.bot_token.clone()).context("discord client")?;
+                    dc.ensure_channel_permissions(&inst.scope_id, Some(limiter.as_ref()))
+                        .await
+                        .context("channel_id permission check")?;
+                    let store = Arc::new(DiscordBlobStore::with_instance(
+                        dc,
+                        inst.scope_id.clone(),
+                        limiter.clone(),
+                        cfg.discord_max_blob_size,
+                        inst.info.clone(),
+                    ));
+                    let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
+                    let backend = MetricsBackend::wrap(WatermarkBackend::wrap(
+                        Arc::new(erase_sweep(store)),
+                        blob_db.clone(),
+                        grace,
+                    ));
+                    pins.push(PinTarget {
+                        instance_id: inst.info.id.clone(),
+                        fingerprint: inst.info.fingerprint.clone(),
+                        pin,
+                        backend: backend.clone(),
+                    });
+                    members.push(backend);
+                }
+                #[cfg(not(feature = "discord"))]
+                {
+                    bail!(
+                        "instance {id:?} is discord but this binary was built without `--features discord`"
+                    );
+                }
+            }
+        }
+    }
+
+    if members.is_empty() {
+        bail!("placement.group produced no backends");
+    }
+    let replicated = Arc::new(
+        Replicated::new(
+            members,
+            cfg.placement.write_quorum,
+            Arc::new(CheapestFirst::new()),
+        )
+        .context("Replicated::new")?,
+    );
+    let primary = cfg.primary_instance()?;
+    Ok((
+        replicated,
+        pins,
+        primary.info.fingerprint.clone(),
+        primary.info.id.clone(),
+    ))
+}
+
+fn with_optional_caches(layer: ChunkStore, cfg: &Config) -> ChunkStore {
+    if cfg.cache.enabled {
+        let l1 = Arc::new(BlockCache::new(
+            cfg.cache.block_memory_bytes,
+            cfg.cache.readahead_blocks,
+        ));
+        layer.with_caches(Some(l1), None)
+    } else {
+        layer
+    }
+}
+
+/// SQLite URL of a database stored next to the S3 index: `x.db` → `x-{suffix}.db`.
+pub fn sibling_db_url(database_url: &str, suffix: &str) -> String {
+    if let Some(rest) = database_url.strip_prefix("sqlite:") {
+        let (path, query) = match rest.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (rest, None),
+        };
+        let path = if let Some(stem) = path.strip_suffix(".db") {
+            format!("{stem}-{suffix}.db")
+        } else {
+            format!("{path}-{suffix}.db")
+        };
+        return match query {
+            Some(q) => format!("sqlite:{path}?{q}"),
+            None => format!("sqlite:{path}?mode=rwc"),
+        };
+    }
+    format!("{database_url}-{suffix}")
+}
