@@ -939,7 +939,7 @@ impl S3 for S3Gateway {
         };
         let etag = Self::etag_of(&ingested.md5);
 
-        let old = self
+        let old = match self
             .index
             .put_object(
                 &input.bucket,
@@ -952,7 +952,13 @@ impl S3 for S3Gateway {
                 &checksums_json,
             )
             .await
-            .map_err(Self::map_err)?;
+        {
+            Ok(old) => old,
+            Err(e) => {
+                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                return Err(Self::map_err(e));
+            }
+        };
         self.release_ids(&old).await;
 
         if !tags.is_empty() {
@@ -1398,7 +1404,7 @@ impl S3 for S3Gateway {
         }
 
         let etag = Self::etag_of(&ingested.md5);
-        let old = self
+        let old = match self
             .index
             .put_multipart_part(
                 &upload_id,
@@ -1408,7 +1414,13 @@ impl S3 for S3Gateway {
                 &ingested.extents,
             )
             .await
-            .map_err(Self::map_err)?;
+        {
+            Ok(old) => old,
+            Err(e) => {
+                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                return Err(Self::map_err(e));
+            }
+        };
         self.release_ids(&old).await;
 
         let mut output = UploadPartOutput {
