@@ -200,9 +200,28 @@ the chain behind it contains all of them.
 
 **Stragglers.** A fenced writer may still pin one batch after the claim (sent
 later, so it tops the pin) — never acknowledged. It is recognisable: its `gen` is
-below the description. The leader checks the head after its own appends and
-unpins such a message; recovery does the same before trusting the head (unpin
-while `head.gen < description gen`, re-read). At most one per fenced writer.
+below the description. Do **not** unpin it: on a live bot (below) unpinning the
+head makes `getChat` report no pinned message for about a minute, which a
+reader would take for an empty log. Instead the leader overrides it by sending
+and pinning a newer batch (an empty one if idle) that links to its own head, so
+the straggler drops out of the chain; recovery skips a head whose `gen` is
+below the description and waits for the leader's override (or claims anew).
+
+**Live-bot findings** (2026-10-28, a channel, Bot API):
+
+- `pinned_message` is the newest pinned message **by sending date**, not the
+  last one pinned: pinning C, then A, then B returned C. Pinning a newer
+  message shows up in the next `getChat` at once.
+- After unpinning the head, `getChat` returned **no** `pinned_message` (other
+  messages still pinned), also after re-pinning an older one; about a minute
+  later it showed the newest remaining pin again. Never unpin in the protocol,
+  and never read a missing head as an empty log when the description holds a
+  generation.
+- `setChatDescription` → `getChat` reads the new value at once, also right
+  after a pin. Setting the same value fails with "chat description is not
+  modified". Rate: six changes in a row went through (one took 3 s), the
+  seventh got "Too Many Requests: retry after 43" — fine for claims, which are
+  rare, but tests must not loop on it.
 
 **Two claimants** may race on step 1 (the description is overwritten blindly).
 Each verifies after step 3 that the description still holds its generation and
@@ -218,8 +237,8 @@ Costs and caveats:
   so snapshots bound recovery time;
 - `setChatDescription` needs the `can_change_info` admin right; it is used only
   on claim;
-- to verify on a live bot: `pinned_message` really is newest-by-sending-date
-  (not last-pinned); limits of `setChatDescription` / `setMyDescription`;
+- verified on a live bot (above): newest-by-sending-date; unpin makes the head
+  vanish for a while; description is read-after-write and rate-limited;
 - chat admins can delete or unpin messages; hash links detect it, nothing
   prevents it;
 - the project disclaimer applies even more: this uses a chat as a database log.
@@ -298,10 +317,9 @@ Each step is a separate commit with tests green.
 
 ## Open questions / Открытые вопросы
 
-- Telegram: confirm `pinned_message` is newest-by-sending-date and that
-  `getChat` after a pin sees the current `description`, plus the limits of
-  `setChatDescription` / `setMyDescription`, on a live bot. The description is
-  not a compare-and-swap; the protocol's safety rests on that read.
+- Telegram: the description is not a compare-and-swap; the protocol's safety
+  rests on reading it right after the pin (read-after-write held on a live
+  bot). `setMyDescription` (private chats) is not verified.
 - Telegram: a straggler batch pinned between a claim's steps 1 and 2 becomes the
   new chain's base, so a command its writer answered with an error is applied
   anyway (outcome unknown, as in Raft). Document it in the contract, or use a

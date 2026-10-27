@@ -59,8 +59,6 @@ Known gaps:
   without; plain `fsync` (what SQLite does on macOS) is an option.
 - Telegram blob chats are swept by id up to the horizon, ours or not: keep
   nothing else in them (the Telegram LogStore needs its own chat).
-- `pinned_message` semantics ("most recent by sending date") is from the docs and
-  not yet verified on a live bot.
 
 ## Steps / Шаги
 
@@ -115,8 +113,10 @@ leaves every chunk-owned key to reclaim.
 Protocol: meta-backends.md § `telegram` (pinned head of a chain of log batches,
 `description` as the generation fence, stragglers unpinned).
 
-1. First verify on a live bot (throwaway channel): `pinned_message` is the
-   newest-by-sending-date pinned message; limits of `setChatDescription`.
+1. ~~Verify on a live bot.~~ Done 2026-10-28 (meta-backends.md § live-bot
+   findings): newest-by-sending-date holds; unpinning the head hides it for
+   ~1 min, so stragglers are overridden by a newer pin, never unpinned;
+   `setChatDescription` is read-after-write, ~6 changes then a 43 s flood wait.
 2. Implement over the Telegram client; a fake chat (pins with send order,
    description register) for tests.
 3. Run the `LogStore` test suite from step 2 against it, plus fault injection:
