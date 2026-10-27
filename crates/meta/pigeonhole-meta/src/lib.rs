@@ -3,10 +3,10 @@
 //! Every metadata change is a **command** owned by one layer (namespace).
 //! [`MetaStore::propose`] is the only write path: it queues the command, a
 //! batcher appends a batch of queued commands to the [`LogStore`] under the
-//! tablet's generation, applies them in order to SQLite and only then answers
-//! the callers. The log is the source of truth; the SQLite file is a cache that
-//! records the last applied position with the state. Reads go straight to
-//! [`MetaStore::pool`].
+//! tablet's generation, applies them in order and only then answers the
+//! callers. The log is the source of truth. State lives in memory
+//! ([`StateMachine`], read via [`MetaStore::read`]) or, for namespaces not
+//! moved yet, in SQLite tables ([`Namespace`], read via [`MetaStore::pool`]).
 //!
 //! Commands must be deterministic: ids, timestamps and locators are chosen by
 //! the proposer and carried in the command, never generated in `apply`. That is
@@ -16,9 +16,8 @@
 //! returns [`Applied::Reject`]: its writes are rolled back, but the entry still
 //! consumes a position — every replay reaches the same verdict.
 //!
-//! Boot ([`MetaStore::open`]): claim the next generation, replay the log
-//! entries the SQLite file has not applied yet, append the zero entry, go
-//! active. Once a newer generation claims the log the tablet stops
+//! Boot ([`MetaStore::open`]): claim the next generation, reset every
+//! namespace and replay the whole log, append the zero entry, go active. Once a newer generation claims the log the tablet stops
 //! ([`Stop::Fenced`]) and every later `propose` fails.
 
 use anyhow::{bail, Context, Result};
@@ -26,11 +25,12 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{SqliteConnection, SqlitePool};
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -63,6 +63,84 @@ pub trait Namespace: Send + Sync + 'static {
     /// Apply one encoded command. `Err` is an infrastructure failure (I/O,
     /// corrupt command), never a state-dependent rejection.
     async fn apply(&self, conn: &mut SqliteConnection, command: &[u8]) -> Result<Applied>;
+}
+
+/// Typed in-memory state of one namespace. The log (and later its snapshots)
+/// is the only durable copy: every boot rebuilds the state from it.
+pub trait StateMachine: Default + Send + Sync + 'static {
+    /// Stable name used to route commands (`chunk`, `s3`, `cas`).
+    const NAME: &'static str;
+
+    /// Apply one encoded command; must be deterministic. Validate before
+    /// mutating: an [`Applied::Reject`] must leave the state untouched. `Err`
+    /// is a corrupt command, never a state-dependent rejection.
+    fn apply(&mut self, command: &[u8]) -> Result<Applied>;
+
+    /// Logical dump of the state (the layer's own encoding) and its inverse.
+    /// Equal states must give equal bytes.
+    fn snapshot(&self) -> Vec<u8>;
+    fn restore(data: &[u8]) -> Result<Self>;
+}
+
+/// Object-safe face of a [`StateMachine`] behind its lock.
+trait AnyState: Send + Sync {
+    fn apply(&self, command: &[u8]) -> Result<Applied>;
+    fn reset(&self);
+    fn as_any(&self) -> &dyn Any;
+}
+
+struct StateCell<S>(RwLock<S>);
+
+impl<S: StateMachine> AnyState for StateCell<S> {
+    fn apply(&self, command: &[u8]) -> Result<Applied> {
+        self.0.write().unwrap().apply(command)
+    }
+
+    fn reset(&self) {
+        *self.0.write().unwrap() = S::default();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[derive(Clone)]
+enum Route {
+    Sql(Arc<dyn Namespace>),
+    State(Arc<dyn AnyState>),
+}
+
+/// The namespaces a tablet serves, fixed at [`MetaStore::open`]: replay must
+/// be able to apply every entry in the log.
+#[derive(Default)]
+pub struct Namespaces {
+    routes: Vec<(&'static str, Route)>,
+}
+
+impl Namespaces {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Serve `S` from memory.
+    pub fn with<S: StateMachine>(mut self) -> Self {
+        let cell: Arc<dyn AnyState> = Arc::new(StateCell(RwLock::new(S::default())));
+        self.routes.push((S::NAME, Route::State(cell)));
+        self
+    }
+
+    /// Serve a namespace whose state lives in SQLite tables.
+    pub fn with_sql(mut self, ns: Arc<dyn Namespace>) -> Self {
+        self.routes.push((ns.name(), Route::Sql(ns)));
+        self
+    }
+}
+
+impl From<Vec<Arc<dyn Namespace>>> for Namespaces {
+    fn from(sql: Vec<Arc<dyn Namespace>>) -> Self {
+        sql.into_iter().fold(Self::new(), Self::with_sql)
+    }
 }
 
 /// Result of [`MetaStore::propose`].
@@ -113,7 +191,7 @@ impl Default for MetaOptions {
     }
 }
 
-type Namespaces = HashMap<&'static str, Arc<dyn Namespace>>;
+type Routes = HashMap<&'static str, Route>;
 
 struct Pending {
     entry: Entry,
@@ -123,7 +201,7 @@ struct Pending {
 /// The metadata tablet shared by every layer.
 pub struct MetaStore {
     pool: SqlitePool,
-    namespaces: Arc<Namespaces>,
+    routes: Arc<Routes>,
     gen: u64,
     queue: mpsc::UnboundedSender<Pending>,
     stop: watch::Receiver<Option<Stop>>,
@@ -133,7 +211,6 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta_tablet (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
     gen INTEGER NOT NULL,
-    log_id TEXT,
     last_applied_position INTEGER NOT NULL
 )
 "#;
@@ -143,14 +220,14 @@ const REPLAY_CHUNK: usize = 1024;
 
 impl MetaStore {
     /// Boot the tablet: open (or create) the SQLite file at `url`
-    /// (`sqlite:path`), create every namespace's tables, claim the next
-    /// generation of `log`, replay what the file has not applied, append the
-    /// zero entry. Namespaces are fixed for the tablet's lifetime: replay must
-    /// be able to apply every entry in the log.
+    /// (`sqlite:path`), claim the next generation of `log`, rebuild every
+    /// namespace's state from the whole log (SQLite tables are emptied first:
+    /// while some namespaces live in memory, the file is only a scratch copy),
+    /// append the zero entry.
     pub async fn open(
         url: &str,
         log: Arc<dyn LogStore>,
-        namespaces: Vec<Arc<dyn Namespace>>,
+        namespaces: impl Into<Namespaces>,
         opts: MetaOptions,
     ) -> Result<Arc<Self>> {
         let sqlite = SqliteConnectOptions::from_str(url)
@@ -170,7 +247,7 @@ impl MetaStore {
             .await
             .with_context(|| format!("connect {url}"))?;
 
-        let mut by_name = Namespaces::new();
+        let mut routes = Routes::new();
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(SCHEMA).execute(&mut *tx).await?;
         sqlx::query(
@@ -179,41 +256,27 @@ impl MetaStore {
         )
         .execute(&mut *tx)
         .await?;
-        for ns in namespaces {
-            let name = ns.name();
-            ns.init(&mut tx).await.with_context(|| format!("init namespace {name}"))?;
-            if by_name.insert(name, ns).is_some() {
+        for (name, route) in namespaces.into().routes {
+            if let Route::Sql(ns) = &route {
+                ns.init(&mut tx).await.with_context(|| format!("init namespace {name}"))?;
+            }
+            if routes.insert(name, route).is_some() {
                 bail!("namespace {name:?} given twice");
             }
         }
         tx.commit().await?;
-        let namespaces = Arc::new(by_name);
+        let routes = Arc::new(routes);
 
-        let (known_gen, _, _) = tablet_row(&pool).await?;
+        let (known_gen, _) = tablet_row(&pool).await?;
         let (gen, head) = claim_next(log.as_ref(), known_gen).await?;
         sqlx::query("UPDATE meta_tablet SET gen = ? WHERE singleton = 0")
             .bind(gen as i64)
             .execute(&pool)
             .await?;
 
-        let (_, log_id, mut applied) = tablet_row(&pool).await?;
-        if log_id.is_some_and(|id| id != head.log_id) || (log_id.is_none() && applied > 0) {
-            // Applied from another history: positions mean different entries.
-            discard_state(&pool, &namespaces).await?;
-            applied = 0;
-        }
-        sqlx::query("UPDATE meta_tablet SET log_id = ? WHERE singleton = 0")
-            .bind(head.log_id.to_string())
-            .execute(&pool)
-            .await?;
-        if applied > head.position {
-            bail!(LogError::Lost(format!(
-                "SQLite state is at {applied}, the log ends at {}",
-                head.position
-            )));
-        }
-        if applied < head.position {
-            replay(&pool, &namespaces, log.as_ref(), applied, head).await?;
+        discard_state(&pool, &routes).await?;
+        if head.position > 0 {
+            replay(&pool, &routes, log.as_ref(), head).await?;
         }
 
         let zero = log.append(gen, &[]).await.context("append zero entry")?;
@@ -226,7 +289,7 @@ impl MetaStore {
         tokio::spawn(batcher(
             Batcher {
                 pool: pool.clone(),
-                namespaces: namespaces.clone(),
+                routes: routes.clone(),
                 log,
                 gen,
                 opts,
@@ -234,11 +297,11 @@ impl MetaStore {
             },
             rx,
         ));
-        Ok(Arc::new(Self { pool, namespaces, gen, queue, stop }))
+        Ok(Arc::new(Self { pool, routes, gen, queue, stop }))
     }
 
     /// Boot over a [`LocalLogStore`] in `<db path>.log` next to the SQLite file.
-    pub async fn open_local(url: &str, namespaces: Vec<Arc<dyn Namespace>>) -> Result<Arc<Self>> {
+    pub async fn open_local(url: &str, namespaces: impl Into<Namespaces>) -> Result<Arc<Self>> {
         let log = LocalLogStore::open(local_log_dir(url)?)?;
         Self::open(url, Arc::new(log), namespaces, MetaOptions::default()).await
     }
@@ -250,7 +313,23 @@ impl MetaStore {
     }
 
     pub fn has_namespace(&self, name: &str) -> bool {
-        self.namespaces.contains_key(name)
+        self.routes.contains_key(name)
+    }
+
+    /// Read `S`'s state under a short read lock (never held across `.await`;
+    /// copy out what you need).
+    ///
+    /// Panics if the tablet was opened without `S`: layers check
+    /// [`Self::has_namespace`] when they open.
+    pub fn read<S: StateMachine, R>(&self, f: impl FnOnce(&S) -> R) -> R {
+        let Some(Route::State(cell)) = self.routes.get(S::NAME) else {
+            panic!("tablet has no in-memory namespace {:?}", S::NAME);
+        };
+        let cell = cell
+            .as_any()
+            .downcast_ref::<StateCell<S>>()
+            .unwrap_or_else(|| panic!("namespace {:?} has another state type", S::NAME));
+        f(&cell.0.read().unwrap())
     }
 
     /// Generation this tablet claimed on boot.
@@ -289,7 +368,7 @@ impl MetaStore {
 
     /// Position of the last applied entry (0 before the first).
     pub async fn applied_position(&self) -> Result<Position> {
-        Ok(tablet_row(&self.pool).await?.2)
+        Ok(tablet_row(&self.pool).await?.1)
     }
 }
 
@@ -338,21 +417,18 @@ fn local_log_dir(url: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(format!("{path}.log")))
 }
 
-async fn tablet_row(pool: &SqlitePool) -> Result<(u64, Option<LogId>, Position)> {
-    let (gen, log_id, pos): (i64, Option<String>, i64) = sqlx::query_as(
-        "SELECT gen, log_id, last_applied_position FROM meta_tablet WHERE singleton = 0",
-    )
-    .fetch_one(pool)
-    .await?;
-    let log_id = log_id
-        .map(|s| s.parse::<LogId>().with_context(|| format!("meta_tablet.log_id {s:?}")))
-        .transpose()?;
-    Ok((gen as u64, log_id, pos as Position))
+async fn tablet_row(pool: &SqlitePool) -> Result<(u64, Position)> {
+    let (gen, pos): (i64, i64) =
+        sqlx::query_as("SELECT gen, last_applied_position FROM meta_tablet WHERE singleton = 0")
+            .fetch_one(pool)
+            .await?;
+    Ok((gen as u64, pos as Position))
 }
 
-/// Empty every table but the tablet's own row and re-run each namespace's
-/// `init`, so the log can be replayed from the start.
-async fn discard_state(pool: &SqlitePool, namespaces: &Namespaces) -> Result<()> {
+/// Reset every namespace to its empty state: SQLite tables (but the tablet's
+/// own row) are emptied and re-initialised, in-memory states replaced by
+/// `Default`.
+async fn discard_state(pool: &SqlitePool, routes: &Routes) -> Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("PRAGMA defer_foreign_keys = ON").execute(&mut *tx).await?;
     let tables: Vec<(String,)> = sqlx::query_as(
@@ -364,10 +440,13 @@ async fn discard_state(pool: &SqlitePool, namespaces: &Namespaces) -> Result<()>
     for (table,) in tables {
         sqlx::query(&format!("DELETE FROM \"{table}\"")).execute(&mut *tx).await?;
     }
-    for ns in namespaces.values() {
-        ns.init(&mut tx).await.with_context(|| format!("init namespace {}", ns.name()))?;
+    for (name, route) in routes {
+        match route {
+            Route::Sql(ns) => ns.init(&mut tx).await.with_context(|| format!("init namespace {name}"))?,
+            Route::State(cell) => cell.reset(),
+        }
     }
-    sqlx::query("UPDATE meta_tablet SET log_id = NULL, last_applied_position = 0 WHERE singleton = 0")
+    sqlx::query("UPDATE meta_tablet SET last_applied_position = 0 WHERE singleton = 0")
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -388,24 +467,16 @@ async fn claim_next(log: &dyn LogStore, known: u64) -> Result<(u64, Head)> {
     bail!("could not claim a generation (last tried {gen})")
 }
 
-/// Apply log entries `(applied, head]` that the SQLite file has not seen.
-async fn replay(
-    pool: &SqlitePool,
-    namespaces: &Namespaces,
-    log: &dyn LogStore,
-    applied: Position,
-    head: Head,
-) -> Result<()> {
+/// Apply the whole log `(0, head]` to empty state.
+async fn replay(pool: &SqlitePool, routes: &Routes, log: &dyn LogStore, head: Head) -> Result<()> {
     if let Some(d) = log.discover().await.context("discover log")? {
         if let Some((at, _)) = d.snapshot {
-            if at > applied {
-                bail!("log snapshot at {at} is ahead of SQLite ({applied}); snapshot restore is not implemented yet");
-            }
+            bail!("log has a snapshot at {at}; snapshot restore is not implemented yet");
         }
     }
-    let mut entries = log.read(applied, head);
+    let mut entries = log.read(0, head);
     let mut chunk = Vec::with_capacity(REPLAY_CHUNK);
-    let mut first = applied + 1;
+    let mut first = 1;
     loop {
         let next = entries.try_next().await.context("read log")?;
         let done = next.is_none();
@@ -416,7 +487,7 @@ async fn replay(
             chunk.push(entry);
         }
         if chunk.len() == REPLAY_CHUNK || (done && !chunk.is_empty()) {
-            apply_batch(pool, namespaces, first, &chunk).await?;
+            apply_batch(pool, routes, first, &chunk).await?;
             first += chunk.len() as u64;
             chunk.clear();
         }
@@ -430,11 +501,13 @@ async fn replay(
     Ok(())
 }
 
-/// Apply entries at positions `first..` in one transaction, advancing
-/// `last_applied_position` with them (so a crash re-applies all or nothing).
+/// Apply entries at positions `first..`: SQL namespaces in one transaction
+/// that also advances `last_applied_position`, in-memory ones directly. A
+/// failure half way leaves the two out of step, so the caller must stop the
+/// tablet; the next boot rebuilds everything from the log.
 async fn apply_batch(
     pool: &SqlitePool,
-    namespaces: &Namespaces,
+    routes: &Routes,
     first: Position,
     entries: &[Entry],
 ) -> Result<Vec<Applied>> {
@@ -449,18 +522,24 @@ async fn apply_batch(
     let mut out = Vec::with_capacity(entries.len());
     for (i, entry) in entries.iter().enumerate() {
         let pos = first + i as u64;
-        let ns = namespaces
+        let route = routes
             .get(entry.namespace.as_str())
             .with_context(|| format!("entry {pos}: unknown namespace {:?}", entry.namespace))?;
-        sqlx::query("SAVEPOINT command").execute(&mut *tx).await?;
-        let applied = ns
-            .apply(&mut tx, &entry.command)
-            .await
-            .with_context(|| format!("apply {} entry {pos}", entry.namespace))?;
-        if matches!(applied, Applied::Reject(_)) {
-            sqlx::query("ROLLBACK TO command").execute(&mut *tx).await?;
-        }
-        sqlx::query("RELEASE command").execute(&mut *tx).await?;
+        let applied = match route {
+            Route::Sql(ns) => {
+                sqlx::query("SAVEPOINT command").execute(&mut *tx).await?;
+                let applied = ns.apply(&mut tx, &entry.command).await;
+                let applied = applied.with_context(|| format!("apply {} entry {pos}", entry.namespace))?;
+                if matches!(applied, Applied::Reject(_)) {
+                    sqlx::query("ROLLBACK TO command").execute(&mut *tx).await?;
+                }
+                sqlx::query("RELEASE command").execute(&mut *tx).await?;
+                applied
+            }
+            Route::State(cell) => cell
+                .apply(&entry.command)
+                .with_context(|| format!("apply {} entry {pos}", entry.namespace))?,
+        };
         out.push(applied);
     }
     sqlx::query("UPDATE meta_tablet SET last_applied_position = ? WHERE singleton = 0")
@@ -473,7 +552,7 @@ async fn apply_batch(
 
 struct Batcher {
     pool: SqlitePool,
-    namespaces: Arc<Namespaces>,
+    routes: Arc<Routes>,
     log: Arc<dyn LogStore>,
     gen: u64,
     opts: MetaOptions,
@@ -506,7 +585,7 @@ async fn batcher(b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
         let result = match b.log.append(b.gen, &entries).await {
             Ok(last) => {
                 let first = last + 1 - entries.len() as u64;
-                apply_batch(&b.pool, &b.namespaces, first, &entries)
+                apply_batch(&b.pool, &b.routes, first, &entries)
                     .await
                     .map(|applied| (first, applied))
                     .map_err(|e| Stop::Failed(format!("apply batch at {first}: {e:#}")))
