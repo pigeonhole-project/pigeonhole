@@ -156,6 +156,11 @@ impl MetaStore {
             .with_context(|| format!("parse sqlite url {url}"))?
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            // The log is durable; the file is a cache. With WAL, NORMAL skips
+            // the fsync per commit: power loss may drop the newest
+            // transactions, but `last_applied_position` drops with them and
+            // boot replays them from the log. A process crash loses nothing.
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
