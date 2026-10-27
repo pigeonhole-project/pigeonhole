@@ -14,6 +14,11 @@ Terms used in code, comments, and docs (Stage B onward).
 | **Object** | Gateway entity: S3 object, `CasEntry`, Kafka segment / сущность шлюза | any | per protocol | gateways |
 | **Root** | Named pointer to a gateway index snapshot (`s3/index`) / именованный указатель на снапшот | — | atomic switch | chunk store |
 | **Superblock** | Per-instance pin: generation, chunk-store checkpoint/journal, roots / закреп в инстансе | small | rewritten | chunk store |
+| **Tablet** | The metadata state machine: commands → `LogStore` → SQLite (`MetaStore`) / таблетка метаданных | — | one active incarnation | `pigeonhole-meta` |
+| **LogStore** | Fencing command log the tablet appends batches to (`local`, later `telegram`, `s3`) / журнал команд с отсечением | — | append-only, collected behind snapshots | `pigeonhole-meta` |
+| **Generation** | Number of a tablet incarnation; a newer claim fences every older one (`Fenced`) / поколение | u64 | strictly increasing | `LogStore` |
+| **Position** | Index of an entry in the log (1, 2, …); `last_applied_position` is stored with the SQLite state / позиция записи | u64 | — | tablet |
+| **Zero entry** | Empty batch appended on boot: proves the claim and starts the generation / нулевая запись | 0 entries | immutable | tablet |
 
 In code, **blob** means only a physical backend message. REAPI CAS “blobs” in the gateway are `CasEntry`.
 

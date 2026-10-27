@@ -22,22 +22,41 @@ Read those first.
 
 Done (on `main`):
 
-- `pigeonhole-meta` (`crates/meta`): `MetaStore::propose(namespace, bytes)`
-  applies a layer command via its `Namespace` in one `BEGIN IMMEDIATE`
-  transaction (savepoint; `Applied::Reject` rolls back but consumes an index);
-  `applied_index` is stored with the state.
+- `pigeonhole-meta` (`crates/meta`) is a tablet (step 2):
+  `MetaStore::propose(namespace, bytes)` queues the command; a batcher appends
+  the queued batch to a `LogStore` (`log.rs`, proto `pigeonhole.meta.v1`
+  `Entry` / `Batch`) under the tablet's generation, applies it in one
+  `BEGIN IMMEDIATE` transaction (savepoint per entry; `Applied::Reject` rolls
+  back but consumes a position) together with `last_applied_position`, then
+  answers. Boot = claim `1 + max known gen` → replay what SQLite lacks → zero
+  entry; a file ahead of the log refuses to boot (`Lost`). `Fenced` / failed
+  append or apply → `Stop`: proposals fail, `serve` exits.
+- `LocalLogStore` (`log/local.rs`): `seg-<first>.log` records
+  `MAGIC|len|crc|Batch` fsynced per batch, `claimed_gen` re-read under a
+  `flock`; claim truncates a torn tail; `install_snapshot` keeps the newest
+  snapshot and drops segments behind it (not called by the tablet yet).
+- Namespaces are fixed at `MetaStore::open` (`BlobDb::namespace()`,
+  `Index::namespace()`, `CasIndex::namespace()`); `connect(url)` keeps a local
+  log in `<db>.log`. Config `[meta]` (`db_path`, `batch_max_delay_ms` = 0,
+  `batch_max_entries`) + `[meta.log]` (`kind = "local"`, `path`).
 - Every metadata change is a proto command:
   `pigeonhole.chunk.v1` (chunk-store, `commands.rs`), `pigeonhole.s3.v1`
   (gateway-s3, `commands.rs`), `pigeonhole.cas.v1` (bytestream, `commands.rs`).
   Proposers (`BlobDb`, `Index`, `CasIndex`) choose ids and timestamps; `apply`
   is deterministic.
-- One SQLite file for all layers (`database_url`), tables prefixed `chunk_`,
+- One SQLite file for all layers (`[meta].db_path`), tables prefixed `chunk_`,
   `s3_`, `cas_`; the binary opens one `MetaStore` in `runtime.rs`.
 - Fixed earlier: sweeper in-flight check order, `BEGIN IMMEDIATE`, copy
   retain-before-publish, ingest leaks, CAS double refs, chunk id reuse
   (`chunk_id_seq`), legacy code removed, config is `[[instances]]`-only.
 
 Still old / known gaps:
+
+- The local log is on the same disk as the SQLite file: disk loss still relies
+  on the old checkpoint / snapshots below (step 3). fsync per batch costs:
+  `sweep_stress` takes ~55 s on macOS (`F_FULLFSYNC`) instead of ~12 s.
+- Rows written directly (list below) bypass the log, so replay does not
+  rebuild them; `tests/meta_replay.rs` compares only command-owned tables.
 
 - Durability is still `chunk-store/src/durability.rs`: periodic checkpoint of
   chunk tables + superblock pinned via `TypedBootstrapPointer::swap`; its
@@ -56,7 +75,7 @@ Still old / known gaps:
 
 ## Steps / Шаги
 
-### Step 2 — Tablet over a local `LogStore`
+### Step 2 — Tablet over a local `LogStore` ✅ done
 
 Goal: the command log, not the SQLite file, is the source of truth; boot =
 claim → recover → zero entry.
@@ -133,6 +152,6 @@ to the active node; `s3` LogStore with conditional writes (`If-None-Match`).
 ## Open questions / Открытые вопросы
 
 - Snapshot format: SQLite image vs logical dump per namespace.
-- Default batch window per LogStore kind.
+- Default batch window per LogStore kind (`local`: 0, no extra wait).
 - Whether node-local tables (watermarks, cursor, repair queue) should move out of
   the replicated SQLite file entirely.

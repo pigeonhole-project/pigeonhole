@@ -1,7 +1,7 @@
 # Metadata as a tablet / Метаданные как таблетка
 
-Status: **step 1 implemented** (commands + one SQLite state machine); the rest is a
-proposal. No backward compatibility: configs, on-disk and in-chat formats are
+Status: **steps 1–2 implemented** (commands, one SQLite state machine, tablet
+over the `local` LogStore); the rest is a proposal. No backward compatibility: configs, on-disk and in-chat formats are
 replaced, existing data is not migrated.
 
 The model follows YDB tablets: a replicated state machine over a **shared log**
@@ -67,14 +67,16 @@ generation has **claimed** the log, every `append` of an older one fails with
 
 ```rust
 trait LogStore {
-    /// Become generation `gen` (> any earlier claim). Fences every older
-    /// generation and returns the log head they left behind: every entry
-    /// whose append was acknowledged to an older generation is ≤ that head.
-    async fn claim(&self, gen: u64) -> Result<Head, ClaimError>;
+    /// Become generation `gen` (> any earlier claim, else `Fenced { current }`).
+    /// Fences every older generation and returns the log head they left
+    /// behind: every entry whose append was acknowledged to an older
+    /// generation is ≤ that head.
+    async fn claim(&self, gen: u64) -> Result<Head, LogError>;
 
-    /// Durably append a batch for `gen`. `Ok` = committed; `Fenced` = a newer
-    /// generation exists, nothing about this batch may be acknowledged.
-    async fn append(&self, gen: u64, batch: &[Entry]) -> Result<Position, AppendError>;
+    /// Durably append a batch for `gen`. `Ok` = committed (position of the
+    /// batch's last entry); `Fenced` = a newer generation exists, nothing
+    /// about this batch may be acknowledged.
+    async fn append(&self, gen: u64, batch: &[Entry]) -> Result<Position, LogError>;
 
     /// Newest snapshot + log head (bootstrap without any local state).
     async fn discover(&self) -> Result<Option<Discovered>>;
@@ -87,13 +89,20 @@ trait LogStore {
 }
 ```
 
-`Entry` = the existing envelope `{ namespace, command }` (proto), applied by
-`MetaStore` exactly as in step 1. A batch is one log write: commits are grouped
+`Entry` = the envelope `{ namespace, command }` (proto `pigeonhole.meta.v1`),
+applied by `MetaStore` exactly as in step 1. One error type for every call:
+`LogError::Fenced { current }` (a claim at or below `current` also gets it, so
+the tablet retries with `current + 1`), `Lost` (entries the caller needs are
+gone or corrupt — collected, a hole, a file ahead of the log) and `Other` (I/O,
+outcome unknown). Positions number entries 1, 2, …; an empty batch (the zero
+entry) takes no position. A batch is one log write: commits are grouped
 (group commit) because some stores (Telegram) allow a write every few seconds.
 
 ### Tablet lifecycle / Жизненный цикл
 
-1. **Boot** (`claim`): `gen = 1 + max(known generations)`; `claim(gen)` → head.
+1. **Boot** (`claim`): `gen = 1 + max(known generations)` (the last claimed
+   generation is kept in the SQLite file; `Fenced { current }` moves past
+   newer claims); `claim(gen)` → head.
 2. **Recover**: if the local SQLite file is behind (or absent), `discover` →
    load snapshot → `read` and apply entries up to head.
 3. **Zero entry**: append an empty batch for `gen` — proves the claim took effect
@@ -217,7 +226,9 @@ deleted by the tablet after a snapshot (`deleteMessage`).
 ```toml
 [meta]
 db_path = "pigeonhole-meta.db"      # local SQLite cache of the state
-batch_max_delay_ms = 2000           # group commit window
+batch_max_delay_ms = 0              # extra group commit window (local: 0;
+                                    # batches still form while an append runs)
+batch_max_entries = 1024
 
 [meta.log]
 kind = "local"                      # local (default) | telegram | s3
@@ -237,7 +248,7 @@ Each step is a separate commit with tests green.
 
 1. ~~Commands, in-process.~~ Done: `pigeonhole-meta`, `chunk` / `s3` / `cas`
    namespaces, one SQLite file.
-2. **Tablet + `LogStore` (local).** `LogStore` trait and the `local`
+2. ~~**Tablet + `LogStore` (local).**~~ Done. `LogStore` trait and the `local`
    implementation; `MetaStore::propose` appends a batch before applying; boot =
    claim → discover → replay → zero entry; fenced → stop. Tests: replay rebuilds
    identical SQLite state; a second incarnation fences the first.
@@ -259,4 +270,4 @@ Each step is a separate commit with tests green.
 - Snapshot format: SQLite file image (simple) or a logical dump per namespace?
 - Telegram: confirm `pinned_message` is newest-by-sending-date and the limits of
   `setChatDescription` / `setMyDescription` on a live bot.
-- Batch size / delay defaults per LogStore kind.
+- Batch size / delay defaults per LogStore kind (`local`: no extra delay).
