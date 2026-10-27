@@ -2,7 +2,6 @@
 
 pub mod cas;
 pub mod cas_index;
-pub mod cas_snapshot;
 mod commands;
 pub mod config;
 pub mod digest;
@@ -37,5 +36,4 @@ pub mod build {
 
 pub use build::bazel::remote::execution::v2 as reapi;
 pub use cas_index::{CasEntry, CasIndex};
-pub use cas_snapshot::{push_cas_snapshot, restore_cas_snapshot, ROOT_NAME as CAS_ROOT};
 pub use google::bytestream as bytestream_pb;

@@ -1,16 +1,16 @@
 //! CAS mapping index owned by the bytestream gateway.
 //!
-//! Stores `CasEntry { hash, size, extents }` rows; chunk refs live in the chunk
-//! store. Queries read SQLite directly; changes go through `cas` commands.
+//! Maps `(hash, size)` to extents; chunk refs live in the chunk store. Reads
+//! look at the tablet's in-memory [`CasState`]; changes go through `cas`
+//! commands.
 
-use crate::commands::{from_pb, pb, to_pb, CasNamespace, NAMESPACE};
+use crate::commands::{from_pb, pb, to_pb, CasState, NAMESPACE};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
-use pigeonhole_meta::{Applied, MetaStore, Namespace};
+use pigeonhole_meta::{Applied, MetaStore, Namespaces};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,60 +20,39 @@ pub struct CasEntry {
     pub extents: Vec<Extent>,
 }
 
-#[derive(Debug, Clone, FromRow)]
+/// A stored entry with its last access time (RFC 3339).
+#[derive(Debug, Clone)]
 pub struct CasBlobRow {
     pub hash: String,
     pub size: i64,
-    pub extents_json: String,
+    pub extents: Vec<Extent>,
     pub last_access: String,
 }
 
 #[derive(Clone)]
 pub struct CasIndex {
-    pool: SqlitePool,
     meta: Arc<MetaStore>,
 }
-
-/// Current schema of the `cas` namespace. No upgrades.
-pub(crate) const SCHEMA: &[&str] = &[
-    r#"
-    CREATE TABLE IF NOT EXISTS cas_blobs (
-        hash TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        extents_json TEXT NOT NULL,
-        last_access TEXT NOT NULL,
-        PRIMARY KEY (hash, size)
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS cas_meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    )
-    "#,
-];
 
 impl CasIndex {
     /// Open a standalone tablet at `database_url` (local log next to it) with
     /// only this namespace.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        Self::open(MetaStore::open_local(database_url, vec![Self::namespace()]).await?).await
+        let namespaces = Self::register(Namespaces::new());
+        Self::open(MetaStore::open_local(database_url, namespaces).await?).await
     }
 
-    /// The `cas` namespace, to pass to [`MetaStore::open`].
-    pub fn namespace() -> Arc<dyn Namespace> {
-        Arc::new(CasNamespace)
+    /// Add the `cas` namespace to the set passed to [`MetaStore::open`].
+    pub fn register(namespaces: Namespaces) -> Namespaces {
+        namespaces.with::<CasState>()
     }
 
-    /// Use `meta`, which must have been opened with [`Self::namespace`].
+    /// Use `meta`, which must have been opened with [`Self::register`].
     pub async fn open(meta: Arc<MetaStore>) -> Result<Self> {
         if !meta.has_namespace(NAMESPACE) {
             anyhow::bail!("metadata tablet opened without the cas namespace");
         }
-        Ok(Self {
-            pool: meta.pool().clone(),
-            meta,
-        })
+        Ok(Self { meta })
     }
 
     async fn propose(&self, op: pb::command::Op) -> Result<Vec<u8>> {
@@ -85,41 +64,23 @@ impl CasIndex {
     }
 
     pub async fn find_missing(&self, digests: &[(String, i64)]) -> Result<Vec<(String, i64)>> {
-        let mut missing = Vec::new();
-        for (hash, size) in digests {
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT 1 FROM cas_blobs WHERE hash = ? AND size = ?",
-            )
-            .bind(hash)
-            .bind(size)
-            .fetch_optional(&self.pool)
-            .await?;
-            if row.is_none() {
-                missing.push((hash.clone(), *size));
-            }
-        }
-        Ok(missing)
+        Ok(self.meta.read::<CasState, _>(|s| {
+            digests
+                .iter()
+                .filter(|(hash, size)| !s.blobs.contains_key(&(hash.clone(), *size)))
+                .cloned()
+                .collect()
+        }))
     }
 
     pub async fn get(&self, hash: &str, size: i64) -> Result<Option<CasEntry>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM cas_blobs WHERE hash = ? AND size = ?",
-        )
-        .bind(hash)
-        .bind(size)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            None => Ok(None),
-            Some((json,)) => {
-                let extents: Vec<Extent> = serde_json::from_str(&json)?;
-                Ok(Some(CasEntry {
-                    hash: hash.to_string(),
-                    size,
-                    extents,
-                }))
-            }
-        }
+        Ok(self.meta.read::<CasState, _>(|s| {
+            s.blobs.get(&(hash.to_string(), size)).map(|r| CasEntry {
+                hash: hash.to_string(),
+                size,
+                extents: r.extents.clone(),
+            })
+        }))
     }
 
     pub async fn touch(&self, hash: &str, size: i64) -> Result<()> {
@@ -158,73 +119,20 @@ impl CasIndex {
         Ok(pb::Released::decode(reply.as_slice())?.chunk_ids)
     }
 
+    /// Entries last accessed before `cutoff`.
     pub async fn stale_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<CasBlobRow>> {
         let cutoff = cutoff.to_rfc3339();
-        let rows = sqlx::query_as::<_, CasBlobRow>(
-            "SELECT hash, size, extents_json, last_access FROM cas_blobs WHERE last_access < ?",
-        )
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM cas_meta WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| r.0))
-    }
-
-    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO cas_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn export_entries(&self) -> Result<Vec<CasEntry>> {
-        let rows = sqlx::query_as::<_, CasBlobRow>(
-            "SELECT hash, size, extents_json, last_access FROM cas_blobs ORDER BY hash, size",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let extents: Vec<Extent> = serde_json::from_str(&r.extents_json)?;
-            out.push(CasEntry {
-                hash: r.hash,
-                size: r.size,
-                extents,
-            });
-        }
-        Ok(out)
-    }
-
-    pub async fn import_entries(&self, entries: &[CasEntry]) -> Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM cas_blobs")
-            .execute(&mut *tx)
-            .await?;
-        let now = Utc::now().to_rfc3339();
-        for e in entries {
-            let json = serde_json::to_string(&e.extents)?;
-            sqlx::query(
-                "INSERT INTO cas_blobs (hash, size, extents_json, last_access) VALUES (?, ?, ?, ?)",
-            )
-            .bind(&e.hash)
-            .bind(e.size)
-            .bind(&json)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        Ok(self.meta.read::<CasState, _>(|s| {
+            s.blobs
+                .iter()
+                .filter(|(_, r)| r.last_access < cutoff)
+                .map(|((hash, size), r)| CasBlobRow {
+                    hash: hash.clone(),
+                    size: *size,
+                    extents: r.extents.clone(),
+                    last_access: r.last_access.clone(),
+                })
+                .collect()
+        }))
     }
 }

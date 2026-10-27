@@ -13,7 +13,7 @@ use pigeonhole_chunk_store::{
     ChunkStore, Durability, IngestOptions, PinTarget, Superblock, WatermarkBackend,
 };
 use pigeonhole::index::Index;
-use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore};
+use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -26,10 +26,11 @@ pub struct Runtime {
 }
 
 pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
-    #[allow(unused_mut)]
-    let mut namespaces = vec![BlobDb::namespace(), Index::namespace()];
+    let namespaces = Namespaces::new()
+        .with_sql(BlobDb::namespace())
+        .with_sql(Index::namespace());
     #[cfg(feature = "bytestream")]
-    namespaces.push(pigeonhole_gateway_bytestream::cas_index::CasIndex::namespace());
+    let namespaces = pigeonhole_gateway_bytestream::cas_index::CasIndex::register(namespaces);
     let log: Arc<dyn LogStore> = match &cfg.meta.log {
         LogSettings::Local { path } => Arc::new(
             LocalLogStore::open(path)
