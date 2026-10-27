@@ -16,6 +16,9 @@ Terms used in code, comments, and docs (Stage B onward).
 | **LogStore** | Fencing command log the tablet appends batches to (`local`, later `telegram`, `s3`) / журнал команд с отсечением | — | append-only, collected behind snapshots | `pigeonhole-meta` |
 | **Generation** | Number of a tablet incarnation; a newer claim fences every older one (`Fenced`) / поколение | u64 | strictly increasing | `LogStore` |
 | **Position** | Index of an entry in the log (1, 2, …) / позиция записи | u64 | — | tablet |
+| **Blob id** | Our id of a blob (`BlobId`), chosen before upload and sent as its file name `ph-<hex>.bin` / наш id блоба | 128 bit | immutable | chunk store |
+| **Upload pin** | Process-local mark of an upload not committed yet; with the others it sets the sweep **horizon** / пин заливки | — | until commit | `UploadPins` |
+| **Read pin** | Process-local mark of a chunk being read; reclaim waits for it / пин чтения | — | for one read | `BlobDb` |
 | **Snapshot** | All namespace states as of a position (`TabletSnapshot`); the log behind it is dropped / снапшот таблетки | state size | replaced | tablet |
 | **Zero entry** | Empty batch appended on boot: proves the claim and starts the generation / нулевая запись | 0 entries | immutable | tablet |
 

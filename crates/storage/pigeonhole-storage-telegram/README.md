@@ -16,10 +16,11 @@ Bot API ([`deleteMessage`](https://core.telegram.org/bots/api#deletemessage),
   GC). Without that right, bots are limited to their own outgoing messages and
   the 48h window (channels also need `can_post_messages` to delete their own).
 
-Pigeonhole expects the bot to be admin with pin rights for bootstrap; for
-unbounded sweeper GC in channels/supergroups, also grant **`can_delete_messages`**.
-If that right is missing, the sweeper grace interval must stay **≥ 48 hours**
-so pending deletes remain within the Bot API window.
+For sweeper GC in channels / supergroups grant the bot **`can_delete_messages`**:
+without it, garbage older than 48 hours (and every message the bot did not
+send) cannot be deleted and stays in the chat. The sweeper treats every
+message id up to its horizon as a candidate, so keep nothing else in a blob
+chat (see docs/sweep-invariants.md).
 
 Batch deletes use `deleteMessages` (up to **100** `message_ids` per call);
 missing messages are skipped (treated as success).

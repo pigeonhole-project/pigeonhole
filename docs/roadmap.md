@@ -21,7 +21,7 @@ Read those first.
 
 ## Where we are / Текущее состояние
 
-Done (on `main`), steps 1–3:
+Done (on `main`), steps 1–5:
 
 - `pigeonhole-meta` is the tablet. `MetaStore::propose::<S>(cmd)` queues a
   typed command; the batcher appends what is queued to the `LogStore` under the
@@ -44,8 +44,12 @@ Done (on `main`), steps 1–3:
 - Removed: `durability.rs` (checkpoint, superblock pins, root journal,
   `start_or_restore`), `s3/index` / `cas/index` snapshots, chunk roots.
   `purge` deletes through commands and releases object chunks.
-- Node-local progress (put watermarks, sweep cursor, repair queue) is process
+- Node-local progress (sweep cursor, repair queue, read pins) is process
   memory in `BlobDb`, not part of the replicated state.
+- Sweeper (sweep-invariants.md): uploads pinned before they start
+  (`UploadPins`), orphans swept up to the pins' horizon, our own `BlobId` as
+  the uploaded file name (Discord sweeps only ours), read pins hold reclaim,
+  `confirm_active` before orphan deletes; no watermarks, no grace.
 
 Known gaps:
 
@@ -53,9 +57,8 @@ Known gaps:
   and restore from an export is lossy. Fixed by an off-host LogStore (step 6).
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
-- Sweeper protection for fresh parts still relies on put watermarks + sweep
-  grace; `sweep_stress` uses `SWEEP_GRACE = 1s` and 400 ops/worker to stay green.
-  Mid-read reclaim of a chunk (GET racing overwrite/delete) is still possible.
+- Telegram blob chats are swept by id up to the horizon, ours or not: keep
+  nothing else in them (the Telegram LogStore needs its own chat).
 - `pinned_message` semantics ("most recent by sending date") is from the docs and
   not yet verified on a live bot.
 
@@ -86,7 +89,15 @@ old durability, index snapshots and roots deleted.
    every orphan delete batch; the loops end once the tablet stops.
 3. ~~Update sweep-invariants.md.~~
 
-### Step 5 — In-flight pin registry (own blob ids)
+### Step 5 — In-flight pin registry (own blob ids) ✅ done
+
+Done as planned, with one change: Telegram orphans are bounded by the
+upload horizon (lowest floor of a live pin) rather than by "ids returned
+before the earliest in-flight upload started" — the same idea, kept per
+instance in `UploadPins`. Found on the way: the orphan sweep also deleted
+parts of released (refs = 0) chunks, which read pins cannot protect; it now
+leaves every chunk-owned key to reclaim.
+
 
 1. Assign our own blob id before every upload; pin it in a process-local
    registry until the commit that references it is applied (or the upload
@@ -112,6 +123,8 @@ Protocol: meta-backends.md § `telegram` (pinned head of a chain of log batches,
    two concurrent incarnations, a straggler pinned after a claim, racing
    claimants. Settle the open Telegram questions in meta-backends.md first
    (description read after pin; straggler as the new chain's base).
+4. The log chat must not be a blob chat (the sweeper deletes every id up to
+   its horizon there): refuse such a config.
 
 ### Step 7 — Arbiter, second node, `s3` LogStore
 

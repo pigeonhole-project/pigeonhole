@@ -1,34 +1,51 @@
 # Sweep invariants / Инварианты уборки
 
-## What is live / Что считается живым
+The sweeper deletes two kinds of backend blobs: parts of **released chunks**
+(reclaim) and **orphans** — blobs no chunk owns (failed or abandoned uploads, a
+dead writer's leftovers). Both run only while the tablet holds its generation.
 
-A backend key (sort key of a blob) must **not** be deleted by the sweeper if any of:
+## Orphans: the upload horizon / Сироты: горизонт заливок
 
-1. **Committed chunk parts** — a part of a chunk in the tablet's `ChunkState` with `refs > 0` that is not reclaiming (looked up through its `(instance, sort_key)` index).
-2. **In-flight uploads** — keys registered in process-local `InflightParts` (uploaded, not yet committed by `CommitChunk` / `AddReplica`).
+Every upload is pinned **before** it sends anything (`UploadPins::pin`, in
+`PartPacker`); the pin records the highest key the instance had returned at
+that moment and is dropped only after the commit that references the part
+(`CommitChunk` / `AddReplica`) is applied, or when the upload fails. Backend
+keys grow with time (Telegram / Discord message ids, the memory store's
+counter), so whatever an in-flight upload gets lies above every pin's floor.
 
-After process restart, `InflightParts` is empty: uncommitted parts of a dead writer are garbage and may be reclaimed. Metadata itself lives in the command log, not in backend blobs, so there are no system blobs to protect.
+`UploadPins::horizon(instance)` = the lowest floor of a live pin, or the
+highest returned key when nothing is pinned. At or below it every blob of this
+process is either committed — owned by a chunk in the tablet's state — or
+garbage. The sweeper lists candidates up to the horizon and, per batch, right
+before deleting:
 
-## Per-batch liveness / Проверка на каждую пачку
+1. drops every key some chunk in the state owns (`owned_part_keys_among`,
+   live or released: released parts are reclaim's to delete);
+2. confirms the tablet still holds its generation (`MetaStore::confirm_active`,
+   a round trip through the log); a fenced incarnation deletes nothing.
 
-The sweeper must **not** snapshot the full live-key set at the start of a pass. Between listing candidates and deleting a batch, another task may `commit_chunk`. For each batch, immediately before `delete`:
+No grace period and no per-batch in-flight check are needed: a key enters the
+candidate range only after its pin is gone, i.e. after its commit is visible in
+the state. After a restart there are no pins and nothing returned yet;
+`ChunkStore::open` seeds the horizon with the highest committed key, so a dead
+writer's uploads below it are swept right away and the rest after the first new
+upload.
 
-1. consult `InflightParts::contains` (snapshot, **first**);
-2. `BlobDb::live_part_keys_among` (live chunks only).
+What the listing yields per backend:
 
-Only keys absent from both are deleted.
+- **Telegram** cannot list: every message id up to the horizon is a candidate,
+  ours or not. A chat that holds blobs must hold nothing else that matters —
+  in particular **not the Telegram LogStore** (roadmap step 6 uses its own chat).
+- **Discord** lists the channel and keeps only messages whose attachment is
+  named with one of our blob ids (`ph-<32 hex>.bin`, see `BlobId`).
+- **Memory** lists its own messages.
 
-The order matters. An `InflightGuard` is dropped only **after** its chunk is committed,
-so a key that is not in flight at step 1 but is committed afterwards is visible at
-step 2. Reading committed state first and `InflightParts` second loses exactly those
-keys: the commit and the guard drop both land between the two reads, and a live part
-is deleted.
+Residual window: a newer generation can claim the log between the confirmation
+and the delete of one batch. The deleted keys are still garbage for this
+incarnation's state and below its horizon; the newer generation's own uploads
+have higher keys than anything this process returned before them.
 
-`WatermarkBackend`’s per-`put` grace timeout only bounds a single upload; it does **not** replace `InflightParts` for the window from the first part of a chunk until commit.
-
-The guard is registered only after the part's `put` returns, and that return waits for the put watermark to be recorded. Meanwhile a *later* key's watermark (stamped before its own record) can already make this key a sweep candidate. The sweep grace must therefore exceed upload latency plus watermark-record latency; the default 15 minutes does by a wide margin, a few milliseconds does not. (Step 5 of the roadmap replaces watermarks and grace with our own blob ids.)
-
-## Chunk refcount lifecycle / Жизненный цикл чанка
+## Reclaim and reads / Освобождение и чтения
 
 ```
 live (refs ≥ 1)
@@ -37,17 +54,26 @@ live (refs ≥ 1)
 live (refs = 0)          ← still visible to Retain until BeginReclaim
   │ BeginReclaim: refs = 0 and not reclaiming → reclaiming
   ▼
-reclaiming               ← Retain → ChunkGone (command rejected, nothing retained)
-  │ delete backend parts, then DropChunk
+reclaiming               ← Retain → ChunkGone; a new read → ChunkGone
+  │ no read pins → delete backend parts, then DropChunk
   ▼
 gone
 ```
 
 - `Retain` only succeeds if every listed chunk is live with `refs > 0` (all-or-nothing).
 - `Release` rejects a double release (`refs` would go below 0); it does not clamp.
-- Chunks left `reclaiming` after a crash are finished on the next sweep pass.
-- `BeginReclaim` is committed to the log before any part is deleted: `propose` returns only after the append, so a restart or failover never brings back a reference to deleted parts (a lossy restore from a snapshot export can).
-- Orphans are judged by this incarnation's state, so right before each orphan delete batch the sweeper calls `confirm_active` (a log round trip); a fenced incarnation fails it and deletes nothing. The sweeper and repair loops end once the tablet stops. Residual window: a newer generation can claim between the confirmation and the delete; own blob ids (roadmap step 5) remove the dependence on this check.
+- `BeginReclaim` is committed to the log before any part is deleted
+  (`propose` returns only after the append), so a restart or failover never
+  brings back a reference to deleted parts (a lossy restore from a snapshot
+  export can).
+- **Read pins.** `ChunkStore::read` pins the chunks it reads
+  (`BlobDb::pin_reads`, process memory) and then checks they are not
+  reclaiming. Reclaim commits `BeginReclaim`, then checks the pins and leaves a
+  pinned chunk `reclaiming` for the next pass. One of the two always sees the
+  other: parts are never deleted under a read, and a read that starts after
+  `BeginReclaim` fails with `ChunkGone`. The S3 GET then looks the key up again
+  (the object was overwritten or deleted) — up to `GET_ATTEMPTS` times.
+- Chunks left `reclaiming` after a crash or a deferral are finished on the next pass.
 
 ## Metrics
 

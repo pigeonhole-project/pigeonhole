@@ -241,9 +241,11 @@ cheap compared to Telegram; needs an S3-compatible store with conditional writes
 - Reclaim: propose `BeginReclaim`, wait for it to be **committed** (appended),
   then delete parts, then propose `DropChunk`. A restore or failover never brings
   back a reference to deleted parts.
-- Orphan sweep needs the in-flight registry (own blob ids before upload, a later
-  step); parts become known only through committed `CommitChunk` / `AddReplica`,
-  and a fenced incarnation cannot commit, so its in-flight parts are garbage.
+- Orphan sweep: uploads are pinned before they start and unpinned after their
+  commit is applied; orphans are swept up to the pins' horizon. Parts become
+  known only through committed `CommitChunk` / `AddReplica`, and a fenced
+  incarnation cannot commit, so its in-flight parts are garbage. Reads pin the
+  chunks they read; reclaim waits for them (sweep-invariants.md).
 - After recovering from a snapshot older than the log head nothing special is
   needed: replay brings the state to the head before side effects start.
 
@@ -287,8 +289,8 @@ Each step is a separate commit with tests green.
    `durability.rs`, superblock pins, index snapshots and roots deleted.
 4. ~~Sweeper contract.~~ Done: `BeginReclaim` is committed before deletes;
    `confirm_active` before each orphan delete batch; loops end on stop.
-5. **In-flight pin registry** (own blob ids before upload) replacing put
-   watermarks, sweep grace and `InflightParts`; read pins.
+5. ~~In-flight pin registry.~~ Done: upload pins + horizon, own `BlobId`s,
+   read pins; watermarks, sweep grace and `InflightParts` removed.
 6. **`telegram` LogStore** (chain + description fence above), tested against the
    same suite as `local` with a fake chat (pins, description, sending order),
    plus a fault-injection test with two concurrent incarnations and stragglers.
