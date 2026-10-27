@@ -229,8 +229,9 @@ impl Shared {
                         }
                         last_gen = batch.gen;
                         seen_first.get_or_insert(batch.first);
-                        // Segments wholly behind a snapshot overlap it; skip them.
-                        if batch.first + batch.entries.len() as u64 > head {
+                        // Batches wholly behind a snapshot (last entry ≤ head)
+                        // are already covered by it; skip them.
+                        if batch.first + batch.entries.len() as u64 > head + 1 {
                             if batch.first != head + 1 {
                                 return Err(LogError::Lost(format!(
                                     "{}: batch at {} after head {head}",
@@ -641,6 +642,26 @@ mod tests {
 
         let err = log.discover().await.unwrap_err();
         assert!(err.to_string().contains("log format 2, this binary reads 1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_inside_a_segment_keeps_it_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = LocalLogStore::open(dir.path()).unwrap();
+        log.claim(1).await.unwrap();
+        for i in 1..=6 {
+            log.append(1, &[entry(i)]).await.unwrap();
+        }
+        // One segment holds everything; the snapshot covers half of it.
+        log.install_snapshot(1, 3, Snapshot { data: b"s3".to_vec() }).await.unwrap();
+        let d = log.discover().await.unwrap().unwrap();
+        assert_eq!(d.head.position, 6);
+        assert_eq!(read_all(&log, 3, 6).await.unwrap().len(), 3);
+
+        let log = LocalLogStore::open(dir.path()).unwrap();
+        assert_eq!(log.claim(2).await.unwrap().position, 6);
+        assert_eq!(log.append(2, &[]).await.unwrap(), 6);
+        assert_eq!(log.append(2, &[entry(7)]).await.unwrap(), 7);
     }
 
     #[tokio::test]
