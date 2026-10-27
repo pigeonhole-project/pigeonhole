@@ -124,72 +124,64 @@ use; `append` checks the generation under a lock. Fences only processes on the
 same host; durability = the disk. Default, and the reference implementation the
 others are tested against.
 
-### `telegram` — a channel or supergroup, Bot API only
+### `telegram` — one chat, Bot API only
 
-The fence is the **message id sequence**. Facts it relies on
-([updates](https://core.telegram.org/api/updates),
-[channels](https://core.telegram.org/api/channel),
-[Bot API](https://core.telegram.org/bots/api)):
+Two registers, both read with one `getChat`
+([Bot API](https://core.telegram.org/bots/api)):
 
-- every channel / supergroup has its **own** monotonically increasing
-  `message_id` sequence; every send returns the id it got;
-- private chats and basic groups share **one** sequence per account (for a bot:
-  all its private chats and basic groups), so anyone who messages the bot would
-  insert ids there — the log belongs in a channel or supergroup;
-- `getChat().pinned_message` is the full `Message` of the most recent pinned
-  message by sending date — pinning a message and calling `getChat` reads it
-  back by id (the only read-by-id the Bot API offers).
+- **head** — `pinned_message`: the full `Message` of the most recent pinned
+  message **by sending date** (pinning adds to a list; the newest-sent pinned
+  message wins);
+- **fence** — the chat `description` (`setChatDescription`), holding `gen=<g>`.
+  Available in channels, supergroups and groups; in a private chat use the bot's
+  own description (`setMyDescription` / `getMyDescription`) instead.
 
-Layout: every log message is a document holding a batch of entries **and** the
-cumulative superblock (last snapshot reference + `file_id`s of the log messages
-since it) and the writer's generation. Data blobs may share the chat.
+**Log layout — a chain.** Every log message is a document: a batch of entries,
+its generation, and a link (`file_id` + hash) to the previous log message; the
+chain ends at a snapshot document. The head of the chain is pinned. Recovery
+needs no history access: `getChat` → head → follow links with `getFile` back to
+the snapshot → apply forward.
 
-**Generation** = the `message_id` of the writer's **claim** message. Ids grow with
-time, so a later claim always has a larger generation.
+`append(g, batch)`:
+1. send the batch (link = current head, `gen = g`);
+2. pin it;
+3. `getChat`: `Ok` iff `description` is `gen=g`; otherwise `Fenced`.
 
-**Writer rule.** The writer records the id of every message it sends (log
-batches and blobs). Before acknowledging a batch that got id `m`, it waits until
-all of its sends that could have received an id below `m` have returned; then
-every id between its previous log message and `m` must be one of its own. A
-foreign id means someone else wrote — possibly a newer claim: the batch is not
-acknowledged and the writer stops (`Fenced`).
+`claim(g + 1)`:
+1. `setChatDescription("gen=g+1")` — from here on every older `append` fails step 3;
+2. `getChat` → `pinned_message` is the old head: the base;
+3. send the first batch of the new generation (link = base) and pin it.
 
-`claim()`:
-1. send a claim message; its id `c` is the new generation;
-2. read message `c − 1` (pin → `getChat` → unpin) and walk backwards past
-   foreign blobs and log messages of older generations to the newest log message
-   or claim; its cumulative superblock is the base;
-3. `getChat`-reads and the walk only touch messages sent before `c`.
+Why it is safe: an older generation acknowledged a batch only after pinning it
+and then seeing its own generation in the description — i.e. before the
+claimant's step 1. The claimant reads the head after step 1, and the head is the
+newest-sent pinned message, so it is not older than any acknowledged batch, and
+the chain behind it contains all of them.
 
-Why it is safe: to take over, a claimant must send a message, which lands as a
-foreign id in the old writer's next range, so the old writer acknowledges only
-batches sent before the claim — and those are below `c`, inside the base the
-claimant adopts (superblocks are cumulative). An old writer sends at most what it
-had in flight after the claim (one log batch, up to `upload_concurrency` blobs)
-and then stops.
+**Stragglers.** A fenced writer may still pin one batch after the claim (sent
+later, so it tops the pin) — never acknowledged. It is recognisable: its `gen` is
+below the description. The leader checks the head after its own appends and
+unpins such a message; recovery does the same before trusting the head (unpin
+while `head.gen < description gen`, re-read). At most one per fenced writer.
 
-**Foreign ids seen by the current leader.** When its own range contains foreign
-ids, the leader reads them (pin trick): a blob or a log message of an older
-generation is a straggler — accept the gap; a claim of a **newer** generation →
-stop.
-
-`discover` = `claim`: recovery starts by claiming, then reading backwards from
-`c − 1`, skipping stragglers of older generations, to the newest message of the
-newest generation.
+**Two claimants** may race on step 1 (the description is overwritten blindly).
+Each verifies after step 3 that the description still holds its generation and
+the head is its own batch; the loser stops. This only costs liveness: neither
+had acknowledged anything yet.
 
 Costs and caveats:
-- an append is **one send**; pins and `getChat` are used only to read by id (claim,
-  recovery, rare foreign ids);
-- appends are batched (one message per batch); a single chat should stay under
-  about one message per second ([Bot FAQ](https://core.telegram.org/bots/faq)),
-  groups under 20 per minute — data uploads share that budget when they share
-  the chat;
-- a log in a private chat is still safe, but any message to the bot in any
-  private chat inserts an id and makes the leader stop needlessly — only for
-  strictly personal use;
-- to verify on a live bot: dense ids in a channel under concurrent sends; the
-  pin → `getChat` → unpin read; pinning without admin rights where applicable;
-- chat admins can delete messages; hash links detect it, nothing prevents it;
+- an append is one send, one pin, one `getChat`; appends are batched — a single
+  chat should stay under about one message per second
+  ([Bot FAQ](https://core.telegram.org/bots/faq)), groups under 20 per minute;
+  data uploads share the budget if they share the chat;
+- recovery walks the chain back to the last snapshot (one `getFile` per batch),
+  so snapshots bound recovery time;
+- `setChatDescription` needs the `can_change_info` admin right; it is used only
+  on claim;
+- to verify on a live bot: `pinned_message` really is newest-by-sending-date
+  (not last-pinned); limits of `setChatDescription` / `setMyDescription`;
+- chat admins can delete or unpin messages; hash links detect it, nothing
+  prevents it;
 - the project disclaimer applies even more: this uses a chat as a database log.
 
 ### `s3` — conditional writes (later)
@@ -232,7 +224,7 @@ kind = "local"                      # local (default) | telegram | s3
 path = "pigeonhole-log"
 # kind = "telegram"                 # ship the log off-host
 # bot_token_env = "BOT_TOKEN"
-# chat_id = -1009876543210          # channel / supergroup (own id sequence)
+# chat_id = -1009876543210          # channel / supergroup (fence = description)
 
 [meta.snapshot]
 every_entries = 10000
@@ -257,14 +249,14 @@ Each step is a separate commit with tests green.
    only while active.
 5. **In-flight pin registry** (own blob ids before upload) replacing put
    watermarks, sweep grace and `InflightParts`; read pins.
-6. **`telegram` LogStore** (message-id fence above), tested against the same
-   suite as `local` (with a fake chat that assigns ids), plus a fault-injection
-   test with two concurrent incarnations and stragglers.
+6. **`telegram` LogStore** (chain + description fence above), tested against the
+   same suite as `local` with a fake chat (pins, description, sending order),
+   plus a fault-injection test with two concurrent incarnations and stragglers.
 7. **Arbiter** and a second node; `s3` LogStore.
 
 ## Open questions / Открытые вопросы
 
 - Snapshot format: SQLite file image (simple) or a logical dump per namespace?
-- Telegram: confirm dense per-channel ids under concurrent sends and the
-  pin-to-read trick on a live bot.
+- Telegram: confirm `pinned_message` is newest-by-sending-date and the limits of
+  `setChatDescription` / `setMyDescription` on a live bot.
 - Batch size / delay defaults per LogStore kind.
