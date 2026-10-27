@@ -1,6 +1,6 @@
 //! Chunk-store metadata: queries plus the proposer side of the `chunk` namespace.
 //!
-//! Chunk state (instances, chunks, blocks, parts, roots) changes only through
+//! Chunk state (instances, chunks, blocks, parts) changes only through
 //! commands applied by [`crate::commands::ChunkNamespace`]. Node-local
 //! operational tables (put watermarks, sweep cursor, repair queue) are written
 //! directly: they are progress of this node, not replicated state.
@@ -135,12 +135,6 @@ pub(crate) const SCHEMA: &[&str] = &[
         locator BLOB NOT NULL,
         PRIMARY KEY (chunk_id, instance_id, part_no),
         UNIQUE (instance_id, sort_key)
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS chunk_roots (
-        name TEXT PRIMARY KEY NOT NULL,
-        extents_json TEXT NOT NULL DEFAULT '[]'
     )
     "#,
     r#"
@@ -281,50 +275,6 @@ impl BlobDb {
         }))
         .await?;
         Ok(chunk_id)
-    }
-
-    pub async fn set_root(&self, name: &str, extents: &[Extent]) -> Result<()> {
-        self.propose_infallible(pb::command::Op::SetRoot(pb::SetRoot {
-            name: name.into(),
-            extents: extents.iter().map(pb::Extent::from).collect(),
-        }))
-        .await
-    }
-
-    pub async fn get_root(&self, name: &str) -> Result<Option<Vec<Extent>>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT extents_json FROM chunk_roots WHERE name = ?")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
-        match row {
-            None => Ok(None),
-            Some((json,)) => {
-                let extents: Vec<Extent> =
-                    serde_json::from_str(&json).context("parse root extents_json")?;
-                Ok(Some(extents))
-            }
-        }
-    }
-
-    /// All named roots (for purge / release-all).
-    pub async fn list_roots(&self) -> Result<Vec<(String, Vec<Extent>)>> {
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT name, extents_json FROM chunk_roots ORDER BY name")
-                .fetch_all(&self.pool)
-                .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (name, json) in rows {
-            let extents: Vec<Extent> =
-                serde_json::from_str(&json).context("parse root extents_json")?;
-            out.push((name, extents));
-        }
-        Ok(out)
-    }
-
-    pub async fn delete_root(&self, name: &str) -> Result<()> {
-        self.propose_infallible(pb::command::Op::DeleteRoot(pb::DeleteRoot { name: name.into() }))
-            .await
     }
 
     /// Atomically bump refs for every id. Fails with [`ChunkGone`] (nothing retained)
@@ -752,18 +702,6 @@ mod tests {
             .await
             .unwrap();
         let _ = chunk_id;
-        db.set_root(
-            "s3/index",
-            &[Extent {
-                chunk: id2,
-                offset: 0,
-                len: 32,
-            }],
-        )
-        .await
-        .unwrap();
-        let root = db.get_root("s3/index").await.unwrap().unwrap();
-        assert_eq!(root[0].chunk, id2);
         db.retain(&[id2]).await.unwrap();
         db.release(&[id2]).await.unwrap();
         assert_eq!(db.chunk_meta(id2).await.unwrap().unwrap().2, 1);

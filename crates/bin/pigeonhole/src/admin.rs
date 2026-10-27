@@ -7,8 +7,8 @@ use pigeonhole::index::Index;
 use pigeonhole_chunk_store::Sweeper;
 use tracing::{info, warn};
 
-/// Release all roots, delete every upload, object and bucket (releasing their
-/// chunks). Backend blobs are then reclaimed by the sweeper.
+/// Delete every upload, object and bucket, releasing their chunks. Backend
+/// blobs are then reclaimed by the sweeper.
 pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     if cfg
@@ -28,28 +28,17 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
     let index = Index::open(rt.meta.clone()).await.context("open index")?;
     let objects = index.count_objects().await.unwrap_or(0);
     let buckets = index.count_buckets().await.unwrap_or(0);
-    let roots = rt.store.db().list_roots().await.context("list roots")?;
     info!(
         scope_id = %scope,
         objects,
         buckets,
-        roots = roots.len(),
-        "purge plan: release all roots, wipe gateway index"
+        "purge plan: delete every upload, object and bucket"
     );
     if !yes {
         bail!(
-            "refusing to purge (scope_id={scope}, objects={objects}, roots={}). \
-             Re-run with: pigeonhole purge --yes [--expect-chat {scope}]",
-            roots.len(),
+            "refusing to purge (scope_id={scope}, objects={objects}). \
+             Re-run with: pigeonhole purge --yes [--expect-chat {scope}]"
         );
-    }
-
-    for (name, extents) in &roots {
-        let ids: Vec<_> = extents.iter().map(|e| e.chunk).collect();
-        if !ids.is_empty() {
-            rt.store.release(&ids).await.with_context(|| format!("release root {name}"))?;
-        }
-        rt.store.db().delete_root(name).await?;
     }
 
     let released = index.delete_everything().await.context("delete gateway index")?;
@@ -67,6 +56,6 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
         ),
         Err(e) => warn!(error = %e, "purge sweeper pass failed; background sweeper will retry"),
     }
-    info!("purge complete: roots released, gateway index wiped");
+    info!("purge complete: gateway index emptied, chunks released");
     Ok(())
 }

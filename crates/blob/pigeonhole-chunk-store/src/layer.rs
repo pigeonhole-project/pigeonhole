@@ -150,14 +150,6 @@ impl ChunkStore {
         Ok(chunk_id)
     }
 
-    pub async fn set_root(&self, name: &str, extents: &[Extent]) -> Result<()> {
-        self.db.set_root(name, extents).await
-    }
-
-    pub async fn get_root(&self, name: &str) -> Result<Option<Vec<Extent>>> {
-        self.db.get_root(name).await
-    }
-
     pub async fn retain(&self, ids: &[ChunkId]) -> Result<()> {
         self.db.retain(ids).await
     }
@@ -727,15 +719,6 @@ mod tests {
         let ids: Vec<_> = ingested.extents.iter().map(|e| e.chunk).collect();
         layer.retain(&ids).await.unwrap();
         layer.release(&ids).await.unwrap();
-
-        let small = layer.put_small(Bytes::from_static(b"snap")).await.unwrap();
-        let root_ext = vec![Extent {
-            chunk: small,
-            offset: 0,
-            len: 4,
-        }];
-        layer.set_root("s3/index", &root_ext).await.unwrap();
-        assert_eq!(layer.get_root("s3/index").await.unwrap(), Some(root_ext));
     }
 
     #[tokio::test]

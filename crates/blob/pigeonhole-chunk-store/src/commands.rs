@@ -1,7 +1,7 @@
 //! The chunk-store namespace of the metadata state machine.
 //!
 //! [`ChunkNamespace::apply`] is the only code that writes chunk state (instances,
-//! chunks, blocks, parts, roots, the chunk id high-water mark). It must stay
+//! chunks, blocks, parts, the chunk id high-water mark). It must stay
 //! deterministic: no clocks, no id generation, no metrics — those belong to the
 //! proposer in [`crate::BlobDb`].
 
@@ -42,8 +42,6 @@ impl Namespace for ChunkNamespace {
             Op::CommitChunk(c) => commit_chunk(conn, c).await,
             Op::Retain(c) => retain(conn, &c.chunk_ids).await,
             Op::Release(c) => release(conn, &c.chunk_ids).await,
-            Op::SetRoot(c) => set_root(conn, c).await,
-            Op::DeleteRoot(c) => delete_root(conn, &c.name).await,
             Op::BeginReclaim(c) => begin_reclaim(conn, c.chunk_id).await,
             Op::DropChunk(c) => drop_chunk(conn, c.chunk_id).await,
             Op::AddReplica(c) => add_replica(conn, c).await,
@@ -219,29 +217,6 @@ async fn release(conn: &mut SqliteConnection, ids: &[ChunkId]) -> Result<Applied
     ok()
 }
 
-async fn set_root(conn: &mut SqliteConnection, c: pb::SetRoot) -> Result<Applied> {
-    let extents: Vec<Extent> = c.extents.into_iter().map(Extent::from).collect();
-    let json = serde_json::to_string(&extents).context("serialize root extents")?;
-    sqlx::query(
-        r#"
-        INSERT INTO chunk_roots (name, extents_json) VALUES (?, ?)
-        ON CONFLICT(name) DO UPDATE SET extents_json = excluded.extents_json
-        "#,
-    )
-    .bind(&c.name)
-    .bind(&json)
-    .execute(&mut *conn)
-    .await?;
-    ok()
-}
-
-async fn delete_root(conn: &mut SqliteConnection, name: &str) -> Result<Applied> {
-    sqlx::query("DELETE FROM chunk_roots WHERE name = ?")
-        .bind(name)
-        .execute(&mut *conn)
-        .await?;
-    ok()
-}
 
 async fn begin_reclaim(conn: &mut SqliteConnection, id: ChunkId) -> Result<Applied> {
     let res = sqlx::query(
