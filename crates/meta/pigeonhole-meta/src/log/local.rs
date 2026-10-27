@@ -15,14 +15,13 @@
 //! `claim` truncates it. Anything else that does not parse is [`LogError::Lost`].
 //! Fences only processes on this host; durability = the disk.
 
-use super::pb::Batch;
 use super::{
-    Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position, Snapshot,
+    Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position,
+    Snapshot,
 };
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
-use prost::Message;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -257,6 +256,9 @@ impl Shared {
                             path.display()
                         )));
                     }
+                    Record::Unreadable(why) => {
+                        return Err(LogError::Lost(format!("{}: {why}", path.display())));
+                    }
                 }
             }
             if let Some(f) = seen_first {
@@ -322,7 +324,7 @@ impl Shared {
         }
 
         let n = entries.len() as u64;
-        let record = encode_record(&Batch { gen, first: o.head + 1, entries });
+        let record = encode_record(&Batch::new(gen, o.head + 1, entries));
         let (f, len, _) = o.seg.as_mut().unwrap();
         let write = f.write_all(&record).and_then(|()| f.sync_data());
         if let Err(e) = write {
@@ -372,11 +374,17 @@ impl Shared {
         let mut out = Vec::new();
         let mut off = 0;
         while off < data.len() && st.next <= st.head {
-            let Record::Ok(batch, len) = decode_record(&data[off..]) else {
-                return Err(LogError::Lost(format!(
-                    "{}: bad record at offset {off}",
-                    path.display()
-                )));
+            let (batch, len) = match decode_record(&data[off..]) {
+                Record::Ok(batch, len) => (batch, len),
+                Record::Unreadable(why) => {
+                    return Err(LogError::Lost(format!("{}: {why}", path.display())));
+                }
+                Record::Torn | Record::Corrupt => {
+                    return Err(LogError::Lost(format!(
+                        "{}: bad record at offset {off}",
+                        path.display()
+                    )));
+                }
             };
             off += len;
             for (i, entry) in batch.entries.into_iter().enumerate() {
@@ -439,7 +447,7 @@ fn numbered(dir: &Path, prefix: &str, suffix: &str) -> LogResult<Vec<(u64, PathB
 }
 
 fn encode_record(batch: &Batch) -> Vec<u8> {
-    let payload = batch.encode_to_vec();
+    let payload = batch.encode();
     let mut out = Vec::with_capacity(HEADER + payload.len());
     out.extend_from_slice(&MAGIC.to_le_bytes());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -453,6 +461,9 @@ enum Record {
     /// Ends past the end of the data or fails its checksum as the last record.
     Torn,
     Corrupt,
+    /// Intact (checksum matches) but not a batch this binary reads, e.g.
+    /// another log format.
+    Unreadable(String),
 }
 
 fn decode_record(data: &[u8]) -> Record {
@@ -472,7 +483,8 @@ fn decode_record(data: &[u8]) -> Record {
     }
     match Batch::decode(payload) {
         Ok(b) => Record::Ok(b, HEADER + len),
-        Err(_) => Record::Corrupt,
+        Err(LogError::Lost(why)) => Record::Unreadable(why),
+        Err(e) => Record::Unreadable(e.to_string()),
     }
 }
 
@@ -482,7 +494,7 @@ mod tests {
     use futures::TryStreamExt;
 
     fn entry(i: u64) -> Entry {
-        Entry { namespace: "t".into(), command: i.to_le_bytes().to_vec() }
+        Entry { namespace: "t".into(), version: 1, command: i.to_le_bytes().to_vec() }
     }
 
     async fn read_all(log: &dyn LogStore, from: Position, head: Position) -> LogResult<Vec<(Position, Entry)>> {
@@ -542,7 +554,7 @@ mod tests {
         log.claim(1).await.unwrap();
         log.append(1, &[entry(1)]).await.unwrap();
         let (_, seg) = log.shared.segments().unwrap().pop().unwrap();
-        let mut torn = encode_record(&Batch { gen: 1, first: 2, entries: vec![entry(2)] });
+        let mut torn = encode_record(&Batch::new(1, 2, vec![entry(2)]));
         torn.truncate(torn.len() - 3);
         OpenOptions::new().append(true).open(&seg).unwrap().write_all(&torn).unwrap();
 
@@ -612,6 +624,23 @@ mod tests {
         fs::remove_file(d1.path().join("log_id")).unwrap();
         assert!(matches!(a.claim(2).await, Err(LogError::Lost(_))));
         assert!(matches!(a.discover().await, Err(LogError::Lost(_))));
+    }
+
+    #[tokio::test]
+    async fn batches_of_another_log_format_are_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = LocalLogStore::open(dir.path()).unwrap();
+        log.claim(1).await.unwrap();
+        log.append(1, &[entry(1)]).await.unwrap();
+        let (_, seg) = log.shared.segments().unwrap().pop().unwrap();
+        let mut future = Batch::new(1, 2, vec![entry(2)]);
+        future.format = crate::LOG_FORMAT + 1;
+        let mut tail = encode_record(&future);
+        tail.extend_from_slice(&encode_record(&Batch::new(1, 3, vec![entry(3)])));
+        OpenOptions::new().append(true).open(&seg).unwrap().write_all(&tail).unwrap();
+
+        let err = log.discover().await.unwrap_err();
+        assert!(err.to_string().contains("log format 2, this binary reads 1"), "{err}");
     }
 
     #[tokio::test]

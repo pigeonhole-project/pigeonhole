@@ -8,7 +8,7 @@ use crate::commands::{from_pb, pb, to_pb, CasState, NAMESPACE};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
-use pigeonhole_meta::{Applied, MetaStore, Namespaces};
+use pigeonhole_meta::{MetaStore, Namespaces};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -57,9 +57,9 @@ impl CasIndex {
 
     async fn propose(&self, op: pb::command::Op) -> Result<Vec<u8>> {
         let cmd = pb::Command { op: Some(op) }.encode_to_vec();
-        match self.meta.propose(NAMESPACE, &cmd).await?.applied {
-            Applied::Commit(reply) => Ok(reply),
-            Applied::Reject(_) => anyhow::bail!("cas commands are never rejected"),
+        match self.meta.propose::<CasState>(cmd).await? {
+            Ok(reply) => Ok(reply),
+            Err(_) => anyhow::bail!("cas commands are never rejected"),
         }
     }
 

@@ -104,23 +104,3 @@ message AddReplica {
   int64 chunk_id = 1;
   Replica replica = 2;
 }
-
-// Logical dump of the namespace; instances by id, chunks by id.
-message Snapshot {
-  repeated Instance instances = 1;
-  repeated ChunkState chunks = 2;
-  // Highest chunk id ever committed (ids are never reused).
-  int64 last_chunk_id = 3;
-}
-
-message ChunkState {
-  int64 chunk_id = 1;
-  int64 logical_size = 2;
-  uint32 crc32 = 3;
-  int64 refs = 4;
-  bool reclaiming = 5;
-  string created_at = 6;
-  repeated Block blocks = 7;
-  // Ordered by instance id.
-  repeated Replica replicas = 8;
-}

@@ -9,7 +9,7 @@ use crate::commands::{pb, ChunkRec, ChunkState, NAMESPACE};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use pigeonhole_blob::{InstanceInfo, ReplicaLayout};
-use pigeonhole_meta::{Applied, MetaStore, Namespaces};
+use pigeonhole_meta::{MetaStore, Namespaces};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -120,9 +120,9 @@ impl BlobDb {
     /// Propose one chunk command; `Err(reason)` is a deterministic rejection.
     async fn propose(&self, op: pb::command::Op) -> Result<Result<(), pb::rejection::Reason>> {
         let cmd = pb::Command { op: Some(op) }.encode_to_vec();
-        match self.meta.propose(NAMESPACE, &cmd).await?.applied {
-            Applied::Commit(_) => Ok(Ok(())),
-            Applied::Reject(bytes) => Ok(Err(pb::Rejection::decode(bytes.as_slice())?
+        match self.meta.propose::<ChunkState>(cmd).await? {
+            Ok(_) => Ok(Ok(())),
+            Err(bytes) => Ok(Err(pb::Rejection::decode(bytes.as_slice())?
                 .reason
                 .context("rejection without reason")?)),
         }
@@ -638,6 +638,35 @@ mod tests {
         let replayed = BlobDb::connect(dir.path().join("blob.log")).await.unwrap();
         let after = replayed.insert_chunk(8, 1).await.unwrap();
         assert!(after > new, "chunk id {new} reused as {after} after replay");
+    }
+
+    #[tokio::test]
+    async fn decoded_state_rebuilds_the_key_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::connect(dir.path().join("blob.log")).await.unwrap();
+        db.sync_instances(&[InstanceInfo {
+            id: "mem".into(),
+            kind: InstanceKind::Memory,
+            fingerprint: "memory:mem".into(),
+            location: "memory:mem".into(),
+            role: InstanceRole::ReadWrite,
+        }])
+        .await
+        .unwrap();
+        for key in 1..=3u8 {
+            let part = PartLayout {
+                first_block: 0,
+                block_count: 0,
+                locator: BlobLocator { key: vec![key], locator: b"{}".to_vec() },
+                block_stored_lens: vec![],
+            };
+            let replica = ReplicaLayout { instance: "mem".into(), parts: vec![part] };
+            db.commit_chunk(1, 1, &[], &[replica]).await.unwrap();
+        }
+        let (bytes, index) = db.read(|s| (pigeonhole_meta::encode_state(s), s.by_key.clone()));
+        let decoded = pigeonhole_meta::decode_state::<ChunkState>(&bytes).unwrap();
+        assert_eq!(index.len(), 3);
+        assert_eq!(decoded.by_key, index);
     }
 
     #[tokio::test]

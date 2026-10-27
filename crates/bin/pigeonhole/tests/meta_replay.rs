@@ -9,7 +9,7 @@ use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_gateway_s3::S3State;
 use pigeonhole_chunk_store::ChunkState;
-use pigeonhole_meta::{LocalLogStore, MetaOptions, MetaStore, Namespaces, StateMachine};
+use pigeonhole_meta::{decode_state, encode_state, LocalLogStore, MetaOptions, MetaStore, Namespaces};
 use s3s::dto::*;
 use s3s::{S3Request, S3};
 use std::path::Path;
@@ -42,7 +42,7 @@ async fn tablet(dir: &Path) -> Arc<MetaStore> {
 
 /// Logical snapshots of both namespaces: equal bytes = equal state.
 fn replicated_state(meta: &MetaStore) -> (Vec<u8>, Vec<u8>) {
-    (meta.read::<ChunkState, _>(|s| s.snapshot()), meta.read::<S3State, _>(|s| s.snapshot()))
+    (meta.read::<ChunkState, _>(encode_state), meta.read::<S3State, _>(encode_state))
 }
 
 #[tokio::test]
@@ -93,6 +93,6 @@ async fn replay_rebuilds_chunk_and_s3_state() {
     assert_eq!(replayed.applied_position(), position);
     assert_eq!(replicated_state(&replayed), before);
     let (chunk, s3) = &before;
-    assert_eq!(&ChunkState::restore(chunk).unwrap().snapshot(), chunk, "restore inverts snapshot");
-    assert_eq!(&S3State::restore(s3).unwrap().snapshot(), s3, "restore inverts snapshot");
+    assert_eq!(&encode_state(&decode_state::<ChunkState>(chunk).unwrap()), chunk, "decode inverts encode");
+    assert_eq!(&encode_state(&decode_state::<S3State>(s3).unwrap()), s3, "decode inverts encode");
 }

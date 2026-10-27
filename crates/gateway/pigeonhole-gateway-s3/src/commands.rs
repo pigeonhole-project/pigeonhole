@@ -8,7 +8,11 @@
 
 use anyhow::{bail, Context, Result};
 use pigeonhole_chunk_store::{ChunkId, Extent};
-use pigeonhole_meta::{Applied, StateMachine};
+use pigeonhole_meta::{Outcome, StateMachine};
+use serde::{Deserialize, Serialize};
+
+/// Proto-encoded reply or rejection (until the commands move to serde).
+type Applied = std::result::Result<Vec<u8>, Vec<u8>>;
 use prost::Message;
 use std::collections::BTreeMap;
 
@@ -20,13 +24,13 @@ use pb::rejection::Reason;
 
 pub(crate) const NAMESPACE: &str = "s3";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BucketRec {
     pub created_at: String,
     pub scope_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ObjectRec {
     pub etag: String,
     pub size: i64,
@@ -39,7 +43,7 @@ pub(crate) struct ObjectRec {
     pub tags: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UploadRec {
     pub bucket: String,
     pub key: String,
@@ -51,7 +55,7 @@ pub(crate) struct UploadRec {
     pub parts: BTreeMap<i64, PartRec>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PartRec {
     pub etag: String,
     pub size: i64,
@@ -59,7 +63,7 @@ pub(crate) struct PartRec {
 }
 
 /// Buckets, objects (by `(bucket, key)`, byte order) and uploads (by id).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct S3State {
     pub(crate) buckets: BTreeMap<String, BucketRec>,
     pub(crate) objects: BTreeMap<(String, String), ObjectRec>,
@@ -68,10 +72,14 @@ pub struct S3State {
 
 impl StateMachine for S3State {
     const NAME: &'static str = NAMESPACE;
+    const VERSION: u32 = 1;
+    type Command = Vec<u8>;
+    type Reply = Vec<u8>;
+    type Reject = Vec<u8>;
 
-    fn apply(&mut self, command: &[u8]) -> Result<Applied> {
+    fn apply(&mut self, command: Vec<u8>) -> Result<Outcome<Self>> {
         use pb::command::Op;
-        let cmd = pb::Command::decode(command).context("decode s3 command")?;
+        let cmd = pb::Command::decode(command.as_slice()).context("decode s3 command")?;
         match cmd.op.context("empty s3 command")? {
             Op::CreateBucket(c) => Ok(self.create_bucket(c)),
             Op::DeleteBucket(c) => Ok(self.delete_bucket(&c.name)),
@@ -84,111 +92,6 @@ impl StateMachine for S3State {
             Op::CompleteUpload(c) => Ok(self.complete_upload(c)),
             Op::AbortUpload(c) => Ok(self.abort_upload(&c.upload_id)),
         }
-    }
-
-    fn snapshot(&self) -> Vec<u8> {
-        let buckets = self
-            .buckets
-            .iter()
-            .map(|(name, b)| pb::BucketState {
-                name: name.clone(),
-                created_at: b.created_at.clone(),
-                scope_id: b.scope_id.clone(),
-            })
-            .collect();
-        let objects = self
-            .objects
-            .iter()
-            .map(|((bucket, key), o)| pb::ObjectState {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                etag: o.etag.clone(),
-                size: o.size,
-                content_type: o.content_type.clone(),
-                mtime: o.mtime.clone(),
-                checksums_json: o.checksums_json.clone(),
-                extents: to_pb(&o.extents),
-                user_meta: map_to_pairs(&o.user_meta),
-                tags: map_to_pairs(&o.tags),
-            })
-            .collect();
-        let uploads = self
-            .uploads
-            .iter()
-            .map(|(id, u)| pb::UploadState {
-                upload_id: id.clone(),
-                bucket: u.bucket.clone(),
-                key: u.key.clone(),
-                content_type: u.content_type.clone(),
-                user_meta: map_to_pairs(&u.user_meta),
-                tags: map_to_pairs(&u.tags),
-                checksum_algorithm: u.checksum_algorithm.clone(),
-                initiated_at: u.initiated_at.clone(),
-                parts: u
-                    .parts
-                    .iter()
-                    .map(|(n, p)| pb::PartState {
-                        part_number: *n,
-                        etag: p.etag.clone(),
-                        size: p.size,
-                        extents: to_pb(&p.extents),
-                    })
-                    .collect(),
-            })
-            .collect();
-        pb::Snapshot { buckets, objects, uploads }.encode_to_vec()
-    }
-
-    fn restore(data: &[u8]) -> Result<Self> {
-        let snap = pb::Snapshot::decode(data).context("decode s3 snapshot")?;
-        let buckets = snap
-            .buckets
-            .into_iter()
-            .map(|b| (b.name, BucketRec { created_at: b.created_at, scope_id: b.scope_id }))
-            .collect();
-        let objects = snap
-            .objects
-            .into_iter()
-            .map(|o| {
-                let rec = ObjectRec {
-                    etag: o.etag,
-                    size: o.size,
-                    content_type: o.content_type,
-                    mtime: o.mtime,
-                    checksums_json: o.checksums_json,
-                    extents: from_pb(&o.extents),
-                    user_meta: pairs_to_map(o.user_meta),
-                    tags: pairs_to_map(o.tags),
-                };
-                ((o.bucket, o.key), rec)
-            })
-            .collect();
-        let uploads = snap
-            .uploads
-            .into_iter()
-            .map(|u| {
-                let parts = u
-                    .parts
-                    .into_iter()
-                    .map(|p| {
-                        let rec = PartRec { etag: p.etag, size: p.size, extents: from_pb(&p.extents) };
-                        (p.part_number, rec)
-                    })
-                    .collect();
-                let rec = UploadRec {
-                    bucket: u.bucket,
-                    key: u.key,
-                    content_type: u.content_type,
-                    user_meta: pairs_to_map(u.user_meta),
-                    tags: pairs_to_map(u.tags),
-                    checksum_algorithm: u.checksum_algorithm,
-                    initiated_at: u.initiated_at,
-                    parts,
-                };
-                (u.upload_id, rec)
-            })
-            .collect();
-        Ok(Self { buckets, objects, uploads })
     }
 }
 
@@ -332,17 +235,17 @@ impl S3State {
 }
 
 fn ok() -> Applied {
-    Applied::Commit(Vec::new())
+    Ok(Vec::new())
 }
 
 fn released(mut chunk_ids: Vec<ChunkId>) -> Applied {
     chunk_ids.sort_unstable();
     chunk_ids.dedup();
-    Applied::Commit(pb::Released { chunk_ids }.encode_to_vec())
+    Ok(pb::Released { chunk_ids }.encode_to_vec())
 }
 
 fn reject(reason: Reason) -> Applied {
-    Applied::Reject(pb::Rejection { reason: Some(reason) }.encode_to_vec())
+    Err(pb::Rejection { reason: Some(reason) }.encode_to_vec())
 }
 
 fn chunk_ids(extents: &[Extent]) -> Vec<ChunkId> {
@@ -366,10 +269,4 @@ fn from_pb(extents: &[pb::Extent]) -> Vec<Extent> {
 /// Later duplicates of a name win, as a repeated header would.
 fn pairs_to_map(pairs: Vec<pb::Pair>) -> BTreeMap<String, String> {
     pairs.into_iter().map(|p| (p.name, p.value)).collect()
-}
-
-fn map_to_pairs(map: &BTreeMap<String, String>) -> Vec<pb::Pair> {
-    map.iter()
-        .map(|(name, value)| pb::Pair { name: name.clone(), value: value.clone() })
-        .collect()
 }

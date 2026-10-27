@@ -2,48 +2,39 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Toy namespace. Command = op id (u64) + signed delta (i64) for a counter;
-/// every committed op is recorded; going negative is rejected.
-#[derive(Default)]
+/// Toy namespace: a counter; every committed op is recorded; going negative
+/// is rejected.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Counter {
     v: i64,
     ops: BTreeMap<u64, i64>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Op {
+    id: u64,
+    delta: i64,
+}
+
 impl StateMachine for Counter {
     const NAME: &'static str = "counter";
+    const VERSION: u32 = 1;
+    type Command = Op;
+    type Reply = i64;
+    type Reject = &'static str;
 
-    fn apply(&mut self, command: &[u8]) -> Result<Applied> {
-        let id = u64::from_le_bytes(command[..8].try_into().context("op id")?);
-        let delta = i64::from_le_bytes(command[8..].try_into().context("8-byte delta")?);
-        if self.v + delta < 0 {
-            return Ok(Applied::Reject(b"negative".to_vec()));
+    fn apply(&mut self, op: Op) -> Result<Outcome<Self>> {
+        if self.v + op.delta < 0 {
+            return Ok(Err("negative"));
         }
-        self.v += delta;
-        self.ops.insert(id, delta);
-        Ok(Applied::Commit(self.v.to_le_bytes().to_vec()))
-    }
-
-    fn snapshot(&self) -> Vec<u8> {
-        let mut out = self.v.to_le_bytes().to_vec();
-        for (id, delta) in &self.ops {
-            out.extend_from_slice(&op(*id, *delta));
-        }
-        out
-    }
-
-    fn restore(data: &[u8]) -> Result<Self> {
-        let v = i64::from_le_bytes(data[..8].try_into()?);
-        let ops = data[8..]
-            .chunks(16)
-            .map(|c| Ok((u64::from_le_bytes(c[..8].try_into()?), i64::from_le_bytes(c[8..].try_into()?))))
-            .collect::<Result<_>>()?;
-        Ok(Self { v, ops })
+        self.v += op.delta;
+        self.ops.insert(op.id, op.delta);
+        Ok(Ok(self.v))
     }
 }
 
-fn op(id: u64, delta: i64) -> Vec<u8> {
-    [id.to_le_bytes(), delta.to_le_bytes()].concat()
+fn op(id: u64, delta: i64) -> Op {
+    Op { id, delta }
 }
 
 fn counter() -> Namespaces {
@@ -63,7 +54,7 @@ fn op_ids(store: &MetaStore) -> Vec<u64> {
 }
 
 fn snapshot(store: &MetaStore) -> Vec<u8> {
-    store.read::<Counter, _>(|c| c.snapshot())
+    store.read::<Counter, _>(encode_state)
 }
 
 #[tokio::test]
@@ -71,13 +62,8 @@ async fn commit_and_reject_both_consume_a_position() {
     let dir = tempfile::tempdir().unwrap();
     let store = open_on(dir.path()).await;
     assert_eq!(store.generation(), 1);
-    let r = store.propose("counter", &op(1, 5)).await.unwrap();
-    assert_eq!(r.position, 1);
-    assert_eq!(r.applied, Applied::Commit(5i64.to_le_bytes().to_vec()));
-
-    let r = store.propose("counter", &op(2, -7)).await.unwrap();
-    assert_eq!(r.position, 2);
-    assert_eq!(r.applied, Applied::Reject(b"negative".to_vec()));
+    assert_eq!(store.propose_at::<Counter>(op(1, 5)).await.unwrap(), (1, Ok(5)));
+    assert_eq!(store.propose_at::<Counter>(op(2, -7)).await.unwrap(), (2, Err("negative")));
     assert_eq!(value(&store), 5, "rejected command must not change state");
     assert_eq!(op_ids(&store), vec![1]);
     assert_eq!(store.applied_position(), 2);
@@ -85,9 +71,21 @@ async fn commit_and_reject_both_consume_a_position() {
 
 #[tokio::test]
 async fn unknown_namespace_fails_without_a_position() {
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Other;
+    impl StateMachine for Other {
+        const NAME: &'static str = "other";
+        const VERSION: u32 = 1;
+        type Command = ();
+        type Reply = ();
+        type Reject = ();
+        fn apply(&mut self, _: ()) -> Result<Outcome<Self>> {
+            Ok(Ok(()))
+        }
+    }
     let dir = tempfile::tempdir().unwrap();
     let store = open_on(dir.path()).await;
-    assert!(store.propose("nope", &[]).await.is_err());
+    assert!(store.propose::<Other>(()).await.is_err());
     assert_eq!(store.applied_position(), 0);
 
     let twice = Namespaces::new().with::<Counter>().with::<Counter>();
@@ -104,12 +102,12 @@ async fn concurrent_proposals_get_distinct_positions() {
         let tasks: Vec<_> = (0..32)
             .map(|i| {
                 let s = store.clone();
-                tokio::spawn(async move { s.propose("counter", &op(i, 1)).await })
+                tokio::spawn(async move { s.propose_at::<Counter>(op(i, 1)).await })
             })
             .collect();
         let mut positions = Vec::new();
         for t in tasks {
-            positions.push(t.await.unwrap().unwrap().position);
+            positions.push(t.await.unwrap().unwrap().0);
         }
         positions.sort_unstable();
         assert_eq!(positions, (1..=32).collect::<Vec<_>>());
@@ -124,11 +122,11 @@ async fn replay_yields_identical_state() {
     for i in 0..300u64 {
         // Every fifth op would go negative and is rejected.
         let delta = if i % 5 == 4 { -1000 } else { i as i64 % 7 };
-        a.propose("counter", &op(i, delta)).await.unwrap();
+        let _ = a.propose::<Counter>(op(i, delta)).await.unwrap();
     }
     assert_eq!(a.applied_position(), 300);
     let snap = snapshot(&a);
-    assert_eq!(Counter::restore(&snap).unwrap().snapshot(), snap, "restore inverts snapshot");
+    assert_eq!(encode_state(&decode_state::<Counter>(&snap).unwrap()), snap, "decode inverts encode");
 
     let b = open_on(dir.path()).await;
     assert_eq!(b.generation(), 2);
@@ -148,7 +146,7 @@ async fn second_incarnation_fences_the_first_without_losing_acknowledged_entries
         tokio::spawn(async move {
             let mut acked = Vec::new();
             for id in 0.. {
-                match a.propose("counter", &op(id, 1)).await {
+                match a.propose::<Counter>(op(id, 1)).await {
                     Ok(_) => acked.push(id),
                     Err(e) => {
                         let stop = e.downcast::<Stop>().expect("a Stop error");
@@ -165,14 +163,14 @@ async fn second_incarnation_fences_the_first_without_losing_acknowledged_entries
 
     assert_eq!(stop, Stop::Fenced { current: 2 });
     assert_eq!(a.stopped().await, Stop::Fenced { current: 2 });
-    assert!(a.propose("counter", &op(u64::MAX >> 1, 1)).await.is_err());
+    assert!(a.propose::<Counter>(op(u64::MAX >> 1, 1)).await.is_err());
     assert!(!acked.is_empty(), "A acknowledged something before the fence");
 
     // B holds exactly A's acknowledged entries: nothing lost, nothing extra.
     assert_eq!(op_ids(&b), acked);
     assert_eq!(snapshot(&a), snapshot(&b));
 
-    b.propose("counter", &op(1 << 40, 1)).await.unwrap();
+    b.propose::<Counter>(op(1 << 40, 1)).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -180,13 +178,12 @@ async fn crash_between_append_and_apply_is_applied_once_on_boot() {
     let dir = tempfile::tempdir().unwrap();
     {
         let a = open_on(dir.path()).await;
-        a.propose("counter", &op(1, 1)).await.unwrap();
+        a.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
     }
     // An incarnation that appended a batch and died before applying it.
     let log = LocalLogStore::open(dir.path().join("log")).unwrap();
     assert_eq!(log.claim(2).await.unwrap().position, 1);
-    let entry = Entry { namespace: "counter".into(), command: op(2, 5) };
-    assert_eq!(log.append(2, &[entry]).await.unwrap(), 2);
+    assert_eq!(log.append(2, &[entry::<Counter>(&op(2, 5))]).await.unwrap(), 2);
 
     for expected_gen in [3, 4] {
         let a = open_on(dir.path()).await;
@@ -195,4 +192,21 @@ async fn crash_between_append_and_apply_is_applied_once_on_boot() {
         assert_eq!(value(&a), 6);
         assert_eq!(op_ids(&a), vec![1, 2]);
     }
+}
+
+#[tokio::test]
+async fn entries_of_another_command_format_refuse_to_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let a = open_on(dir.path()).await;
+        a.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
+    }
+    let log = LocalLogStore::open(dir.path().join("log")).unwrap();
+    log.claim(2).await.unwrap();
+    let mut old = entry::<Counter>(&op(2, 1));
+    old.version = Counter::VERSION + 1;
+    log.append(2, &[old]).await.unwrap();
+
+    let err = MetaStore::open_local(dir.path().join("log"), counter()).await.err().expect("boot must fail");
+    assert!(format!("{err:#}").contains("counter command in format 2, this binary reads 1"), "{err:#}");
 }

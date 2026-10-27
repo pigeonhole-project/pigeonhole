@@ -12,8 +12,13 @@
 //! what lets the log rebuild the same state elsewhere.
 //!
 //! A command can fail on state (e.g. retain of a reclaimed chunk). `apply` then
-//! returns [`Applied::Reject`] and leaves the state untouched, but the entry
+//! returns `Ok(Err(reject))` and leaves the state untouched, but the entry
 //! still consumes a position — every replay reaches the same verdict.
+//!
+//! Encodings (postcard): commands carry their namespace's
+//! [`StateMachine::VERSION`] and batches the [`LOG_FORMAT`]; a binary refuses a
+//! log written in another format instead of misreading it. States encode the
+//! same way for snapshots ([`encode_state`] / [`decode_state`]).
 //!
 //! Boot ([`MetaStore::open`]): claim the next generation, replay the whole log
 //! into empty states, append the zero entry, go active. Once a newer
@@ -22,6 +27,8 @@
 
 use anyhow::{bail, Context, Result};
 use futures::TryStreamExt;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
@@ -34,48 +41,86 @@ use tokio::sync::{mpsc, oneshot, watch};
 pub mod log;
 
 pub use log::{
-    Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogId, LogResult, LogStore,
-    Position, Snapshot,
+    Batch, Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogId, LogResult,
+    LogStore, Position, Snapshot, LOG_FORMAT,
 };
 
-/// Outcome of applying one command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Applied {
-    /// The command took effect; `payload` is the layer's encoded response.
-    Commit(Vec<u8>),
-    /// Deterministic failure, state untouched; `payload` is the layer's
-    /// encoded error.
-    Reject(Vec<u8>),
-}
+/// Outcome of a command: its reply or its deterministic rejection.
+pub type Outcome<S> = std::result::Result<<S as StateMachine>::Reply, <S as StateMachine>::Reject>;
 
 /// Typed in-memory state of one namespace. The log (and later its snapshots)
 /// is the only durable copy: every boot rebuilds the state from it.
-pub trait StateMachine: Default + Send + Sync + 'static {
+///
+/// The state is serialized for snapshots, so ordered containers only
+/// (`BTreeMap`): equal states must encode to equal bytes. Derived indexes are
+/// `#[serde(skip)]` and recomputed in [`Self::rebuild`].
+pub trait StateMachine: Default + Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Stable name used to route commands (`chunk`, `s3`, `cas`).
     const NAME: &'static str;
+    /// Encoding version of [`Self::Command`]: bump it on any change to its
+    /// shape (variant order, fields), or replay would misread old entries.
+    const VERSION: u32;
 
-    /// Apply one encoded command; must be deterministic. Validate before
-    /// mutating: an [`Applied::Reject`] must leave the state untouched. `Err`
-    /// is a corrupt command, never a state-dependent rejection.
-    fn apply(&mut self, command: &[u8]) -> Result<Applied>;
+    type Command: Serialize + DeserializeOwned + Send + 'static;
+    /// Returned to the proposer in-process; never serialized.
+    type Reply: Send + 'static;
+    type Reject: Send + 'static;
 
-    /// Logical dump of the state (the layer's own encoding) and its inverse.
-    /// Equal states must give equal bytes.
-    fn snapshot(&self) -> Vec<u8>;
-    fn restore(data: &[u8]) -> Result<Self>;
+    /// Apply one command; must be deterministic. Validate before mutating: a
+    /// rejection must leave the state untouched. `Err` is a command that cannot
+    /// be applied at all (a bug); it stops the tablet.
+    fn apply(&mut self, command: Self::Command) -> Result<Outcome<Self>>;
+
+    /// Recompute `#[serde(skip)]` fields after [`decode_state`].
+    fn rebuild(&mut self) {}
 }
+
+/// Snapshot encoding of a state.
+pub fn encode_state<S: StateMachine>(state: &S) -> Vec<u8> {
+    postcard::to_stdvec(state).expect("state always encodes")
+}
+
+/// Inverse of [`encode_state`], indexes rebuilt.
+pub fn decode_state<S: StateMachine>(data: &[u8]) -> Result<S> {
+    let mut state: S = postcard::from_bytes(data).with_context(|| format!("decode {} state", S::NAME))?;
+    state.rebuild();
+    Ok(state)
+}
+
+/// A log entry carrying `command` for `S`.
+pub fn entry<S: StateMachine>(command: &S::Command) -> Entry {
+    Entry {
+        namespace: S::NAME.to_string(),
+        version: S::VERSION,
+        command: postcard::to_stdvec(command).expect("command always encodes"),
+    }
+}
+
+/// [`Outcome`] behind `dyn Any`, so one batcher serves every namespace.
+type AnyOutcome = Box<dyn Any + Send>;
 
 /// Object-safe face of a [`StateMachine`] behind its lock.
 trait AnyState: Send + Sync {
-    fn apply(&self, command: &[u8]) -> Result<Applied>;
+    fn apply(&self, entry: &Entry) -> Result<AnyOutcome>;
     fn as_any(&self) -> &dyn Any;
 }
 
 struct StateCell<S>(RwLock<S>);
 
 impl<S: StateMachine> AnyState for StateCell<S> {
-    fn apply(&self, command: &[u8]) -> Result<Applied> {
-        self.0.write().unwrap().apply(command)
+    fn apply(&self, entry: &Entry) -> Result<AnyOutcome> {
+        if entry.version != S::VERSION {
+            bail!(
+                "{} command in format {}, this binary reads {}",
+                S::NAME,
+                entry.version,
+                S::VERSION
+            );
+        }
+        let command: S::Command =
+            postcard::from_bytes(&entry.command).with_context(|| format!("decode {} command", S::NAME))?;
+        let outcome = self.0.write().unwrap().apply(command)?;
+        Ok(Box::new(outcome))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -100,14 +145,6 @@ impl Namespaces {
         self.states.push((S::NAME, Arc::new(StateCell(RwLock::new(S::default())))));
         self
     }
-}
-
-/// Result of [`MetaStore::propose`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Response {
-    /// Position of the entry in the log.
-    pub position: Position,
-    pub applied: Applied,
 }
 
 /// Why the tablet stopped accepting proposals.
@@ -154,7 +191,7 @@ type States = HashMap<&'static str, Arc<dyn AnyState>>;
 
 struct Pending {
     entry: Entry,
-    reply: oneshot::Sender<Result<Response>>,
+    reply: oneshot::Sender<Result<(Position, AnyOutcome)>>,
 }
 
 /// The metadata tablet shared by every layer.
@@ -242,23 +279,29 @@ impl MetaStore {
         self.gen
     }
 
-    /// Append `command` in `namespace` to the log and apply it.
-    pub async fn propose(&self, namespace: &str, command: &[u8]) -> Result<Response> {
-        if !self.has_namespace(namespace) {
-            bail!("unknown namespace {namespace:?}");
+    /// Append `command` for `S` to the log and apply it. `Err` = the tablet
+    /// could not commit it (fenced, stopped, I/O); `Ok(Err(_))` = `S` rejected it.
+    pub async fn propose<S: StateMachine>(&self, command: S::Command) -> Result<Outcome<S>> {
+        Ok(self.propose_at::<S>(command).await?.1)
+    }
+
+    /// [`Self::propose`], also returning the entry's log position.
+    pub async fn propose_at<S: StateMachine>(&self, command: S::Command) -> Result<(Position, Outcome<S>)> {
+        if !self.has_namespace(S::NAME) {
+            bail!("unknown namespace {:?}", S::NAME);
         }
         if let Some(stop) = self.stop.borrow().clone() {
             return Err(stop.into());
         }
         let (reply, rx) = oneshot::channel();
-        let entry = Entry {
-            namespace: namespace.to_owned(),
-            command: command.to_vec(),
-        };
-        if self.queue.send(Pending { entry, reply }).is_err() {
+        if self.queue.send(Pending { entry: entry::<S>(&command), reply }).is_err() {
             bail!("tablet batcher is gone");
         }
-        rx.await.context("tablet batcher dropped the proposal")?
+        let (position, outcome) = rx.await.context("tablet batcher dropped the proposal")??;
+        let outcome = outcome
+            .downcast::<Outcome<S>>()
+            .unwrap_or_else(|_| panic!("namespace {:?} has another state type", S::NAME));
+        Ok((position, *outcome))
     }
 
     /// Resolves once the tablet stops accepting proposals.
@@ -312,12 +355,12 @@ async fn replay(states: &States, log: &dyn LogStore, head: Head) -> Result<()> {
     Ok(())
 }
 
-fn apply_entry(states: &States, pos: Position, entry: &Entry) -> Result<Applied> {
+fn apply_entry(states: &States, pos: Position, entry: &Entry) -> Result<AnyOutcome> {
     let state = states
         .get(entry.namespace.as_str())
         .with_context(|| format!("entry {pos}: unknown namespace {:?}", entry.namespace))?;
     state
-        .apply(&entry.command)
+        .apply(entry)
         .with_context(|| format!("apply {} entry {pos}", entry.namespace))
 }
 
@@ -382,9 +425,8 @@ async fn batcher(b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
         };
         match result {
             Ok((first, applied)) => {
-                for (i, (p, applied)) in batch.into_iter().zip(applied).enumerate() {
-                    let position = first + i as u64;
-                    let _ = p.reply.send(Ok(Response { position, applied }));
+                for (i, (p, outcome)) in batch.into_iter().zip(applied).enumerate() {
+                    let _ = p.reply.send(Ok((first + i as u64, outcome)));
                 }
             }
             Err(stop) => {

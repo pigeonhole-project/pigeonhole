@@ -10,13 +10,10 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 crc32fast = { workspace = true }
 futures = { workspace = true }
-prost = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
-
-[build-dependencies]
-prost-build = { workspace = true }
-protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

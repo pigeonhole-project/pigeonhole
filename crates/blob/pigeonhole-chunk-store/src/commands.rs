@@ -10,7 +10,11 @@
 use crate::blob_db::{ChunkId, Extent, StoredBlock};
 use anyhow::{bail, Context, Result};
 use pigeonhole_blob::{BlobLocator, PartLayout, ReplicaLayout};
-use pigeonhole_meta::{Applied, StateMachine};
+use pigeonhole_meta::{Outcome, StateMachine};
+use serde::{Deserialize, Serialize};
+
+/// Proto-encoded reply or rejection (until the commands move to serde).
+type Applied = std::result::Result<Vec<u8>, Vec<u8>>;
 use prost::Message;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -20,7 +24,7 @@ pub(crate) mod pb {
 
 pub(crate) const NAMESPACE: &str = "chunk";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InstanceRec {
     pub kind: String,
     pub fingerprint: String,
@@ -30,7 +34,7 @@ pub(crate) struct InstanceRec {
 }
 
 /// One part of a replica: a blob holding `block_count` blocks from `first_block`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PartRec {
     pub first_block: u32,
     pub block_count: u32,
@@ -38,7 +42,7 @@ pub(crate) struct PartRec {
     pub locator: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChunkRec {
     pub logical_size: i64,
     pub crc32: u32,
@@ -59,11 +63,12 @@ impl ChunkRec {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ChunkState {
     pub(crate) instances: BTreeMap<String, InstanceRec>,
     pub(crate) chunks: BTreeMap<ChunkId, ChunkRec>,
     /// `(instance, sort_key)` → owning chunk; a backend key belongs to one part.
+    #[serde(skip)]
     pub(crate) by_key: HashMap<(String, Vec<u8>), ChunkId>,
     /// Highest chunk id ever committed: ids are never reused (block cache and
     /// extents are keyed by chunk id).
@@ -72,10 +77,14 @@ pub struct ChunkState {
 
 impl StateMachine for ChunkState {
     const NAME: &'static str = NAMESPACE;
+    const VERSION: u32 = 1;
+    type Command = Vec<u8>;
+    type Reply = Vec<u8>;
+    type Reject = Vec<u8>;
 
-    fn apply(&mut self, command: &[u8]) -> Result<Applied> {
+    fn apply(&mut self, command: Vec<u8>) -> Result<Outcome<Self>> {
         use pb::command::Op;
-        let cmd = pb::Command::decode(command).context("decode chunk command")?;
+        let cmd = pb::Command::decode(command.as_slice()).context("decode chunk command")?;
         match cmd.op.context("empty chunk command")? {
             Op::SyncInstances(c) => self.sync_instances(c),
             Op::CommitChunk(c) => self.commit_chunk(c),
@@ -87,65 +96,16 @@ impl StateMachine for ChunkState {
         }
     }
 
-    fn snapshot(&self) -> Vec<u8> {
-        let instances = self
-            .instances
-            .iter()
-            .map(|(id, i)| pb::Instance {
-                id: id.clone(),
-                kind: i.kind.clone(),
-                fingerprint: i.fingerprint.clone(),
-                location: i.location.clone(),
-                state: i.state.clone(),
-            })
-            .collect();
-        let chunks = self
+    fn rebuild(&mut self) {
+        self.by_key = self
             .chunks
             .iter()
-            .map(|(&chunk_id, c)| pb::ChunkState {
-                chunk_id,
-                logical_size: c.logical_size,
-                crc32: c.crc32,
-                refs: c.refs,
-                reclaiming: c.reclaiming,
-                created_at: c.created_at.clone(),
-                blocks: c.blocks.iter().map(pb::Block::from).collect(),
-                replicas: c
-                    .replicas
-                    .iter()
-                    .map(|(instance, parts)| pb::Replica {
-                        instance: instance.clone(),
-                        parts: parts.iter().map(pb::Part::from).collect(),
-                    })
-                    .collect(),
+            .flat_map(|(&id, c)| {
+                c.replicas.iter().flat_map(move |(instance, parts)| {
+                    parts.iter().map(move |p| ((instance.clone(), p.sort_key.clone()), id))
+                })
             })
             .collect();
-        pb::Snapshot { instances, chunks, last_chunk_id: self.last_chunk_id }.encode_to_vec()
-    }
-
-    fn restore(data: &[u8]) -> Result<Self> {
-        let snap = pb::Snapshot::decode(data).context("decode chunk snapshot")?;
-        let mut state = ChunkState { last_chunk_id: snap.last_chunk_id, ..Default::default() };
-        for i in snap.instances {
-            state.instances.insert(i.id.clone(), InstanceRec::from(i));
-        }
-        for c in snap.chunks {
-            let rec = ChunkRec {
-                logical_size: c.logical_size,
-                crc32: c.crc32,
-                refs: c.refs,
-                reclaiming: c.reclaiming,
-                created_at: c.created_at,
-                blocks: c.blocks.into_iter().map(StoredBlock::from).collect(),
-                replicas: BTreeMap::new(),
-            };
-            state.chunks.insert(c.chunk_id, rec);
-            for rep in &c.replicas {
-                state.check_replica(c.chunk_id, rep)?;
-                state.put_replica(c.chunk_id, rep);
-            }
-        }
-        Ok(state)
     }
 }
 
@@ -326,11 +286,11 @@ impl ChunkState {
 }
 
 fn ok() -> Applied {
-    Applied::Commit(Vec::new())
+    Ok(Vec::new())
 }
 
 fn reject(reason: pb::rejection::Reason) -> Applied {
-    Applied::Reject(pb::Rejection { reason: Some(reason) }.encode_to_vec())
+    Err(pb::Rejection { reason: Some(reason) }.encode_to_vec())
 }
 
 // --- conversions -----------------------------------------------------------

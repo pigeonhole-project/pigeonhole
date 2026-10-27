@@ -8,7 +8,7 @@ use crate::commands::{pb, ObjectRec, S3State, UploadRec, NAMESPACE};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
-use pigeonhole_meta::{Applied, MetaStore, Namespaces};
+use pigeonhole_meta::{MetaStore, Namespaces};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::ops::Bound;
@@ -105,9 +105,9 @@ impl Index {
         op: pb::command::Op,
     ) -> Result<std::result::Result<Vec<ChunkId>, pb::rejection::Reason>> {
         let cmd = pb::Command { op: Some(op) }.encode_to_vec();
-        match self.meta.propose(NAMESPACE, &cmd).await?.applied {
-            Applied::Commit(bytes) => Ok(Ok(pb::Released::decode(bytes.as_slice())?.chunk_ids)),
-            Applied::Reject(bytes) => Ok(Err(pb::Rejection::decode(bytes.as_slice())?
+        match self.meta.propose::<S3State>(cmd).await? {
+            Ok(bytes) => Ok(Ok(pb::Released::decode(bytes.as_slice())?.chunk_ids)),
+            Err(bytes) => Ok(Err(pb::Rejection::decode(bytes.as_slice())?
                 .reason
                 .context("rejection without reason")?)),
         }

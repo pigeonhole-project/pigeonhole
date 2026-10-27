@@ -3,17 +3,58 @@
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 mod local;
 
 pub use local::{LocalLogStore, DEFAULT_SEGMENT_BYTES};
 
-pub mod pb {
-    include!(concat!(env!("OUT_DIR"), "/pigeonhole.meta.v1.rs"));
+/// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
+/// to their encoding: a binary refuses to read batches of another format.
+pub const LOG_FORMAT: u32 = 1;
+
+/// One layer command. `version` is the namespace's command format
+/// ([`crate::StateMachine::VERSION`]) it was encoded with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    pub namespace: String,
+    pub version: u32,
+    pub command: Vec<u8>,
 }
 
-pub use pb::Entry;
+/// One LogStore write. Entries get consecutive positions starting at `first`;
+/// an empty batch is the zero entry of generation `gen` and takes no position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Batch {
+    /// [`LOG_FORMAT`]; first, so it can be read before the rest.
+    pub format: u32,
+    pub gen: u64,
+    pub first: Position,
+    pub entries: Vec<Entry>,
+}
+
+impl Batch {
+    pub fn new(gen: u64, first: Position, entries: Vec<Entry>) -> Self {
+        Self { format: LOG_FORMAT, gen, first, entries }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("a batch always encodes")
+    }
+
+    /// `Lost` for a batch of another [`LOG_FORMAT`] or one that does not parse.
+    pub fn decode(data: &[u8]) -> LogResult<Self> {
+        let (format, _) = postcard::take_from_bytes::<u32>(data)
+            .map_err(|e| LogError::Lost(format!("batch header: {e}")))?;
+        if format != LOG_FORMAT {
+            return Err(LogError::Lost(format!(
+                "batch in log format {format}, this binary reads {LOG_FORMAT}"
+            )));
+        }
+        postcard::from_bytes(data).map_err(|e| LogError::Lost(format!("batch: {e}")))
+    }
+}
 
 /// Position of an entry in the log: entries are numbered 1, 2, … in append
 /// order; `0` is "before the first entry".

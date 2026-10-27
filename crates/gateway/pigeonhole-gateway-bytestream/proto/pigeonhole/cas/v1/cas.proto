@@ -46,15 +46,3 @@ message DropEntry {
 message Released {
   repeated int64 chunk_ids = 1;
 }
-
-// Logical dump of the namespace, entries ordered by (hash, size).
-message Snapshot {
-  repeated SnapshotEntry entries = 1;
-}
-
-message SnapshotEntry {
-  string hash = 1;
-  int64 size = 2;
-  repeated Extent extents = 3;
-  string last_access = 4;
-}

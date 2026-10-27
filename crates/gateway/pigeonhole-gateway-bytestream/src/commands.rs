@@ -4,7 +4,9 @@
 
 use anyhow::{Context, Result};
 use pigeonhole_chunk_store::Extent;
-use pigeonhole_meta::{Applied, StateMachine};
+use pigeonhole_meta::{Outcome, StateMachine};
+use serde::{Deserialize, Serialize};
+
 use prost::Message;
 use std::collections::BTreeMap;
 
@@ -15,7 +17,7 @@ pub(crate) mod pb {
 pub(crate) const NAMESPACE: &str = "cas";
 
 /// One stored digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CasRecord {
     pub extents: Vec<Extent>,
     /// RFC 3339, set by the proposer.
@@ -23,17 +25,21 @@ pub(crate) struct CasRecord {
 }
 
 /// `(hash, size)` → record.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CasState {
     pub(crate) blobs: BTreeMap<(String, i64), CasRecord>,
 }
 
 impl StateMachine for CasState {
     const NAME: &'static str = NAMESPACE;
+    const VERSION: u32 = 1;
+    type Command = Vec<u8>;
+    type Reply = Vec<u8>;
+    type Reject = Vec<u8>;
 
-    fn apply(&mut self, command: &[u8]) -> Result<Applied> {
+    fn apply(&mut self, command: Vec<u8>) -> Result<Outcome<Self>> {
         use pb::command::Op;
-        let cmd = pb::Command::decode(command).context("decode cas command")?;
+        let cmd = pb::Command::decode(command.as_slice()).context("decode cas command")?;
         let reply = match cmd.op.context("empty cas command")? {
             Op::PutEntry(c) => self.put_entry(c).encode_to_vec(),
             Op::TouchEntry(c) => {
@@ -42,34 +48,7 @@ impl StateMachine for CasState {
             }
             Op::DropEntry(c) => self.drop_entry(c.hash, c.size).encode_to_vec(),
         };
-        Ok(Applied::Commit(reply))
-    }
-
-    fn snapshot(&self) -> Vec<u8> {
-        let entries = self
-            .blobs
-            .iter()
-            .map(|((hash, size), r)| pb::SnapshotEntry {
-                hash: hash.clone(),
-                size: *size,
-                extents: to_pb(&r.extents),
-                last_access: r.last_access.clone(),
-            })
-            .collect();
-        pb::Snapshot { entries }.encode_to_vec()
-    }
-
-    fn restore(data: &[u8]) -> Result<Self> {
-        let snap = pb::Snapshot::decode(data).context("decode cas snapshot")?;
-        let blobs = snap
-            .entries
-            .into_iter()
-            .map(|e| {
-                let record = CasRecord { extents: from_pb(e.extents), last_access: e.last_access };
-                ((e.hash, e.size), record)
-            })
-            .collect();
-        Ok(Self { blobs })
+        Ok(Ok(reply))
     }
 }
 
@@ -132,9 +111,9 @@ mod tests {
     use super::*;
 
     fn apply(s: &mut CasState, op: pb::command::Op) -> Vec<u8> {
-        match s.apply(&pb::Command { op: Some(op) }.encode_to_vec()).unwrap() {
-            Applied::Commit(reply) => reply,
-            Applied::Reject(_) => panic!("cas never rejects"),
+        match s.apply(pb::Command { op: Some(op) }.encode_to_vec()).unwrap() {
+            Ok(reply) => reply,
+            Err(_) => panic!("cas never rejects"),
         }
     }
 
@@ -154,8 +133,9 @@ mod tests {
         let key = ("a".to_string(), 3);
         assert_eq!(s.blobs[&key].last_access, "t2");
 
-        let snap = s.snapshot();
-        assert_eq!(CasState::restore(&snap).unwrap().snapshot(), snap);
+        let snap = pigeonhole_meta::encode_state(&s);
+        let back = pigeonhole_meta::decode_state::<CasState>(&snap).unwrap();
+        assert_eq!(pigeonhole_meta::encode_state(&back), snap);
 
         let drop = pb::command::Op::DropEntry(pb::DropEntry { hash: "a".into(), size: 3 });
         let released = pb::Released::decode(apply(&mut s, drop.clone()).as_slice()).unwrap();
