@@ -24,7 +24,7 @@ pub use pigeonhole_chunk_store::{
 };
 #[cfg(feature = "discord")]
 pub use pigeonhole_storage_discord as discord;
-pub use pigeonhole_gateway_s3::{Index, IndexSnapshot, S3Gateway};
+pub use pigeonhole_gateway_s3::{Index, S3Gateway};
 pub use pigeonhole_storage_telegram::{PinnedContent, TelegramBlobStore, TelegramClient};
 
 /// Rate-limit module path used by older imports.

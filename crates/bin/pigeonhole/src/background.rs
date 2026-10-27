@@ -1,23 +1,16 @@
-//! Binary-only: long-running tasks spawned by `serve` (durability, snapshots, sweep, repair).
+//! Binary-only: long-running tasks spawned by `serve` (durability, sweep, repair).
 
 use crate::runtime::Runtime;
 use pigeonhole::config::Config;
-use pigeonhole::index::Index;
 use pigeonhole_blob::{set_checkpoint_age, set_superblock_age};
 use pigeonhole_chunk_store::{Repairer, Sweeper};
-use pigeonhole_gateway_s3::snapshot::push_index_snapshot_durable;
 use std::time::Duration;
 use tracing::{info, warn};
 
 const JOURNAL_FLUSH_SECS: u64 = 5;
 const DEFAULT_CHECKPOINT_SECS: u64 = 300;
 
-pub fn spawn_background_tasks(
-    cfg: &Config,
-    rt: &Runtime,
-    index: &Index,
-    s3_gateway: &pigeonhole::S3Gateway,
-) {
+pub fn spawn_background_tasks(cfg: &Config, rt: &Runtime) {
     let dur = rt.durability.clone();
     tokio::spawn(async move {
         let period = Duration::from_secs(JOURNAL_FLUSH_SECS);
@@ -45,24 +38,6 @@ pub fn spawn_background_tasks(
             }
         }
     });
-
-    if cfg.snapshot_interval_secs > 0 {
-        let idx = index.clone();
-        let st = rt.store.clone();
-        let dur = rt.durability.clone();
-        let gate = s3_gateway.snapshot_gate.clone();
-        let interval = cfg.snapshot_interval_secs;
-        tokio::spawn(async move {
-            let period = Duration::from_secs(interval);
-            loop {
-                tokio::time::sleep(period).await;
-                let _g = gate.lock().await;
-                if let Err(e) = push_index_snapshot_durable(&idx, st.as_ref(), dur.as_ref()).await {
-                    warn!(error = %e, "periodic s3 index snapshot failed");
-                }
-            }
-        });
-    }
 
     let members: Vec<_> = rt.store.replicated().members().to_vec();
     let sweeper = Sweeper::with_inflight(

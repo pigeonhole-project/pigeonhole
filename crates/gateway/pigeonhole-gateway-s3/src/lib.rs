@@ -3,17 +3,12 @@
 mod commands;
 pub mod index;
 mod service;
-pub mod snapshot;
 
 pub use index::{
-    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, IndexSnapshot,
-    ObjectMeta,
+    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ObjectMeta,
 };
 pub use pigeonhole_chunk_store::{ChunkStore, Config, Extent};
 pub use service::S3Gateway;
-pub use snapshot::{
-    push_index_snapshot, push_index_snapshot_durable, restore_index_snapshot, PushOutcome, ROOT_NAME,
-};
 
 use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};

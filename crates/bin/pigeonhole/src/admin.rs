@@ -7,10 +7,10 @@ use pigeonhole::index::Index;
 use pigeonhole_chunk_store::{
     start_or_restore, JournalOp, Sweeper,
 };
-use pigeonhole_gateway_s3::snapshot::restore_index_snapshot;
 use tracing::{info, warn};
 
-/// Release all roots + wipe gateway index. Backend object reclaim is stage H (sweeper).
+/// Release all roots, delete every upload, object and bucket (releasing their
+/// chunks). Backend blobs are then reclaimed by the sweeper.
 pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     if cfg
@@ -67,7 +67,8 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
         warn!(error = %e, "purge checkpoint failed");
     }
 
-    index.wipe_all().await.context("wipe sqlite index")?;
+    let released = index.delete_everything().await.context("delete gateway index")?;
+    rt.store.release(&released).await.context("release object chunks")?;
 
     // Immediate reclaim pass (background sweeper uses the same path; grace still applies).
     let members: Vec<_> = rt.store.replicated().members().to_vec();
@@ -90,19 +91,11 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
     Ok(())
 }
 
-/// Restore blob.db (+ gateway index) from superblock pins.
+/// Restore chunk metadata from superblock pins. The gateway index is rebuilt
+/// from the metadata log on every boot and has no separate snapshot.
 pub async fn cmd_restore(force: bool) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     let rt = open_runtime(&cfg).await.context("open runtime")?;
-    let index = Index::open(rt.meta.clone()).await.context("open index")?;
-    if index.has_data().await.context("check index")? && !force {
-        bail!(
-            "index is not empty (buckets={}, objects={}); pass --force to overwrite",
-            index.count_buckets().await.unwrap_or(0),
-            index.count_objects().await.unwrap_or(0)
-        );
-    }
-
     start_or_restore(
         rt.store.db(),
         rt.durability.as_ref(),
@@ -111,14 +104,6 @@ pub async fn cmd_restore(force: bool) -> anyhow::Result<()> {
     )
     .await
     .context("restore from superblocks")?;
-
-    if rt.store.get_root("s3/index").await?.is_some() {
-        restore_index_snapshot(&index, rt.store.as_ref())
-            .await
-            .context("restore s3/index root into gateway index")?;
-        info!("gateway index restored from chunk-store root s3/index");
-    } else {
-        info!("no s3/index root after superblock restore; gateway index left unchanged");
-    }
+    info!("chunk metadata restored from superblock pins");
     Ok(())
 }

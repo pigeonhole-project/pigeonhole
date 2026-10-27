@@ -1,4 +1,5 @@
-//! Stage G E2E (memory): start → PUT → wipe local DBs → restore from superblock → GET.
+//! E2E (memory): start → PUT → lose the local SQLite files → boot replays the
+//! metadata log → GET; plus the chunk-store superblock restore of roots.
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -12,9 +13,6 @@ use pigeonhole_blob::{
     erase_sweep, BlobBackend, CheapestFirst, Replicated, SharedBackend, TypedBootstrapPointer,
 };
 use pigeonhole_chunk_store::{commit_root, start_or_restore, PinTarget};
-use pigeonhole_gateway_s3::snapshot::{
-    push_index_snapshot_durable, restore_index_snapshot, ROOT_NAME,
-};
 use s3s::dto::*;
 use s3s::{S3, S3Request};
 use std::sync::Arc;
@@ -89,17 +87,17 @@ async fn open_with_shared_mem(
 }
 
 #[tokio::test]
-async fn memory_put_wipe_restore_get() {
+async fn memory_put_lose_state_replay_get() {
     let dir = tempfile::tempdir().unwrap();
     let idx_path = dir.path().join("s3.db");
     let blob_path = dir.path().join("blob.db");
     let idx_url = format!("sqlite:{}?mode=rwc", idx_path.display());
     let blob_url = format!("sqlite:{}?mode=rwc", blob_path.display());
 
-    // Shared backend+pin survives "restart without local DB".
+    // The backend survives the restart; so do the metadata logs.
     let mem = Arc::new(MemoryBlobStore::new());
 
-    let (s3, store, dur, fp) = open_with_shared_mem(dir.path(), &idx_url, &blob_url, mem.clone()).await;
+    let (s3, store, dur, _fp) = open_with_shared_mem(dir.path(), &idx_url, &blob_url, mem.clone()).await;
 
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
@@ -118,40 +116,21 @@ async fn memory_put_wipe_restore_get() {
     .await
     .unwrap();
 
-    push_index_snapshot_durable(&s3.index, store.as_ref(), dur.as_ref())
-        .await
-        .unwrap();
-    dur.checkpoint(store.db()).await.unwrap();
-    assert!(store.get_root(ROOT_NAME).await.unwrap().is_some());
     drop(s3);
     drop(store);
     drop(dur);
 
-    // Wipe local DBs (simulate lost disk).
-    std::fs::remove_file(&idx_path).unwrap();
-    std::fs::remove_file(&blob_path).unwrap();
-    let _ = std::fs::remove_file(dir.path().join("s3.db-wal"));
-    let _ = std::fs::remove_file(dir.path().join("s3.db-shm"));
-    let _ = std::fs::remove_file(dir.path().join("blob.db-wal"));
-    let _ = std::fs::remove_file(dir.path().join("blob.db-shm"));
-    // The local metadata logs live on the same disk.
-    std::fs::remove_dir_all(dir.path().join("s3.db.log")).unwrap();
-    std::fs::remove_dir_all(dir.path().join("blob.db.log")).unwrap();
+    // Lose the SQLite files; the logs next to them stay.
+    for db in ["s3.db", "blob.db"] {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.path().join(format!("{db}{suffix}")));
+        }
+    }
+    assert!(!idx_path.exists() && !blob_path.exists());
 
-    let (s32, store2, dur2, _fp2) = open_with_shared_mem(dir.path(), &idx_url, &blob_url, mem).await;
-    // force not needed: empty DBs; start_or_restore already ran inside open.
-    assert!(store2.get_root(ROOT_NAME).await.unwrap().is_some());
-    restore_index_snapshot(&s32.index, store2.as_ref())
-        .await
-        .unwrap();
-
+    let (s32, _store2, _dur2, _fp2) = open_with_shared_mem(dir.path(), &idx_url, &blob_url, mem).await;
     let got = s3s2_get(&s32).await;
     assert_eq!(got, payload.as_ref());
-
-    // Fencing still works after restore.
-    let gen = dur2.generation().await;
-    assert!(gen >= 1);
-    let _ = fp;
 }
 
 async fn s3s2_get(s3: &pigeonhole::S3Gateway) -> Vec<u8> {

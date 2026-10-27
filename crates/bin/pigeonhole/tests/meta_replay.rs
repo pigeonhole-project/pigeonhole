@@ -19,7 +19,6 @@ const NODE_LOCAL: &[&str] = &[
     "chunk_put_watermarks",
     "chunk_repair_queue",
     "chunk_sweep_cursor",
-    "s3_meta",
 ];
 
 fn req<T>(input: T) -> S3Request<T> {

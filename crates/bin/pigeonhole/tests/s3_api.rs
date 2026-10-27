@@ -191,14 +191,8 @@ async fn compressible_object_roundtrip_and_snapshot() {
         .output;
     assert_eq!(collect_body(got.body).await, data.as_ref());
 
-    let snap = s3.index.export_snapshot().await.unwrap();
-    let sc = snap
-        .objects
-        .iter()
-        .find(|c| c.key == "zeros.bin")
-        .unwrap();
-    assert!(!sc.extents_json.is_empty());
-    assert_ne!(sc.extents_json, "[]");
+    let extents = s3.index.get_extents("demo", "zeros.bin").await.unwrap().unwrap();
+    assert!(!extents.is_empty());
 }
 
 #[tokio::test]
@@ -631,4 +625,35 @@ async fn list_object_versions_as_null_current() {
     assert_eq!(versions[0].version_id.as_deref(), Some("null"));
     assert_eq!(versions[0].is_latest, Some(true));
     assert_eq!(out.is_truncated, Some(false));
+}
+
+#[tokio::test]
+async fn delete_everything_releases_every_object_chunk() {
+    let (s3, _mem, _dir) = setup_with_mem().await;
+    for bucket in ["a", "b"] {
+        s3.create_bucket(req(CreateBucketInput { bucket: bucket.into(), ..Default::default() }))
+            .await
+            .unwrap();
+        for key in ["x", "y"] {
+            s3.put_object(req(PutObjectInput {
+                bucket: bucket.into(),
+                key: key.into(),
+                body: Some(StreamingBlob::from_bytes(Bytes::from(format!("{bucket}/{key}")))),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        }
+    }
+    let mut held = Vec::new();
+    for (bucket, key) in [("a", "x"), ("a", "y"), ("b", "x"), ("b", "y")] {
+        let extents = s3.index.get_extents(bucket, key).await.unwrap().unwrap();
+        held.extend(extents.iter().map(|e| e.chunk));
+    }
+    let mut released = s3.index.delete_everything().await.unwrap();
+    released.sort_unstable();
+    held.sort_unstable();
+    assert_eq!(released, held);
+    assert_eq!(s3.index.count_objects().await.unwrap(), 0);
+    assert!(s3.index.list_buckets().await.unwrap().is_empty());
 }

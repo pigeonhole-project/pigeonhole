@@ -51,14 +51,6 @@ pub struct SourceSnapshot {
     pub checksums_json: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct UserMeta {
-    pub bucket: String,
-    pub key: String,
-    pub name: String,
-    pub value: String,
-}
-
 #[derive(Debug, Clone, FromRow)]
 pub struct MultipartUpload {
     pub upload_id: String,
@@ -77,37 +69,6 @@ pub struct MultipartPart {
     pub part_number: i64,
     pub etag: String,
     pub size: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct IndexSnapshot {
-    pub buckets: Vec<Bucket>,
-    pub objects: Vec<ObjectRow>,
-    #[serde(default)]
-    pub metadata: Vec<UserMeta>,
-    #[serde(default)]
-    pub tags: Vec<ObjectTagRow>,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct ObjectRow {
-    pub bucket: String,
-    pub key: String,
-    pub etag: String,
-    pub size: i64,
-    pub content_type: Option<String>,
-    pub mtime: String,
-    #[serde(default)]
-    pub checksums_json: String,
-    pub extents_json: String,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct ObjectTagRow {
-    pub bucket: String,
-    pub key: String,
-    pub tag_key: String,
-    pub tag_value: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -182,12 +143,6 @@ pub(crate) const SCHEMA: &[&str] = &[
                 extents_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (upload_id, part_number),
                 FOREIGN KEY (upload_id) REFERENCES s3_uploads(upload_id) ON DELETE CASCADE
-            )
-    "#,
-    r#"
-            CREATE TABLE IF NOT EXISTS s3_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
             )
     "#,
 ];
@@ -686,25 +641,6 @@ impl Index {
         Ok((objs, Vec::new(), truncated, next))
     }
 
-    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM s3_meta WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| r.0))
-    }
-
-    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO s3_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn count_objects(&self) -> Result<i64> {
         let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM s3_objects")
             .fetch_one(&self.pool)
@@ -719,117 +655,26 @@ impl Index {
         Ok(n)
     }
 
-    pub async fn has_data(&self) -> Result<bool> {
-        Ok(self.count_buckets().await? > 0 || self.count_objects().await? > 0)
-    }
-
-    pub async fn wipe_all(&self) -> Result<()> {
-        sqlx::query("DELETE FROM s3_uploads")
-            .execute(&self.pool)
+    /// Abort every upload, delete every object and bucket, one command each.
+    /// Returns the chunk ids the removed uploads and objects held, to `release`.
+    pub async fn delete_everything(&self) -> Result<Vec<ChunkId>> {
+        let mut released = Vec::new();
+        let uploads: Vec<(String,)> = sqlx::query_as("SELECT upload_id FROM s3_uploads")
+            .fetch_all(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM s3_objects")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM s3_buckets")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM s3_meta").execute(&self.pool).await?;
-        Ok(())
-    }
-
-    pub async fn export_snapshot(&self) -> Result<IndexSnapshot> {
-        let buckets = self.list_buckets().await?;
-        let objects = sqlx::query_as::<_, ObjectRow>(
-            r#"
-            SELECT bucket, key, etag, size, content_type, mtime, checksums_json, extents_json
-            FROM s3_objects ORDER BY bucket, key
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let metadata = sqlx::query_as::<_, UserMeta>(
-            "SELECT bucket, key, name, value FROM s3_object_metadata ORDER BY bucket, key, name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let tags = sqlx::query_as::<_, ObjectTagRow>(
-            "SELECT bucket, key, tag_key, tag_value FROM s3_object_tags ORDER BY bucket, key, tag_key",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(IndexSnapshot {
-            buckets,
-            objects,
-            metadata,
-            tags,
-        })
-    }
-
-    pub async fn import_snapshot(&self, snap: &IndexSnapshot) -> Result<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM s3_uploads")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM s3_objects")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM s3_buckets")
-            .execute(&mut *tx)
-            .await?;
-
-        for b in &snap.buckets {
-            sqlx::query(
-                "INSERT INTO s3_buckets (name, created_at, scope_id) VALUES (?, ?, ?)",
-            )
-            .bind(&b.name)
-            .bind(&b.created_at)
-            .bind(&b.scope_id)
-            .execute(&mut *tx)
-            .await?;
+        for (upload_id,) in uploads {
+            released.extend(self.abort_multipart_upload(&upload_id).await?.unwrap_or_default());
         }
-        for o in &snap.objects {
-            sqlx::query(
-                r#"
-                INSERT INTO s3_objects
-                    (bucket, key, etag, size, content_type, mtime, checksums_json, extents_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(&o.bucket)
-            .bind(&o.key)
-            .bind(&o.etag)
-            .bind(o.size)
-            .bind(&o.content_type)
-            .bind(&o.mtime)
-            .bind(&o.checksums_json)
-            .bind(&o.extents_json)
-            .execute(&mut *tx)
+        let objects: Vec<(String, String)> = sqlx::query_as("SELECT bucket, key FROM s3_objects")
+            .fetch_all(&self.pool)
             .await?;
+        for (bucket, key) in objects {
+            released.extend(self.delete_object(&bucket, &key).await?.unwrap_or_default());
         }
-        for m in &snap.metadata {
-            sqlx::query(
-                "INSERT INTO s3_object_metadata (bucket, key, name, value) VALUES (?, ?, ?, ?)",
-            )
-            .bind(&m.bucket)
-            .bind(&m.key)
-            .bind(&m.name)
-            .bind(&m.value)
-            .execute(&mut *tx)
-            .await?;
+        for bucket in self.list_buckets().await? {
+            self.delete_bucket(&bucket.name).await?;
         }
-        for t in &snap.tags {
-            sqlx::query(
-                "INSERT INTO s3_object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
-            )
-            .bind(&t.bucket)
-            .bind(&t.key)
-            .bind(&t.tag_key)
-            .bind(&t.tag_value)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        Ok(released)
     }
 
     #[allow(clippy::too_many_arguments)]

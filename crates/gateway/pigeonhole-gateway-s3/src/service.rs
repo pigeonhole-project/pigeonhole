@@ -15,7 +15,6 @@ use s3s::s3_error;
 use s3s::{S3, S3Request, S3Response, S3Result};
 use std::ops::Not;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::Mutex;
 use tracing::info;
 
 
@@ -24,17 +23,11 @@ pub struct S3Gateway {
     pub cfg: Config,
     pub index: Index,
     pub store: Arc<ChunkStore>,
-    pub snapshot_gate: Arc<Mutex<()>>,
 }
 
 impl S3Gateway {
     pub fn new(cfg: Config, index: Index, store: Arc<ChunkStore>) -> Self {
-        Self {
-            cfg,
-            index,
-            store,
-            snapshot_gate: Arc::new(Mutex::new(())),
-        }
+        Self { cfg, index, store }
     }
 
     fn scope_id(&self) -> &str {

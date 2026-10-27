@@ -24,7 +24,6 @@ use pigeonhole_blob::{
     SharedBackend, TypedBootstrapPointer,
 };
 use pigeonhole_chunk_store::{start_or_restore, PinTarget, SweepConfig, Sweeper, WatermarkBackend};
-use pigeonhole_gateway_s3::snapshot::{push_index_snapshot_durable, restore_index_snapshot};
 use s3s::dto::*;
 use s3s::{S3ErrorCode, S3Request, S3};
 use std::collections::{BTreeSet, HashMap};
@@ -417,9 +416,6 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     let live = verify_all(&node.s3, "after stress").await;
 
     // Quiesce: persist everything, then sweep until stable.
-    push_index_snapshot_durable(&node.s3.index, node.store.as_ref(), node.dur.as_ref())
-        .await
-        .unwrap();
     node.dur.flush_journal().await.unwrap();
     node.dur.checkpoint(node.store.db()).await.unwrap();
     // Let the newest puts age past the sweep grace so they become candidates.
@@ -441,24 +437,19 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     assert!(garbage.is_empty(), "unreclaimed backend keys: {garbage:?}");
     assert!(missing.is_empty(), "live keys deleted from backend: {missing:?}");
 
-    // Lost disk: restore from the pin and read everything back.
+    // Lost local state: the SQLite files go, the metadata logs (`*.db.log/`)
+    // stay, and boot replays them.
     drop(sw);
     drop(node);
-    // The local metadata log (`*.db.log/`) is on the same disk and goes too.
     for f in std::fs::read_dir(dir.path()).unwrap() {
         let path = f.unwrap().path();
-        if path.is_dir() {
-            std::fs::remove_dir_all(path).unwrap();
-        } else {
+        if path.is_file() {
             std::fs::remove_file(path).unwrap();
         }
     }
     let restored = open_node(dir.path(), mem).await;
-    restore_index_snapshot(&restored.s3.index, restored.store.as_ref())
-        .await
-        .unwrap();
     assert_eq!(
-        verify_all(&restored.s3, "after restore").await,
+        verify_all(&restored.s3, "after replay").await,
         live,
         "restore lost or changed objects"
     );

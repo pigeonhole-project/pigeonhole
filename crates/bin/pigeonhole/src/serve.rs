@@ -35,7 +35,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     .context("start_or_restore")?;
 
     let s3_gateway = build_s3_gateway(cfg.clone(), index.clone(), rt.store.clone());
-    spawn_background_tasks(&cfg, &rt, &index, &s3_gateway);
+    spawn_background_tasks(&cfg, &rt);
 
     #[cfg(feature = "bytestream")]
     if cfg.bytestream.enabled {
