@@ -34,7 +34,7 @@ Metadata is a log of commands (a tablet, see
 log on every boot.
 
 Architecture terms: [docs/glossary.md](docs/glossary.md) (Instance, Blob, Block,
-Chunk, Replica, Extent, Root, Tablet, LogStore). GC rules:
+Chunk, Replica, Extent, Tablet, LogStore, Snapshot). GC rules:
 [docs/sweep-invariants.md](docs/sweep-invariants.md).
 
 ## Layout
@@ -47,7 +47,7 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 | `core/pigeonhole-codec` | Codecs + `BlockWriter` |
 | `meta/pigeonhole-meta` | Metadata tablet: layer commands in a fencing `LogStore`, applied to in-memory `StateMachine`s (`MetaStore`) |
 | `blob/pigeonhole-blob` | `BlobBackend`, `Replicated`, rate limits, `BootstrapPointer`, cache knobs |
-| `blob/pigeonhole-chunk-store` | `ChunkStore`, ingest, roots, durability, sweeper, repair, config (no protocol crates) |
+| `blob/pigeonhole-chunk-store` | `ChunkStore`, the `chunk` namespace, ingest, sweeper, repair, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
 | `storage/pigeonhole-storage-discord` | Discord Bot API storage |
 | `storage/pigeonhole-storage-memory` | In-memory storage for tests / `kind = "memory"` instances |
@@ -209,10 +209,22 @@ in-memory state of its layer (`chunk`, `s3`, `cas`); the log is the source of
 truth and every boot rebuilds the state by replaying it (see
 [docs/meta-backends.md](docs/meta-backends.md)). There is no local database.
 
-**Losing the disk loses the metadata.** The only LogStore so far is `local`, on
-the same disk; nothing is pushed into the blob backend any more (the old
-checkpoint / superblock pins are gone). Snapshot export and an off-host
-(Telegram) log are the next steps in [docs/roadmap.md](docs/roadmap.md).
+Every `[meta.snapshot] every_entries` entries the tablet snapshots all states
+and drops the log behind it, so boot = newest snapshot + the log after it.
+
+**Losing the disk loses the metadata** — the only LogStore so far is `local`,
+on the same disk. Point `[meta.snapshot] export` at another disk to keep copies
+of the snapshots; after losing the log:
+
+```bash
+# seeds an empty [meta.log] from the newest export; changes after it are lost
+cargo run --release -- restore --from-export /mnt/backup/pigeonhole --lossy
+```
+
+The restore is lossy: chunks committed after the export become orphans (the
+sweeper deletes them), and objects whose chunks were reclaimed after it read
+back broken. An off-host (Telegram) log is the next step in
+[docs/roadmap.md](docs/roadmap.md).
 
 Delete every backend message tracked by the local index (server must be stopped):
 

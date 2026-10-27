@@ -11,8 +11,9 @@ Read those first.
   and configs outright, no aliases or migrations.
 - One logical change per commit; commit only with `cargo test --workspace` and
   `./scripts/check-deps.sh --strict` green. Commit freely, **ask before push**.
-- Run the stress test several times after touching ingest / sweep / metadata:
-  `for i in $(seq 1 10); do cargo test -q -p pigeonhole --test sweep_stress || break; done`.
+- `cargo test --workspace` runs `sweep_stress` once; run it repeatedly
+  (`for i in $(seq 1 10); do cargo test -q -p pigeonhole --test sweep_stress || break; done`)
+  at the end of a step or before a push, not after every commit (~50 s a run).
 - After S3-visible changes also run `make compat-s3s-e2e` (STS failure is
   expected), `make compat-s3s-boto3`, `make compat-memory`.
 - Layering is enforced: `meta` and `types`/`codec` depend on crates.io only;
@@ -20,53 +21,41 @@ Read those first.
 
 ## Where we are / Текущее состояние
 
-Done (on `main`):
+Done (on `main`), steps 1–3:
 
-- `pigeonhole-meta` (`crates/meta`) is a tablet (step 2):
-  `MetaStore::propose(namespace, bytes)` queues the command; a batcher appends
-  the queued batch to a `LogStore` (`log.rs`, proto `pigeonhole.meta.v1`
-  `Entry` / `Batch`) under the tablet's generation, applies it in one
-  `BEGIN IMMEDIATE` transaction (savepoint per entry; `Applied::Reject` rolls
-  back but consumes a position) together with `last_applied_position`, then
-  answers. Boot = claim `1 + max known gen` → replay what SQLite lacks → zero
-  entry; a file ahead of the log refuses to boot (`Lost`). `Fenced` / failed
-  append or apply → `Stop`: proposals fail, `serve` exits.
-- `LocalLogStore` (`log/local.rs`): `seg-<first>.log` records
-  `MAGIC|len|crc|Batch` fsynced per batch, `claimed_gen` re-read under a
-  `flock`; claim truncates a torn tail; `install_snapshot` keeps the newest
-  snapshot and drops segments behind it (not called by the tablet yet).
-- Namespaces are fixed at `MetaStore::open` (`BlobDb::namespace()`,
-  `Index::namespace()`, `CasIndex::namespace()`); `connect(url)` keeps a local
-  log in `<db>.log`. Config `[meta]` (`db_path`, `batch_max_delay_ms` = 0,
-  `batch_max_entries`) + `[meta.log]` (`kind = "local"`, `path`).
-- Every metadata change is a proto command:
-  `pigeonhole.chunk.v1` (chunk-store, `commands.rs`), `pigeonhole.s3.v1`
-  (gateway-s3, `commands.rs`), `pigeonhole.cas.v1` (bytestream, `commands.rs`).
-  Proposers (`BlobDb`, `Index`, `CasIndex`) choose ids and timestamps; `apply`
-  is deterministic.
-- One SQLite file for all layers (`[meta].db_path`), tables prefixed `chunk_`,
-  `s3_`, `cas_`; the binary opens one `MetaStore` in `runtime.rs`.
-- Fixed earlier: sweeper in-flight check order, `BEGIN IMMEDIATE`, copy
-  retain-before-publish, ingest leaks, CAS double refs, chunk id reuse
-  (`chunk_id_seq`), legacy code removed, config is `[[instances]]`-only.
+- `pigeonhole-meta` is the tablet. `MetaStore::propose::<S>(cmd)` queues a
+  typed command; the batcher appends what is queued to the `LogStore` under the
+  tablet's generation, applies it to `S`'s in-memory state, installs a snapshot
+  if one is due, then answers with `Result<S::Reply, S::Reject>`. Reads:
+  `MetaStore::read::<S>`. Boot = claim `1 + discover().gen` → newest snapshot →
+  replay the tail → zero entry. `Fenced` / failed append / unappliable command →
+  `Stop`: proposals fail, `serve` exits.
+- Namespaces `ChunkState` (chunk-store), `S3State` (gateway-s3), `CasState`
+  (bytestream): Rust command enums, serde state, `VERSION` covering both.
+  Postcard everywhere, versioned (`LOG_FORMAT`, `VERSION`, `SNAPSHOT_FORMAT`);
+  golden tests pin command encodings. No SQLite, no proto in metadata (proto
+  only for REAPI).
+- `LocalLogStore`: `seg-<first>.log` records `MAGIC|len|crc|Batch`, fsync per
+  batch, `claimed_gen` + `log_id` under a `flock`; claim truncates a torn tail;
+  snapshots drop the segments behind them.
+- Snapshots every `[meta.snapshot] every_entries` (10000); `export = DIR` copies
+  them; `pigeonhole restore [--from-export DIR] --lossy` seeds an empty log
+  from the newest export.
+- Removed: `durability.rs` (checkpoint, superblock pins, root journal,
+  `start_or_restore`), `s3/index` / `cas/index` snapshots, chunk roots.
+  `purge` deletes through commands and releases object chunks.
+- Node-local progress (put watermarks, sweep cursor, repair queue) is process
+  memory in `BlobDb`, not part of the replicated state.
 
-Still old / known gaps:
+Known gaps:
 
-- The local log is on the same disk as the SQLite file: disk loss still relies
-  on the old checkpoint / snapshots below (step 3). fsync per batch costs:
-  `sweep_stress` takes ~55 s on macOS (`F_FULLFSYNC`) instead of ~12 s.
-- Rows written directly (list below) bypass the log, so replay does not
-  rebuild them; `tests/meta_replay.rs` compares only command-owned tables.
-
-- Durability is still `chunk-store/src/durability.rs`: periodic checkpoint of
-  chunk tables + superblock pinned via `TypedBootstrapPointer::swap`; its
-  journal carries only `SetRoot`. S3 / CAS indexes are snapshotted separately as
-  roots `s3/index`, `cas/index` (`gateway-s3/src/snapshot.rs`,
-  `bytestream/src/cas_snapshot.rs`). After disk loss chunks committed since the
-  last checkpoint are lost and a journaled root may point at a missing chunk.
-- Node-local tables written directly (not commands): `chunk_put_watermarks`,
-  `chunk_sweep_cursor`, `chunk_repair_queue`; snapshot `s3_meta` / `cas_meta`,
-  `import_snapshot`, `wipe_all`, checkpoint import/export.
+- **Disk loss loses metadata** unless a snapshot export lives on another disk,
+  and restore from an export is lossy. Fixed by an off-host LogStore (step 6).
+- fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
+  without; plain `fsync` (what SQLite does on macOS) is an option.
+- The sweeper and repair keep running after the tablet is `Fenced` (step 4;
+  reclaim is already committed before deletes, since `propose` returns after
+  the append).
 - Sweeper protection for fresh parts still relies on put watermarks + sweep
   grace; `sweep_stress` uses `SWEEP_GRACE = 1s` and 400 ops/worker to stay green.
   Mid-read reclaim of a chunk (GET racing overwrite/delete) is still possible.
@@ -77,44 +66,24 @@ Still old / known gaps:
 
 ### Step 2 — Tablet over a local `LogStore` ✅ done
 
-Goal: the command log, not the SQLite file, is the source of truth; boot =
-claim → recover → zero entry.
+`LogStore` contract and `LocalLogStore`; `MetaStore` as a tablet with group
+commit; boot = claim → recover → zero entry; `Fenced` stops it; `[meta]` /
+`[meta.log]` config. Tests: replay rebuilds identical state, a second
+incarnation fences the first without losing acknowledged entries, a crash
+between append and apply is applied once on boot.
 
-1. In `pigeonhole-meta`: `Entry { namespace, command }` proto envelope; `LogStore`
-   trait exactly as in meta-backends.md (`claim`, `append`, `discover`, `read`,
-   `install_snapshot`); errors `Fenced`, `Lost`.
-2. `LocalLogStore`: segmented append-only files in a directory, fsync per batch,
-   `claimed_gen` file; `append` rejects stale generations under a lock.
-3. `MetaStore` becomes the tablet: `propose` enqueues; a batcher appends a batch
-   (`batch_max_delay_ms`, size cap), then applies entries in order and completes
-   callers. Persist `last_applied_position` in the SQLite file.
-4. Boot: `claim(gen)` → if SQLite is behind, `discover` + `read` + apply → zero
-   entry → active. `Fenced` → stop accepting proposals, report to the binary.
-5. Config `[meta]` + `[meta.log]` (`kind = "local"`, `path`), wired in
-   `runtime.rs`.
+### Step 3 — Snapshots; remove the old durability ✅ done
 
-Tests: replay of the log into an empty file yields identical tables (dump and
-compare); a second `MetaStore` on the same log fences the first (first gets
-`Fenced`, no acknowledged entry is lost); crash between append and apply
-re-applies on boot exactly once.
-
-### Step 3 — Snapshots; remove the old durability
-
-1. `install_snapshot`: SQLite file image (consistent copy via `VACUUM INTO`) +
-   collect log segments ≤ snapshot position. Periodic, by entry count.
-2. Optional snapshot export (`[meta.snapshot] export`) — to a directory first.
-3. Delete `durability.rs` (checkpoint, superblock, journal, `commit_root`,
-   `start_or_restore`), the `s3/index` / `cas/index` snapshot modules, `s3_meta`
-   / `cas_meta` tables, `set_meta`, `import_snapshot`, `wipe_all` rewrite as
-   commands if still needed by purge.
-4. `pigeonhole restore` = discover + replay from the configured LogStore /
-   export. Update `e2e_memory_restore` and `sweep_stress` (restore part).
-5. README "Durability and restore" rewritten.
+State moved from SQLite into typed in-memory `StateMachine`s (after a look at
+etcd, ZooKeeper, KRaft, rqlite, hiqlite: small metadata is usually kept in
+memory with logical snapshots); commands and log envelope moved from proto to
+versioned postcard; tablet snapshots + collect; export and lossy restore; the
+old durability, index snapshots and roots deleted.
 
 ### Step 4 — Sweeper contract on the log
 
-1. Reclaim: propose `BeginReclaim`, await its commit (append), delete parts,
-   propose `DropChunk`.
+1. ~~Reclaim: propose `BeginReclaim`, await its commit (append), delete parts,
+   propose `DropChunk`.~~ Holds already: `propose` returns after the append.
 2. Sweeper / repair run only while the tablet is active; stop on `Fenced`.
 3. Update sweep-invariants.md.
 
@@ -127,8 +96,8 @@ re-applies on boot exactly once.
    message (file name / caption) for Discord listing and debugging.
 3. Orphan sweep: Telegram — message ids `≤ K` where `K` = largest id returned
    before the earliest in-flight upload started; Discord — by our id from the
-   listing. Remove put watermarks, sweep grace, `InflightParts`, the watermark
-   table; restore the stress test to grace-free settings and make mid-stress GETs
+   listing. Remove put watermarks, sweep grace, `InflightParts`; restore the
+   stress test to grace-free settings and make mid-stress GETs
    strict again.
 
 ### Step 6 — `telegram` LogStore
@@ -142,7 +111,8 @@ Protocol: meta-backends.md § `telegram` (pinned head of a chain of log batches,
    description register) for tests.
 3. Run the `LogStore` test suite from step 2 against it, plus fault injection:
    two concurrent incarnations, a straggler pinned after a claim, racing
-   claimants.
+   claimants. Settle the open Telegram questions in meta-backends.md first
+   (description read after pin; straggler as the new chain's base).
 
 ### Step 7 — Arbiter, second node, `s3` LogStore
 
@@ -151,7 +121,6 @@ to the active node; `s3` LogStore with conditional writes (`If-None-Match`).
 
 ## Open questions / Открытые вопросы
 
-- Snapshot format: SQLite image vs logical dump per namespace.
 - Default batch window per LogStore kind (`local`: 0, no extra wait).
-- Whether node-local tables (watermarks, cursor, repair queue) should move out of
-  the replicated SQLite file entirely.
+- Plain `fsync` instead of `F_FULLFSYNC` for the local log on macOS.
+- A converter for old logs / snapshots when a `VERSION` changes, if ever needed.

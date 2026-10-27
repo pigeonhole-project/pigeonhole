@@ -1,36 +1,32 @@
 # Metadata as a tablet / Метаданные как таблетка
 
-Status: **steps 1–2 implemented** (commands, one SQLite state machine, tablet
-over the `local` LogStore); the rest is a proposal. No backward compatibility: configs, on-disk and in-chat formats are
-replaced, existing data is not migrated.
+Status: **steps 1–3 implemented** — typed commands, in-memory state machines,
+a tablet over the `local` LogStore, snapshots, export and restore. The rest
+is a proposal. No backward compatibility: configs, on-disk and in-chat formats
+are replaced, existing data is not migrated (formats are versioned, so a
+binary refuses old data instead of misreading it; a converter can be written
+when needed).
 
 The model follows YDB tablets: a replicated state machine over a **shared log**
 kept in a storage that can **fence** old writers; an external **arbiter** only
 restarts the tablet somewhere else. Correctness comes from the log store, not
 from the arbiter.
 
-## Problem / Проблема
+## Why / Зачем
 
-Today metadata durability is hard-wired into the chunk store
-(`durability.rs`): a checkpoint of chunk metadata plus a superblock pinned in
-each read-write chat, and a journal that records only `SetRoot`.
-
-- Chunk commits / retain / release are durable only at the next checkpoint. A
-  restore after disk loss can find a root pointing at a chunk missing from the
-  checkpoint, and the sweeper then deletes the parts of every chunk committed
-  after it.
-- The S3 and CAS indexes are snapshotted separately (`s3/index`, `cas/index`), so
-  after a restore the layers disagree.
-- Publishing the superblock is check-then-write on the pin: two writers can both
-  pass `ensure_not_fenced` and the later pin silently wins.
+The old design made metadata durable from inside the chunk store: a periodic
+checkpoint of the chunk tables, a superblock pinned in every read-write chat
+and a journal of index roots; the S3 and CAS indexes were snapshotted
+separately. Commits between checkpoints were lost with the disk, the layers
+could disagree after a restore, and publishing the superblock was
+check-then-write, so two writers could both win. All of it is gone (step 3).
 
 ## Goals / Цели
 
-1. Every metadata change is a typed command; state = commands applied in order
-   (done in step 1: `pigeonhole-meta`, `chunk` / `s3` / `cas` namespaces, one
-   SQLite file).
+1. Every metadata change is a typed command; state = commands applied in order.
 2. The command log lives in a pluggable **`LogStore`** that fences old
-   generations. The node's SQLite file is a cache rebuilt from snapshot + log.
+   generations. State lives in memory and is rebuilt from snapshot + log on
+   every boot; there is no local database.
 3. A tablet can move to another node: boot = claim a generation, discover,
    replay, write a zero entry.
 4. Side effects outside the state machine (deleting blobs) never run ahead of
@@ -47,14 +43,39 @@ Non-goals for now: several tablets / sharding metadata; follower reads.
                     │ starts / restarts the tablet
                     ▼
  ┌──────────────────────────── tablet (one per cluster) ───────────────────────────┐
- │ propose(Command) ─► batch ─► LogStore.append(gen, batch) ─► apply to SQLite      │
- │ reads ◄──────────────────────────────────────────────────────── SQLite (cache)  │
+ │ propose::<S>(cmd) ─► batch ─► LogStore.append(gen, batch) ─► S::apply in memory │
+ │ reads: MetaStore::read::<S> (short read lock on the namespace's state)          │
+ │ every N entries: snapshot all states ─► LogStore.install_snapshot (+ export)    │
  │ side effects (sweeper, repair) only while the tablet holds its generation       │
  └──────────────────────────────────────────────────────────────────────────────────┘
                     │                                             ▲
-                    ▼                                             │ replay on boot
-              LogStore: claim / append / discover / read / snapshot / collect
+                    ▼                                             │ snapshot + tail on boot
+              LogStore: claim / append / discover / read / install_snapshot
 ```
+
+### Namespaces / Пространства имён
+
+Each layer (`chunk`, `s3`, `cas`) is a `StateMachine`:
+
+```rust
+trait StateMachine: Default + Serialize + DeserializeOwned {
+    const NAME: &'static str;
+    const VERSION: u32;          // encoding of Command and of the state
+    type Command: Serialize + DeserializeOwned;   // what goes into the log
+    type Reply;                  // handed back in-process, never serialized
+    type Reject;                 // deterministic failure, state untouched
+    fn apply(&mut self, cmd: Self::Command) -> Result<Result<Self::Reply, Self::Reject>>;
+    fn rebuild(&mut self) {}     // recompute #[serde(skip)] indexes after loading
+}
+```
+
+Commands, states, log batches and snapshots are encoded with postcard. That
+encoding follows the Rust types, so every format carries a version: each batch
+its `LOG_FORMAT`, each entry its namespace's `VERSION`, each snapshot its
+`SNAPSHOT_FORMAT` and per-namespace `VERSION`. A mismatch is an explicit error
+at boot; golden tests pin each command encoding so a shape change has to bump
+`VERSION`. State uses ordered containers only, so equal states encode to equal
+bytes.
 
 ### Generations / Поколения
 
@@ -89,8 +110,9 @@ trait LogStore {
 }
 ```
 
-`Entry` = the envelope `{ namespace, command }` (proto `pigeonhole.meta.v1`),
-applied by `MetaStore` exactly as in step 1. One error type for every call:
+`Entry` = `{ namespace, version, command }`, a `Batch` = `{ format, gen, first,
+entries }`, both postcard. Every log has a `LogId` fixed by its first claim.
+One error type for every call:
 `LogError::Fenced { current }` (a claim at or below `current` also gets it, so
 the tablet retries with `current + 1`), `Lost` (entries the caller needs are
 gone or corrupt — collected, a hole, a file ahead of the log) and `Other` (I/O,
@@ -100,21 +122,30 @@ entry) takes no position. A batch is one log write: commits are grouped
 
 ### Tablet lifecycle / Жизненный цикл
 
-1. **Boot** (`claim`): `gen = 1 + max(known generations)` (the last claimed
-   generation is kept in the SQLite file; `Fenced { current }` moves past
-   newer claims); `claim(gen)` → head.
-2. **Recover**: if the local SQLite file is behind (or absent), `discover` →
-   load snapshot → `read` and apply entries up to head.
+1. **Boot** (`claim`): `gen = 1 + discover().gen` (`Fenced { current }` moves
+   past a racing claim); `claim(gen)` → head.
+2. **Recover**: `discover` → load the newest snapshot into empty states →
+   `read` and apply entries after it up to head.
 3. **Zero entry**: append an empty batch for `gen` — proves the claim took effect
    and marks the start of this generation (as YDB's `WriteZeroEntry`).
-4. **Active**: `propose` buffers commands; a batch is appended, then applied to
-   SQLite, then callers get their responses. `Fenced` → stop the tablet
-   (responses fail, side effects stop, process exits or waits for the arbiter).
-5. **Snapshot**: periodically `install_snapshot` (SQLite file image) and collect
-   the log behind it.
+4. **Active**: `propose` queues commands; the batcher appends what is queued
+   (group commit), applies it in order, installs a snapshot if one is due, then
+   answers the callers. `Fenced` → stop the tablet (proposals fail, side effects
+   stop, `serve` exits). A command that cannot be applied stops it too; the next
+   boot rebuilds from the log.
+5. **Snapshot**: every `[meta.snapshot] every_entries` entries, between
+   batches: one `TabletSnapshot` of all states → `install_snapshot`, which
+   drops the log behind it; with `export` set, a copy goes to a directory. A
+   failed snapshot keeps the log and is retried after the next batch.
 
 Responses are released only after `append` returned `Ok`, so a client never sees
 a result the next generation might not have.
+
+**Restore** (`pigeonhole restore --from-export DIR --lossy`) seeds an empty log
+from the newest export: the states as of the export, positions from 0. It is
+lossy: changes after the export are gone, chunks committed later become
+orphans (the sweeper deletes them) and chunks reclaimed later are referenced
+but deleted. Only an off-host LogStore makes disk loss lossless.
 
 ### Arbiter / Арбитр
 
@@ -225,7 +256,6 @@ deleted by the tablet after a snapshot (`deleteMessage`).
 
 ```toml
 [meta]
-db_path = "pigeonhole-meta.db"      # local SQLite cache of the state
 batch_max_delay_ms = 0              # extra group commit window (local: 0;
                                     # batches still form while an append runs)
 batch_max_entries = 1024
@@ -238,24 +268,21 @@ path = "pigeonhole-log"
 # chat_id = -1009876543210          # channel / supergroup (fence = description)
 
 [meta.snapshot]
-every_entries = 10000
-# export = "telegram"               # also push snapshots off-host (like today)
+every_entries = 10000               # 0 = never
+# export = "/mnt/backup/pigeonhole" # copy every snapshot here (for restore)
 ```
 
 ## Plan / План
 
 Each step is a separate commit with tests green.
 
-1. ~~Commands, in-process.~~ Done: `pigeonhole-meta`, `chunk` / `s3` / `cas`
-   namespaces, one SQLite file.
-2. ~~**Tablet + `LogStore` (local).**~~ Done. `LogStore` trait and the `local`
-   implementation; `MetaStore::propose` appends a batch before applying; boot =
-   claim → discover → replay → zero entry; fenced → stop. Tests: replay rebuilds
-   identical SQLite state; a second incarnation fences the first.
-3. **Snapshots and removal of the old durability.** `install_snapshot` (SQLite
-   file image) + collect; delete `durability.rs` (checkpoint, superblock pin,
-   root journal) and the `s3/index` / `cas/index` snapshots; `pigeonhole restore`
-   = discover + replay.
+1. ~~Commands, in-process.~~ Done.
+2. ~~Tablet + `LogStore` (local).~~ Done: claim → replay → zero entry, group
+   commit, fencing, `LogId`.
+3. ~~Snapshots and removal of the old durability.~~ Done: states in memory
+   (SQLite and proto gone from metadata), typed `StateMachine` with versioned
+   postcard encodings, tablet snapshots + collect, export and lossy restore;
+   `durability.rs`, superblock pins, index snapshots and roots deleted.
 4. **Sweeper contract.** `BeginReclaim` committed before deletes; side effects
    only while active.
 5. **In-flight pin registry** (own blob ids before upload) replacing put
@@ -267,7 +294,14 @@ Each step is a separate commit with tests green.
 
 ## Open questions / Открытые вопросы
 
-- Snapshot format: SQLite file image (simple) or a logical dump per namespace?
-- Telegram: confirm `pinned_message` is newest-by-sending-date and the limits of
-  `setChatDescription` / `setMyDescription` on a live bot.
+- Telegram: confirm `pinned_message` is newest-by-sending-date and that
+  `getChat` after a pin sees the current `description`, plus the limits of
+  `setChatDescription` / `setMyDescription`, on a live bot. The description is
+  not a compare-and-swap; the protocol's safety rests on that read.
+- Telegram: a straggler batch pinned between a claim's steps 1 and 2 becomes the
+  new chain's base, so a command its writer answered with an error is applied
+  anyway (outcome unknown, as in Raft). Document it in the contract, or use a
+  new chain per generation (BookKeeper style).
+- Snapshots are taken between batches under read locks: O(state). Fine at our
+  scale; persistent maps (imbl) would make them O(1) if it ever matters.
 - Batch size / delay defaults per LogStore kind (`local`: no extra delay).
