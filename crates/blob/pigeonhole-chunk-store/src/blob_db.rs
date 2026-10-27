@@ -1,28 +1,23 @@
 //! Chunk-store metadata: queries plus the proposer side of the `chunk` namespace.
 //!
-//! Chunk state (instances, chunks, blocks, parts) changes only through
-//! commands applied by [`crate::commands::ChunkNamespace`]. Node-local
-//! operational tables (put watermarks, sweep cursor, repair queue) are written
-//! directly: they are progress of this node, not replicated state.
+//! Chunk state (instances, chunks, blocks, parts) lives in the tablet's
+//! [`ChunkState`] and changes only through `chunk` commands. Node-local
+//! progress (put watermarks, sweep cursor, repair queue) is kept in this
+//! process: it is not replicated and starts empty on every boot.
 
-use crate::commands::{pb, ChunkNamespace, NAMESPACE};
+use crate::commands::{pb, ChunkRec, ChunkState, NAMESPACE};
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
-use pigeonhole_blob::{InstanceInfo, PartLayout, ReplicaLayout, BlobLocator};
-use pigeonhole_meta::{Applied, MetaStore, Namespace};
+use chrono::{DateTime, Utc};
+use pigeonhole_blob::{InstanceInfo, ReplicaLayout};
+use pigeonhole_meta::{Applied, MetaStore, Namespaces};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-/// Internal integer chunk id (row in `chunks`).
+/// Chunk id, chosen by the proposer and never reused.
 pub type ChunkId = i64;
-
-/// Chunk lifecycle for reclaim races with `retain`.
-pub const CHUNK_STATE_LIVE: &str = "live";
-pub const CHUNK_STATE_RECLAIMING: &str = "reclaiming";
 
 /// `retain` failed because the chunk is missing, `refs = 0`, or already reclaiming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,22 +47,7 @@ pub struct Extent {
     pub len: i64,
 }
 
-/// Chunk-store view of the metadata state machine.
-#[derive(Clone)]
-pub struct BlobDb {
-    pool: SqlitePool,
-    meta: Arc<MetaStore>,
-    /// Next chunk id to hand out; ids are chosen by the proposer (see commands.rs).
-    next_chunk_id: Arc<AtomicI64>,
-}
-
-impl std::fmt::Debug for BlobDb {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlobDb").finish_non_exhaustive()
-    }
-}
-
-/// One stored block row (offsets inside a part are derived from `stored_len`).
+/// One stored block (offsets inside a part are derived from `stored_len`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredBlock {
     pub block_no: i64,
@@ -77,133 +57,64 @@ pub struct StoredBlock {
     pub codec: String,
 }
 
-/// Current schema. No upgrades: an incompatible file is recreated by hand.
-pub(crate) const SCHEMA: &[&str] = &[
-    r#"
-    CREATE TABLE IF NOT EXISTS chunk_instances (
-        id TEXT PRIMARY KEY NOT NULL,
-        kind TEXT NOT NULL,
-        fingerprint TEXT NOT NULL,
-        location TEXT NOT NULL,
-        state TEXT NOT NULL
-    )
-    "#,
-    r#"
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_instances_location_active
-    ON chunk_instances(location)
-    WHERE state = 'read-write'
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS chunks (
-        id INTEGER PRIMARY KEY NOT NULL,
-        logical_size INTEGER NOT NULL,
-        crc32 INTEGER NOT NULL,
-        refs INTEGER NOT NULL DEFAULT 0,
-        block_count INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        state TEXT NOT NULL DEFAULT 'live'
-    )
-    "#,
-    // High-water mark for chunk ids. `chunks.id` is a plain INTEGER PRIMARY KEY,
-    // which SQLite re-issues once the highest row is deleted; ids must never be
-    // reused (block cache and extents are keyed by chunk id).
-    r#"
-    CREATE TABLE IF NOT EXISTS chunk_id_seq (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
-        last INTEGER NOT NULL
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS chunk_blocks (
-        chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-        block_no INTEGER NOT NULL,
-        logical_off INTEGER NOT NULL,
-        logical_len INTEGER NOT NULL,
-        stored_len INTEGER NOT NULL,
-        codec TEXT NOT NULL,
-        PRIMARY KEY (chunk_id, block_no)
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS chunk_parts (
-        chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-        instance_id TEXT NOT NULL REFERENCES chunk_instances(id),
-        part_no INTEGER NOT NULL,
-        first_block INTEGER NOT NULL,
-        block_count INTEGER NOT NULL,
-        sort_key BLOB NOT NULL,
-        locator BLOB NOT NULL,
-        PRIMARY KEY (chunk_id, instance_id, part_no),
-        UNIQUE (instance_id, sort_key)
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS chunk_put_watermarks (
-        instance_id TEXT NOT NULL,
-        at TEXT NOT NULL,
-        max_key BLOB NOT NULL
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS chunk_sweep_cursor (
-        instance_id TEXT PRIMARY KEY NOT NULL,
-        after BLOB
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS chunk_repair_queue (
-        chunk_id INTEGER NOT NULL REFERENCES chunks(id),
-        instance_id TEXT NOT NULL,
-        enqueued_at TEXT NOT NULL,
-        PRIMARY KEY (chunk_id, instance_id)
-    )
-    "#,
-];
+/// Progress of this process; lost on restart by design.
+#[derive(Default)]
+struct NodeLocal {
+    /// Per instance: `(at, max_key)` of successful puts, oldest first.
+    watermarks: HashMap<String, Vec<(DateTime<Utc>, Vec<u8>)>>,
+    sweep_cursor: HashMap<String, Vec<u8>>,
+    /// `(chunk, instance)` → enqueue order.
+    repair_queue: BTreeMap<(ChunkId, String), u64>,
+    repair_seq: u64,
+}
+
+/// Chunk-store view of the metadata tablet.
+#[derive(Clone)]
+pub struct BlobDb {
+    meta: Arc<MetaStore>,
+    /// Next chunk id to hand out; ids are chosen by the proposer (see commands.rs).
+    next_chunk_id: Arc<AtomicI64>,
+    local: Arc<Mutex<NodeLocal>>,
+}
+
+impl std::fmt::Debug for BlobDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobDb").finish_non_exhaustive()
+    }
+}
 
 impl BlobDb {
     /// Open a standalone tablet at `database_url` (local log next to it) with
     /// only this namespace.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        Self::open(MetaStore::open_local(database_url, vec![Self::namespace()]).await?).await
+        let namespaces = Self::register(Namespaces::new());
+        Self::open(MetaStore::open_local(database_url, namespaces).await?).await
     }
 
-    /// The `chunk` namespace, to pass to [`MetaStore::open`].
-    pub fn namespace() -> Arc<dyn Namespace> {
-        Arc::new(ChunkNamespace)
+    /// Add the `chunk` namespace to the set passed to [`MetaStore::open`].
+    pub fn register(namespaces: Namespaces) -> Namespaces {
+        namespaces.with::<ChunkState>()
     }
 
-    /// Use `meta`, which must have been opened with [`Self::namespace`].
+    /// Use `meta`, which must have been opened with [`Self::register`].
     pub async fn open(meta: Arc<MetaStore>) -> Result<Self> {
         if !meta.has_namespace(NAMESPACE) {
             anyhow::bail!("metadata tablet opened without the chunk namespace");
         }
-        let db = Self {
-            pool: meta.pool().clone(),
+        let last = meta.read::<ChunkState, _>(|s| s.last_chunk_id);
+        Ok(Self {
             meta,
-            next_chunk_id: Arc::new(AtomicI64::new(0)),
-        };
-        db.reseed_chunk_ids().await?;
-        Ok(db)
+            next_chunk_id: Arc::new(AtomicI64::new(last + 1)),
+            local: Arc::default(),
+        })
     }
 
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+    fn read<R>(&self, f: impl FnOnce(&ChunkState) -> R) -> R {
+        self.meta.read::<ChunkState, _>(f)
     }
 
-    /// Restart id allocation above every id the state has seen (open / restore).
-    pub(crate) async fn reseed_chunk_ids(&self) -> Result<()> {
-        let (last,): (i64,) = sqlx::query_as(
-            r#"
-            SELECT MAX(
-                COALESCE((SELECT last FROM chunk_id_seq WHERE singleton = 0), 0),
-                COALESCE((SELECT MAX(id) FROM chunks), 0)
-            )
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        self.next_chunk_id.fetch_max(last + 1, Ordering::SeqCst);
-        Ok(())
+    fn chunk<R>(&self, chunk_id: ChunkId, f: impl FnOnce(&ChunkRec) -> R) -> Option<R> {
+        self.read(|s| s.chunks.get(&chunk_id).map(f))
     }
 
     /// Propose one chunk command; `Err(reason)` is a deterministic rejection.
@@ -241,22 +152,26 @@ impl BlobDb {
     }
 
     pub async fn list_instance_fingerprints(&self) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query("SELECT id, fingerprint FROM chunk_instances")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
-            .collect())
+        Ok(self.read(|s| {
+            s.instances
+                .iter()
+                .map(|(id, i)| (id.clone(), i.fingerprint.clone()))
+                .collect()
+        }))
     }
 
-    /// Chunk row with refs = 1 and no blocks or parts (tests).
+    /// `read-write` / `read-only` / `retired`, or `None` if never configured.
+    pub async fn instance_state(&self, instance_id: &str) -> Result<Option<String>> {
+        Ok(self.read(|s| s.instances.get(instance_id).map(|i| i.state.clone())))
+    }
+
+    /// Chunk with refs = 1 and no blocks or parts (tests).
     #[cfg(test)]
     pub(crate) async fn insert_chunk(&self, logical_size: i64, crc32: u32) -> Result<ChunkId> {
         self.commit_chunk(logical_size, crc32, &[], &[]).await
     }
 
-    /// Atomically insert chunk + blocks + parts after a successful quorum write.
+    /// Atomically record chunk + blocks + parts after a successful quorum write.
     pub async fn commit_chunk(
         &self,
         logical_size: i64,
@@ -314,94 +229,24 @@ impl BlobDb {
         }
     }
 
+    /// `(logical_size, crc32, refs)`.
     pub async fn chunk_meta(&self, chunk_id: i64) -> Result<Option<(i64, u32, i64)>> {
-        let row: Option<(i64, i64, i64)> =
-            sqlx::query_as("SELECT logical_size, crc32, refs FROM chunks WHERE id = ?")
-                .bind(chunk_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(size, crc, refs)| (size, crc as u32, refs)))
+        Ok(self.chunk(chunk_id, |c| (c.logical_size, c.crc32, c.refs)))
     }
 
     pub async fn chunk_block_count(&self, chunk_id: i64) -> Result<Option<i64>> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT block_count FROM chunks WHERE id = ?")
-                .bind(chunk_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|r| r.0))
+        Ok(self.chunk(chunk_id, |c| c.blocks.len() as i64))
     }
 
+    /// Blocks in `block_no` order; empty for a missing chunk.
     pub async fn get_blocks(&self, chunk_id: i64) -> Result<Vec<StoredBlock>> {
-        let rows: Vec<(i64, i64, i64, i64, String)> = sqlx::query_as(
-            r#"
-            SELECT block_no, logical_off, logical_len, stored_len, codec
-            FROM chunk_blocks WHERE chunk_id = ? ORDER BY block_no
-            "#,
-        )
-        .bind(chunk_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(block_no, logical_off, logical_len, stored_len, codec)| StoredBlock {
-                    block_no,
-                    logical_off,
-                    logical_len,
-                    stored_len,
-                    codec,
-                },
-            )
-            .collect())
+        Ok(self.chunk(chunk_id, |c| c.blocks.clone()).unwrap_or_default())
     }
 
-    /// Replica layouts for a chunk (for [`pigeonhole_blob::Replicated::read`]).
-    ///
-    /// `block_stored_lens` are reconstructed from `chunk_blocks` for Range GETs.
+    /// Replica layouts for a chunk (for [`pigeonhole_blob::Replicated::read`]),
+    /// ordered by instance; empty for a missing chunk.
     pub async fn get_replica_layouts(&self, chunk_id: i64) -> Result<Vec<ReplicaLayout>> {
-        let blocks = self.get_blocks(chunk_id).await?;
-        let stored_lens: Vec<u32> = blocks
-            .iter()
-            .map(|b| b.stored_len.max(0) as u32)
-            .collect();
-
-        let rows: Vec<(String, i64, i64, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-            r#"
-            SELECT instance_id, part_no, first_block, block_count, sort_key, locator
-            FROM chunk_parts WHERE chunk_id = ?
-            ORDER BY instance_id, part_no
-            "#,
-        )
-        .bind(chunk_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut by_inst: std::collections::BTreeMap<String, Vec<PartLayout>> =
-            std::collections::BTreeMap::new();
-        for (instance_id, _part_no, first_block, block_count, sort_key, locator) in rows {
-            let first = first_block.max(0) as u32;
-            let count = block_count.max(0) as u32;
-            let end = (first as usize).saturating_add(count as usize);
-            let lenses = if end <= stored_lens.len() {
-                stored_lens[first as usize..end].to_vec()
-            } else {
-                Vec::new()
-            };
-            by_inst.entry(instance_id).or_default().push(PartLayout {
-                first_block: first,
-                block_count: count,
-                locator: BlobLocator {
-                    key: sort_key,
-                    locator,
-                },
-                block_stored_lens: lenses,
-            });
-        }
-        Ok(by_inst
-            .into_iter()
-            .map(|(instance, parts)| ReplicaLayout { instance, parts })
-            .collect())
+        Ok(self.chunk(chunk_id, ChunkRec::replica_layouts).unwrap_or_default())
     }
 
     /// Record the highest sort key observed from a successful backend put.
@@ -410,24 +255,19 @@ impl BlobDb {
             .await
     }
 
-    /// Test / restore helper: record a watermark at an explicit timestamp.
+    /// Test helper: record a watermark at an explicit timestamp.
     pub async fn record_put_watermark_at(
         &self,
         instance_id: &str,
         max_key: &[u8],
-        at: chrono::DateTime<Utc>,
+        at: DateTime<Utc>,
     ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO chunk_put_watermarks (instance_id, at, max_key)
-            VALUES (?, ?, ?)
-            "#,
-        )
-        .bind(instance_id)
-        .bind(at.to_rfc3339())
-        .bind(max_key)
-        .execute(&self.pool)
-        .await?;
+        let mut local = self.local.lock().unwrap();
+        local
+            .watermarks
+            .entry(instance_id.to_string())
+            .or_default()
+            .push((at, max_key.to_vec()));
         Ok(())
     }
 
@@ -438,28 +278,24 @@ impl BlobDb {
         grace: std::time::Duration,
     ) -> Result<Option<Vec<u8>>> {
         let cutoff = Utc::now() - chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::zero());
-        let row: Option<(Vec<u8>,)> = sqlx::query_as(
-            r#"
-            SELECT max_key FROM chunk_put_watermarks
-            WHERE instance_id = ? AND at <= ?
-            ORDER BY max_key DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(instance_id)
-        .bind(cutoff.to_rfc3339())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(k,)| k))
+        let mut local = self.local.lock().unwrap();
+        let Some(marks) = local.watermarks.get_mut(instance_id) else {
+            return Ok(None);
+        };
+        // Everything at or before the cutoff collapses into one entry: later
+        // cutoffs only move forward.
+        let (old, mut fresh): (Vec<_>, Vec<_>) = marks.drain(..).partition(|(at, _)| *at <= cutoff);
+        let best = old.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        let upto = best.as_ref().map(|(_, k)| k.clone());
+        if let Some(b) = best {
+            fresh.insert(0, b);
+        }
+        *marks = fresh;
+        Ok(upto)
     }
 
     pub async fn get_sweep_cursor(&self, instance_id: &str) -> Result<Option<Vec<u8>>> {
-        let row: Option<(Option<Vec<u8>>,)> =
-            sqlx::query_as("SELECT after FROM chunk_sweep_cursor WHERE instance_id = ?")
-                .bind(instance_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.and_then(|(a,)| a))
+        Ok(self.local.lock().unwrap().sweep_cursor.get(instance_id).cloned())
     }
 
     pub async fn set_sweep_cursor(
@@ -467,83 +303,56 @@ impl BlobDb {
         instance_id: &str,
         after: Option<&[u8]>,
     ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO chunk_sweep_cursor (instance_id, after) VALUES (?, ?)
-            ON CONFLICT(instance_id) DO UPDATE SET after = excluded.after
-            "#,
-        )
-        .bind(instance_id)
-        .bind(after)
-        .execute(&self.pool)
-        .await?;
+        let mut local = self.local.lock().unwrap();
+        match after {
+            Some(k) => local.sweep_cursor.insert(instance_id.to_string(), k.to_vec()),
+            None => local.sweep_cursor.remove(instance_id),
+        };
         Ok(())
     }
 
-    /// Sort keys of parts belonging to chunks with `refs > 0` on this instance.
+    /// Sort keys of parts belonging to live chunks on this instance.
     pub async fn live_part_keys(&self, instance_id: &str) -> Result<Vec<Vec<u8>>> {
-        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
-            r#"
-            SELECT p.sort_key
-            FROM chunk_parts p
-            INNER JOIN chunks c ON c.id = p.chunk_id
-            WHERE p.instance_id = ? AND c.refs > 0 AND c.state = 'live'
-            "#,
-        )
-        .bind(instance_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(k,)| k).collect())
+        Ok(self.read(|s| {
+            s.chunks
+                .values()
+                .filter(|c| c.is_live())
+                .flat_map(|c| c.replicas.get(instance_id).into_iter().flatten())
+                .map(|p| p.sort_key.clone())
+                .collect()
+        }))
     }
 
-    /// Which of `keys` belong to live (`refs > 0`, `state = live`) chunks on this instance.
-    /// Used by the sweeper per-batch (never cache across batches).
+    /// Which of `keys` belong to live (`refs > 0`, not reclaiming) chunks on this
+    /// instance. Used by the sweeper per batch (never cache across batches).
     pub async fn live_part_keys_among(
         &self,
         instance_id: &str,
         keys: &[Vec<u8>],
     ) -> Result<HashSet<Vec<u8>>> {
-        if keys.is_empty() {
-            return Ok(HashSet::new());
-        }
-        // SQLite: bind each key; chunk size is sweep batch (≤100).
-        let mut placeholders = String::new();
-        for i in 0..keys.len() {
-            if i > 0 {
-                placeholders.push(',');
-            }
-            placeholders.push('?');
-        }
-        let sql = format!(
-            r#"
-            SELECT p.sort_key
-            FROM chunk_parts p
-            INNER JOIN chunks c ON c.id = p.chunk_id
-            WHERE p.instance_id = ? AND c.refs > 0 AND c.state = 'live'
-              AND p.sort_key IN ({placeholders})
-            "#
-        );
-        let mut q = sqlx::query_as::<_, (Vec<u8>,)>(&sql).bind(instance_id);
-        for k in keys {
-            q = q.bind(k);
-        }
-        let rows = q.fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|(k,)| k).collect())
+        Ok(self.read(|s| {
+            keys.iter()
+                .filter(|k| {
+                    s.by_key
+                        .get(&(instance_id.to_string(), (*k).clone()))
+                        .and_then(|id| s.chunks.get(id))
+                        .is_some_and(ChunkRec::is_live)
+                })
+                .cloned()
+                .collect()
+        }))
     }
 
-    /// Chunk ids ready for reclaim: `refs = 0` and still `live`, plus crash leftovers
-    /// already marked `reclaiming`.
+    /// Chunk ids ready for reclaim: `refs = 0` and still live, plus crash leftovers
+    /// already marked reclaiming.
     pub async fn list_zero_ref_chunks(&self) -> Result<Vec<ChunkId>> {
-        let rows: Vec<(i64,)> = sqlx::query_as(
-            r#"
-            SELECT id FROM chunks
-            WHERE (refs = 0 AND state = 'live') OR state = 'reclaiming'
-            ORDER BY id
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
+        Ok(self.read(|s| {
+            s.chunks
+                .iter()
+                .filter(|(_, c)| c.refs == 0 || c.reclaiming)
+                .map(|(&id, _)| id)
+                .collect()
+        }))
     }
 
     /// Atomically mark a zero-ref live chunk as reclaiming. Returns false if another
@@ -559,83 +368,73 @@ impl BlobDb {
         }
     }
 
-    /// Delete chunk_parts, chunk_blocks, and the chunk row (after backend deletes).
+    /// Forget the chunk (after its backend parts are deleted).
     pub async fn delete_chunk_metadata(&self, chunk_id: ChunkId) -> Result<()> {
         self.propose_infallible(pb::command::Op::DropChunk(pb::DropChunk { chunk_id }))
-            .await
+            .await?;
+        self.local
+            .lock()
+            .unwrap()
+            .repair_queue
+            .retain(|(id, _), _| *id != chunk_id);
+        Ok(())
     }
 
     /// Enqueue `repair(chunk_id, instance_id)` (idempotent).
     pub async fn enqueue_repair(&self, chunk_id: ChunkId, instance_id: &str) -> Result<()> {
-        let at = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            INSERT INTO chunk_repair_queue (chunk_id, instance_id, enqueued_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(chunk_id, instance_id) DO NOTHING
-            "#,
-        )
-        .bind(chunk_id)
-        .bind(instance_id)
-        .bind(&at)
-        .execute(&self.pool)
-        .await?;
+        let mut local = self.local.lock().unwrap();
+        let seq = local.repair_seq;
+        if let std::collections::btree_map::Entry::Vacant(e) =
+            local.repair_queue.entry((chunk_id, instance_id.to_string()))
+        {
+            e.insert(seq);
+            local.repair_seq += 1;
+        }
         Ok(())
     }
 
     /// Remove a completed / cancelled repair job.
     pub async fn dequeue_repair(&self, chunk_id: ChunkId, instance_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM chunk_repair_queue WHERE chunk_id = ? AND instance_id = ?")
-            .bind(chunk_id)
-            .bind(instance_id)
-            .execute(&self.pool)
-            .await?;
+        self.local
+            .lock()
+            .unwrap()
+            .repair_queue
+            .remove(&(chunk_id, instance_id.to_string()));
         Ok(())
     }
 
-    /// Pop up to `limit` jobs, prioritizing chunks with the fewest replicas.
+    /// Up to `limit` jobs, chunks with the fewest replicas first, then oldest.
     pub async fn take_repair_jobs(&self, limit: usize) -> Result<Vec<(ChunkId, String)>> {
-        let limit = limit.max(1) as i64;
-        let rows: Vec<(i64, String)> = sqlx::query_as(
-            r#"
-            SELECT q.chunk_id, q.instance_id
-            FROM chunk_repair_queue q
-            LEFT JOIN (
-                SELECT chunk_id, COUNT(DISTINCT instance_id) AS n
-                FROM chunk_parts
-                GROUP BY chunk_id
-            ) r ON r.chunk_id = q.chunk_id
-            ORDER BY COALESCE(r.n, 0) ASC, q.enqueued_at ASC, q.chunk_id ASC
-            LIMIT ?
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        let queue: Vec<((ChunkId, String), u64)> = {
+            let local = self.local.lock().unwrap();
+            local.repair_queue.iter().map(|(k, &seq)| (k.clone(), seq)).collect()
+        };
+        let mut jobs: Vec<(usize, u64, ChunkId, String)> = self.read(|s| {
+            queue
+                .into_iter()
+                .map(|((id, instance), seq)| {
+                    let replicas = s.chunks.get(&id).map_or(0, |c| c.replicas.len());
+                    (replicas, seq, id, instance)
+                })
+                .collect()
+        });
+        jobs.sort();
+        jobs.truncate(limit.max(1));
+        Ok(jobs.into_iter().map(|(_, _, id, instance)| (id, instance)).collect())
     }
 
-    /// Live chunks (`refs > 0`) missing a replica on `instance_id`.
+    /// Referenced chunks (`refs > 0`) missing a replica on `instance_id`.
     pub async fn chunks_missing_instance(&self, instance_id: &str) -> Result<Vec<ChunkId>> {
-        let rows: Vec<(i64,)> = sqlx::query_as(
-            r#"
-            SELECT c.id
-            FROM chunks c
-            WHERE c.refs > 0
-              AND NOT EXISTS (
-                  SELECT 1 FROM chunk_parts p
-                  WHERE p.chunk_id = c.id AND p.instance_id = ?
-              )
-            ORDER BY c.id
-            "#,
-        )
-        .bind(instance_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
+        Ok(self.read(|s| {
+            s.chunks
+                .iter()
+                .filter(|(_, c)| c.refs > 0 && !c.replicas.contains_key(instance_id))
+                .map(|(&id, _)| id)
+                .collect()
+        }))
     }
 
-    /// Replace all parts for one instance replica in a single transaction.
+    /// Replace all parts for one instance replica.
     pub async fn commit_instance_replica(
         &self,
         chunk_id: ChunkId,
@@ -650,20 +449,17 @@ impl BlobDb {
 
     /// Pending repair queue depth (tests / metrics).
     pub async fn repair_queue_len(&self) -> Result<u64> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunk_repair_queue")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.0.max(0) as u64)
+        Ok(self.local.lock().unwrap().repair_queue.len() as u64)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pigeonhole_blob::{InstanceKind, InstanceRole};
+    use pigeonhole_blob::{BlobLocator, InstanceKind, InstanceRole, PartLayout};
 
     #[tokio::test]
-    async fn migrate_and_root_roundtrip() {
+    async fn instances_and_refs_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
         let db = BlobDb::connect(&url).await.unwrap();
@@ -721,11 +517,7 @@ mod tests {
         };
         db.sync_instances(&[a.clone()]).await.unwrap();
         db.sync_instances(&[]).await.unwrap();
-        let state: (String,) = sqlx::query_as("SELECT state FROM chunk_instances WHERE id = 'a'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(state.0, "retired");
+        assert_eq!(db.instance_state("a").await.unwrap().as_deref(), Some("retired"));
     }
 
     #[tokio::test]

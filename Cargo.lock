@@ -1932,7 +1932,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sqlx",
  "tempfile",
  "tokio",
  "toml",

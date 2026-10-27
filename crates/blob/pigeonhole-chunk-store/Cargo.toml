@@ -25,7 +25,6 @@ pigeonhole-blob = { workspace = true }
 pigeonhole-codec = { workspace = true }
 pigeonhole-meta = { workspace = true }
 pigeonhole-types = { workspace = true }
-sqlx = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }

@@ -1,5 +1,5 @@
 //! The command log is the source of truth: replaying it into an empty tablet
-//! rebuilds the chunk tables and the s3 state exactly.
+//! rebuilds the chunk and s3 state exactly.
 
 use bytes::Bytes;
 use http::{Extensions, HeaderMap, Method, Uri};
@@ -8,19 +8,12 @@ use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_gateway_s3::S3State;
-use pigeonhole_meta::{dump_tables, LocalLogStore, MetaOptions, MetaStore, Namespaces, StateMachine};
+use pigeonhole_chunk_store::ChunkState;
+use pigeonhole_meta::{LocalLogStore, MetaOptions, MetaStore, Namespaces, StateMachine};
 use s3s::dto::*;
 use s3s::{S3Request, S3};
 use std::path::Path;
 use std::sync::Arc;
-
-/// Written directly by the node, not through commands (until they move out
-/// of the replicated file, see docs/roadmap.md).
-const NODE_LOCAL: &[&str] = &[
-    "chunk_put_watermarks",
-    "chunk_repair_queue",
-    "chunk_sweep_cursor",
-];
 
 fn req<T>(input: T) -> S3Request<T> {
     S3Request {
@@ -42,21 +35,20 @@ async fn tablet(dir: &Path, db: &str) -> Arc<MetaStore> {
     MetaStore::open(
         &url,
         Arc::new(log),
-        Index::register(Namespaces::new().with_sql(BlobDb::namespace())),
+        Index::register(BlobDb::register(Namespaces::new())),
         MetaOptions::default(),
     )
     .await
     .unwrap()
 }
 
-async fn replicated_state(meta: &MetaStore) -> (Vec<(String, Vec<String>)>, Vec<u8>) {
-    let mut dump = dump_tables(meta.pool()).await.unwrap();
-    dump.retain(|(table, _)| !NODE_LOCAL.contains(&table.as_str()));
-    (dump, meta.read::<S3State, _>(|s| s.snapshot()))
+/// Logical snapshots of both namespaces: equal bytes = equal state.
+fn replicated_state(meta: &MetaStore) -> (Vec<u8>, Vec<u8>) {
+    (meta.read::<ChunkState, _>(|s| s.snapshot()), meta.read::<S3State, _>(|s| s.snapshot()))
 }
 
 #[tokio::test]
-async fn replay_rebuilds_chunk_and_s3_tables() {
+async fn replay_rebuilds_chunk_and_s3_state() {
     let dir = tempfile::tempdir().unwrap();
     let meta = tablet(dir.path(), "a.db").await;
     let cfg = Config::for_test(dir.path());
@@ -94,14 +86,15 @@ async fn replay_rebuilds_chunk_and_s3_tables() {
         .delete_object(req(DeleteObjectInput { bucket: "b".into(), key: "nope".into(), ..Default::default() }))
         .await;
 
-    let before = replicated_state(&meta).await;
+    let before = replicated_state(&meta);
     let position = meta.applied_position().await.unwrap();
     assert!(position > 20, "every metadata change went through the log");
     drop(s3);
 
     let replayed = tablet(dir.path(), "b.db").await;
     assert_eq!(replayed.applied_position().await.unwrap(), position);
-    assert_eq!(replicated_state(&replayed).await, before);
-    let snap = &before.1;
-    assert_eq!(&S3State::restore(snap).unwrap().snapshot(), snap, "restore inverts snapshot");
+    assert_eq!(replicated_state(&replayed), before);
+    let (chunk, s3) = &before;
+    assert_eq!(&ChunkState::restore(chunk).unwrap().snapshot(), chunk, "restore inverts snapshot");
+    assert_eq!(&S3State::restore(s3).unwrap().snapshot(), s3, "restore inverts snapshot");
 }
