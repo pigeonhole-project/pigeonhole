@@ -53,9 +53,6 @@ Known gaps:
   and restore from an export is lossy. Fixed by an off-host LogStore (step 6).
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
-- The sweeper and repair keep running after the tablet is `Fenced` (step 4;
-  reclaim is already committed before deletes, since `propose` returns after
-  the append).
 - Sweeper protection for fresh parts still relies on put watermarks + sweep
   grace; `sweep_stress` uses `SWEEP_GRACE = 1s` and 400 ops/worker to stay green.
   Mid-read reclaim of a chunk (GET racing overwrite/delete) is still possible.
@@ -80,12 +77,14 @@ memory with logical snapshots); commands and log envelope moved from proto to
 versioned postcard; tablet snapshots + collect; export and lossy restore; the
 old durability, index snapshots and roots deleted.
 
-### Step 4 — Sweeper contract on the log
+### Step 4 — Sweeper contract on the log ✅ done
 
 1. ~~Reclaim: propose `BeginReclaim`, await its commit (append), delete parts,
    propose `DropChunk`.~~ Holds already: `propose` returns after the append.
-2. Sweeper / repair run only while the tablet is active; stop on `Fenced`.
-3. Update sweep-invariants.md.
+2. ~~Sweeper / repair run only while the tablet is active; stop on `Fenced`.~~
+   `MetaStore::confirm_active` (an empty batch through the batcher) before
+   every orphan delete batch; the loops end once the tablet stops.
+3. ~~Update sweep-invariants.md.~~
 
 ### Step 5 — In-flight pin registry (own blob ids)
 

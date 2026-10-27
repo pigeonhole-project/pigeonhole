@@ -68,10 +68,15 @@ impl Repairer {
         &self.config
     }
 
-    /// Background loop: scrub (optional), drain queue, sleep.
+    /// Background loop: scrub (optional), drain queue, sleep; ends once the
+    /// tablet stops.
     pub async fn run_loop(self) {
         let period = self.config.interval.max(Duration::from_secs(1));
         loop {
+            if self.db.tablet_stopped() {
+                info!("metadata tablet stopped; repair exits");
+                return;
+            }
             match self.repair_once().await {
                 Ok(stats) => {
                     pigeonhole_blob::record_repair("repaired", stats.repaired);

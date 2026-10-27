@@ -235,7 +235,9 @@ cheap compared to Telegram; needs an S3-compatible store with conditional writes
 ### Side effects / Побочные эффекты
 
 - Only the active tablet runs the sweeper and repair; on `Fenced` they stop
-  before the next backend call.
+  before the next backend call. Orphan deletes are preceded by
+  `MetaStore::confirm_active` (an empty batch through the log), so a deposed
+  incarnation that has not written since the claim still finds out.
 - Reclaim: propose `BeginReclaim`, wait for it to be **committed** (appended),
   then delete parts, then propose `DropChunk`. A restore or failover never brings
   back a reference to deleted parts.
@@ -283,8 +285,8 @@ Each step is a separate commit with tests green.
    (SQLite and proto gone from metadata), typed `StateMachine` with versioned
    postcard encodings, tablet snapshots + collect, export and lossy restore;
    `durability.rs`, superblock pins, index snapshots and roots deleted.
-4. **Sweeper contract.** `BeginReclaim` committed before deletes; side effects
-   only while active.
+4. ~~Sweeper contract.~~ Done: `BeginReclaim` is committed before deletes;
+   `confirm_active` before each orphan delete batch; loops end on stop.
 5. **In-flight pin registry** (own blob ids before upload) replacing put
    watermarks, sweep grace and `InflightParts`; read pins.
 6. **`telegram` LogStore** (chain + description fence above), tested against the

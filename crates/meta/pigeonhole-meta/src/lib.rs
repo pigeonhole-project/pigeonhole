@@ -246,7 +246,9 @@ impl Default for MetaOptions {
 type States = HashMap<&'static str, Arc<dyn AnyState>>;
 
 struct Pending {
-    entry: Entry,
+    /// `None` = a barrier ([`MetaStore::confirm_active`]): no entry, answered
+    /// once its batch is appended.
+    entry: Option<Entry>,
     reply: oneshot::Sender<Result<(Position, AnyOutcome)>>,
 }
 
@@ -349,7 +351,7 @@ impl MetaStore {
             return Err(stop.into());
         }
         let (reply, rx) = oneshot::channel();
-        if self.queue.send(Pending { entry: entry::<S>(&command), reply }).is_err() {
+        if self.queue.send(Pending { entry: Some(entry::<S>(&command)), reply }).is_err() {
             bail!("tablet batcher is gone");
         }
         let (position, outcome) = rx.await.context("tablet batcher dropped the proposal")??;
@@ -357,6 +359,27 @@ impl MetaStore {
             .downcast::<Outcome<S>>()
             .unwrap_or_else(|_| panic!("namespace {:?} has another state type", S::NAME));
         Ok((position, *outcome))
+    }
+
+    /// Prove the tablet still holds its generation: a round trip through the
+    /// log (an empty batch if nothing else is queued). `Err` = fenced or
+    /// stopped. Call it right before a side effect the log cannot undo, such
+    /// as deleting backend blobs.
+    pub async fn confirm_active(&self) -> Result<()> {
+        if let Some(stop) = self.stop.borrow().clone() {
+            return Err(stop.into());
+        }
+        let (reply, rx) = oneshot::channel();
+        if self.queue.send(Pending { entry: None, reply }).is_err() {
+            bail!("tablet batcher is gone");
+        }
+        rx.await.context("tablet batcher dropped the barrier")??;
+        Ok(())
+    }
+
+    /// Whether the tablet has stopped (fenced or failed).
+    pub fn is_stopped(&self) -> bool {
+        self.stop.borrow().is_some()
     }
 
     /// Resolves once the tablet stops accepting proposals.
@@ -491,7 +514,7 @@ async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
             }
         }
 
-        let entries: Vec<Entry> = batch.iter().map(|p| p.entry.clone()).collect();
+        let entries: Vec<Entry> = batch.iter().filter_map(|p| p.entry.clone()).collect();
         let result = match b.log.append(b.gen, &entries).await {
             Ok(last) => {
                 let first = last + 1 - entries.len() as u64;
@@ -525,8 +548,17 @@ async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
                 // (and export) due at this batch is in place. The batch is
                 // committed either way, so a fence here still answers Ok.
                 let stop = b.maybe_snapshot().await;
-                for (i, (p, outcome)) in batch.into_iter().zip(applied).enumerate() {
-                    let _ = p.reply.send(Ok((first + i as u64, outcome)));
+                let mut outcomes = applied.into_iter();
+                let mut position = first;
+                for p in batch {
+                    let reply = match p.entry {
+                        Some(_) => {
+                            position += 1;
+                            (position - 1, outcomes.next().expect("one outcome per entry"))
+                        }
+                        None => (position - 1, Box::new(()) as AnyOutcome),
+                    };
+                    let _ = p.reply.send(Ok(reply));
                 }
                 match stop {
                     None => continue,

@@ -301,3 +301,17 @@ async fn lossy_restore_from_an_export_starts_a_new_log() {
     drop(b);
     assert_eq!(value(&*open_on(dir.path()).await), 41);
 }
+
+#[tokio::test]
+async fn confirm_active_detects_a_fence_without_any_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = open_on(dir.path()).await;
+    a.confirm_active().await.unwrap();
+    assert_eq!(a.applied_position(), 0, "a barrier takes no position");
+
+    let _b = open_on(dir.path()).await;
+    assert!(!a.is_stopped(), "A has not touched the log since B claimed it");
+    let err = a.confirm_active().await.unwrap_err();
+    assert_eq!(err.downcast::<Stop>().unwrap(), Stop::Fenced { current: 2 });
+    assert!(a.is_stopped());
+}

@@ -151,11 +151,16 @@ impl Sweeper {
         &self.config
     }
 
-    /// Background loop: sleep `interval`, then [`Self::sweep_once`].
+    /// Background loop: sleep `interval`, then [`Self::sweep_once`]; ends once
+    /// the tablet stops (a fenced incarnation must not delete anything).
     pub async fn run_loop(self) {
         let period = self.config.interval.max(Duration::from_secs(1));
         loop {
             tokio::time::sleep(period).await;
+            if self.db.tablet_stopped() {
+                info!("metadata tablet stopped; sweeper exits");
+                return;
+            }
             match self.sweep_once().await {
                 Ok(stats) => {
                     pigeonhole_blob::record_sweep("deleted", stats.keys_deleted);
@@ -273,6 +278,13 @@ impl Sweeper {
                 pigeonhole_blob::record_sweep("inflight_protected", protected);
             }
             if !to_delete.is_empty() {
+                // Orphans are judged by this incarnation's state: delete only
+                // while it still holds the generation. (Reclaim needs no check:
+                // its deletes follow a committed BeginReclaim.)
+                self.db
+                    .confirm_active()
+                    .await
+                    .context("confirm the tablet's generation before deleting orphans")?;
                 backend
                     .delete(&to_delete)
                     .await
@@ -425,6 +437,25 @@ mod tests {
             .mem
             .message_keys()
             .contains(&u64::from_bytes(&orphan.key).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn fenced_sweeper_deletes_nothing() {
+        let f = setup().await;
+        let orphan = f.backend.put(Bytes::from_static(b"orphan")).await.unwrap();
+        // A newer incarnation claims the same log; this one has not written since.
+        let _newer = BlobDb::connect(f._dir.path().join("blob.log")).await.unwrap();
+
+        let err = sweeper(f.db.clone(), f.backend, Duration::ZERO, f.inflight)
+            .sweep_once()
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("fenced"), "{err:#}");
+        assert!(f.db.tablet_stopped());
+        assert!(f
+            .mem
+            .message_keys()
+            .contains(&u64::from_bytes(&orphan.key).unwrap()), "orphan kept");
     }
 
     #[tokio::test]

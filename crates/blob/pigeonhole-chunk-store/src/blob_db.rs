@@ -116,6 +116,17 @@ impl BlobDb {
         self.read(|s| s.chunks.get(&chunk_id).map(f))
     }
 
+    /// Prove the tablet still holds its generation (a log round trip); call
+    /// right before deleting backend blobs. `Err` = fenced or stopped.
+    pub async fn confirm_active(&self) -> Result<()> {
+        self.meta.confirm_active().await
+    }
+
+    /// Whether the tablet has stopped (fenced or failed): background work ends.
+    pub fn tablet_stopped(&self) -> bool {
+        self.meta.is_stopped()
+    }
+
     /// Propose one chunk command; `Ok(Err(_))` is a deterministic rejection.
     async fn propose(&self, cmd: ChunkCommand) -> Result<Result<(), ChunkReject>> {
         self.meta.propose::<ChunkState>(cmd).await

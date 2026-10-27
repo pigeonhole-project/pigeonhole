@@ -47,7 +47,7 @@ gone
 - `Release` rejects a double release (`refs` would go below 0); it does not clamp.
 - Chunks left `reclaiming` after a crash are finished on the next sweep pass.
 - `BeginReclaim` is committed to the log before any part is deleted: `propose` returns only after the append, so a restart or failover never brings back a reference to deleted parts (a lossy restore from a snapshot export can).
-- Not yet (roadmap step 4): the sweeper and repair stop once the tablet is fenced.
+- Orphans are judged by this incarnation's state, so right before each orphan delete batch the sweeper calls `confirm_active` (a log round trip); a fenced incarnation fails it and deletes nothing. The sweeper and repair loops end once the tablet stops. Residual window: a newer generation can claim between the confirmation and the delete; own blob ids (roadmap step 5) remove the dependence on this check.
 
 ## Metrics
 
