@@ -6,23 +6,71 @@
 //! [`crate::index::Index`]). Every check runs before the first mutation, so a
 //! rejected command leaves the state untouched.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use pigeonhole_chunk_store::{ChunkId, Extent};
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
-
-/// Proto-encoded reply or rejection (until the commands move to serde).
-type Applied = std::result::Result<Vec<u8>, Vec<u8>>;
-use prost::Message;
 use std::collections::BTreeMap;
 
-pub(crate) mod pb {
-    include!(concat!(env!("OUT_DIR"), "/pigeonhole.s3.v1.rs"));
+pub(crate) const NAMESPACE: &str = "s3";
+
+/// `(name, value)` pairs: user metadata or tags. Later duplicates of a name
+/// win, as a repeated header would.
+pub type Pairs = Vec<(String, String)>;
+
+/// Commands of the `s3` namespace. Changing the shape of a variant or the
+/// order of variants needs a new [`S3State::VERSION`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum S3Command {
+    CreateBucket { name: String, scope_id: String, created_at: String },
+    DeleteBucket { name: String },
+    /// Insert or replace an object (user metadata and tags of the old version go).
+    PutObject {
+        bucket: String,
+        key: String,
+        etag: String,
+        size: i64,
+        content_type: Option<String>,
+        extents: Vec<Extent>,
+        user_meta: Pairs,
+        checksums_json: String,
+        mtime: String,
+    },
+    DeleteObject { bucket: String, key: String },
+    /// Replace an object's tags (empty = delete them).
+    PutObjectTags { bucket: String, key: String, tags: Pairs },
+    CreateUpload {
+        upload_id: String,
+        bucket: String,
+        key: String,
+        content_type: Option<String>,
+        user_meta: Pairs,
+        tags: Pairs,
+        checksum_algorithm: Option<String>,
+        initiated_at: String,
+    },
+    PutPart { upload_id: String, part_number: i64, etag: String, size: i64, extents: Vec<Extent> },
+    /// Assemble the object from parts; part extents move to the object (no release).
+    CompleteUpload { upload_id: String, part_numbers: Vec<i64>, etag: String, total_size: i64, mtime: String },
+    AbortUpload { upload_id: String },
 }
 
-use pb::rejection::Reason;
+/// Deterministic failure of an [`S3Command`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3Reject {
+    BucketExists,
+    BucketNotFound,
+    BucketNotEmpty,
+    NoSuchKey,
+    NoSuchUpload,
+    MissingPart(i64),
+}
 
-pub(crate) const NAMESPACE: &str = "s3";
+/// Reply of every committed command: chunk ids the caller must release
+/// (replaced or removed), sorted and unique; empty when nothing was freed.
+pub type Released = Vec<ChunkId>;
+
+type Applied = std::result::Result<Released, S3Reject>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BucketRec {
@@ -73,44 +121,114 @@ pub struct S3State {
 impl StateMachine for S3State {
     const NAME: &'static str = NAMESPACE;
     const VERSION: u32 = 1;
-    type Command = Vec<u8>;
-    type Reply = Vec<u8>;
-    type Reject = Vec<u8>;
+    type Command = S3Command;
+    type Reply = Released;
+    type Reject = S3Reject;
 
-    fn apply(&mut self, command: Vec<u8>) -> Result<Outcome<Self>> {
-        use pb::command::Op;
-        let cmd = pb::Command::decode(command.as_slice()).context("decode s3 command")?;
-        match cmd.op.context("empty s3 command")? {
-            Op::CreateBucket(c) => Ok(self.create_bucket(c)),
-            Op::DeleteBucket(c) => Ok(self.delete_bucket(&c.name)),
-            Op::PutObject(c) => Ok(self.put_object(c)),
-            Op::DeleteObject(c) => Ok(self.delete_object(c.bucket, c.key)),
-            Op::PutObjectTags(c) => Ok(self.put_tags(c.bucket, c.key, c.tags)),
-            Op::DeleteObjectTags(c) => Ok(self.put_tags(c.bucket, c.key, Vec::new())),
-            Op::CreateUpload(c) => self.create_upload(c),
-            Op::PutPart(c) => Ok(self.put_part(c)),
-            Op::CompleteUpload(c) => Ok(self.complete_upload(c)),
-            Op::AbortUpload(c) => Ok(self.abort_upload(&c.upload_id)),
-        }
+    fn apply(&mut self, command: S3Command) -> Result<Outcome<Self>> {
+        Ok(match command {
+            S3Command::CreateBucket { name, scope_id, created_at } => {
+                if self.buckets.contains_key(&name) {
+                    return Ok(Err(S3Reject::BucketExists));
+                }
+                self.buckets.insert(name, BucketRec { created_at, scope_id });
+                ok()
+            }
+            S3Command::DeleteBucket { name } => self.delete_bucket(&name),
+            S3Command::PutObject {
+                bucket,
+                key,
+                etag,
+                size,
+                content_type,
+                extents,
+                user_meta,
+                checksums_json,
+                mtime,
+            } => {
+                if !self.buckets.contains_key(&bucket) {
+                    return Ok(Err(S3Reject::BucketNotFound));
+                }
+                let rec = ObjectRec {
+                    etag,
+                    size,
+                    content_type,
+                    mtime,
+                    checksums_json,
+                    extents,
+                    user_meta: user_meta.into_iter().collect(),
+                    tags: BTreeMap::new(),
+                };
+                released(self.write_object(bucket, key, rec))
+            }
+            S3Command::DeleteObject { bucket, key } => match self.objects.remove(&(bucket, key)) {
+                Some(o) => released(chunk_ids(&o.extents)),
+                None => Err(S3Reject::NoSuchKey),
+            },
+            S3Command::PutObjectTags { bucket, key, tags } => match self.objects.get_mut(&(bucket, key)) {
+                Some(o) => {
+                    o.tags = tags.into_iter().collect();
+                    ok()
+                }
+                None => Err(S3Reject::NoSuchKey),
+            },
+            S3Command::CreateUpload {
+                upload_id,
+                bucket,
+                key,
+                content_type,
+                user_meta,
+                tags,
+                checksum_algorithm,
+                initiated_at,
+            } => {
+                if !self.buckets.contains_key(&bucket) {
+                    return Ok(Err(S3Reject::BucketNotFound));
+                }
+                if self.uploads.contains_key(&upload_id) {
+                    bail!("upload id {upload_id} reused");
+                }
+                let rec = UploadRec {
+                    bucket,
+                    key,
+                    content_type,
+                    user_meta: user_meta.into_iter().collect(),
+                    tags: tags.into_iter().collect(),
+                    checksum_algorithm,
+                    initiated_at,
+                    parts: BTreeMap::new(),
+                };
+                self.uploads.insert(upload_id, rec);
+                ok()
+            }
+            S3Command::PutPart { upload_id, part_number, etag, size, extents } => {
+                let Some(upload) = self.uploads.get_mut(&upload_id) else {
+                    return Ok(Err(S3Reject::NoSuchUpload));
+                };
+                let old = upload.parts.insert(part_number, PartRec { etag, size, extents });
+                released(old.map(|p| chunk_ids(&p.extents)).unwrap_or_default())
+            }
+            S3Command::CompleteUpload { upload_id, part_numbers, etag, total_size, mtime } => {
+                self.complete_upload(&upload_id, &part_numbers, etag, total_size, mtime)
+            }
+            S3Command::AbortUpload { upload_id } => {
+                let Some(upload) = self.uploads.remove(&upload_id) else {
+                    return Ok(Err(S3Reject::NoSuchUpload));
+                };
+                released(upload.parts.values().flat_map(|p| chunk_ids(&p.extents)).collect())
+            }
+        })
     }
 }
 
 impl S3State {
-    fn create_bucket(&mut self, c: pb::CreateBucket) -> Applied {
-        if self.buckets.contains_key(&c.name) {
-            return reject(Reason::BucketExists(true));
-        }
-        self.buckets.insert(c.name, BucketRec { created_at: c.created_at, scope_id: c.scope_id });
-        ok()
-    }
-
     /// Refuses a bucket with objects; its unfinished uploads go with it.
     fn delete_bucket(&mut self, name: &str) -> Applied {
         if !self.buckets.contains_key(name) {
-            return reject(Reason::BucketNotFound(true));
+            return Err(S3Reject::BucketNotFound);
         }
         if self.bucket_objects(name).next().is_some() {
-            return reject(Reason::BucketNotEmpty(true));
+            return Err(S3Reject::BucketNotEmpty);
         }
         self.buckets.remove(name);
         self.uploads.retain(|_, u| u.bucket != name);
@@ -133,104 +251,37 @@ impl S3State {
         old.map(|o| chunk_ids(&o.extents)).unwrap_or_default()
     }
 
-    fn put_object(&mut self, c: pb::PutObject) -> Applied {
-        if !self.buckets.contains_key(&c.bucket) {
-            return reject(Reason::BucketNotFound(true));
-        }
-        let rec = ObjectRec {
-            etag: c.etag,
-            size: c.size,
-            content_type: c.content_type,
-            mtime: c.mtime,
-            checksums_json: c.checksums_json,
-            extents: from_pb(&c.extents),
-            user_meta: pairs_to_map(c.user_meta),
-            tags: BTreeMap::new(),
-        };
-        released(self.write_object(c.bucket, c.key, rec))
-    }
-
-    fn delete_object(&mut self, bucket: String, key: String) -> Applied {
-        match self.objects.remove(&(bucket, key)) {
-            Some(o) => released(chunk_ids(&o.extents)),
-            None => reject(Reason::NoSuchKey(true)),
-        }
-    }
-
-    fn put_tags(&mut self, bucket: String, key: String, tags: Vec<pb::Pair>) -> Applied {
-        match self.objects.get_mut(&(bucket, key)) {
-            Some(o) => {
-                o.tags = pairs_to_map(tags);
-                ok()
-            }
-            None => reject(Reason::NoSuchKey(true)),
-        }
-    }
-
-    fn create_upload(&mut self, c: pb::CreateUpload) -> Result<Applied> {
-        if !self.buckets.contains_key(&c.bucket) {
-            return Ok(reject(Reason::BucketNotFound(true)));
-        }
-        if self.uploads.contains_key(&c.upload_id) {
-            bail!("upload id {} reused", c.upload_id);
-        }
-        let rec = UploadRec {
-            bucket: c.bucket,
-            key: c.key,
-            content_type: c.content_type,
-            user_meta: pairs_to_map(c.user_meta),
-            tags: pairs_to_map(c.tags),
-            checksum_algorithm: c.checksum_algorithm,
-            initiated_at: c.initiated_at,
-            parts: BTreeMap::new(),
-        };
-        self.uploads.insert(c.upload_id, rec);
-        Ok(ok())
-    }
-
-    /// Store a part; returns the replaced part's chunks.
-    fn put_part(&mut self, c: pb::PutPart) -> Applied {
-        let Some(upload) = self.uploads.get_mut(&c.upload_id) else {
-            return reject(Reason::NoSuchUpload(true));
-        };
-        let rec = PartRec { etag: c.etag, size: c.size, extents: from_pb(&c.extents) };
-        let old = upload.parts.insert(c.part_number, rec);
-        released(old.map(|p| chunk_ids(&p.extents)).unwrap_or_default())
-    }
-
-    /// Assemble the object from parts; part extents move to the object (no
-    /// release), parts not listed are dropped with the upload.
-    fn complete_upload(&mut self, c: pb::CompleteUpload) -> Applied {
-        let Some(upload) = self.uploads.get(&c.upload_id) else {
-            return reject(Reason::NoSuchUpload(true));
+    /// Parts not listed are dropped with the upload.
+    fn complete_upload(
+        &mut self,
+        upload_id: &str,
+        part_numbers: &[i64],
+        etag: String,
+        total_size: i64,
+        mtime: String,
+    ) -> Applied {
+        let Some(upload) = self.uploads.get(upload_id) else {
+            return Err(S3Reject::NoSuchUpload);
         };
         let mut extents = Vec::new();
-        for &pn in &c.part_numbers {
+        for &pn in part_numbers {
             let Some(part) = upload.parts.get(&pn) else {
-                return reject(Reason::MissingPart(pn));
+                return Err(S3Reject::MissingPart(pn));
             };
             extents.extend_from_slice(&part.extents);
         }
-        let upload = self.uploads.remove(&c.upload_id).expect("checked above");
+        let upload = self.uploads.remove(upload_id).expect("checked above");
         let rec = ObjectRec {
-            etag: c.etag,
-            size: c.total_size,
+            etag,
+            size: total_size,
             content_type: upload.content_type,
-            mtime: c.mtime,
+            mtime,
             checksums_json: "{}".into(),
             extents,
             user_meta: upload.user_meta,
             tags: upload.tags,
         };
         released(self.write_object(upload.bucket, upload.key, rec))
-    }
-
-    /// Drop an upload; returns every part's chunks.
-    fn abort_upload(&mut self, upload_id: &str) -> Applied {
-        let Some(upload) = self.uploads.remove(upload_id) else {
-            return reject(Reason::NoSuchUpload(true));
-        };
-        released(upload.parts.values().flat_map(|p| chunk_ids(&p.extents)).collect())
     }
 }
 
@@ -241,32 +292,56 @@ fn ok() -> Applied {
 fn released(mut chunk_ids: Vec<ChunkId>) -> Applied {
     chunk_ids.sort_unstable();
     chunk_ids.dedup();
-    Ok(pb::Released { chunk_ids }.encode_to_vec())
-}
-
-fn reject(reason: Reason) -> Applied {
-    Err(pb::Rejection { reason: Some(reason) }.encode_to_vec())
+    Ok(chunk_ids)
 }
 
 fn chunk_ids(extents: &[Extent]) -> Vec<ChunkId> {
     extents.iter().map(|e| e.chunk).collect()
 }
 
-pub(crate) fn to_pb(extents: &[Extent]) -> Vec<pb::Extent> {
-    extents
-        .iter()
-        .map(|e| pb::Extent { chunk: e.chunk, offset: e.offset, len: e.len })
-        .collect()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn from_pb(extents: &[pb::Extent]) -> Vec<Extent> {
-    extents
-        .iter()
-        .map(|e| Extent { chunk: e.chunk, offset: e.offset, len: e.len })
-        .collect()
-}
+    /// Fails when the encoding of a command changes: bump `VERSION` and update
+    /// the expected bytes (old logs then refuse to replay, as they should).
+    #[test]
+    fn command_encoding_is_pinned() {
+        let cmd = S3Command::DeleteObject { bucket: "b".into(), key: "k".into() };
+        assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k']);
+        assert_eq!(S3State::VERSION, 1);
+    }
 
-/// Later duplicates of a name win, as a repeated header would.
-fn pairs_to_map(pairs: Vec<pb::Pair>) -> BTreeMap<String, String> {
-    pairs.into_iter().map(|p| (p.name, p.value)).collect()
+    #[test]
+    fn rejected_commands_leave_the_state_untouched() {
+        let mut s = S3State::default();
+        let put = |key: &str| S3Command::PutObject {
+            bucket: "b".into(),
+            key: key.into(),
+            etag: "e".into(),
+            size: 1,
+            content_type: None,
+            extents: vec![Extent { chunk: 7, offset: 0, len: 1 }],
+            user_meta: vec![],
+            checksums_json: "{}".into(),
+            mtime: "t".into(),
+        };
+        assert_eq!(s.apply(put("k")).unwrap(), Err(S3Reject::BucketNotFound));
+        let create = S3Command::CreateBucket { name: "b".into(), scope_id: "".into(), created_at: "t".into() };
+        assert_eq!(s.apply(create.clone()).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(create).unwrap(), Err(S3Reject::BucketExists));
+        assert_eq!(s.apply(put("k")).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(put("k")).unwrap(), Ok(vec![7]), "overwrite releases the old chunks");
+        let before = pigeonhole_meta::encode_state(&s);
+        let done = S3Command::CompleteUpload {
+            upload_id: "u".into(),
+            part_numbers: vec![1],
+            etag: "e".into(),
+            total_size: 1,
+            mtime: "t".into(),
+        };
+        assert_eq!(s.apply(done).unwrap(), Err(S3Reject::NoSuchUpload));
+        assert_eq!(s.apply(S3Command::DeleteBucket { name: "b".into() }).unwrap(), Err(S3Reject::BucketNotEmpty));
+        assert_eq!(pigeonhole_meta::encode_state(&s), before);
+    }
 }

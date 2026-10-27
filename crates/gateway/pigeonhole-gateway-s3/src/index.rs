@@ -4,12 +4,11 @@
 //! an `s3` command (see [`crate::commands`]). Chunk refcounts live in the
 //! chunk store ([`ChunkStore::retain`] / [`release`]).
 
-use crate::commands::{pb, ObjectRec, S3State, UploadRec, NAMESPACE};
-use anyhow::{Context, Result};
+use crate::commands::{ObjectRec, S3Command, S3Reject, S3State, UploadRec, NAMESPACE};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
 use pigeonhole_meta::{MetaStore, Namespaces};
-use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -102,19 +101,13 @@ impl Index {
     /// Propose one s3 command; `Ok(Err(reason))` is a deterministic rejection.
     async fn propose(
         &self,
-        op: pb::command::Op,
-    ) -> Result<std::result::Result<Vec<ChunkId>, pb::rejection::Reason>> {
-        let cmd = pb::Command { op: Some(op) }.encode_to_vec();
-        match self.meta.propose::<S3State>(cmd).await? {
-            Ok(bytes) => Ok(Ok(pb::Released::decode(bytes.as_slice())?.chunk_ids)),
-            Err(bytes) => Ok(Err(pb::Rejection::decode(bytes.as_slice())?
-                .reason
-                .context("rejection without reason")?)),
-        }
+        cmd: S3Command,
+    ) -> Result<std::result::Result<Vec<ChunkId>, S3Reject>> {
+        self.meta.propose::<S3State>(cmd).await
     }
 
-    async fn propose_infallible(&self, op: pb::command::Op) -> Result<Vec<ChunkId>> {
-        match self.propose(op).await? {
+    async fn propose_infallible(&self, cmd: S3Command) -> Result<Vec<ChunkId>> {
+        match self.propose(cmd).await? {
             Ok(ids) => Ok(ids),
             Err(reason) => anyhow::bail!("unexpected s3 rejection {reason:?}"),
         }
@@ -122,14 +115,14 @@ impl Index {
 
     /// Returns false when the bucket already exists.
     pub async fn create_bucket(&self, name: &str, scope_id: &str) -> Result<bool> {
-        let op = pb::command::Op::CreateBucket(pb::CreateBucket {
+        let cmd = S3Command::CreateBucket {
             name: name.into(),
             scope_id: scope_id.into(),
             created_at: Utc::now().to_rfc3339(),
-        });
-        match self.propose(op).await? {
+        };
+        match self.propose(cmd).await? {
             Ok(_) => Ok(true),
-            Err(pb::rejection::Reason::BucketExists(_)) => Ok(false),
+            Err(S3Reject::BucketExists) => Ok(false),
             Err(other) => anyhow::bail!("unexpected create_bucket rejection {other:?}"),
         }
     }
@@ -139,12 +132,10 @@ impl Index {
     }
 
     pub async fn delete_bucket(&self, name: &str) -> Result<DeleteBucketResult> {
-        use pb::rejection::Reason;
-        let op = pb::command::Op::DeleteBucket(pb::DeleteBucket { name: name.into() });
-        Ok(match self.propose(op).await? {
+        Ok(match self.propose(S3Command::DeleteBucket { name: name.into() }).await? {
             Ok(_) => DeleteBucketResult::Deleted,
-            Err(Reason::BucketNotFound(_)) => DeleteBucketResult::NotFound,
-            Err(Reason::BucketNotEmpty(_)) => DeleteBucketResult::NotEmpty,
+            Err(S3Reject::BucketNotFound) => DeleteBucketResult::NotFound,
+            Err(S3Reject::BucketNotEmpty) => DeleteBucketResult::NotEmpty,
             Err(other) => anyhow::bail!("unexpected delete_bucket rejection {other:?}"),
         })
     }
@@ -197,17 +188,17 @@ impl Index {
         checksums_json: &str,
         mtime: &str,
     ) -> Result<Vec<ChunkId>> {
-        self.propose_infallible(pb::command::Op::PutObject(pb::PutObject {
+        self.propose_infallible(S3Command::PutObject {
             bucket: bucket.into(),
             key: key.into(),
             etag: etag.into(),
             size,
             content_type: content_type.map(Into::into),
-            extents: pb_extents(extents),
-            user_meta: pb_pairs(user_meta),
+            extents: extents.to_vec(),
+            user_meta: user_meta.to_vec(),
             checksums_json: checksums_json.into(),
             mtime: mtime.into(),
-        }))
+        })
         .await
     }
 
@@ -255,33 +246,31 @@ impl Index {
         key: &str,
         tags: &[(String, String)],
     ) -> Result<()> {
-        self.propose_infallible(pb::command::Op::PutObjectTags(pb::PutObjectTags {
+        self.propose_infallible(S3Command::PutObjectTags {
             bucket: bucket.into(),
             key: key.into(),
-            tags: pb_pairs(tags),
-        }))
+            tags: tags.to_vec(),
+        })
         .await?;
         Ok(())
     }
 
     pub async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<()> {
-        self.propose_infallible(pb::command::Op::DeleteObjectTags(pb::DeleteObjectTags {
+        self.propose_infallible(S3Command::PutObjectTags {
             bucket: bucket.into(),
             key: key.into(),
-        }))
+            tags: Vec::new(),
+        })
         .await?;
         Ok(())
     }
 
     /// Delete object; returns extents' chunk ids to `release`, or `None` if missing.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<ChunkId>>> {
-        let op = pb::command::Op::DeleteObject(pb::DeleteObject {
-            bucket: bucket.into(),
-            key: key.into(),
-        });
-        match self.propose(op).await? {
+        let cmd = S3Command::DeleteObject { bucket: bucket.into(), key: key.into() };
+        match self.propose(cmd).await? {
             Ok(ids) => Ok(Some(ids)),
-            Err(pb::rejection::Reason::NoSuchKey(_)) => Ok(None),
+            Err(S3Reject::NoSuchKey) => Ok(None),
             Err(other) => anyhow::bail!("unexpected delete_object rejection {other:?}"),
         }
     }
@@ -508,16 +497,16 @@ impl Index {
         tags: &[(String, String)],
         checksum_algorithm: Option<&str>,
     ) -> Result<()> {
-        self.propose_infallible(pb::command::Op::CreateUpload(pb::CreateUpload {
+        self.propose_infallible(S3Command::CreateUpload {
             upload_id: upload_id.into(),
             bucket: bucket.into(),
             key: key.into(),
             content_type: content_type.map(Into::into),
-            user_meta: pb_pairs(user_meta),
-            tags: pb_pairs(tags),
+            user_meta: user_meta.to_vec(),
+            tags: tags.to_vec(),
             checksum_algorithm: checksum_algorithm.map(Into::into),
             initiated_at: Utc::now().to_rfc3339(),
-        }))
+        })
         .await?;
         Ok(())
     }
@@ -535,13 +524,13 @@ impl Index {
         size: i64,
         extents: &[Extent],
     ) -> Result<Vec<ChunkId>> {
-        self.propose_infallible(pb::command::Op::PutPart(pb::PutPart {
+        self.propose_infallible(S3Command::PutPart {
             upload_id: upload_id.into(),
             part_number,
             etag: etag.into(),
             size,
-            extents: pb_extents(extents),
-        }))
+            extents: extents.to_vec(),
+        })
         .await
     }
 
@@ -579,28 +568,25 @@ impl Index {
         etag: &str,
         total_size: i64,
     ) -> Result<Vec<ChunkId>> {
-        let op = pb::command::Op::CompleteUpload(pb::CompleteUpload {
+        let cmd = S3Command::CompleteUpload {
             upload_id: upload.upload_id.clone(),
             part_numbers: part_numbers.to_vec(),
             etag: etag.into(),
             total_size,
             mtime: Utc::now().to_rfc3339(),
-        });
-        match self.propose(op).await? {
+        };
+        match self.propose(cmd).await? {
             Ok(ids) => Ok(ids),
-            Err(pb::rejection::Reason::MissingPart(pn)) => anyhow::bail!("missing part {pn}"),
+            Err(S3Reject::MissingPart(pn)) => anyhow::bail!("missing part {pn}"),
             Err(other) => anyhow::bail!("complete_multipart_upload rejected: {other:?}"),
         }
     }
 
     /// Abort upload; returns all part chunk ids to `release`, or `None` if missing.
     pub async fn abort_multipart_upload(&self, upload_id: &str) -> Result<Option<Vec<ChunkId>>> {
-        let op = pb::command::Op::AbortUpload(pb::AbortUpload {
-            upload_id: upload_id.into(),
-        });
-        match self.propose(op).await? {
+        match self.propose(S3Command::AbortUpload { upload_id: upload_id.into() }).await? {
             Ok(ids) => Ok(Some(ids)),
-            Err(pb::rejection::Reason::NoSuchUpload(_)) => Ok(None),
+            Err(S3Reject::NoSuchUpload) => Ok(None),
             Err(other) => anyhow::bail!("unexpected abort rejection {other:?}"),
         }
     }
@@ -790,18 +776,4 @@ pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
-}
-
-fn pb_extents(extents: &[Extent]) -> Vec<pb::Extent> {
-    crate::commands::to_pb(extents)
-}
-
-fn pb_pairs(pairs: &[(String, String)]) -> Vec<pb::Pair> {
-    pairs
-        .iter()
-        .map(|(name, value)| pb::Pair {
-            name: name.clone(),
-            value: value.clone(),
-        })
-        .collect()
 }
