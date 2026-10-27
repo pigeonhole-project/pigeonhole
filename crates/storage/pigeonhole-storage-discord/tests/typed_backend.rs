@@ -190,13 +190,25 @@ async fn mount_core_mocks(server: &MockServer, state: Arc<MockState>, server_uri
             // API returns newest → oldest.
             ids.reverse();
             ids.truncate(limit);
+            // Uploaded blobs come back under our name; text messages
+            // (bootstrap pins) have no attachment.
+            let texts = st.message_text.lock().unwrap();
             let body: Vec<_> = ids
                 .into_iter()
                 .map(|mid| {
+                    let attachments = if texts.contains_key(&mid) {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!([{
+                            "id": (mid + 1).to_string(),
+                            "url": format!("https://cdn.example/{mid}"),
+                            "filename": "ph-00000000000000000000000000000001.bin"
+                        }])
+                    };
                     serde_json::json!({
                         "id": mid.to_string(),
-                        "content": "",
-                        "attachments": []
+                        "content": texts.get(&mid).cloned().unwrap_or_default(),
+                        "attachments": attachments
                     })
                 })
                 .collect();
@@ -354,7 +366,7 @@ async fn typed_put_get_sweep_delete_and_fingerprint() {
     );
     assert_eq!(store.instance().location, discord_location(CHANNEL));
 
-    let id = BlobBackend::put(&store, Bytes::from_static(b"typed-dc"))
+    let id = BlobBackend::put(&store, Bytes::from_static(b"typed-dc"), "ph-00000000000000000000000000000001.bin")
         .await
         .unwrap();
     assert!(id.message_id > 0);
@@ -407,13 +419,13 @@ async fn typed_bulk_delete_for_young_messages() {
     let dc = DiscordClient::with_api_base(TOKEN.into(), api_base).unwrap();
     let store = DiscordBlobStore::new(dc, CHANNEL.into(), fast_limiter(), None);
 
-    let a = BlobBackend::put(&store, Bytes::from_static(b"a"))
+    let a = BlobBackend::put(&store, Bytes::from_static(b"a"), "ph-00000000000000000000000000000001.bin")
         .await
         .unwrap();
-    let b = BlobBackend::put(&store, Bytes::from_static(b"b"))
+    let b = BlobBackend::put(&store, Bytes::from_static(b"b"), "ph-00000000000000000000000000000001.bin")
         .await
         .unwrap();
-    let c = BlobBackend::put(&store, Bytes::from_static(b"c"))
+    let c = BlobBackend::put(&store, Bytes::from_static(b"c"), "ph-00000000000000000000000000000001.bin")
         .await
         .unwrap();
 

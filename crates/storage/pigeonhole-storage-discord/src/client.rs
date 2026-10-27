@@ -67,6 +67,10 @@ impl Message {
     pub fn first_attachment_id(&self) -> Option<String> {
         self.attachments.first().map(|a| a.id.to_string())
     }
+
+    pub fn attachment_filename(&self) -> Option<&str> {
+        self.attachments.first().and_then(|a| a.filename.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize)]

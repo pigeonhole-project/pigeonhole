@@ -128,7 +128,7 @@ impl BlobBackend for TelegramBlobStore {
         }
     }
 
-    async fn put(&self, data: Bytes) -> Result<Self::Id> {
+    async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
         if data.is_empty() {
             bail!("refusing empty blob upload (Telegram rejects empty documents)");
         }
@@ -145,7 +145,7 @@ impl BlobBackend for TelegramBlobStore {
             .send_document(
                 &self.chat_id,
                 data,
-                "blob.bin",
+                name,
                 "",
                 Some(self.limiter.as_ref()),
             )

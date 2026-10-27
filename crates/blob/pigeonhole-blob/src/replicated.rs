@@ -4,7 +4,7 @@ use crate::backend::{bytes_stream, BoxByteStream};
 use crate::erase::DynBlobBackend;
 use crate::upload_pins::{UploadPin, UploadPins};
 use crate::part_packer::{EncodedBlock, PartPacker, PartUploaded};
-use crate::typed::{BlobLocator, CostHint, OpKind};
+use crate::typed::{BlobId, BlobLocator, CostHint, OpKind};
 use anyhow::{bail, Result};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, StreamExt};
@@ -25,6 +25,8 @@ pub struct PartLayout {
     pub first_block: u32,
     pub block_count: u32,
     pub locator: BlobLocator,
+    /// Our id of the blob (its uploaded file name).
+    pub blob_id: BlobId,
     /// Stored length of each block in this part (enables Range GET).
     pub block_stored_lens: Vec<u32>,
 }
@@ -36,6 +38,7 @@ impl PartUploaded {
             first_block: self.first_block,
             block_count: self.block_count,
             locator: self.locator,
+            blob_id: self.blob_id,
             block_stored_lens: self.block_stored_lens,
         };
         (layout, self.pin)
@@ -845,7 +848,7 @@ mod tests {
                 inflight: 0,
             }
         }
-        async fn put(&self, data: Bytes) -> Result<Self::Id> {
+        async fn put(&self, data: Bytes, _name: &str) -> Result<Self::Id> {
             if self.unavailable.load(Ordering::Relaxed) {
                 bail!("503 service unavailable");
             }

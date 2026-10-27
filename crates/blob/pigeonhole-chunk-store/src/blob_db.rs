@@ -422,7 +422,7 @@ impl BlobDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pigeonhole_blob::{BlobLocator, InstanceKind, InstanceRole, PartLayout};
+    use pigeonhole_blob::{BlobId, BlobLocator, InstanceKind, InstanceRole, PartLayout};
 
     #[tokio::test]
     async fn instances_and_refs_roundtrip() {
@@ -450,6 +450,7 @@ mod tests {
                     key: vec![0, 0, 0, 1],
                     locator: b"loc".to_vec(),
                 },
+                blob_id: BlobId(0),
                 block_stored_lens: vec![],
             }],
         }];
@@ -513,6 +514,7 @@ mod tests {
                             key: vec![0, 0, 0, 0, 0, 0, 0, 1],
                             locator: b"{}".to_vec(),
                         },
+                        blob_id: BlobId(0),
                         block_stored_lens: vec![8],
                     }],
                 }],
@@ -538,6 +540,7 @@ mod tests {
                             key: vec![0, 0, 0, 0, 0, 0, 0, 2],
                             locator: b"{}".to_vec(),
                         },
+                        blob_id: BlobId(0),
                         block_stored_lens: vec![4],
                     }],
                 }],
@@ -580,6 +583,7 @@ mod tests {
                                 key: vec![0, 0, 0, 0, 0, 0, 0, key],
                                 locator: b"{}".to_vec(),
                             },
+                            blob_id: BlobId(0),
                             block_stored_lens: vec![8],
                         }],
                     }],
@@ -624,6 +628,7 @@ mod tests {
                 first_block: 0,
                 block_count: 0,
                 locator: BlobLocator { key: vec![key], locator: b"{}".to_vec() },
+                blob_id: BlobId(0),
                 block_stored_lens: vec![],
             };
             let replica = ReplicaLayout { instance: "mem".into(), parts: vec![part] };
@@ -662,6 +667,7 @@ mod tests {
                             key: vec![1],
                             locator: b"{}".to_vec(),
                         },
+                        blob_id: BlobId(0),
                         block_stored_lens: vec![],
                     }],
                 }],

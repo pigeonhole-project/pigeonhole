@@ -1,7 +1,7 @@
 //! Pack encoded blocks into instance-sized blob parts (stage D.1).
 
 use crate::erase::DynBlobBackend;
-use crate::typed::BlobLocator;
+use crate::typed::{BlobId, BlobLocator};
 use crate::upload_pins::{UploadPin, UploadPins};
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -21,6 +21,8 @@ pub struct PartUploaded {
     pub first_block: u32,
     pub block_count: u32,
     pub locator: BlobLocator,
+    /// Our id of the blob, uploaded as its file name.
+    pub blob_id: BlobId,
     /// Per-block stored lengths inside this part (for Range reads).
     pub block_stored_lens: Vec<u32>,
     /// Taken before the upload; hold it until the part is committed.
@@ -119,9 +121,10 @@ impl PartPacker {
 
         let instance = self.backend.instance().id.clone();
         let pin = self.pins.pin(&instance);
+        let blob_id = BlobId::random();
         let locator = self
             .backend
-            .put(payload)
+            .put(payload, &blob_id.name())
             .await
             .with_context(|| {
                 format!(
@@ -137,6 +140,7 @@ impl PartPacker {
             first_block,
             block_count,
             locator,
+            blob_id,
             block_stored_lens: lenses,
             pin,
         })
@@ -214,7 +218,7 @@ mod tests {
         fn cost(&self, _: OpKind, _: Option<&Self::Id>) -> CostHint {
             CostHint::free()
         }
-        async fn put(&self, data: Bytes) -> Result<Self::Id> {
+        async fn put(&self, data: Bytes, _name: &str) -> Result<Self::Id> {
             if data.len() > self.limits.max_blob_size {
                 bail!("oversize");
             }

@@ -28,6 +28,8 @@ pub struct MemoryBlobStore {
     next_fid: AtomicU64,
     files: Mutex<HashMap<String, Bytes>>,
     messages: Mutex<HashMap<i64, String>>,
+    /// Message id → the name the blob was uploaded under.
+    names: Mutex<HashMap<i64, String>>,
     /// Bootstrap pin payload (TypedBootstrapPointer).
     pin: Mutex<Option<Bytes>>,
     /// When set and true, get/put fail (failover tests).
@@ -57,6 +59,7 @@ impl MemoryBlobStore {
             next_fid: AtomicU64::new(1),
             files: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
+            names: Mutex::new(HashMap::new()),
             pin: Mutex::new(None),
             unavailable: None,
         }
@@ -109,6 +112,11 @@ impl MemoryBlobStore {
     }
 
     /// Test helper: message sort keys currently held by the store.
+    /// The name the message's blob was uploaded under.
+    pub fn name_of(&self, message_id: u64) -> Option<String> {
+        self.names.lock().unwrap().get(&(message_id as i64)).cloned()
+    }
+
     pub fn message_keys(&self) -> Vec<u64> {
         let mut keys: Vec<u64> = self
             .messages
@@ -156,7 +164,7 @@ impl BlobBackend for MemoryBlobStore {
         CostHint::free()
     }
 
-    async fn put(&self, data: Bytes) -> Result<Self::Id> {
+    async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
         self.check_available()?;
         if data.is_empty() {
             bail!("refusing empty blob upload (Telegram rejects empty documents)");
@@ -175,6 +183,7 @@ impl BlobBackend for MemoryBlobStore {
             .lock()
             .unwrap()
             .insert(message_id, file_id.clone());
+        self.names.lock().unwrap().insert(message_id, name.to_string());
         Ok(MemoryId {
             file_id,
             message_id: message_id as u64,
@@ -251,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn memory_put_get_delete() {
         let store = MemoryBlobStore::new();
-        let id = BlobBackend::put(&store, Bytes::from_static(b"hello"))
+        let id = BlobBackend::put(&store, Bytes::from_static(b"hello"), "t.bin")
             .await
             .unwrap();
         let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
@@ -267,13 +276,13 @@ mod tests {
     #[tokio::test]
     async fn memory_rejects_empty_put() {
         let store = MemoryBlobStore::new();
-        assert!(BlobBackend::put(&store, Bytes::new()).await.is_err());
+        assert!(BlobBackend::put(&store, Bytes::new(), "t.bin").await.is_err());
     }
 
     #[tokio::test]
     async fn memory_range_get() {
         let store = MemoryBlobStore::new();
-        let id = BlobBackend::put(&store, Bytes::from_static(b"abcdefgh"))
+        let id = BlobBackend::put(&store, Bytes::from_static(b"abcdefgh"), "t.bin")
             .await
             .unwrap();
         let got = collect_stream(BlobBackend::get(&store, &id, Some(2..5)).await.unwrap())
@@ -285,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn typed_backend_put_get_sweep() {
         let store = MemoryBlobStore::new();
-        let id = BlobBackend::put(&store, Bytes::from_static(b"typed"))
+        let id = BlobBackend::put(&store, Bytes::from_static(b"typed"), "t.bin")
             .await
             .unwrap();
         let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())

@@ -316,7 +316,7 @@ async fn concurrent_ops_with_aggressive_sweeper() {
 
     // A dead writer's uploads: on the backend, never committed to chunk_parts.
     for i in 0..5u64 {
-        node.backend.put(payload(0xDEAD + i, 1024)).await.unwrap();
+        node.backend.put(payload(0xDEAD + i, 1024), "orphan.bin").await.unwrap();
     }
 
     let stop = Arc::new(AtomicBool::new(false));

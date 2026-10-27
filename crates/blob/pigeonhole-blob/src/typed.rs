@@ -129,6 +129,32 @@ impl CostHint {
     }
 }
 
+/// Our own identity of a blob, chosen before it is uploaded and sent as its
+/// file name (`ph-<32 hex>.bin`): it tells our blobs from anything else in a
+/// chat or channel, and ties a backend message to the part that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BlobId(pub u128);
+
+impl BlobId {
+    pub fn random() -> Self {
+        BlobId(uuid::Uuid::new_v4().as_u128())
+    }
+
+    /// File name the blob is uploaded under.
+    pub fn name(&self) -> String {
+        format!("ph-{:032x}.bin", self.0)
+    }
+
+    /// Inverse of [`Self::name`]; `None` for a name we did not give.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let hex = name.strip_prefix("ph-")?.strip_suffix(".bin")?;
+        if hex.len() != 32 {
+            return None;
+        }
+        u128::from_str_radix(hex, 16).ok().map(BlobId)
+    }
+}
+
 /// Type-erased stored identity: order key + postcard/bincode locator bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobLocator {
@@ -149,7 +175,8 @@ pub trait BlobBackend: Send + Sync + 'static {
     /// Peek cost without capturing a limiter token.
     fn cost(&self, op: OpKind, id: Option<&Self::Id>) -> CostHint;
 
-    async fn put(&self, data: Bytes) -> Result<Self::Id>;
+    /// Upload `data` as one blob named `name` (see [`BlobId::name`]).
+    async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id>;
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream>;
     /// Batch delete; not-found is ok.
     async fn delete(&self, keys: &[Self::Key]) -> Result<()>;
@@ -197,8 +224,8 @@ impl<B: BlobBackend> BlobBackend for std::sync::Arc<B> {
     fn cost(&self, op: OpKind, id: Option<&Self::Id>) -> CostHint {
         (**self).cost(op, id)
     }
-    async fn put(&self, data: Bytes) -> Result<Self::Id> {
-        (**self).put(data).await
+    async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
+        (**self).put(data, name).await
     }
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         (**self).get(id, range).await
@@ -248,6 +275,21 @@ pub fn load_id<B: BlobBackend>(stored: &BlobLocator) -> Result<B::Id> {
         bail!("BlobLocator key mismatch for decoded locator");
     }
     Ok(id)
+}
+
+#[cfg(test)]
+mod blob_id_tests {
+    use super::BlobId;
+
+    #[test]
+    fn name_roundtrips_and_rejects_foreign_names() {
+        let id = BlobId(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+        assert_eq!(id.name(), "ph-0123456789abcdef0011223344556677.bin");
+        assert_eq!(BlobId::from_name(&id.name()), Some(id));
+        for foreign in ["blob.bin", "ph-zz.bin", "ph-0123.bin", "photo.jpg"] {
+            assert_eq!(BlobId::from_name(foreign), None, "{foreign}");
+        }
+    }
 }
 
 #[cfg(test)]

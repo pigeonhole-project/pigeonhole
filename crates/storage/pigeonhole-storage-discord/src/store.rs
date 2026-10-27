@@ -6,7 +6,7 @@ use bytes::Bytes;
 use pigeonhole_blob::{
     bytes_stream, slice_range, BootstrapPointer, BoxByteStream, ChatLimiter, CostHint,
     DeleteOutcome, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey, PinnedContent,
-    Sweepable, BlobBackend, TypedBootstrapPointer,
+    BlobBackend, BlobId, Sweepable, TypedBootstrapPointer,
 };
 use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 use serde::{Deserialize, Serialize};
@@ -201,7 +201,7 @@ impl BlobBackend for DiscordBlobStore {
         }
     }
 
-    async fn put(&self, data: Bytes) -> Result<Self::Id> {
+    async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
         if data.is_empty() {
             bail!("refusing empty blob upload");
         }
@@ -217,7 +217,7 @@ impl BlobBackend for DiscordBlobStore {
             .send_attachment(
                 &self.channel_id,
                 data,
-                "blob.bin",
+                name,
                 "",
                 Some(self.limiter.as_ref()),
             )
@@ -306,8 +306,10 @@ impl Sweepable for DiscordBlobStore {
             if msgs.is_empty() {
                 break;
             }
+            // Only our blobs: anything else in the channel is not ours to sweep.
             let mut ids: Vec<u64> = msgs
                 .iter()
+                .filter(|m| m.attachment_filename().and_then(BlobId::from_name).is_some())
                 .map(|m| m.message_id())
                 .filter(|&k| k <= upto && after.map(|a| k > a).unwrap_or(true))
                 .collect();

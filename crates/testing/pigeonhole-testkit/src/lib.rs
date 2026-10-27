@@ -3,7 +3,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    collect_stream, Sweepable, BlobBackend, TypedBootstrapPointer,
+    collect_stream, BlobBackend, BlobId, Sweepable, TypedBootstrapPointer,
 };
 
 /// Shared suite for [`BlobBackend`] + [`Sweepable`] + [`TypedBootstrapPointer`].
@@ -16,11 +16,11 @@ where
 {
     // empty rejected
     assert!(
-        backend.put(Bytes::new()).await.is_err(),
+        backend.put(Bytes::new(), &BlobId::random().name()).await.is_err(),
         "empty blob must be rejected"
     );
 
-    let id = backend.put(Bytes::from_static(b"hello-typed-conformance")).await?;
+    let id = backend.put(Bytes::from_static(b"hello-typed-conformance"), &BlobId::random().name()).await?;
     let got = collect_stream(backend.get(&id, None).await?).await?;
     assert_eq!(got.as_ref(), b"hello-typed-conformance");
 
@@ -30,17 +30,17 @@ where
     // Near max (capped for test runtime; oversized still uses true max).
     let max = backend.limits().max_blob_size.min(64 * 1024);
     let big = Bytes::from(vec![0xABu8; max]);
-    let big_id = backend.put(big.clone()).await?;
+    let big_id = backend.put(big.clone(), &BlobId::random().name()).await?;
     let big_got = collect_stream(backend.get(&big_id, None).await?).await?;
     assert_eq!(big_got, big);
 
     let over = Bytes::from(vec![0u8; backend.limits().max_blob_size + 1]);
-    assert!(backend.put(over).await.is_err());
+    assert!(backend.put(over, &BlobId::random().name()).await.is_err());
 
     // Monotonic keys across successive puts.
     let mut ids = vec![id.clone(), big_id.clone()];
     for i in 0..4u8 {
-        ids.push(backend.put(Bytes::from(vec![i; 32])).await?);
+        ids.push(backend.put(Bytes::from(vec![i; 32]), &BlobId::random().name()).await?);
     }
     for w in ids.windows(2) {
         assert!(

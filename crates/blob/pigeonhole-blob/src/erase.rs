@@ -17,7 +17,8 @@ pub trait DynBlobBackend: Send + Sync + 'static {
     fn instance(&self) -> &InstanceInfo;
     fn limits(&self) -> &BackendLimits;
     fn cost(&self, op: OpKind, id: Option<&BlobLocator>) -> CostHint;
-    async fn put(&self, data: Bytes) -> Result<BlobLocator>;
+    /// Upload `data` as one blob named `name` (see [`crate::BlobId::name`]).
+    async fn put(&self, data: Bytes, name: &str) -> Result<BlobLocator>;
     async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream>;
     async fn delete(&self, keys: &[Vec<u8>]) -> Result<()>;
     /// Optional sweeper registration.
@@ -68,8 +69,8 @@ where
         self.inner.cost(op, typed.as_ref())
     }
 
-    async fn put(&self, data: Bytes) -> Result<BlobLocator> {
-        let id = self.inner.put(data).await?;
+    async fn put(&self, data: Bytes, name: &str) -> Result<BlobLocator> {
+        let id = self.inner.put(data, name).await?;
         store_id::<B>(&id)
     }
 
@@ -124,8 +125,8 @@ where
         self.inner.cost(op, typed.as_ref())
     }
 
-    async fn put(&self, data: Bytes) -> Result<BlobLocator> {
-        let id = BlobBackend::put(&self.inner, data).await?;
+    async fn put(&self, data: Bytes, name: &str) -> Result<BlobLocator> {
+        let id = BlobBackend::put(&self.inner, data, name).await?;
         store_id::<B>(&id)
     }
 
@@ -233,7 +234,7 @@ mod tests {
         fn cost(&self, _: OpKind, _: Option<&Self::Id>) -> CostHint {
             CostHint::free()
         }
-        async fn put(&self, data: Bytes) -> Result<Self::Id> {
+        async fn put(&self, data: Bytes, _name: &str) -> Result<Self::Id> {
             let key = self
                 .next
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -283,7 +284,7 @@ mod tests {
     #[tokio::test]
     async fn erased_sweep_roundtrip() {
         let backend: SharedBackend = Arc::new(erase_sweep(TinyMem::new()));
-        let id = backend.put(Bytes::from_static(b"hi")).await.unwrap();
+        let id = backend.put(Bytes::from_static(b"hi"), "hi.bin").await.unwrap();
         let got = collect_stream(backend.get(&id, None).await.unwrap())
             .await
             .unwrap();

@@ -30,7 +30,7 @@ pub use replicated::{
 };
 pub use typed::{
     load_id, store_id, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
-    BlobLocator, Sweepable, BlobBackend, TypedBootstrapPointer,
+    BlobId, BlobLocator, Sweepable, BlobBackend, TypedBootstrapPointer,
 };
 pub use pigeonhole_types::{
     BackendId, BackendLimits, BlobKey, ByteRange, DeleteOutcome, RangeSupport,

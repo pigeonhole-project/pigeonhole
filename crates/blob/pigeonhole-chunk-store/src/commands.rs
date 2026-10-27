@@ -9,7 +9,7 @@
 
 use crate::blob_db::{ChunkId, StoredBlock};
 use anyhow::{bail, Result};
-use pigeonhole_blob::{BlobLocator, PartLayout, ReplicaLayout};
+use pigeonhole_blob::{BlobId, BlobLocator, PartLayout, ReplicaLayout};
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -77,6 +77,8 @@ pub struct PartRec {
     pub block_count: u32,
     pub sort_key: Vec<u8>,
     pub locator: Vec<u8>,
+    /// Our id of the blob (its uploaded file name).
+    pub blob_id: BlobId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +118,7 @@ type Applied = std::result::Result<(), ChunkReject>;
 
 impl StateMachine for ChunkState {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     type Command = ChunkCommand;
     type Reply = ();
     type Reject = ChunkReject;
@@ -332,6 +334,7 @@ impl From<&ReplicaLayout> for Replica {
                     block_count: p.block_count,
                     sort_key: p.locator.key.clone(),
                     locator: p.locator.locator.clone(),
+                    blob_id: p.blob_id,
                 })
                 .collect(),
         }
@@ -358,6 +361,7 @@ impl ChunkRec {
                                 key: p.sort_key.clone(),
                                 locator: p.locator.clone(),
                             },
+                            blob_id: p.blob_id,
                             block_stored_lens: stored_lens
                                 .get(p.first_block as usize..end)
                                 .map(<[u32]>::to_vec)
@@ -380,6 +384,6 @@ mod tests {
     fn command_encoding_is_pinned() {
         let cmd = ChunkCommand::Release { chunk_ids: vec![1, 2] };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 2, 2, 4]);
-        assert_eq!(ChunkState::VERSION, 1);
+        assert_eq!(ChunkState::VERSION, 2);
     }
 }

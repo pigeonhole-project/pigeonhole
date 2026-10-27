@@ -172,9 +172,9 @@ async fn wiremock_conformance_suite() {
     }));
     let store = DiscordBlobStore::new(dc, CHANNEL.into(), limiter, None);
 
-    assert!(BlobBackend::put(&store, Bytes::new()).await.is_err());
+    assert!(BlobBackend::put(&store, Bytes::new(), "ph-00000000000000000000000000000001.bin").await.is_err());
 
-    let id = BlobBackend::put(&store, Bytes::from_static(b"hello-conformance"))
+    let id = BlobBackend::put(&store, Bytes::from_static(b"hello-conformance"), "ph-00000000000000000000000000000001.bin")
         .await
         .unwrap();
     let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
@@ -253,7 +253,7 @@ async fn wiremock_expired_url_refresh_and_429_retry() {
     let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
     let store = DiscordBlobStore::new(dc, CHANNEL.into(), limiter, None);
 
-    let id = BlobBackend::put(&store, Bytes::from_static(b"payload-bytes"))
+    let id = BlobBackend::put(&store, Bytes::from_static(b"payload-bytes"), "ph-00000000000000000000000000000001.bin")
         .await
         .unwrap();
     let got = pigeonhole_blob::collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())

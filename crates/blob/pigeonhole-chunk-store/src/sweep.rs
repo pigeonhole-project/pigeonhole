@@ -273,7 +273,7 @@ mod tests {
 
     /// An upload this process saw finish and never committed (a failed chunk).
     async fn orphan(f: &Fixture, data: &'static [u8]) -> BlobLocator {
-        let loc = f.backend.put(Bytes::from_static(data)).await.unwrap();
+        let loc = f.backend.put(Bytes::from_static(data), "orphan.bin").await.unwrap();
         f.pins.returned("default", &loc.key);
         loc
     }
@@ -309,7 +309,7 @@ mod tests {
         let f = setup().await;
         let old = orphan(&f, b"old-orphan").await;
         // An upload this process never saw return (another writer's, say).
-        let unseen = f.backend.put(Bytes::from_static(b"unseen")).await.unwrap();
+        let unseen = f.backend.put(Bytes::from_static(b"unseen"), "orphan.bin").await.unwrap();
         let stats = sweeper(&f).sweep_once().await.unwrap();
         assert_eq!(stats.keys_deleted, 1);
         assert!(!on_backend(&f, &old));
@@ -322,7 +322,7 @@ mod tests {
         let before = orphan(&f, b"before").await;
         // A slow chunk: pinned, uploaded, not committed; later uploads finish.
         let pin = f.pins.pin("default");
-        let slow = f.backend.put(Bytes::from_static(b"slow-part")).await.unwrap();
+        let slow = f.backend.put(Bytes::from_static(b"slow-part"), "orphan.bin").await.unwrap();
         f.pins.returned("default", &slow.key);
         let after = orphan(&f, b"after").await;
 
@@ -349,6 +349,16 @@ mod tests {
         assert_eq!((stats.keys_deleted, stats.keys_skipped_live), (1, 1));
         assert!(on_backend(&f, &loc));
         assert!(!on_backend(&f, &later));
+    }
+
+    #[tokio::test]
+    async fn committed_parts_carry_the_name_they_were_uploaded_under() {
+        let f = setup().await;
+        let id = f.layer.put_small(Bytes::from_static(b"named")).await.unwrap();
+        let part = f.db.get_replica_layouts(id).await.unwrap()[0].parts[0].clone();
+        let key = u64::from_bytes(&part.locator.key).unwrap();
+        assert_eq!(f.mem.name_of(key), Some(part.blob_id.name()));
+        assert_eq!(pigeonhole_blob::BlobId::from_name(&part.blob_id.name()), Some(part.blob_id));
     }
 
     #[tokio::test]
@@ -382,7 +392,7 @@ mod tests {
     async fn restart_seeds_the_horizon_from_committed_parts() {
         let f = setup().await;
         // A dead writer's upload, then a committed chunk above it.
-        let dead = f.backend.put(Bytes::from_static(b"dead-writer")).await.unwrap();
+        let dead = f.backend.put(Bytes::from_static(b"dead-writer"), "orphan.bin").await.unwrap();
         let id = f.layer.put_small(Bytes::from_static(b"committed")).await.unwrap();
 
         // Restart: fresh pins, nothing returned in this process yet.

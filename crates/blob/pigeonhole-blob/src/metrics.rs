@@ -267,12 +267,12 @@ impl DynBlobBackend for MetricsBackend {
         self.inner.cost(op, id)
     }
 
-    async fn put(&self, data: Bytes) -> Result<BlobLocator> {
+    async fn put(&self, data: Bytes, name: &str) -> Result<BlobLocator> {
         let instance = self.inner.instance().id.clone();
         let op = "put";
         inflight_inc(&instance, op);
         let t0 = Instant::now();
-        let result = self.inner.put(data).await;
+        let result = self.inner.put(data, name).await;
         let elapsed = t0.elapsed();
         inflight_dec(&instance, op);
         match &result {

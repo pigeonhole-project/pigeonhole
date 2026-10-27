@@ -280,7 +280,7 @@ async fn typed_put_get_delete_and_instance_info() {
     assert_eq!(store.instance().fingerprint, "tg:123456:-100111");
     assert_eq!(store.instance().location, "tg:chat:-100111");
 
-    let id = BlobBackend::put(&store, Bytes::from_static(b"hello-typed"))
+    let id = BlobBackend::put(&store, Bytes::from_static(b"hello-typed"), "ph-00000000000000000000000000000001.bin")
         .await
         .unwrap();
     let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
@@ -334,7 +334,7 @@ async fn cost_get_zero_when_file_path_cached() {
     let server = MockServer::start().await;
     let (store, _) = make_store(&server).await;
 
-    let id = BlobBackend::put(&store, Bytes::from_static(b"cached-path"))
+    let id = BlobBackend::put(&store, Bytes::from_static(b"cached-path"), "ph-00000000000000000000000000000001.bin")
         .await
         .unwrap();
     // Prime getFile cache.
