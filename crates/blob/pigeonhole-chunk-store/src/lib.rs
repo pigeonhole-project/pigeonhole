@@ -32,11 +32,10 @@ pub use repair::{
     DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
 };
 pub use sweep::{
-    SweepConfig, SweepStats, Sweeper, WatermarkBackend, DEFAULT_SWEEP_GRACE, DEFAULT_SWEEP_INTERVAL,
-    SWEEP_BATCH_SIZE,
+    SweepConfig, SweepStats, Sweeper, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE,
 };
 pub use pigeonhole_blob::{
-    collect_stream, BootstrapPointer, BoxByteStream, DeleteOutcome, InflightGuard, InflightParts,
-    PinnedContent,
+    collect_stream, BootstrapPointer, BoxByteStream, DeleteOutcome, PinnedContent, UploadPin,
+    UploadPins,
 };
 pub use pigeonhole_codec::{ByteBudget, ChunkCodec, BlockRecord};

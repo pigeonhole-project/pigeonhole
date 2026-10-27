@@ -2,12 +2,12 @@
 //!
 //! Chunk state (instances, chunks, blocks, parts) lives in the tablet's
 //! [`ChunkState`] and changes only through `chunk` commands. Node-local
-//! progress (put watermarks, sweep cursor, repair queue) is kept in this
+//! progress (sweep cursor, repair queue) is kept in this
 //! process: it is not replicated and starts empty on every boot.
 
 use crate::commands::{ChunkCommand, ChunkRec, ChunkReject, ChunkState, InstanceRec, Replica, NAMESPACE};
 use anyhow::{bail, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use pigeonhole_blob::{InstanceInfo, ReplicaLayout};
 use pigeonhole_meta::{MetaStore, Namespaces};
 use serde::{Deserialize, Serialize};
@@ -59,8 +59,6 @@ pub struct StoredBlock {
 /// Progress of this process; lost on restart by design.
 #[derive(Default)]
 struct NodeLocal {
-    /// Per instance: `(at, max_key)` of successful puts, oldest first.
-    watermarks: HashMap<String, Vec<(DateTime<Utc>, Vec<u8>)>>,
     sweep_cursor: HashMap<String, Vec<u8>>,
     /// `(chunk, instance)` → enqueue order.
     repair_queue: BTreeMap<(ChunkId, String), u64>,
@@ -254,51 +252,6 @@ impl BlobDb {
         Ok(self.chunk(chunk_id, ChunkRec::replica_layouts).unwrap_or_default())
     }
 
-    /// Record the highest sort key observed from a successful backend put.
-    pub async fn record_put_watermark(&self, instance_id: &str, max_key: &[u8]) -> Result<()> {
-        self.record_put_watermark_at(instance_id, max_key, Utc::now())
-            .await
-    }
-
-    /// Test helper: record a watermark at an explicit timestamp.
-    pub async fn record_put_watermark_at(
-        &self,
-        instance_id: &str,
-        max_key: &[u8],
-        at: DateTime<Utc>,
-    ) -> Result<()> {
-        let mut local = self.local.lock().unwrap();
-        local
-            .watermarks
-            .entry(instance_id.to_string())
-            .or_default()
-            .push((at, max_key.to_vec()));
-        Ok(())
-    }
-
-    /// Max sort key among watermarks with `at <= now - grace` (sweep upper bound).
-    pub async fn sweep_watermark(
-        &self,
-        instance_id: &str,
-        grace: std::time::Duration,
-    ) -> Result<Option<Vec<u8>>> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::zero());
-        let mut local = self.local.lock().unwrap();
-        let Some(marks) = local.watermarks.get_mut(instance_id) else {
-            return Ok(None);
-        };
-        // Everything at or before the cutoff collapses into one entry: later
-        // cutoffs only move forward.
-        let (old, mut fresh): (Vec<_>, Vec<_>) = marks.drain(..).partition(|(at, _)| *at <= cutoff);
-        let best = old.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-        let upto = best.as_ref().map(|(_, k)| k.clone());
-        if let Some(b) = best {
-            fresh.insert(0, b);
-        }
-        *marks = fresh;
-        Ok(upto)
-    }
-
     pub async fn get_sweep_cursor(&self, instance_id: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.local.lock().unwrap().sweep_cursor.get(instance_id).cloned())
     }
@@ -314,6 +267,17 @@ impl BlobDb {
             None => local.sweep_cursor.remove(instance_id),
         };
         Ok(())
+    }
+
+    /// Highest sort key of any committed part on `instance_id`.
+    pub fn max_part_key(&self, instance_id: &str) -> Option<Vec<u8>> {
+        self.read(|s| {
+            s.chunks
+                .values()
+                .flat_map(|c| c.replicas.get(instance_id).into_iter().flatten())
+                .map(|p| p.sort_key.clone())
+                .max()
+        })
     }
 
     /// Sort keys of parts belonging to live chunks on this instance.

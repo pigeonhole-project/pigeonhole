@@ -1,20 +1,17 @@
-//! Stage H: reclaim orphan backend blobs and zero-ref chunk parts.
+//! Reclaim zero-ref chunks and orphan backend blobs.
+//!
+//! Orphans are swept only up to the instance's upload horizon
+//! ([`UploadPins::horizon`]): every key at or below it is either a committed
+//! part (kept) or garbage, because uploads are pinned before they start and
+//! unpinned only after their commit is applied.
 
 use crate::blob_db::BlobDb;
-use anyhow::{bail, Context, Result};
-use async_trait::async_trait;
-use bytes::Bytes;
-use pigeonhole_blob::{
-    BlobLocator, BoxByteStream, CostHint, DynBlobBackend, DynSweep, InflightParts, InstanceInfo,
-    OpKind, SharedBackend,
-};
-use pigeonhole_types::{BackendLimits, ByteRange};
+use anyhow::{Context, Result};
+use pigeonhole_blob::{SharedBackend, UploadPins};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Default grace: keys from puts newer than this are not swept.
-pub const DEFAULT_SWEEP_GRACE: Duration = Duration::from_secs(15 * 60);
 /// Candidates fetched / deleted per batch.
 pub const SWEEP_BATCH_SIZE: usize = 100;
 /// Default pause between full sweep passes in the binary.
@@ -23,7 +20,6 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Runtime knobs for the sweeper.
 #[derive(Clone, Debug)]
 pub struct SweepConfig {
-    pub grace: Duration,
     pub batch_size: usize,
     pub interval: Duration,
 }
@@ -31,7 +27,6 @@ pub struct SweepConfig {
 impl Default for SweepConfig {
     fn default() -> Self {
         Self {
-            grace: DEFAULT_SWEEP_GRACE,
             batch_size: SWEEP_BATCH_SIZE,
             interval: DEFAULT_SWEEP_INTERVAL,
         }
@@ -46,105 +41,23 @@ pub struct SweepStats {
     pub keys_skipped_live: u64,
 }
 
-/// Wraps a [`DynBlobBackend`] so every successful put records a watermark and
-/// individual puts older than `grace` are interrupted (when grace is non-zero).
-///
-/// The per-put timeout does **not** cover the window from the first part of a
-/// chunk until `commit_chunk` / superblock publish — that protection is
-/// [`InflightParts`], consulted by [`Sweeper`] on every delete batch.
-pub struct WatermarkBackend {
-    inner: SharedBackend,
-    db: BlobDb,
-    grace: Duration,
-}
-
-impl WatermarkBackend {
-    pub fn new(inner: SharedBackend, db: BlobDb, grace: Duration) -> Self {
-        Self { inner, db, grace }
-    }
-
-    pub fn wrap(inner: SharedBackend, db: BlobDb, grace: Duration) -> SharedBackend {
-        Arc::new(Self::new(inner, db, grace))
-    }
-}
-
-#[async_trait]
-impl DynBlobBackend for WatermarkBackend {
-    fn instance(&self) -> &InstanceInfo {
-        self.inner.instance()
-    }
-
-    fn limits(&self) -> &BackendLimits {
-        self.inner.limits()
-    }
-
-    fn cost(&self, op: OpKind, id: Option<&BlobLocator>) -> CostHint {
-        self.inner.cost(op, id)
-    }
-
-    async fn put(&self, data: Bytes) -> Result<BlobLocator> {
-        let put = self.inner.put(data);
-        let loc = if self.grace.is_zero() {
-            put.await?
-        } else {
-            match tokio::time::timeout(self.grace, put).await {
-                Ok(r) => r?,
-                Err(_) => bail!(
-                    "put on instance {} exceeded sweep grace {:?}",
-                    self.inner.instance().id,
-                    self.grace
-                ),
-            }
-        };
-        self.db
-            .record_put_watermark(&self.inner.instance().id, &loc.key)
-            .await
-            .context("record put watermark")?;
-        Ok(loc)
-    }
-
-    async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream> {
-        self.inner.get(id, range).await
-    }
-
-    async fn delete(&self, keys: &[Vec<u8>]) -> Result<()> {
-        self.inner.delete(keys).await
-    }
-
-    fn sweeper(&self) -> Option<&dyn DynSweep> {
-        self.inner.sweeper()
-    }
-}
-
 /// One sweeper per process; iterates every Sweepable member of the placement group.
 pub struct Sweeper {
     db: BlobDb,
     members: Vec<SharedBackend>,
     config: SweepConfig,
-    inflight: Arc<InflightParts>,
+    /// The upload pins of this process (`Replicated::pins`).
+    pins: Arc<UploadPins>,
 }
 
 impl Sweeper {
-    pub fn new(db: BlobDb, members: Vec<SharedBackend>, config: SweepConfig) -> Self {
-        Self::with_inflight(db, members, config, InflightParts::shared())
-    }
-
-    pub fn with_inflight(
+    pub fn new(
         db: BlobDb,
         members: Vec<SharedBackend>,
         config: SweepConfig,
-        inflight: Arc<InflightParts>,
+        pins: Arc<UploadPins>,
     ) -> Self {
-        Self {
-            db,
-            members,
-            config,
-            inflight,
-        }
-    }
-
-    pub fn inflight(&self) -> &Arc<InflightParts> {
-        &self.inflight
+        Self { db, members, config, pins }
     }
 
     pub fn config(&self) -> &SweepConfig {
@@ -246,11 +159,7 @@ impl Sweeper {
             return Ok((0, 0));
         };
         let instance_id = backend.instance().id.as_str();
-        let Some(upto) = self
-            .db
-            .sweep_watermark(instance_id, self.config.grace)
-            .await?
-        else {
+        let Some(upto) = self.pins.horizon(instance_id) else {
             return Ok((0, 0));
         };
 
@@ -269,14 +178,9 @@ impl Sweeper {
                 break;
             }
 
-            // Re-check liveness immediately before delete (never cache across batches):
-            // committed chunk_parts and in-flight uploads.
-            let (to_delete, skipped_batch, protected) =
-                self.filter_deletable(instance_id, &keys).await?;
+            // Re-check liveness immediately before delete (never cache across batches).
+            let (to_delete, skipped_batch) = self.filter_deletable(instance_id, &keys).await?;
             skipped += skipped_batch;
-            if protected > 0 {
-                pigeonhole_blob::record_sweep("inflight_protected", protected);
-            }
             if !to_delete.is_empty() {
                 // Orphans are judged by this incarnation's state: delete only
                 // while it still holds the generation. (Reclaim needs no check:
@@ -306,35 +210,17 @@ impl Sweeper {
         Ok((deleted, skipped))
     }
 
-    /// Classify a candidate batch: `(to_delete, skipped_live, inflight_protected)`.
+    /// Split a candidate batch (all at or below the horizon) into
+    /// `(to_delete, skipped_live)`: committed parts of live chunks stay.
     async fn filter_deletable(
         &self,
         instance_id: &str,
         keys: &[Vec<u8>],
-    ) -> Result<(Vec<Vec<u8>>, u64, u64)> {
-        // Snapshot in-flight membership *before* reading committed state: guards are
-        // dropped only after commit, so a key absent here but committed later is
-        // visible to the queries below. The reverse order loses keys committed in between.
-        let inflight: Vec<bool> = keys
-            .iter()
-            .map(|k| self.inflight.contains(instance_id, k))
-            .collect();
-        let committed = self.db.live_part_keys_among(instance_id, keys).await?;
-
-        let mut to_delete = Vec::new();
-        let mut skipped = 0u64;
-        let mut protected = 0u64;
-        for (k, inflight) in keys.iter().zip(inflight) {
-            if committed.contains(k) {
-                skipped += 1;
-            } else if inflight {
-                protected += 1;
-                skipped += 1;
-            } else {
-                to_delete.push(k.clone());
-            }
-        }
-        Ok((to_delete, skipped, protected))
+    ) -> Result<(Vec<Vec<u8>>, u64)> {
+        let live = self.db.live_part_keys_among(instance_id, keys).await?;
+        let to_delete: Vec<Vec<u8>> = keys.iter().filter(|k| !live.contains(*k)).cloned().collect();
+        let skipped = (keys.len() - to_delete.len()) as u64;
+        Ok((to_delete, skipped))
     }
 }
 
@@ -344,9 +230,9 @@ mod tests {
     use crate::ingest::IngestOptions;
     use crate::instances::{validate_instances, InstanceConfig};
     use crate::layer::ChunkStore;
-    use chrono::{Duration as ChronoDuration, Utc};
+    use bytes::Bytes;
     use pigeonhole_blob::{
-        erase_sweep, InflightParts, InstanceInfo, InstanceKind, InstanceRole, OrderedKey,
+        erase_sweep, BlobLocator, InstanceInfo, InstanceKind, InstanceRole, OrderedKey, Replicated,
     };
     use pigeonhole_codec::ChunkCodec;
     use pigeonhole_storage_memory::MemoryBlobStore;
@@ -357,166 +243,134 @@ mod tests {
         mem: Arc<MemoryBlobStore>,
         backend: SharedBackend,
         layer: ChunkStore,
-        inflight: Arc<InflightParts>,
-        replicated: Arc<pigeonhole_blob::Replicated>,
+        pins: Arc<UploadPins>,
+    }
+
+    async fn open_layer(db: BlobDb, backend: SharedBackend) -> (ChunkStore, Arc<UploadPins>) {
+        let replicated = Arc::new(
+            Replicated::new(vec![backend], 1, Arc::new(pigeonhole_blob::CheapestFirst::new())).unwrap(),
+        );
+        let pins = replicated.pins().clone();
+        let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
+        opts.block_size = 64 * 1024;
+        let layer = ChunkStore::open_replicated(db, replicated, opts).await.unwrap();
+        (layer, pins)
     }
 
     async fn setup() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let log_dir = dir.path().join("blob.log");
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::connect(dir.path().join("blob.log")).await.unwrap();
         let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
-        let backend = WatermarkBackend::wrap(
-            Arc::new(erase_sweep(mem.clone())),
-            db.clone(),
-            Duration::ZERO,
-        );
-        let inflight = InflightParts::shared();
-        let replicated = Arc::new(
-            pigeonhole_blob::Replicated::new(
-                vec![backend.clone()],
-                1,
-                Arc::new(pigeonhole_blob::CheapestFirst::new()),
-            )
-            .unwrap()
-            .with_inflight(inflight.clone()),
-        );
-        let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
-        opts.block_size = 64 * 1024;
-        let layer = ChunkStore::open_replicated(db.clone(), replicated.clone(), opts)
-            .await
-            .unwrap();
-        Fixture {
-            _dir: dir,
-            db,
-            mem,
-            backend,
-            layer,
-            inflight,
-            replicated,
-        }
+        let backend: SharedBackend = Arc::new(erase_sweep(mem.clone()));
+        let (layer, pins) = open_layer(db.clone(), backend.clone()).await;
+        Fixture { _dir: dir, db, mem, backend, layer, pins }
     }
 
-    fn sweeper(
-        db: BlobDb,
-        backend: SharedBackend,
-        grace: Duration,
-        inflight: Arc<InflightParts>,
-    ) -> Sweeper {
-        Sweeper::with_inflight(
-            db,
-            vec![backend],
-            SweepConfig {
-                grace,
-                batch_size: SWEEP_BATCH_SIZE,
-                interval: Duration::from_secs(1),
-            },
-            inflight,
-        )
+    fn sweeper(f: &Fixture) -> Sweeper {
+        let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: Duration::from_secs(1) };
+        Sweeper::new(f.db.clone(), vec![f.backend.clone()], config, f.pins.clone())
+    }
+
+    /// An upload this process saw finish and never committed (a failed chunk).
+    async fn orphan(f: &Fixture, data: &'static [u8]) -> BlobLocator {
+        let loc = f.backend.put(Bytes::from_static(data)).await.unwrap();
+        f.pins.returned("default", &loc.key);
+        loc
+    }
+
+    fn on_backend(f: &Fixture, loc: &BlobLocator) -> bool {
+        f.mem.message_keys().contains(&u64::from_bytes(&loc.key).unwrap())
     }
 
     #[tokio::test]
-    async fn orphans_from_partial_writes_are_deleted() {
+    async fn orphans_below_the_horizon_are_deleted() {
         let f = setup().await;
-        let orphan = f
-            .backend
-            .put(Bytes::from_static(b"orphan-partial"))
-            .await
-            .unwrap();
-        assert!(f
-            .mem
-            .message_keys()
-            .contains(&u64::from_bytes(&orphan.key).unwrap()));
-
-        let stats = sweeper(f.db, f.backend, Duration::ZERO, f.inflight)
-            .sweep_once()
-            .await
-            .unwrap();
-        assert!(stats.keys_deleted >= 1);
-        assert!(!f
-            .mem
-            .message_keys()
-            .contains(&u64::from_bytes(&orphan.key).unwrap()));
+        let loc = orphan(&f, b"orphan-partial").await;
+        let stats = sweeper(&f).sweep_once().await.unwrap();
+        assert_eq!(stats.keys_deleted, 1);
+        assert!(!on_backend(&f, &loc));
     }
 
     #[tokio::test]
     async fn fenced_sweeper_deletes_nothing() {
         let f = setup().await;
-        let orphan = f.backend.put(Bytes::from_static(b"orphan")).await.unwrap();
+        let loc = orphan(&f, b"orphan").await;
         // A newer incarnation claims the same log; this one has not written since.
         let _newer = BlobDb::connect(f._dir.path().join("blob.log")).await.unwrap();
 
-        let err = sweeper(f.db.clone(), f.backend, Duration::ZERO, f.inflight)
-            .sweep_once()
-            .await
-            .unwrap_err();
+        let err = sweeper(&f).sweep_once().await.unwrap_err();
         assert!(format!("{err:#}").contains("fenced"), "{err:#}");
         assert!(f.db.tablet_stopped());
-        assert!(f
-            .mem
-            .message_keys()
-            .contains(&u64::from_bytes(&orphan.key).unwrap()), "orphan kept");
+        assert!(on_backend(&f, &loc), "orphan kept");
     }
 
     #[tokio::test]
-    async fn keys_newer_than_watermark_untouched() {
+    async fn keys_above_the_horizon_untouched() {
         let f = setup().await;
-        let old = f.backend.put(Bytes::from_static(b"old-orphan")).await.unwrap();
-        let new = f.backend.put(Bytes::from_static(b"new-orphan")).await.unwrap();
+        let old = orphan(&f, b"old-orphan").await;
+        // An upload this process never saw return (another writer's, say).
+        let unseen = f.backend.put(Bytes::from_static(b"unseen")).await.unwrap();
+        let stats = sweeper(&f).sweep_once().await.unwrap();
+        assert_eq!(stats.keys_deleted, 1);
+        assert!(!on_backend(&f, &old));
+        assert!(on_backend(&f, &unseen));
+    }
 
-        // Backdate only the old key's watermark; keep grace so the fresh watermark
-        // for `new` does not advance the sweep upper bound.
-        let past = Utc::now() - ChronoDuration::minutes(30);
-        f.db
-            .record_put_watermark_at("default", &old.key, past)
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn pinned_upload_survives_until_unpinned() {
+        let f = setup().await;
+        let before = orphan(&f, b"before").await;
+        // A slow chunk: pinned, uploaded, not committed; later uploads finish.
+        let pin = f.pins.pin("default");
+        let slow = f.backend.put(Bytes::from_static(b"slow-part")).await.unwrap();
+        f.pins.returned("default", &slow.key);
+        let after = orphan(&f, b"after").await;
 
-        let grace = Duration::from_secs(15 * 60);
-        let stats = sweeper(f.db, f.backend, grace, f.inflight)
-            .sweep_once()
-            .await
-            .unwrap();
-        assert!(stats.keys_deleted >= 1);
-        let keys = f.mem.message_keys();
-        assert!(!keys.contains(&u64::from_bytes(&old.key).unwrap()));
-        assert!(keys.contains(&u64::from_bytes(&new.key).unwrap()));
+        let stats = sweeper(&f).sweep_once().await.unwrap();
+        assert_eq!(stats.keys_deleted, 1, "only what is below the pin's floor");
+        assert!(!on_backend(&f, &before));
+        assert!(on_backend(&f, &slow) && on_backend(&f, &after));
+
+        // The writer gave up without committing: its part is garbage now.
+        drop(pin);
+        let stats = sweeper(&f).sweep_once().await.unwrap();
+        assert_eq!(stats.keys_deleted, 2);
+        assert!(!on_backend(&f, &slow) && !on_backend(&f, &after));
+    }
+
+    #[tokio::test]
+    async fn committed_parts_below_the_horizon_survive() {
+        let f = setup().await;
+        let id = f.layer.put_small(Bytes::from_static(b"committed")).await.unwrap();
+        let layouts = f.db.get_replica_layouts(id).await.unwrap();
+        let loc = layouts[0].parts[0].locator.clone();
+        let later = orphan(&f, b"later").await;
+        let stats = sweeper(&f).sweep_once().await.unwrap();
+        assert_eq!((stats.keys_deleted, stats.keys_skipped_live), (1, 1));
+        assert!(on_backend(&f, &loc));
+        assert!(!on_backend(&f, &later));
     }
 
     #[tokio::test]
     async fn repeat_pass_idempotent() {
         let f = setup().await;
-        let _ = f.backend.put(Bytes::from_static(b"o1")).await.unwrap();
-        let _ = f.backend.put(Bytes::from_static(b"o2")).await.unwrap();
-        let s = sweeper(
-            f.db.clone(),
-            f.backend.clone(),
-            Duration::ZERO,
-            f.inflight.clone(),
-        );
-        let a = s.sweep_once().await.unwrap();
-        assert!(a.keys_deleted >= 2);
+        orphan(&f, b"o1").await;
+        orphan(&f, b"o2").await;
+        let s = sweeper(&f);
+        assert_eq!(s.sweep_once().await.unwrap().keys_deleted, 2);
         let mid = f.mem.message_keys();
-        let b = s.sweep_once().await.unwrap();
-        assert_eq!(b.keys_deleted, 0);
+        assert_eq!(s.sweep_once().await.unwrap().keys_deleted, 0);
         assert_eq!(f.mem.message_keys(), mid);
     }
 
     #[tokio::test]
     async fn zero_ref_chunk_parts_reclaimed() {
         let f = setup().await;
-        let id = f
-            .layer
-            .put_small(Bytes::from_static(b"live-then-release"))
-            .await
-            .unwrap();
+        let id = f.layer.put_small(Bytes::from_static(b"live-then-release")).await.unwrap();
         let keys_before = f.mem.message_keys();
         assert!(!keys_before.is_empty());
         f.layer.release(&[id]).await.unwrap();
-        let stats = sweeper(f.db, f.backend, Duration::ZERO, f.inflight)
-            .sweep_once()
-            .await
-            .unwrap();
+        let stats = sweeper(&f).sweep_once().await.unwrap();
         assert_eq!(stats.zero_ref_chunks, 1);
         assert!(f.layer.db().chunk_meta(id).await.unwrap().is_none());
         for k in keys_before {
@@ -525,137 +379,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inflight_parts_survive_sweep_past_grace() {
+    async fn restart_seeds_the_horizon_from_committed_parts() {
         let f = setup().await;
-        // Simulate first part of a slow chunk: uploaded, watermark aged past grace,
-        // not yet in chunk_parts — but protected by InflightParts.
-        let part = f
-            .backend
-            .put(Bytes::from(vec![0xABu8; 64]))
-            .await
-            .unwrap();
-        let guard = f.inflight.guard("default", part.key.clone());
-        let past = Utc::now() - ChronoDuration::minutes(30);
-        f.db
-            .record_put_watermark_at("default", &part.key, past)
-            .await
-            .unwrap();
+        // A dead writer's upload, then a committed chunk above it.
+        let dead = f.backend.put(Bytes::from_static(b"dead-writer")).await.unwrap();
+        let id = f.layer.put_small(Bytes::from_static(b"committed")).await.unwrap();
 
-        let stats = sweeper(
-            f.db.clone(),
-            f.backend.clone(),
-            Duration::from_secs(15 * 60),
-            f.inflight.clone(),
-        )
-        .sweep_once()
-        .await
-        .unwrap();
-        assert_eq!(stats.keys_deleted, 0);
-        assert!(f
-            .mem
-            .message_keys()
-            .contains(&u64::from_bytes(&part.key).unwrap()));
-
-        // Writer crashed / aborted without commit → drop guard → next sweep reclaims.
-        drop(guard);
-        let stats = sweeper(
-            f.db,
-            f.backend,
-            Duration::from_secs(15 * 60),
-            f.inflight,
-        )
-        .sweep_once()
-        .await
-        .unwrap();
-        assert!(stats.keys_deleted >= 1);
-        assert!(!f
-            .mem
-            .message_keys()
-            .contains(&u64::from_bytes(&part.key).unwrap()));
-    }
-
-    #[tokio::test]
-    async fn commit_during_sweep_batch_protects_new_parts() {
-        let f = setup().await;
-        // Orphan candidate key that will be committed mid-pass via filter_deletable.
-        let loc = f
-            .backend
-            .put(Bytes::from_static(b"about-to-commit"))
+        // Restart: fresh pins, nothing returned in this process yet.
+        let (_layer, pins) = open_layer(f.db.clone(), f.backend.clone()).await;
+        let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: Duration::from_secs(1) };
+        let stats = Sweeper::new(f.db.clone(), vec![f.backend.clone()], config, pins)
+            .sweep_once()
             .await
             .unwrap();
-        let past = Utc::now() - ChronoDuration::minutes(30);
-        f.db
-            .record_put_watermark_at("default", &loc.key, past)
-            .await
-            .unwrap();
-
-        // Commit into chunk_parts before the delete decision (simulates commit
-        // between candidate listing and delete — we re-query per batch).
-        let chunks = f
-            .db
-            .commit_chunk(
-                16,
-                1,
-                &[],
-                &[pigeonhole_blob::ReplicaLayout {
-                    instance: "default".into(),
-                    parts: vec![pigeonhole_blob::PartLayout {
-                        first_block: 0,
-                        block_count: 1,
-                        locator: loc.clone(),
-                        block_stored_lens: vec![16],
-                    }],
-                }],
-            )
-            .await
-            .unwrap();
-        let _ = chunks;
-
-        let stats = sweeper(
-            f.db,
-            f.backend,
-            Duration::from_secs(15 * 60),
-            f.inflight,
-        )
-        .sweep_once()
-        .await
-        .unwrap();
-        assert_eq!(stats.keys_deleted, 0);
-        assert!(f
-            .mem
-            .message_keys()
-            .contains(&u64::from_bytes(&loc.key).unwrap()));
-    }
-
-    #[tokio::test]
-    async fn repair_inflight_parts_survive_sweep() {
-        let f = setup().await;
-        let loc = f
-            .backend
-            .put(Bytes::from_static(b"repair-part"))
-            .await
-            .unwrap();
-        let guard = f.replicated.inflight().guard("default", loc.key.clone());
-        let past = Utc::now() - ChronoDuration::minutes(30);
-        f.db
-            .record_put_watermark_at("default", &loc.key, past)
-            .await
-            .unwrap();
-        let stats = sweeper(
-            f.db,
-            f.backend,
-            Duration::from_secs(15 * 60),
-            f.inflight,
-        )
-        .sweep_once()
-        .await
-        .unwrap();
-        assert_eq!(stats.keys_deleted, 0);
-        assert!(f
-            .mem
-            .message_keys()
-            .contains(&u64::from_bytes(&loc.key).unwrap()));
-        drop(guard);
+        assert_eq!(stats.keys_deleted, 1);
+        assert!(!on_backend(&f, &dead));
+        assert!(f.db.chunk_meta(id).await.unwrap().is_some());
     }
 
     #[test]

@@ -104,9 +104,8 @@ max_batch_total_size_bytes = 4194304
 gc_ttl_secs = 604800
 
 [sweep]
-# Keys from puts newer than grace are not deleted. Default 15 minutes.
-# Puts that exceed grace are interrupted so the watermark stays sound.
-grace_secs = 900
+# Orphans are swept up to the upload horizon: uploads are pinned before they
+# start and unpinned once committed, so no grace period is needed.
 # Pause between full sweeper passes.
 interval_secs = 60
 # Candidate keys fetched / deleted per batch.

@@ -2,6 +2,7 @@
 
 use crate::erase::DynBlobBackend;
 use crate::typed::BlobLocator;
+use crate::upload_pins::{UploadPin, UploadPins};
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
@@ -15,13 +16,15 @@ pub struct EncodedBlock {
 }
 
 /// Result of uploading one part (one blob / message).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PartUploaded {
     pub first_block: u32,
     pub block_count: u32,
     pub locator: BlobLocator,
     /// Per-block stored lengths inside this part (for Range reads).
     pub block_stored_lens: Vec<u32>,
+    /// Taken before the upload; hold it until the part is committed.
+    pub pin: UploadPin,
 }
 
 /// Accumulates encoded blocks into blobs respecting `max_blob_size`.
@@ -29,6 +32,7 @@ pub struct PartUploaded {
 /// Keeps at most one open (unfilled) part in memory.
 pub struct PartPacker {
     backend: Arc<dyn DynBlobBackend>,
+    pins: Arc<UploadPins>,
     max_blob_size: usize,
     /// Absolute block index of the next block to accept.
     next_block: u32,
@@ -39,10 +43,12 @@ pub struct PartPacker {
 }
 
 impl PartPacker {
-    pub fn new(backend: Arc<dyn DynBlobBackend>) -> Self {
+    /// Every upload is pinned in `pins` before it starts.
+    pub fn new(backend: Arc<dyn DynBlobBackend>, pins: Arc<UploadPins>) -> Self {
         let max_blob_size = backend.limits().max_blob_size;
         Self {
             backend,
+            pins,
             max_blob_size,
             next_block: 0,
             open_first: 0,
@@ -111,6 +117,8 @@ impl PartPacker {
         let block_count = lenses.len() as u32;
         self.open_total = 0;
 
+        let instance = self.backend.instance().id.clone();
+        let pin = self.pins.pin(&instance);
         let locator = self
             .backend
             .put(payload)
@@ -124,11 +132,13 @@ impl PartPacker {
                 )
             })?;
 
+        self.pins.returned(&instance, &locator.key);
         Ok(PartUploaded {
             first_block,
             block_count,
             locator,
             block_stored_lens: lenses,
+            pin,
         })
     }
 }
@@ -244,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn packs_until_max_then_puts() {
         let backend: SharedBackend = Arc::new(erase(LimMem::new("a", 100)));
-        let mut p = PartPacker::new(backend.clone());
+        let mut p = PartPacker::new(backend.clone(), UploadPins::shared());
         assert!(p.push(block(40)).await.unwrap().is_none());
         assert!(p.push(block(40)).await.unwrap().is_none());
         let sealed = p.push(block(40)).await.unwrap().expect("flush");
@@ -263,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_block_is_config_error() {
         let backend: SharedBackend = Arc::new(erase(LimMem::new("a", 50)));
-        let mut p = PartPacker::new(backend);
+        let mut p = PartPacker::new(backend, UploadPins::shared());
         let err = p.push(block(51)).await.unwrap_err();
         assert!(
             err.to_string().contains("configuration error"),

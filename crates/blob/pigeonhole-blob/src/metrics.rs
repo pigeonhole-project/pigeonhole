@@ -71,10 +71,6 @@ pub fn describe_metrics() {
         "Replica instances chosen for reads"
     );
     metrics::describe_counter!(
-        "pigeonhole_sweep_inflight_protected_total",
-        "Sweep candidates skipped because InflightParts held them"
-    );
-    metrics::describe_counter!(
         "pigeonhole_chunk_gone_total",
         "retain failed because chunk was reclaiming or missing"
     );
@@ -204,9 +200,6 @@ pub fn record_double_release() {
 }
 
 pub fn record_sweep(outcome: &str, n: u64) {
-    if outcome == "inflight_protected" {
-        metrics::counter!("pigeonhole_sweep_inflight_protected_total").increment(n);
-    }
     if n == 0 {
         return;
     }

@@ -80,6 +80,13 @@ impl ChunkStore {
             .collect();
         db.sync_instances(&infos).await?;
         check_block_fits_members(opts.block_size, replicated.as_ref())?;
+        // Uncommitted parts at or below the highest committed key are a dead
+        // writer's garbage: start the sweep horizon there.
+        for info in &infos {
+            if let Some(key) = db.max_part_key(&info.id) {
+                replicated.pins().seed(&info.id, &key);
+            }
+        }
         Ok(Self {
             db,
             replicated,
@@ -146,7 +153,7 @@ impl ChunkStore {
             .await?;
         self.enqueue_missing_replicas(chunk_id, &sealed.layouts)
             .await?;
-        drop(sealed.inflight);
+        drop(sealed.pins);
         Ok(chunk_id)
     }
 
@@ -588,8 +595,8 @@ impl ChunkStore {
             .await?;
         self.enqueue_missing_replicas(chunk_id, &sealed.layouts)
             .await?;
-        // Release inflight protection only after chunk_parts are durable.
-        drop(sealed.inflight);
+        // Unpin the uploads only once the commit is applied.
+        drop(sealed.pins);
         Ok(Extent {
             chunk: chunk_id,
             offset: 0,

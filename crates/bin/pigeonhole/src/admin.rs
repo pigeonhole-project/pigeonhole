@@ -47,10 +47,11 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
     let released = index.delete_everything().await.context("delete gateway index")?;
     rt.store.release(&released).await.context("release object chunks")?;
 
-    // Immediate reclaim pass (background sweeper uses the same path; grace still applies).
+    // Reclaim the released chunks now; orphans below the horizon (seeded from
+    // the committed parts) go too.
     let members: Vec<_> = rt.store.replicated().members().to_vec();
-    // Purge reclaim pass; grace still protects in-flight puts.
-    let sweeper = Sweeper::new(rt.store.db().clone(), members, cfg.sweep.clone());
+    let pins = rt.store.replicated().pins().clone();
+    let sweeper = Sweeper::new(rt.store.db().clone(), members, cfg.sweep.clone(), pins);
     match sweeper.sweep_once().await {
         Ok(stats) => info!(
             zero_ref_chunks = stats.zero_ref_chunks,

@@ -192,7 +192,7 @@ comments. Sections:
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Separate send / getFile / delete budgets, upload/download concurrency |
 | `[cache]` | `file_path` LRU, L1 unpacked blocks, L2 memory/disk blob cache |
-| `[sweep]` | Garbage collector: `grace_secs`, `interval_secs`, `batch_size` |
+| `[sweep]` | Garbage collector: `interval_secs`, `batch_size` |
 | `[repair]` | Replica repair/backfill: interval, batch, cost limit, `scrub` |
 | `[http]` | Body/header timeouts, concurrency limit, max headers |
 | `[metrics]` | Prometheus `/metrics` (feature `metrics-prometheus`, on by default) |

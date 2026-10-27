@@ -22,7 +22,7 @@ use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_blob::{
     erase_sweep, BlobBackend, CheapestFirst, OrderedKey, Replicated, SharedBackend,
 };
-use pigeonhole_chunk_store::{SweepConfig, Sweeper, WatermarkBackend};
+use pigeonhole_chunk_store::{SweepConfig, Sweeper};
 use s3s::dto::*;
 use s3s::{S3ErrorCode, S3Request, S3};
 use std::collections::{BTreeSet, HashMap};
@@ -39,10 +39,6 @@ const CHUNK_SIZE: usize = 64 * 1024;
 const BLOCK_SIZE: usize = 16 * 1024;
 const MAX_OBJECT: u64 = 200 * 1024;
 const HEADER: usize = 16;
-/// Must exceed the gap between a part landing on the backend and its InflightParts
-/// guard being registered, which includes waiting on SQLite for the put watermark
-/// (tens to hundreds of ms under this contention; see docs/sweep-invariants.md).
-const SWEEP_GRACE: Duration = Duration::from_millis(1000);
 
 fn req<T>(input: T) -> S3Request<T> {
     S3Request {
@@ -130,10 +126,9 @@ async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
     opts.block_size = cfg.block_size;
 
     let info = mem.instance().clone();
-    // Same wiring as the binary: watermark every put; grace 0 = only InflightParts
-    // and per-batch liveness protect fresh parts.
-    let backend =
-        WatermarkBackend::wrap(Arc::new(erase_sweep(mem)), db.clone(), Duration::ZERO);
+    // Same wiring as the binary: uploads are pinned until committed, the
+    // sweeper stops at the pins' horizon.
+    let backend: SharedBackend = Arc::new(erase_sweep(mem));
     let rep = Arc::new(
         Replicated::new(vec![backend.clone()], 1, Arc::new(CheapestFirst::new())).unwrap(),
     );
@@ -148,15 +143,11 @@ async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
 }
 
 fn sweeper(node: &Node) -> Sweeper {
-    Sweeper::with_inflight(
+    Sweeper::new(
         node.store.db().clone(),
         vec![node.backend.clone()],
-        SweepConfig {
-            grace: SWEEP_GRACE,
-            batch_size: 7,
-            interval: Duration::ZERO,
-        },
-        node.store.replicated().inflight().clone(),
+        SweepConfig { batch_size: 7, interval: Duration::ZERO },
+        node.store.replicated().pins().clone(),
     )
 }
 
@@ -377,9 +368,8 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     let node = Node { s3, ..node };
     let live = verify_all(&node.s3, "after stress").await;
 
-    // Quiesce: sweep until stable.
-    // Let the newest puts age past the sweep grace so they become candidates.
-    tokio::time::sleep(SWEEP_GRACE * 3).await;
+    // Quiesce: no upload is pinned, so everything up to the last returned key
+    // is a candidate.
     let sw = sweeper(&node);
     for _ in 0..3 {
         sw.sweep_once().await.unwrap();

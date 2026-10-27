@@ -51,6 +51,5 @@ gone
 
 ## Metrics
 
-- `pigeonhole_sweep_inflight_protected_total` — candidates skipped due to `InflightParts`
 - `pigeonhole_chunk_gone_total` — failed `retain` against reclaiming/missing chunks
 - `pigeonhole_double_release_total` — `release` with `refs` already 0

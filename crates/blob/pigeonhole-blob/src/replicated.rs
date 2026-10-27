@@ -2,7 +2,7 @@
 
 use crate::backend::{bytes_stream, BoxByteStream};
 use crate::erase::DynBlobBackend;
-use crate::inflight::{InflightGuard, InflightParts};
+use crate::upload_pins::{UploadPin, UploadPins};
 use crate::part_packer::{EncodedBlock, PartPacker, PartUploaded};
 use crate::typed::{BlobLocator, CostHint, OpKind};
 use anyhow::{bail, Result};
@@ -29,14 +29,16 @@ pub struct PartLayout {
     pub block_stored_lens: Vec<u32>,
 }
 
-impl From<PartUploaded> for PartLayout {
-    fn from(p: PartUploaded) -> Self {
-        Self {
-            first_block: p.first_block,
-            block_count: p.block_count,
-            locator: p.locator,
-            block_stored_lens: p.block_stored_lens,
-        }
+impl PartUploaded {
+    /// The part's layout and the pin to hold until it is committed.
+    pub fn into_layout(self) -> (PartLayout, UploadPin) {
+        let layout = PartLayout {
+            first_block: self.first_block,
+            block_count: self.block_count,
+            locator: self.locator,
+            block_stored_lens: self.block_stored_lens,
+        };
+        (layout, self.pin)
     }
 }
 
@@ -195,16 +197,16 @@ pub struct Replicated {
     write_quorum: usize,
     selector: Arc<dyn ReplicaSelector>,
     member_timeout: Duration,
-    /// Protects uploaded-but-not-yet-committed part keys from the sweeper.
-    inflight: Arc<InflightParts>,
+    /// Pins every upload until its part is committed; bounds the sweeper.
+    pins: Arc<UploadPins>,
 }
 
-/// Result of sealing one chunk: layouts plus guards held until DB / superblock commit.
+/// Result of sealing one chunk: layouts plus the pins of its uploads.
 #[derive(Debug)]
 pub struct SealedChunk {
     pub layouts: Vec<ReplicaLayout>,
-    /// Drop only after `commit_chunk` / superblock publish (or on failure → orphans).
-    pub inflight: Vec<InflightGuard>,
+    /// Drop only after `commit_chunk` is applied (or on failure → orphans).
+    pub pins: Vec<UploadPin>,
 }
 
 impl Replicated {
@@ -235,7 +237,7 @@ impl Replicated {
             write_quorum,
             selector,
             member_timeout: Duration::from_secs(60),
-            inflight: InflightParts::shared(),
+            pins: UploadPins::shared(),
         })
     }
 
@@ -244,14 +246,9 @@ impl Replicated {
         self
     }
 
-    /// Share an existing in-flight registry (binary: one per process with Sweeper).
-    pub fn with_inflight(mut self, inflight: Arc<InflightParts>) -> Self {
-        self.inflight = inflight;
-        self
-    }
-
-    pub fn inflight(&self) -> &Arc<InflightParts> {
-        &self.inflight
+    /// Upload pins of this placement group (shared with the sweeper and repair).
+    pub fn pins(&self) -> &Arc<UploadPins> {
+        &self.pins
     }
 
     pub fn members(&self) -> &[Arc<dyn DynBlobBackend>] {
@@ -285,15 +282,14 @@ impl Replicated {
                 .iter()
                 .map(|m| MemberWriter {
                     instance: m.instance().id.clone(),
-                    packer: Some(PartPacker::new(m.clone())),
+                    packer: Some(PartPacker::new(m.clone(), Arc::clone(&self.pins))),
                     parts: Vec::new(),
                     failed: false,
                 })
                 .collect(),
             write_quorum: self.write_quorum,
             timeout: self.member_timeout,
-            inflight: Arc::clone(&self.inflight),
-            guards: Vec::new(),
+            pins: Vec::new(),
         }
     }
 
@@ -373,8 +369,7 @@ pub struct ChunkReplicaWriter {
     writers: Vec<MemberWriter>,
     write_quorum: usize,
     timeout: Duration,
-    inflight: Arc<InflightParts>,
-    guards: Vec<InflightGuard>,
+    pins: Vec<UploadPin>,
 }
 
 impl ChunkReplicaWriter {
@@ -415,9 +410,9 @@ impl ChunkReplicaWriter {
             self.writers[i].packer = Some(packer);
             match result {
                 Ok(Ok(Some(part))) => {
-                    let guard = self.inflight.guard(&instance, part.locator.key.clone());
-                    self.guards.push(guard);
-                    self.writers[i].parts.push(part.into());
+                    let (layout, pin) = part.into_layout();
+                    self.pins.push(pin);
+                    self.writers[i].parts.push(layout);
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
@@ -435,8 +430,8 @@ impl ChunkReplicaWriter {
 
     /// Flush remaining parts; return layouts only for members that uploaded all parts.
     ///
-    /// Hold [`SealedChunk::inflight`] until the chunk metadata (or superblock) is
-    /// committed; dropping early exposes parts to the sweeper as orphans.
+    /// Hold [`SealedChunk::pins`] until the chunk metadata is committed;
+    /// dropping early exposes parts to the sweeper as orphans.
     pub async fn finish(mut self) -> Result<SealedChunk> {
         let timeout = self.timeout;
         let mut tasks = Vec::new();
@@ -457,9 +452,9 @@ impl ChunkReplicaWriter {
             let instance = self.writers[i].instance.clone();
             match result {
                 Ok(Ok(Some(part))) => {
-                    let guard = self.inflight.guard(&instance, part.locator.key.clone());
-                    self.guards.push(guard);
-                    self.writers[i].parts.push(part.into());
+                    let (layout, pin) = part.into_layout();
+                    self.pins.push(pin);
+                    self.writers[i].parts.push(layout);
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
@@ -484,7 +479,7 @@ impl ChunkReplicaWriter {
             }
         }
         if ok.len() < self.write_quorum {
-            // Drop guards → parts become sweep orphans.
+            // Dropping the pins makes the parts sweep orphans.
             bail!(
                 "write quorum not met: {} successful replicas, need {}",
                 ok.len(),
@@ -493,7 +488,7 @@ impl ChunkReplicaWriter {
         }
         Ok(SealedChunk {
             layouts: ok,
-            inflight: self.guards,
+            pins: self.pins,
         })
     }
 }

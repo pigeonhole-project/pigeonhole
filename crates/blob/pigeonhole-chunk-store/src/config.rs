@@ -2,7 +2,7 @@ use crate::instances::{memory_instance, resolve_instances, FileInstance, Instanc
 use crate::repair::{
     RepairConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
 };
-use crate::sweep::{SweepConfig, DEFAULT_SWEEP_GRACE, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};
+use crate::sweep::{SweepConfig, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};
 use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind, InstanceRole};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
@@ -443,7 +443,6 @@ impl FileMetrics {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileSweep {
-    grace_secs: u64,
     interval_secs: u64,
     batch_size: usize,
 }
@@ -451,7 +450,6 @@ struct FileSweep {
 impl Default for FileSweep {
     fn default() -> Self {
         Self {
-            grace_secs: DEFAULT_SWEEP_GRACE.as_secs(),
             interval_secs: DEFAULT_SWEEP_INTERVAL.as_secs(),
             batch_size: SWEEP_BATCH_SIZE,
         }
@@ -461,7 +459,6 @@ impl Default for FileSweep {
 impl FileSweep {
     fn into_sweep_config(self) -> SweepConfig {
         SweepConfig {
-            grace: Duration::from_secs(self.grace_secs),
             batch_size: self.batch_size.max(1),
             interval: Duration::from_secs(self.interval_secs.max(1)),
         }

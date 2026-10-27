@@ -211,19 +211,20 @@ impl Repairer {
         let blocks = self.db.get_blocks(chunk_id).await?;
         let encoded = read_encoded_blocks(self.replicated.as_ref(), &sources, &blocks).await?;
 
-        let mut packer = PartPacker::new(target.clone());
+        let mut packer = PartPacker::new(target.clone(), self.replicated.pins().clone());
         let mut parts: Vec<PartLayout> = Vec::new();
-        let mut inflight = Vec::new();
-        let inflight_reg = self.replicated.inflight().clone();
+        let mut pins = Vec::new();
         for block in encoded {
             if let Some(part) = packer.push(block).await.context("repair packer push")? {
-                inflight.push(inflight_reg.guard(instance_id, part.locator.key.clone()));
-                parts.push(part.into());
+                let (layout, pin) = part.into_layout();
+                pins.push(pin);
+                parts.push(layout);
             }
         }
         if let Some(part) = packer.finish().await.context("repair packer finish")? {
-            inflight.push(inflight_reg.guard(instance_id, part.locator.key.clone()));
-            parts.push(part.into());
+            let (layout, pin) = part.into_layout();
+            pins.push(pin);
+            parts.push(layout);
         }
         if parts.is_empty() {
             bail!("repair chunk {chunk_id}: produced no parts for {instance_id}");
@@ -238,7 +239,7 @@ impl Repairer {
             .await
             .context("commit repaired replica")?;
         self.db.dequeue_repair(chunk_id, instance_id).await?;
-        drop(inflight);
+        drop(pins);
         debug!(
             chunk_id,
             instance = %instance_id,
