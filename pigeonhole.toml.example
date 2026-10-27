@@ -19,6 +19,9 @@ batch_max_delay_ms = 0        # group commit window; 0 = append when the previou
 kind = "local"                # segmented files on this host
 path = "pigeonhole-log"
 
+[meta.snapshot]
+every_entries = 10000         # snapshot all states, drop the log behind it; 0 = never
+
 # Backend instances (at least one). Secrets come from the env var named in
 # bot_token_env (defaults: BOT_TOKEN / DISCORD_BOT_TOKEN), never inline.
 # Telegram: the bot must be admin with pin rights (channels: "Edit messages",

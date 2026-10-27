@@ -97,7 +97,7 @@ async fn concurrent_proposals_get_distinct_positions() {
     let dir = tempfile::tempdir().unwrap();
     for delay in [Duration::ZERO, Duration::from_millis(20)] {
         let log = LocalLogStore::open(dir.path().join(format!("log-{}", delay.as_millis()))).unwrap();
-        let opts = MetaOptions { batch_max_delay: delay, batch_max_entries: 8 };
+        let opts = MetaOptions { batch_max_delay: delay, batch_max_entries: 8, snapshot_every: 5 };
         let store = MetaStore::open(Arc::new(log), counter(), opts).await.unwrap();
         let tasks: Vec<_> = (0..32)
             .map(|i| {
@@ -209,4 +209,66 @@ async fn entries_of_another_command_format_refuse_to_replay() {
 
     let err = MetaStore::open_local(dir.path().join("log"), counter()).await.err().expect("boot must fail");
     assert!(format!("{err:#}").contains("counter command in format 2, this binary reads 1"), "{err:#}");
+}
+
+fn segments(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("seg-"))
+        .collect();
+    names.sort();
+    names
+}
+
+async fn open_snapshotting(dir: &Path) -> Arc<MetaStore> {
+    let log = LocalLogStore::with_segment_bytes(dir, 64).unwrap();
+    let opts = MetaOptions { snapshot_every: 10, ..MetaOptions::default() };
+    MetaStore::open(Arc::new(log), counter(), opts).await.unwrap()
+}
+
+#[tokio::test]
+async fn snapshots_collect_the_log_and_boot_from_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_dir = dir.path().join("log");
+    let a = open_snapshotting(&log_dir).await;
+    for i in 0..35u64 {
+        a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    let state = snapshot(&a);
+    drop(a);
+
+    let d = LocalLogStore::open(&log_dir).unwrap().discover().await.unwrap().unwrap();
+    let (at, snap) = d.snapshot.expect("a snapshot was taken");
+    assert_eq!(at, 30);
+    assert_eq!(TabletSnapshot::decode(&snap.data).unwrap().position, 30);
+    let segs = segments(&log_dir);
+    assert!(segs[0] > "seg-00000000000000000001.log".to_string(), "log behind the snapshot collected: {segs:?}");
+
+    let b = open_snapshotting(&log_dir).await;
+    assert_eq!(b.applied_position(), 35);
+    assert_eq!(snapshot(&b), state, "snapshot + tail rebuild the same state");
+    b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
+    assert_eq!(value(&b), 36);
+}
+
+#[tokio::test]
+async fn snapshot_of_another_state_version_refuses_to_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_dir = dir.path().join("log");
+    {
+        let a = open_on(dir.path()).await;
+        a.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
+    }
+    let log = LocalLogStore::open(&log_dir).unwrap();
+    log.claim(2).await.unwrap();
+    let snap = TabletSnapshot {
+        format: SNAPSHOT_FORMAT,
+        position: 1,
+        states: vec![("counter".into(), Counter::VERSION + 1, encode_state(&Counter::default()))],
+    };
+    log.install_snapshot(2, 1, Snapshot { data: snap.encode() }).await.unwrap();
+
+    let err = MetaStore::open_local(&log_dir, counter()).await.err().expect("boot must fail");
+    assert!(format!("{err:#}").contains("counter state in format 2, this binary reads 1"), "{err:#}");
 }

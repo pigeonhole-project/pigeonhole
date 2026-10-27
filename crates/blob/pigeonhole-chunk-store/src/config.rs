@@ -61,6 +61,8 @@ pub struct MetaSettings {
     /// Group commit window; `0` = append as soon as the previous append returns.
     pub batch_max_delay: Duration,
     pub batch_max_entries: usize,
+    /// Snapshot (and collect the log behind it) every this many entries; 0 = never.
+    pub snapshot_every_entries: u64,
     pub log: LogSettings,
 }
 
@@ -353,6 +355,19 @@ struct FileMeta {
     batch_max_delay_ms: u64,
     batch_max_entries: usize,
     log: FileLog,
+    snapshot: FileMetaSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileMetaSnapshot {
+    every_entries: u64,
+}
+
+impl Default for FileMetaSnapshot {
+    fn default() -> Self {
+        Self { every_entries: 10_000 }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +382,7 @@ impl Default for FileMeta {
             batch_max_delay_ms: 0,
             batch_max_entries: 1024,
             log: FileLog::default(),
+            snapshot: FileMetaSnapshot::default(),
         }
     }
 }
@@ -382,6 +398,7 @@ impl FileMeta {
         MetaSettings {
             batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
             batch_max_entries: self.batch_max_entries.max(1),
+            snapshot_every_entries: self.snapshot.every_entries,
             log: match self.log {
                 FileLog::Local { path } => LogSettings::Local { path },
             },
@@ -834,16 +851,18 @@ upload_concurrency = 4
         assert_eq!(cfg.placement.group, vec!["mem".to_string()]);
         assert_eq!(cfg.placement.write_quorum, 1);
         assert_eq!(cfg.meta.batch_max_delay, Duration::ZERO);
+        assert_eq!(cfg.meta.snapshot_every_entries, 10_000);
         assert_eq!(cfg.meta.log, LogSettings::Local { path: "pigeonhole-log".into() });
     }
 
     #[test]
     fn parses_meta_section() {
         let cfg = load(&format!(
-            "[meta]\nbatch_max_delay_ms = 250\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
+            "[meta]\nbatch_max_delay_ms = 250\n[meta.snapshot]\nevery_entries = 0\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
         ))
         .unwrap();
         assert_eq!(cfg.meta.batch_max_delay, Duration::from_millis(250));
+        assert_eq!(cfg.meta.snapshot_every_entries, 0);
         assert_eq!(cfg.meta.log, LogSettings::Local { path: "/var/log-dir".into() });
         for bad in ["[meta]\ndb_path = \"m.db\"\n", "[meta.log]\nkind = \"s3\"\n", "[meta.log]\nkind = \"local\"\nchat_id = 1\n"] {
             assert!(load(&format!("{bad}{MEM}")).is_err(), "{bad:?} accepted");

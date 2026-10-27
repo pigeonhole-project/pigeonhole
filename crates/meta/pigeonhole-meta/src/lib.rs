@@ -20,8 +20,12 @@
 //! log written in another format instead of misreading it. States encode the
 //! same way for snapshots ([`encode_state`] / [`decode_state`]).
 //!
-//! Boot ([`MetaStore::open`]): claim the next generation, replay the whole log
-//! into empty states, append the zero entry, go active. Once a newer
+//! Every [`MetaOptions::snapshot_every`] entries the batcher encodes all
+//! states into one [`TabletSnapshot`] and hands it to
+//! [`LogStore::install_snapshot`], which drops the log behind it.
+//!
+//! Boot ([`MetaStore::open`]): claim the next generation, load the newest
+//! snapshot and replay the log after it, append the zero entry, go active. Once a newer
 //! generation claims the log the tablet stops ([`Stop::Fenced`]) and every
 //! later `propose` fails.
 
@@ -57,8 +61,10 @@ pub type Outcome<S> = std::result::Result<<S as StateMachine>::Reply, <S as Stat
 pub trait StateMachine: Default + Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Stable name used to route commands (`chunk`, `s3`, `cas`).
     const NAME: &'static str;
-    /// Encoding version of [`Self::Command`]: bump it on any change to its
-    /// shape (variant order, fields), or replay would misread old entries.
+    /// Encoding version of [`Self::Command`] and of the state itself: bump it
+    /// on any change to either shape (variant order, fields), or replay and
+    /// snapshot loading would misread old data. Old logs and snapshots then
+    /// refuse to load instead.
     const VERSION: u32;
 
     type Command: Serialize + DeserializeOwned + Send + 'static;
@@ -96,12 +102,42 @@ pub fn entry<S: StateMachine>(command: &S::Command) -> Entry {
     }
 }
 
+/// Version of the [`TabletSnapshot`] envelope.
+pub const SNAPSHOT_FORMAT: u32 = 1;
+
+/// Every namespace's state as of `position`, in one LogStore snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct TabletSnapshot {
+    /// [`SNAPSHOT_FORMAT`]; first, so it can be read before the rest.
+    pub format: u32,
+    pub position: Position,
+    /// `(namespace, VERSION, encode_state)`, ordered by namespace.
+    pub states: Vec<(String, u32, Vec<u8>)>,
+}
+
+impl TabletSnapshot {
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("a snapshot always encodes")
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let (format, _) = postcard::take_from_bytes::<u32>(data).context("snapshot header")?;
+        if format != SNAPSHOT_FORMAT {
+            bail!("snapshot in format {format}, this binary reads {SNAPSHOT_FORMAT}");
+        }
+        postcard::from_bytes(data).context("decode snapshot")
+    }
+}
+
 /// [`Outcome`] behind `dyn Any`, so one batcher serves every namespace.
 type AnyOutcome = Box<dyn Any + Send>;
 
 /// Object-safe face of a [`StateMachine`] behind its lock.
 trait AnyState: Send + Sync {
     fn apply(&self, entry: &Entry) -> Result<AnyOutcome>;
+    /// `(VERSION, encode_state)`.
+    fn snapshot(&self) -> (u32, Vec<u8>);
+    fn restore(&self, version: u32, data: &[u8]) -> Result<()>;
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -121,6 +157,18 @@ impl<S: StateMachine> AnyState for StateCell<S> {
             postcard::from_bytes(&entry.command).with_context(|| format!("decode {} command", S::NAME))?;
         let outcome = self.0.write().unwrap().apply(command)?;
         Ok(Box::new(outcome))
+    }
+
+    fn snapshot(&self) -> (u32, Vec<u8>) {
+        (S::VERSION, encode_state(&*self.0.read().unwrap()))
+    }
+
+    fn restore(&self, version: u32, data: &[u8]) -> Result<()> {
+        if version != S::VERSION {
+            bail!("{} state in format {version}, this binary reads {}", S::NAME, S::VERSION);
+        }
+        *self.0.write().unwrap() = decode_state(data)?;
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -176,6 +224,9 @@ pub struct MetaOptions {
     /// whatever queued meanwhile).
     pub batch_max_delay: Duration,
     pub batch_max_entries: usize,
+    /// Take a snapshot (and collect the log behind it) after this many
+    /// entries since the last one; 0 = never.
+    pub snapshot_every: u64,
 }
 
 impl Default for MetaOptions {
@@ -183,6 +234,7 @@ impl Default for MetaOptions {
         Self {
             batch_max_delay: Duration::ZERO,
             batch_max_entries: 1024,
+            snapshot_every: 10_000,
         }
     }
 }
@@ -222,9 +274,7 @@ impl MetaStore {
 
         let known = log.discover().await.context("discover log")?.map_or(0, |d| d.gen);
         let (gen, head) = claim_next(log.as_ref(), known).await?;
-        if head.position > 0 {
-            replay(&states, log.as_ref(), head).await?;
-        }
+        let snapshot_at = recover(&states, log.as_ref(), head).await?;
 
         let zero = log.append(gen, &[]).await.context("append zero entry")?;
         if zero != head.position {
@@ -238,6 +288,7 @@ impl MetaStore {
             Batcher {
                 states: states.clone(),
                 applied: applied.clone(),
+                snapshot_at,
                 log,
                 gen,
                 opts,
@@ -333,15 +384,40 @@ async fn claim_next(log: &dyn LogStore, known: u64) -> Result<(u64, Head)> {
     bail!("could not claim a generation (last tried {gen})")
 }
 
-/// Apply the whole log `(0, head]` to empty states.
-async fn replay(states: &States, log: &dyn LogStore, head: Head) -> Result<()> {
-    if let Some(d) = log.discover().await.context("discover log")? {
-        if let Some((at, _)) = d.snapshot {
-            bail!("log has a snapshot at {at}; snapshot restore is not implemented yet");
+/// Load the newest snapshot into the empty states and replay the log after
+/// it up to `head`. Returns the snapshot's position (0 without one).
+async fn recover(states: &States, log: &dyn LogStore, head: Head) -> Result<Position> {
+    let snapshot = log.discover().await.context("discover log")?.and_then(|d| d.snapshot);
+    let from = match snapshot {
+        Some((at, snapshot)) => {
+            let snap = TabletSnapshot::decode(&snapshot.data)?;
+            if snap.position != at {
+                bail!("snapshot stored at {at} says it covers {}", snap.position);
+            }
+            for (name, version, data) in &snap.states {
+                let state = states
+                    .get(name.as_str())
+                    .with_context(|| format!("snapshot has unknown namespace {name:?}"))?;
+                state.restore(*version, data)?;
+            }
+            at
         }
+        None => 0,
+    };
+    if from > head.position {
+        bail!(LogError::Lost(format!("snapshot at {from} is past the log head {}", head.position)));
     }
-    let mut entries = log.read(0, head);
-    let mut next = 1;
+    replay(states, log, from, head).await?;
+    Ok(from)
+}
+
+/// Apply log entries `(from, head]`.
+async fn replay(states: &States, log: &dyn LogStore, from: Position, head: Head) -> Result<()> {
+    if from == head.position {
+        return Ok(());
+    }
+    let mut entries = log.read(from, head);
+    let mut next = from + 1;
     while let Some((pos, entry)) = entries.try_next().await.context("read log")? {
         if pos != next {
             bail!(LogError::Lost(format!("replay expected {next}, got {pos}")));
@@ -364,9 +440,25 @@ fn apply_entry(states: &States, pos: Position, entry: &Entry) -> Result<AnyOutco
         .with_context(|| format!("apply {} entry {pos}", entry.namespace))
 }
 
+/// Encode every state as of `position` (between batches, so nothing is half
+/// applied).
+fn take_snapshot(states: &States, position: Position) -> TabletSnapshot {
+    let mut snap: Vec<(String, u32, Vec<u8>)> = states
+        .iter()
+        .map(|(name, state)| {
+            let (version, data) = state.snapshot();
+            (name.to_string(), version, data)
+        })
+        .collect();
+    snap.sort_by(|a, b| a.0.cmp(&b.0));
+    TabletSnapshot { format: SNAPSHOT_FORMAT, position, states: snap }
+}
+
 struct Batcher {
     states: Arc<States>,
     applied: Arc<AtomicU64>,
+    /// Position of the newest installed snapshot.
+    snapshot_at: Position,
     log: Arc<dyn LogStore>,
     gen: u64,
     opts: MetaOptions,
@@ -375,7 +467,7 @@ struct Batcher {
 
 /// Group commit: take what is queued, append it, apply it, answer. Ends when
 /// every [`MetaStore`] handle is dropped.
-async fn batcher(b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
+async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
     let max = b.opts.batch_max_entries.max(1);
     while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
@@ -423,22 +515,49 @@ async fn batcher(b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
             Err(LogError::Fenced { current }) => Err(Stop::Fenced { current }),
             Err(e) => Err(Stop::Failed(format!("append: {e}"))),
         };
-        match result {
+        let (stop, unanswered) = match result {
             Ok((first, applied)) => {
                 for (i, (p, outcome)) in batch.into_iter().zip(applied).enumerate() {
                     let _ = p.reply.send(Ok((first + i as u64, outcome)));
                 }
+                match b.maybe_snapshot().await {
+                    None => continue,
+                    Some(stop) => (stop, Vec::new()),
+                }
             }
-            Err(stop) => {
-                b.stop.send_replace(Some(stop.clone()));
-                for p in batch {
-                    let _ = p.reply.send(Err(stop.clone().into()));
-                }
-                // Stopped for good: fail whatever is still queued or arrives.
-                while let Some(p) = rx.recv().await {
-                    let _ = p.reply.send(Err(stop.clone().into()));
-                }
-                return;
+            Err(stop) => (stop, batch),
+        };
+        b.stop.send_replace(Some(stop.clone()));
+        for p in unanswered {
+            let _ = p.reply.send(Err(stop.clone().into()));
+        }
+        // Stopped for good: fail whatever is still queued or arrives.
+        while let Some(p) = rx.recv().await {
+            let _ = p.reply.send(Err(stop.clone().into()));
+        }
+        return;
+    }
+}
+
+impl Batcher {
+    /// Snapshot when due. Only a fence stops the tablet: a failed snapshot
+    /// leaves the log intact, so it is retried after the next batch.
+    async fn maybe_snapshot(&mut self) -> Option<Stop> {
+        let position = self.applied.load(Ordering::SeqCst);
+        let every = self.opts.snapshot_every;
+        if every == 0 || position < self.snapshot_at + every {
+            return None;
+        }
+        let data = take_snapshot(&self.states, position).encode();
+        match self.log.install_snapshot(self.gen, position, Snapshot { data }).await {
+            Ok(()) => {
+                self.snapshot_at = position;
+                None
+            }
+            Err(LogError::Fenced { current }) => Some(Stop::Fenced { current }),
+            Err(e) => {
+                tracing::warn!(position, error = %e, "snapshot failed; the log is kept");
+                None
             }
         }
     }
