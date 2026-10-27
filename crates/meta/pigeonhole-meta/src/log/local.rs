@@ -665,6 +665,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passes_the_logstore_conformance_suite() {
+        crate::log::conformance::run_all(|| {
+            let dir = Arc::new(tempfile::tempdir().unwrap());
+            move || {
+                let dir = dir.clone();
+                async move { Arc::new(LocalLogStore::open(dir.path()).unwrap()) as Arc<dyn LogStore> }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn read_past_the_end_is_lost() {
         let dir = tempfile::tempdir().unwrap();
         let log = LocalLogStore::open(dir.path()).unwrap();

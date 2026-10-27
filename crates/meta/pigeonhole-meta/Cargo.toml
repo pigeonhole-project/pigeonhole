@@ -16,5 +16,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+# The LogStore contract tests (`log::conformance`) for other implementations.
+testsuite = []
+
 [dev-dependencies]
 tempfile = { workspace = true }

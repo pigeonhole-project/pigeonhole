@@ -6,6 +6,8 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+#[cfg(any(test, feature = "testsuite"))]
+pub mod conformance;
 mod local;
 
 pub use local::{LocalLogStore, DEFAULT_SEGMENT_BYTES};
