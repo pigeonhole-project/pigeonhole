@@ -24,7 +24,8 @@ use std::sync::{Arc, RwLock};
 pub mod log;
 
 pub use log::{
-    Discovered, Entry, EntryStream, Head, LogError, LogResult, LogStore, Position, Snapshot,
+    Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogResult, LogStore, Position,
+    Snapshot,
 };
 
 /// Outcome of applying one command.

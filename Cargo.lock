@@ -2025,6 +2025,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "crc32fast",
  "futures",
  "prost",
  "prost-build",

@@ -5,6 +5,10 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::fmt;
 
+mod local;
+
+pub use local::{LocalLogStore, DEFAULT_SEGMENT_BYTES};
+
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/pigeonhole.meta.v1.rs"));
 }
