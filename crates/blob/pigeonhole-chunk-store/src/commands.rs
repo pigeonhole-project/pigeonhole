@@ -7,25 +7,55 @@
 //! Every check runs before the first mutation, so a rejected command leaves
 //! the state untouched.
 
-use crate::blob_db::{ChunkId, Extent, StoredBlock};
-use anyhow::{bail, Context, Result};
+use crate::blob_db::{ChunkId, StoredBlock};
+use anyhow::{bail, Result};
 use pigeonhole_blob::{BlobLocator, PartLayout, ReplicaLayout};
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
-
-/// Proto-encoded reply or rejection (until the commands move to serde).
-type Applied = std::result::Result<Vec<u8>, Vec<u8>>;
-use prost::Message;
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-pub(crate) mod pb {
-    include!(concat!(env!("OUT_DIR"), "/pigeonhole.chunk.v1.rs"));
-}
 
 pub(crate) const NAMESPACE: &str = "chunk";
 
+/// Commands of the `chunk` namespace. Changing the shape of a variant or the
+/// order of variants needs a new [`ChunkState::VERSION`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InstanceRec {
+pub enum ChunkCommand {
+    /// Upsert configured instances; instances not listed become retired.
+    SyncInstances { instances: Vec<(String, InstanceRec)> },
+    /// New chunk with refs = 1 after a successful quorum write.
+    CommitChunk {
+        chunk_id: ChunkId,
+        logical_size: i64,
+        crc32: u32,
+        blocks: Vec<StoredBlock>,
+        replicas: Vec<Replica>,
+        created_at: String,
+    },
+    /// All-or-nothing refs + 1.
+    Retain { chunk_ids: Vec<ChunkId> },
+    /// All-or-nothing refs - 1.
+    Release { chunk_ids: Vec<ChunkId> },
+    /// live with refs = 0 → reclaiming (or confirm an already reclaiming chunk).
+    BeginReclaim { chunk_id: ChunkId },
+    /// Forget a reclaiming chunk after its backend parts are deleted.
+    DropChunk { chunk_id: ChunkId },
+    /// Replace one instance's replica of a chunk (repair / backfill).
+    AddReplica { chunk_id: ChunkId, replica: Replica },
+}
+
+/// Deterministic failure of a [`ChunkCommand`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkReject {
+    /// Retain: chunk missing, refs = 0, or reclaiming.
+    ChunkGone(ChunkId),
+    /// Release: refs already 0, chunk missing, or reclaiming.
+    DoubleRelease(ChunkId),
+    /// BeginReclaim: chunk is referenced again or already gone.
+    NotReclaimable(ChunkId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceRec {
     pub kind: String,
     pub fingerprint: String,
     pub location: String,
@@ -33,9 +63,16 @@ pub(crate) struct InstanceRec {
     pub state: String,
 }
 
+/// One instance's copy of a chunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Replica {
+    pub instance: String,
+    pub parts: Vec<PartRec>,
+}
+
 /// One part of a replica: a blob holding `block_count` blocks from `first_block`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PartRec {
+pub struct PartRec {
     pub first_block: u32,
     pub block_count: u32,
     pub sort_key: Vec<u8>,
@@ -75,24 +112,29 @@ pub struct ChunkState {
     pub(crate) last_chunk_id: ChunkId,
 }
 
+type Applied = std::result::Result<(), ChunkReject>;
+
 impl StateMachine for ChunkState {
     const NAME: &'static str = NAMESPACE;
     const VERSION: u32 = 1;
-    type Command = Vec<u8>;
-    type Reply = Vec<u8>;
-    type Reject = Vec<u8>;
+    type Command = ChunkCommand;
+    type Reply = ();
+    type Reject = ChunkReject;
 
-    fn apply(&mut self, command: Vec<u8>) -> Result<Outcome<Self>> {
-        use pb::command::Op;
-        let cmd = pb::Command::decode(command.as_slice()).context("decode chunk command")?;
-        match cmd.op.context("empty chunk command")? {
-            Op::SyncInstances(c) => self.sync_instances(c),
-            Op::CommitChunk(c) => self.commit_chunk(c),
-            Op::Retain(c) => Ok(self.retain(&c.chunk_ids)),
-            Op::Release(c) => Ok(self.release(&c.chunk_ids)),
-            Op::BeginReclaim(c) => Ok(self.begin_reclaim(c.chunk_id)),
-            Op::DropChunk(c) => Ok(self.drop_chunk(c.chunk_id)),
-            Op::AddReplica(c) => self.add_replica(c),
+    fn apply(&mut self, command: ChunkCommand) -> Result<Outcome<Self>> {
+        match command {
+            ChunkCommand::SyncInstances { instances } => self.sync_instances(instances),
+            ChunkCommand::CommitChunk { chunk_id, logical_size, crc32, blocks, replicas, created_at } => {
+                self.commit_chunk(chunk_id, logical_size, crc32, blocks, replicas, created_at)
+            }
+            ChunkCommand::Retain { chunk_ids } => Ok(self.retain(&chunk_ids)),
+            ChunkCommand::Release { chunk_ids } => Ok(self.release(&chunk_ids)),
+            ChunkCommand::BeginReclaim { chunk_id } => Ok(self.begin_reclaim(chunk_id)),
+            ChunkCommand::DropChunk { chunk_id } => {
+                self.drop_chunk(chunk_id);
+                Ok(Ok(()))
+            }
+            ChunkCommand::AddReplica { chunk_id, replica } => self.add_replica(chunk_id, replica),
         }
     }
 
@@ -110,18 +152,15 @@ impl StateMachine for ChunkState {
 }
 
 impl ChunkState {
-    /// Upsert configured instances; instances not listed become retired.
-    fn sync_instances(&mut self, c: pb::SyncInstances) -> Result<Applied> {
+    fn sync_instances(&mut self, configured: Vec<(String, InstanceRec)>) -> Result<Applied> {
         let mut instances = self.instances.clone();
-        let configured: HashSet<&str> = c.instances.iter().map(|i| i.id.as_str()).collect();
+        let ids: HashSet<&str> = configured.iter().map(|(id, _)| id.as_str()).collect();
         for (id, rec) in instances.iter_mut() {
-            if !configured.contains(id.as_str()) {
+            if !ids.contains(id.as_str()) {
                 rec.state = "retired".into();
             }
         }
-        for i in c.instances {
-            instances.insert(i.id.clone(), InstanceRec::from(i));
-        }
+        instances.extend(configured);
         let mut locations = HashSet::new();
         for (id, rec) in &instances {
             if rec.state == "read-write" && !locations.insert(rec.location.as_str()) {
@@ -129,11 +168,11 @@ impl ChunkState {
             }
         }
         self.instances = instances;
-        Ok(ok())
+        Ok(Ok(()))
     }
 
     /// A replica's parts must name a known instance and keys no other part owns.
-    fn check_replica(&self, chunk_id: ChunkId, rep: &pb::Replica) -> Result<()> {
+    fn check_replica(&self, chunk_id: ChunkId, rep: &Replica) -> Result<()> {
         if !self.instances.contains_key(&rep.instance) {
             bail!("chunk {chunk_id}: unknown instance {}", rep.instance);
         }
@@ -143,78 +182,81 @@ impl ChunkState {
                 bail!("chunk {chunk_id}: duplicate sort_key on instance {}", rep.instance);
             }
             let owner = self.by_key.get(&(rep.instance.clone(), part.sort_key.clone()));
-            if owner.is_some_and(|&o| o != chunk_id) {
+            if let Some(&owner) = owner.filter(|&&o| o != chunk_id) {
                 bail!(
-                    "chunk {chunk_id}: key {} on {} belongs to chunk {}",
+                    "chunk {chunk_id}: key {} on {} belongs to chunk {owner}",
                     hex::encode(&part.sort_key),
-                    rep.instance,
-                    owner.unwrap()
+                    rep.instance
                 );
             }
         }
         Ok(())
     }
 
-    fn put_replica(&mut self, chunk_id: ChunkId, rep: &pb::Replica) {
-        let parts: Vec<PartRec> = rep.parts.iter().map(PartRec::from).collect();
-        for p in &parts {
+    fn put_replica(&mut self, chunk_id: ChunkId, rep: Replica) {
+        for p in &rep.parts {
             self.by_key.insert((rep.instance.clone(), p.sort_key.clone()), chunk_id);
         }
         let chunk = self.chunks.get_mut(&chunk_id).expect("caller checked the chunk");
-        chunk.replicas.insert(rep.instance.clone(), parts);
+        chunk.replicas.insert(rep.instance, rep.parts);
     }
 
-    fn remove_replica(&mut self, chunk_id: ChunkId, instance: &str) {
-        let Some(chunk) = self.chunks.get_mut(&chunk_id) else {
-            return;
-        };
-        for p in chunk.replicas.remove(instance).unwrap_or_default() {
-            self.by_key.remove(&(instance.to_string(), p.sort_key));
+    fn remove_replica(&mut self, chunk_id: ChunkId, instance: &str) -> Option<Replica> {
+        let parts = self.chunks.get_mut(&chunk_id)?.replicas.remove(instance)?;
+        for p in &parts {
+            self.by_key.remove(&(instance.to_string(), p.sort_key.clone()));
         }
+        Some(Replica { instance: instance.to_string(), parts })
     }
 
-    /// New chunk with refs = 1 after a successful quorum write.
-    fn commit_chunk(&mut self, c: pb::CommitChunk) -> Result<Applied> {
-        if self.chunks.contains_key(&c.chunk_id) {
-            bail!("chunk {} committed twice", c.chunk_id);
+    fn commit_chunk(
+        &mut self,
+        chunk_id: ChunkId,
+        logical_size: i64,
+        crc32: u32,
+        mut blocks: Vec<StoredBlock>,
+        replicas: Vec<Replica>,
+        created_at: String,
+    ) -> Result<Applied> {
+        if self.chunks.contains_key(&chunk_id) {
+            bail!("chunk {chunk_id} committed twice");
         }
         let mut instances = HashSet::new();
-        for rep in &c.replicas {
+        for rep in &replicas {
             if !instances.insert(rep.instance.as_str()) {
-                bail!("chunk {}: two replicas on {}", c.chunk_id, rep.instance);
+                bail!("chunk {chunk_id}: two replicas on {}", rep.instance);
             }
-            self.check_replica(c.chunk_id, rep)?;
+            self.check_replica(chunk_id, rep)?;
         }
-        let mut blocks: Vec<StoredBlock> = c.blocks.into_iter().map(StoredBlock::from).collect();
         blocks.sort_by_key(|b| b.block_no);
         let rec = ChunkRec {
-            logical_size: c.logical_size,
-            crc32: c.crc32,
+            logical_size,
+            crc32,
             refs: 1,
             reclaiming: false,
-            created_at: c.created_at,
+            created_at,
             blocks,
             replicas: BTreeMap::new(),
         };
-        self.chunks.insert(c.chunk_id, rec);
-        self.last_chunk_id = self.last_chunk_id.max(c.chunk_id);
-        for rep in &c.replicas {
-            self.put_replica(c.chunk_id, rep);
+        self.chunks.insert(chunk_id, rec);
+        self.last_chunk_id = self.last_chunk_id.max(chunk_id);
+        for rep in replicas {
+            self.put_replica(chunk_id, rep);
         }
-        Ok(ok())
+        Ok(Ok(()))
     }
 
     /// All-or-nothing `refs + 1` (an id listed twice gets two).
     fn retain(&mut self, ids: &[ChunkId]) -> Applied {
         for &id in ids {
             if !self.chunks.get(&id).is_some_and(ChunkRec::is_live) {
-                return reject(pb::rejection::Reason::ChunkGone(id));
+                return Err(ChunkReject::ChunkGone(id));
             }
         }
         for id in ids {
             self.chunks.get_mut(id).expect("checked above").refs += 1;
         }
-        ok()
+        Ok(())
     }
 
     /// All-or-nothing `refs - 1`; going below zero is a double release.
@@ -225,30 +267,29 @@ impl ChunkState {
             *n += 1;
             match self.chunks.get(&id) {
                 Some(c) if !c.reclaiming && c.refs >= *n => {}
-                _ => return reject(pb::rejection::Reason::DoubleRelease(id)),
+                _ => return Err(ChunkReject::DoubleRelease(id)),
             }
         }
         for (id, n) in wanted {
             self.chunks.get_mut(&id).expect("checked above").refs -= n;
         }
-        ok()
+        Ok(())
     }
 
-    /// live with refs = 0 → reclaiming; an already reclaiming chunk (a pass
-    /// interrupted by a crash) counts as started.
+    /// An already reclaiming chunk (a pass interrupted by a crash) counts as started.
     fn begin_reclaim(&mut self, id: ChunkId) -> Applied {
         match self.chunks.get_mut(&id) {
-            Some(c) if c.reclaiming => ok(),
+            Some(c) if c.reclaiming => Ok(()),
             Some(c) if c.refs == 0 => {
                 c.reclaiming = true;
-                ok()
+                Ok(())
             }
-            _ => reject(pb::rejection::Reason::NotReclaimable(id)),
+            _ => Err(ChunkReject::NotReclaimable(id)),
         }
     }
 
-    /// Forget a chunk whose backend parts are deleted (missing is fine).
-    fn drop_chunk(&mut self, id: ChunkId) -> Applied {
+    /// Missing is fine.
+    fn drop_chunk(&mut self, id: ChunkId) {
         let instances: Vec<String> = self
             .chunks
             .get(&id)
@@ -258,123 +299,35 @@ impl ChunkState {
             self.remove_replica(id, &instance);
         }
         self.chunks.remove(&id);
-        ok()
     }
 
-    /// Replace one instance's replica of a chunk (repair / backfill).
-    fn add_replica(&mut self, c: pb::AddReplica) -> Result<Applied> {
-        let rep = c.replica.context("add_replica without replica")?;
-        if !self.chunks.contains_key(&c.chunk_id) {
-            bail!("add_replica: chunk {} not found", c.chunk_id);
+    fn add_replica(&mut self, chunk_id: ChunkId, rep: Replica) -> Result<Applied> {
+        if !self.chunks.contains_key(&chunk_id) {
+            bail!("add_replica: chunk {chunk_id} not found");
         }
         // Keys of the replica being replaced may be reused by the new one.
-        let old = self.chunks[&c.chunk_id].replicas.get(&rep.instance).cloned();
-        self.remove_replica(c.chunk_id, &rep.instance);
-        if let Err(e) = self.check_replica(c.chunk_id, &rep) {
-            if let Some(parts) = old {
-                let old = pb::Replica {
-                    instance: rep.instance.clone(),
-                    parts: parts.iter().map(pb::Part::from).collect(),
-                };
-                self.put_replica(c.chunk_id, &old);
+        let old = self.remove_replica(chunk_id, &rep.instance);
+        if let Err(e) = self.check_replica(chunk_id, &rep) {
+            if let Some(old) = old {
+                self.put_replica(chunk_id, old);
             }
             return Err(e);
         }
-        self.put_replica(c.chunk_id, &rep);
-        Ok(ok())
+        self.put_replica(chunk_id, rep);
+        Ok(Ok(()))
     }
-}
-
-fn ok() -> Applied {
-    Ok(Vec::new())
-}
-
-fn reject(reason: pb::rejection::Reason) -> Applied {
-    Err(pb::Rejection { reason: Some(reason) }.encode_to_vec())
 }
 
 // --- conversions -----------------------------------------------------------
 
-impl From<pb::Instance> for InstanceRec {
-    fn from(i: pb::Instance) -> Self {
-        Self { kind: i.kind, fingerprint: i.fingerprint, location: i.location, state: i.state }
-    }
-}
-
-impl From<pb::Extent> for Extent {
-    fn from(e: pb::Extent) -> Self {
-        Self {
-            chunk: e.chunk,
-            offset: e.offset,
-            len: e.len,
-        }
-    }
-}
-
-impl From<&Extent> for pb::Extent {
-    fn from(e: &Extent) -> Self {
-        Self {
-            chunk: e.chunk,
-            offset: e.offset,
-            len: e.len,
-        }
-    }
-}
-
-impl From<&StoredBlock> for pb::Block {
-    fn from(b: &StoredBlock) -> Self {
-        Self {
-            block_no: b.block_no,
-            logical_off: b.logical_off,
-            logical_len: b.logical_len,
-            stored_len: b.stored_len,
-            codec: b.codec.clone(),
-        }
-    }
-}
-
-impl From<pb::Block> for StoredBlock {
-    fn from(b: pb::Block) -> Self {
-        Self {
-            block_no: b.block_no,
-            logical_off: b.logical_off,
-            logical_len: b.logical_len,
-            stored_len: b.stored_len,
-            codec: b.codec,
-        }
-    }
-}
-
-impl From<&pb::Part> for PartRec {
-    fn from(p: &pb::Part) -> Self {
-        Self {
-            first_block: p.first_block,
-            block_count: p.block_count,
-            sort_key: p.sort_key.clone(),
-            locator: p.locator.clone(),
-        }
-    }
-}
-
-impl From<&PartRec> for pb::Part {
-    fn from(p: &PartRec) -> Self {
-        Self {
-            first_block: p.first_block,
-            block_count: p.block_count,
-            sort_key: p.sort_key.clone(),
-            locator: p.locator.clone(),
-        }
-    }
-}
-
-impl From<&ReplicaLayout> for pb::Replica {
+impl From<&ReplicaLayout> for Replica {
     fn from(r: &ReplicaLayout) -> Self {
         Self {
             instance: r.instance.clone(),
             parts: r
                 .parts
                 .iter()
-                .map(|p: &PartLayout| pb::Part {
+                .map(|p: &PartLayout| PartRec {
                     first_block: p.first_block,
                     block_count: p.block_count,
                     sort_key: p.locator.key.clone(),
@@ -414,5 +367,19 @@ impl ChunkRec {
                     .collect(),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fails when the encoding of a command changes: bump `VERSION` and update
+    /// the expected bytes (old logs then refuse to replay, as they should).
+    #[test]
+    fn command_encoding_is_pinned() {
+        let cmd = ChunkCommand::Release { chunk_ids: vec![1, 2] };
+        assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 2, 2, 4]);
+        assert_eq!(ChunkState::VERSION, 1);
     }
 }

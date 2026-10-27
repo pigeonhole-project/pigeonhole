@@ -11,7 +11,7 @@ pub mod repair;
 pub mod sweep;
 
 pub use blob_db::{is_chunk_gone, BlobDb, ChunkGone, StoredBlock};
-pub use commands::ChunkState;
+pub use commands::{ChunkCommand, ChunkReject, ChunkState, InstanceRec, PartRec, Replica};
 pub use config::{
     BytestreamSettings, Config, HttpSettings, LogSettings, MetaSettings, MetricsSettings,
     PlacementConfig,

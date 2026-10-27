@@ -5,12 +5,11 @@
 //! progress (put watermarks, sweep cursor, repair queue) is kept in this
 //! process: it is not replicated and starts empty on every boot.
 
-use crate::commands::{pb, ChunkRec, ChunkState, NAMESPACE};
-use anyhow::{bail, Context, Result};
+use crate::commands::{ChunkCommand, ChunkRec, ChunkReject, ChunkState, InstanceRec, Replica, NAMESPACE};
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use pigeonhole_blob::{InstanceInfo, ReplicaLayout};
 use pigeonhole_meta::{MetaStore, Namespaces};
-use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -117,20 +116,14 @@ impl BlobDb {
         self.read(|s| s.chunks.get(&chunk_id).map(f))
     }
 
-    /// Propose one chunk command; `Err(reason)` is a deterministic rejection.
-    async fn propose(&self, op: pb::command::Op) -> Result<Result<(), pb::rejection::Reason>> {
-        let cmd = pb::Command { op: Some(op) }.encode_to_vec();
-        match self.meta.propose::<ChunkState>(cmd).await? {
-            Ok(_) => Ok(Ok(())),
-            Err(bytes) => Ok(Err(pb::Rejection::decode(bytes.as_slice())?
-                .reason
-                .context("rejection without reason")?)),
-        }
+    /// Propose one chunk command; `Ok(Err(_))` is a deterministic rejection.
+    async fn propose(&self, cmd: ChunkCommand) -> Result<Result<(), ChunkReject>> {
+        self.meta.propose::<ChunkState>(cmd).await
     }
 
     /// Propose a command that has no state-dependent failure.
-    async fn propose_infallible(&self, op: pb::command::Op) -> Result<()> {
-        match self.propose(op).await? {
+    async fn propose_infallible(&self, cmd: ChunkCommand) -> Result<()> {
+        match self.propose(cmd).await? {
             Ok(()) => Ok(()),
             Err(reason) => bail!("unexpected rejection {reason:?}"),
         }
@@ -139,16 +132,17 @@ impl BlobDb {
     pub async fn sync_instances(&self, configured: &[InstanceInfo]) -> Result<()> {
         let instances = configured
             .iter()
-            .map(|i| pb::Instance {
-                id: i.id.clone(),
-                kind: i.kind.as_str().into(),
-                fingerprint: i.fingerprint.clone(),
-                location: i.location.clone(),
-                state: i.role.as_str().into(),
+            .map(|i| {
+                let rec = InstanceRec {
+                    kind: i.kind.as_str().into(),
+                    fingerprint: i.fingerprint.clone(),
+                    location: i.location.clone(),
+                    state: i.role.as_str().into(),
+                };
+                (i.id.clone(), rec)
             })
             .collect();
-        self.propose_infallible(pb::command::Op::SyncInstances(pb::SyncInstances { instances }))
-            .await
+        self.propose_infallible(ChunkCommand::SyncInstances { instances }).await
     }
 
     pub async fn list_instance_fingerprints(&self) -> Result<Vec<(String, String)>> {
@@ -180,14 +174,14 @@ impl BlobDb {
         replicas: &[ReplicaLayout],
     ) -> Result<ChunkId> {
         let chunk_id = self.next_chunk_id.fetch_add(1, Ordering::SeqCst);
-        self.propose_infallible(pb::command::Op::CommitChunk(pb::CommitChunk {
+        self.propose_infallible(ChunkCommand::CommitChunk {
             chunk_id,
             logical_size,
             crc32,
-            blocks: blocks.iter().map(pb::Block::from).collect(),
-            replicas: replicas.iter().map(pb::Replica::from).collect(),
+            blocks: blocks.to_vec(),
+            replicas: replicas.iter().map(Replica::from).collect(),
             created_at: Utc::now().to_rfc3339(),
-        }))
+        })
         .await?;
         Ok(chunk_id)
     }
@@ -199,11 +193,11 @@ impl BlobDb {
             return Ok(());
         }
         match self
-            .propose(pb::command::Op::Retain(pb::Retain { chunk_ids: ids.to_vec() }))
+            .propose(ChunkCommand::Retain { chunk_ids: ids.to_vec() })
             .await?
         {
             Ok(()) => Ok(()),
-            Err(pb::rejection::Reason::ChunkGone(chunk_id)) => {
+            Err(ChunkReject::ChunkGone(chunk_id)) => {
                 pigeonhole_blob::record_chunk_gone();
                 Err(anyhow::Error::new(ChunkGone { chunk_id }))
             }
@@ -217,11 +211,11 @@ impl BlobDb {
             return Ok(());
         }
         match self
-            .propose(pb::command::Op::Release(pb::Release { chunk_ids: ids.to_vec() }))
+            .propose(ChunkCommand::Release { chunk_ids: ids.to_vec() })
             .await?
         {
             Ok(()) => Ok(()),
-            Err(pb::rejection::Reason::DoubleRelease(id)) => {
+            Err(ChunkReject::DoubleRelease(id)) => {
                 pigeonhole_blob::record_double_release();
                 bail!("double release or missing chunk {id}")
             }
@@ -359,18 +353,18 @@ impl BlobDb {
     /// worker won the race or `retain` revived the chunk.
     pub async fn try_begin_reclaim(&self, chunk_id: ChunkId) -> Result<bool> {
         match self
-            .propose(pb::command::Op::BeginReclaim(pb::BeginReclaim { chunk_id }))
+            .propose(ChunkCommand::BeginReclaim { chunk_id })
             .await?
         {
             Ok(()) => Ok(true),
-            Err(pb::rejection::Reason::NotReclaimable(_)) => Ok(false),
+            Err(ChunkReject::NotReclaimable(_)) => Ok(false),
             Err(other) => bail!("unexpected begin_reclaim rejection {other:?}"),
         }
     }
 
     /// Forget the chunk (after its backend parts are deleted).
     pub async fn delete_chunk_metadata(&self, chunk_id: ChunkId) -> Result<()> {
-        self.propose_infallible(pb::command::Op::DropChunk(pb::DropChunk { chunk_id }))
+        self.propose_infallible(ChunkCommand::DropChunk { chunk_id })
             .await?;
         self.local
             .lock()
@@ -440,10 +434,7 @@ impl BlobDb {
         chunk_id: ChunkId,
         layout: &ReplicaLayout,
     ) -> Result<()> {
-        self.propose_infallible(pb::command::Op::AddReplica(pb::AddReplica {
-            chunk_id,
-            replica: Some(pb::Replica::from(layout)),
-        }))
+        self.propose_infallible(ChunkCommand::AddReplica { chunk_id, replica: Replica::from(layout) })
         .await
     }
 
