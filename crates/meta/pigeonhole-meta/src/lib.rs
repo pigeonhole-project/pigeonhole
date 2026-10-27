@@ -37,8 +37,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 pub mod log;
 
 pub use log::{
-    Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogResult, LogStore, Position,
-    Snapshot,
+    Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogId, LogResult, LogStore,
+    Position, Snapshot,
 };
 
 /// Outcome of applying one command.
@@ -133,6 +133,7 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta_tablet (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
     gen INTEGER NOT NULL,
+    log_id TEXT,
     last_applied_position INTEGER NOT NULL
 )
 "#;
@@ -188,13 +189,23 @@ impl MetaStore {
         tx.commit().await?;
         let namespaces = Arc::new(by_name);
 
-        let (known_gen, applied) = tablet_row(&pool).await?;
+        let (known_gen, _, _) = tablet_row(&pool).await?;
         let (gen, head) = claim_next(log.as_ref(), known_gen).await?;
         sqlx::query("UPDATE meta_tablet SET gen = ? WHERE singleton = 0")
             .bind(gen as i64)
             .execute(&pool)
             .await?;
 
+        let (_, log_id, mut applied) = tablet_row(&pool).await?;
+        if log_id.is_some_and(|id| id != head.log_id) || (log_id.is_none() && applied > 0) {
+            // Applied from another history: positions mean different entries.
+            discard_state(&pool, &namespaces).await?;
+            applied = 0;
+        }
+        sqlx::query("UPDATE meta_tablet SET log_id = ? WHERE singleton = 0")
+            .bind(head.log_id.to_string())
+            .execute(&pool)
+            .await?;
         if applied > head.position {
             bail!(LogError::Lost(format!(
                 "SQLite state is at {applied}, the log ends at {}",
@@ -278,7 +289,7 @@ impl MetaStore {
 
     /// Position of the last applied entry (0 before the first).
     pub async fn applied_position(&self) -> Result<Position> {
-        Ok(tablet_row(&self.pool).await?.1)
+        Ok(tablet_row(&self.pool).await?.2)
     }
 }
 
@@ -327,12 +338,40 @@ fn local_log_dir(url: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(format!("{path}.log")))
 }
 
-async fn tablet_row(pool: &SqlitePool) -> Result<(u64, Position)> {
-    let (gen, pos): (i64, i64) =
-        sqlx::query_as("SELECT gen, last_applied_position FROM meta_tablet WHERE singleton = 0")
-            .fetch_one(pool)
-            .await?;
-    Ok((gen as u64, pos as Position))
+async fn tablet_row(pool: &SqlitePool) -> Result<(u64, Option<LogId>, Position)> {
+    let (gen, log_id, pos): (i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT gen, log_id, last_applied_position FROM meta_tablet WHERE singleton = 0",
+    )
+    .fetch_one(pool)
+    .await?;
+    let log_id = log_id
+        .map(|s| s.parse::<LogId>().with_context(|| format!("meta_tablet.log_id {s:?}")))
+        .transpose()?;
+    Ok((gen as u64, log_id, pos as Position))
+}
+
+/// Empty every table but the tablet's own row and re-run each namespace's
+/// `init`, so the log can be replayed from the start.
+async fn discard_state(pool: &SqlitePool, namespaces: &Namespaces) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("PRAGMA defer_foreign_keys = ON").execute(&mut *tx).await?;
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' \
+         AND name NOT LIKE 'sqlite_%' AND name != 'meta_tablet'",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for (table,) in tables {
+        sqlx::query(&format!("DELETE FROM \"{table}\"")).execute(&mut *tx).await?;
+    }
+    for ns in namespaces.values() {
+        ns.init(&mut tx).await.with_context(|| format!("init namespace {}", ns.name()))?;
+    }
+    sqlx::query("UPDATE meta_tablet SET log_id = NULL, last_applied_position = 0 WHERE singleton = 0")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Claim `1 + max(known generations)`; a racing or forgotten newer claim

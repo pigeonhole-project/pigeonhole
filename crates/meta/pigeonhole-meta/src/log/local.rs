@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! <dir>/lock                  flock'ed around every claim / append / snapshot
+//! <dir>/log_id                identity of this history, written by the first claim
 //! <dir>/claimed_gen           newest claimed generation (tmp + fsync + rename)
 //! <dir>/seg-<first>.log       records; <first> = position of its first entry
 //! <dir>/snapshot-<at>.snap    newest snapshot; segments wholly ≤ <at> are dropped
@@ -15,7 +16,9 @@
 //! Fences only processes on this host; durability = the disk.
 
 use super::pb::Batch;
-use super::{Discovered, Entry, EntryStream, Head, LogError, LogResult, LogStore, Position, Snapshot};
+use super::{
+    Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position, Snapshot,
+};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -159,6 +162,25 @@ impl Shared {
         }
     }
 
+    /// The log's identity; the first claim of an empty directory creates it.
+    fn log_id(&self, create: bool) -> LogResult<LogId> {
+        match fs::read_to_string(self.dir.join("log_id")) {
+            Ok(s) => s.parse().map_err(|e| LogError::Lost(format!("log_id {s:?}: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let empty = self.claimed_gen()?.is_none()
+                    && self.segments()?.is_empty()
+                    && self.snapshot_at()?.is_none();
+                if !(create && empty) {
+                    return Err(LogError::Lost(format!("{}: no log_id", self.dir.display())));
+                }
+                let id = LogId::random();
+                self.write_atomic("log_id", id.to_string().as_bytes())?;
+                Ok(id)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn sync_dir(&self) -> LogResult<()> {
         File::open(&self.dir)?.sync_all()?;
         Ok(())
@@ -256,6 +278,7 @@ impl Shared {
                 return Err(LogError::Fenced { current });
             }
         }
+        let log_id = self.log_id(true)?;
         self.write_atomic("claimed_gen", gen.to_string().as_bytes())?;
         let head = self.scan(true)?;
         let seg = match self.segments()?.pop() {
@@ -267,7 +290,7 @@ impl Shared {
             None => None,
         };
         *self.owner.lock().unwrap() = Some(Owner { gen, head, seg });
-        Ok(Head { position: head })
+        Ok(Head { log_id, position: head })
     }
 
     fn append(&self, gen: u64, entries: Vec<Entry>) -> LogResult<Position> {
@@ -317,12 +340,13 @@ impl Shared {
         let Some(gen) = self.claimed_gen()? else {
             return Ok(None);
         };
+        let log_id = self.log_id(false)?;
         let head = self.scan(false)?;
         let snapshot = match self.snapshot_at()? {
             Some((at, path)) => Some((at, Snapshot { data: fs::read(path)? })),
             None => None,
         };
-        Ok(Some(Discovered { snapshot, head: Head { position: head }, gen }))
+        Ok(Some(Discovered { snapshot, head: Head { log_id, position: head }, gen }))
     }
 
     fn read_step(&self, st: &mut ReadState) -> LogResult<Vec<(Position, Entry)>> {
@@ -462,7 +486,8 @@ mod tests {
     }
 
     async fn read_all(log: &dyn LogStore, from: Position, head: Position) -> LogResult<Vec<(Position, Entry)>> {
-        log.read(from, Head { position: head }).try_collect().await
+        let log_id = log.discover().await?.expect("claimed").head.log_id;
+        log.read(from, Head { log_id, position: head }).try_collect().await
     }
 
     #[tokio::test]
@@ -470,7 +495,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = LocalLogStore::with_segment_bytes(dir.path(), 64).unwrap();
         assert_eq!(log.discover().await.unwrap(), None);
-        assert_eq!(log.claim(1).await.unwrap(), Head { position: 0 });
+        assert_eq!(log.claim(1).await.unwrap().position, 0);
         assert_eq!(log.append(1, &[]).await.unwrap(), 0, "zero entry takes no position");
         let mut pos = 0;
         for i in 1..=10 {
@@ -484,8 +509,9 @@ mod tests {
 
         let again = LocalLogStore::open(dir.path()).unwrap();
         let d = again.discover().await.unwrap().unwrap();
-        assert_eq!((d.gen, d.head, d.snapshot), (1, Head { position: 20 }, None));
-        assert_eq!(again.claim(2).await.unwrap(), Head { position: 20 });
+        assert_eq!((d.gen, d.head.position, d.snapshot), (1, 20, None));
+        let head = again.claim(2).await.unwrap();
+        assert_eq!((head.log_id, head.position), (d.head.log_id, 20), "identity survives claims");
         assert_eq!(again.append(2, &[entry(21)]).await.unwrap(), 21);
         assert_eq!(read_all(&again, 0, 21).await.unwrap().len(), 21);
     }
@@ -499,7 +525,7 @@ mod tests {
         a.append(1, &[entry(1)]).await.unwrap();
 
         assert!(matches!(b.claim(1).await, Err(LogError::Fenced { current: 1 })));
-        assert_eq!(b.claim(2).await.unwrap(), Head { position: 1 }, "acknowledged entry ≤ head");
+        assert_eq!(b.claim(2).await.unwrap().position, 1, "acknowledged entry ≤ head");
         assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Fenced { current: 2 })));
         assert!(matches!(
             a.install_snapshot(1, 1, Snapshot { data: vec![] }).await,
@@ -521,8 +547,8 @@ mod tests {
         OpenOptions::new().append(true).open(&seg).unwrap().write_all(&torn).unwrap();
 
         let log = LocalLogStore::open(dir.path()).unwrap();
-        assert_eq!(log.discover().await.unwrap().unwrap().head, Head { position: 1 });
-        assert_eq!(log.claim(2).await.unwrap(), Head { position: 1 });
+        assert_eq!(log.discover().await.unwrap().unwrap().head.position, 1);
+        assert_eq!(log.claim(2).await.unwrap().position, 1);
         assert_eq!(log.append(2, &[entry(2)]).await.unwrap(), 2);
         assert_eq!(read_all(&log, 0, 2).await.unwrap().len(), 2);
 
@@ -549,12 +575,12 @@ mod tests {
 
         let d = log.discover().await.unwrap().unwrap();
         assert_eq!(d.snapshot, Some((4, Snapshot { data: b"s4".to_vec() })));
-        assert_eq!(d.head, Head { position: 6 });
+        assert_eq!(d.head.position, 6);
         assert_eq!(read_all(&log, 4, 6).await.unwrap(), vec![(5, entry(5)), (6, entry(6))]);
         assert!(matches!(read_all(&log, 2, 6).await, Err(LogError::Lost(_))));
 
         let log = LocalLogStore::open(dir.path()).unwrap();
-        assert_eq!(log.claim(2).await.unwrap(), Head { position: 6 });
+        assert_eq!(log.claim(2).await.unwrap().position, 6);
     }
 
     #[tokio::test]
@@ -562,7 +588,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for gen in 1..=3 {
             let log = LocalLogStore::with_segment_bytes(dir.path(), 1).unwrap();
-            assert_eq!(log.claim(gen).await.unwrap(), Head { position: 0 });
+            assert_eq!(log.claim(gen).await.unwrap().position, 0);
             assert_eq!(log.append(gen, &[]).await.unwrap(), 0);
         }
         let log = LocalLogStore::with_segment_bytes(dir.path(), 1).unwrap();
@@ -572,6 +598,20 @@ mod tests {
         let firsts: Vec<_> = log.shared.segments().unwrap().into_iter().map(|(f, _)| f).collect();
         assert_eq!(firsts, vec![1, 2]);
         assert_eq!(read_all(&log, 0, 2).await.unwrap(), vec![(1, entry(1)), (2, entry(2))]);
+    }
+
+    #[tokio::test]
+    async fn log_id_is_new_for_a_new_log_and_required_for_an_old_one() {
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = LocalLogStore::open(d1.path()).unwrap();
+        let b = LocalLogStore::open(d2.path()).unwrap();
+        let (ha, hb) = (a.claim(1).await.unwrap(), b.claim(1).await.unwrap());
+        assert_ne!(ha.log_id, hb.log_id);
+
+        a.append(1, &[entry(1)]).await.unwrap();
+        fs::remove_file(d1.path().join("log_id")).unwrap();
+        assert!(matches!(a.claim(2).await, Err(LogError::Lost(_))));
+        assert!(matches!(a.discover().await, Err(LogError::Lost(_))));
     }
 
     #[tokio::test]

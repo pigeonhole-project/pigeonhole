@@ -19,9 +19,36 @@ pub use pb::Entry;
 /// order; `0` is "before the first entry".
 pub type Position = u64;
 
+/// Identity of one log history, fixed when the log is first claimed. A local
+/// state applied up to some position is only meaningful for the same log: a
+/// recreated log reuses positions for different entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LogId(pub u128);
+
+impl LogId {
+    pub fn random() -> Self {
+        LogId(uuid::Uuid::new_v4().as_u128())
+    }
+}
+
+impl fmt::Display for LogId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+impl std::str::FromStr for LogId {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        u128::from_str_radix(s.trim(), 16).map(LogId)
+    }
+}
+
 /// End of the committed log: every acknowledged entry is at or before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Head {
+    pub log_id: LogId,
     pub position: Position,
 }
 

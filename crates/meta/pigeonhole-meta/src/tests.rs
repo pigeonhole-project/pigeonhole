@@ -205,7 +205,7 @@ async fn crash_between_append_and_apply_is_applied_once_on_boot() {
     }
     // An incarnation that appended a batch and died before applying it.
     let log = LocalLogStore::open(dir.path().join("log")).unwrap();
-    assert_eq!(log.claim(2).await.unwrap(), Head { position: 1 });
+    assert_eq!(log.claim(2).await.unwrap().position, 1);
     let entry = Entry { namespace: "counter".into(), command: op(2, 5) };
     assert_eq!(log.append(2, &[entry]).await.unwrap(), 2);
 
@@ -219,13 +219,41 @@ async fn crash_between_append_and_apply_is_applied_once_on_boot() {
 }
 
 #[tokio::test]
-async fn state_ahead_of_the_log_refuses_to_boot() {
+async fn state_from_another_log_is_rebuilt_from_this_one() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let a = open_on(dir.path(), "a.db").await;
+        a.propose("counter", &op(1, 1)).await.unwrap();
+        a.propose("counter", &op(2, 1)).await.unwrap();
+    }
+    // A recreated log reuses positions 1, 2, 3 for different entries.
+    std::fs::remove_dir_all(dir.path().join("log")).unwrap();
+    {
+        let other = open_on(dir.path(), "other.db").await;
+        for id in 10..13 {
+            other.propose("counter", &op(id, 5)).await.unwrap();
+        }
+    }
+    let a = open_on(dir.path(), "a.db").await;
+    assert_eq!(a.applied_position().await.unwrap(), 3);
+    assert_eq!(op_ids(&a).await, vec![10, 11, 12], "nothing of the old history survives");
+    assert_eq!(value(&a).await, 15);
+}
+
+#[tokio::test]
+async fn state_ahead_of_the_same_log_refuses_to_boot() {
     let dir = tempfile::tempdir().unwrap();
     {
         let a = open_on(dir.path(), "a.db").await;
         a.propose("counter", &op(1, 1)).await.unwrap();
     }
-    std::fs::remove_dir_all(dir.path().join("log")).unwrap();
+    // Lose the log's segments but keep its identity: the file is ahead of the log.
+    for f in std::fs::read_dir(dir.path().join("log")).unwrap() {
+        let path = f.unwrap().path();
+        if path.file_name().unwrap().to_str().unwrap().starts_with("seg-") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
     let log = Arc::new(LocalLogStore::open(dir.path().join("log")).unwrap());
     let err = MetaStore::open(&url(dir.path(), "a.db"), log, vec![Arc::new(Counter)], MetaOptions::default())
         .await
