@@ -296,6 +296,24 @@ impl Index {
         user_meta: &[(String, String)],
         checksums_json: &str,
     ) -> Result<Vec<ChunkId>> {
+        let mtime = Utc::now().to_rfc3339();
+        self.put_object_at(bucket, key, etag, size, content_type, extents, user_meta, checksums_json, &mtime)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_object_at(
+        &self,
+        bucket: &str,
+        key: &str,
+        etag: &str,
+        size: i64,
+        content_type: Option<&str>,
+        extents: &[Extent],
+        user_meta: &[(String, String)],
+        checksums_json: &str,
+        mtime: &str,
+    ) -> Result<Vec<ChunkId>> {
         self.propose_infallible(pb::command::Op::PutObject(pb::PutObject {
             bucket: bucket.into(),
             key: key.into(),
@@ -305,7 +323,7 @@ impl Index {
             extents: pb_extents(extents),
             user_meta: pb_pairs(user_meta),
             checksums_json: checksums_json.into(),
-            mtime: Utc::now().to_rfc3339(),
+            mtime: mtime.into(),
         }))
         .await
     }
@@ -456,8 +474,8 @@ impl Index {
 
     /// Shallow copy of `src` (from [`Self::get_copy_source`]) to `dst`. The caller must
     /// `retain` the source extents' chunks **before** calling this, so the new object
-    /// never points at chunks it does not hold a ref on. Returns the destination row
-    /// and the previous destination chunk ids to `release`.
+    /// never points at chunks it does not hold a ref on. Returns the destination row as
+    /// written and the previous destination chunk ids to `release`.
     pub async fn copy_object(
         &self,
         src: &SourceSnapshot,
@@ -473,8 +491,9 @@ impl Index {
         } else {
             user_meta
         };
+        let mtime = Utc::now().to_rfc3339();
         let old = self
-            .put_object(
+            .put_object_at(
                 dst_bucket,
                 dst_key,
                 &src.etag,
@@ -483,13 +502,20 @@ impl Index {
                 &src.extents,
                 meta,
                 &src.checksums_json,
+                &mtime,
             )
             .await?;
 
-        let dst = self
-            .get_object(dst_bucket, dst_key)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("destination missing after copy"))?;
+        // The row as written, not re-read: a concurrent delete or overwrite of
+        // `dst` may already be applied after this put.
+        let dst = ObjectMeta {
+            bucket: dst_bucket.into(),
+            key: dst_key.into(),
+            etag: src.etag.clone(),
+            size: src.size,
+            content_type: ct.map(Into::into),
+            mtime,
+        };
         Ok((dst, old))
     }
 
