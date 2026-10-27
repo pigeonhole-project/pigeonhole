@@ -36,12 +36,13 @@ use serde::Serialize;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
+pub mod export;
 pub mod log;
 
 pub use log::{
@@ -227,6 +228,8 @@ pub struct MetaOptions {
     /// Take a snapshot (and collect the log behind it) after this many
     /// entries since the last one; 0 = never.
     pub snapshot_every: u64,
+    /// Also copy every snapshot into this directory (see [`export`]).
+    pub snapshot_export: Option<PathBuf>,
 }
 
 impl Default for MetaOptions {
@@ -235,6 +238,7 @@ impl Default for MetaOptions {
             batch_max_delay: Duration::ZERO,
             batch_max_entries: 1024,
             snapshot_every: 10_000,
+            snapshot_export: None,
         }
     }
 }
@@ -517,10 +521,14 @@ async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
         };
         let (stop, unanswered) = match result {
             Ok((first, applied)) => {
+                // Snapshot before answering: once `propose` returns, a snapshot
+                // (and export) due at this batch is in place. The batch is
+                // committed either way, so a fence here still answers Ok.
+                let stop = b.maybe_snapshot().await;
                 for (i, (p, outcome)) in batch.into_iter().zip(applied).enumerate() {
                     let _ = p.reply.send(Ok((first + i as u64, outcome)));
                 }
-                match b.maybe_snapshot().await {
+                match stop {
                     None => continue,
                     Some(stop) => (stop, Vec::new()),
                 }
@@ -549,9 +557,19 @@ impl Batcher {
             return None;
         }
         let data = take_snapshot(&self.states, position).encode();
+        let copy = self.opts.snapshot_export.clone().map(|dir| (dir, data.clone()));
         match self.log.install_snapshot(self.gen, position, Snapshot { data }).await {
             Ok(()) => {
                 self.snapshot_at = position;
+                if let Some((dir, data)) = copy {
+                    let written =
+                        tokio::task::spawn_blocking(move || export::write_export(&dir, position, &data)).await;
+                    match written {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(position, error = %e, "snapshot export failed"),
+                        Err(e) => tracing::warn!(position, error = %e, "snapshot export task failed"),
+                    }
+                }
                 None
             }
             Err(LogError::Fenced { current }) => Some(Stop::Fenced { current }),

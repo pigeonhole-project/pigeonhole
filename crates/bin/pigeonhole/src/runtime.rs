@@ -36,6 +36,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
         batch_max_delay: cfg.meta.batch_max_delay,
         batch_max_entries: cfg.meta.batch_max_entries,
         snapshot_every: cfg.meta.snapshot_every_entries,
+        snapshot_export: cfg.meta.snapshot_export.clone(),
     };
     let meta = MetaStore::open(log, namespaces, opts)
         .await

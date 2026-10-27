@@ -187,7 +187,7 @@ comments. Sections:
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
 | `[meta]` | Metadata tablet: `batch_max_delay_ms` / `batch_max_entries` (group commit) |
 | `[meta.log]` | Command log: `kind = "local"`, `path` (directory) |
-| `[meta.snapshot]` | `every_entries`: snapshot every state and drop the log behind it (`0` = never) |
+| `[meta.snapshot]` | `every_entries`: snapshot every state and drop the log behind it (`0` = never); `export`: also copy each snapshot into a directory |
 | `[chunk]` | `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Separate send / getFile / delete budgets, upload/download concurrency |

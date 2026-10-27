@@ -1,10 +1,13 @@
-//! Binary-only: offline maintenance subcommands (`purge`).
+//! Binary-only: offline maintenance subcommands (`purge`, `restore`).
 
 use crate::runtime::open_runtime;
 use anyhow::{bail, Context};
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
-use pigeonhole_chunk_store::Sweeper;
+use pigeonhole_chunk_store::{LogSettings, Sweeper};
+use pigeonhole_meta::{export, LocalLogStore, LogStore};
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Delete every upload, object and bucket, releasing their chunks. Backend
@@ -57,5 +60,33 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
         Err(e) => warn!(error = %e, "purge sweeper pass failed; background sweeper will retry"),
     }
     info!("purge complete: gateway index emptied, chunks released");
+    Ok(())
+}
+
+/// Start a new metadata log from the newest snapshot export (after losing the
+/// disk with the log). Lossy: everything after the export is gone.
+pub async fn cmd_restore(from: Option<PathBuf>, lossy: bool) -> anyhow::Result<()> {
+    let cfg = Config::load().context("load config")?;
+    let from = from
+        .or_else(|| cfg.meta.snapshot_export.clone())
+        .context("no export directory: pass --from-export DIR or set [meta.snapshot] export")?;
+    if !lossy {
+        bail!(
+            "restore from an export loses every change after it, and objects whose chunks were \
+             reclaimed since then read back broken; re-run with --lossy to accept"
+        );
+    }
+    let snapshot = export::newest_export(&from)?
+        .with_context(|| format!("no snapshot export in {}", from.display()))?;
+    let log: Arc<dyn LogStore> = match &cfg.meta.log {
+        LogSettings::Local { path } => Arc::new(LocalLogStore::open(path)?),
+    };
+    let position = snapshot.position;
+    export::seed_log(log.as_ref(), snapshot).await?;
+    warn!(
+        export = %from.display(),
+        position,
+        "metadata restored from a snapshot export; changes after it are lost"
+    );
     Ok(())
 }

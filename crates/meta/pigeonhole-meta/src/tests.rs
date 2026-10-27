@@ -97,7 +97,7 @@ async fn concurrent_proposals_get_distinct_positions() {
     let dir = tempfile::tempdir().unwrap();
     for delay in [Duration::ZERO, Duration::from_millis(20)] {
         let log = LocalLogStore::open(dir.path().join(format!("log-{}", delay.as_millis()))).unwrap();
-        let opts = MetaOptions { batch_max_delay: delay, batch_max_entries: 8, snapshot_every: 5 };
+        let opts = MetaOptions { batch_max_delay: delay, batch_max_entries: 8, snapshot_every: 5, snapshot_export: None };
         let store = MetaStore::open(Arc::new(log), counter(), opts).await.unwrap();
         let tasks: Vec<_> = (0..32)
             .map(|i| {
@@ -271,4 +271,33 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
 
     let err = MetaStore::open_local(&log_dir, counter()).await.err().expect("boot must fail");
     assert!(format!("{err:#}").contains("counter state in format 2, this binary reads 1"), "{err:#}");
+}
+
+#[tokio::test]
+async fn lossy_restore_from_an_export_starts_a_new_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log_dir, export_dir) = (dir.path().join("log"), dir.path().join("export"));
+    let opts = MetaOptions { snapshot_every: 10, snapshot_export: Some(export_dir.clone()), ..MetaOptions::default() };
+    let a = MetaStore::open(Arc::new(LocalLogStore::open(&log_dir).unwrap()), counter(), opts).await.unwrap();
+    for i in 0..45u64 {
+        a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    drop(a);
+    let exported: Vec<_> = std::fs::read_dir(&export_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(exported.len(), export::KEEP_EXPORTS, "older exports pruned: {exported:?}");
+
+    // The disk with the log is lost; only the export survives.
+    std::fs::remove_dir_all(&log_dir).unwrap();
+    let snap = export::newest_export(&export_dir).unwrap().expect("an export");
+    assert_eq!(snap.position, 40);
+    let log = LocalLogStore::open(&log_dir).unwrap();
+    export::seed_log(&log, snap.clone()).await.unwrap();
+    assert!(export::seed_log(&log, snap).await.is_err(), "only an empty log is seeded");
+
+    let b = open_on(dir.path()).await;
+    assert_eq!(value(&b), 40, "state as of the export; the last 5 ops are lost");
+    assert_eq!(b.applied_position(), 0, "the new log numbers from 0");
+    b.propose::<Counter>(op(1000, 1)).await.unwrap().unwrap();
+    drop(b);
+    assert_eq!(value(&*open_on(dir.path()).await), 41);
 }

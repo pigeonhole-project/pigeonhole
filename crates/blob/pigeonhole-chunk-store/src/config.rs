@@ -63,6 +63,8 @@ pub struct MetaSettings {
     pub batch_max_entries: usize,
     /// Snapshot (and collect the log behind it) every this many entries; 0 = never.
     pub snapshot_every_entries: u64,
+    /// Also copy every snapshot into this directory (for `pigeonhole restore`).
+    pub snapshot_export: Option<PathBuf>,
     pub log: LogSettings,
 }
 
@@ -362,11 +364,12 @@ struct FileMeta {
 #[serde(default, deny_unknown_fields)]
 struct FileMetaSnapshot {
     every_entries: u64,
+    export: Option<PathBuf>,
 }
 
 impl Default for FileMetaSnapshot {
     fn default() -> Self {
-        Self { every_entries: 10_000 }
+        Self { every_entries: 10_000, export: None }
     }
 }
 
@@ -399,6 +402,7 @@ impl FileMeta {
             batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
             batch_max_entries: self.batch_max_entries.max(1),
             snapshot_every_entries: self.snapshot.every_entries,
+            snapshot_export: self.snapshot.export,
             log: match self.log {
                 FileLog::Local { path } => LogSettings::Local { path },
             },
@@ -858,11 +862,12 @@ upload_concurrency = 4
     #[test]
     fn parses_meta_section() {
         let cfg = load(&format!(
-            "[meta]\nbatch_max_delay_ms = 250\n[meta.snapshot]\nevery_entries = 0\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
+            "[meta]\nbatch_max_delay_ms = 250\n[meta.snapshot]\nevery_entries = 0\nexport = \"/backup\"\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
         ))
         .unwrap();
         assert_eq!(cfg.meta.batch_max_delay, Duration::from_millis(250));
         assert_eq!(cfg.meta.snapshot_every_entries, 0);
+        assert_eq!(cfg.meta.snapshot_export, Some(PathBuf::from("/backup")));
         assert_eq!(cfg.meta.log, LogSettings::Local { path: "/var/log-dir".into() });
         for bad in ["[meta]\ndb_path = \"m.db\"\n", "[meta.log]\nkind = \"s3\"\n", "[meta.log]\nkind = \"local\"\nchat_id = 1\n"] {
             assert!(load(&format!("{bad}{MEM}")).is_err(), "{bad:?} accepted");

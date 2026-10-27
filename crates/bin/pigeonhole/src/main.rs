@@ -5,7 +5,7 @@ mod background;
 mod runtime;
 mod serve;
 
-use admin::cmd_purge;
+use admin::{cmd_purge, cmd_restore};
 use anyhow::{bail, Context};
 use serve::cmd_serve;
 use tracing::warn;
@@ -21,6 +21,23 @@ async fn main() -> anyhow::Result<()> {
 
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("restore") => {
+            let mut from = None;
+            let mut lossy = false;
+            let mut rest = args;
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--lossy" => lossy = true,
+                    "--from-export" => {
+                        from = Some(rest.next().context("--from-export requires a directory")?.into());
+                    }
+                    other => bail!(
+                        "unknown restore flag {other}; usage: pigeonhole restore [--from-export DIR] --lossy"
+                    ),
+                }
+            }
+            cmd_restore(from, lossy).await
+        }
         Some("purge") => {
             let mut yes = false;
             let mut expect_chat: Option<String> = None;
@@ -48,7 +65,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(other) => {
             bail!(
-                "unknown command {other:?}; usage: pigeonhole [purge --yes]"
+                "unknown command {other:?}; usage: pigeonhole \
+                 [purge --yes | restore [--from-export DIR] --lossy]"
             )
         }
         None => cmd_serve().await,
