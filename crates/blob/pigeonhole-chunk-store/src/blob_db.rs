@@ -901,16 +901,15 @@ mod tests {
         let new = commit(2).await;
         assert!(new > old, "chunk id {old} reused as {new}");
 
-        // Same after a restore: the high-water mark travels in the checkpoint.
+        // Same after the state is rebuilt from the log: the high-water mark is state.
         db.release(&[new]).await.unwrap();
         assert!(db.try_begin_reclaim(new).await.unwrap());
         db.delete_chunk_metadata(new).await.unwrap();
-        let cp = db.export_checkpoint().await.unwrap();
-        let url2 = format!("sqlite:{}?mode=rwc", dir.path().join("restored.db").display());
-        let restored = BlobDb::connect(&url2).await.unwrap();
-        restored.import_checkpoint(&cp).await.unwrap();
-        let after = restored.insert_chunk(8, 1).await.unwrap();
-        assert!(after > new, "chunk id {new} reused as {after} after restore");
+        let url2 = format!("sqlite:{}?mode=rwc", dir.path().join("replayed.db").display());
+        std::fs::rename(dir.path().join("blob.db.log"), dir.path().join("replayed.db.log")).unwrap();
+        let replayed = BlobDb::connect(&url2).await.unwrap();
+        let after = replayed.insert_chunk(8, 1).await.unwrap();
+        assert!(after > new, "chunk id {new} reused as {after} after replay");
     }
 
     #[tokio::test]

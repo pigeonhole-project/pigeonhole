@@ -18,10 +18,7 @@ pub use pigeonhole_storage_memory as memory;
 pub use pigeonhole_blob::{ChatLimiter, DeleteOutcome};
 pub use pigeonhole_storage_memory::{MemoryBackend, MemoryBlobStore};
 pub use pigeonhole_types::{BackendId, BackendLimits, BlobKey, RangeSupport};
-pub use pigeonhole_chunk_store::{
-    start_or_restore, BlobDb, ChunkStore, Config, Durability, IngestOptions,
-    Superblock,
-};
+pub use pigeonhole_chunk_store::{BlobDb, ChunkStore, Config, IngestOptions};
 #[cfg(feature = "discord")]
 pub use pigeonhole_storage_discord as discord;
 pub use pigeonhole_gateway_s3::{Index, S3Gateway};

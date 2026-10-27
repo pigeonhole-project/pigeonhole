@@ -1,11 +1,11 @@
 //! Stress: concurrent S3 put / copy / delete / get against an aggressive sweeper
-//! (grace = 0, no pause between passes) plus journal flush / checkpoint churn.
+//! (no pause between passes).
 //!
 //! Invariants checked (docs/sweep-invariants.md):
 //! - every object visible in the index reads back intact (no reclaimed live parts);
-//! - after quiescence, backend keys == committed live parts ∪ durability system keys
-//!   (garbage, including a dead writer's uncommitted uploads, is fully reclaimed);
-//! - a clean-disk restore from the pin still reads every object.
+//! - after quiescence, backend keys == committed live parts (garbage, including a
+//!   dead writer's uncommitted uploads, is fully reclaimed);
+//! - losing the SQLite files and replaying the metadata log reads every object.
 //!
 //! Known gap: a GET racing an overwrite/delete of the same key can fail or return a
 //! truncated body, because nothing pins chunks for the duration of a read and the
@@ -18,12 +18,11 @@ use http::{Extensions, HeaderMap, Method, Uri};
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, Durability, IngestOptions, Superblock};
+use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_blob::{
-    erase_sweep, BlobBackend, CheapestFirst, OrderedKey, Replicated,
-    SharedBackend, TypedBootstrapPointer,
+    erase_sweep, BlobBackend, CheapestFirst, OrderedKey, Replicated, SharedBackend,
 };
-use pigeonhole_chunk_store::{start_or_restore, PinTarget, SweepConfig, Sweeper, WatermarkBackend};
+use pigeonhole_chunk_store::{SweepConfig, Sweeper, WatermarkBackend};
 use s3s::dto::*;
 use s3s::{S3ErrorCode, S3Request, S3};
 use std::collections::{BTreeSet, HashMap};
@@ -114,7 +113,6 @@ fn key(i: u64) -> String {
 struct Node {
     s3: pigeonhole::S3Gateway,
     store: Arc<ChunkStore>,
-    dur: Arc<Durability>,
     backend: SharedBackend,
     instance_id: String,
 }
@@ -132,7 +130,6 @@ async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
     opts.block_size = cfg.block_size;
 
     let info = mem.instance().clone();
-    let pin: Arc<dyn TypedBootstrapPointer> = mem.clone();
     // Same wiring as the binary: watermark every put; grace 0 = only InflightParts
     // and per-batch liveness protect fresh parts.
     let backend =
@@ -140,27 +137,11 @@ async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
     let rep = Arc::new(
         Replicated::new(vec![backend.clone()], 1, Arc::new(CheapestFirst::new())).unwrap(),
     );
-    let store = Arc::new(
-        ChunkStore::open_replicated(db, rep.clone(), opts)
-            .await
-            .unwrap(),
-    );
-    let genesis = Superblock::new(0, info.id.clone(), info.fingerprint.clone());
-    let pins = vec![PinTarget {
-        instance_id: info.id.clone(),
-        fingerprint: info.fingerprint.clone(),
-        pin,
-        backend: backend.clone(),
-    }];
-    let dur = Arc::new(Durability::new_replicated(rep, pins, genesis));
-    start_or_restore(store.db(), dur.as_ref(), &info.fingerprint, false)
-        .await
-        .unwrap();
+    let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
     let s3 = build_s3_gateway(cfg, index, store.clone());
     Node {
         s3,
         store,
-        dur,
         backend,
         instance_id: info.id,
     }
@@ -169,7 +150,6 @@ async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
 fn sweeper(node: &Node) -> Sweeper {
     Sweeper::with_inflight(
         node.store.db().clone(),
-        node.dur.clone(),
         vec![node.backend.clone()],
         SweepConfig {
             grace: SWEEP_GRACE,
@@ -320,16 +300,13 @@ async fn backend_keys(mem: &MemoryBlobStore) -> BTreeSet<Vec<u8>> {
 }
 
 async fn expected_keys(node: &Node) -> BTreeSet<Vec<u8>> {
-    let mut keys: BTreeSet<Vec<u8>> = node
-        .store
+    node.store
         .db()
         .live_part_keys(&node.instance_id)
         .await
         .unwrap()
         .into_iter()
-        .collect();
-    keys.extend(node.dur.system_keys(&node.instance_id).await.unwrap());
-    keys
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -367,20 +344,6 @@ async fn concurrent_ops_with_aggressive_sweeper() {
             }
         })
     };
-    let durability_task = {
-        let (dur, store, stop) = (node.dur.clone(), node.store.clone(), stop.clone());
-        tokio::spawn(async move {
-            let mut n = 0u64;
-            while !stop.load(Ordering::Relaxed) {
-                dur.flush_journal().await.expect("journal flush");
-                if n.is_multiple_of(5) {
-                    dur.checkpoint(store.db()).await.expect("checkpoint");
-                }
-                n += 1;
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-    };
 
     let s3 = Arc::new(node.s3);
     let counters = Arc::new(Counters::default());
@@ -394,7 +357,6 @@ async fn concurrent_ops_with_aggressive_sweeper() {
 
     stop.store(true, Ordering::Relaxed);
     sweep_task.await.unwrap();
-    durability_task.await.unwrap();
 
     eprintln!(
         "puts={} copies={} copies_src_missing={} deletes={} gets={} racy_get_failures={} \
@@ -415,9 +377,7 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     let node = Node { s3, ..node };
     let live = verify_all(&node.s3, "after stress").await;
 
-    // Quiesce: persist everything, then sweep until stable.
-    node.dur.flush_journal().await.unwrap();
-    node.dur.checkpoint(node.store.db()).await.unwrap();
+    // Quiesce: sweep until stable.
     // Let the newest puts age past the sweep grace so they become candidates.
     tokio::time::sleep(SWEEP_GRACE * 3).await;
     let sw = sweeper(&node);

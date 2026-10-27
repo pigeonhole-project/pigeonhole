@@ -11,7 +11,6 @@ use pigeonhole::gateway_metrics::track_gateway;
 use pigeonhole::http_timeout::with_http_timeouts;
 use pigeonhole::index::Index;
 use pigeonhole::{build_s3_gateway, build_s3_service};
-use pigeonhole_chunk_store::start_or_restore;
 use s3s::{Body, HttpError};
 use std::time::Duration;
 use tracing::info;
@@ -25,14 +24,6 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     let index = Index::open(rt.meta.clone())
         .await
         .context("open s3 index")?;
-    start_or_restore(
-        rt.store.db(),
-        rt.durability.as_ref(),
-        &rt.primary_fingerprint,
-        false,
-    )
-    .await
-    .context("start_or_restore")?;
 
     let s3_gateway = build_s3_gateway(cfg.clone(), index.clone(), rt.store.clone());
     spawn_background_tasks(&cfg, &rt);

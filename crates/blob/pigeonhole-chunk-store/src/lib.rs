@@ -1,9 +1,8 @@
-//! Ingest, snapshot push/restore, and shared runtime config.
+//! Chunk store: metadata namespace, ingest, sweep, repair, and shared runtime config.
 
 pub mod blob_db;
 mod commands;
 pub mod config;
-pub mod durability;
 pub mod block_cache;
 pub mod ingest;
 pub mod instances;
@@ -15,10 +14,6 @@ pub use blob_db::{is_chunk_gone, BlobDb, ChunkGone, StoredBlock};
 pub use config::{
     BytestreamSettings, Config, HttpSettings, LogSettings, MetaSettings, MetricsSettings,
     PlacementConfig,
-};
-pub use durability::{
-    commit_root, start_or_restore, CheckpointPayload, Durability, JournalOp, PinTarget,
-    Superblock,
 };
 pub use layer::{
     check_block_fits_members, default_layer_opts, ChunkId, ChunkStore, Extent, Ingested,

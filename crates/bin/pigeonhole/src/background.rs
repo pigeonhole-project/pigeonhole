@@ -1,48 +1,14 @@
-//! Binary-only: long-running tasks spawned by `serve` (durability, sweep, repair).
+//! Binary-only: long-running tasks spawned by `serve` (sweep, repair).
 
 use crate::runtime::Runtime;
 use pigeonhole::config::Config;
-use pigeonhole_blob::{set_checkpoint_age, set_superblock_age};
 use pigeonhole_chunk_store::{Repairer, Sweeper};
-use std::time::Duration;
-use tracing::{info, warn};
-
-const JOURNAL_FLUSH_SECS: u64 = 5;
-const DEFAULT_CHECKPOINT_SECS: u64 = 300;
+use tracing::info;
 
 pub fn spawn_background_tasks(cfg: &Config, rt: &Runtime) {
-    let dur = rt.durability.clone();
-    tokio::spawn(async move {
-        let period = Duration::from_secs(JOURNAL_FLUSH_SECS);
-        loop {
-            tokio::time::sleep(period).await;
-            if let Err(e) = dur.flush_journal().await {
-                warn!(error = %e, "journal flush failed");
-            }
-        }
-    });
-
-    let checkpoint_secs = if cfg.snapshot_interval_secs > 0 {
-        cfg.snapshot_interval_secs.max(60)
-    } else {
-        DEFAULT_CHECKPOINT_SECS
-    };
-    let dur = rt.durability.clone();
-    let store = rt.store.clone();
-    tokio::spawn(async move {
-        let period = Duration::from_secs(checkpoint_secs);
-        loop {
-            tokio::time::sleep(period).await;
-            if let Err(e) = dur.checkpoint(store.db()).await {
-                warn!(error = %e, "blob.db checkpoint failed");
-            }
-        }
-    });
-
     let members: Vec<_> = rt.store.replicated().members().to_vec();
     let sweeper = Sweeper::with_inflight(
         rt.store.db().clone(),
-        rt.durability.clone(),
         members,
         cfg.sweep.clone(),
         rt.store.replicated().inflight().clone(),
@@ -70,20 +36,4 @@ pub fn spawn_background_tasks(cfg: &Config, rt: &Runtime) {
         scrub = cfg.repair.scrub,
         "repair background task started"
     );
-
-    if cfg.metrics.enabled {
-        let dur = rt.durability.clone();
-        tokio::spawn(async move {
-            let period = Duration::from_secs(15);
-            loop {
-                tokio::time::sleep(period).await;
-                if let Some(age) = dur.superblock_age().await {
-                    set_superblock_age(age);
-                }
-                if let Some(age) = dur.checkpoint_age().await {
-                    set_checkpoint_age(age);
-                }
-            }
-        });
-    }
 }

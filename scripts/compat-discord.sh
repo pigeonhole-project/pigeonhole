@@ -95,7 +95,6 @@ CONFIG_OUT="$CFG" \
   CONFIG_SCOPE_ID="$DISCORD_CHANNEL_ID" \
   CONFIG_LISTEN_ADDR="$LISTEN_ADDR" \
   CONFIG_META_DB="$ROOT/.cache/pigeonhole-discord.db" \
-  CONFIG_SNAPSHOT_SECS=0 \
   "$ROOT/scripts/gen-config.sh"
 export PIGEONHOLE_CONFIG="$CFG"
 export DISCORD_BOT_TOKEN

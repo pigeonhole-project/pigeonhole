@@ -31,7 +31,6 @@ pub struct Config {
     pub access_key: String,
     pub secret_key: String,
     pub region: String,
-    pub snapshot_interval_secs: u64,
     /// Max on-wire chunk size in bytes (`< 20 MiB`).
     pub chunk_size: usize,
     pub chunk_codec: ChunkCodec,
@@ -221,7 +220,6 @@ impl Config {
             access_key,
             secret_key,
             region: file.region,
-            snapshot_interval_secs: file.snapshot.interval_secs,
             chunk_size,
             chunk_codec,
             block_size,
@@ -247,7 +245,6 @@ impl Config {
             access_key: "pigeonhole".into(),
             secret_key: "pigeonholesecret".into(),
             region: "us-east-1".into(),
-            snapshot_interval_secs: 0,
             chunk_size: chunker::DEFAULT_CHUNK_SIZE,
             chunk_codec: ChunkCodec::Zstd,
             block_size: chunker::DEFAULT_BLOCK_SIZE,
@@ -315,7 +312,6 @@ struct FileConfig {
     listen_addr: String,
     region: String,
     meta: FileMeta,
-    snapshot: FileSnapshot,
     chunk: FileChunk,
     #[serde(default)]
     ingest: FileIngest,
@@ -344,7 +340,6 @@ impl Default for FileConfig {
             listen_addr: "0.0.0.0:8333".into(),
             region: "us-east-1".into(),
             meta: FileMeta::default(),
-            snapshot: FileSnapshot::default(),
             chunk: FileChunk::default(),
             ingest: FileIngest::default(),
             telegram: FileTelegram::default(),
@@ -722,20 +717,6 @@ impl FileCache {
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct FileSnapshot {
-    interval_secs: u64,
-}
-
-impl Default for FileSnapshot {
-    fn default() -> Self {
-        Self {
-            interval_secs: 300,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
 struct FileChunk {
     size: usize,
     codec: ChunkCodec,
@@ -845,8 +826,6 @@ kind = "memory"
         let cfg = load(&format!(
             r#"
 listen_addr = "127.0.0.1:9"
-[snapshot]
-interval_secs = 0
 [chunk]
 size = 1024
 codec = "raw"

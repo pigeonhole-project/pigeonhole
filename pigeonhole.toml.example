@@ -47,10 +47,6 @@ role = "read-write"   # read-write | read-only | retired
 # group = ["tg-main", "dc-backup"]
 # write_quorum = 1
 
-[snapshot]
-# Seconds between automatic index snapshots. 0 disables.
-interval_secs = 300
-
 [chunk]
 # Max on-wire chunk size in bytes (Telegram getFile < 20 MiB). Default 19 MiB.
 # Max on-wire document size. With codec zstd/gzip, independent 1 MiB blocks are

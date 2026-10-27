@@ -1,12 +1,10 @@
-//! Binary-only: offline maintenance subcommands (`restore`, `purge`).
+//! Binary-only: offline maintenance subcommands (`purge`).
 
 use crate::runtime::open_runtime;
 use anyhow::{bail, Context};
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
-use pigeonhole_chunk_store::{
-    start_or_restore, JournalOp, Sweeper,
-};
+use pigeonhole_chunk_store::Sweeper;
 use tracing::{info, warn};
 
 /// Release all roots, delete every upload, object and bucket (releasing their
@@ -52,19 +50,6 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
             rt.store.release(&ids).await.with_context(|| format!("release root {name}"))?;
         }
         rt.store.db().delete_root(name).await?;
-        rt.durability
-            .enqueue(JournalOp::SetRoot {
-                name: name.clone(),
-                extents: vec![],
-            })
-            .await;
-    }
-    if let Err(e) = rt.durability.flush_journal().await {
-        warn!(error = %e, "purge journal flush failed");
-    }
-    // Attempt a checkpoint so pins reflect cleared roots (best-effort).
-    if let Err(e) = rt.durability.checkpoint(rt.store.db()).await {
-        warn!(error = %e, "purge checkpoint failed");
     }
 
     let released = index.delete_everything().await.context("delete gateway index")?;
@@ -73,12 +58,7 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
     // Immediate reclaim pass (background sweeper uses the same path; grace still applies).
     let members: Vec<_> = rt.store.replicated().members().to_vec();
     // Purge reclaim pass; grace still protects in-flight puts.
-    let sweeper = Sweeper::new(
-        rt.store.db().clone(),
-        rt.durability.clone(),
-        members,
-        cfg.sweep.clone(),
-    );
+    let sweeper = Sweeper::new(rt.store.db().clone(), members, cfg.sweep.clone());
     match sweeper.sweep_once().await {
         Ok(stats) => info!(
             zero_ref_chunks = stats.zero_ref_chunks,
@@ -88,22 +68,5 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
         Err(e) => warn!(error = %e, "purge sweeper pass failed; background sweeper will retry"),
     }
     info!("purge complete: roots released, gateway index wiped");
-    Ok(())
-}
-
-/// Restore chunk metadata from superblock pins. The gateway index is rebuilt
-/// from the metadata log on every boot and has no separate snapshot.
-pub async fn cmd_restore(force: bool) -> anyhow::Result<()> {
-    let cfg = Config::load().context("load config")?;
-    let rt = open_runtime(&cfg).await.context("open runtime")?;
-    start_or_restore(
-        rt.store.db(),
-        rt.durability.as_ref(),
-        &rt.primary_fingerprint,
-        force,
-    )
-    .await
-    .context("restore from superblocks")?;
-    info!("chunk metadata restored from superblock pins");
     Ok(())
 }

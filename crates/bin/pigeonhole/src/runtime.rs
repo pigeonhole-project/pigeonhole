@@ -1,4 +1,4 @@
-//! Binary-only: boot the metadata tablet, build the placement group, and wire `ChunkStore` + `Durability`.
+//! Binary-only: boot the metadata tablet, build the placement group, and wire the `ChunkStore`.
 
 use anyhow::{bail, Context};
 use pigeonhole::config::Config;
@@ -6,11 +6,10 @@ use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::telegram::{TelegramBlobStore, TelegramClient};
 use pigeonhole_blob::{
     erase_sweep, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
-    TypedBootstrapPointer,
 };
 use pigeonhole_chunk_store::{
-    check_fingerprints, BlockCache, BlobDb, LogSettings,
-    ChunkStore, Durability, IngestOptions, PinTarget, Superblock, WatermarkBackend,
+    check_fingerprints, BlockCache, BlobDb, ChunkStore, IngestOptions, LogSettings,
+    WatermarkBackend,
 };
 use pigeonhole::index::Index;
 use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
@@ -21,8 +20,6 @@ pub struct Runtime {
     /// The one metadata store every layer registers its namespace on.
     pub meta: Arc<MetaStore>,
     pub store: Arc<ChunkStore>,
-    pub durability: Arc<Durability>,
-    pub primary_fingerprint: String,
 }
 
 pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
@@ -53,36 +50,25 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
         .context("list instance fingerprints")?;
     check_fingerprints(&cfg.instances, &stored).context("fingerprint check")?;
 
-    let (replicated, pins, primary_fingerprint, primary_id) =
-        build_placement(cfg, &blob_db).await.context("build placement group")?;
+    let replicated = build_placement(cfg, &blob_db).await.context("build placement group")?;
 
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
     opts.memory_budget = cfg.ingest_budget.clone();
 
-    let layer = ChunkStore::open_replicated(blob_db, replicated.clone(), opts)
+    let layer = ChunkStore::open_replicated(blob_db, replicated, opts)
         .await
         .context("open ChunkStore")?;
     let store = Arc::new(with_optional_caches(layer, cfg));
-
-    let genesis = Superblock::new(0, primary_id, primary_fingerprint.clone());
-    let durability = Arc::new(Durability::new_replicated(replicated, pins, genesis));
-
-    Ok(Runtime {
-        meta,
-        store,
-        durability,
-        primary_fingerprint,
-    })
+    Ok(Runtime { meta, store })
 }
 
 async fn build_placement(
     cfg: &Config,
     blob_db: &BlobDb,
-) -> anyhow::Result<(Arc<Replicated>, Vec<PinTarget>, String, String)> {
+) -> anyhow::Result<Arc<Replicated>> {
     let limiter = cfg.chat_limiter();
     let mut members: Vec<SharedBackend> = Vec::new();
-    let mut pins: Vec<PinTarget> = Vec::new();
     let grace = cfg.sweep.grace;
 
     for id in &cfg.placement.group {
@@ -94,22 +80,15 @@ async fn build_placement(
 
         match inst.info.kind {
             InstanceKind::Memory => {
-                warn!("memory instance {id}: in-process MemoryBlobStore (no durable pin across processes)");
+                warn!("memory instance {id}: in-process MemoryBlobStore (data does not survive the process)");
                 let mem = Arc::new(
                     MemoryBlobStore::new().with_instance_info(inst.info.clone()),
                 );
-                let pin: Arc<dyn TypedBootstrapPointer> = mem.clone();
                 let backend = MetricsBackend::wrap(WatermarkBackend::wrap(
                     Arc::new(erase_sweep(mem)),
                     blob_db.clone(),
                     grace,
                 ));
-                pins.push(PinTarget {
-                    instance_id: inst.info.id.clone(),
-                    fingerprint: inst.info.fingerprint.clone(),
-                    pin,
-                    backend: backend.clone(),
-                });
                 members.push(backend);
             }
             InstanceKind::Telegram => {
@@ -123,18 +102,11 @@ async fn build_placement(
                     limiter.clone(),
                     inst.info.clone(),
                 ));
-                let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
                 let backend = MetricsBackend::wrap(WatermarkBackend::wrap(
                     Arc::new(erase_sweep(store)),
                     blob_db.clone(),
                     grace,
                 ));
-                pins.push(PinTarget {
-                    instance_id: inst.info.id.clone(),
-                    fingerprint: inst.info.fingerprint.clone(),
-                    pin,
-                    backend: backend.clone(),
-                });
                 members.push(backend);
             }
             InstanceKind::Discord => {
@@ -152,18 +124,11 @@ async fn build_placement(
                         inst.max_blob_size,
                         inst.info.clone(),
                     ));
-                    let pin: Arc<dyn TypedBootstrapPointer> = store.clone();
                     let backend = MetricsBackend::wrap(WatermarkBackend::wrap(
                         Arc::new(erase_sweep(store)),
                         blob_db.clone(),
                         grace,
                     ));
-                    pins.push(PinTarget {
-                        instance_id: inst.info.id.clone(),
-                        fingerprint: inst.info.fingerprint.clone(),
-                        pin,
-                        backend: backend.clone(),
-                    });
                     members.push(backend);
                 }
                 #[cfg(not(feature = "discord"))]
@@ -179,21 +144,13 @@ async fn build_placement(
     if members.is_empty() {
         bail!("placement.group produced no backends");
     }
-    let replicated = Arc::new(
-        Replicated::new(
-            members,
-            cfg.placement.write_quorum,
-            Arc::new(CheapestFirst::new()),
-        )
-        .context("Replicated::new")?,
-    );
-    let primary = cfg.primary_instance()?;
-    Ok((
-        replicated,
-        pins,
-        primary.info.fingerprint.clone(),
-        primary.info.id.clone(),
-    ))
+    let replicated = Replicated::new(
+        members,
+        cfg.placement.write_quorum,
+        Arc::new(CheapestFirst::new()),
+    )
+    .context("Replicated::new")?;
+    Ok(Arc::new(replicated))
 }
 
 fn with_optional_caches(layer: ChunkStore, cfg: &Config) -> ChunkStore {

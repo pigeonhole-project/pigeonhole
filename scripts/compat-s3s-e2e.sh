@@ -88,7 +88,6 @@ CONFIG_OUT="$CFG" \
   CONFIG_INSTANCE=memory \
   CONFIG_LISTEN_ADDR="127.0.0.1:${PORT}" \
   CONFIG_META_DB="${DB}" \
-  CONFIG_SNAPSHOT_SECS=0 \
   "$ROOT/scripts/gen-config.sh"
 export PIGEONHOLE_CONFIG="$CFG"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-pigeonhole}"

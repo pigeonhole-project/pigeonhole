@@ -29,11 +29,12 @@ source's chunks instead of re-sending bytes (there is no content dedup).
 A chunk can have **replicas** on several **instances** (bot + chat/channel,
 Telegram and/or Discord). A background repair task re-replicates
 under-replicated chunks; a sweeper deletes unreferenced backend messages.
-Metadata lives in local SQLite and is continuously made durable back into the
-backend, so a clean machine can recover everything from a pinned message.
+Metadata is a log of commands (a tablet, see
+[docs/meta-backends.md](docs/meta-backends.md)); the state is rebuilt from the
+log on every boot.
 
 Architecture terms: [docs/glossary.md](docs/glossary.md) (Instance, Blob, Block,
-Chunk, Replica, Extent, Root, Superblock). GC rules:
+Chunk, Replica, Extent, Root, Tablet, LogStore). GC rules:
 [docs/sweep-invariants.md](docs/sweep-invariants.md).
 
 ## Layout
@@ -186,7 +187,6 @@ comments. Sections:
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
 | `[meta]` | Metadata tablet: `db_path` (SQLite state shared by all layers, tables prefixed `chunk_` / `s3_` / `cas_`), `batch_max_delay_ms` / `batch_max_entries` (group commit) |
 | `[meta.log]` | Command log: `kind = "local"`, `path` (directory) |
-| `[snapshot]` | `interval_secs`: S3 index snapshot / checkpoint period (`0` disables snapshots) |
 | `[chunk]` | `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Separate send / getFile / delete budgets, upload/download concurrency |
@@ -203,39 +203,15 @@ half-applied.
 ## Durability and restore
 
 Every metadata change is a layer command. `pigeonhole-meta` appends it to the
-command log (`[meta.log]`, fsynced per batch) and then applies it to the SQLite
-file (`[meta].db_path`); the log is the source of truth and the file is rebuilt
-from it on boot (see [docs/meta-backends.md](docs/meta-backends.md)). The local
-log sits on the same disk, so it does not survive disk loss yet; until log
-snapshots replace them, two copies are still pushed into the blob backend:
+command log (`[meta.log]`, fsynced per batch) and then applies it; the log is
+the source of truth and every boot rebuilds the state by replaying it (see
+[docs/meta-backends.md](docs/meta-backends.md)). Losing the SQLite file
+(`[meta].db_path`) loses nothing.
 
-- **Chunk metadata** (chunks, parts, refcounts, roots) — a full checkpoint every
-  `[snapshot].interval_secs` (min 60 s; 300 s when snapshots are off). A journal
-  flushed every 5 s records only root changes.
-- **S3 index** (buckets, keys, object metadata → extent lists) — exported as a
-  gzip snapshot stored as an ordinary chunk-store object and published as the
-  `s3/index` root every `[snapshot].interval_secs` (only when it changed).
-
-Each instance has a pinned **superblock** message (generation, checkpoint and
-journal locations, roots); that pin is the bootstrap pointer, so no `file_id`s
-need to be remembered after disk loss. Publishing is fenced by generation so a
-stale writer cannot overwrite a newer superblock.
-
-**RPO after losing the disk:** ≈ `[snapshot].interval_secs` for both. Known gap:
-a root journaled after the last checkpoint can point at a chunk the checkpoint
-does not have, and chunks committed after it are lost — the redesign replaces
-this mechanism.
-
-Restore on a stopped server / clean machine (tokens in `.env`, instances in TOML):
-
-```bash
-# refuses a non-empty index unless --force
-cargo run --release -- restore
-```
-
-`restore` rebuilds chunk metadata and the S3 index. Normal startup only restores
-chunk metadata automatically (when it is empty and a superblock is pinned); the
-S3 index needs an explicit `restore`.
+**Losing the disk loses the metadata.** The only LogStore so far is `local`, on
+the same disk; nothing is pushed into the blob backend any more (the old
+checkpoint / superblock pins are gone). Snapshot export and an off-host
+(Telegram) log are the next steps in [docs/roadmap.md](docs/roadmap.md).
 
 Delete every backend message tracked by the local index (server must be stopped):
 

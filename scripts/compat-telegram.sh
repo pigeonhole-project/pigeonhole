@@ -2,7 +2,7 @@
 # Purge the real Telegram backend + run the full client suite against it once.
 #
 # Unlike compat-memory / compat-s3s-* / compat-rclone, this uses TelegramBlobStore
-# (requires BOT_TOKEN + CHAT_ID in .env). Snapshots are disabled for the run.
+# (requires BOT_TOKEN + CHAT_ID in .env).
 #
 # Steps:
 #   1. cargo test
@@ -109,7 +109,6 @@ CONFIG_OUT="$CFG" \
   CONFIG_SCOPE_ID="$CHAT_ID" \
   CONFIG_LISTEN_ADDR="$LISTEN_ADDR" \
   CONFIG_META_DB="$META_DB" \
-  CONFIG_SNAPSHOT_SECS=0 \
   "$ROOT/scripts/gen-config.sh"
 export PIGEONHOLE_CONFIG="$CFG"
 

@@ -5,7 +5,7 @@ mod background;
 mod runtime;
 mod serve;
 
-use admin::{cmd_purge, cmd_restore};
+use admin::cmd_purge;
 use anyhow::{bail, Context};
 use serve::cmd_serve;
 use tracing::warn;
@@ -21,20 +21,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("restore") => {
-            let mut force = false;
-            for a in args {
-                match a.as_str() {
-                    "--force" | "--yes" => force = true,
-                    other => {
-                        bail!(
-                            "unknown restore flag {other}; usage: pigeonhole restore [--force]"
-                        )
-                    }
-                }
-            }
-            cmd_restore(force).await
-        }
         Some("purge") => {
             let mut yes = false;
             let mut expect_chat: Option<String> = None;
@@ -62,8 +48,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(other) => {
             bail!(
-                "unknown command {other:?}; usage: pigeonhole \
-                 [restore [--force] | purge --yes]"
+                "unknown command {other:?}; usage: pigeonhole [purge --yes]"
             )
         }
         None => cmd_serve().await,

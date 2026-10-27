@@ -66,14 +66,6 @@ pub fn describe_metrics() {
         "pigeonhole_repair_queue_depth",
         "Pending repair queue depth"
     );
-    metrics::describe_gauge!(
-        "pigeonhole_superblock_age_seconds",
-        "Seconds since last superblock publish"
-    );
-    metrics::describe_gauge!(
-        "pigeonhole_checkpoint_age_seconds",
-        "Seconds since last blob.db checkpoint"
-    );
     metrics::describe_counter!(
         "pigeonhole_replica_selected_total",
         "Replica instances chosen for reads"
@@ -238,14 +230,6 @@ pub fn record_repair(outcome: &str, n: u64) {
 
 pub fn set_repair_queue_depth(n: u64) {
     metrics::gauge!("pigeonhole_repair_queue_depth").set(n as f64);
-}
-
-pub fn set_superblock_age(d: Duration) {
-    metrics::gauge!("pigeonhole_superblock_age_seconds").set(d.as_secs_f64());
-}
-
-pub fn set_checkpoint_age(d: Duration) {
-    metrics::gauge!("pigeonhole_checkpoint_age_seconds").set(d.as_secs_f64());
 }
 
 pub fn record_replica_selected(instance: &str) {

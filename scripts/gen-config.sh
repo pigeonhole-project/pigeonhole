@@ -10,7 +10,6 @@
 #   CONFIG_META_DB       metadata SQLite file (default pigeonhole-meta.db)
 #   CONFIG_META_LOG      local command log directory (default <CONFIG_META_DB>.log)
 #   CONFIG_REGION        default us-east-1
-#   CONFIG_SNAPSHOT_SECS default 0 for memory, 300 otherwise
 #   CONFIG_CHUNK_SIZE    default 19922944
 #   CONFIG_CHUNK_CODEC   default zstd
 
@@ -29,13 +28,11 @@ EXTRA_BG=""
 
 case "$INSTANCE" in
   memory)
-    SNAPSHOT_SECS="${CONFIG_SNAPSHOT_SECS:-0}"
     INSTANCE_BLOCK=$'[[instances]]\nid = "mem"\nkind = "memory"'
     # MemoryBlobStore is process-local; quiet background tasks under heavy suites.
     EXTRA_BG=$'\n[repair]\nscrub = false\ninterval_secs = 3600\n\n[sweep]\ninterval_secs = 3600\n'
     ;;
   telegram)
-    SNAPSHOT_SECS="${CONFIG_SNAPSHOT_SECS:-300}"
     : "${CONFIG_SCOPE_ID:?CONFIG_SCOPE_ID (chat id) required for telegram}"
     INSTANCE_BLOCK="[[instances]]
 id = \"tg\"
@@ -43,7 +40,6 @@ kind = \"telegram\"
 chat_id = ${CONFIG_SCOPE_ID}"
     ;;
   discord)
-    SNAPSHOT_SECS="${CONFIG_SNAPSHOT_SECS:-300}"
     : "${CONFIG_SCOPE_ID:?CONFIG_SCOPE_ID (channel id) required for discord}"
     INSTANCE_BLOCK="[[instances]]
 id = \"dc\"
@@ -70,9 +66,6 @@ kind = "local"
 path = "${META_LOG}"
 
 ${INSTANCE_BLOCK}
-
-[snapshot]
-interval_secs = ${SNAPSHOT_SECS}
 
 [chunk]
 size = ${CHUNK_SIZE}
