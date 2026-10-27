@@ -1,16 +1,16 @@
-//! The S3 namespace of the metadata state machine.
+//! The S3 namespace of the metadata tablet.
 //!
-//! [`S3Namespace::apply`] is the only code that writes buckets, objects and
-//! multipart uploads. It must stay deterministic: timestamps and upload ids
-//! come in the command (chosen by [`crate::index::Index`]).
+//! [`S3State`] holds buckets, objects and multipart uploads in memory;
+//! [`S3State::apply`] is the only code that changes them. It must stay
+//! deterministic: timestamps and upload ids come in the command (chosen by
+//! [`crate::index::Index`]). Every check runs before the first mutation, so a
+//! rejected command leaves the state untouched.
 
-use crate::index::SCHEMA;
-use anyhow::{Context, Result};
-use async_trait::async_trait;
+use anyhow::{bail, Context, Result};
 use pigeonhole_chunk_store::{ChunkId, Extent};
-use pigeonhole_meta::{Applied, Namespace};
+use pigeonhole_meta::{Applied, StateMachine};
 use prost::Message;
-use sqlx::SqliteConnection;
+use std::collections::BTreeMap;
 
 pub(crate) mod pb {
     include!(concat!(env!("OUT_DIR"), "/pigeonhole.s3.v1.rs"));
@@ -20,383 +20,356 @@ use pb::rejection::Reason;
 
 pub(crate) const NAMESPACE: &str = "s3";
 
-pub(crate) struct S3Namespace;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BucketRec {
+    pub created_at: String,
+    pub scope_id: String,
+}
 
-#[async_trait]
-impl Namespace for S3Namespace {
-    fn name(&self) -> &'static str {
-        NAMESPACE
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectRec {
+    pub etag: String,
+    pub size: i64,
+    pub content_type: Option<String>,
+    pub mtime: String,
+    pub checksums_json: String,
+    pub extents: Vec<Extent>,
+    /// Name → value, ordered by name.
+    pub user_meta: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+}
 
-    async fn init(&self, conn: &mut SqliteConnection) -> Result<()> {
-        for ddl in SCHEMA {
-            sqlx::query(ddl).execute(&mut *conn).await?;
-        }
-        Ok(())
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UploadRec {
+    pub bucket: String,
+    pub key: String,
+    pub content_type: Option<String>,
+    pub user_meta: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub checksum_algorithm: Option<String>,
+    pub initiated_at: String,
+    pub parts: BTreeMap<i64, PartRec>,
+}
 
-    async fn apply(&self, conn: &mut SqliteConnection, command: &[u8]) -> Result<Applied> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PartRec {
+    pub etag: String,
+    pub size: i64,
+    pub extents: Vec<Extent>,
+}
+
+/// Buckets, objects (by `(bucket, key)`, byte order) and uploads (by id).
+#[derive(Debug, Default)]
+pub struct S3State {
+    pub(crate) buckets: BTreeMap<String, BucketRec>,
+    pub(crate) objects: BTreeMap<(String, String), ObjectRec>,
+    pub(crate) uploads: BTreeMap<String, UploadRec>,
+}
+
+impl StateMachine for S3State {
+    const NAME: &'static str = NAMESPACE;
+
+    fn apply(&mut self, command: &[u8]) -> Result<Applied> {
         use pb::command::Op;
         let cmd = pb::Command::decode(command).context("decode s3 command")?;
         match cmd.op.context("empty s3 command")? {
-            Op::CreateBucket(c) => create_bucket(conn, c).await,
-            Op::DeleteBucket(c) => delete_bucket(conn, &c.name).await,
-            Op::PutObject(c) => put_object(conn, c).await,
-            Op::DeleteObject(c) => delete_object(conn, &c.bucket, &c.key).await,
-            Op::PutObjectTags(c) => put_tags(conn, &c.bucket, &c.key, &c.tags).await,
-            Op::DeleteObjectTags(c) => put_tags(conn, &c.bucket, &c.key, &[]).await,
-            Op::CreateUpload(c) => create_upload(conn, c).await,
-            Op::PutPart(c) => put_part(conn, c).await,
-            Op::CompleteUpload(c) => complete_upload(conn, c).await,
-            Op::AbortUpload(c) => abort_upload(conn, &c.upload_id).await,
+            Op::CreateBucket(c) => Ok(self.create_bucket(c)),
+            Op::DeleteBucket(c) => Ok(self.delete_bucket(&c.name)),
+            Op::PutObject(c) => Ok(self.put_object(c)),
+            Op::DeleteObject(c) => Ok(self.delete_object(c.bucket, c.key)),
+            Op::PutObjectTags(c) => Ok(self.put_tags(c.bucket, c.key, c.tags)),
+            Op::DeleteObjectTags(c) => Ok(self.put_tags(c.bucket, c.key, Vec::new())),
+            Op::CreateUpload(c) => self.create_upload(c),
+            Op::PutPart(c) => Ok(self.put_part(c)),
+            Op::CompleteUpload(c) => Ok(self.complete_upload(c)),
+            Op::AbortUpload(c) => Ok(self.abort_upload(&c.upload_id)),
         }
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        let buckets = self
+            .buckets
+            .iter()
+            .map(|(name, b)| pb::BucketState {
+                name: name.clone(),
+                created_at: b.created_at.clone(),
+                scope_id: b.scope_id.clone(),
+            })
+            .collect();
+        let objects = self
+            .objects
+            .iter()
+            .map(|((bucket, key), o)| pb::ObjectState {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                etag: o.etag.clone(),
+                size: o.size,
+                content_type: o.content_type.clone(),
+                mtime: o.mtime.clone(),
+                checksums_json: o.checksums_json.clone(),
+                extents: to_pb(&o.extents),
+                user_meta: map_to_pairs(&o.user_meta),
+                tags: map_to_pairs(&o.tags),
+            })
+            .collect();
+        let uploads = self
+            .uploads
+            .iter()
+            .map(|(id, u)| pb::UploadState {
+                upload_id: id.clone(),
+                bucket: u.bucket.clone(),
+                key: u.key.clone(),
+                content_type: u.content_type.clone(),
+                user_meta: map_to_pairs(&u.user_meta),
+                tags: map_to_pairs(&u.tags),
+                checksum_algorithm: u.checksum_algorithm.clone(),
+                initiated_at: u.initiated_at.clone(),
+                parts: u
+                    .parts
+                    .iter()
+                    .map(|(n, p)| pb::PartState {
+                        part_number: *n,
+                        etag: p.etag.clone(),
+                        size: p.size,
+                        extents: to_pb(&p.extents),
+                    })
+                    .collect(),
+            })
+            .collect();
+        pb::Snapshot { buckets, objects, uploads }.encode_to_vec()
+    }
+
+    fn restore(data: &[u8]) -> Result<Self> {
+        let snap = pb::Snapshot::decode(data).context("decode s3 snapshot")?;
+        let buckets = snap
+            .buckets
+            .into_iter()
+            .map(|b| (b.name, BucketRec { created_at: b.created_at, scope_id: b.scope_id }))
+            .collect();
+        let objects = snap
+            .objects
+            .into_iter()
+            .map(|o| {
+                let rec = ObjectRec {
+                    etag: o.etag,
+                    size: o.size,
+                    content_type: o.content_type,
+                    mtime: o.mtime,
+                    checksums_json: o.checksums_json,
+                    extents: from_pb(&o.extents),
+                    user_meta: pairs_to_map(o.user_meta),
+                    tags: pairs_to_map(o.tags),
+                };
+                ((o.bucket, o.key), rec)
+            })
+            .collect();
+        let uploads = snap
+            .uploads
+            .into_iter()
+            .map(|u| {
+                let parts = u
+                    .parts
+                    .into_iter()
+                    .map(|p| {
+                        let rec = PartRec { etag: p.etag, size: p.size, extents: from_pb(&p.extents) };
+                        (p.part_number, rec)
+                    })
+                    .collect();
+                let rec = UploadRec {
+                    bucket: u.bucket,
+                    key: u.key,
+                    content_type: u.content_type,
+                    user_meta: pairs_to_map(u.user_meta),
+                    tags: pairs_to_map(u.tags),
+                    checksum_algorithm: u.checksum_algorithm,
+                    initiated_at: u.initiated_at,
+                    parts,
+                };
+                (u.upload_id, rec)
+            })
+            .collect();
+        Ok(Self { buckets, objects, uploads })
     }
 }
 
-fn ok() -> Result<Applied> {
-    Ok(Applied::Commit(Vec::new()))
+impl S3State {
+    fn create_bucket(&mut self, c: pb::CreateBucket) -> Applied {
+        if self.buckets.contains_key(&c.name) {
+            return reject(Reason::BucketExists(true));
+        }
+        self.buckets.insert(c.name, BucketRec { created_at: c.created_at, scope_id: c.scope_id });
+        ok()
+    }
+
+    /// Refuses a bucket with objects; its unfinished uploads go with it.
+    fn delete_bucket(&mut self, name: &str) -> Applied {
+        if !self.buckets.contains_key(name) {
+            return reject(Reason::BucketNotFound(true));
+        }
+        if self.bucket_objects(name).next().is_some() {
+            return reject(Reason::BucketNotEmpty(true));
+        }
+        self.buckets.remove(name);
+        self.uploads.retain(|_, u| u.bucket != name);
+        ok()
+    }
+
+    pub(crate) fn bucket_objects<'a>(
+        &'a self,
+        bucket: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a ObjectRec)> + 'a {
+        self.objects
+            .range((bucket.to_string(), String::new())..)
+            .take_while(move |((b, _), _)| b == bucket)
+            .map(|((_, key), o)| (key, o))
+    }
+
+    /// Insert or replace an object; returns the replaced version's chunks.
+    fn write_object(&mut self, bucket: String, key: String, rec: ObjectRec) -> Vec<ChunkId> {
+        let old = self.objects.insert((bucket, key), rec);
+        old.map(|o| chunk_ids(&o.extents)).unwrap_or_default()
+    }
+
+    fn put_object(&mut self, c: pb::PutObject) -> Applied {
+        if !self.buckets.contains_key(&c.bucket) {
+            return reject(Reason::BucketNotFound(true));
+        }
+        let rec = ObjectRec {
+            etag: c.etag,
+            size: c.size,
+            content_type: c.content_type,
+            mtime: c.mtime,
+            checksums_json: c.checksums_json,
+            extents: from_pb(&c.extents),
+            user_meta: pairs_to_map(c.user_meta),
+            tags: BTreeMap::new(),
+        };
+        released(self.write_object(c.bucket, c.key, rec))
+    }
+
+    fn delete_object(&mut self, bucket: String, key: String) -> Applied {
+        match self.objects.remove(&(bucket, key)) {
+            Some(o) => released(chunk_ids(&o.extents)),
+            None => reject(Reason::NoSuchKey(true)),
+        }
+    }
+
+    fn put_tags(&mut self, bucket: String, key: String, tags: Vec<pb::Pair>) -> Applied {
+        match self.objects.get_mut(&(bucket, key)) {
+            Some(o) => {
+                o.tags = pairs_to_map(tags);
+                ok()
+            }
+            None => reject(Reason::NoSuchKey(true)),
+        }
+    }
+
+    fn create_upload(&mut self, c: pb::CreateUpload) -> Result<Applied> {
+        if !self.buckets.contains_key(&c.bucket) {
+            return Ok(reject(Reason::BucketNotFound(true)));
+        }
+        if self.uploads.contains_key(&c.upload_id) {
+            bail!("upload id {} reused", c.upload_id);
+        }
+        let rec = UploadRec {
+            bucket: c.bucket,
+            key: c.key,
+            content_type: c.content_type,
+            user_meta: pairs_to_map(c.user_meta),
+            tags: pairs_to_map(c.tags),
+            checksum_algorithm: c.checksum_algorithm,
+            initiated_at: c.initiated_at,
+            parts: BTreeMap::new(),
+        };
+        self.uploads.insert(c.upload_id, rec);
+        Ok(ok())
+    }
+
+    /// Store a part; returns the replaced part's chunks.
+    fn put_part(&mut self, c: pb::PutPart) -> Applied {
+        let Some(upload) = self.uploads.get_mut(&c.upload_id) else {
+            return reject(Reason::NoSuchUpload(true));
+        };
+        let rec = PartRec { etag: c.etag, size: c.size, extents: from_pb(&c.extents) };
+        let old = upload.parts.insert(c.part_number, rec);
+        released(old.map(|p| chunk_ids(&p.extents)).unwrap_or_default())
+    }
+
+    /// Assemble the object from parts; part extents move to the object (no
+    /// release), parts not listed are dropped with the upload.
+    fn complete_upload(&mut self, c: pb::CompleteUpload) -> Applied {
+        let Some(upload) = self.uploads.get(&c.upload_id) else {
+            return reject(Reason::NoSuchUpload(true));
+        };
+        let mut extents = Vec::new();
+        for &pn in &c.part_numbers {
+            let Some(part) = upload.parts.get(&pn) else {
+                return reject(Reason::MissingPart(pn));
+            };
+            extents.extend_from_slice(&part.extents);
+        }
+        let upload = self.uploads.remove(&c.upload_id).expect("checked above");
+        let rec = ObjectRec {
+            etag: c.etag,
+            size: c.total_size,
+            content_type: upload.content_type,
+            mtime: c.mtime,
+            checksums_json: "{}".into(),
+            extents,
+            user_meta: upload.user_meta,
+            tags: upload.tags,
+        };
+        released(self.write_object(upload.bucket, upload.key, rec))
+    }
+
+    /// Drop an upload; returns every part's chunks.
+    fn abort_upload(&mut self, upload_id: &str) -> Applied {
+        let Some(upload) = self.uploads.remove(upload_id) else {
+            return reject(Reason::NoSuchUpload(true));
+        };
+        released(upload.parts.values().flat_map(|p| chunk_ids(&p.extents)).collect())
+    }
 }
 
-fn released(mut chunk_ids: Vec<ChunkId>) -> Result<Applied> {
+fn ok() -> Applied {
+    Applied::Commit(Vec::new())
+}
+
+fn released(mut chunk_ids: Vec<ChunkId>) -> Applied {
     chunk_ids.sort_unstable();
     chunk_ids.dedup();
-    Ok(Applied::Commit(pb::Released { chunk_ids }.encode_to_vec()))
+    Applied::Commit(pb::Released { chunk_ids }.encode_to_vec())
 }
 
-fn reject(reason: Reason) -> Result<Applied> {
-    Ok(Applied::Reject(
-        pb::Rejection {
-            reason: Some(reason),
-        }
-        .encode_to_vec(),
-    ))
+fn reject(reason: Reason) -> Applied {
+    Applied::Reject(pb::Rejection { reason: Some(reason) }.encode_to_vec())
 }
 
-pub(crate) fn chunk_ids_from_json(json: &str) -> Result<Vec<ChunkId>> {
-    let extents: Vec<Extent> = serde_json::from_str(json).context("parse extents_json")?;
-    Ok(extents.into_iter().map(|e| e.chunk).collect())
+fn chunk_ids(extents: &[Extent]) -> Vec<ChunkId> {
+    extents.iter().map(|e| e.chunk).collect()
 }
 
-pub(crate) fn extents_json(extents: &[pb::Extent]) -> Result<String> {
-    let extents: Vec<Extent> = extents
+pub(crate) fn to_pb(extents: &[Extent]) -> Vec<pb::Extent> {
+    extents
         .iter()
-        .map(|e| Extent {
-            chunk: e.chunk,
-            offset: e.offset,
-            len: e.len,
-        })
-        .collect();
-    Ok(serde_json::to_string(&extents)?)
-}
-
-async fn create_bucket(conn: &mut SqliteConnection, c: pb::CreateBucket) -> Result<Applied> {
-    let res = sqlx::query(
-        "INSERT OR IGNORE INTO s3_buckets (name, created_at, scope_id) VALUES (?, ?, ?)",
-    )
-    .bind(&c.name)
-    .bind(&c.created_at)
-    .bind(&c.scope_id)
-    .execute(&mut *conn)
-    .await?;
-    if res.rows_affected() == 0 {
-        return reject(Reason::BucketExists(true));
-    }
-    ok()
-}
-
-async fn delete_bucket(conn: &mut SqliteConnection, name: &str) -> Result<Applied> {
-    let (objects,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM s3_objects WHERE bucket = ?")
-        .bind(name)
-        .fetch_one(&mut *conn)
-        .await?;
-    if objects > 0 {
-        return reject(Reason::BucketNotEmpty(true));
-    }
-    let res = sqlx::query("DELETE FROM s3_buckets WHERE name = ?")
-        .bind(name)
-        .execute(&mut *conn)
-        .await?;
-    if res.rows_affected() == 0 {
-        return reject(Reason::BucketNotFound(true));
-    }
-    ok()
-}
-
-/// Write the object row + user metadata + tags, returning the replaced version's chunks.
-#[allow(clippy::too_many_arguments)]
-async fn write_object(
-    conn: &mut SqliteConnection,
-    bucket: &str,
-    key: &str,
-    etag: &str,
-    size: i64,
-    content_type: Option<&str>,
-    extents_json: &str,
-    user_meta: &[pb::Pair],
-    tags: &[pb::Pair],
-    checksums_json: &str,
-    mtime: &str,
-) -> Result<Vec<ChunkId>> {
-    let old: Option<(String,)> =
-        sqlx::query_as("SELECT extents_json FROM s3_objects WHERE bucket = ? AND key = ?")
-            .bind(bucket)
-            .bind(key)
-            .fetch_optional(&mut *conn)
-            .await?;
-    let old_ids = old
-        .map(|(j,)| chunk_ids_from_json(&j))
-        .transpose()?
-        .unwrap_or_default();
-
-    for sql in [
-        "DELETE FROM s3_object_metadata WHERE bucket = ? AND key = ?",
-        "DELETE FROM s3_object_tags WHERE bucket = ? AND key = ?",
-    ] {
-        sqlx::query(sql).bind(bucket).bind(key).execute(&mut *conn).await?;
-    }
-    sqlx::query(
-        r#"
-        INSERT INTO s3_objects
-            (bucket, key, etag, size, content_type, mtime, checksums_json, extents_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(bucket, key) DO UPDATE SET
-            etag = excluded.etag,
-            size = excluded.size,
-            content_type = excluded.content_type,
-            mtime = excluded.mtime,
-            checksums_json = excluded.checksums_json,
-            extents_json = excluded.extents_json
-        "#,
-    )
-    .bind(bucket)
-    .bind(key)
-    .bind(etag)
-    .bind(size)
-    .bind(content_type)
-    .bind(mtime)
-    .bind(checksums_json)
-    .bind(extents_json)
-    .execute(&mut *conn)
-    .await?;
-    for m in user_meta {
-        sqlx::query("INSERT INTO s3_object_metadata (bucket, key, name, value) VALUES (?, ?, ?, ?)")
-            .bind(bucket)
-            .bind(key)
-            .bind(&m.name)
-            .bind(&m.value)
-            .execute(&mut *conn)
-            .await?;
-    }
-    insert_tags(conn, bucket, key, tags).await?;
-    Ok(old_ids)
-}
-
-async fn insert_tags(
-    conn: &mut SqliteConnection,
-    bucket: &str,
-    key: &str,
-    tags: &[pb::Pair],
-) -> Result<()> {
-    for t in tags {
-        sqlx::query(
-            "INSERT INTO s3_object_tags (bucket, key, tag_key, tag_value) VALUES (?, ?, ?, ?)",
-        )
-        .bind(bucket)
-        .bind(key)
-        .bind(&t.name)
-        .bind(&t.value)
-        .execute(&mut *conn)
-        .await?;
-    }
-    Ok(())
-}
-
-async fn put_object(conn: &mut SqliteConnection, c: pb::PutObject) -> Result<Applied> {
-    let old = write_object(
-        conn,
-        &c.bucket,
-        &c.key,
-        &c.etag,
-        c.size,
-        c.content_type.as_deref(),
-        &extents_json(&c.extents)?,
-        &c.user_meta,
-        &[],
-        &c.checksums_json,
-        &c.mtime,
-    )
-    .await?;
-    released(old)
-}
-
-async fn delete_object(conn: &mut SqliteConnection, bucket: &str, key: &str) -> Result<Applied> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT extents_json FROM s3_objects WHERE bucket = ? AND key = ?")
-            .bind(bucket)
-            .bind(key)
-            .fetch_optional(&mut *conn)
-            .await?;
-    let Some((json,)) = row else {
-        return reject(Reason::NoSuchKey(true));
-    };
-    sqlx::query("DELETE FROM s3_objects WHERE bucket = ? AND key = ?")
-        .bind(bucket)
-        .bind(key)
-        .execute(&mut *conn)
-        .await?;
-    released(chunk_ids_from_json(&json)?)
-}
-
-async fn put_tags(
-    conn: &mut SqliteConnection,
-    bucket: &str,
-    key: &str,
-    tags: &[pb::Pair],
-) -> Result<Applied> {
-    sqlx::query("DELETE FROM s3_object_tags WHERE bucket = ? AND key = ?")
-        .bind(bucket)
-        .bind(key)
-        .execute(&mut *conn)
-        .await?;
-    insert_tags(conn, bucket, key, tags).await?;
-    ok()
-}
-
-fn pairs_json(pairs: &[pb::Pair]) -> Result<String> {
-    let v: Vec<(&str, &str)> = pairs.iter().map(|p| (p.name.as_str(), p.value.as_str())).collect();
-    Ok(serde_json::to_string(&v)?)
-}
-
-fn pairs_from_json(json: &str) -> Vec<pb::Pair> {
-    serde_json::from_str::<Vec<(String, String)>>(json)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(name, value)| pb::Pair { name, value })
+        .map(|e| pb::Extent { chunk: e.chunk, offset: e.offset, len: e.len })
         .collect()
 }
 
-async fn create_upload(conn: &mut SqliteConnection, c: pb::CreateUpload) -> Result<Applied> {
-    sqlx::query(
-        r#"
-        INSERT INTO s3_uploads
-            (upload_id, bucket, key, content_type, user_meta_json, tagging_json,
-             checksum_algorithm, initiated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(&c.upload_id)
-    .bind(&c.bucket)
-    .bind(&c.key)
-    .bind(&c.content_type)
-    .bind(pairs_json(&c.user_meta)?)
-    .bind(pairs_json(&c.tags)?)
-    .bind(&c.checksum_algorithm)
-    .bind(&c.initiated_at)
-    .execute(&mut *conn)
-    .await?;
-    ok()
+fn from_pb(extents: &[pb::Extent]) -> Vec<Extent> {
+    extents
+        .iter()
+        .map(|e| Extent { chunk: e.chunk, offset: e.offset, len: e.len })
+        .collect()
 }
 
-async fn put_part(conn: &mut SqliteConnection, c: pb::PutPart) -> Result<Applied> {
-    let old: Option<(String,)> = sqlx::query_as(
-        "SELECT extents_json FROM s3_parts WHERE upload_id = ? AND part_number = ?",
-    )
-    .bind(&c.upload_id)
-    .bind(c.part_number)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let old_ids = old
-        .map(|(j,)| chunk_ids_from_json(&j))
-        .transpose()?
-        .unwrap_or_default();
-    sqlx::query(
-        r#"
-        INSERT INTO s3_parts (upload_id, part_number, etag, size, extents_json)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(upload_id, part_number) DO UPDATE SET
-            etag = excluded.etag,
-            size = excluded.size,
-            extents_json = excluded.extents_json
-        "#,
-    )
-    .bind(&c.upload_id)
-    .bind(c.part_number)
-    .bind(&c.etag)
-    .bind(c.size)
-    .bind(extents_json(&c.extents)?)
-    .execute(&mut *conn)
-    .await?;
-    released(old_ids)
+/// Later duplicates of a name win, as a repeated header would.
+fn pairs_to_map(pairs: Vec<pb::Pair>) -> BTreeMap<String, String> {
+    pairs.into_iter().map(|p| (p.name, p.value)).collect()
 }
 
-async fn complete_upload(conn: &mut SqliteConnection, c: pb::CompleteUpload) -> Result<Applied> {
-    let upload: Option<(String, String, Option<String>, String, String)> = sqlx::query_as(
-        r#"
-        SELECT bucket, key, content_type, user_meta_json, tagging_json
-        FROM s3_uploads WHERE upload_id = ?
-        "#,
-    )
-    .bind(&c.upload_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let Some((bucket, key, content_type, user_meta_json, tagging_json)) = upload else {
-        return reject(Reason::NoSuchUpload(true));
-    };
-
-    let mut assembled: Vec<Extent> = Vec::new();
-    for &pn in &c.part_numbers {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM s3_parts WHERE upload_id = ? AND part_number = ?",
-        )
-        .bind(&c.upload_id)
-        .bind(pn)
-        .fetch_optional(&mut *conn)
-        .await?;
-        let Some((json,)) = row else {
-            return reject(Reason::MissingPart(pn));
-        };
-        let mut part: Vec<Extent> = serde_json::from_str(&json)?;
-        assembled.append(&mut part);
-    }
-
-    let old = write_object(
-        conn,
-        &bucket,
-        &key,
-        &c.etag,
-        c.total_size,
-        content_type.as_deref(),
-        &serde_json::to_string(&assembled)?,
-        &pairs_from_json(&user_meta_json),
-        &pairs_from_json(&tagging_json),
-        "{}",
-        &c.mtime,
-    )
-    .await?;
-    // Part extents now belong to the object: drop the upload without releasing them.
-    sqlx::query("DELETE FROM s3_uploads WHERE upload_id = ?")
-        .bind(&c.upload_id)
-        .execute(&mut *conn)
-        .await?;
-    released(old)
-}
-
-async fn abort_upload(conn: &mut SqliteConnection, upload_id: &str) -> Result<Applied> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT extents_json FROM s3_parts WHERE upload_id = ?")
-            .bind(upload_id)
-            .fetch_all(&mut *conn)
-            .await?;
-    let res = sqlx::query("DELETE FROM s3_uploads WHERE upload_id = ?")
-        .bind(upload_id)
-        .execute(&mut *conn)
-        .await?;
-    if res.rows_affected() == 0 {
-        return reject(Reason::NoSuchUpload(true));
-    }
-    let mut ids = Vec::new();
-    for (json,) in rows {
-        ids.extend(chunk_ids_from_json(&json)?);
-    }
-    released(ids)
+fn map_to_pairs(map: &BTreeMap<String, String>) -> Vec<pb::Pair> {
+    map.iter()
+        .map(|(name, value)| pb::Pair { name: name.clone(), value: value.clone() })
+        .collect()
 }

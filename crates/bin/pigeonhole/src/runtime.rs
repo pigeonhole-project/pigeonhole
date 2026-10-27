@@ -26,9 +26,7 @@ pub struct Runtime {
 }
 
 pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
-    let namespaces = Namespaces::new()
-        .with_sql(BlobDb::namespace())
-        .with_sql(Index::namespace());
+    let namespaces = Index::register(Namespaces::new().with_sql(BlobDb::namespace()));
     #[cfg(feature = "bytestream")]
     let namespaces = pigeonhole_gateway_bytestream::cas_index::CasIndex::register(namespaces);
     let log: Arc<dyn LogStore> = match &cfg.meta.log {

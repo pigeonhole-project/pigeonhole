@@ -1,5 +1,5 @@
-//! The command log is the source of truth: replaying it into an empty SQLite
-//! file rebuilds the chunk and s3 tables exactly.
+//! The command log is the source of truth: replaying it into an empty tablet
+//! rebuilds the chunk tables and the s3 state exactly.
 
 use bytes::Bytes;
 use http::{Extensions, HeaderMap, Method, Uri};
@@ -7,7 +7,8 @@ use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
-use pigeonhole_meta::{dump_tables, LocalLogStore, MetaOptions, MetaStore};
+use pigeonhole_gateway_s3::S3State;
+use pigeonhole_meta::{dump_tables, LocalLogStore, MetaOptions, MetaStore, Namespaces, StateMachine};
 use s3s::dto::*;
 use s3s::{S3Request, S3};
 use std::path::Path;
@@ -41,17 +42,17 @@ async fn tablet(dir: &Path, db: &str) -> Arc<MetaStore> {
     MetaStore::open(
         &url,
         Arc::new(log),
-        vec![BlobDb::namespace(), Index::namespace()],
+        Index::register(Namespaces::new().with_sql(BlobDb::namespace())),
         MetaOptions::default(),
     )
     .await
     .unwrap()
 }
 
-async fn replicated_state(meta: &MetaStore) -> Vec<(String, Vec<String>)> {
+async fn replicated_state(meta: &MetaStore) -> (Vec<(String, Vec<String>)>, Vec<u8>) {
     let mut dump = dump_tables(meta.pool()).await.unwrap();
     dump.retain(|(table, _)| !NODE_LOCAL.contains(&table.as_str()));
-    dump
+    (dump, meta.read::<S3State, _>(|s| s.snapshot()))
 }
 
 #[tokio::test]
@@ -101,4 +102,6 @@ async fn replay_rebuilds_chunk_and_s3_tables() {
     let replayed = tablet(dir.path(), "b.db").await;
     assert_eq!(replayed.applied_position().await.unwrap(), position);
     assert_eq!(replicated_state(&replayed).await, before);
+    let snap = &before.1;
+    assert_eq!(&S3State::restore(snap).unwrap().snapshot(), snap, "restore inverts snapshot");
 }

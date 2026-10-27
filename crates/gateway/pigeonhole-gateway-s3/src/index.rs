@@ -1,33 +1,32 @@
 //! S3 gateway index: buckets/objects/multipart with extent lists.
 //!
-//! Queries read SQLite directly; every change goes through an `s3` command
-//! (see [`crate::commands`]). Chunk refcounts live in the chunk store
-//! ([`ChunkStore::retain`] / [`release`]).
+//! Queries read the tablet's in-memory [`S3State`]; every change goes through
+//! an `s3` command (see [`crate::commands`]). Chunk refcounts live in the
+//! chunk store ([`ChunkStore::retain`] / [`release`]).
 
+use crate::commands::{pb, ObjectRec, S3State, UploadRec, NAMESPACE};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
-use serde::{Deserialize, Serialize};
-use crate::commands::{pb, S3Namespace, NAMESPACE};
-use pigeonhole_meta::{Applied, MetaStore, Namespace};
+use pigeonhole_meta::{Applied, MetaStore, Namespaces};
 use prost::Message;
-use sqlx::{FromRow, SqlitePool};
+use serde::{Deserialize, Serialize};
+use std::ops::Bound;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Index {
-    pool: SqlitePool,
     meta: Arc<MetaStore>,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bucket {
     pub name: String,
     pub created_at: String,
     pub scope_id: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub bucket: String,
     pub key: String,
@@ -36,9 +35,6 @@ pub struct ObjectMeta {
     pub content_type: Option<String>,
     pub mtime: String,
 }
-
-/// `(bucket, key, size, content_type, etag, extents_json, checksums_json)`.
-type SourceRow = (String, String, i64, Option<String>, String, String, String);
 
 /// Snapshot of a copy source, see [`Index::get_copy_source`].
 #[derive(Debug, Clone)]
@@ -51,19 +47,19 @@ pub struct SourceSnapshot {
     pub checksums_json: String,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct MultipartUpload {
     pub upload_id: String,
     pub bucket: String,
     pub key: String,
     pub content_type: Option<String>,
-    pub user_meta_json: String,
-    pub tagging_json: String,
+    pub user_meta: Vec<(String, String)>,
+    pub tags: Vec<(String, String)>,
     pub checksum_algorithm: Option<String>,
     pub initiated_at: String,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct MultipartPart {
     pub upload_id: String,
     pub part_number: i64,
@@ -78,96 +74,29 @@ pub enum DeleteBucketResult {
     NotEmpty,
 }
 
-/// Current schema of the `s3` namespace. No upgrades.
-pub(crate) const SCHEMA: &[&str] = &[
-    r#"
-            CREATE TABLE IF NOT EXISTS s3_buckets (
-                name TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                scope_id TEXT NOT NULL DEFAULT ''
-            )
-    "#,
-    r#"
-            CREATE TABLE IF NOT EXISTS s3_objects (
-                bucket TEXT NOT NULL,
-                key TEXT NOT NULL,
-                etag TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                content_type TEXT,
-                mtime TEXT NOT NULL,
-                checksums_json TEXT NOT NULL DEFAULT '{}',
-                extents_json TEXT NOT NULL DEFAULT '[]',
-                PRIMARY KEY (bucket, key),
-                FOREIGN KEY (bucket) REFERENCES s3_buckets(name) ON DELETE CASCADE
-            )
-    "#,
-    r#"
-            CREATE TABLE IF NOT EXISTS s3_object_metadata (
-                bucket TEXT NOT NULL,
-                key TEXT NOT NULL,
-                name TEXT NOT NULL,
-                value TEXT NOT NULL,
-                PRIMARY KEY (bucket, key, name),
-                FOREIGN KEY (bucket, key) REFERENCES s3_objects(bucket, key) ON DELETE CASCADE
-            )
-    "#,
-    r#"
-            CREATE TABLE IF NOT EXISTS s3_object_tags (
-                bucket TEXT NOT NULL,
-                key TEXT NOT NULL,
-                tag_key TEXT NOT NULL,
-                tag_value TEXT NOT NULL,
-                PRIMARY KEY (bucket, key, tag_key),
-                FOREIGN KEY (bucket, key) REFERENCES s3_objects(bucket, key) ON DELETE CASCADE
-            )
-    "#,
-    r#"
-            CREATE TABLE IF NOT EXISTS s3_uploads (
-                upload_id TEXT PRIMARY KEY,
-                bucket TEXT NOT NULL,
-                key TEXT NOT NULL,
-                content_type TEXT,
-                user_meta_json TEXT NOT NULL DEFAULT '[]',
-                tagging_json TEXT NOT NULL DEFAULT '[]',
-                checksum_algorithm TEXT,
-                initiated_at TEXT NOT NULL,
-                FOREIGN KEY (bucket) REFERENCES s3_buckets(name) ON DELETE CASCADE
-            )
-    "#,
-    r#"
-            CREATE TABLE IF NOT EXISTS s3_parts (
-                upload_id TEXT NOT NULL,
-                part_number INTEGER NOT NULL,
-                etag TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                extents_json TEXT NOT NULL DEFAULT '[]',
-                PRIMARY KEY (upload_id, part_number),
-                FOREIGN KEY (upload_id) REFERENCES s3_uploads(upload_id) ON DELETE CASCADE
-            )
-    "#,
-];
-
 impl Index {
     /// Open a standalone tablet at `database_url` (local log next to it) with
     /// only this namespace.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        Self::open(MetaStore::open_local(database_url, vec![Self::namespace()]).await?).await
+        let namespaces = Self::register(Namespaces::new());
+        Self::open(MetaStore::open_local(database_url, namespaces).await?).await
     }
 
-    /// The `s3` namespace, to pass to [`MetaStore::open`].
-    pub fn namespace() -> Arc<dyn Namespace> {
-        Arc::new(S3Namespace)
+    /// Add the `s3` namespace to the set passed to [`MetaStore::open`].
+    pub fn register(namespaces: Namespaces) -> Namespaces {
+        namespaces.with::<S3State>()
     }
 
-    /// Use `meta`, which must have been opened with [`Self::namespace`].
+    /// Use `meta`, which must have been opened with [`Self::register`].
     pub async fn open(meta: Arc<MetaStore>) -> Result<Self> {
         if !meta.has_namespace(NAMESPACE) {
             anyhow::bail!("metadata tablet opened without the s3 namespace");
         }
-        Ok(Self {
-            pool: meta.pool().clone(),
-            meta,
-        })
+        Ok(Self { meta })
+    }
+
+    fn read<R>(&self, f: impl FnOnce(&S3State) -> R) -> R {
+        self.meta.read::<S3State, _>(f)
     }
 
     /// Propose one s3 command; `Ok(Err(reason))` is a deterministic rejection.
@@ -191,10 +120,6 @@ impl Index {
         }
     }
 
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
-    }
-
     /// Returns false when the bucket already exists.
     pub async fn create_bucket(&self, name: &str, scope_id: &str) -> Result<bool> {
         let op = pb::command::Op::CreateBucket(pb::CreateBucket {
@@ -210,12 +135,7 @@ impl Index {
     }
 
     pub async fn bucket_scope_id(&self, name: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT scope_id FROM s3_buckets WHERE name = ?")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|r| r.0))
+        Ok(self.read(|s| s.buckets.get(name).map(|b| b.scope_id.clone())))
     }
 
     pub async fn delete_bucket(&self, name: &str) -> Result<DeleteBucketResult> {
@@ -230,20 +150,20 @@ impl Index {
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>> {
-        let rows = sqlx::query_as::<_, Bucket>(
-            "SELECT name, created_at, scope_id FROM s3_buckets ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        Ok(self.read(|s| {
+            s.buckets
+                .iter()
+                .map(|(name, b)| Bucket {
+                    name: name.clone(),
+                    created_at: b.created_at.clone(),
+                    scope_id: b.scope_id.clone(),
+                })
+                .collect()
+        }))
     }
 
     pub async fn bucket_exists(&self, name: &str) -> Result<bool> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT name FROM s3_buckets WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.is_some())
+        Ok(self.read(|s| s.buckets.contains_key(name)))
     }
 
     /// Insert/replace object. Returns previous extent chunk ids (caller should `release`).
@@ -291,29 +211,16 @@ impl Index {
         .await
     }
 
+    fn object<R>(&self, bucket: &str, key: &str, f: impl FnOnce(&ObjectRec) -> R) -> Option<R> {
+        self.read(|s| s.objects.get(&(bucket.to_string(), key.to_string())).map(f))
+    }
+
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
-        let row = sqlx::query_as::<_, ObjectMeta>(
-            "SELECT bucket, key, etag, size, content_type, mtime FROM s3_objects WHERE bucket = ? AND key = ?",
-        )
-        .bind(bucket)
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
+        Ok(self.object(bucket, key, |o| object_meta(bucket, key, o)))
     }
 
     pub async fn get_extents(&self, bucket: &str, key: &str) -> Result<Option<Vec<Extent>>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM s3_objects WHERE bucket = ? AND key = ?",
-        )
-        .bind(bucket)
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            None => Ok(None),
-            Some((j,)) => Ok(Some(serde_json::from_str(&j)?)),
-        }
+        Ok(self.object(bucket, key, |o| o.extents.clone()))
     }
 
     pub async fn get_object_checksums_json(
@@ -321,44 +228,25 @@ impl Index {
         bucket: &str,
         key: &str,
     ) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT checksums_json FROM s3_objects WHERE bucket = ? AND key = ?",
-        )
-        .bind(bucket)
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(j,)| j))
+        Ok(self.object(bucket, key, |o| o.checksums_json.clone()))
     }
 
+    /// Ordered by name; empty for a missing object.
     pub async fn get_user_metadata(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT name, value FROM s3_object_metadata WHERE bucket = ? AND key = ? ORDER BY name",
-        )
-        .bind(bucket)
-        .bind(key)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        Ok(self.object(bucket, key, |o| pairs(&o.user_meta)).unwrap_or_default())
     }
 
+    /// Ordered by tag key; empty for a missing object.
     pub async fn get_object_tags(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT tag_key, tag_value FROM s3_object_tags WHERE bucket = ? AND key = ? ORDER BY tag_key",
-        )
-        .bind(bucket)
-        .bind(key)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        Ok(self.object(bucket, key, |o| pairs(&o.tags)).unwrap_or_default())
     }
 
     pub async fn put_object_tags(
@@ -399,39 +287,15 @@ impl Index {
     }
 
     /// Consistent view of a copy source: object row, extents, user metadata, and
-    /// checksums from one read transaction (no mix of two versions).
+    /// checksums under one read lock (no mix of two versions).
     pub async fn get_copy_source(&self, bucket: &str, key: &str) -> Result<Option<SourceSnapshot>> {
-        let mut tx = self.pool.begin().await?;
-        let row: Option<SourceRow> =
-            sqlx::query_as(
-                r#"
-                SELECT bucket, key, size, content_type, etag, extents_json, checksums_json
-                FROM s3_objects WHERE bucket = ? AND key = ?
-                "#,
-            )
-            .bind(bucket)
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some((bucket, key, size, content_type, etag, extents_json, checksums_json)) = row
-        else {
-            return Ok(None);
-        };
-        let user_meta = sqlx::query_as::<_, (String, String)>(
-            "SELECT name, value FROM s3_object_metadata WHERE bucket = ? AND key = ? ORDER BY name",
-        )
-        .bind(&bucket)
-        .bind(&key)
-        .fetch_all(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(Some(SourceSnapshot {
-            etag,
-            size,
-            content_type,
-            extents: serde_json::from_str(&extents_json)?,
-            user_meta,
-            checksums_json,
+        Ok(self.object(bucket, key, |o| SourceSnapshot {
+            etag: o.etag.clone(),
+            size: o.size,
+            content_type: o.content_type.clone(),
+            extents: o.extents.clone(),
+            user_meta: pairs(&o.user_meta),
+            checksums_json: o.checksums_json.clone(),
         }))
     }
 
@@ -482,6 +346,30 @@ impl Index {
         Ok((dst, old))
     }
 
+    /// Up to `limit` objects of `bucket` with keys in `(lower, upper)` bounds,
+    /// in byte order.
+    fn scan_objects(
+        &self,
+        bucket: &str,
+        lower: Bound<&str>,
+        upper: Option<&str>,
+        limit: usize,
+    ) -> Vec<ObjectMeta> {
+        let start = match lower {
+            Bound::Included(k) => Bound::Included((bucket.to_string(), k.to_string())),
+            Bound::Excluded(k) => Bound::Excluded((bucket.to_string(), k.to_string())),
+            Bound::Unbounded => Bound::Included((bucket.to_string(), String::new())),
+        };
+        self.read(|s| {
+            s.objects
+                .range((start, Bound::Unbounded))
+                .take_while(|((b, k), _)| b == bucket && upper.is_none_or(|hi| k.as_str() < hi))
+                .take(limit)
+                .map(|((b, k), o)| object_meta(b, k, o))
+                .collect()
+        })
+    }
+
     pub async fn list_objects(
         &self,
         bucket: &str,
@@ -494,7 +382,7 @@ impl Index {
         let range_end = exclusive_prefix_end(prefix);
 
         if let Some(delim) = delimiter {
-            let batch = (max_keys * 32).max(64).min(10_000) as i64;
+            let batch = (max_keys * 32).clamp(64, 10_000);
             let mut cursor: Option<(bool, String)> = match start_after {
                 Some(after) if after.ends_with(delim) => {
                     exclusive_prefix_end(after).map(|e| (true, e))
@@ -506,43 +394,13 @@ impl Index {
             let mut exhausted = false;
 
             loop {
-                let mut q = String::from(
-                    r#"
-                    SELECT bucket, key, etag, size, content_type, mtime
-                    FROM s3_objects
-                    WHERE bucket = ?
-                    "#,
-                );
-                let mut binds: Vec<String> = Vec::new();
-                if !prefix.is_empty() {
-                    q.push_str(" AND key >= ? COLLATE BINARY");
-                    binds.push(prefix.to_string());
-                }
-                if let Some(ref hi) = range_end {
-                    q.push_str(" AND key < ? COLLATE BINARY");
-                    binds.push(hi.clone());
-                }
-                match &cursor {
-                    Some((true, c)) => {
-                        q.push_str(" AND key >= ? COLLATE BINARY");
-                        binds.push(c.clone());
-                    }
-                    Some((false, c)) => {
-                        q.push_str(" AND key > ? COLLATE BINARY");
-                        binds.push(c.clone());
-                    }
-                    None => {}
-                }
-                q.push_str(" ORDER BY key COLLATE BINARY LIMIT ?");
-
-                let mut query = sqlx::query_as::<_, ObjectMeta>(&q).bind(bucket);
-                for b in &binds {
-                    query = query.bind(b);
-                }
-                query = query.bind(batch);
-
-                let objs = query.fetch_all(&self.pool).await?;
-                if (objs.len() as i64) < batch {
+                let lower = match &cursor {
+                    Some((true, c)) if c.as_str() >= prefix => Bound::Included(c.as_str()),
+                    Some((false, c)) if c.as_str() >= prefix => Bound::Excluded(c.as_str()),
+                    _ => Bound::Included(prefix),
+                };
+                let objs = self.scan_objects(bucket, lower, range_end.as_deref(), batch);
+                if objs.len() < batch {
                     exhausted = true;
                 }
 
@@ -598,40 +456,12 @@ impl Index {
             return Ok((objects, common, truncated, next));
         }
 
-        let fetch_limit = (max_keys + 1) as i64;
-        let mut q = String::from(
-            r#"
-            SELECT bucket, key, etag, size, content_type, mtime
-            FROM s3_objects
-            WHERE bucket = ?
-            "#,
-        );
-        if !prefix.is_empty() {
-            q.push_str(" AND key >= ? COLLATE BINARY");
-        }
-        if range_end.is_some() {
-            q.push_str(" AND key < ? COLLATE BINARY");
-        }
-        if start_after.is_some() {
-            q.push_str(" AND key > ? COLLATE BINARY");
-        }
-        q.push_str(" ORDER BY key COLLATE BINARY LIMIT ?");
-
-        let mut query = sqlx::query_as::<_, ObjectMeta>(&q).bind(bucket);
-        if !prefix.is_empty() {
-            query = query.bind(prefix);
-        }
-        if let Some(ref hi) = range_end {
-            query = query.bind(hi);
-        }
-        if let Some(after) = start_after {
-            query = query.bind(after);
-        }
-        query = query.bind(fetch_limit);
-
-        let objs = query.fetch_all(&self.pool).await?;
+        let lower = match start_after {
+            Some(after) if after >= prefix => Bound::Excluded(after),
+            _ => Bound::Included(prefix),
+        };
+        let mut objs = self.scan_objects(bucket, lower, range_end.as_deref(), max_keys + 1);
         let truncated = objs.len() > max_keys;
-        let mut objs = objs;
         objs.truncate(max_keys);
         let next = if truncated {
             objs.last().map(|o| o.key.clone())
@@ -642,32 +472,22 @@ impl Index {
     }
 
     pub async fn count_objects(&self) -> Result<i64> {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM s3_objects")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(n)
+        Ok(self.read(|s| s.objects.len() as i64))
     }
 
     pub async fn count_buckets(&self) -> Result<i64> {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM s3_buckets")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(n)
+        Ok(self.read(|s| s.buckets.len() as i64))
     }
 
     /// Abort every upload, delete every object and bucket, one command each.
     /// Returns the chunk ids the removed uploads and objects held, to `release`.
     pub async fn delete_everything(&self) -> Result<Vec<ChunkId>> {
         let mut released = Vec::new();
-        let uploads: Vec<(String,)> = sqlx::query_as("SELECT upload_id FROM s3_uploads")
-            .fetch_all(&self.pool)
-            .await?;
-        for (upload_id,) in uploads {
+        let uploads: Vec<String> = self.read(|s| s.uploads.keys().cloned().collect());
+        for upload_id in uploads {
             released.extend(self.abort_multipart_upload(&upload_id).await?.unwrap_or_default());
         }
-        let objects: Vec<(String, String)> = sqlx::query_as("SELECT bucket, key FROM s3_objects")
-            .fetch_all(&self.pool)
-            .await?;
+        let objects: Vec<(String, String)> = self.read(|s| s.objects.keys().cloned().collect());
         for (bucket, key) in objects {
             released.extend(self.delete_object(&bucket, &key).await?.unwrap_or_default());
         }
@@ -703,17 +523,7 @@ impl Index {
     }
 
     pub async fn get_multipart_upload(&self, upload_id: &str) -> Result<Option<MultipartUpload>> {
-        let row = sqlx::query_as::<_, MultipartUpload>(
-            r#"
-            SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json,
-                   checksum_algorithm, initiated_at
-            FROM s3_uploads WHERE upload_id = ?
-            "#,
-        )
-        .bind(upload_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
+        Ok(self.read(|s| s.uploads.get(upload_id).map(|u| multipart_upload(upload_id, u))))
     }
 
     /// Store part extents. Returns previous part chunk ids to `release`.
@@ -740,14 +550,15 @@ impl Index {
         upload_id: &str,
         part_number: i64,
     ) -> Result<Option<MultipartPart>> {
-        let row = sqlx::query_as::<_, MultipartPart>(
-            "SELECT upload_id, part_number, etag, size FROM s3_parts WHERE upload_id = ? AND part_number = ?",
-        )
-        .bind(upload_id)
-        .bind(part_number)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
+        Ok(self.read(|s| {
+            let p = s.uploads.get(upload_id)?.parts.get(&part_number)?;
+            Some(MultipartPart {
+                upload_id: upload_id.into(),
+                part_number,
+                etag: p.etag.clone(),
+                size: p.size,
+            })
+        }))
     }
 
     pub async fn get_multipart_part_extents(
@@ -755,17 +566,9 @@ impl Index {
         upload_id: &str,
         part_number: i64,
     ) -> Result<Option<Vec<Extent>>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT extents_json FROM s3_parts WHERE upload_id = ? AND part_number = ?",
-        )
-        .bind(upload_id)
-        .bind(part_number)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            None => Ok(None),
-            Some((j,)) => Ok(Some(serde_json::from_str(&j)?)),
-        }
+        Ok(self.read(|s| {
+            Some(s.uploads.get(upload_id)?.parts.get(&part_number)?.extents.clone())
+        }))
     }
 
     /// Assemble object from parts (ownership transfer). Returns old object chunk ids to release.
@@ -802,6 +605,8 @@ impl Index {
         }
     }
 
+    /// Uploads of `bucket` under `prefix`, ordered by `(key, upload_id)`,
+    /// after the `(key_marker, upload_id_marker)` position.
     pub async fn list_multipart_uploads(
         &self,
         bucket: &str,
@@ -811,42 +616,23 @@ impl Index {
         max_uploads: i64,
     ) -> Result<(Vec<MultipartUpload>, bool, Option<(String, String)>)> {
         let max_uploads = max_uploads.clamp(1, 1000) as usize;
-        let mut sql = String::from(
-            r#"
-            SELECT upload_id, bucket, key, content_type, user_meta_json, tagging_json,
-                   checksum_algorithm, initiated_at
-            FROM s3_uploads
-            WHERE bucket = ?
-            "#,
-        );
-        let mut binds: Vec<String> = vec![bucket.to_string()];
-        if !prefix.is_empty() {
-            sql.push_str(" AND key >= ?");
-            binds.push(prefix.to_string());
-            if let Some(end) = exclusive_prefix_end(prefix) {
-                sql.push_str(" AND key < ?");
-                binds.push(end);
-            }
-        }
-        if let Some(km) = key_marker.filter(|s| !s.is_empty()) {
-            if let Some(um) = upload_id_marker.filter(|s| !s.is_empty()) {
-                sql.push_str(" AND (key > ? OR (key = ? AND upload_id > ?))");
-                binds.push(km.to_string());
-                binds.push(km.to_string());
-                binds.push(um.to_string());
-            } else {
-                sql.push_str(" AND key > ?");
-                binds.push(km.to_string());
-            }
-        }
-        sql.push_str(" ORDER BY key, upload_id LIMIT ?");
-
-        let mut query = sqlx::query_as::<_, MultipartUpload>(&sql);
-        for b in &binds {
-            query = query.bind(b);
-        }
-        query = query.bind((max_uploads + 1) as i64);
-        let mut rows = query.fetch_all(&self.pool).await?;
+        let key_marker = key_marker.filter(|s| !s.is_empty());
+        let upload_id_marker = upload_id_marker.filter(|s| !s.is_empty());
+        let mut rows: Vec<MultipartUpload> = self.read(|s| {
+            s.uploads
+                .iter()
+                .filter(|(_, u)| u.bucket == bucket && u.key.starts_with(prefix))
+                .filter(|(id, u)| match (key_marker, upload_id_marker) {
+                    (Some(km), Some(um)) => {
+                        u.key.as_str() > km || (u.key == km && id.as_str() > um)
+                    }
+                    (Some(km), None) => u.key.as_str() > km,
+                    (None, _) => true,
+                })
+                .map(|(id, u)| multipart_upload(id, u))
+                .collect()
+        });
+        rows.sort_by(|a, b| (&a.key, &a.upload_id).cmp(&(&b.key, &b.upload_id)));
         let truncated = rows.len() > max_uploads;
         rows.truncate(max_uploads);
         let next = if truncated {
@@ -865,20 +651,21 @@ impl Index {
     ) -> Result<(Vec<MultipartPart>, bool, Option<i64>)> {
         let max_parts = max_parts.clamp(1, 1000) as usize;
         let marker = part_number_marker.unwrap_or(0);
-        let mut rows = sqlx::query_as::<_, MultipartPart>(
-            r#"
-            SELECT upload_id, part_number, etag, size
-            FROM s3_parts
-            WHERE upload_id = ? AND part_number > ?
-            ORDER BY part_number
-            LIMIT ?
-            "#,
-        )
-        .bind(upload_id)
-        .bind(marker)
-        .bind((max_parts + 1) as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut rows: Vec<MultipartPart> = self.read(|s| {
+            let Some(u) = s.uploads.get(upload_id) else {
+                return Vec::new();
+            };
+            u.parts
+                .range(marker.saturating_add(1)..)
+                .take(max_parts + 1)
+                .map(|(n, p)| MultipartPart {
+                    upload_id: upload_id.into(),
+                    part_number: *n,
+                    etag: p.etag.clone(),
+                    size: p.size,
+                })
+                .collect()
+        });
         let truncated = rows.len() > max_parts;
         rows.truncate(max_parts);
         let next = if truncated {
@@ -888,6 +675,34 @@ impl Index {
         };
         Ok((rows, truncated, next))
     }
+}
+
+fn object_meta(bucket: &str, key: &str, o: &ObjectRec) -> ObjectMeta {
+    ObjectMeta {
+        bucket: bucket.into(),
+        key: key.into(),
+        etag: o.etag.clone(),
+        size: o.size,
+        content_type: o.content_type.clone(),
+        mtime: o.mtime.clone(),
+    }
+}
+
+fn multipart_upload(upload_id: &str, u: &UploadRec) -> MultipartUpload {
+    MultipartUpload {
+        upload_id: upload_id.into(),
+        bucket: u.bucket.clone(),
+        key: u.key.clone(),
+        content_type: u.content_type.clone(),
+        user_meta: pairs(&u.user_meta),
+        tags: pairs(&u.tags),
+        checksum_algorithm: u.checksum_algorithm.clone(),
+        initiated_at: u.initiated_at.clone(),
+    }
+}
+
+fn pairs(map: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
+    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 /// Unique chunk ids referenced by an extent list (sorted).
@@ -926,7 +741,6 @@ pub fn slice_extents(extents: &[Extent], start: u64, length: u64) -> Vec<Extent>
     }
     out
 }
-
 
 enum DelimEntry {
     Object(ObjectMeta),
@@ -979,14 +793,7 @@ pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
 }
 
 fn pb_extents(extents: &[Extent]) -> Vec<pb::Extent> {
-    extents
-        .iter()
-        .map(|e| pb::Extent {
-            chunk: e.chunk,
-            offset: e.offset,
-            len: e.len,
-        })
-        .collect()
+    crate::commands::to_pb(extents)
 }
 
 fn pb_pairs(pairs: &[(String, String)]) -> Vec<pb::Pair> {

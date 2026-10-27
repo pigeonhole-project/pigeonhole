@@ -8,6 +8,7 @@ pub use index::{
     parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ObjectMeta,
 };
 pub use pigeonhole_chunk_store::{ChunkStore, Config, Extent};
+pub use commands::S3State;
 pub use service::S3Gateway;
 
 use s3s::auth::SimpleAuth;
