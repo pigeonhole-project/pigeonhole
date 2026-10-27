@@ -6,6 +6,7 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod chat;
 #[cfg(any(test, feature = "testsuite"))]
 pub mod conformance;
 mod local;
@@ -65,7 +66,7 @@ pub type Position = u64;
 /// Identity of one log history, fixed when the log is first claimed. A local
 /// state applied up to some position is only meaningful for the same log: a
 /// recreated log reuses positions for different entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LogId(pub u128);
 
 impl LogId {

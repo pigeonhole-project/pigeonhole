@@ -315,3 +315,32 @@ async fn confirm_active_detects_a_fence_without_any_proposal() {
     assert_eq!(err.downcast::<Stop>().unwrap(), Stop::Fenced { current: 2 });
     assert!(a.is_stopped());
 }
+
+#[tokio::test]
+async fn the_tablet_runs_over_a_chat_log() {
+    use crate::log::chat::{fake::FakeChat, ChatLogOptions, ChatLogStore};
+    let chat = Arc::new(FakeChat::default());
+    let open = || {
+        let opts = ChatLogOptions {
+            straggler_window: Duration::ZERO,
+            head_retries: 1,
+            head_retry_delay: Duration::from_millis(1),
+        };
+        let log = Arc::new(ChatLogStore::new(chat.clone(), opts));
+        MetaStore::open(log, counter(), MetaOptions { snapshot_every: 7, ..MetaOptions::default() })
+    };
+    let a = open().await.unwrap();
+    for i in 0..20u64 {
+        a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    let state = snapshot(&a);
+
+    let b = open().await.unwrap();
+    assert_eq!(b.applied_position(), 20);
+    assert_eq!(snapshot(&b), state, "snapshot + tail from the chat rebuild the state");
+    let err = a.propose::<Counter>(op(100, 1)).await.unwrap_err();
+    assert_eq!(err.downcast::<Stop>().unwrap(), Stop::Fenced { current: 2 });
+    b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
+    assert_eq!(value(&b), 21);
+    assert!(chat.inner.lock().unwrap().docs.len() < 20, "messages behind snapshots are collected");
+}
