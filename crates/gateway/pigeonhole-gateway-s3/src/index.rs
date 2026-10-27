@@ -35,6 +35,16 @@ pub struct ObjectMeta {
     pub mtime: String,
 }
 
+/// One version of an object as a GET sees it, read under one lock.
+#[derive(Debug, Clone)]
+pub struct ObjectView {
+    pub meta: ObjectMeta,
+    pub extents: Vec<Extent>,
+    pub user_meta: Vec<(String, String)>,
+    pub tag_count: usize,
+    pub checksums_json: String,
+}
+
 /// Snapshot of a copy source, see [`Index::get_copy_source`].
 #[derive(Debug, Clone)]
 pub struct SourceSnapshot {
@@ -208,6 +218,17 @@ impl Index {
 
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         Ok(self.object(bucket, key, |o| object_meta(bucket, key, o)))
+    }
+
+    /// Everything a GET needs from one version of the object.
+    pub async fn get_object_view(&self, bucket: &str, key: &str) -> Result<Option<ObjectView>> {
+        Ok(self.object(bucket, key, |o| ObjectView {
+            meta: object_meta(bucket, key, o),
+            extents: o.extents.clone(),
+            user_meta: pairs(&o.user_meta),
+            tag_count: o.tags.len(),
+            checksums_json: o.checksums_json.clone(),
+        }))
     }
 
     pub async fn get_extents(&self, bucket: &str, key: &str) -> Result<Option<Vec<Extent>>> {

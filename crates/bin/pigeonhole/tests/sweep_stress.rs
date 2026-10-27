@@ -5,12 +5,9 @@
 //! - every object visible in the index reads back intact (no reclaimed live parts);
 //! - after quiescence, backend keys == committed live parts (garbage, including a
 //!   dead writer's uncommitted uploads, is fully reclaimed);
-//! - a restart that replays the metadata logs reads every object.
-//!
-//! Known gap: a GET racing an overwrite/delete of the same key can fail or return a
-//! truncated body, because nothing pins chunks for the duration of a read and the
-//! sweeper may reclaim them mid-stream. Such mid-stress GET failures are counted and
-//! reported but tolerated until reads hold a lease; everything else is strict.
+//! - a restart that replays the metadata logs reads every object;
+//! - a GET racing an overwrite / delete of the same key returns some whole
+//!   version or NoSuchKey, never an error or a torn body (reads pin chunks).
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -179,8 +176,6 @@ struct Counters {
     copies_src_missing: AtomicU64,
     deletes: AtomicU64,
     gets: AtomicU64,
-    /// GETs that failed while racing a concurrent overwrite/delete (known gap).
-    racy_get_failures: AtomicU64,
 }
 
 async fn worker(s3: Arc<pigeonhole::S3Gateway>, id: u64, c: Arc<Counters>) -> Vec<String> {
@@ -250,13 +245,14 @@ async fn worker(s3: Arc<pigeonhole::S3Gateway>, id: u64, c: Arc<Counters>) -> Ve
             }
             _ => {
                 c.gets.fetch_add(1, Ordering::Relaxed);
-                let ok = match get_object(&s3, &k).await {
-                    Ok(Some(data)) => verify_payload(&data).is_ok(),
-                    Ok(None) => true,
-                    Err(_) => false,
-                };
-                if !ok {
-                    c.racy_get_failures.fetch_add(1, Ordering::Relaxed);
+                match get_object(&s3, &k).await {
+                    Ok(Some(data)) => {
+                        if let Err(e) = verify_payload(&data) {
+                            failures.push(format!("get {k}: {e}"));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => failures.push(e),
                 }
             }
         }
@@ -350,14 +346,13 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     sweep_task.await.unwrap();
 
     eprintln!(
-        "puts={} copies={} copies_src_missing={} deletes={} gets={} racy_get_failures={} \
+        "puts={} copies={} copies_src_missing={} deletes={} gets={} \
          sweep_passes={} swept_keys={}",
         counters.puts.load(Ordering::Relaxed),
         counters.copies.load(Ordering::Relaxed),
         counters.copies_src_missing.load(Ordering::Relaxed),
         counters.deletes.load(Ordering::Relaxed),
         counters.gets.load(Ordering::Relaxed),
-        counters.racy_get_failures.load(Ordering::Relaxed),
         sweep_passes.load(Ordering::Relaxed),
         sweep_deleted.load(Ordering::Relaxed),
     );

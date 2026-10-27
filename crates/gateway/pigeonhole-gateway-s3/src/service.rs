@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tracing::info;
 
 
+/// GET re-reads the object this many times if its chunks are reclaimed underneath it.
+const GET_ATTEMPTS: u32 = 5;
+
 #[derive(Clone)]
 pub struct S3Gateway {
     pub cfg: Config,
@@ -984,78 +987,66 @@ impl S3 for S3Gateway {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
-        let meta = self
-            .index
-            .get_object(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?
-            .ok_or_else(|| s3_error!(NoSuchKey))?;
-
-        let extents = self
-            .index
-            .get_extents(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?
-            .unwrap_or_default();
-
-        let total = meta.size as u64;
-        let (start, end_inclusive) = match input.range {
-            None => (0u64, total.saturating_sub(1)),
-            Some(Range::Int { first, last }) => {
-                let last = last
-                    .unwrap_or(total.saturating_sub(1))
-                    .min(total.saturating_sub(1));
-                if first >= total || first > last {
-                    return Err(s3_error!(InvalidRange));
-                }
-                (first, last)
-            }
-            Some(Range::Suffix { length }) => {
-                if length == 0 || total == 0 {
-                    return Err(s3_error!(InvalidRange));
-                }
-                let start = total.saturating_sub(length);
-                (start, total.saturating_sub(1))
-            }
-        };
-        let length = if total == 0 {
-            0
-        } else {
-            end_inclusive.saturating_sub(start) + 1
-        };
-
-        let body = if length == 0 {
-            Some(StreamingBlob::from_bytes(Bytes::new()))
-        } else {
-            let range = start..(start.saturating_add(length));
-            let data = self
-                .store
-                .read(&extents, Some(range))
+        // Read one version of the object, then its chunks. If the chunks went
+        // away meanwhile (overwritten or deleted, then reclaimed), that version
+        // is gone: look the key up again.
+        let mut attempt = 0;
+        let (view, start, end_inclusive, length, body) = loop {
+            attempt += 1;
+            let view = self
+                .index
+                .get_object_view(&input.bucket, &input.key)
                 .await
-                .map_err(Self::map_err)?;
-            Some(StreamingBlob::from_bytes(data))
+                .map_err(Self::map_err)?
+                .ok_or_else(|| s3_error!(NoSuchKey))?;
+            let total = view.meta.size as u64;
+            let (start, end_inclusive) = match input.range {
+                None => (0u64, total.saturating_sub(1)),
+                Some(Range::Int { first, last }) => {
+                    let last = last
+                        .unwrap_or(total.saturating_sub(1))
+                        .min(total.saturating_sub(1));
+                    if first >= total || first > last {
+                        return Err(s3_error!(InvalidRange));
+                    }
+                    (first, last)
+                }
+                Some(Range::Suffix { length }) => {
+                    if length == 0 || total == 0 {
+                        return Err(s3_error!(InvalidRange));
+                    }
+                    let start = total.saturating_sub(length);
+                    (start, total.saturating_sub(1))
+                }
+            };
+            let length = if total == 0 {
+                0
+            } else {
+                end_inclusive.saturating_sub(start) + 1
+            };
+            if length == 0 {
+                break (view, start, end_inclusive, length, Bytes::new());
+            }
+            let range = start..(start.saturating_add(length));
+            match self.store.read(&view.extents, Some(range)).await {
+                Ok(data) => break (view, start, end_inclusive, length, data),
+                Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) && attempt < GET_ATTEMPTS => continue,
+                Err(e) => return Err(Self::map_err(e)),
+            }
         };
+        let total = view.meta.size as u64;
+        let meta = view.meta;
+        let body = Some(StreamingBlob::from_bytes(body));
         let content_range = input
             .range
             .as_ref()
             .map(|_| format!("bytes {start}-{end_inclusive}/{total}"));
-
-        let user_meta = self
-            .index
-            .get_user_metadata(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?;
-        let metadata = if user_meta.is_empty() {
+        let metadata = if view.user_meta.is_empty() {
             None
         } else {
-            Some(user_meta.into_iter().collect())
+            Some(view.user_meta.into_iter().collect())
         };
-        let tag_count = self
-            .index
-            .get_object_tags(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?
-            .len() as i32;
+        let tag_count = view.tag_count as i32;
 
         let checksum_enabled = input
             .checksum_mode
@@ -1063,12 +1054,7 @@ impl S3 for S3Gateway {
             .is_some_and(|m| m.as_str() == ChecksumMode::ENABLED);
         let full_object = length == total;
         let stored_checksum = if checksum_enabled && full_object {
-            self.index
-                .get_object_checksums_json(&input.bucket, &input.key)
-                .await
-                .map_err(Self::map_err)?
-                .map(|j| checksum_from_json(&j))
-                .unwrap_or_default()
+            checksum_from_json(&view.checksums_json)
         } else {
             Checksum::default()
         };

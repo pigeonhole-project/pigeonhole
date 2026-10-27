@@ -180,11 +180,23 @@ impl ChunkStore {
     }
 
     /// Read a logical byte range across extents (None = entire concatenation).
+    ///
+    /// The chunks stay pinned for the whole read, so the sweeper does not
+    /// delete their parts underneath it. A chunk already reclaimed (the object
+    /// was overwritten or deleted after its extents were read) fails with
+    /// [`ChunkGone`](crate::ChunkGone): re-read the extents and retry.
     pub async fn read(
         &self,
         extents: &[Extent],
         range: Option<ByteRange>,
     ) -> Result<Bytes> {
+        let ids: Vec<ChunkId> = extents.iter().map(|e| e.chunk).collect();
+        let _pin = self.db.pin_reads(&ids);
+        for &chunk_id in &ids {
+            if !self.db.chunk_readable(chunk_id) {
+                return Err(anyhow::Error::new(crate::ChunkGone { chunk_id }));
+            }
+        }
         let mut pieces = Vec::new();
         let mut cursor = 0u64;
         for ext in extents {
@@ -192,7 +204,7 @@ impl ChunkStore {
                 .db
                 .chunk_meta(ext.chunk)
                 .await?
-                .with_context(|| format!("unknown chunk_id {}", ext.chunk))?;
+                .ok_or(crate::ChunkGone { chunk_id: ext.chunk })?;
             let chunk_size = meta.0;
             let ext_off = ext.offset.max(0);
             let ext_len = if ext.len < 0 {

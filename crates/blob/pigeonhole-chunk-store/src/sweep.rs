@@ -117,6 +117,13 @@ impl Sweeper {
             if !self.db.try_begin_reclaim(chunk_id).await? {
                 continue;
             }
+            // Committed as reclaiming first, then the pins: a reader that pins
+            // later sees `reclaiming` and backs off; one already reading
+            // keeps the parts until the next pass.
+            if self.db.is_read_pinned(chunk_id) {
+                debug!(chunk_id, "reclaim deferred: chunk is being read");
+                continue;
+            }
             let layouts = self.db.get_replica_layouts(chunk_id).await?;
             for layout in &layouts {
                 let Some(backend) = self
@@ -211,14 +218,15 @@ impl Sweeper {
     }
 
     /// Split a candidate batch (all at or below the horizon) into
-    /// `(to_delete, skipped_live)`: committed parts of live chunks stay.
+    /// `(to_delete, skipped)`: parts of any chunk in the state stay (live ones,
+    /// and released ones that reclaim will delete once nobody reads them).
     async fn filter_deletable(
         &self,
         instance_id: &str,
         keys: &[Vec<u8>],
     ) -> Result<(Vec<Vec<u8>>, u64)> {
-        let live = self.db.live_part_keys_among(instance_id, keys).await?;
-        let to_delete: Vec<Vec<u8>> = keys.iter().filter(|k| !live.contains(*k)).cloned().collect();
+        let owned = self.db.owned_part_keys_among(instance_id, keys).await?;
+        let to_delete: Vec<Vec<u8>> = keys.iter().filter(|k| !owned.contains(*k)).cloned().collect();
         let skipped = (keys.len() - to_delete.len()) as u64;
         Ok((to_delete, skipped))
     }
@@ -386,6 +394,30 @@ mod tests {
         for k in keys_before {
             assert!(!f.mem.message_keys().contains(&k));
         }
+    }
+
+    #[tokio::test]
+    async fn reclaim_waits_for_readers_and_late_readers_back_off() {
+        let f = setup().await;
+        let id = f.layer.put_small(Bytes::from_static(b"being-read")).await.unwrap();
+        let keys = f.mem.message_keys();
+        let reading = f.db.pin_reads(&[id]);
+        f.layer.release(&[id]).await.unwrap();
+
+        // Committed as reclaiming, but a read holds it: parts stay.
+        let stats = sweeper(&f).sweep_once().await.unwrap();
+        assert_eq!(stats.zero_ref_chunks, 0);
+        assert_eq!(f.mem.message_keys(), keys);
+
+        // A read starting now sees `reclaiming` and gets ChunkGone.
+        let extents = [crate::Extent { chunk: id, offset: 0, len: 10 }];
+        let err = f.layer.read(&extents, None).await.unwrap_err();
+        assert!(crate::is_chunk_gone(&err), "{err:#}");
+
+        drop(reading);
+        let stats = sweeper(&f).sweep_once().await.unwrap();
+        assert_eq!(stats.zero_ref_chunks, 1);
+        assert!(f.db.chunk_meta(id).await.unwrap().is_none());
     }
 
     #[tokio::test]

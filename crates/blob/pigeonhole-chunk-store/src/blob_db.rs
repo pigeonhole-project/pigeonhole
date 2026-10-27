@@ -2,7 +2,7 @@
 //!
 //! Chunk state (instances, chunks, blocks, parts) lives in the tablet's
 //! [`ChunkState`] and changes only through `chunk` commands. Node-local
-//! progress (sweep cursor, repair queue) is kept in this
+//! progress (sweep cursor, repair queue, read pins) is kept in this
 //! process: it is not replicated and starts empty on every boot.
 
 use crate::commands::{ChunkCommand, ChunkRec, ChunkReject, ChunkState, InstanceRec, Replica, NAMESPACE};
@@ -65,10 +65,35 @@ struct NodeLocal {
     repair_seq: u64,
 }
 
+/// Chunks being read right now (chunk → readers). Reclaim leaves a pinned
+/// chunk's parts alone until the readers are done.
+type ReadPins = Arc<Mutex<HashMap<ChunkId, usize>>>;
+
+/// Pin on the chunks of one read; [`Drop`] releases it.
+pub struct ReadPin {
+    pins: ReadPins,
+    ids: Vec<ChunkId>,
+}
+
+impl Drop for ReadPin {
+    fn drop(&mut self) {
+        let mut pins = self.pins.lock().unwrap();
+        for id in &self.ids {
+            if let Some(n) = pins.get_mut(id) {
+                *n -= 1;
+                if *n == 0 {
+                    pins.remove(id);
+                }
+            }
+        }
+    }
+}
+
 /// Chunk-store view of the metadata tablet.
 #[derive(Clone)]
 pub struct BlobDb {
     meta: Arc<MetaStore>,
+    read_pins: ReadPins,
     /// Next chunk id to hand out; ids are chosen by the proposer (see commands.rs).
     next_chunk_id: Arc<AtomicI64>,
     local: Arc<Mutex<NodeLocal>>,
@@ -101,6 +126,7 @@ impl BlobDb {
         let last = meta.read::<ChunkState, _>(|s| s.last_chunk_id);
         Ok(Self {
             meta,
+            read_pins: Arc::default(),
             next_chunk_id: Arc::new(AtomicI64::new(last + 1)),
             local: Arc::default(),
         })
@@ -269,6 +295,29 @@ impl BlobDb {
         Ok(())
     }
 
+    /// Pin `ids` for a read. Pin first, then check [`Self::chunk_readable`]:
+    /// reclaim commits `BeginReclaim` first, then checks pins, so one of the
+    /// two always sees the other.
+    pub fn pin_reads(&self, ids: &[ChunkId]) -> ReadPin {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut pins = self.read_pins.lock().unwrap();
+        for id in &ids {
+            *pins.entry(*id).or_default() += 1;
+        }
+        ReadPin { pins: self.read_pins.clone(), ids }
+    }
+
+    pub fn is_read_pinned(&self, chunk_id: ChunkId) -> bool {
+        self.read_pins.lock().unwrap().contains_key(&chunk_id)
+    }
+
+    /// The chunk exists and is not being reclaimed.
+    pub fn chunk_readable(&self, chunk_id: ChunkId) -> bool {
+        self.chunk(chunk_id, |c| !c.reclaiming).unwrap_or(false)
+    }
+
     /// Highest sort key of any committed part on `instance_id`.
     pub fn max_part_key(&self, instance_id: &str) -> Option<Vec<u8>> {
         self.read(|s| {
@@ -292,21 +341,17 @@ impl BlobDb {
         }))
     }
 
-    /// Which of `keys` belong to live (`refs > 0`, not reclaiming) chunks on this
-    /// instance. Used by the sweeper per batch (never cache across batches).
-    pub async fn live_part_keys_among(
+    /// Which of `keys` are parts of a chunk in the state on this instance, live
+    /// or not: those are reclaim's to delete (it respects read pins), never the
+    /// orphan sweep's. Used by the sweeper per batch (never cache across batches).
+    pub async fn owned_part_keys_among(
         &self,
         instance_id: &str,
         keys: &[Vec<u8>],
     ) -> Result<HashSet<Vec<u8>>> {
         Ok(self.read(|s| {
             keys.iter()
-                .filter(|k| {
-                    s.by_key
-                        .get(&(instance_id.to_string(), (*k).clone()))
-                        .and_then(|id| s.chunks.get(id))
-                        .is_some_and(ChunkRec::is_live)
-                })
+                .filter(|k| s.by_key.contains_key(&(instance_id.to_string(), (*k).clone())))
                 .cloned()
                 .collect()
         }))
