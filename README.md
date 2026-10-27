@@ -45,7 +45,7 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 |---|---|
 | `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
 | `core/pigeonhole-codec` | Codecs + `BlockWriter` |
-| `meta/pigeonhole-meta` | Metadata state machine: layer commands applied to SQLite (`MetaStore`, `Namespace`) |
+| `meta/pigeonhole-meta` | Metadata tablet: layer commands in a fencing `LogStore`, applied to in-memory `StateMachine`s (`MetaStore`) |
 | `blob/pigeonhole-blob` | `BlobBackend`, `Replicated`, rate limits, `BootstrapPointer`, cache knobs |
 | `blob/pigeonhole-chunk-store` | `ChunkStore`, ingest, roots, durability, sweeper, repair, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
@@ -185,7 +185,7 @@ comments. Sections:
 | `[[instances]]` | Backends (≥ 1): id, kind (`telegram` / `discord` / `memory`), token env, chat/channel, role, `max_blob_size` |
 | `[placement]` | Write group + quorum; required with several read-write instances |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `[meta]` | Metadata tablet: `db_path` (SQLite state shared by all layers, tables prefixed `chunk_` / `s3_` / `cas_`), `batch_max_delay_ms` / `batch_max_entries` (group commit) |
+| `[meta]` | Metadata tablet: `batch_max_delay_ms` / `batch_max_entries` (group commit) |
 | `[meta.log]` | Command log: `kind = "local"`, `path` (directory) |
 | `[chunk]` | `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
@@ -203,10 +203,10 @@ half-applied.
 ## Durability and restore
 
 Every metadata change is a layer command. `pigeonhole-meta` appends it to the
-command log (`[meta.log]`, fsynced per batch) and then applies it; the log is
-the source of truth and every boot rebuilds the state by replaying it (see
-[docs/meta-backends.md](docs/meta-backends.md)). Losing the SQLite file
-(`[meta].db_path`) loses nothing.
+command log (`[meta.log]`, fsynced per batch) and then applies it to the
+in-memory state of its layer (`chunk`, `s3`, `cas`); the log is the source of
+truth and every boot rebuilds the state by replaying it (see
+[docs/meta-backends.md](docs/meta-backends.md)). There is no local database.
 
 **Losing the disk loses the metadata.** The only LogStore so far is `local`, on
 the same disk; nothing is pushed into the blob backend any more (the old

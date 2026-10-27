@@ -29,11 +29,9 @@ fn req<T>(input: T) -> S3Request<T> {
     }
 }
 
-async fn tablet(dir: &Path, db: &str) -> Arc<MetaStore> {
-    let url = format!("sqlite:{}", dir.join(db).display());
+async fn tablet(dir: &Path) -> Arc<MetaStore> {
     let log = LocalLogStore::open(dir.join("log")).unwrap();
     MetaStore::open(
-        &url,
         Arc::new(log),
         Index::register(BlobDb::register(Namespaces::new())),
         MetaOptions::default(),
@@ -50,7 +48,7 @@ fn replicated_state(meta: &MetaStore) -> (Vec<u8>, Vec<u8>) {
 #[tokio::test]
 async fn replay_rebuilds_chunk_and_s3_state() {
     let dir = tempfile::tempdir().unwrap();
-    let meta = tablet(dir.path(), "a.db").await;
+    let meta = tablet(dir.path()).await;
     let cfg = Config::for_test(dir.path());
     let db = BlobDb::open(meta.clone()).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
@@ -87,12 +85,12 @@ async fn replay_rebuilds_chunk_and_s3_state() {
         .await;
 
     let before = replicated_state(&meta);
-    let position = meta.applied_position().await.unwrap();
+    let position = meta.applied_position();
     assert!(position > 20, "every metadata change went through the log");
     drop(s3);
 
-    let replayed = tablet(dir.path(), "b.db").await;
-    assert_eq!(replayed.applied_position().await.unwrap(), position);
+    let replayed = tablet(dir.path()).await;
+    assert_eq!(replayed.applied_position(), position);
     assert_eq!(replicated_state(&replayed), before);
     let (chunk, s3) = &before;
     assert_eq!(&ChunkState::restore(chunk).unwrap().snapshot(), chunk, "restore inverts snapshot");

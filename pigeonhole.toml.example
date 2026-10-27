@@ -9,10 +9,9 @@ listen_addr = "0.0.0.0:8333"
 region = "us-east-1"
 
 # Metadata tablet (docs/meta-backends.md): every metadata change is appended to
-# the command log, then applied to the local SQLite file. The log is the source
-# of truth; a second process on the same log fences (stops) the first.
+# the command log, then applied to in-memory state; every boot replays the log.
+# A second process on the same log fences (stops) the first.
 [meta]
-db_path = "pigeonhole-meta.db"
 batch_max_delay_ms = 0        # group commit window; 0 = append when the previous append returns
 # batch_max_entries = 1024
 

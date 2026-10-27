@@ -36,7 +36,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
         batch_max_delay: cfg.meta.batch_max_delay,
         batch_max_entries: cfg.meta.batch_max_entries,
     };
-    let meta = MetaStore::open(&cfg.meta.db_url(), log, namespaces, opts)
+    let meta = MetaStore::open(log, namespaces, opts)
         .await
         .context("boot metadata tablet")?;
     info!(generation = meta.generation(), "metadata tablet active");

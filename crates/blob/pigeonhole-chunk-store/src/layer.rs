@@ -646,12 +646,12 @@ pub fn default_layer_opts() -> IngestOptions {
     IngestOptions::new(DEFAULT_LOGICAL_CHUNK_SIZE, ChunkCodec::Zstd)
 }
 
-/// Test helper: open a memory-backed layer with a temp `blob.db`.
+/// Test helper: open a memory-backed layer over a local log in `log_dir`.
 #[cfg(test)]
-pub async fn open_memory_chunk_store(db_url: &str) -> Result<ChunkStore> {
+pub async fn open_memory_chunk_store(log_dir: impl AsRef<std::path::Path>) -> Result<ChunkStore> {
     use pigeonhole_codec::DEFAULT_BLOCK_SIZE;
     use pigeonhole_storage_memory::MemoryBlobStore;
-    let db = BlobDb::connect(db_url).await?;
+    let db = BlobDb::connect(log_dir).await?;
     let mut opts = default_layer_opts();
     opts.chunk_size = 64 * 1024;
     opts.block_size = DEFAULT_BLOCK_SIZE.min(64 * 1024);
@@ -669,8 +669,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_ingests_do_not_collide_sort_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let layer = Arc::new(open_memory_chunk_store(&url).await.unwrap());
+        let log_dir = dir.path().join("blob.log");
+        let layer = Arc::new(open_memory_chunk_store(&log_dir).await.unwrap());
         let mut joins = Vec::new();
         for i in 0..32u8 {
             let layer = layer.clone();
@@ -695,8 +695,8 @@ mod tests {
     #[tokio::test]
     async fn ingest_read_retain_release_root() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let layer = open_memory_chunk_store(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let layer = open_memory_chunk_store(&log_dir).await.unwrap();
 
         let body = Bytes::from(vec![7u8; 200_000]);
         let ingested = layer
@@ -725,8 +725,8 @@ mod tests {
     async fn put_200mib_two_limits_range_per_replica() {
         const MIB: usize = 1024 * 1024;
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let db = BlobDb::connect(&log_dir).await.unwrap();
 
         let a = MemoryBlobStore::with_limits(BackendLimits {
             max_blob_size: 19 * MIB,
@@ -834,8 +834,8 @@ mod tests {
     async fn lose_one_instance_still_reads() {
         const MIB: usize = 1024 * 1024;
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         let a = MemoryBlobStore::with_limits(BackendLimits::memory())
             .with_instance_id("a")
             .with_unavailable_flag();
@@ -870,12 +870,12 @@ mod tests {
     #[tokio::test]
     async fn large_put_under_small_budget_completes() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+        let log_dir = dir.path().join("blob.log");
         let budget = ByteBudget::new(32 * 1024 * 1024);
         let mut opts = IngestOptions::new(8 * 1024 * 1024, ChunkCodec::Zstd);
         opts.block_size = 1024 * 1024;
         opts.memory_budget = Some(budget.clone());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
             .await
             .unwrap();
@@ -905,14 +905,11 @@ mod tests {
             let budget = budget.clone();
             joins.push(tokio::spawn(async move {
                 let dir = tempfile::tempdir().unwrap();
-                let url = format!(
-                    "sqlite:{}?mode=rwc",
-                    dir.path().join(format!("blob-{i}.db")).display()
-                );
+                let log_dir = dir.path().join(format!("blob-{i}.log"));
                 let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
                 opts.block_size = 512 * 1024;
                 opts.memory_budget = Some(budget);
-                let db = BlobDb::connect(&url).await.unwrap();
+                let db = BlobDb::connect(&log_dir).await.unwrap();
                 let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
                     .await
                     .unwrap();
@@ -947,14 +944,11 @@ mod tests {
             let budget = budget.clone();
             joins.push(tokio::spawn(async move {
                 let dir = tempfile::tempdir().unwrap();
-                let url = format!(
-                    "sqlite:{}?mode=rwc",
-                    dir.path().join(format!("blob-{i}.db")).display()
-                );
+                let log_dir = dir.path().join(format!("blob-{i}.log"));
                 let mut opts = IngestOptions::new(2 * 1024 * 1024, ChunkCodec::Raw);
                 opts.block_size = frame;
                 opts.memory_budget = Some(budget);
-                let db = BlobDb::connect(&url).await.unwrap();
+                let db = BlobDb::connect(&log_dir).await.unwrap();
                 let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
                     .await
                     .unwrap();
@@ -989,11 +983,11 @@ mod tests {
     async fn cancel_mid_put_returns_budget() {
         let budget = ByteBudget::new(16 * 1024 * 1024);
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+        let log_dir = dir.path().join("blob.log");
         let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
         opts.block_size = 512 * 1024;
         opts.memory_budget = Some(budget.clone());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         let layer = Arc::new(
             ChunkStore::open(db, MemoryBlobStore::new(), opts)
                 .await

@@ -5,7 +5,7 @@
 //! - every object visible in the index reads back intact (no reclaimed live parts);
 //! - after quiescence, backend keys == committed live parts (garbage, including a
 //!   dead writer's uncommitted uploads, is fully reclaimed);
-//! - losing the SQLite files and replaying the metadata log reads every object.
+//! - a restart that replays the metadata logs reads every object.
 //!
 //! Known gap: a GET racing an overwrite/delete of the same key can fail or return a
 //! truncated body, because nothing pins chunks for the duration of a read and the
@@ -118,14 +118,14 @@ struct Node {
 }
 
 async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
-    let idx_url = format!("sqlite:{}?mode=rwc", dir.join("s3.db").display());
-    let blob_url = format!("sqlite:{}?mode=rwc", dir.join("blob.db").display());
+    let idx_log = dir.join("s3.log");
+    let blob_log = dir.join("blob.log");
     let mut cfg = Config::for_test(dir);
     cfg.chunk_size = CHUNK_SIZE;
     cfg.block_size = BLOCK_SIZE;
 
-    let index = Index::connect(&idx_url).await.unwrap();
-    let db = BlobDb::connect(&blob_url).await.unwrap();
+    let index = Index::connect(&idx_log).await.unwrap();
+    let db = BlobDb::connect(&blob_log).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
 
@@ -397,20 +397,13 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     assert!(garbage.is_empty(), "unreclaimed backend keys: {garbage:?}");
     assert!(missing.is_empty(), "live keys deleted from backend: {missing:?}");
 
-    // Lost local state: the SQLite files go, the metadata logs (`*.db.log/`)
-    // stay, and boot replays them.
+    // Restart: all metadata state is gone, boot replays the metadata logs.
     drop(sw);
     drop(node);
-    for f in std::fs::read_dir(dir.path()).unwrap() {
-        let path = f.unwrap().path();
-        if path.is_file() {
-            std::fs::remove_file(path).unwrap();
-        }
-    }
     let restored = open_node(dir.path(), mem).await;
     assert_eq!(
         verify_all(&restored.s3, "after replay").await,
         live,
-        "restore lost or changed objects"
+        "replay lost or changed objects"
     );
 }

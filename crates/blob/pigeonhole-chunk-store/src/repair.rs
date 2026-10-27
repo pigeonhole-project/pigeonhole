@@ -386,8 +386,8 @@ mod tests {
         block_size: usize,
     ) -> (tempfile::TempDir, ChunkStore, Arc<Replicated>) {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         let rep = Arc::new(
             Replicated::new(members, write_quorum, Arc::new(CheapestFirst::new())).unwrap(),
         );

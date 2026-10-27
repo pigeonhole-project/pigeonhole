@@ -55,11 +55,9 @@ pub struct Config {
     pub config_path: PathBuf,
 }
 
-/// Metadata tablet: local SQLite cache + command log (`[meta]`, `[meta.log]`).
+/// Metadata tablet: group commit knobs and the command log (`[meta]`, `[meta.log]`).
 #[derive(Clone, Debug)]
 pub struct MetaSettings {
-    /// SQLite file holding the applied state.
-    pub db_path: PathBuf,
     /// Group commit window; `0` = append as soon as the previous append returns.
     pub batch_max_delay: Duration,
     pub batch_max_entries: usize,
@@ -74,15 +72,9 @@ pub enum LogSettings {
 }
 
 impl MetaSettings {
-    /// `sqlite:` url of [`Self::db_path`].
-    pub fn db_url(&self) -> String {
-        format!("sqlite:{}", self.db_path.display())
-    }
-
-    /// Defaults with every file under `dir` (tests).
+    /// Defaults with the log under `dir` (tests).
     pub fn in_dir(dir: &Path) -> Self {
         let mut meta = FileMeta::default().into_settings();
-        meta.db_path = dir.join(&meta.db_path);
         let LogSettings::Local { path } = &mut meta.log;
         *path = dir.join(&*path);
         meta
@@ -358,7 +350,6 @@ impl Default for FileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileMeta {
-    db_path: PathBuf,
     batch_max_delay_ms: u64,
     batch_max_entries: usize,
     log: FileLog,
@@ -373,7 +364,6 @@ enum FileLog {
 impl Default for FileMeta {
     fn default() -> Self {
         Self {
-            db_path: "pigeonhole-meta.db".into(),
             batch_max_delay_ms: 0,
             batch_max_entries: 1024,
             log: FileLog::default(),
@@ -390,7 +380,6 @@ impl Default for FileLog {
 impl FileMeta {
     fn into_settings(self) -> MetaSettings {
         MetaSettings {
-            db_path: self.db_path,
             batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
             batch_max_entries: self.batch_max_entries.max(1),
             log: match self.log {
@@ -844,7 +833,6 @@ upload_concurrency = 4
         assert_eq!(cfg.tg.upload_concurrency, 4);
         assert_eq!(cfg.placement.group, vec!["mem".to_string()]);
         assert_eq!(cfg.placement.write_quorum, 1);
-        assert_eq!(cfg.meta.db_path, PathBuf::from("pigeonhole-meta.db"));
         assert_eq!(cfg.meta.batch_max_delay, Duration::ZERO);
         assert_eq!(cfg.meta.log, LogSettings::Local { path: "pigeonhole-log".into() });
     }
@@ -852,13 +840,12 @@ upload_concurrency = 4
     #[test]
     fn parses_meta_section() {
         let cfg = load(&format!(
-            "[meta]\ndb_path = \"m.db\"\nbatch_max_delay_ms = 250\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
+            "[meta]\nbatch_max_delay_ms = 250\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
         ))
         .unwrap();
-        assert_eq!(cfg.meta.db_url(), "sqlite:m.db");
         assert_eq!(cfg.meta.batch_max_delay, Duration::from_millis(250));
         assert_eq!(cfg.meta.log, LogSettings::Local { path: "/var/log-dir".into() });
-        for bad in ["[meta.log]\nkind = \"s3\"\n", "[meta.log]\nkind = \"local\"\nchat_id = 1\n"] {
+        for bad in ["[meta]\ndb_path = \"m.db\"\n", "[meta.log]\nkind = \"s3\"\n", "[meta.log]\nkind = \"local\"\nchat_id = 1\n"] {
             assert!(load(&format!("{bad}{MEM}")).is_err(), "{bad:?} accepted");
         }
     }

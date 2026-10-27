@@ -25,8 +25,8 @@ async fn test_harness() -> (
     tempfile::TempDir,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let cas_url = format!("sqlite:{}?mode=rwc", dir.path().join("cas.db").display());
-    let blob_url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
+    let cas_url = dir.path().join("cas.log");
+    let blob_url = dir.path().join("blob.log");
     let cas = CasIndex::connect(&cas_url).await.unwrap();
     let db = BlobDb::connect(&blob_url).await.unwrap();
     let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);

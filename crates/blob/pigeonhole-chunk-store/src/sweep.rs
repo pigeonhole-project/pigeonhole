@@ -351,8 +351,8 @@ mod tests {
 
     async fn setup() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
         let backend = WatermarkBackend::wrap(
             Arc::new(erase_sweep(mem.clone())),

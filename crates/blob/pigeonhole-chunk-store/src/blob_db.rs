@@ -84,11 +84,11 @@ impl std::fmt::Debug for BlobDb {
 }
 
 impl BlobDb {
-    /// Open a standalone tablet at `database_url` (local log next to it) with
-    /// only this namespace.
-    pub async fn connect(database_url: &str) -> Result<Self> {
+    /// Open a standalone tablet over a local log in `log_dir` with only this
+    /// namespace.
+    pub async fn connect(log_dir: impl AsRef<std::path::Path>) -> Result<Self> {
         let namespaces = Self::register(Namespaces::new());
-        Self::open(MetaStore::open_local(database_url, namespaces).await?).await
+        Self::open(MetaStore::open_local(log_dir, namespaces).await?).await
     }
 
     /// Add the `chunk` namespace to the set passed to [`MetaStore::open`].
@@ -461,8 +461,8 @@ mod tests {
     #[tokio::test]
     async fn instances_and_refs_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         let info = InstanceInfo {
             id: "tg-main".into(),
             kind: InstanceKind::Telegram,
@@ -506,8 +506,8 @@ mod tests {
     #[tokio::test]
     async fn missing_from_config_becomes_retired() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         let a = InstanceInfo {
             id: "a".into(),
             kind: InstanceKind::Memory,
@@ -523,8 +523,8 @@ mod tests {
     #[tokio::test]
     async fn reclaim_then_retain_returns_chunk_gone() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         let info = InstanceInfo {
             id: "mem".into(),
             kind: InstanceKind::Memory,
@@ -587,8 +587,8 @@ mod tests {
     #[tokio::test]
     async fn reclaimed_chunk_ids_are_never_reused() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         db.sync_instances(&[InstanceInfo {
             id: "mem".into(),
             kind: InstanceKind::Memory,
@@ -635,9 +635,7 @@ mod tests {
         db.release(&[new]).await.unwrap();
         assert!(db.try_begin_reclaim(new).await.unwrap());
         db.delete_chunk_metadata(new).await.unwrap();
-        let url2 = format!("sqlite:{}?mode=rwc", dir.path().join("replayed.db").display());
-        std::fs::rename(dir.path().join("blob.db.log"), dir.path().join("replayed.db.log")).unwrap();
-        let replayed = BlobDb::connect(&url2).await.unwrap();
+        let replayed = BlobDb::connect(dir.path().join("blob.log")).await.unwrap();
         let after = replayed.insert_chunk(8, 1).await.unwrap();
         assert!(after > new, "chunk id {new} reused as {after} after replay");
     }
@@ -645,8 +643,8 @@ mod tests {
     #[tokio::test]
     async fn double_release_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-        let db = BlobDb::connect(&url).await.unwrap();
+        let log_dir = dir.path().join("blob.log");
+        let db = BlobDb::connect(&log_dir).await.unwrap();
         let info = InstanceInfo {
             id: "mem".into(),
             kind: InstanceKind::Memory,

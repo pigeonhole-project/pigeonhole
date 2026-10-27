@@ -3,15 +3,14 @@ name = "pigeonhole-meta"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Metadata tablet: layer commands logged to a fencing LogStore and applied to SQLite"
+description = "Metadata tablet: layer commands logged to a fencing LogStore and applied in memory"
 
 [dependencies]
 anyhow = { workspace = true }
-crc32fast = { workspace = true }
 async-trait = { workspace = true }
+crc32fast = { workspace = true }
 futures = { workspace = true }
 prost = { workspace = true }
-sqlx = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 

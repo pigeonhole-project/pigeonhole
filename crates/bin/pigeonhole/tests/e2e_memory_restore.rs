@@ -1,5 +1,5 @@
-//! E2E (memory): start → PUT → lose the local SQLite files → boot replays the
-//! metadata log → GET.
+//! E2E (memory): start → PUT → restart (all metadata state is gone) → boot
+//! replays the metadata logs → GET.
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -43,13 +43,13 @@ async fn collect_body(body: Option<StreamingBlob>) -> Vec<u8> {
 
 async fn open_with_shared_mem(
     dir: &std::path::Path,
-    idx_url: &str,
-    blob_url: &str,
+    idx_log: &std::path::Path,
+    blob_log: &std::path::Path,
     mem: Arc<MemoryBlobStore>,
 ) -> pigeonhole::S3Gateway {
     let cfg = Config::for_test(dir);
-    let index = Index::connect(idx_url).await.unwrap();
-    let db = BlobDb::connect(blob_url).await.unwrap();
+    let index = Index::connect(idx_log).await.unwrap();
+    let db = BlobDb::connect(blob_log).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
 
@@ -60,17 +60,15 @@ async fn open_with_shared_mem(
 }
 
 #[tokio::test]
-async fn memory_put_lose_state_replay_get() {
+async fn memory_put_restart_replay_get() {
     let dir = tempfile::tempdir().unwrap();
-    let idx_path = dir.path().join("s3.db");
-    let blob_path = dir.path().join("blob.db");
-    let idx_url = format!("sqlite:{}?mode=rwc", idx_path.display());
-    let blob_url = format!("sqlite:{}?mode=rwc", blob_path.display());
+    let idx_log = dir.path().join("s3.log");
+    let blob_log = dir.path().join("blob.log");
 
     // The backend survives the restart; so do the metadata logs.
     let mem = Arc::new(MemoryBlobStore::new());
 
-    let s3 = open_with_shared_mem(dir.path(), &idx_url, &blob_url, mem.clone()).await;
+    let s3 = open_with_shared_mem(dir.path(), &idx_log, &blob_log, mem.clone()).await;
 
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
@@ -91,15 +89,7 @@ async fn memory_put_lose_state_replay_get() {
 
     drop(s3);
 
-    // Lose the SQLite files; the logs next to them stay.
-    for db in ["s3.db", "blob.db"] {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(dir.path().join(format!("{db}{suffix}")));
-        }
-    }
-    assert!(!idx_path.exists() && !blob_path.exists());
-
-    let s32 = open_with_shared_mem(dir.path(), &idx_url, &blob_url, mem).await;
+    let s32 = open_with_shared_mem(dir.path(), &idx_log, &blob_log, mem).await;
     let got = s3s2_get(&s32).await;
     assert_eq!(got, payload.as_ref());
 }
