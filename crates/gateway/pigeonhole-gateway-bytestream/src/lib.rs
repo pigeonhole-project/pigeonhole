@@ -36,4 +36,5 @@ pub mod build {
 
 pub use build::bazel::remote::execution::v2 as reapi;
 pub use cas_index::{CasEntry, CasIndex};
+pub use commands::{CasCommand, CasReply, CasState};
 pub use google::bytestream as bytestream_pb;

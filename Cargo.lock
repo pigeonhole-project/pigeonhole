@@ -1751,6 +1751,7 @@ dependencies = [
  "pigeonhole-meta",
  "pigeonhole-storage-memory",
  "pigeonhole-types",
+ "postcard",
  "prost",
  "prost-types",
  "protoc-bin-vendored",

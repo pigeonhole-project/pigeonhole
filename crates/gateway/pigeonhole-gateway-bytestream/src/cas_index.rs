@@ -4,12 +4,11 @@
 //! look at the tablet's in-memory [`CasState`]; changes go through `cas`
 //! commands.
 
-use crate::commands::{from_pb, pb, to_pb, CasState, NAMESPACE};
-use anyhow::{Context, Result};
+use crate::commands::{CasCommand, CasReply, CasState, NAMESPACE};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
 use pigeonhole_meta::{MetaStore, Namespaces};
-use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -55,12 +54,9 @@ impl CasIndex {
         Ok(Self { meta })
     }
 
-    async fn propose(&self, op: pb::command::Op) -> Result<Vec<u8>> {
-        let cmd = pb::Command { op: Some(op) }.encode_to_vec();
-        match self.meta.propose::<CasState>(cmd).await? {
-            Ok(reply) => Ok(reply),
-            Err(_) => anyhow::bail!("cas commands are never rejected"),
-        }
+    async fn propose(&self, cmd: CasCommand) -> Result<CasReply> {
+        let Ok(reply) = self.meta.propose::<CasState>(cmd).await?;
+        Ok(reply)
     }
 
     pub async fn find_missing(&self, digests: &[(String, i64)]) -> Result<Vec<(String, i64)>> {
@@ -84,39 +80,33 @@ impl CasIndex {
     }
 
     pub async fn touch(&self, hash: &str, size: i64) -> Result<()> {
-        self.propose(pb::command::Op::TouchEntry(pb::TouchEntry {
-            hash: hash.into(),
-            size,
-            at: Utc::now().to_rfc3339(),
-        }))
-        .await?;
+        let at = Utc::now().to_rfc3339();
+        self.propose(CasCommand::TouchEntry { hash: hash.into(), size, at }).await?;
         Ok(())
     }
 
     /// Store a new CAS entry. If the digest already exists, returns existing extents
     /// so the caller can `release` the newly ingested chunks (the existing row keeps its ref).
     pub async fn store_or_get_existing(&self, entry: &CasEntry) -> Result<Option<Vec<Extent>>> {
-        let reply = self
-            .propose(pb::command::Op::PutEntry(pb::PutEntry {
-                hash: entry.hash.clone(),
-                size: entry.size,
-                extents: to_pb(&entry.extents),
-                at: Utc::now().to_rfc3339(),
-            }))
-            .await?;
-        let r = pb::PutResult::decode(reply.as_slice()).context("decode PutResult")?;
-        Ok(r.existed.then(|| from_pb(r.existing)))
+        let cmd = CasCommand::PutEntry {
+            hash: entry.hash.clone(),
+            size: entry.size,
+            extents: entry.extents.clone(),
+            at: Utc::now().to_rfc3339(),
+        };
+        match self.propose(cmd).await? {
+            CasReply::Stored => Ok(None),
+            CasReply::Existing(extents) => Ok(Some(extents)),
+            other => anyhow::bail!("unexpected cas reply {other:?}"),
+        }
     }
 
     /// Remove CAS row; returns chunk ids to `release`.
     pub async fn release(&self, hash: &str, size: i64) -> Result<Vec<ChunkId>> {
-        let reply = self
-            .propose(pb::command::Op::DropEntry(pb::DropEntry {
-                hash: hash.into(),
-                size,
-            }))
-            .await?;
-        Ok(pb::Released::decode(reply.as_slice())?.chunk_ids)
+        match self.propose(CasCommand::DropEntry { hash: hash.into(), size }).await? {
+            CasReply::Dropped(ids) => Ok(ids),
+            other => anyhow::bail!("unexpected cas reply {other:?}"),
+        }
     }
 
     /// Entries last accessed before `cutoff`.

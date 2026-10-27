@@ -29,6 +29,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+postcard = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
