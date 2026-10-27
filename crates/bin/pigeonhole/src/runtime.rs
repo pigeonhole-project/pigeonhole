@@ -1,4 +1,4 @@
-//! Binary-only: open blob.db, build the placement group, and wire `ChunkStore` + `Durability`.
+//! Binary-only: boot the metadata tablet, build the placement group, and wire `ChunkStore` + `Durability`.
 
 use anyhow::{bail, Context};
 use pigeonhole::config::Config;
@@ -9,13 +9,13 @@ use pigeonhole_blob::{
     TypedBootstrapPointer,
 };
 use pigeonhole_chunk_store::{
-    check_fingerprints, BlockCache, BlobDb,
+    check_fingerprints, BlockCache, BlobDb, LogSettings,
     ChunkStore, Durability, IngestOptions, PinTarget, Superblock, WatermarkBackend,
 };
 use pigeonhole::index::Index;
-use pigeonhole_meta::MetaStore;
+use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub struct Runtime {
     /// The one metadata store every layer registers its namespace on.
@@ -30,9 +30,20 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     let mut namespaces = vec![BlobDb::namespace(), Index::namespace()];
     #[cfg(feature = "bytestream")]
     namespaces.push(pigeonhole_gateway_bytestream::cas_index::CasIndex::namespace());
-    let meta = MetaStore::open_local(&cfg.database_url, namespaces)
+    let log: Arc<dyn LogStore> = match &cfg.meta.log {
+        LogSettings::Local { path } => Arc::new(
+            LocalLogStore::open(path)
+                .with_context(|| format!("open local log {}", path.display()))?,
+        ),
+    };
+    let opts = MetaOptions {
+        batch_max_delay: cfg.meta.batch_max_delay,
+        batch_max_entries: cfg.meta.batch_max_entries,
+    };
+    let meta = MetaStore::open(&cfg.meta.db_url(), log, namespaces, opts)
         .await
         .context("boot metadata tablet")?;
+    info!(generation = meta.generation(), "metadata tablet active");
     let blob_db = BlobDb::open(meta.clone())
         .await
         .context("open chunk metadata")?;

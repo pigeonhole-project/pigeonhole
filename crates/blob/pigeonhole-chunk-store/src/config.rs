@@ -26,7 +26,8 @@ pub struct PlacementConfig {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen_addr: String,
-    pub database_url: String,
+    /// Metadata tablet (`[meta]`).
+    pub meta: MetaSettings,
     pub access_key: String,
     pub secret_key: String,
     pub region: String,
@@ -53,6 +54,40 @@ pub struct Config {
     /// Prometheus scrape endpoint (`[metrics]`); off by default.
     pub metrics: MetricsSettings,
     pub config_path: PathBuf,
+}
+
+/// Metadata tablet: local SQLite cache + command log (`[meta]`, `[meta.log]`).
+#[derive(Clone, Debug)]
+pub struct MetaSettings {
+    /// SQLite file holding the applied state.
+    pub db_path: PathBuf,
+    /// Group commit window; `0` = append as soon as the previous append returns.
+    pub batch_max_delay: Duration,
+    pub batch_max_entries: usize,
+    pub log: LogSettings,
+}
+
+/// Where the command log lives (`[meta.log] kind = ...`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogSettings {
+    /// Segmented files in a directory on this host.
+    Local { path: PathBuf },
+}
+
+impl MetaSettings {
+    /// `sqlite:` url of [`Self::db_path`].
+    pub fn db_url(&self) -> String {
+        format!("sqlite:{}", self.db_path.display())
+    }
+
+    /// Defaults with every file under `dir` (tests).
+    pub fn in_dir(dir: &Path) -> Self {
+        let mut meta = FileMeta::default().into_settings();
+        meta.db_path = dir.join(&meta.db_path);
+        let LogSettings::Local { path } = &mut meta.log;
+        *path = dir.join(&*path);
+        meta
+    }
 }
 
 /// Optional Prometheus metrics exporter (`[metrics]`).
@@ -145,10 +180,6 @@ impl Config {
             bail!("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY must not be empty");
         }
 
-        let database_url = file
-            .database_url
-            .unwrap_or_else(|| "sqlite:pigeonhole.db".into());
-
         let chunk_size = file.chunk.size;
         chunker::validate_chunk_size(chunk_size).context("chunk.size")?;
         let chunk_codec = file.chunk.codec;
@@ -186,7 +217,7 @@ impl Config {
 
         Ok(Self {
             listen_addr: file.listen_addr,
-            database_url,
+            meta: file.meta.into_settings(),
             access_key,
             secret_key,
             region: file.region,
@@ -208,10 +239,11 @@ impl Config {
         })
     }
 
-    pub fn for_test(database_url: &str) -> Self {
+    /// Defaults for in-process tests; metadata files go under `dir`.
+    pub fn for_test(dir: &Path) -> Self {
         Self {
             listen_addr: "127.0.0.1:0".into(),
-            database_url: database_url.into(),
+            meta: MetaSettings::in_dir(dir),
             access_key: "pigeonhole".into(),
             secret_key: "pigeonholesecret".into(),
             region: "us-east-1".into(),
@@ -281,8 +313,8 @@ fn config_path_from_env() -> PathBuf {
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     listen_addr: String,
-    database_url: Option<String>,
     region: String,
+    meta: FileMeta,
     snapshot: FileSnapshot,
     chunk: FileChunk,
     #[serde(default)]
@@ -310,8 +342,8 @@ impl Default for FileConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:8333".into(),
-            database_url: None,
             region: "us-east-1".into(),
+            meta: FileMeta::default(),
             snapshot: FileSnapshot::default(),
             chunk: FileChunk::default(),
             ingest: FileIngest::default(),
@@ -324,6 +356,51 @@ impl Default for FileConfig {
             sweep: FileSweep::default(),
             repair: FileRepair::default(),
             metrics: FileMetrics::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileMeta {
+    db_path: PathBuf,
+    batch_max_delay_ms: u64,
+    batch_max_entries: usize,
+    log: FileLog,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+enum FileLog {
+    Local { path: PathBuf },
+}
+
+impl Default for FileMeta {
+    fn default() -> Self {
+        Self {
+            db_path: "pigeonhole-meta.db".into(),
+            batch_max_delay_ms: 0,
+            batch_max_entries: 1024,
+            log: FileLog::default(),
+        }
+    }
+}
+
+impl Default for FileLog {
+    fn default() -> Self {
+        FileLog::Local { path: "pigeonhole-log".into() }
+    }
+}
+
+impl FileMeta {
+    fn into_settings(self) -> MetaSettings {
+        MetaSettings {
+            db_path: self.db_path,
+            batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
+            batch_max_entries: self.batch_max_entries.max(1),
+            log: match self.log {
+                FileLog::Local { path } => LogSettings::Local { path },
+            },
         }
     }
 }
@@ -788,6 +865,23 @@ upload_concurrency = 4
         assert_eq!(cfg.tg.upload_concurrency, 4);
         assert_eq!(cfg.placement.group, vec!["mem".to_string()]);
         assert_eq!(cfg.placement.write_quorum, 1);
+        assert_eq!(cfg.meta.db_path, PathBuf::from("pigeonhole-meta.db"));
+        assert_eq!(cfg.meta.batch_max_delay, Duration::ZERO);
+        assert_eq!(cfg.meta.log, LogSettings::Local { path: "pigeonhole-log".into() });
+    }
+
+    #[test]
+    fn parses_meta_section() {
+        let cfg = load(&format!(
+            "[meta]\ndb_path = \"m.db\"\nbatch_max_delay_ms = 250\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
+        ))
+        .unwrap();
+        assert_eq!(cfg.meta.db_url(), "sqlite:m.db");
+        assert_eq!(cfg.meta.batch_max_delay, Duration::from_millis(250));
+        assert_eq!(cfg.meta.log, LogSettings::Local { path: "/var/log-dir".into() });
+        for bad in ["[meta.log]\nkind = \"s3\"\n", "[meta.log]\nkind = \"local\"\nchat_id = 1\n"] {
+            assert!(load(&format!("{bad}{MEM}")).is_err(), "{bad:?} accepted");
+        }
     }
 
     #[test]
@@ -806,7 +900,7 @@ upload_concurrency = 4
 
     #[test]
     fn rejects_unknown_keys() {
-        for stale in ["memory = true\n", "chat_id = \"-1001\"\n", "[telegram]\nrate_per_sec = 1.0\n"] {
+        for stale in ["database_url = \"sqlite:x.db\"\n", "memory = true\n", "chat_id = \"-1001\"\n", "[telegram]\nrate_per_sec = 1.0\n"] {
             let err = load(&format!("{stale}{MEM}")).unwrap_err();
             assert!(format!("{err:#}").contains("unknown field"), "{stale:?} accepted");
         }

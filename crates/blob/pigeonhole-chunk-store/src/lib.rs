@@ -13,7 +13,8 @@ pub mod sweep;
 
 pub use blob_db::{is_chunk_gone, BlobDb, ChunkGone, StoredBlock};
 pub use config::{
-    BytestreamSettings, Config, HttpSettings, MetricsSettings, PlacementConfig,
+    BytestreamSettings, Config, HttpSettings, LogSettings, MetaSettings, MetricsSettings,
+    PlacementConfig,
 };
 pub use durability::{
     commit_root, start_or_restore, CheckpointPayload, Durability, JournalOp, PinTarget,

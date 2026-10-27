@@ -6,8 +6,19 @@
 # Override path with PIGEONHOLE_CONFIG=/path/to.toml
 
 listen_addr = "0.0.0.0:8333"
-database_url = "sqlite:pigeonhole.db"
 region = "us-east-1"
+
+# Metadata tablet (docs/meta-backends.md): every metadata change is appended to
+# the command log, then applied to the local SQLite file. The log is the source
+# of truth; a second process on the same log fences (stops) the first.
+[meta]
+db_path = "pigeonhole-meta.db"
+batch_max_delay_ms = 0        # group commit window; 0 = append when the previous append returns
+# batch_max_entries = 1024
+
+[meta.log]
+kind = "local"                # segmented files on this host
+path = "pigeonhole-log"
 
 # Backend instances (at least one). Secrets come from the env var named in
 # bot_token_env (defaults: BOT_TOKEN / DISCORD_BOT_TOKEN), never inline.

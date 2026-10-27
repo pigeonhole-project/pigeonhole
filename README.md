@@ -184,7 +184,8 @@ comments. Sections:
 | `[[instances]]` | Backends (≥ 1): id, kind (`telegram` / `discord` / `memory`), token env, chat/channel, role, `max_blob_size` |
 | `[placement]` | Write group + quorum; required with several read-write instances |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `database_url` | SQLite metadata database shared by all layers (tables prefixed `chunk_` / `s3_` / `cas_`) |
+| `[meta]` | Metadata tablet: `db_path` (SQLite state shared by all layers, tables prefixed `chunk_` / `s3_` / `cas_`), `batch_max_delay_ms` / `batch_max_entries` (group commit) |
+| `[meta.log]` | Command log: `kind = "local"`, `path` (directory) |
 | `[snapshot]` | `interval_secs`: S3 index snapshot / checkpoint period (`0` disables snapshots) |
 | `[chunk]` | `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
@@ -201,10 +202,12 @@ half-applied.
 
 ## Durability and restore
 
-All metadata lives in one SQLite database (`database_url`); every change is a
-layer command applied by `pigeonhole-meta` (see
-[docs/meta-backends.md](docs/meta-backends.md) for where this is heading). Today
-two copies are pushed into the blob backend:
+Every metadata change is a layer command. `pigeonhole-meta` appends it to the
+command log (`[meta.log]`, fsynced per batch) and then applies it to the SQLite
+file (`[meta].db_path`); the log is the source of truth and the file is rebuilt
+from it on boot (see [docs/meta-backends.md](docs/meta-backends.md)). The local
+log sits on the same disk, so it does not survive disk loss yet; until log
+snapshots replace them, two copies are still pushed into the blob backend:
 
 - **Chunk metadata** (chunks, parts, refcounts, roots) — a full checkpoint every
   `[snapshot].interval_secs` (min 60 s; 300 s when snapshots are off). A journal
@@ -288,8 +291,9 @@ make compat-discord
 
 ## Limitations / ops notes
 
-- **One writer process per database.** Concurrent pigeonhole processes on the
-  same `database_url` are unsupported.
+- **One active process per log.** A process booting on the same `[meta.log]`
+  claims a newer generation and fences the running one, which exits. The
+  `local` log fences only processes on the same host.
 - **`file_id` is bot-bound.** Telegram `file_id`s are only valid for the bot
   that uploaded them; rotating `BOT_TOKEN` breaks reads of existing data.
 - **Single tenant.** One access key pair, no ACLs.

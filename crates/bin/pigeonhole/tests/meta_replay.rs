@@ -59,7 +59,7 @@ async fn replicated_state(meta: &MetaStore) -> Vec<(String, Vec<String>)> {
 async fn replay_rebuilds_chunk_and_s3_tables() {
     let dir = tempfile::tempdir().unwrap();
     let meta = tablet(dir.path(), "a.db").await;
-    let cfg = Config::for_test("sqlite::memory:");
+    let cfg = Config::for_test(dir.path());
     let db = BlobDb::open(meta.clone()).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;

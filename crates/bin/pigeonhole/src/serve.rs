@@ -110,7 +110,11 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         max_headers = cfg.http.max_headers,
         "pigeonhole listening on http://{addr}"
     );
-    axum::serve(listener, app).await.context("serve")?;
+    // A fenced tablet must not answer again: exit and let a restart claim anew.
+    tokio::select! {
+        r = axum::serve(listener, app) => r.context("serve")?,
+        stop = rt.meta.stopped() => anyhow::bail!("{stop}"),
+    }
     Ok(())
 }
 

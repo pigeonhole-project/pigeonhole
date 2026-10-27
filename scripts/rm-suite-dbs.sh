@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Remove an index sqlite DB and its companion chunk-store / CAS files.
+# Remove an index sqlite DB, its local command log (<db>.log) and its companion
+# chunk-store / CAS files.
 # Usage: rm_suite_dbs /path/to/index.db
 #
 # Companion paths mirror crates/bin/pigeonhole blob_db_url_from_index /
@@ -8,6 +9,7 @@
 rm_suite_dbs() {
   local db="$1"
   rm -f "$db" "${db}-wal" "${db}-shm"
+  rm -rf "${db}.log"
   local stem blob cas
   if [[ "$db" == *.db ]]; then
     stem="${db%.db}"

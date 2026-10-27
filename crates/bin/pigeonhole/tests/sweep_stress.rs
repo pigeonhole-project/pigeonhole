@@ -123,7 +123,7 @@ struct Node {
 async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
     let idx_url = format!("sqlite:{}?mode=rwc", dir.join("s3.db").display());
     let blob_url = format!("sqlite:{}?mode=rwc", dir.join("blob.db").display());
-    let mut cfg = Config::for_test(&idx_url);
+    let mut cfg = Config::for_test(dir);
     cfg.chunk_size = CHUNK_SIZE;
     cfg.block_size = BLOCK_SIZE;
 

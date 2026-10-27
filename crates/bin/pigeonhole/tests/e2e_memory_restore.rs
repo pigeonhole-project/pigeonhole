@@ -45,11 +45,12 @@ async fn collect_body(body: Option<StreamingBlob>) -> Vec<u8> {
 }
 
 async fn open_with_shared_mem(
+    dir: &std::path::Path,
     idx_url: &str,
     blob_url: &str,
     mem: Arc<MemoryBlobStore>,
 ) -> (pigeonhole::S3Gateway, Arc<ChunkStore>, Arc<Durability>, String) {
-    let cfg = Config::for_test(idx_url);
+    let cfg = Config::for_test(dir);
     let index = Index::connect(idx_url).await.unwrap();
     let db = BlobDb::connect(blob_url).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
@@ -98,7 +99,7 @@ async fn memory_put_wipe_restore_get() {
     // Shared backend+pin survives "restart without local DB".
     let mem = Arc::new(MemoryBlobStore::new());
 
-    let (s3, store, dur, fp) = open_with_shared_mem(&idx_url, &blob_url, mem.clone()).await;
+    let (s3, store, dur, fp) = open_with_shared_mem(dir.path(), &idx_url, &blob_url, mem.clone()).await;
 
     s3.create_bucket(req(CreateBucketInput {
         bucket: "demo".into(),
@@ -137,7 +138,7 @@ async fn memory_put_wipe_restore_get() {
     std::fs::remove_dir_all(dir.path().join("s3.db.log")).unwrap();
     std::fs::remove_dir_all(dir.path().join("blob.db.log")).unwrap();
 
-    let (s32, store2, dur2, _fp2) = open_with_shared_mem(&idx_url, &blob_url, mem).await;
+    let (s32, store2, dur2, _fp2) = open_with_shared_mem(dir.path(), &idx_url, &blob_url, mem).await;
     // force not needed: empty DBs; start_or_restore already ran inside open.
     assert!(store2.get_root(ROOT_NAME).await.unwrap().is_some());
     restore_index_snapshot(&s32.index, store2.as_ref())

@@ -103,12 +103,12 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 CFG="$ROOT/.cache/pigeonhole-storage-telegram-config.toml"
-DB_URL="sqlite:$ROOT/.cache/pigeonhole-telegram.db"
+META_DB="$ROOT/.cache/pigeonhole-telegram.db"
 CONFIG_OUT="$CFG" \
   CONFIG_INSTANCE=telegram \
   CONFIG_SCOPE_ID="$CHAT_ID" \
   CONFIG_LISTEN_ADDR="$LISTEN_ADDR" \
-  CONFIG_DATABASE_URL="$DB_URL" \
+  CONFIG_META_DB="$META_DB" \
   CONFIG_SNAPSHOT_SECS=0 \
   "$ROOT/scripts/gen-config.sh"
 export PIGEONHOLE_CONFIG="$CFG"

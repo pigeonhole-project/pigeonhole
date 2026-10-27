@@ -34,7 +34,7 @@ async fn setup_with_mem() -> (
     let dir = tempfile::tempdir().unwrap();
     let idx_url = format!("sqlite:{}?mode=rwc", dir.path().join("s3.db").display());
     let blob_url = format!("sqlite:{}?mode=rwc", dir.path().join("blob.db").display());
-    let cfg = Config::for_test(&idx_url);
+    let cfg = Config::for_test(dir.path());
     let index = Index::connect(&idx_url).await.unwrap();
     let mem = Arc::new(MemoryBlobStore::new());
     let db = BlobDb::connect(&blob_url).await.unwrap();
