@@ -444,8 +444,14 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     // Lost disk: restore from the pin and read everything back.
     drop(sw);
     drop(node);
+    // The local metadata log (`*.db.log/`) is on the same disk and goes too.
     for f in std::fs::read_dir(dir.path()).unwrap() {
-        std::fs::remove_file(f.unwrap().path()).unwrap();
+        let path = f.unwrap().path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(path).unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
     }
     let restored = open_node(dir.path(), mem).await;
     restore_index_snapshot(&restored.s3.index, restored.store.as_ref())

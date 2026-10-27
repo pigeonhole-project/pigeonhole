@@ -12,6 +12,7 @@ use pigeonhole_chunk_store::{
     check_fingerprints, BlockCache, BlobDb,
     ChunkStore, Durability, IngestOptions, PinTarget, Superblock, WatermarkBackend,
 };
+use pigeonhole::index::Index;
 use pigeonhole_meta::MetaStore;
 use std::sync::Arc;
 use tracing::warn;
@@ -25,9 +26,13 @@ pub struct Runtime {
 }
 
 pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
-    let meta = MetaStore::open(&cfg.database_url)
+    #[allow(unused_mut)]
+    let mut namespaces = vec![BlobDb::namespace(), Index::namespace()];
+    #[cfg(feature = "bytestream")]
+    namespaces.push(pigeonhole_gateway_bytestream::cas_index::CasIndex::namespace());
+    let meta = MetaStore::open_local(&cfg.database_url, namespaces)
         .await
-        .context("open metadata store")?;
+        .context("boot metadata tablet")?;
     let blob_db = BlobDb::open(meta.clone())
         .await
         .context("open chunk metadata")?;

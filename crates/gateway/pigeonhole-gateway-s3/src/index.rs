@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
 use serde::{Deserialize, Serialize};
 use crate::commands::{pb, S3Namespace, NAMESPACE};
-use pigeonhole_meta::{Applied, MetaStore};
+use pigeonhole_meta::{Applied, MetaStore, Namespace};
 use prost::Message;
 use sqlx::{FromRow, SqlitePool};
 use std::sync::Arc;
@@ -193,14 +193,22 @@ pub(crate) const SCHEMA: &[&str] = &[
 ];
 
 impl Index {
-    /// Open a standalone metadata store at `database_url` with only this namespace.
+    /// Open a standalone tablet at `database_url` (local log next to it) with
+    /// only this namespace.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        Self::open(MetaStore::open(database_url).await?).await
+        Self::open(MetaStore::open_local(database_url, vec![Self::namespace()]).await?).await
     }
 
-    /// Register the `s3` namespace on `meta`.
+    /// The `s3` namespace, to pass to [`MetaStore::open`].
+    pub fn namespace() -> Arc<dyn Namespace> {
+        Arc::new(S3Namespace)
+    }
+
+    /// Use `meta`, which must have been opened with [`Self::namespace`].
     pub async fn open(meta: Arc<MetaStore>) -> Result<Self> {
-        meta.register(Arc::new(S3Namespace)).await?;
+        if !meta.has_namespace(NAMESPACE) {
+            anyhow::bail!("metadata tablet opened without the s3 namespace");
+        }
         Ok(Self {
             pool: meta.pool().clone(),
             meta,

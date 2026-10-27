@@ -1,25 +1,38 @@
-//! Metadata state machine (see `docs/meta-backends.md`).
+//! Metadata tablet (see `docs/meta-backends.md`).
 //!
-//! Every metadata change is a **command** owned by one layer (namespace). A
-//! command is applied by that layer's [`Namespace::apply`] inside one SQLite
-//! transaction; [`MetaStore::propose`] is the only write path. Reads go straight
-//! to [`MetaStore::pool`].
+//! Every metadata change is a **command** owned by one layer (namespace).
+//! [`MetaStore::propose`] is the only write path: it queues the command, a
+//! batcher appends a batch of queued commands to the [`LogStore`] under the
+//! tablet's generation, applies them in order to SQLite and only then answers
+//! the callers. The log is the source of truth; the SQLite file is a cache that
+//! records the last applied position with the state. Reads go straight to
+//! [`MetaStore::pool`].
 //!
 //! Commands must be deterministic: ids, timestamps and locators are chosen by
 //! the proposer and carried in the command, never generated in `apply`. That is
-//! what lets the same command log rebuild the same state elsewhere (raft).
+//! what lets the log rebuild the same state elsewhere.
 //!
 //! A command can fail on state (e.g. retain of a reclaimed chunk). `apply` then
 //! returns [`Applied::Reject`]: its writes are rolled back, but the entry still
-//! consumes an index — every replica reaches the same verdict.
+//! consumes a position — every replay reaches the same verdict.
+//!
+//! Boot ([`MetaStore::open`]): claim the next generation, replay the log
+//! entries the SQLite file has not applied yet, append the zero entry, go
+//! active. Once a newer generation claims the log the tablet stops
+//! ([`Stop::Fenced`]) and every later `propose` fails.
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{SqliteConnection, SqlitePool};
 use std::collections::HashMap;
+use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub mod log;
 
@@ -55,214 +68,429 @@ pub trait Namespace: Send + Sync + 'static {
 /// Result of [`MetaStore::propose`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
-    /// Index of the entry in the command sequence.
-    pub index: u64,
+    /// Position of the entry in the log.
+    pub position: Position,
     pub applied: Applied,
 }
 
-/// SQLite-backed state machine shared by every registered namespace.
+/// Why the tablet stopped accepting proposals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// A newer generation claimed the log.
+    Fenced { current: u64 },
+    /// The log or the SQLite file failed; the outcome of the last batch is
+    /// unknown until the next boot replays the log.
+    Failed(String),
+}
+
+impl fmt::Display for Stop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Stop::Fenced { current } => write!(f, "tablet fenced by generation {current}"),
+            Stop::Failed(why) => write!(f, "tablet stopped: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for Stop {}
+
+/// Tablet knobs (`[meta]`).
+#[derive(Debug, Clone)]
+pub struct MetaOptions {
+    /// Extra time to wait for more commands before appending a batch. Zero =
+    /// append as soon as the previous append finished (batches still form from
+    /// whatever queued meanwhile).
+    pub batch_max_delay: Duration,
+    pub batch_max_entries: usize,
+}
+
+impl Default for MetaOptions {
+    fn default() -> Self {
+        Self {
+            batch_max_delay: Duration::ZERO,
+            batch_max_entries: 1024,
+        }
+    }
+}
+
+type Namespaces = HashMap<&'static str, Arc<dyn Namespace>>;
+
+struct Pending {
+    entry: Entry,
+    reply: oneshot::Sender<Result<Response>>,
+}
+
+/// The metadata tablet shared by every layer.
 pub struct MetaStore {
     pool: SqlitePool,
-    namespaces: RwLock<HashMap<&'static str, Arc<dyn Namespace>>>,
+    namespaces: Arc<Namespaces>,
+    gen: u64,
+    queue: mpsc::UnboundedSender<Pending>,
+    stop: watch::Receiver<Option<Stop>>,
 }
 
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS meta_applied (
+CREATE TABLE IF NOT EXISTS meta_tablet (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
-    last_index INTEGER NOT NULL
+    gen INTEGER NOT NULL,
+    last_applied_position INTEGER NOT NULL
 )
 "#;
 
+/// Entries applied per SQLite transaction during replay.
+const REPLAY_CHUNK: usize = 1024;
+
 impl MetaStore {
-    /// Open (or create) the database at `url` (`sqlite:path`).
-    pub async fn open(url: &str) -> Result<Arc<Self>> {
-        let opts = SqliteConnectOptions::from_str(url)
+    /// Boot the tablet: open (or create) the SQLite file at `url`
+    /// (`sqlite:path`), create every namespace's tables, claim the next
+    /// generation of `log`, replay what the file has not applied, append the
+    /// zero entry. Namespaces are fixed for the tablet's lifetime: replay must
+    /// be able to apply every entry in the log.
+    pub async fn open(
+        url: &str,
+        log: Arc<dyn LogStore>,
+        namespaces: Vec<Arc<dyn Namespace>>,
+        opts: MetaOptions,
+    ) -> Result<Arc<Self>> {
+        let sqlite = SqliteConnectOptions::from_str(url)
             .with_context(|| format!("parse sqlite url {url}"))?
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
-            .connect_with(opts)
+            .connect_with(sqlite)
             .await
             .with_context(|| format!("connect {url}"))?;
-        sqlx::query(SCHEMA).execute(&pool).await?;
-        Ok(Arc::new(Self {
-            pool,
-            namespaces: RwLock::new(HashMap::new()),
-        }))
+
+        let mut by_name = Namespaces::new();
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(SCHEMA).execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO meta_tablet (singleton, gen, last_applied_position) VALUES (0, 0, 0) \
+             ON CONFLICT (singleton) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        for ns in namespaces {
+            let name = ns.name();
+            ns.init(&mut tx).await.with_context(|| format!("init namespace {name}"))?;
+            if by_name.insert(name, ns).is_some() {
+                bail!("namespace {name:?} given twice");
+            }
+        }
+        tx.commit().await?;
+        let namespaces = Arc::new(by_name);
+
+        let (known_gen, applied) = tablet_row(&pool).await?;
+        let (gen, head) = claim_next(log.as_ref(), known_gen).await?;
+        sqlx::query("UPDATE meta_tablet SET gen = ? WHERE singleton = 0")
+            .bind(gen as i64)
+            .execute(&pool)
+            .await?;
+
+        if applied > head.position {
+            bail!(LogError::Lost(format!(
+                "SQLite state is at {applied}, the log ends at {}",
+                head.position
+            )));
+        }
+        if applied < head.position {
+            replay(&pool, &namespaces, log.as_ref(), applied, head).await?;
+        }
+
+        let zero = log.append(gen, &[]).await.context("append zero entry")?;
+        if zero != head.position {
+            bail!("zero entry of generation {gen} at {zero}, expected {}", head.position);
+        }
+
+        let (queue, rx) = mpsc::unbounded_channel();
+        let (stop_tx, stop) = watch::channel(None);
+        tokio::spawn(batcher(
+            Batcher {
+                pool: pool.clone(),
+                namespaces: namespaces.clone(),
+                log,
+                gen,
+                opts,
+                stop: stop_tx,
+            },
+            rx,
+        ));
+        Ok(Arc::new(Self { pool, namespaces, gen, queue, stop }))
     }
 
-    /// Read-only access for layer queries. Never write through this pool.
+    /// Boot over a [`LocalLogStore`] in `<db path>.log` next to the SQLite file.
+    pub async fn open_local(url: &str, namespaces: Vec<Arc<dyn Namespace>>) -> Result<Arc<Self>> {
+        let log = LocalLogStore::open(local_log_dir(url)?)?;
+        Self::open(url, Arc::new(log), namespaces, MetaOptions::default()).await
+    }
+
+    /// Read-only access for layer queries. Never write command-owned tables
+    /// through this pool.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
-    /// Register a layer and create its schema.
-    pub async fn register(&self, ns: Arc<dyn Namespace>) -> Result<()> {
-        let name = ns.name();
-        if self.namespaces.read().unwrap().contains_key(name) {
-            bail!("namespace {name:?} already registered");
-        }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        ns.init(&mut tx).await.with_context(|| format!("init namespace {name}"))?;
-        tx.commit().await?;
-        self.namespaces.write().unwrap().insert(name, ns);
-        Ok(())
+    pub fn has_namespace(&self, name: &str) -> bool {
+        self.namespaces.contains_key(name)
     }
 
-    /// Apply `command` in `namespace` as the next entry.
+    /// Generation this tablet claimed on boot.
+    pub fn generation(&self) -> u64 {
+        self.gen
+    }
+
+    /// Append `command` in `namespace` to the log and apply it.
     pub async fn propose(&self, namespace: &str, command: &[u8]) -> Result<Response> {
-        let ns = self
-            .namespaces
-            .read()
-            .unwrap()
-            .get(namespace)
-            .cloned()
-            .with_context(|| format!("unknown namespace {namespace:?}"))?;
+        if !self.has_namespace(namespace) {
+            bail!("unknown namespace {namespace:?}");
+        }
+        if let Some(stop) = self.stop.borrow().clone() {
+            return Err(stop.into());
+        }
+        let (reply, rx) = oneshot::channel();
+        let entry = Entry {
+            namespace: namespace.to_owned(),
+            command: command.to_vec(),
+        };
+        if self.queue.send(Pending { entry, reply }).is_err() {
+            bail!("tablet batcher is gone");
+        }
+        rx.await.context("tablet batcher dropped the proposal")?
+    }
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let (last,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE((SELECT last_index FROM meta_applied WHERE singleton = 0), 0)",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        let index = last + 1;
+    /// Resolves once the tablet stops accepting proposals.
+    pub async fn stopped(&self) -> Stop {
+        let mut rx = self.stop.clone();
+        let stop = match rx.wait_for(Option::is_some).await {
+            Ok(stop) => stop.clone().unwrap(),
+            Err(_) => Stop::Failed("tablet batcher is gone".into()),
+        };
+        stop
+    }
 
+    /// Position of the last applied entry (0 before the first).
+    pub async fn applied_position(&self) -> Result<Position> {
+        Ok(tablet_row(&self.pool).await?.1)
+    }
+}
+
+/// Every table except the tablet's own bookkeeping, rows rendered with SQL
+/// `quote()` and sorted: two files with equal dumps hold the same state.
+pub async fn dump_tables(pool: &SqlitePool) -> Result<Vec<(String, Vec<String>)>> {
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' \
+         AND name NOT LIKE 'sqlite_%' AND name != 'meta_tablet' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::new();
+    for (table,) in tables {
+        let cols: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info(?)")
+            .bind(&table)
+            .fetch_all(pool)
+            .await?;
+        let row = cols
+            .iter()
+            .map(|(c,)| format!("quote(\"{c}\")"))
+            .collect::<Vec<_>>()
+            .join(" || ',' || ");
+        let mut rows: Vec<String> = sqlx::query_as::<_, (String,)>(&format!("SELECT {row} FROM \"{table}\""))
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|(r,)| r)
+            .collect();
+        rows.sort_unstable();
+        out.push((table, rows));
+    }
+    Ok(out)
+}
+
+/// `sqlite:path[?query]` → `path.log`.
+fn local_log_dir(url: &str) -> Result<PathBuf> {
+    let path = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .with_context(|| format!("not a sqlite url: {url}"))?;
+    let path = path.split('?').next().unwrap_or(path);
+    if path.is_empty() || path.starts_with(':') {
+        bail!("{url}: the local log needs an on-disk database");
+    }
+    Ok(PathBuf::from(format!("{path}.log")))
+}
+
+async fn tablet_row(pool: &SqlitePool) -> Result<(u64, Position)> {
+    let (gen, pos): (i64, i64) =
+        sqlx::query_as("SELECT gen, last_applied_position FROM meta_tablet WHERE singleton = 0")
+            .fetch_one(pool)
+            .await?;
+    Ok((gen as u64, pos as Position))
+}
+
+/// Claim `1 + max(known generations)`; a racing or forgotten newer claim
+/// moves the floor up.
+async fn claim_next(log: &dyn LogStore, known: u64) -> Result<(u64, Head)> {
+    let mut gen = known + 1;
+    for _ in 0..16 {
+        match log.claim(gen).await {
+            Ok(head) => return Ok((gen, head)),
+            Err(LogError::Fenced { current }) => gen = gen.max(current + 1),
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("claim generation {gen}"))),
+        }
+    }
+    bail!("could not claim a generation (last tried {gen})")
+}
+
+/// Apply log entries `(applied, head]` that the SQLite file has not seen.
+async fn replay(
+    pool: &SqlitePool,
+    namespaces: &Namespaces,
+    log: &dyn LogStore,
+    applied: Position,
+    head: Head,
+) -> Result<()> {
+    if let Some(d) = log.discover().await.context("discover log")? {
+        if let Some((at, _)) = d.snapshot {
+            if at > applied {
+                bail!("log snapshot at {at} is ahead of SQLite ({applied}); snapshot restore is not implemented yet");
+            }
+        }
+    }
+    let mut entries = log.read(applied, head);
+    let mut chunk = Vec::with_capacity(REPLAY_CHUNK);
+    let mut first = applied + 1;
+    loop {
+        let next = entries.try_next().await.context("read log")?;
+        let done = next.is_none();
+        if let Some((pos, entry)) = next {
+            if pos != first + chunk.len() as u64 {
+                bail!(LogError::Lost(format!("replay expected {}, got {pos}", first + chunk.len() as u64)));
+            }
+            chunk.push(entry);
+        }
+        if chunk.len() == REPLAY_CHUNK || (done && !chunk.is_empty()) {
+            apply_batch(pool, namespaces, first, &chunk).await?;
+            first += chunk.len() as u64;
+            chunk.clear();
+        }
+        if done {
+            break;
+        }
+    }
+    if first - 1 != head.position {
+        bail!(LogError::Lost(format!("replay stopped at {}, head is {}", first - 1, head.position)));
+    }
+    Ok(())
+}
+
+/// Apply entries at positions `first..` in one transaction, advancing
+/// `last_applied_position` with them (so a crash re-applies all or nothing).
+async fn apply_batch(
+    pool: &SqlitePool,
+    namespaces: &Namespaces,
+    first: Position,
+    entries: &[Entry],
+) -> Result<Vec<Applied>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let (last,): (i64,) =
+        sqlx::query_as("SELECT last_applied_position FROM meta_tablet WHERE singleton = 0")
+            .fetch_one(&mut *tx)
+            .await?;
+    if last as u64 + 1 != first {
+        bail!("apply at {first}, but SQLite is at {last}");
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let pos = first + i as u64;
+        let ns = namespaces
+            .get(entry.namespace.as_str())
+            .with_context(|| format!("entry {pos}: unknown namespace {:?}", entry.namespace))?;
         sqlx::query("SAVEPOINT command").execute(&mut *tx).await?;
         let applied = ns
-            .apply(&mut tx, command)
+            .apply(&mut tx, &entry.command)
             .await
-            .with_context(|| format!("apply {namespace} entry {index}"))?;
-        let undo = match applied {
-            Applied::Commit(_) => "RELEASE command",
-            Applied::Reject(_) => "ROLLBACK TO command",
-        };
-        sqlx::query(undo).execute(&mut *tx).await?;
+            .with_context(|| format!("apply {} entry {pos}", entry.namespace))?;
         if matches!(applied, Applied::Reject(_)) {
-            sqlx::query("RELEASE command").execute(&mut *tx).await?;
+            sqlx::query("ROLLBACK TO command").execute(&mut *tx).await?;
         }
-
-        sqlx::query(
-            r#"
-            INSERT INTO meta_applied (singleton, last_index) VALUES (0, ?)
-            ON CONFLICT (singleton) DO UPDATE SET last_index = excluded.last_index
-            "#,
-        )
-        .bind(index)
+        sqlx::query("RELEASE command").execute(&mut *tx).await?;
+        out.push(applied);
+    }
+    sqlx::query("UPDATE meta_tablet SET last_applied_position = ? WHERE singleton = 0")
+        .bind((first - 1 + entries.len() as u64) as i64)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
-        Ok(Response {
-            index: index as u64,
-            applied,
-        })
-    }
+    tx.commit().await?;
+    Ok(out)
+}
 
-    /// Index of the last applied entry (0 before the first).
-    pub async fn applied_index(&self) -> Result<u64> {
-        let (last,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE((SELECT last_index FROM meta_applied WHERE singleton = 0), 0)",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(last as u64)
+struct Batcher {
+    pool: SqlitePool,
+    namespaces: Arc<Namespaces>,
+    log: Arc<dyn LogStore>,
+    gen: u64,
+    opts: MetaOptions,
+    stop: watch::Sender<Option<Stop>>,
+}
+
+/// Group commit: take what is queued, append it, apply it, answer. Ends when
+/// every [`MetaStore`] handle is dropped.
+async fn batcher(b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
+    let max = b.opts.batch_max_entries.max(1);
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        if !b.opts.batch_max_delay.is_zero() {
+            let deadline = tokio::time::Instant::now() + b.opts.batch_max_delay;
+            while batch.len() < max {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(p)) => batch.push(p),
+                    _ => break,
+                }
+            }
+        }
+        while batch.len() < max {
+            match rx.try_recv() {
+                Ok(p) => batch.push(p),
+                Err(_) => break,
+            }
+        }
+
+        let entries: Vec<Entry> = batch.iter().map(|p| p.entry.clone()).collect();
+        let result = match b.log.append(b.gen, &entries).await {
+            Ok(last) => {
+                let first = last + 1 - entries.len() as u64;
+                apply_batch(&b.pool, &b.namespaces, first, &entries)
+                    .await
+                    .map(|applied| (first, applied))
+                    .map_err(|e| Stop::Failed(format!("apply batch at {first}: {e:#}")))
+            }
+            Err(LogError::Fenced { current }) => Err(Stop::Fenced { current }),
+            Err(e) => Err(Stop::Failed(format!("append: {e}"))),
+        };
+        match result {
+            Ok((first, applied)) => {
+                for (i, (p, applied)) in batch.into_iter().zip(applied).enumerate() {
+                    let position = first + i as u64;
+                    let _ = p.reply.send(Ok(Response { position, applied }));
+                }
+            }
+            Err(stop) => {
+                b.stop.send_replace(Some(stop.clone()));
+                for p in batch {
+                    let _ = p.reply.send(Err(stop.clone().into()));
+                }
+                // Stopped for good: fail whatever is still queued or arrives.
+                while let Some(p) = rx.recv().await {
+                    let _ = p.reply.send(Err(stop.clone().into()));
+                }
+                return;
+            }
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Toy namespace: command = signed delta for a counter; going negative is rejected.
-    struct Counter;
-
-    #[async_trait]
-    impl Namespace for Counter {
-        fn name(&self) -> &'static str {
-            "counter"
-        }
-
-        async fn init(&self, conn: &mut SqliteConnection) -> Result<()> {
-            sqlx::query("CREATE TABLE IF NOT EXISTS counter (v INTEGER NOT NULL)")
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query("INSERT INTO counter SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM counter)")
-                .execute(&mut *conn)
-                .await?;
-            Ok(())
-        }
-
-        async fn apply(&self, conn: &mut SqliteConnection, command: &[u8]) -> Result<Applied> {
-            let delta = i64::from_le_bytes(command.try_into().context("8-byte delta")?);
-            sqlx::query("UPDATE counter SET v = v + ?")
-                .bind(delta)
-                .execute(&mut *conn)
-                .await?;
-            let (v,): (i64,) = sqlx::query_as("SELECT v FROM counter")
-                .fetch_one(&mut *conn)
-                .await?;
-            if v < 0 {
-                return Ok(Applied::Reject(b"negative".to_vec()));
-            }
-            Ok(Applied::Commit(v.to_le_bytes().to_vec()))
-        }
-    }
-
-    async fn open() -> (Arc<MetaStore>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}", dir.path().join("meta.db").display());
-        let store = MetaStore::open(&url).await.unwrap();
-        store.register(Arc::new(Counter)).await.unwrap();
-        (store, dir)
-    }
-
-    async fn value(store: &MetaStore) -> i64 {
-        sqlx::query_as::<_, (i64,)>("SELECT v FROM counter")
-            .fetch_one(store.pool())
-            .await
-            .unwrap()
-            .0
-    }
-
-    #[tokio::test]
-    async fn commit_and_reject_both_consume_an_index() {
-        let (store, _dir) = open().await;
-        let r = store.propose("counter", &5i64.to_le_bytes()).await.unwrap();
-        assert_eq!(r.index, 1);
-        assert_eq!(r.applied, Applied::Commit(5i64.to_le_bytes().to_vec()));
-
-        let r = store.propose("counter", &(-7i64).to_le_bytes()).await.unwrap();
-        assert_eq!(r.index, 2);
-        assert_eq!(r.applied, Applied::Reject(b"negative".to_vec()));
-        assert_eq!(value(&store).await, 5, "rejected command must not leave writes");
-        assert_eq!(store.applied_index().await.unwrap(), 2);
-    }
-
-    #[tokio::test]
-    async fn unknown_namespace_and_double_register_fail() {
-        let (store, _dir) = open().await;
-        assert!(store.propose("nope", &[]).await.is_err());
-        assert!(store.register(Arc::new(Counter)).await.is_err());
-        assert_eq!(store.applied_index().await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn concurrent_proposals_get_distinct_indexes() {
-        let (store, _dir) = open().await;
-        let tasks: Vec<_> = (0..32)
-            .map(|_| {
-                let s = store.clone();
-                tokio::spawn(async move { s.propose("counter", &1i64.to_le_bytes()).await })
-            })
-            .collect();
-        let mut indexes = Vec::new();
-        for t in tasks {
-            indexes.push(t.await.unwrap().unwrap().index);
-        }
-        indexes.sort_unstable();
-        assert_eq!(indexes, (1..=32).collect::<Vec<_>>());
-        assert_eq!(value(&store).await, 32);
-    }
-}
+mod tests;

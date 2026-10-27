@@ -133,6 +133,9 @@ async fn memory_put_wipe_restore_get() {
     let _ = std::fs::remove_file(dir.path().join("s3.db-shm"));
     let _ = std::fs::remove_file(dir.path().join("blob.db-wal"));
     let _ = std::fs::remove_file(dir.path().join("blob.db-shm"));
+    // The local metadata logs live on the same disk.
+    std::fs::remove_dir_all(dir.path().join("s3.db.log")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("blob.db.log")).unwrap();
 
     let (s32, store2, dur2, _fp2) = open_with_shared_mem(&idx_url, &blob_url, mem).await;
     // force not needed: empty DBs; start_or_restore already ran inside open.

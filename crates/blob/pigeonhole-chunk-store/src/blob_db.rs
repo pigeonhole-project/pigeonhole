@@ -9,7 +9,7 @@ use crate::commands::{pb, ChunkNamespace, NAMESPACE};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use pigeonhole_blob::{InstanceInfo, PartLayout, ReplicaLayout, BlobLocator};
-use pigeonhole_meta::{Applied, MetaStore};
+use pigeonhole_meta::{Applied, MetaStore, Namespace};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
@@ -167,14 +167,22 @@ pub(crate) const SCHEMA: &[&str] = &[
 ];
 
 impl BlobDb {
-    /// Open a standalone metadata store at `database_url` with only this namespace.
+    /// Open a standalone tablet at `database_url` (local log next to it) with
+    /// only this namespace.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        Self::open(MetaStore::open(database_url).await?).await
+        Self::open(MetaStore::open_local(database_url, vec![Self::namespace()]).await?).await
     }
 
-    /// Register the `chunk` namespace on `meta`.
+    /// The `chunk` namespace, to pass to [`MetaStore::open`].
+    pub fn namespace() -> Arc<dyn Namespace> {
+        Arc::new(ChunkNamespace)
+    }
+
+    /// Use `meta`, which must have been opened with [`Self::namespace`].
     pub async fn open(meta: Arc<MetaStore>) -> Result<Self> {
-        meta.register(Arc::new(ChunkNamespace)).await?;
+        if !meta.has_namespace(NAMESPACE) {
+            anyhow::bail!("metadata tablet opened without the chunk namespace");
+        }
         let db = Self {
             pool: meta.pool().clone(),
             meta,
