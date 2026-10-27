@@ -3,13 +3,19 @@ name = "pigeonhole-meta"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Metadata state machine: layer commands applied to SQLite"
+description = "Metadata tablet: layer commands logged to a fencing LogStore and applied to SQLite"
 
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
+prost = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

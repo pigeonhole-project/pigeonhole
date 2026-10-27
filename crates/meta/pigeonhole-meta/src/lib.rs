@@ -21,6 +21,12 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
+pub mod log;
+
+pub use log::{
+    Discovered, Entry, EntryStream, Head, LogError, LogResult, LogStore, Position, Snapshot,
+};
+
 /// Outcome of applying one command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
