@@ -128,7 +128,8 @@ async fn a_changed_log_message_is_detected() {
     // Someone edits the older message's file in place.
     {
         let mut g = chat.inner.lock().unwrap();
-        let first = *g.docs.keys().next().unwrap();
+        // The claim's empty head comes first; then the batch with entry 1.
+        let first = *g.docs.keys().nth(1).unwrap();
         g.docs.get_mut(&first).unwrap().1.push(0);
     }
     let head = a.discover().await.unwrap().unwrap().head;

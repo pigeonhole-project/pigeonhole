@@ -369,7 +369,14 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
             }
         };
         let position = tip.position;
+        let new = before.is_none();
         *self.owner.lock().unwrap() = Some(Owner { gen, log_id, tip });
+        if new {
+            // Give the new log a head at once: a later boot then finds one
+            // instead of retrying for a pin that a log without writes lacks.
+            let w = Write { first: 1, entries: Vec::new(), head_term: 0, base: None, vote: None };
+            self.write(gen, w).await?;
+        }
         Ok(Head { log_id, position })
     }
 
@@ -428,6 +435,17 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
     }
 
     async fn discover(&self) -> LogResult<Option<Discovered>> {
+        // The handle that claimed the log knows it best: no chat round trip
+        // (and no waiting for a head that a new log does not have yet).
+        if let Some(o) = self.owner.lock().unwrap().as_ref() {
+            return Ok(Some(Discovered {
+                base: o.tip.base.clone(),
+                head: Head { log_id: o.log_id, position: o.tip.position },
+                head_term: o.tip.head_term,
+                vote: o.tip.vote.clone(),
+                gen: o.gen,
+            }));
+        }
         let Some((log_id, gen)) = parse_description(self.registers().await?.description.as_deref())? else {
             return Ok(None);
         };
