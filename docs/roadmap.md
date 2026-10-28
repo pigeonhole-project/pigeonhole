@@ -180,12 +180,15 @@ checking on a live bot before the chat protocol is adapted to it.
 
 ### Step 8 — Raft between nodes
 
-Nodes are processes of this binary talking Raft (openraft); each node keeps
-its own Raft log and snapshots in a store of its own (a dir, or a chat with its
-own bot), so a node is defined by its store, not by its machine. Terms and
-quorums fence; the per-node store needs only local durability plus the claim
-that keeps two processes from running as the same node. The leader is the
-tablet (sweeper, repair, writes). Design in meta-backends.md first.
+Design: meta-backends.md § Raft between nodes. Sub-steps:
+
+1. Node storage contract (Raft `LogId`, truncate, vote) + conformance suite
+   for local_disk, memory, telegram (fake chat).
+2. `MetaStore` over openraft as a cluster of one; old tablet batcher removed.
+3. gRPC network, in-process multi-node tests (failover, partitions, a node on
+   a fake chat), leader-only side effects, forwarding.
+4. `[[node]]` config, `init-cluster`, live runs with a node on Telegram.
+5. Later: follower reads, auth between nodes.
 
 ## Open questions
 

@@ -347,6 +347,145 @@ path = "pigeonhole-meta"
 | telegram | telegram (another chat) | nothing |
 | telegram | local_disk / memory | refused by the config |
 
+## Raft between nodes (proposal, step 8)
+
+Not implemented yet; this section is the design to agree on before code.
+
+### Why
+
+The tablet above has one writer and a shared log in an external store that
+fences. Its availability is that store's: a Telegram log is down when
+Telegram is, a local log when the host is. Making the shared log itself
+survive (a quorum of chats, BookKeeper style) means quorum fencing, recovery
+and repair of divergent copies over chats. Raft does exactly that between our
+own processes, so the per-node storage can stay simple.
+
+### Model
+
+```
+              Raft (terms, votes, replication of commands)
+   ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+   │ node a           │◄─►│ node b           │◄─►│ node c           │
+   │ log: local_disk  │   │ log: telegram    │   │ log: local_disk  │
+   │ snap: local_disk │   │ snap: telegram   │   │ snap: memory?    │
+   └──────────────────┘   └──────────────────┘   └──────────────────┘
+          blobs: shared [[store]] / [[replicas]] / [[shards]] (unchanged)
+```
+
+- A **node** is a process of this binary with a node id, an address, and a
+  log store and a snapshot store of its own (`[[node]] log` / `snapshot`, any
+  store kind that holds metadata). A node is defined by its stores, not by its
+  machine: a node whose log is a Telegram chat can be started anywhere.
+- Nodes replicate commands with Raft ([openraft](https://docs.rs/openraft)
+  0.9). Terms and quorums fence; a node's store has exactly one writer, the
+  node, so it needs local durability only.
+- The **leader is the tablet**: it serves writes (`MetaStore::propose` →
+  `client_write`), runs the sweeper and repair. Followers forward.
+- Single node = a cluster of one; the old tablet code goes away, one code path.
+
+### Node storage (`RaftLogStorage`)
+
+What openraft needs from a node's log, and how each store kind provides it:
+
+| need | local_disk | memory | telegram (chain) |
+|---|---|---|---|
+| `append(entries)`, durable at callback | segment record + fsync | push | send + pin, one message per batch |
+| `truncate(from)` (drop a divergent tail) | cut the segment | pop | a new message linking to the entry before `from`: the chain forks, the old tail is unreachable garbage |
+| `purge(upto)` (behind a snapshot) | `rebase` (exists) | drop | `rebase` (exists) |
+| `save_vote` / `read_vote`, durable | a `vote` file (tmp + rename) | field | carried in every message; a vote change alone sends an empty message |
+| one process per node | `flock` + `claimed_gen` (exists) | — | description fence + straggler window (exists) |
+
+Entries carry their Raft `LogId` (term, index) instead of our generation;
+`claim` stays, now meaning "this process is node X" so two processes started
+as the same node cannot both vote. A conformance suite (append / truncate /
+purge / vote / reopen) runs against every kind, as the LogStore suite does now.
+
+### State machine and snapshots (`RaftStateMachine`)
+
+- State = the namespaces as now (`chunk`, `s3`, `cas`) + last applied
+  `LogId` + membership. `apply` = `StateMachine::apply` per entry.
+- Snapshot = `TabletSnapshot` + Raft meta (last log id, membership), stored in
+  the node's `SnapshotStore` (`put` → ref). A lagging follower gets the
+  leader's snapshot over the network and `put`s it into its own store.
+- Positions: our `Position` becomes the Raft log index. Blank and membership
+  entries take indices too; nothing relies on positions being dense (the
+  reclaim gate only needs them to grow).
+- Entry payload: one command per Raft entry (`Entry { namespace, version,
+  command }`); openraft batches appends itself, our batcher goes away.
+
+### Network
+
+A tonic gRPC service on `[[node]] addr` (tonic is already a dependency for
+REAPI): `AppendEntries`, `Vote`, `InstallSnapshot` (streamed), and `Forward`
+(a follower's `propose` to the leader). Payloads are postcard bytes inside a
+`bytes` field, so the proto never mirrors our types. No auth in the first
+version: a shared secret header later.
+
+### Reads, writes, side effects
+
+- **Writes** (S3 PUT, DELETE, …): the leader serves them; a follower's S3
+  front forwards the whole request at first (simplest: upload pins and the
+  sweeper horizon are per process, so uploads must happen on the leader).
+- **Reads**: first version on the leader too; later followers serve reads with
+  read-index (`ensure_linearizable` on the leader) or bounded staleness.
+- **Sweeper / repair** run only while leader, and start only after
+  `ensure_linearizable` on the new term: by then the leader has applied every
+  entry an older leader got into the log, including commits of uploads it did
+  not know about, so its horizon (seeded from committed parts) is safe.
+  `confirm_active` before deletes becomes `ensure_linearizable`.
+- Losing leadership pauses side effects instead of stopping the process.
+
+### Config
+
+```toml
+[[node]]
+id = "a"
+addr = "10.0.0.1:9100"
+log = "a-disk"          # [[store]] ids, one purpose each as now
+snapshot = "a-disk"
+
+[[node]]
+id = "b"
+addr = "10.0.0.2:9100"
+log = "b-chat"
+snapshot = "b-snap-chat"
+
+[meta]
+node = "a"              # or PIGEONHOLE_NODE / --node: which node this process is
+```
+
+`pigeonhole init-cluster` initializes the membership from `[[node]]` once;
+later membership changes go through `change_membership`.
+
+### Restore
+
+If every node lost its log, `restore --lossy` seeds a one-node cluster from
+the newest snapshot found in the nodes' snapshot stores; the others join as
+learners. The reclaim gate applies when some node's snapshots outlive its log.
+
+### Steps
+
+1. Node storage contract over our stores (Raft `LogId`, truncate, vote) with
+   a conformance suite for local_disk, memory, telegram (fake chat).
+2. `MetaStore` over openraft in one process: a cluster of one, every existing
+   test green, the old tablet batcher removed.
+3. Network + in-process multi-node tests (memory stores, a fake transport):
+   leader election, failover, a node on a fake Telegram chat, partitions;
+   leader-only side effects and forwarding.
+4. `[[node]]` config, `init-cluster`, live runs (a node whose log is a real
+   Telegram channel).
+5. Later: reads on followers, auth between nodes, membership changes in ops.
+
+### Open questions
+
+- openraft 0.9 (stable) vs 0.10 (in progress, changes the storage traits).
+- A node whose log is Telegram appends ~1 message per batch: fine as a
+  follower (it lags, the majority commits), slow as a leader. Prefer leaders
+  on fast stores (openraft has no leader preference; a node could refuse to
+  campaign, or step down when another node is caught up).
+- Telegram chain truncate (a fork) leaves messages behind until the next
+  `rebase` deletes the chain; also the pin service messages (step 6b).
+
 ## Plan
 
 Each step is a separate commit with tests green.
