@@ -400,6 +400,37 @@ Entries carry their Raft `LogId` (term, index) instead of our generation;
 as the same node cannot both vote. A conformance suite (append / truncate /
 purge / vote / reopen) runs against every kind, as the LogStore suite does now.
 
+Appends are batched: openraft hands `append` several entries at once, and
+while one append is in flight new commands queue for the next. A store's
+speed limits appends, not commands: a Telegram channel takes about 20
+messages a minute, one message carries any number of entries (up to 20 MB).
+Costs per append: local_disk ~ms (fsync), telegram 1–3 s (send, pin, read
+the fence).
+
+### Two processes as one node
+
+Raft is safe only if every node keeps its promises (a vote, an
+acknowledged entry). Two processes started as the same node would break that,
+so the node's store fences them, the way the tablet's log fences writers now:
+
+- **Every durable change is fenced.** Granting a vote (`save_vote`),
+  acknowledging entries (`append` / `truncate`) and campaigning (a vote for
+  itself) first write to the store; the write succeeds only while the process
+  holds the store's generation (`flock` + `claimed_gen`, or the chat
+  description `pigeonhole-node id=<node> gen=<g>` read back after the pin).
+  A process that lost the store can neither vote nor acknowledge.
+- **Answers without a write are leased.** A heartbeat answered from memory
+  ("I match up to i") writes nothing. A process re-reads its fence at least
+  every half straggler window and stops once it is not its own; a claiming
+  process waits the window before taking part. Their lifetimes do not overlap,
+  on the same timing assumptions as the log fence (a deadline on every call,
+  the window longer than it).
+- **The fence names the node**: a process started as node `c` on node `b`'s
+  chat refuses to claim it; one config cannot give two nodes the same store.
+- Peers talk to `[[node]] addr`, so a second process elsewhere gets no RPCs;
+  it could only campaign, which needs `save_vote`, which is fenced.
+- local_disk: `flock` (not on NFS); memory: inside the process.
+
 ### State machine and snapshots (`RaftStateMachine`)
 
 - State = the namespaces as now (`chunk`, `s3`, `cas`) + last applied
@@ -478,11 +509,13 @@ learners. The reclaim gate applies when some node's snapshots outlive its log.
 
 ### Open questions
 
-- openraft 0.9 (stable) vs 0.10 (in progress, changes the storage traits).
-- A node whose log is Telegram appends ~1 message per batch: fine as a
-  follower (it lags, the majority commits), slow as a leader. Prefer leaders
-  on fast stores (openraft has no leader preference; a node could refuse to
-  campaign, or step down when another node is caught up).
+- openraft 0.9 (stable) is the choice; 0.10 changes the storage traits.
+- Any node may lead, a Telegram one included: a leader need not be in the
+  majority that commits an entry (Raft §10.2.1), so its slow store delays
+  commits only when no majority forms without it. Check openraft's quorum
+  accounting of the leader's own append in a test; keep the recent log tail in
+  memory so catching followers up does not download old messages. Measure
+  commit and append latency per node.
 - Telegram chain truncate (a fork) leaves messages behind until the next
   `rebase` deletes the chain; also the pin service messages (step 6b).
 
