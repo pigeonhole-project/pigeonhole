@@ -1,6 +1,6 @@
 # The metadata log and snapshots in Discord
 
-Status: **proposal**, not spiked. A brief for making a Discord channel a
+Status: **proposal**; spike done (see Spike findings). A brief for making a Discord channel a
 `LogStore` and a `SnapshotStore`, and for aligning the Discord blob backend
 with the MTProto one. Read [roadmap.md](roadmap.md) § Ground rules,
 [meta-backends.md](meta-backends.md), [telegram-mtproto.md](telegram-mtproto.md)
@@ -67,7 +67,8 @@ garbage, whatever its id and whenever it landed.
 **append(g, batch)**, with `head` = our last linked message:
 
 1. Send the batch (`prev = head`) with `enforce_nonce` (nonce derived from
-   `(log_id, gen, first)`), get its id `b`.
+   `(log_id, gen, first)`: nonces are per bot across channels; a resend
+   deduplicates only within ~3 minutes), get its id `b`.
 2. Start a thread from `head` named `next b g<g>`.
 3. Created: `b` is committed and is the new head, `Ok`. `160004`: someone
    linked `head` first — a newer generation's claim — `Fenced`; `b` stays
@@ -91,7 +92,15 @@ follows `prev` from the head down to the base.
 
 **Rebase and collection**: a rebase is a batch carrying the new base. Once it is
 linked, the writer deletes the messages below it and the snapshot the old base
-named. Threads of collected messages are left alone (see Spike: re-creation).
+named: each **message first, then its thread**. A deleted thread can be started
+again from a message that still exists (a reopened compare-and-set), but not
+from a deleted message (`10008 Unknown Message`); a thread outlives its
+deleted starter.
+
+**Archiving**: an archived thread still answers `160004`. A writer archives the
+previous link once the next one is made (`PATCH /channels/{thread}
+archived=true`; its rate bucket is per thread), so about one link is active at
+a time and the guild's active-thread limit is never near.
 
 **Genesis**: an empty channel has no tail, and two first claims would each
 start a chain. `pigeonhole init-log` posts one genesis message, once, by the
@@ -104,14 +113,25 @@ linked. A batch is committed when linked; a batch sent but never linked is
 lost even if its writer died before learning the outcome, which is the
 ordinary "unacknowledged" case.
 
+**Throughput**: a link is a thread creation, and those are limited to 50 per
+300 s (fixed window, shared by all channels; failed attempts count). So at
+most ~10 appends a minute sustained: group commit must aim at one append per
+6 s or more, and claims retrying on `160004` spend the same budget. Comparable
+to the Telegram log (~20–30 sends a minute), but this is the limit to watch.
+
+**Discover** skips `THREAD_CREATED` system messages (type 18): Discord posts one
+when the starter message is 5 or more messages back. An append links the
+message right below its batch, so normally none appear.
+
 ## Snapshots
 
 A `SnapshotStore` in a channel of its own: plain storage, no order, no fence.
 
 - `SnapshotRef` = `message_id` + crc; `get` fetches the message (fresh CDN
   URLs) and downloads; the crc catches a replaced message.
-- Snapshots above 20 MiB are split over several attachments (≤ 10 per message)
-  or messages; the ref names the first, which lists the rest.
+- Snapshots above 20 MiB are split over several attachments (≤ 10 per message,
+  each ≤ 20 MiB: the limit is per file) or messages; the ref names the first,
+  which lists the rest.
 - `newest()` (lossy restore): list the newest messages, take the first that
   decodes as a snapshot; filter by `log_id` when asked.
 
@@ -126,38 +146,62 @@ refresh by fetching the message). Changes:
 - Uploads with `enforce_nonce`, nonce derived from the `BlobId` (25 chars:
   base62 of its 128 bits fits in 22): a retried upload never posts twice.
 - `BackendLimits::discord` default to 20 MiB (minus margin); keep the
-  `max_blob_size` override for boosted servers.
+  `max_blob_size` override for boosted servers. The limit is per file, so a
+  message may carry several parts.
 
-## Spike
+## Spike findings (2026-10-28, bot on an unboosted test guild, API v10)
 
-Against a test guild and channel, with a bot holding `SEND_MESSAGES`,
-`READ_MESSAGE_HISTORY`, `CREATE_PUBLIC_THREADS`, `MANAGE_THREADS`,
-`MANAGE_MESSAGES`:
+Throwaway Python against the test channels (ids in the repo `.env`); all
+spike messages and threads were deleted afterwards.
 
-1. `160004` on a second thread from one message, also from another process
-   and token session; what a racing pair of creates returns.
-2. Does `GET /messages` (list) return the `thread` field? Then discover reads
-   links 100 at a time; otherwise one fetch per link.
-3. **Active thread limit per guild**: threads auto-archive after ≥ 60 min,
-   and one per append at ~1 append/s is thousands an hour. Archive each link
-   (`PATCH /channels/{thread} archived=true`) right away or a little later;
-   check `160004` still holds for an archived thread.
-4. **Re-creation after delete**: can a thread be started again from a message
-   whose thread was deleted? If so, links must never be deleted, only
-   archived (the design above assumes that).
-5. Rate limits of thread creation and archiving (headers), and whether
-   starting a thread posts anything visible in the channel.
-6. `enforce_nonce` window and scope with multipart uploads; nonce format.
-7. 20 MiB attachments for a bot on an unboosted server.
+- **Create-once holds**: a second thread from a message → HTTP 400, code
+  `160004`. Three concurrent creates on one message: exactly one `201`, two
+  `160004`. Archived, and archived + locked, threads still answer `160004`.
+- **Re-creation after delete**: deleting a thread clears `message.thread`, and a
+  new thread can then be started from the same message. Starting one from a
+  deleted message fails (`10008`), also while its old thread still exists (a
+  thread survives its starter's deletion). Hence collection order: message,
+  then thread.
+- **Links are visible in listings**: `GET /channels/{c}/messages` (100 per page)
+  returns each message's `thread` with its name and `thread_metadata`; so does
+  `GET` of one message. Discover reads 100 links per call.
+- **System messages**: starting a thread from a message 5+ messages back posts
+  a type 18 (`THREAD_CREATED`) message named like the thread; 1–3 back posts
+  nothing.
+- **Rate limits** (headers, dynamic):
+  - thread creation: 50 per 300 s fixed window, one bucket across channels
+    (per bot or per guild: not told apart), plus short bursts limited (a 429
+    with `retry_after` ~3–5 s after ~10 quick creates); a 429 creates nothing;
+  - message create: 5 per ~5 s per channel (30 sends took 26 s);
+  - get one message, list messages: 5 per few s per channel;
+  - archive (`PATCH` thread): 10 per 15 s, per thread;
+  - bulk delete: 1 per ~2 s per channel; delete thread: effectively free.
+- **Nonces**: `enforce_nonce` returns the earlier message for a resend within
+  **3–5 minutes** (seen at 3 min, a new message at 5), even with a different
+  body or no attachment; it returns the newest message carrying that nonce.
+  The scope is the author across channels: the same nonce in another channel
+  within the window fails with `404 Unknown Message`. ≤ 25 characters
+  (26 → `NONCE_TYPE_TOO_LONG`); digit strings work. Nonces must therefore be
+  unique per bot (derive them from log id + generation + position, or the
+  `BlobId`), and a send may be retried only within ~3 minutes.
+- **Files**: exactly 20 MiB (20 971 520 bytes) per attachment is accepted,
+  one byte more → `413`, code `40005`. The limit is per file: one message with
+  2 × 15 MiB went through. Upload ~1.8 MB/s (20 MiB in 11 s); CDN download of
+  20 MiB in 1.2 s; `Range` answers `206` with `Content-Range`.
+- **CDN URLs**: `ex − is` = 24 h; `POST /attachments/refresh-urls` works for a
+  bot with bare URLs.
+- **Not probed**: the guild's active-thread limit (archiving each link keeps
+  us far below it); whether the thread bucket is per bot or per guild (needs a
+  second guild).
 
 ## Steps
 
 Each step ends with `cargo test --workspace` and
 `./scripts/check-deps.sh --strict` green; one logical change per commit.
 
-1. **Spike** (throwaway binary, not merged); findings into this doc.
-2. **Blob backend**: `DiscordId` = `message_id`, nonce uploads, 20 MiB default,
-   URL refresh batching. Existing wiremock conformance tests follow.
+1. ~~**Spike**~~ Done; results in Spike findings above.
+2. **Blob backend**: `DiscordId` = `message_id`, nonce uploads, 20 MiB default
+   (exactly 20 971 520 accepted), URL refresh batching. Existing wiremock conformance tests follow.
 3. **Linked log** in `pigeonhole-meta`: the protocol over a `LinkableChat`
    trait (`send_document`, `link(from, name) -> Created | Taken(name)`,
    `thread_of(id)`, `list(after, limit)`, `download`, `delete`), a fake with
@@ -173,6 +217,6 @@ Each step ends with `cargo test --workspace` and
 
 ## Open questions
 
-- Archive links right away (one extra call per append) or in batches?
 - Genesis by an explicit `init-log`, or the oldest message after a pause?
-- One guild per log to keep the active-thread budget to ourselves?
+- Is the thread-creation bucket per bot or per guild? If per guild, one guild
+  per log keeps its ~10 appends a minute to itself.
