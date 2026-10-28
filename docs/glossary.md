@@ -15,13 +15,13 @@ Terms used in code, comments, and docs (Stage B onward).
 | **Extent list** | Ordered extents = object bytes | any | replaced as a whole | gateways |
 | **Object** | Gateway entity: S3 object, `CasEntry`, Kafka segment | any | per protocol | gateways |
 | **Tablet** | The metadata state machine: commands → `LogStore` → in-memory `StateMachine`s (`MetaStore`) | — | one active incarnation | `pigeonhole-meta` |
-| **LogStore** | Fencing command log the tablet appends batches to (`local`, `telegram`, later `s3`) | — | append-only, collected behind its base | `pigeonhole-meta` |
+| **LogStore** | Fencing command log the tablet appends batches to (`local_disk`, `memory`, `telegram`: a channel fenced by the order of message ids) | — | append-only, collected behind its base | `pigeonhole-meta` |
 | **Generation** | Number of a tablet incarnation; a newer claim fences every older one (`Fenced`) | u64 | strictly increasing | `LogStore` |
 | **Position** | Index of an entry in the log (1, 2, …) | u64 | — | tablet |
 | **Blob id** | Our id of a blob (`BlobId`), chosen before upload and sent as its file name `ph-<hex>.bin` | 128 bit | immutable | chunk store |
 | **Upload pin** | Process-local mark of an upload not committed yet; with the others it sets the sweep **horizon** | — | until commit | `UploadPins` |
 | **Read pin** | Process-local mark of a chunk being read; reclaim waits for it | — | for one read | `BlobDb` |
-| **Snapshot** | All namespace states as of a position (`TabletSnapshot`), kept in a **SnapshotStore** (`local`, `telegram`) | state size | replaced | tablet |
+| **Snapshot** | All namespace states as of a position (`TabletSnapshot`), kept in a **SnapshotStore** (`local_disk`, `memory`, `telegram`) | state size | replaced | tablet |
 | **Base** | The stored snapshot a log starts from (`at` + `SnapshotRef`), set by `rebase`; entries ≤ `at` are dropped | — | moves forward | `LogStore` |
 | **Zero entry** | Empty batch appended on boot: proves the claim and starts the generation | 0 entries | immutable | tablet |
 

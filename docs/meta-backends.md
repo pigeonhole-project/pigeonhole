@@ -153,9 +153,10 @@ deposed writer's late `put` is just an unreferenced copy. A store never drops
 snapshots on its own; the tablet removes the previous base once the log is
 rebased on a newer one. Implementations: `local` (`snapshot-<log id>-<at>.snap`
 files, crc-checked; the directory may be the log's) and `telegram`
-(`ChatSnapshotStore`: one document per snapshot in a dedicated chat, the
-newest pinned so `newest` needs no history). The log and the snapshots cannot
-share a chat: both use the pinned message.
+(`ChannelSnapshotStore`: one document per snapshot in a channel of its own;
+the ref is the message id and the document's crc; `newest` posts a probe to
+learn the top and walks down). The log and the snapshots cannot share a
+channel: snapshot ids would land in the log's checked ranges.
 
 ### Tablet lifecycle
 
@@ -210,84 +211,35 @@ under a lock. Fences only processes on the
 same host; durability = the disk. Default, and the reference implementation the
 others are tested against.
 
-### `telegram` — one chat, Bot API only
+### `telegram` — a channel over MTProto, fenced by message order
 
-Implemented as `ChatLogStore` (`pigeonhole-meta/src/log/chat.rs`, protocol
-over a `ChatApi` trait, tested on a fake chat) with a Telegram adapter in the
-binary. Two registers, both read with one `getChat`
-([Bot API](https://core.telegram.org/bots/api)):
+Implemented as `ChannelLogStore` (`pigeonhole-meta/src/log/channel.rs`,
+protocol over a `ChannelApi` trait, tested on a fake channel) with an MTProto
+adapter in the binary. Design, spike and live findings:
+[telegram-mtproto.md](telegram-mtproto.md). In short:
 
-- **head** — `pinned_message`: the newest pinned message **by sending date**;
-- **fence** — the chat `description`: `pigeonhole-log id=<log id> gen=<g>`.
-  Channels, supergroups and groups (private chats are not supported).
+- A channel numbers every message, atomically and in increasing order, and a
+  bot may read any message by id (`channels.getMessages`). That order is the
+  fence: who won is decided by the **position** of a message, not by time.
+- Two kinds of documents: `log-<g>-claim.bin` and `log-<g>-batch.bin` (a
+  batch with the log's registers: base, vote, head term; `prev` links the
+  chain, `since` is the last message its writer had checked).
+- A claim is valid iff no valid claim of a generation ≥ its own lies below
+  it; a batch of `g` iff no claim of a generation > `g` lies in
+  `(since, batch)`. The head is the highest valid batch.
+- `append`: send; if the id is `checked + 1`, committed without a read (the
+  common case in a dedicated channel), else read the gap for a higher claim.
+- `claim`: send the claim, walk down to the highest valid batch, check the
+  claims above it.
+- A deposed writer's batch that lands late (a dropped grammers request still
+  goes out) is above the newer claim and invalid for every reader alike: no
+  straggler window, no pins, no description.
+- A batch sent but never confirmed is valid if no higher claim precedes it,
+  and becomes the head: entries never acknowledged may survive, as Raft allows.
 
-**Log layout — a chain.** Every log message is a document (postcard `LogDoc`):
-log id, generation, the log's current base, a crc-checked link to the previous
-log message (with the position of its last entry) and a batch. Recovery needs
-no history access: `getChat` → head → base snapshot from the SnapshotStore →
-follow links with `getFile` back to the base → apply forward. `rebase` sends
-an empty batch carrying the new base and deletes the messages it covers.
-
-`append(g, batch)`:
-1. send the batch (link = this writer's tip, `gen = g`);
-2. pin it;
-3. `getChat`: `Ok` iff the description still says `gen=g`, else `Fenced`. If
-   something newer tops the pin (a straggler), send and pin a newer empty batch
-   linked to the tip — never unpin.
-
-`claim(g)`:
-1. refuse a chat whose description or pin is not ours (the log needs a
-   dedicated chat; the config refuses a log chat that is also a blob chat);
-2. `setChatDescription(gen=g)` — from here on every older `append` fails step 3;
-3. **wait the straggler window** (`straggler_window_secs`, default 90 s, longer
-   than the 30 s deadline the adapter puts on every Bot API call);
-4. `getChat`: the description must still say `gen=g` (else `Fenced`); the
-   pinned message is the base.
-
-Why it is safe: an older generation acknowledged a batch only after pinning it
-and then seeing its own generation in the description — i.e. before the
-claimant's step 2. A deposed writer has at most one batch in flight; it lands
-within the call deadline, so before step 4, and it links to that writer's own
-tip. The head read at step 4 is therefore the newest-sent message of the
-newest older generation, and the chain behind it holds every acknowledged
-batch. A straggler is never acknowledged but may become part of the history
-(its proposer got an error: outcome unknown, as in Raft).
-
-**Two claimants** may race on step 2 (the description is overwritten
-blindly): whoever wrote last wins; the other sees a different generation at
-step 4 or on its first append and stops. Neither had acknowledged anything.
-
-**Live-bot findings** (2026-10-28, a channel, Bot API):
-
-- `pinned_message` is the newest pinned message **by sending date**, not the
-  last one pinned: pinning C, then A, then B returned C. Pinning a newer
-  message shows up in the next `getChat` at once.
-- After unpinning the head, `getChat` returned **no** `pinned_message` (other
-  messages still pinned), also after re-pinning an older one; about a minute
-  later it showed the newest remaining pin again. Hence: never unpin, and
-  retry a missing head (`head_retries` × `head_retry_delay`, 2 minutes) before
-  taking a claimed log for empty.
-- `setChatDescription` → `getChat` reads the new value at once, also right
-  after a pin. Setting the same value fails with "chat description is not
-  modified" (a claimant with the same generation is fenced). Rate: six changes
-  in a row went through (one took 3 s), the seventh got "Too Many Requests:
-  retry after 43" — fine for claims, which are rare.
-
-Costs and caveats:
-- an append is one send, one pin, one `getChat`; appends are batched — a single
-  chat should stay under about one message per second
-  ([Bot FAQ](https://core.telegram.org/bots/faq)), groups under 20 per minute;
-- a claim (boot, failover) takes the straggler window;
-- recovery walks the chain back to the base (one `getFile` per batch), so
-  snapshots bound recovery time; a snapshot in a chat is one document, so it
-  must fit the bot download limit (20 MB);
-- every pin leaves a "pinned message" service message in the chat, and nothing
-  deletes them yet;
-- the bot needs `can_change_info`, `can_pin_messages` (channels: edit
-  messages) and `can_delete_messages`;
-- chat admins can delete or unpin messages; crc links detect a changed
-  message, nothing prevents it;
-- the project disclaimer applies even more: this uses a chat as a database log.
+Costs: an append is one send (~20 a minute per channel); `confirm` posts an
+empty batch; `discover` posts a probe (kept). Recovery follows `prev` down
+to the base, a page read per 100 ids. The bot needs post and delete rights.
 
 ### `s3` — conditional writes (later)
 
@@ -320,8 +272,9 @@ cheap compared to Telegram; needs an S3-compatible store with conditional writes
 
 The tablet decides what is garbage in its own log (entries ≤ the base), like
 YDB's `CollectGarbage` barrier on `generation:step`; ids of log objects are
-chosen by the writer, so collection needs no listing. Old Telegram messages are
-deleted by `rebase` (`deleteMessage`), the previous base snapshot by the tablet.
+chosen by the writer, so collection needs no listing. Old Telegram log
+messages (ours only) below the oldest batch a reader needs are deleted by
+`rebase`, the previous base snapshot by the tablet.
 
 ## Config
 
@@ -332,7 +285,6 @@ log = "meta"                        # a [[store]] id: local_disk | memory | tele
 snapshot = "meta"                   # default: the log's store if local_disk / memory
 snapshot_every_entries = 10000      # 0 = never
 snapshot_every_secs = 600           # also by time if anything changed
-# log_straggler_window_secs = 90    # telegram log: claim waits for a deposed writer
 
 [[store]]
 id = "meta"
@@ -340,8 +292,8 @@ kind = "local_disk"
 path = "pigeonhole-meta"
 
 # [[store]]                         # ship the log off-host: a channel of its own
-# id = "tg-log"                     # (fence = description); snapshots then go to
-# kind = "telegram"                 # another telegram store
+# id = "tg-log"                     # (fenced by message order); snapshots then go
+# kind = "telegram"                 # to another telegram store
 # chat_id = -1009876543210
 ```
 
@@ -350,7 +302,7 @@ path = "pigeonhole-meta"
 | local_disk | the same store | everything |
 | memory | memory | everything (tests) |
 | local_disk | another local_disk / telegram | `restore --lossy`: the tail after the newest snapshot |
-| telegram | telegram (another chat) | nothing |
+| telegram | telegram (another channel) | nothing |
 | telegram | local_disk / memory | refused by the config |
 
 ## Raft between nodes (proposal, step 8)
@@ -393,13 +345,13 @@ own processes, so the per-node storage can stay simple.
 
 What openraft needs from a node's log, and how each store kind provides it:
 
-| need | local_disk | memory | telegram (chain) |
+| need | local_disk | memory | telegram (channel) |
 |---|---|---|---|
-| `append(entries)`, durable at callback | segment record + fsync | push | send + pin, one message per batch |
+| `append(entries)`, durable at callback | segment record + fsync | push | one send per batch (+ a gap read if something lies between) |
 | `truncate(from)` (drop a divergent tail) | cut the segment | pop | a new message linking to the entry before `from`: the chain forks, the old tail is unreachable garbage |
 | `purge(upto)` (behind a snapshot) | `rebase` (exists) | drop | `rebase` (exists) |
 | `save_vote` / `read_vote`, durable | a `vote` file (tmp + rename) | field | carried in every message; a vote change alone sends an empty message |
-| one process per node | `flock` + `claimed_gen` (exists) | — | description fence + straggler window (exists) |
+| one process per node | `flock` + `claimed_gen` (exists) | — | claims ordered by message id (exists) |
 
 Entries carry their Raft `LogId` (term, index) instead of our generation;
 `claim` stays, now meaning "this process is node X" so two processes started
@@ -410,8 +362,7 @@ Appends are batched: openraft hands `append` several entries at once, and
 while one append is in flight new commands queue for the next. A store's
 speed limits appends, not commands: a Telegram channel takes about 20
 messages a minute, one message carries any number of entries (up to 20 MB).
-Costs per append: local_disk ~ms (fsync), telegram 1–3 s (send, pin, read
-the fence).
+Costs per append: local_disk ~ms (fsync), telegram ~1 s (one send).
 
 ### Two processes as one node
 
@@ -422,17 +373,17 @@ so the node's store fences them, the way the tablet's log fences writers now:
 - **Every durable change is fenced.** Granting a vote (`save_vote`),
   acknowledging entries (`append` / `truncate`) and campaigning (a vote for
   itself) first write to the store; the write succeeds only while the process
-  holds the store's generation (`flock` + `claimed_gen`, or the chat
-  description `pigeonhole-node id=<node> gen=<g>` read back after the pin).
+  holds the store's generation (`flock` + `claimed_gen`, or in a channel no
+  newer claim below its message: the order fence of the `telegram` log).
   A process that lost the store can neither vote nor acknowledge.
 - **Answers without a write are leased.** A heartbeat answered from memory
-  ("I match up to i") writes nothing. A process re-reads its fence at least
-  every half straggler window and stops once it is not its own; a claiming
-  process waits the window before taking part. Their lifetimes do not overlap,
-  on the same timing assumptions as the log fence (a deadline on every call,
-  the window longer than it).
+  ("I match up to i") writes nothing. A process confirms its fence at least
+  every half lease (in a channel: an empty batch) and stops once it is not
+  its own; a claiming process waits a lease before taking part. Their
+  lifetimes do not overlap if clocks run at about the same rate (the channel
+  order gives no time bound of its own).
 - **The fence names the node**: a process started as node `c` on node `b`'s
-  chat refuses to claim it; one config cannot give two nodes the same store.
+  channel refuses to claim it; one config cannot give two nodes the same store.
 - Peers talk to `[[node]] addr`, so a second process elsewhere gets no RPCs;
   it could only campaign, which needs `save_vote`, which is fenced.
 - local_disk: `flock` (not on NFS); memory: inside the process.
@@ -503,11 +454,11 @@ learners. The reclaim gate applies when some node's snapshots outlive its log.
 ### Steps
 
 1. Node storage contract over our stores (Raft `LogId`, truncate, vote) with
-   a conformance suite for local_disk, memory, telegram (fake chat).
+   a conformance suite for local_disk, memory, telegram (fake channel).
 2. `MetaStore` over openraft in one process: a cluster of one, every existing
    test green, the old tablet batcher removed.
 3. Network + in-process multi-node tests (memory stores, a fake transport):
-   leader election, failover, a node on a fake Telegram chat, partitions;
+   leader election, failover, a node on a fake Telegram channel, partitions;
    leader-only side effects and forwarding.
 4. `[[node]]` config, `init-cluster`, live runs (a node whose log is a real
    Telegram channel).
@@ -523,7 +474,7 @@ learners. The reclaim gate applies when some node's snapshots outlive its log.
   memory so catching followers up does not download old messages. Measure
   commit and append latency per node.
 - Telegram chain truncate (a fork) leaves messages behind until the next
-  `rebase` deletes the chain; also the pin service messages (step 6b).
+  `rebase` collects them.
 
 ## Plan
 
@@ -540,20 +491,17 @@ Each step is a separate commit with tests green.
    `confirm_active` before each orphan delete batch; loops end on stop.
 5. ~~In-flight pin registry.~~ Done: upload pins + horizon, own `BlobId`s,
    read pins; watermarks, sweep grace and `InflightParts` removed.
-6. ~~`telegram` LogStore.~~ Done: `ChatLogStore` + Telegram adapter, the
-   LogStore conformance suite and fault injection on a fake chat; snapshots
-   moved into a `SnapshotStore` of their own (`local` | `telegram`).
+6. ~~`telegram` LogStore.~~ Done: first over the Bot API (pins, a description
+   fence, a straggler window), then replaced by `ChannelLogStore` over MTProto
+   (fenced by message order); the LogStore conformance suite and fault
+   injection on a fake channel; snapshots in a `SnapshotStore` of their own.
 7. **Arbiter** and a second node; `s3` LogStore.
 
 ## Open questions
 
-- Telegram: the description is not a compare-and-swap; the protocol's safety
-  rests on reading it right after the pin (read-after-write held on a live
-  bot). `setMyDescription` (private chats) is not verified.
-- Telegram: a straggler batch pinned between a claim's steps 1 and 2 becomes the
-  new chain's base, so a command its writer answered with an error is applied
-  anyway (outcome unknown, as in Raft). Document it in the contract, or use a
-  new chain per generation (BookKeeper style).
+- Telegram: the log trusts that a message is readable by id once its send
+  returned (checked live, also from another session); an id that stays empty
+  is taken as deleted. Someone deleting a claim by hand defeats the fence.
 - Snapshots are taken between batches under read locks: O(state). Fine at our
   scale; persistent maps (imbl) would make them O(1) if it ever matters.
 - Batch size / delay defaults per LogStore kind (`local`: no extra delay).

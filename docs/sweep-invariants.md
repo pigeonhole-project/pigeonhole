@@ -33,9 +33,9 @@ upload.
 
 What the listing yields per backend:
 
-- **Telegram** cannot list: every message id up to the horizon is a candidate,
-  ours or not. A chat that holds blobs must hold nothing else that matters —
-  in particular **not the Telegram LogStore** (roadmap step 6 uses its own chat).
+- **Telegram** (MTProto) reads the channel's id range up to the horizon, 100
+  ids per `channels.getMessages`, and keeps only documents named with one of
+  our blob ids (`ph-<32 hex>.bin`); it never deletes what is not ours.
 - **Discord** lists the channel and keeps only messages whose attachment is
   named with one of our blob ids (`ph-<32 hex>.bin`, see `BlobId`).
 - **Memory** lists its own messages.

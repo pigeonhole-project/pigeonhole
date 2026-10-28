@@ -110,7 +110,7 @@ upload_concurrency = 2
 download_concurrency = 8
 
 [cache]
-# L0 (Telegram file_path) + L1 blocks + L2 compressed blobs.
+# L1 blocks + L2 compressed blobs.
 enabled = true
 # L2 in-memory capacity (bytes).
 memory_bytes = 268435456

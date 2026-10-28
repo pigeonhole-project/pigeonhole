@@ -1,7 +1,7 @@
 # Telegram over MTProto (bot token)
 
 Status: **implemented** (steps 1–5; see Implementation notes); the Bot API
-backend is to be removed next. A Telegram backend that talks MTProto instead
+backend is removed and this one is `kind = "telegram"`. A Telegram backend that talks MTProto instead
 of the Bot API, still logged in as a **bot** (no user account). Read [roadmap.md](roadmap.md) § Ground rules,
 [meta-backends.md](meta-backends.md), [sweep-invariants.md](sweep-invariants.md)
 and [glossary.md](glossary.md) first.

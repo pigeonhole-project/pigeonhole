@@ -179,9 +179,8 @@ pinless snapshots. The Bot API backend removed, the kind renamed to
 
 ### Step 6e — MTProto leftovers
 
-- Docs that still describe the Bot API: README (Telegram section),
-  meta-backends.md, sweep-invariants.md, glossary.md, `.env.example`
-  (`CHAT_ID` / `BOT_TOKEN` vs the `TG_*` names), `scripts/compat-telegram*.sh`.
+- ~~Docs that still describe the Bot API~~ Done: README, meta-backends.md,
+  sweep-invariants.md, glossary.md, `.env.example`.
 - The grammers-mtsender patch (telegram-mtproto.md § Steps 2): discuss, apply
   through `[patch.crates-io]`, offer upstream.
 

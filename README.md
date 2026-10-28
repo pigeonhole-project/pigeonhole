@@ -6,7 +6,8 @@
 > for storing real data, and it is **not** an invitation to use Telegram or
 > Discord as free file hosting. Using a messenger as a general-purpose storage
 > backend may violate the [Telegram Terms of Service](https://telegram.org/tos),
-> the [Telegram Bot API Terms](https://telegram.org/tos/bot-developers),
+> the [Telegram API Terms](https://core.telegram.org/api/terms) and
+> [Bot Developer Terms](https://telegram.org/tos/bot-developers),
 > the [Discord Terms of Service](https://discord.com/terms) and the
 > [Discord Developer Policy](https://discord.com/developers/docs/policies-and-agreements/developer-policy).
 > If you run it against a real bot, keep it to small, short-lived test data in
@@ -17,10 +18,11 @@
 Pluggable blob storage with protocol gateways, written in Rust. The main
 gateway is S3-compatible HTTP (via [s3s](https://github.com/s3s-project/s3s));
 a Bazel/Buck2 remote cache (REAPI v2) gateway is optional. Bytes are stored as
-documents/attachments through the Telegram or Discord Bot API, or in memory.
+documents/attachments in Telegram (MTProto, logged in as a bot) or Discord
+channels, in files on a local disk, or in memory.
 
 Objects are split into **chunks** (default on-wire ≤ 19 MiB, hard cap
-`< 20 MiB` for Telegram `getFile`). Chunk encoding is `raw` | `gzip` | `zstd`
+`< 20 MiB`). Chunk encoding is `raw` | `gzip` | `zstd`
 (default `zstd`): compressing policies pack independent 1 MiB **blocks** into
 backend messages so each block is compressed once and Range reads only touch
 the blocks they need. Chunks are refcounted, so `CopyObject` shares the
@@ -48,7 +50,7 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 | `meta/pigeonhole-meta` | Metadata tablet: layer commands in a fencing `LogStore`, applied to in-memory `StateMachine`s (`MetaStore`) |
 | `blob/pigeonhole-blob` | `BlobBackend`, `Replicated`, rate limits, `BootstrapPointer`, cache knobs |
 | `blob/pigeonhole-chunk-store` | `ChunkStore`, the `chunk` namespace, ingest, sweeper, repair, config (no protocol crates) |
-| `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
+| `storage/pigeonhole-storage-telegram` | Telegram storage over MTProto (grammers), logged in as a bot |
 | `storage/pigeonhole-storage-discord` | Discord Bot API storage |
 | `storage/pigeonhole-storage-memory` | In-memory blob storage for tests / `kind = "memory"` stores |
 | `storage/pigeonhole-storage-disk` | Blobs as files in a directory (`kind = "local_disk"`) |
@@ -89,30 +91,39 @@ Authentication is AWS SigV4 via s3s `SimpleAuth` (keys from `AWS_ACCESS_KEY_ID` 
 
 Non-secret settings live in **`pigeonhole.toml`** (path override:
 `PIGEONHOLE_CONFIG`). Secrets stay in **`.env` / environment**: `BOT_TOKEN`,
-`DISCORD_BOT_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+`TG_API_ID`, `TG_API_HASH`, `DISCORD_BOT_TOKEN`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`.
 
 ## Telegram backend
 
 Read the disclaimer at the top first.
 
+pigeonhole talks MTProto (the protocol of Telegram's own apps, via
+[grammers](https://codeberg.org/Lonami/grammers)) but logs in as a **bot**,
+with its token: no user account, no interactive login.
+
 1. Create a bot with [@BotFather](https://t.me/BotFather) and get a `BOT_TOKEN`.
-2. Create a private channel or group, add the bot as **administrator** with:
-   - **Channel:** permission to **edit messages** (needed to pin).
-   - **Group / supergroup:** permission to **pin messages**.
-   - Pinning in a group also posts a Telegram service message — expected noise.
-3. Set the instance `chat_id` in `pigeonhole.toml` (see the example), `BOT_TOKEN` in `.env`.
+2. Register an app at [my.telegram.org](https://my.telegram.org) for
+   `TG_API_ID` / `TG_API_HASH`.
+3. Create a private **channel** or **supergroup** per purpose (blobs, log,
+   snapshots) and add the bot as **administrator** with the post and delete
+   messages rights. Basic groups and private chats are refused: only channels
+   number their messages per chat.
+4. Set `chat_id` (`-100…`) per `[[store]]` in `pigeonhole.toml`, the secrets
+   in `.env`.
 
-On startup pigeonhole calls `getMe` + `getChatMember` and exits if the bot is not
-an admin with the pin/edit rights above.
+The first start logs in (~2 s) and caches the auth key in the session file
+(`pigeonhole-tg-<bot id>.session`, 0600, one per bot; delete it to log in
+again). On startup the bot's rights in each channel are checked.
 
-Bot API limits that shape the design:
-
-- Upload (`sendDocument`): 50 MiB; download (`getFile`): 20 MiB → `chunk.size`
-  must be `< 20 MiB` (default 19 MiB).
-- Sends to a chat are slow (~20/min); `getFile` is much faster. pigeonhole uses
-  **separate** token budgets for send / getFile / delete; CDN downloads are only
-  capped by a connection semaphore. Resolved `file_path` values are kept in an
-  in-memory LRU so repeated chunk reads do not call `getFile` again.
+What MTProto gives a bot over the Bot API: any message of a channel can be
+read by id (`channels.getMessages`), so a channel is listed by reading id
+ranges (ids are dense), the sweeper deletes only our `ph-<hex>.bin`
+documents, and the log needs no pins (it is fenced by the order of message
+ids, [docs/telegram-mtproto.md](docs/telegram-mtproto.md)); files are not
+capped at 20 MiB and are read in exact 512 KiB windows. What it does not
+change: about 20 messages a minute per channel. `FLOOD_WAIT` answers cool the
+budget they hit (`[telegram]`) and are waited out.
 
 ## Discord backend
 
@@ -138,7 +149,7 @@ accordingly.
 ## Stores and replication
 
 Every place bytes can live is a `[[store]]` (`local_disk`, `memory`,
-`telegram`, `discord`; tokens are referenced by env var name, never inline). Stores are
+`telegram`, `discord`; secrets are referenced by env var name, never inline). Stores are
 combined into `[[replicas]]` groups, and `[meta] log` / `snapshot` and
 `[chunk] store` name a store or a group:
 
@@ -205,15 +216,15 @@ comments. Sections:
 
 | TOML | Meaning |
 |---|---|
-| `[[store]]` | Where bytes live: id, kind (`local_disk` + `path` / `memory` / `telegram` + `chat_id` / `discord` + `channel_id`), token env, `max_blob_size`. Every kind holds blobs; the log and snapshots go to `local_disk`, `memory` or `telegram` |
+| `[[store]]` | Where bytes live: id, kind (`local_disk` + `path` / `memory` / `telegram` + `chat_id` / `discord` + `channel_id`), secret env names (`bot_token_env`; telegram also `api_id_env`, `api_hash_env`), telegram `session`, discord `max_blob_size`. Every kind holds blobs; the log and snapshots go to `local_disk`, `memory` or `telegram` |
 | `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
 | `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never), `log_straggler_window_secs` |
+| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never) |
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
-| `[telegram]` | Rate limits on two levels: per bot (`bot_rate_per_sec`) and per chat (send + pin / getFile / delete / info budgets); a 429 freezes the bucket it hit; upload/download concurrency |
-| `[cache]` | `file_path` LRU, L1 unpacked blocks, L2 memory/disk blob cache |
+| `[telegram]` | Rate limits on two levels: per bot (`bot_rate_per_sec`) and per channel (send / getFile / delete / info budgets); a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency |
+| `[cache]` | L1 unpacked blocks, L2 memory/disk blob cache |
 | `[sweep]` | Garbage collector: `interval_secs`, `batch_size` |
 | `[repair]` | Replica repair/backfill: interval, batch, cost limit, `scrub` |
 | `[http]` | Body/header timeouts, concurrency limit, max headers |
@@ -240,7 +251,7 @@ snapshots are configured separately:
 |---|---|---|
 | a `local_disk` store | the same store (default) | loses the metadata |
 | a `local_disk` store | a `local_disk` on another disk, or a `telegram` store | `restore --lossy`: loses the changes after the newest snapshot |
-| a `telegram` store | another `telegram` store | loses nothing: a clean machine boots from the chats |
+| a `telegram` store | another `telegram` store | loses nothing: a clean machine boots from the channels |
 
 After losing a local log whose snapshots survived:
 
@@ -255,7 +266,8 @@ deletes a chunk's parts only after a stored snapshot shows the chunk released.
 Starting the server on an empty log next to stored snapshots is refused
 instead of booting with empty metadata.
 
-Delete every backend message tracked by the local index (server must be stopped):
+Delete every object, upload and bucket; the sweeper then deletes their blobs
+(server must be stopped):
 
 ```bash
 cargo run --release -- purge --yes [--expect-chat CHAT_ID]
@@ -298,9 +310,10 @@ make compat-s3s-e2e ARGS='--filter ^Basic'
 make compat-rclone             # rclone S3 e2e (downloads pinned rclone)
 ```
 
-Manual live suites (not in CI; they purge the chat first — use a throwaway test
-chat/channel and see the disclaimer). They read `CHAT_ID` / `DISCORD_CHANNEL_ID`
-from `.env`:
+Manual live suites (not in CI; they purge the store first — use a throwaway
+test channel and see the disclaimer). They read `TG_BOT_TOKEN`, `TG_API_ID`,
+`TG_API_HASH`, `TG_BLOBS_CHAT_ID` / `DISCORD_CHANNEL_ID` from `.env`. The
+Telegram one is slow: every small put is a message, ~20 a minute.
 
 ```bash
 make compat-telegram
@@ -312,8 +325,10 @@ make compat-discord
 - **One active process per log.** A process booting on the same `[meta] log`
   claims a newer generation and fences the running one, which exits. The
   `local` log fences only processes on the same host.
-- **`file_id` is bot-bound.** Telegram `file_id`s are only valid for the bot
-  that uploaded them; rotating `BOT_TOKEN` breaks reads of existing data.
+- **Blobs are bot-bound.** A blob is a message id in a channel; another bot
+  admin of the same channel reads it, but the store's fingerprint includes the
+  bot id, so changing the bot is refused at startup (a moved store would need
+  a new id).
 - **Single tenant.** One access key pair, no ACLs.
 - HTTP uses tower timeouts, a concurrency limit and a header-count guard
   (`[http]`). Backend/cache counters are logged periodically and, with
