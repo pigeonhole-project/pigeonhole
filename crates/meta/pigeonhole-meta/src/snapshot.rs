@@ -10,7 +10,6 @@
 //! [`LogStore::rebase`]: crate::LogStore::rebase
 
 use crate::log::channel::{ChannelApi, ChannelMsg, PAGE};
-use crate::log::chat::ChatApi;
 use crate::{LogId, Position};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -206,62 +205,6 @@ impl SnapshotStore for MemorySnapshotStore {
     }
 }
 
-/// Snapshots as documents in a dedicated chat; the newest is pinned, so a
-/// restore finds it without reading the history.
-pub struct ChatSnapshotStore<C> {
-    chat: Arc<C>,
-}
-
-impl<C: ChatApi> ChatSnapshotStore<C> {
-    pub fn new(chat: Arc<C>) -> Self {
-        Self { chat }
-    }
-}
-
-fn chat_ref(message_id: i64, download_ref: &str) -> SnapshotRef {
-    SnapshotRef(format!("{message_id} {download_ref}"))
-}
-
-fn parse_chat_ref(r: &SnapshotRef) -> Result<(i64, &str)> {
-    let (id, download_ref) = r.0.split_once(' ').ok_or_else(|| anyhow!("{:?} is not a chat snapshot", r.0))?;
-    Ok((id.parse().with_context(|| format!("{:?} is not a chat snapshot", r.0))?, download_ref))
-}
-
-#[async_trait]
-impl<C: ChatApi> SnapshotStore for ChatSnapshotStore<C> {
-    async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
-        if self.chat.registers().await?.pinned_other {
-            bail!("the snapshot chat has a pinned message that is not ours; use a dedicated chat");
-        }
-        let name = format!("snapshot-{}-{}.snap", snapshot.log_id, snapshot.at);
-        let sent = self.chat.send_document(&name, snapshot.encode()).await?;
-        self.chat.pin(sent.message_id).await?;
-        Ok(chat_ref(sent.message_id, &sent.download_ref))
-    }
-
-    async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
-        let (id, download_ref) = parse_chat_ref(r)?;
-        let data = self.chat.download(download_ref).await.with_context(|| format!("download snapshot {id}"))?;
-        StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {id}"))
-    }
-
-    async fn newest(&self) -> Result<Option<StoredSnapshot>> {
-        let regs = self.chat.registers().await?;
-        if regs.pinned_other {
-            bail!("the snapshot chat's pinned message is not a snapshot");
-        }
-        let Some(doc) = regs.pinned else {
-            return Ok(None);
-        };
-        Ok(Some(self.get(&chat_ref(doc.message_id, &doc.download_ref)).await?))
-    }
-
-    async fn remove(&self, r: &SnapshotRef) -> Result<()> {
-        // Deleting an older (not the newest) pinned message leaves the newest pinned.
-        self.chat.delete(&[parse_chat_ref(r)?.0]).await
-    }
-}
-
 /// Snapshots as documents in a channel read by id (no order, no fence: a
 /// snapshot counts only while the log's base names it). The ref is the
 /// message id and the document's crc, so a replaced message is detected.
@@ -375,7 +318,6 @@ pub mod conformance {
 mod tests {
     use super::*;
     use crate::log::channel::fake::FakeChannel;
-    use crate::log::chat::fake::FakeChat;
 
     #[tokio::test]
     async fn local_store_passes_the_conformance_suite() {
@@ -393,16 +335,6 @@ mod tests {
         conformance::run_all(|| {
             let store = store.clone();
             async move { Arc::new(store) as Arc<dyn SnapshotStore> }
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn chat_store_passes_the_conformance_suite() {
-        let chat = Arc::new(FakeChat::default());
-        conformance::run_all(|| {
-            let chat = chat.clone();
-            async move { Arc::new(ChatSnapshotStore::new(chat)) as Arc<dyn SnapshotStore> }
         })
         .await;
     }
@@ -443,14 +375,5 @@ mod tests {
         let err = store.get(&r).await.unwrap_err();
         assert!(format!("{err:#}").contains("checksum"), "{err:#}");
         assert!(store.get(&SnapshotRef("../etc/passwd".into())).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn the_chat_store_refuses_a_shared_chat() {
-        let chat = Arc::new(FakeChat::default());
-        chat.post_text_and_pin();
-        let store = ChatSnapshotStore::new(chat);
-        assert!(store.newest().await.is_err());
-        assert!(store.put(&StoredSnapshot { log_id: LogId(1), at: 1, data: vec![] }).await.is_err());
     }
 }

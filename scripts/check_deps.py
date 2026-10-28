@@ -14,7 +14,6 @@ ROLE = {
     "pigeonhole-meta": "meta",
     "pigeonhole-blob": "blob",
     "pigeonhole-chunk-store": "chunk-store",
-    "pigeonhole-storage-telegram": "storage",
     "pigeonhole-storage-telegram-mtproto": "storage",
     "pigeonhole-storage-discord": "storage",
     "pigeonhole-storage-memory": "storage",

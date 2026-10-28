@@ -1,8 +1,8 @@
 # Telegram over MTProto (bot token)
 
-Status: **proposal**; spike done (see Spike findings). A brief for implementing a second Telegram backend that
-talks MTProto instead of the Bot API, still logged in as a **bot** (no user
-account). Read [roadmap.md](roadmap.md) § Ground rules,
+Status: **implemented** (steps 1–5; see Implementation notes); the Bot API
+backend is to be removed next. A Telegram backend that talks MTProto instead
+of the Bot API, still logged in as a **bot** (no user account). Read [roadmap.md](roadmap.md) § Ground rules,
 [meta-backends.md](meta-backends.md), [sweep-invariants.md](sweep-invariants.md)
 and [glossary.md](glossary.md) first.
 
@@ -280,6 +280,39 @@ move between machines with a local log; that is what the channel log is for.
   provoked (re-fetching by `getMessages` on `FILE_REFERENCE_EXPIRED` stays the
   plan).
 
+## Implementation notes (2026-10-28)
+
+Where the code differs from the design above, and why:
+
+- **Claim names carry no `log_id`**: `log-<gen>-claim.bin`,
+  `log-<gen>-batch.bin`. A claimant of a fresh log cannot know the id before
+  it sends; the first batch fixes it, and of racing fresh claimants only the
+  valid one writes a batch. One log per channel.
+- **`since` instead of `prev` for validity**: a batch records the last
+  message its writer had checked when it sent it (its claim, for the first
+  batch of a generation); validity reads `(since, batch)`, `prev` is only the
+  chain link (id + crc). A straggler's check reads top-down and stops at the
+  first higher claim, so it never reaches collected messages.
+- **Empty ids are taken as deleted** after a few re-reads, not `Other`: a live
+  check (`tests/live.rs`) found every sent message readable at once, also from
+  another session, while any message deleted by hand in a checked range would
+  otherwise stop every later claim.
+- **`confirm` posts an empty batch** (the top of a channel is only learnt by
+  posting); `discover` posts a probe that stays (a deleted one would leave a
+  hole); snapshot `newest()` posts a probe and deletes it.
+- **Collection** deletes only our messages (claims, batches, probes) below the
+  oldest batch a reader needs and below the rebase batch's `since`; foreign
+  messages stay.
+- **No grammers-client**: only `grammers-mtsender`, `grammers-session` (no
+  SQLite) and `grammers-tl-types`; the session is a JSON file of the home DC
+  and auth keys, 0600, locked. The grammers patch is not applied yet.
+- The log adapter caches document locations and reads the page below a
+  missing one, so a replay down its chain reads each page once.
+
+Measured on the test channels: boot 17 s on a fresh log, 24 s with ~50
+batches to replay; S3 smoke with every store in a channel 61 s (log appends
+are the limit: ~18 sends a minute).
+
 ## Steps
 
 Each step ends with `cargo test --workspace` and
@@ -287,7 +320,7 @@ Each step ends with `cargo test --workspace` and
 
 1. ~~**Spike**~~ Done: a throwaway binary against the test channels (not
    merged); results in Spike findings above.
-2. **Crate** `pigeonhole-storage-telegram-mtproto`. First a patched
+2. ✅ (without the grammers patch) **Crate** `pigeonhole-storage-telegram-mtproto`. First a patched
    grammers-mtsender (`[patch.crates-io]` to a vendored 0.11.0 copy, and the
    same change offered upstream on codeberg): `try_fill_write` drops requests
    whose result receiver is closed before serializing them, and
@@ -302,16 +335,16 @@ Each step ends with `cargo test --workspace` and
    `deleteMessages`) with a fake implementation; `BlobBackend` + `Sweepable`;
    the testkit conformance suites and a `typed_backend` test on the fake.
    No wiremock: MTProto is not HTTP.
-3. **Order-fenced log and pinless snapshots** in `pigeonhole-meta`: the
+3. ✅ **Order-fenced log and pinless snapshots** in `pigeonhole-meta`: the
    protocol over the new `ChatApi`, the fake chat (late visibility), tests for
    the fast path, a gap read, stragglers, racing claims, an unconfirmed batch
    becoming the head, rebase and collection. Then the MTProto `ChatApi`
    adapter, and a live check that an id below one returned by a send is never
    `messageEmpty` for long.
-4. **Wiring**: config (`kind = "telegram_mtproto"`, env names, session path),
+4. ✅ **Wiring**: config (`kind = "telegram_mtproto"`, env names, session path),
    `runtime.rs` (`build_member`, `open_log`, `open_snapshots`), startup checks,
    `pigeonhole.toml.example`, `.env.example`.
-5. **Live run**: `scripts/compat-telegram-mtproto.sh` modelled on
+5. **Live run** (smoke ✅, `compat-telegram-mtproto.sh` written): `scripts/compat-telegram-mtproto.sh` modelled on
    `compat-telegram.sh`; README (backend section, disclaimer still applies),
    meta-backends.md, sweep-invariants.md, glossary. Repeated `sweep_stress`
    and the S3 compat suites from the ground rules at the end.

@@ -8,25 +8,31 @@
 listen_addr = "0.0.0.0:8333"
 region = "us-east-1"
 
-# Stores: where bytes live. kind = local_disk (path) | memory | telegram
+# Stores: where bytes live. kind = local_disk (path) | memory | telegram_mtproto
 # (chat_id) | discord (channel_id). Every kind holds blobs; the log and
 # snapshots go to local_disk, memory (tests: no fsync, gone with the process)
-# or telegram. Secrets come from the env var named in bot_token_env (defaults:
-# BOT_TOKEN / DISCORD_BOT_TOKEN), never inline. A store serves one purpose
-# (the blob sweeper deletes everything it does not know in a blob store; a
-# chat's pinned message serves the log or the snapshots); only a local_disk or
-# memory store holds both the log and the snapshots.
+# or telegram_mtproto. Secrets come from env vars named in the store (defaults:
+# BOT_TOKEN, TG_API_ID, TG_API_HASH / DISCORD_BOT_TOKEN), never inline. A store
+# serves one purpose (the blob sweeper deletes our blobs it does not know; the
+# log's fence reads its channel's message order); only a local_disk or memory
+# store holds both the log and the snapshots.
 [[store]]
 id = "meta"
 kind = "local_disk"
 path = "pigeonhole-meta"
 
-# Telegram: the bot must be admin; blob chats need delete rights, the log also
-# change-info and pin, snapshots pin.
+# Telegram over MTProto, logged in as a bot: a channel or supergroup (-100…)
+# where the bot is an admin with post and delete rights. api_id / api_hash are
+# an app's, from my.telegram.org. The session file caches the login (one per
+# bot, shared by its stores; secret, 0600).
 [[store]]
 id = "tg-main"
-kind = "telegram"
+kind = "telegram_mtproto"
 chat_id = -1001234567890
+# bot_token_env = "BOT_TOKEN"
+# api_id_env = "TG_API_ID"
+# api_hash_env = "TG_API_HASH"
+# session = "pigeonhole-tg-<bot id>.session"
 
 # [[store]]
 # id = "dc-backup"
@@ -59,18 +65,17 @@ chat_id = -1001234567890
 [meta]
 log = "meta"                  # default: a local_disk at pigeonhole-meta
 snapshot = "meta"             # default: the log's store if it is local_disk / memory
-# A telegram log (a dedicated channel) needs
-# telegram snapshots in another channel; a memory log needs memory snapshots.
+# A telegram_mtproto log (a dedicated channel, fenced by the order of its
+# messages) needs telegram_mtproto snapshots in another channel; a memory log
+# needs memory snapshots.
 # A local_disk log with snapshots in a channel or on another disk survives
 # losing the log's disk: `pigeonhole restore --lossy` starts a new log from
 # the newest snapshot.
-# log_straggler_window_secs = 90   # telegram log: a claim waits this long for a deposed writer
 snapshot_every_entries = 10000     # snapshot all states, drop the log behind it; 0 = never
 snapshot_every_secs = 600          # and this often if anything changed; 0 = never
 
 [chunk]
 store = "tg-main"             # a blob store or a [[replicas]] group
-# Max on-wire chunk size in bytes (Telegram getFile < 20 MiB). Default 19 MiB.
 # Max on-wire document size. With codec zstd/gzip, independent 1 MiB blocks are
 # packed until this size (or 256 MiB logical) is reached.
 size = 19922944
@@ -85,17 +90,16 @@ block_size = 1048576
 memory_budget = 268435456
 
 [telegram]
-# Bot API budgets on two levels. Bot: every call of one token, across all its
+# Telegram budgets on two levels. Bot: every call of one token, across all its
 # chats (Telegram: ~30/s). Chat: per chat and per kind of call, each call also
-# taking a bot token. A 429 freezes the bucket it hit for its retry_after (a
-# getFile 429 the whole bot: getFile is not tied to a chat).
+# taking a bot token. A FLOOD_WAIT freezes the bucket it hit for its wait (a
+# getFile or upload one the whole bot).
 bot_rate_per_sec = 25.0
 bot_burst = 30.0
-# Sends and pins (a pin posts a service message): ~20 messages a minute in a
-# channel or group, so 18.
+# Sends: ~20 messages a minute in a channel or group, so 18.
 send_rate_per_sec = 0.3
 send_burst = 3.0
-# getChat, descriptions (the metadata log's fence).
+# getMessages (reads by id: the log's fence checks, listing for the sweeper).
 info_rate_per_sec = 2.0
 info_burst = 5.0
 get_file_rate_per_sec = 15.0

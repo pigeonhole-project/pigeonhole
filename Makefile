@@ -1,4 +1,4 @@
-.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps
+.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram-mtproto compat-discord test test-all check-deps
 
 run:
 	cargo run --release
@@ -37,8 +37,8 @@ compat-rclone:
 
 # Purge real Telegram + run the full client suite against TelegramBlobStore.
 # Extra args forwarded to compat.sh, e.g. `make compat-telegram ARGS=--all`
-compat-telegram:
-	./scripts/compat-telegram.sh $(ARGS)
+compat-telegram-mtproto:
+	./scripts/compat-telegram-mtproto.sh $(ARGS)
 
 # Manual Discord Bot API suite (not in CI). Needs DISCORD_BOT_TOKEN + channel_id.
 compat-discord:

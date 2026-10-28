@@ -90,8 +90,6 @@ pub enum SnapshotSettings {
     LocalDisk { path: PathBuf },
     /// Process memory, with a memory log (tests).
     Memory,
-    /// A dedicated Telegram channel (the newest snapshot pinned).
-    Telegram { chat_id: String, bot_token: String },
     /// A dedicated Telegram channel read over MTProto.
     TelegramMtproto { chat_id: String, login: TelegramLogin },
 }
@@ -103,14 +101,6 @@ pub enum LogSettings {
     LocalDisk { path: PathBuf },
     /// Process memory: gone with the process (tests, throwaway runs).
     Memory,
-    /// A dedicated Telegram channel / supergroup (pinned head chain,
-    /// description fence; docs/meta-backends.md).
-    Telegram {
-        chat_id: String,
-        bot_token: String,
-        /// A claim waits this long for a deposed writer's last batch.
-        straggler_window: Duration,
-    },
     /// A dedicated Telegram channel read over MTProto (fenced by the order
     /// of its messages; docs/telegram-mtproto.md).
     TelegramMtproto { chat_id: String, login: TelegramLogin },
@@ -135,11 +125,9 @@ impl MetaSettings {
     pub fn snapshots_outlive_log(&self) -> bool {
         match (&self.log, &self.snapshot) {
             (LogSettings::LocalDisk { path: log }, SnapshotSettings::LocalDisk { path }) => log != path,
-            (LogSettings::LocalDisk { .. }, SnapshotSettings::Telegram { .. } | SnapshotSettings::TelegramMtproto { .. }) => {
-                true
-            }
+            (LogSettings::LocalDisk { .. }, SnapshotSettings::TelegramMtproto { .. }) => true,
             (LogSettings::LocalDisk { .. }, SnapshotSettings::Memory) => false,
-            (LogSettings::Telegram { .. } | LogSettings::TelegramMtproto { .. } | LogSettings::Memory, _) => false,
+            (LogSettings::TelegramMtproto { .. } | LogSettings::Memory, _) => false,
         }
     }
 }
@@ -436,8 +424,6 @@ struct FileMeta {
     log: Option<String>,
     /// `[[store]]` id of the snapshots; unset = the log's store if it is a `dir`.
     snapshot: Option<String>,
-    /// Telegram log: a claim waits this long for a deposed writer's last batch.
-    log_straggler_window_secs: u64,
     snapshot_every_entries: u64,
     snapshot_every_secs: u64,
 }
@@ -447,7 +433,6 @@ impl Default for FileMeta {
         Self {
             log: None,
             snapshot: None,
-            log_straggler_window_secs: 90,
             snapshot_every_entries: 10_000,
             snapshot_every_secs: 600,
         }
@@ -466,11 +451,6 @@ impl FileMeta {
         let log = match &log_store {
             Store::LocalDisk { path } => LogSettings::LocalDisk { path: path.clone() },
             Store::Memory => LogSettings::Memory,
-            Store::Telegram { chat_id, bot_token, .. } => LogSettings::Telegram {
-                chat_id: chat_id.clone(),
-                bot_token: bot_token.clone(),
-                straggler_window: Duration::from_secs(self.log_straggler_window_secs),
-            },
             Store::TelegramMtproto { chat_id, login, .. } => {
                 LogSettings::TelegramMtproto { chat_id: chat_id.clone(), login: login.clone() }
             }
@@ -484,13 +464,12 @@ impl FileMeta {
         let snapshot = match snapshot_store {
             Store::LocalDisk { path } => SnapshotSettings::LocalDisk { path },
             Store::Memory => SnapshotSettings::Memory,
-            Store::Telegram { chat_id, bot_token, .. } => SnapshotSettings::Telegram { chat_id, bot_token },
             Store::TelegramMtproto { chat_id, login, .. } => SnapshotSettings::TelegramMtproto { chat_id, login },
             Store::Discord { .. } => unreachable!("meta_store refuses discord"),
         };
         match (&log, &snapshot) {
             (
-                LogSettings::Telegram { .. } | LogSettings::TelegramMtproto { .. },
+                LogSettings::TelegramMtproto { .. },
                 SnapshotSettings::LocalDisk { .. } | SnapshotSettings::Memory,
             ) => bail!(
                 "[meta] snapshot: a telegram log needs telegram snapshots (a log off-host cannot \
@@ -609,7 +588,7 @@ pub fn check_block_size_against_instances(
     let mut min_max = usize::MAX;
     for inst in instances {
         let max = match inst.info.kind {
-            InstanceKind::Telegram | InstanceKind::Memory => 20 * 1024 * 1024 - 1,
+            InstanceKind::Memory => 20 * 1024 * 1024 - 1,
             InstanceKind::LocalDisk => pigeonhole_types::BackendLimits::local_disk().max_blob_size,
             InstanceKind::TelegramMtproto => pigeonhole_types::BackendLimits::telegram_mtproto().max_blob_size,
             InstanceKind::Discord => {
@@ -889,7 +868,10 @@ mod tests {
     }
 
     fn tg_store(id: &str, chat: i64) -> String {
-        format!("[[store]]\nid = \"{id}\"\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_env = \"PH_TEST_TG_TOKEN\"\n")
+        std::env::set_var("PH_TEST_TGM_TOKEN", "42:secret");
+        std::env::set_var("PH_TEST_TGM_API_ID", "12345");
+        std::env::set_var("PH_TEST_TGM_API_HASH", "hash");
+        tgm_store(id, chat)
     }
 
     #[test]
@@ -956,19 +938,11 @@ upload_concurrency = 4
 
     #[test]
     fn telegram_log_needs_a_chat_of_its_own() {
-        std::env::set_var("PH_TEST_TG_TOKEN", "1:test");
         let stores = format!("{}{}", tg_store("tg-log", -100), tg_store("tg-snap", -101));
         let cfg = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n{stores}")).unwrap();
         assert!(!cfg.meta.snapshots_outlive_log());
-        assert_eq!(
-            cfg.meta.log,
-            LogSettings::Telegram {
-                chat_id: "-100".into(),
-                bot_token: "1:test".into(),
-                straggler_window: Duration::from_secs(90),
-            }
-        );
-        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Telegram { chat_id: "-101".into(), bot_token: "1:test".into() });
+        assert!(matches!(&cfg.meta.log, LogSettings::TelegramMtproto { chat_id, .. } if chat_id == "-100"));
+        assert!(matches!(&cfg.meta.snapshot, SnapshotSettings::TelegramMtproto { chat_id, .. } if chat_id == "-101"));
 
         let err = load(&format!(
             "[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n[chunk]\nstore = \"tg-log\"\n{stores}"
@@ -1123,6 +1097,8 @@ upload_concurrency = 4
     fn example_config_loads() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../pigeonhole.toml.example");
         std::env::set_var("BOT_TOKEN", "123:example");
+        std::env::set_var("TG_API_ID", "1");
+        std::env::set_var("TG_API_HASH", "example");
         let cfg = Config::load_from_path(&path).unwrap();
         assert_eq!(cfg.primary_instance().unwrap().info.id, "tg-main");
     }

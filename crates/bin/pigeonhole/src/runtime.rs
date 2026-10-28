@@ -1,9 +1,8 @@
 //! Binary-only: boot the metadata tablet, build the placement group, and wire the `ChunkStore`.
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use pigeonhole::config::Config;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::telegram::{TelegramBlobStore, TelegramClient};
 use pigeonhole_blob::{
     erase_sweep, ChatLimiter, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
 };
@@ -13,12 +12,9 @@ use pigeonhole_chunk_store::{
 };
 use pigeonhole::index::Index;
 use crate::channel_log::{self, LogChannel};
-use crate::telegram_log::{self, TelegramChat};
 use pigeonhole::telegram_mtproto::{Lane, MtprotoBlobStore};
 use pigeonhole_meta::log::channel::{ChannelLogOptions, ChannelLogStore};
 use pigeonhole_meta::snapshot::ChannelSnapshotStore;
-use pigeonhole_meta::log::chat::{ChatLogOptions, ChatLogStore};
-use pigeonhole_meta::snapshot::ChatSnapshotStore;
 use pigeonhole_meta::{LocalSnapshotStore, MemoryLogStore, MemorySnapshotStore, SnapshotStore};
 use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_storage_disk::DiskBlobStore;
@@ -41,20 +37,6 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
         LogSettings::LocalDisk { path } => Arc::new(
             LocalLogStore::open(path).with_context(|| format!("open local log {}", path.display()))?,
         ),
-        LogSettings::Telegram { chat_id, bot_token, straggler_window } => {
-            if *straggler_window <= telegram_log::CALL_DEADLINE {
-                bail!(
-                    "[meta] log_straggler_window_secs must exceed the {:?} call deadline",
-                    telegram_log::CALL_DEADLINE
-                );
-            }
-            let tg = TelegramClient::new(bot_token.clone()).context("telegram client for the log")?;
-            tg.ensure_chat_admin(chat_id).await.context("log chat access check")?;
-            let chat = TelegramChat::new(tg, chat_id.clone(), cfg.chat_limiter(bot_token, chat_id));
-            let opts = ChatLogOptions { straggler_window: *straggler_window, ..ChatLogOptions::default() };
-            info!(chat_id = %chat_id, "metadata log in a Telegram chat");
-            Arc::new(ChatLogStore::new(Arc::new(chat), opts))
-        }
         LogSettings::TelegramMtproto { chat_id, login } => {
             let channel = channel_log::client(login)
                 .await?
@@ -72,13 +54,6 @@ pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStor
     Ok(match &cfg.meta.snapshot {
         SnapshotSettings::LocalDisk { path } => Arc::new(LocalSnapshotStore::new(path)),
         SnapshotSettings::Memory => Arc::new(MemorySnapshotStore::new()),
-        SnapshotSettings::Telegram { chat_id, bot_token } => {
-            let tg = TelegramClient::new(bot_token.clone()).context("telegram client for snapshots")?;
-            tg.ensure_chat_admin(chat_id).await.context("snapshot chat access check")?;
-            let chat = TelegramChat::new(tg, chat_id.clone(), cfg.chat_limiter(bot_token, chat_id));
-            info!(chat_id = %chat_id, "metadata snapshots in a Telegram chat");
-            Arc::new(ChatSnapshotStore::new(Arc::new(chat)))
-        }
         SnapshotSettings::TelegramMtproto { chat_id, login } => {
             let channel = channel_log::client(login)
                 .await?
@@ -168,19 +143,6 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
                 .with_context(|| format!("open local_disk store {}", inst.scope_id))?;
             MetricsBackend::wrap(Arc::new(erase_sweep(Arc::new(store))))
         }
-        InstanceKind::Telegram => {
-            let tg = TelegramClient::new(inst.bot_token.clone()).context("telegram client")?;
-            tg.ensure_chat_admin(&inst.scope_id)
-                .await
-                .context("chat_id access check")?;
-            let store = Arc::new(TelegramBlobStore::with_instance(
-                tg,
-                inst.scope_id.clone(),
-                limiter.clone(),
-                inst.info.clone(),
-            ));
-            MetricsBackend::wrap(Arc::new(erase_sweep(store)))
-        }
         InstanceKind::TelegramMtproto => {
             let login = inst.telegram.as_ref().with_context(|| format!("store {id:?}: no MTProto login"))?;
             let channel = channel_log::client(login)
@@ -210,7 +172,7 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
             }
             #[cfg(not(feature = "discord"))]
             {
-                bail!(
+                anyhow::bail!(
                     "store {id:?} is discord but this binary was built without `--features discord`"
                 );
             }

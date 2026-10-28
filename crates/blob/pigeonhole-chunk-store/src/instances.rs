@@ -164,7 +164,7 @@ mod tests {
         let a = InstanceConfig {
             info: InstanceInfo {
                 id: "a".into(),
-                kind: InstanceKind::Telegram,
+                kind: InstanceKind::TelegramMtproto,
                 fingerprint: "tg:1:-100".into(),
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,
@@ -185,7 +185,7 @@ mod tests {
         let a = InstanceConfig {
             info: InstanceInfo {
                 id: "rw".into(),
-                kind: InstanceKind::Telegram,
+                kind: InstanceKind::TelegramMtproto,
                 fingerprint: "tg:1:-100".into(),
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,
@@ -208,7 +208,7 @@ mod tests {
         let cfg = InstanceConfig {
             info: InstanceInfo {
                 id: "tg-main".into(),
-                kind: InstanceKind::Telegram,
+                kind: InstanceKind::TelegramMtproto,
                 fingerprint: "tg:1:-100".into(),
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,

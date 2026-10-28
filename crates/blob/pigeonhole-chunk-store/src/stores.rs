@@ -4,7 +4,7 @@
 
 use crate::instances::{
     discord_app_id_from_token, discord_fingerprint, discord_location, local_disk_location,
-    memory_fingerprint, memory_location, telegram_fingerprint, telegram_location, telegram_mtproto_fingerprint,
+    memory_fingerprint, memory_location, telegram_location, telegram_mtproto_fingerprint,
     InstanceConfig, TelegramLogin,
 };
 use crate::{PlacementConfig, ShardPlacement};
@@ -22,11 +22,11 @@ pub(crate) struct FileStore {
     kind: String,
     /// `dir`.
     path: Option<PathBuf>,
-    /// `telegram` / `telegram_mtproto`.
+    /// `telegram_mtproto`.
     chat_id: Option<i64>,
     /// `discord`.
     channel_id: Option<u64>,
-    /// `telegram` / `telegram_mtproto` / `discord`.
+    /// `telegram_mtproto` / `discord`.
     bot_token_env: Option<String>,
     /// `discord`.
     max_blob_size: Option<usize>,
@@ -67,7 +67,6 @@ pub(crate) struct FileShards {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Store {
     LocalDisk { path: PathBuf },
-    Telegram { chat_id: String, bot_token_env: String, bot_token: String },
     TelegramMtproto { chat_id: String, bot_token_env: String, login: TelegramLogin },
     Discord { channel_id: String, bot_token_env: String, bot_token: String, max_blob_size: Option<usize> },
     Memory,
@@ -77,7 +76,7 @@ impl Store {
     /// Where it lives, if two stores could name the same place.
     fn location(&self) -> Option<String> {
         match self {
-            Store::Telegram { chat_id, .. } | Store::TelegramMtproto { chat_id, .. } => Some(telegram_location(chat_id)),
+            Store::TelegramMtproto { chat_id, .. } => Some(telegram_location(chat_id)),
             Store::Discord { channel_id, .. } => Some(discord_location(channel_id)),
             Store::LocalDisk { path } => Some(local_disk_location(path)),
             Store::Memory => None,
@@ -135,14 +134,6 @@ impl Topology {
                     refuse("max_blob_size", f.max_blob_size.is_some())?;
                     Store::LocalDisk { path: f.path.with_context(|| format!("[[store]] {id}: local_disk needs path"))? }
                 }
-                "telegram" => {
-                    refuse("path", f.path.is_some())?;
-                    refuse("channel_id", f.channel_id.is_some())?;
-                    refuse("max_blob_size", f.max_blob_size.is_some())?;
-                    let chat = f.chat_id.with_context(|| format!("[[store]] {id}: telegram needs chat_id"))?;
-                    let env_name = f.bot_token_env.unwrap_or_else(|| "BOT_TOKEN".into());
-                    Store::Telegram { chat_id: chat.to_string(), bot_token: token(&id, &env_name)?, bot_token_env: env_name }
-                }
                 "telegram_mtproto" => {
                     refuse("path", f.path.is_some())?;
                     refuse("channel_id", f.channel_id.is_some())?;
@@ -184,7 +175,7 @@ impl Topology {
                     refuse("max_blob_size", f.max_blob_size.is_some())?;
                     Store::Memory
                 }
-                other => bail!("[[store]] {id}: unknown kind {other:?}; expected local_disk | memory | telegram | telegram_mtproto | discord"),
+                other => bail!("[[store]] {id}: unknown kind {other:?}; expected local_disk | memory | telegram_mtproto | discord"),
             };
             if let Some(loc) = store.location() {
                 if let Some(prev) = locations.insert(loc.clone(), id.clone()) {
@@ -265,7 +256,7 @@ impl Topology {
     }
 
     /// A store the metadata log or snapshots live in: `local_disk`,
-    /// `memory`, `telegram` or `telegram_mtproto` (`discord` not yet).
+    /// `memory` or `telegram_mtproto` (`discord` not yet).
     pub(crate) fn meta_store(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
         let store = self.take(id, purpose)?;
         if matches!(store, Store::Discord { .. }) {
@@ -340,15 +331,6 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
             "local".to_string(),
             memory_fingerprint(id),
             memory_location(id),
-            None,
-        ),
-        Store::Telegram { chat_id, bot_token_env, bot_token } => (
-            InstanceKind::Telegram,
-            bot_token_env.clone(),
-            bot_token.clone(),
-            chat_id.clone(),
-            telegram_fingerprint(bot_token, chat_id)?,
-            telegram_location(chat_id),
             None,
         ),
         Store::TelegramMtproto { chat_id, bot_token_env, login } => {

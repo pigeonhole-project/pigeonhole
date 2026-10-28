@@ -1,5 +1,5 @@
 use super::*;
-use crate::log::chat::fake::FakeChat;
+use crate::log::channel::fake::FakeChannel;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -384,40 +384,7 @@ async fn confirm_active_detects_a_fence_without_any_proposal() {
 }
 
 #[tokio::test]
-async fn the_tablet_runs_over_a_chat_log_with_snapshots_in_another_chat() {
-    use crate::log::chat::{ChatLogOptions, ChatLogStore};
-    use crate::snapshot::ChatSnapshotStore;
-    let (log_chat, snap_chat) = (Arc::new(FakeChat::default()), Arc::new(FakeChat::default()));
-    let open = || {
-        let opts = ChatLogOptions {
-            straggler_window: Duration::ZERO,
-            head_retries: 1,
-            head_retry_delay: Duration::from_millis(1),
-        };
-        let log = Arc::new(ChatLogStore::new(log_chat.clone(), opts));
-        let snapshots = Arc::new(ChatSnapshotStore::new(snap_chat.clone()));
-        MetaStore::open(log, snapshots, counter(), MetaOptions { snapshot_every: 7, ..MetaOptions::default() })
-    };
-    let a = open().await.unwrap();
-    for i in 0..20u64 {
-        a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
-    }
-    wait_base(&a, 14).await;
-    let state = snapshot(&a);
-    eventually("older snapshots removed", || snap_chat.inner.lock().unwrap().docs.len() <= 2).await;
-
-    let b = open().await.unwrap();
-    assert_eq!(snapshot(&b), state, "snapshot + tail rebuild the state");
-    let err = a.propose::<Counter>(op(100, 1)).await.unwrap_err();
-    assert_eq!(err.downcast::<Stop>().unwrap(), Stop::Fenced { current: 2 });
-    b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
-    assert_eq!(value(&b), 21);
-    assert!(log_chat.inner.lock().unwrap().docs.len() < 15, "messages behind the base are collected");
-}
-
-#[tokio::test]
 async fn the_tablet_runs_over_a_channel_log_with_snapshots_in_another_channel() {
-    use crate::log::channel::fake::FakeChannel;
     use crate::log::channel::{ChannelLogOptions, ChannelLogStore};
     use crate::snapshot::ChannelSnapshotStore;
     let (log_chat, snap_chat) = (Arc::new(FakeChannel::default()), Arc::new(FakeChannel::default()));
@@ -446,11 +413,11 @@ async fn the_tablet_runs_over_a_channel_log_with_snapshots_in_another_channel() 
 }
 
 #[tokio::test]
-async fn a_local_log_restores_from_snapshots_in_a_chat() {
-    use crate::snapshot::ChatSnapshotStore;
+async fn a_local_log_restores_from_snapshots_in_a_channel() {
+    use crate::snapshot::ChannelSnapshotStore;
     let dir = tempfile::tempdir().unwrap();
-    let chat = Arc::new(FakeChat::default());
-    let snapshots: Arc<dyn SnapshotStore> = Arc::new(ChatSnapshotStore::new(chat.clone()));
+    let chat = Arc::new(FakeChannel::default());
+    let snapshots: Arc<dyn SnapshotStore> = Arc::new(ChannelSnapshotStore::new(chat.clone()));
     let opts = MetaOptions { snapshot_every: 10, snapshots_outlive_log: true, ..MetaOptions::default() };
     let a = MetaStore::open(Arc::new(LocalLogStore::open(dir.path()).unwrap()), snapshots.clone(), counter(), opts)
         .await

@@ -2343,7 +2343,6 @@ dependencies = [
  "pigeonhole-storage-discord",
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
- "pigeonhole-storage-telegram",
  "pigeonhole-storage-telegram-mtproto",
  "pigeonhole-types",
  "pin-project-lite",
@@ -2545,25 +2544,6 @@ dependencies = [
  "pigeonhole-types",
  "serde",
  "tokio",
-]
-
-[[package]]
-name = "pigeonhole-storage-telegram"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "moka",
- "pigeonhole-blob",
- "pigeonhole-testkit",
- "pigeonhole-types",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "wiremock",
 ]
 
 [[package]]

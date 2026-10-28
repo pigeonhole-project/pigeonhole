@@ -24,7 +24,6 @@ pigeonhole-codec = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
 pigeonhole-meta = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
-pigeonhole-storage-telegram = { workspace = true }
 pigeonhole-storage-telegram-mtproto = { workspace = true }
 uuid = { workspace = true }
 lru = { workspace = true }

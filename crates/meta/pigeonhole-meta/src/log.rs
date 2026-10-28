@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub mod channel;
-pub mod chat;
 #[cfg(any(test, feature = "testsuite"))]
 pub mod conformance;
 mod local;

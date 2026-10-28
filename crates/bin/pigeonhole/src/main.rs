@@ -5,7 +5,6 @@ mod background;
 mod runtime;
 mod serve;
 mod channel_log;
-mod telegram_log;
 
 use admin::{cmd_purge, cmd_restore};
 use anyhow::{bail, Context};
