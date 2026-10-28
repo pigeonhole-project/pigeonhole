@@ -186,7 +186,7 @@ comments. Sections:
 | `[placement]` | Write group + quorum; required with several read-write instances |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
 | `[meta]` | Metadata tablet: `batch_max_delay_ms` / `batch_max_entries` (group commit) |
-| `[meta.log]` | Command log: `kind = "local"`, `path` (directory) |
+| `[meta.log]` | Command log: `kind = "local"` + `path`, or `kind = "telegram"` + `chat_id` (a dedicated channel) |
 | `[meta.snapshot]` | `every_entries`: snapshot every state and drop the log behind it (`0` = never); `export`: also copy each snapshot into a directory |
 | `[chunk]` | `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
@@ -212,9 +212,11 @@ truth and every boot rebuilds the state by replaying it (see
 Every `[meta.snapshot] every_entries` entries the tablet snapshots all states
 and drops the log behind it, so boot = newest snapshot + the log after it.
 
-**Losing the disk loses the metadata** — the only LogStore so far is `local`,
-on the same disk. Point `[meta.snapshot] export` at another disk to keep copies
-of the snapshots; after losing the log:
+With `[meta.log] kind = "telegram"` the log (and its snapshots) live in a
+dedicated Telegram channel: a clean machine boots from it with nothing local.
+With the default `local` log, **losing the disk loses the metadata**; point
+`[meta.snapshot] export` at another disk to keep copies of the snapshots;
+after losing the log:
 
 ```bash
 # seeds an empty [meta.log] from the newest export; changes after it are lost
@@ -223,8 +225,7 @@ cargo run --release -- restore --from-export /mnt/backup/pigeonhole --lossy
 
 The restore is lossy: chunks committed after the export become orphans (the
 sweeper deletes them), and objects whose chunks were reclaimed after it read
-back broken. An off-host (Telegram) log is the next step in
-[docs/roadmap.md](docs/roadmap.md).
+back broken.
 
 Delete every backend message tracked by the local index (server must be stopped):
 

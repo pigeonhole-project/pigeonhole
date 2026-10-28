@@ -11,6 +11,8 @@ use pigeonhole_chunk_store::{
     check_fingerprints, BlockCache, BlobDb, ChunkStore, IngestOptions, LogSettings,
 };
 use pigeonhole::index::Index;
+use crate::telegram_log::{self, TelegramChat};
+use pigeonhole_meta::log::chat::{ChatLogOptions, ChatLogStore};
 use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -21,16 +23,34 @@ pub struct Runtime {
     pub store: Arc<ChunkStore>,
 }
 
+/// The configured metadata log (`[meta.log]`).
+pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
+    Ok(match &cfg.meta.log {
+        LogSettings::Local { path } => Arc::new(
+            LocalLogStore::open(path).with_context(|| format!("open local log {}", path.display()))?,
+        ),
+        LogSettings::Telegram { chat_id, bot_token, straggler_window } => {
+            if *straggler_window <= telegram_log::CALL_DEADLINE {
+                bail!(
+                    "[meta.log] straggler_window_secs must exceed the {:?} call deadline",
+                    telegram_log::CALL_DEADLINE
+                );
+            }
+            let tg = TelegramClient::new(bot_token.clone()).context("telegram client for the log")?;
+            tg.ensure_chat_admin(chat_id).await.context("log chat access check")?;
+            let chat = TelegramChat::new(tg, chat_id.clone(), cfg.chat_limiter());
+            let opts = ChatLogOptions { straggler_window: *straggler_window, ..ChatLogOptions::default() };
+            info!(chat_id = %chat_id, "metadata log in a Telegram chat");
+            Arc::new(ChatLogStore::new(Arc::new(chat), opts))
+        }
+    })
+}
+
 pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     let namespaces = Index::register(BlobDb::register(Namespaces::new()));
     #[cfg(feature = "bytestream")]
     let namespaces = pigeonhole_gateway_bytestream::cas_index::CasIndex::register(namespaces);
-    let log: Arc<dyn LogStore> = match &cfg.meta.log {
-        LogSettings::Local { path } => Arc::new(
-            LocalLogStore::open(path)
-                .with_context(|| format!("open local log {}", path.display()))?,
-        ),
-    };
+    let log = open_log(cfg).await?;
     let opts = MetaOptions {
         batch_max_delay: cfg.meta.batch_max_delay,
         batch_max_entries: cfg.meta.batch_max_entries,

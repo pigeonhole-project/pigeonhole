@@ -73,14 +73,23 @@ pub struct MetaSettings {
 pub enum LogSettings {
     /// Segmented files in a directory on this host.
     Local { path: PathBuf },
+    /// A dedicated Telegram channel / supergroup (pinned head chain,
+    /// description fence; docs/meta-backends.md).
+    Telegram {
+        chat_id: String,
+        bot_token: String,
+        /// A claim waits this long for a deposed writer's last batch.
+        straggler_window: Duration,
+    },
 }
 
 impl MetaSettings {
     /// Defaults with the log under `dir` (tests).
     pub fn in_dir(dir: &Path) -> Self {
-        let mut meta = FileMeta::default().into_settings();
-        let LogSettings::Local { path } = &mut meta.log;
-        *path = dir.join(&*path);
+        let mut meta = FileMeta::default().into_settings().expect("default meta settings");
+        if let LogSettings::Local { path } = &mut meta.log {
+            *path = dir.join(&*path);
+        }
         meta
     }
 }
@@ -206,13 +215,26 @@ impl Config {
             bail!("pigeonhole.toml: at least one [[instances]] entry is required");
         }
         let instances = resolve_instances(&file.instances)?;
+        let meta = file.meta.into_settings()?;
+        if let LogSettings::Telegram { chat_id, .. } = &meta.log {
+            if let Some(i) = instances
+                .iter()
+                .find(|i| i.info.kind == InstanceKind::Telegram && i.scope_id == *chat_id)
+            {
+                bail!(
+                    "[meta.log] chat_id {chat_id} is also instance {:?}: the sweeper deletes every \
+                     message of a blob chat, so the log needs a chat of its own",
+                    i.info.id
+                );
+            }
+        }
 
         let placement = resolve_placement(file.placement, &instances)?;
         check_block_size_against_instances(block_size, &instances)?;
 
         Ok(Self {
             listen_addr: file.listen_addr,
-            meta: file.meta.into_settings(),
+            meta,
             access_key,
             secret_key,
             region: file.region,
@@ -376,7 +398,24 @@ impl Default for FileMetaSnapshot {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 enum FileLog {
-    Local { path: PathBuf },
+    Local {
+        path: PathBuf,
+    },
+    Telegram {
+        chat_id: i64,
+        #[serde(default = "default_bot_token_env")]
+        bot_token_env: String,
+        #[serde(default = "default_straggler_window_secs")]
+        straggler_window_secs: u64,
+    },
+}
+
+fn default_bot_token_env() -> String {
+    "BOT_TOKEN".into()
+}
+
+fn default_straggler_window_secs() -> u64 {
+    90
 }
 
 impl Default for FileMeta {
@@ -397,16 +436,26 @@ impl Default for FileLog {
 }
 
 impl FileMeta {
-    fn into_settings(self) -> MetaSettings {
-        MetaSettings {
+    fn into_settings(self) -> Result<MetaSettings> {
+        let log = match self.log {
+            FileLog::Local { path } => LogSettings::Local { path },
+            FileLog::Telegram { chat_id, bot_token_env, straggler_window_secs } => {
+                let bot_token = env::var(&bot_token_env)
+                    .with_context(|| format!("[meta.log] bot_token_env {bot_token_env} is not set"))?;
+                LogSettings::Telegram {
+                    chat_id: chat_id.to_string(),
+                    bot_token,
+                    straggler_window: Duration::from_secs(straggler_window_secs),
+                }
+            }
+        };
+        Ok(MetaSettings {
             batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
             batch_max_entries: self.batch_max_entries.max(1),
             snapshot_every_entries: self.snapshot.every_entries,
             snapshot_export: self.snapshot.export,
-            log: match self.log {
-                FileLog::Local { path } => LogSettings::Local { path },
-            },
-        }
+            log,
+        })
     }
 }
 
@@ -869,6 +918,24 @@ upload_concurrency = 4
         for bad in ["[meta]\ndb_path = \"m.db\"\n", "[meta.log]\nkind = \"s3\"\n", "[meta.log]\nkind = \"local\"\nchat_id = 1\n"] {
             assert!(load(&format!("{bad}{MEM}")).is_err(), "{bad:?} accepted");
         }
+    }
+
+    #[test]
+    fn telegram_log_needs_a_chat_of_its_own() {
+        std::env::set_var("PH_TEST_LOG_TOKEN", "1:test");
+        let log = "[meta.log]\nkind = \"telegram\"\nchat_id = -100\nbot_token_env = \"PH_TEST_LOG_TOKEN\"\n";
+        let cfg = load(&format!("{log}{MEM}")).unwrap();
+        assert_eq!(
+            cfg.meta.log,
+            LogSettings::Telegram {
+                chat_id: "-100".into(),
+                bot_token: "1:test".into(),
+                straggler_window: Duration::from_secs(90),
+            }
+        );
+        let blob_chat = "[[instances]]\nid = \"tg\"\nkind = \"telegram\"\nchat_id = -100\nbot_token_env = \"PH_TEST_LOG_TOKEN\"\n";
+        let err = load(&format!("{log}{blob_chat}")).unwrap_err();
+        assert!(format!("{err:#}").contains("chat of its own"), "{err:#}");
     }
 
     #[test]

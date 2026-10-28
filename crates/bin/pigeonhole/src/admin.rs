@@ -4,10 +4,9 @@ use crate::runtime::open_runtime;
 use anyhow::{bail, Context};
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
-use pigeonhole_chunk_store::{LogSettings, Sweeper};
-use pigeonhole_meta::{export, LocalLogStore, LogStore};
+use pigeonhole_chunk_store::Sweeper;
+use pigeonhole_meta::export;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Delete every upload, object and bucket, releasing their chunks. Backend
@@ -79,9 +78,7 @@ pub async fn cmd_restore(from: Option<PathBuf>, lossy: bool) -> anyhow::Result<(
     }
     let snapshot = export::newest_export(&from)?
         .with_context(|| format!("no snapshot export in {}", from.display()))?;
-    let log: Arc<dyn LogStore> = match &cfg.meta.log {
-        LogSettings::Local { path } => Arc::new(LocalLogStore::open(path)?),
-    };
+    let log = crate::runtime::open_log(&cfg).await?;
     let position = snapshot.position;
     export::seed_log(log.as_ref(), snapshot).await?;
     warn!(

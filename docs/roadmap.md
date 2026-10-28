@@ -53,8 +53,9 @@ Done (on `main`), steps 1–5:
 
 Known gaps:
 
-- **Disk loss loses metadata** unless a snapshot export lives on another disk,
-  and restore from an export is lossy. Fixed by an off-host LogStore (step 6).
+- With the `local` log, disk loss loses metadata unless a snapshot export
+  lives on another disk (and restore from it is lossy); the `telegram` log
+  avoids it. Not yet run end to end against a live chat (only the fake).
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
 - Telegram blob chats are swept by id up to the horizon, ours or not: keep
@@ -108,7 +109,13 @@ leaves every chunk-owned key to reclaim.
    stress test to grace-free settings and make mid-stress GETs
    strict again.
 
-### Step 6 — `telegram` LogStore
+### Step 6 — `telegram` LogStore ✅ done
+
+`ChatLogStore` (protocol over a `ChatApi` trait, in `pigeonhole-meta`) plus a
+Telegram adapter in the binary; `[meta.log] kind = "telegram"`. Changed from
+the plan after the live-bot check: stragglers are never unpinned (overridden
+by a newer pin), and a claim waits a straggler window before reading the head.
+
 
 Protocol: meta-backends.md § `telegram` (pinned head of a chain of log batches,
 `description` as the generation fence, stragglers unpinned).

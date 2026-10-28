@@ -166,46 +166,50 @@ others are tested against.
 
 ### `telegram` — one chat, Bot API only
 
-Two registers, both read with one `getChat`
+Implemented as `ChatLogStore` (`pigeonhole-meta/src/log/chat.rs`, protocol
+over a `ChatApi` trait, tested on a fake chat) with a Telegram adapter in the
+binary. Two registers, both read with one `getChat`
 ([Bot API](https://core.telegram.org/bots/api)):
 
-- **head** — `pinned_message`: the full `Message` of the most recent pinned
-  message **by sending date** (pinning adds to a list; the newest-sent pinned
-  message wins);
-- **fence** — the chat `description` (`setChatDescription`), holding `gen=<g>`.
-  Available in channels, supergroups and groups; in a private chat use the bot's
-  own description (`setMyDescription` / `getMyDescription`) instead.
+- **head** — `pinned_message`: the newest pinned message **by sending date**;
+- **fence** — the chat `description`: `pigeonhole-log id=<log id> gen=<g>`.
+  Channels, supergroups and groups (private chats are not supported).
 
-**Log layout — a chain.** Every log message is a document: a batch of entries,
-its generation, and a link (`file_id` + hash) to the previous log message; the
-chain ends at a snapshot document. The head of the chain is pinned. Recovery
-needs no history access: `getChat` → head → follow links with `getFile` back to
-the snapshot → apply forward.
+**Log layout — a chain.** Every log message is a document (postcard `LogDoc`):
+log id, generation, a crc-checked link to the previous log message, and a
+batch — or a snapshot, where the chain ends. Recovery needs no history access:
+`getChat` → head → follow links with `getFile` back to the snapshot → apply
+forward. A snapshot is installed at the head and the messages behind it are
+deleted.
 
 `append(g, batch)`:
-1. send the batch (link = current head, `gen = g`);
+1. send the batch (link = this writer's tip, `gen = g`);
 2. pin it;
-3. `getChat`: `Ok` iff `description` is `gen=g`; otherwise `Fenced`.
+3. `getChat`: `Ok` iff the description still says `gen=g`, else `Fenced`. If
+   something newer tops the pin (a straggler), send and pin a newer empty batch
+   linked to the tip — never unpin.
 
-`claim(g + 1)`:
-1. `setChatDescription("gen=g+1")` — from here on every older `append` fails step 3;
-2. `getChat` → `pinned_message` is the old head: the base;
-3. send the first batch of the new generation (link = base) and pin it.
+`claim(g)`:
+1. refuse a chat whose description or pin is not ours (the log needs a
+   dedicated chat; the config refuses a log chat that is also a blob chat);
+2. `setChatDescription(gen=g)` — from here on every older `append` fails step 3;
+3. **wait the straggler window** (`straggler_window_secs`, default 90 s, longer
+   than the 30 s deadline the adapter puts on every Bot API call);
+4. `getChat`: the description must still say `gen=g` (else `Fenced`); the
+   pinned message is the base.
 
 Why it is safe: an older generation acknowledged a batch only after pinning it
 and then seeing its own generation in the description — i.e. before the
-claimant's step 1. The claimant reads the head after step 1, and the head is the
-newest-sent pinned message, so it is not older than any acknowledged batch, and
-the chain behind it contains all of them.
+claimant's step 2. A deposed writer has at most one batch in flight; it lands
+within the call deadline, so before step 4, and it links to that writer's own
+tip. The head read at step 4 is therefore the newest-sent message of the
+newest older generation, and the chain behind it holds every acknowledged
+batch. A straggler is never acknowledged but may become part of the history
+(its proposer got an error: outcome unknown, as in Raft).
 
-**Stragglers.** A fenced writer may still pin one batch after the claim (sent
-later, so it tops the pin) — never acknowledged. It is recognisable: its `gen` is
-below the description. Do **not** unpin it: on a live bot (below) unpinning the
-head makes `getChat` report no pinned message for about a minute, which a
-reader would take for an empty log. Instead the leader overrides it by sending
-and pinning a newer batch (an empty one if idle) that links to its own head, so
-the straggler drops out of the chain; recovery skips a head whose `gen` is
-below the description and waits for the leader's override (or claims anew).
+**Two claimants** may race on step 2 (the description is overwritten
+blindly): whoever wrote last wins; the other sees a different generation at
+step 4 or on its first append and stops. Neither had acknowledged anything.
 
 **Live-bot findings** (2026-10-28, a channel, Bot API):
 
@@ -214,33 +218,28 @@ below the description and waits for the leader's override (or claims anew).
   message shows up in the next `getChat` at once.
 - After unpinning the head, `getChat` returned **no** `pinned_message` (other
   messages still pinned), also after re-pinning an older one; about a minute
-  later it showed the newest remaining pin again. Never unpin in the protocol,
-  and never read a missing head as an empty log when the description holds a
-  generation.
+  later it showed the newest remaining pin again. Hence: never unpin, and
+  retry a missing head (`head_retries` × `head_retry_delay`, 2 minutes) before
+  taking a claimed log for empty.
 - `setChatDescription` → `getChat` reads the new value at once, also right
   after a pin. Setting the same value fails with "chat description is not
-  modified". Rate: six changes in a row went through (one took 3 s), the
-  seventh got "Too Many Requests: retry after 43" — fine for claims, which are
-  rare, but tests must not loop on it.
-
-**Two claimants** may race on step 1 (the description is overwritten blindly).
-Each verifies after step 3 that the description still holds its generation and
-the head is its own batch; the loser stops. This only costs liveness: neither
-had acknowledged anything yet.
+  modified" (a claimant with the same generation is fenced). Rate: six changes
+  in a row went through (one took 3 s), the seventh got "Too Many Requests:
+  retry after 43" — fine for claims, which are rare.
 
 Costs and caveats:
 - an append is one send, one pin, one `getChat`; appends are batched — a single
   chat should stay under about one message per second
   ([Bot FAQ](https://core.telegram.org/bots/faq)), groups under 20 per minute;
-  data uploads share the budget if they share the chat;
+  set `[meta] batch_max_delay_ms` (e.g. 1000) for a Telegram log;
+- a claim (boot, failover) takes the straggler window;
 - recovery walks the chain back to the last snapshot (one `getFile` per batch),
-  so snapshots bound recovery time;
-- `setChatDescription` needs the `can_change_info` admin right; it is used only
-  on claim;
-- verified on a live bot (above): newest-by-sending-date; unpin makes the head
-  vanish for a while; description is read-after-write and rate-limited;
-- chat admins can delete or unpin messages; hash links detect it, nothing
-  prevents it;
+  so snapshots bound recovery time; a snapshot is one document, so it must fit
+  the bot download limit (20 MB);
+- the bot needs `can_change_info`, `can_pin_messages` (channels: edit
+  messages) and `can_delete_messages`;
+- chat admins can delete or unpin messages; crc links detect a changed
+  message, nothing prevents it;
 - the project disclaimer applies even more: this uses a chat as a database log.
 
 ### `s3` — conditional writes (later)
@@ -310,9 +309,8 @@ Each step is a separate commit with tests green.
    `confirm_active` before each orphan delete batch; loops end on stop.
 5. ~~In-flight pin registry.~~ Done: upload pins + horizon, own `BlobId`s,
    read pins; watermarks, sweep grace and `InflightParts` removed.
-6. **`telegram` LogStore** (chain + description fence above), tested against the
-   same suite as `local` with a fake chat (pins, description, sending order),
-   plus a fault-injection test with two concurrent incarnations and stragglers.
+6. ~~`telegram` LogStore.~~ Done: `ChatLogStore` + Telegram adapter, the
+   LogStore conformance suite and fault injection on a fake chat.
 7. **Arbiter** and a second node; `s3` LogStore.
 
 ## Open questions / Открытые вопросы

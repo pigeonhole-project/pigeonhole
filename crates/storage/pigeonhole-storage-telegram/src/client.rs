@@ -78,6 +78,8 @@ pub struct Chat {
     pub title: Option<String>,
     #[serde(default)]
     pub pinned_message: Option<Message>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -725,6 +727,27 @@ impl TelegramClient {
             .result
             .ok_or_else(|| anyhow!("sendMessage missing result"))?
             .message_id)
+    }
+
+    /// Set the chat description. `Ok(false)`: it already had this value.
+    pub async fn set_chat_description(&self, chat_id: &str, description: &str) -> Result<bool> {
+        let resp = self
+            .http
+            .post(self.api_url("setChatDescription"))
+            .form(&[("chat_id", chat_id), ("description", description)])
+            .send()
+            .await
+            .context("setChatDescription http")?;
+        let status = resp.status();
+        let body: ApiResponse<bool> = resp.json().await.context("setChatDescription json")?;
+        if status.is_success() && body.ok {
+            return Ok(true);
+        }
+        let why = body.description.unwrap_or_else(|| status.to_string());
+        if why.contains("not modified") {
+            return Ok(false);
+        }
+        Err(anyhow!("setChatDescription failed: {why}"))
     }
 
     pub async fn pin_chat_message(

@@ -18,6 +18,12 @@ batch_max_delay_ms = 0        # group commit window; 0 = append when the previou
 [meta.log]
 kind = "local"                # segmented files on this host
 path = "pigeonhole-log"
+# Off-host log in a dedicated Telegram channel (not a blob chat): the bot needs
+# change-info, pin and delete rights. Set [meta] batch_max_delay_ms = 1000.
+# kind = "telegram"
+# chat_id = -1009876543210
+# bot_token_env = "BOT_TOKEN"
+# straggler_window_secs = 90  # a claim waits this long for a deposed writer
 
 [meta.snapshot]
 every_entries = 10000         # snapshot all states, drop the log behind it; 0 = never
