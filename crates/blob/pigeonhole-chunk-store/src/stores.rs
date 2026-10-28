@@ -1,12 +1,12 @@
-//! Where bytes live (`[[store]]`) and how stores are combined
-//! (`[[replicas]]`); `[meta] log` / `snapshot` and `[chunk] store` refer to
-//! them by id.
+//! Where bytes live (`[[store]]`) and how stores are combined: copies
+//! (`[[replicas]]`) and parts (`[[shards]]`). `[meta] log` / `snapshot` and
+//! `[chunk] store` refer to them by id.
 
 use crate::instances::{
     discord_app_id_from_token, discord_fingerprint, discord_location, memory_fingerprint,
     memory_location, telegram_fingerprint, telegram_location, InstanceConfig,
 };
-use crate::PlacementConfig;
+use crate::{PlacementConfig, ShardPlacement};
 use anyhow::{bail, Context, Result};
 use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole};
 use serde::Deserialize;
@@ -46,6 +46,15 @@ fn one() -> usize {
     1
 }
 
+/// One `[[shards]]`: every write goes to one member (a store or a
+/// `[[replicas]]` group), the least loaded.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileShards {
+    id: String,
+    members: Vec<String>,
+}
+
 /// A resolved `[[store]]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Store {
@@ -80,6 +89,7 @@ impl Store {
 pub(crate) struct Topology {
     stores: HashMap<String, Store>,
     replicas: HashMap<String, FileReplicas>,
+    shards: HashMap<String, FileShards>,
     /// Store id → purpose that uses it.
     used: HashMap<String, &'static str>,
     used_groups: HashSet<String>,
@@ -90,7 +100,7 @@ fn token(store: &str, env_name: &str) -> Result<String> {
 }
 
 impl Topology {
-    pub(crate) fn new(stores: Vec<FileStore>, replicas: Vec<FileReplicas>) -> Result<Self> {
+    pub(crate) fn new(stores: Vec<FileStore>, replicas: Vec<FileReplicas>, shards: Vec<FileShards>) -> Result<Self> {
         let mut by_id = HashMap::new();
         let mut locations: HashMap<String, String> = HashMap::new();
         for f in stores {
@@ -172,14 +182,37 @@ impl Topology {
             }
             groups.insert(id, r);
         }
-        Ok(Self { stores: by_id, replicas: groups, used: HashMap::new(), used_groups: HashSet::new() })
+        let mut sharded = HashMap::new();
+        for g in shards {
+            let id = g.id.trim().to_string();
+            if by_id.contains_key(&id) || groups.contains_key(&id) || sharded.contains_key(&id) {
+                bail!("duplicate id {id:?}");
+            }
+            if g.members.is_empty() {
+                bail!("[[shards]] {id}: needs members");
+            }
+            let mut seen = HashSet::new();
+            for m in &g.members {
+                if !seen.insert(m) {
+                    bail!("[[shards]] {id}: member {m:?} listed twice");
+                }
+            }
+            sharded.insert(id, g);
+        }
+        Ok(Self {
+            stores: by_id,
+            replicas: groups,
+            shards: sharded,
+            used: HashMap::new(),
+            used_groups: HashSet::new(),
+        })
     }
 
     /// Take store `id` for `purpose`; a chat can serve one purpose only.
     fn take(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
         let store = self.stores.get(id).cloned().with_context(|| {
-            if self.replicas.contains_key(id) {
-                format!("{purpose} = {id:?}: a [[replicas]] group is not supported here yet; use a [[store]]")
+            if self.replicas.contains_key(id) || self.shards.contains_key(id) {
+                format!("{purpose} = {id:?}: a group is not supported here yet; use a [[store]]")
             } else {
                 format!("{purpose} = {id:?}: no [[store]] with that id")
             }
@@ -205,32 +238,50 @@ impl Topology {
         Ok(store)
     }
 
-    /// `[chunk] store`: a blob store, or a `[[replicas]]` group of them.
+    /// `[chunk] store`: a blob store, a `[[replicas]]` group of them, or
+    /// `[[shards]]` over stores and replica groups.
     pub(crate) fn blob_placement(&mut self, id: &str) -> Result<(Vec<InstanceConfig>, PlacementConfig)> {
-        let (members, write_quorum) = match self.replicas.get(id) {
-            Some(r) => (r.members.clone(), r.write_quorum),
-            None => (vec![id.to_string()], 1),
-        };
-        if self.replicas.contains_key(id) {
-            self.used_groups.insert(id.to_string());
-        }
-        let mut instances = Vec::new();
-        for m in &members {
-            if self.replicas.contains_key(m) {
-                bail!("[[replicas]] {id}: member {m:?} is a group; replicas of groups are not supported");
+        let shard_ids = match self.shards.get(id) {
+            Some(g) => {
+                self.used_groups.insert(id.to_string());
+                g.members.clone()
             }
-            let store = self.take(m, "[chunk] store")?;
-            instances.push(blob_instance(m, &store)?);
+            None => vec![id.to_string()],
+        };
+        let mut instances = Vec::new();
+        let mut shards = Vec::new();
+        for shard in &shard_ids {
+            if self.shards.contains_key(shard) {
+                bail!("[[shards]] {id}: member {shard:?} is a [[shards]] group; shards of shards are not supported");
+            }
+            let (group, write_quorum) = match self.replicas.get(shard) {
+                Some(r) => {
+                    self.used_groups.insert(shard.clone());
+                    (r.members.clone(), r.write_quorum)
+                }
+                None => (vec![shard.clone()], 1),
+            };
+            for m in &group {
+                if self.replicas.contains_key(m) || self.shards.contains_key(m) {
+                    bail!("[[replicas]] {shard}: member {m:?} is a group; replicas of groups are not supported");
+                }
+                if self.used.get(m.as_str()) == Some(&"[chunk] store") {
+                    bail!("[[store]] {m} is in two shards / replica groups of [chunk] store");
+                }
+                let store = self.take(m, "[chunk] store")?;
+                instances.push(blob_instance(m, &store)?);
+            }
+            shards.push(ShardPlacement { group, write_quorum });
         }
-        Ok((instances, PlacementConfig { group: members, write_quorum }))
+        Ok((instances, PlacementConfig { shards }))
     }
 
-    /// Every `[[store]]` and `[[replicas]]` must be used: a leftover is
-    /// almost always a typo in a reference.
+    /// Every `[[store]]`, `[[replicas]]` and `[[shards]]` must be used: a
+    /// leftover is almost always a typo in a reference.
     pub(crate) fn check_all_used(&self) -> Result<()> {
-        for id in self.replicas.keys() {
+        for id in self.replicas.keys().chain(self.shards.keys()) {
             if !self.used_groups.contains(id) {
-                bail!("[[replicas]] {id} is not used by [chunk] store");
+                bail!("group {id} is not used by [chunk] store");
             }
         }
         for id in self.stores.keys() {

@@ -4,7 +4,9 @@ Terms used in code, comments, and docs (Stage B onward).
 
 | Term | Meaning | Size | Mutability | Owner |
 |---|---|---|---|---|
-| **Instance** | Storage place: bot + chat/channel (`tg-main`, `dc-backup`) | — | config | `storage-*` + config |
+| **Store** (instance) | Where bytes live, a `[[store]]`: a dir, or bot + chat/channel (`tg-main`, `dc-backup`) | — | config | `storage-*` + config |
+| **Replica group** | `[[replicas]]`: stores that each get a copy of every chunk written to the group | — | config | `Replicated` |
+| **Shard** | One member of `[[shards]]` (a store or replica group); a chunk lives in exactly one shard | — | config | `Replicated` |
 | **Blob** | One message in one instance; address is `BlobLocator` | ≤ instance `max_blob_size` | immutable | blob storage (stateless) |
 | **Block** | Chunk slice; unit of compression and Range | ~1 MiB logical | immutable | codec + chunk-store metadata |
 | **Chunk** | Logical immutable storage unit: `ChunkId`, size, CRC, refcount; independent of backend limits | config, e.g. 64 MiB | immutable (`refs` / replica set may change) | chunk store |

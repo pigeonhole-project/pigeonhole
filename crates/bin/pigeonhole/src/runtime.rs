@@ -5,10 +5,11 @@ use pigeonhole::config::Config;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::telegram::{TelegramBlobStore, TelegramClient};
 use pigeonhole_blob::{
-    erase_sweep, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
+    erase_sweep, ChatLimiter, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
 };
 use pigeonhole_chunk_store::{
-    check_fingerprints, BlockCache, BlobDb, ChunkStore, IngestOptions, LogSettings, SnapshotSettings,
+    check_fingerprints, BlockCache, BlobDb, ChunkStore, IngestOptions, InstanceConfig, LogSettings,
+    SnapshotSettings,
 };
 use pigeonhole::index::Index;
 use crate::telegram_log::{self, TelegramChat};
@@ -104,76 +105,72 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
 
 async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {
     let limiter = cfg.chat_limiter();
-    let mut members: Vec<SharedBackend> = Vec::new();
+    let mut shards = Vec::new();
+    for shard in &cfg.placement.shards {
+        let mut members: Vec<SharedBackend> = Vec::new();
+        for id in &shard.group {
+            let inst = cfg
+                .instances
+                .iter()
+                .find(|i| i.info.id == *id)
+                .with_context(|| format!("blob store {id:?} not resolved"))?;
+            members.push(build_member(inst, &limiter).await?);
+        }
+        shards.push((members, shard.write_quorum));
+    }
+    let replicated = Replicated::sharded(shards, Arc::new(CheapestFirst::new())).context("blob placement")?;
+    Ok(Arc::new(replicated))
+}
 
-    for id in &cfg.placement.group {
-        let inst = cfg
-            .instances
-            .iter()
-            .find(|i| i.info.id == *id)
-            .with_context(|| format!("placement member {id:?} missing from instances"))?;
-
-        match inst.info.kind {
-            InstanceKind::Memory => {
-                warn!("memory instance {id}: in-process MemoryBlobStore (data does not survive the process)");
-                let mem = Arc::new(
-                    MemoryBlobStore::new().with_instance_info(inst.info.clone()),
-                );
-                let backend = MetricsBackend::wrap(Arc::new(erase_sweep(mem)));
-                members.push(backend);
-            }
-            InstanceKind::Telegram => {
-                let tg = TelegramClient::new(inst.bot_token.clone()).context("telegram client")?;
-                tg.ensure_chat_admin(&inst.scope_id)
+/// One blob store as a placement member.
+async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyhow::Result<SharedBackend> {
+    let id = &inst.info.id;
+    Ok(match inst.info.kind {
+        InstanceKind::Memory => {
+            warn!("memory instance {id}: in-process MemoryBlobStore (data does not survive the process)");
+            let mem = Arc::new(
+                MemoryBlobStore::new().with_instance_info(inst.info.clone()),
+            );
+            MetricsBackend::wrap(Arc::new(erase_sweep(mem)))
+        }
+        InstanceKind::Telegram => {
+            let tg = TelegramClient::new(inst.bot_token.clone()).context("telegram client")?;
+            tg.ensure_chat_admin(&inst.scope_id)
+                .await
+                .context("chat_id access check")?;
+            let store = Arc::new(TelegramBlobStore::with_instance(
+                tg,
+                inst.scope_id.clone(),
+                limiter.clone(),
+                inst.info.clone(),
+            ));
+            MetricsBackend::wrap(Arc::new(erase_sweep(store)))
+        }
+        InstanceKind::Discord => {
+            #[cfg(feature = "discord")]
+            {
+                use pigeonhole_storage_discord::{DiscordBlobStore, DiscordClient};
+                let dc = DiscordClient::new(inst.bot_token.clone()).context("discord client")?;
+                dc.ensure_channel_permissions(&inst.scope_id, Some(limiter.as_ref()))
                     .await
-                    .context("chat_id access check")?;
-                let store = Arc::new(TelegramBlobStore::with_instance(
-                    tg,
+                    .context("channel_id permission check")?;
+                let store = Arc::new(DiscordBlobStore::with_instance(
+                    dc,
                     inst.scope_id.clone(),
                     limiter.clone(),
+                    inst.max_blob_size,
                     inst.info.clone(),
                 ));
-                let backend = MetricsBackend::wrap(Arc::new(erase_sweep(store)));
-                members.push(backend);
+                MetricsBackend::wrap(Arc::new(erase_sweep(store)))
             }
-            InstanceKind::Discord => {
-                #[cfg(feature = "discord")]
-                {
-                    use pigeonhole_storage_discord::{DiscordBlobStore, DiscordClient};
-                    let dc = DiscordClient::new(inst.bot_token.clone()).context("discord client")?;
-                    dc.ensure_channel_permissions(&inst.scope_id, Some(limiter.as_ref()))
-                        .await
-                        .context("channel_id permission check")?;
-                    let store = Arc::new(DiscordBlobStore::with_instance(
-                        dc,
-                        inst.scope_id.clone(),
-                        limiter.clone(),
-                        inst.max_blob_size,
-                        inst.info.clone(),
-                    ));
-                    let backend = MetricsBackend::wrap(Arc::new(erase_sweep(store)));
-                    members.push(backend);
-                }
-                #[cfg(not(feature = "discord"))]
-                {
-                    bail!(
-                        "instance {id:?} is discord but this binary was built without `--features discord`"
-                    );
-                }
+            #[cfg(not(feature = "discord"))]
+            {
+                bail!(
+                    "store {id:?} is discord but this binary was built without `--features discord`"
+                );
             }
         }
-    }
-
-    if members.is_empty() {
-        bail!("placement.group produced no backends");
-    }
-    let replicated = Replicated::new(
-        members,
-        cfg.placement.write_quorum,
-        Arc::new(CheapestFirst::new()),
-    )
-    .context("Replicated::new")?;
-    Ok(Arc::new(replicated))
+    })
 }
 
 fn with_optional_caches(layer: ChunkStore, cfg: &Config) -> ChunkStore {

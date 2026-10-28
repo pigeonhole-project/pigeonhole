@@ -15,7 +15,7 @@ pub use blob_db::{is_chunk_gone, BlobDb, ChunkGone, ReadPin, StoredBlock};
 pub use commands::{ChunkCommand, ChunkReject, ChunkState, InstanceRec, PartRec, Replica};
 pub use config::{
     BytestreamSettings, Config, HttpSettings, LogSettings, MetaSettings, MetricsSettings, SnapshotSettings,
-    PlacementConfig,
+    PlacementConfig, ShardPlacement,
 };
 pub use layer::{
     check_block_fits_members, default_layer_opts, ChunkId, ChunkStore, Extent, Ingested,

@@ -162,7 +162,7 @@ so `restore --lossy` loses recent changes but never breaks an object.
 `[[replicas]]` combines blob stores; `[meta] log` / `snapshot` and
 `[chunk] store` name a store or group. A chat serves one purpose.
 
-### Step 7 — Blob shards
+### Step 7 — Blob shards ✅ done
 
 `[[shards]]`: each chunk goes to one member (least loaded), a member being a
 store or a `[[replicas]]` group; `[chunk] store` may name it. Shards add

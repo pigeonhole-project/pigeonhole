@@ -142,9 +142,14 @@ impl Repairer {
         Ok(stats)
     }
 
-    /// Enqueue repairs for every live chunk missing a replica on `instance_id`.
+    /// Enqueue repairs for every live chunk of `instance_id`'s shard missing
+    /// a replica on it.
     pub async fn enqueue_instance_backfill(&self, instance_id: &str) -> Result<u64> {
-        let missing = self.db.chunks_missing_instance(instance_id).await?;
+        let Some(peers) = self.replicated.shard_peers(instance_id) else {
+            return Ok(0);
+        };
+        let peers: Vec<&str> = peers.iter().map(|m| m.instance().id.as_str()).collect();
+        let missing = self.db.chunks_missing_instance(instance_id, &peers).await?;
         let mut n = 0u64;
         for chunk_id in missing {
             self.db.enqueue_repair(chunk_id, instance_id).await?;
@@ -155,9 +160,9 @@ impl Repairer {
 
     /// Scrub: enqueue under-replicated (chunk, member) pairs; prioritize happens at take.
     pub async fn scrub_enqueue(&self) -> Result<u64> {
-        // Single-member groups have nothing to backfill; scrubbing them only
+        // Single-member shards have nothing to backfill; scrubbing them only
         // burns budget and can race ingest under heavy S3 suites.
-        if self.replicated.members().len() <= 1 {
+        if self.replicated.members().len() == self.replicated.shard_count() {
             return Ok(0);
         }
         let mut n = 0u64;
@@ -176,6 +181,13 @@ impl Repairer {
         };
 
         let layouts = self.db.get_replica_layouts(chunk_id).await?;
+        // A chunk belongs to the shard it was written to; never copy it into
+        // another shard.
+        let peers = self.replicated.shard_peers(instance_id).unwrap_or_default();
+        if !layouts.iter().any(|l| peers.iter().any(|p| p.instance().id == l.instance)) {
+            self.db.dequeue_repair(chunk_id, instance_id).await?;
+            return Ok(RepairOutcome::Noop);
+        }
         if layouts.iter().any(|l| l.instance == instance_id) {
             // Already present; still allow re-pack if caller deleted backend blobs
             // and re-enqueued. Detect healthy replica by probing the first part.
@@ -498,6 +510,44 @@ mod tests {
             assert_eq!(got, body, "replica {}", layout.instance);
         }
         let _ = rep;
+    }
+
+    #[tokio::test]
+    async fn repair_stays_inside_a_chunks_shard() {
+        let (a1, a2, b) = (lim("a1", 4 * MIB), lim("a2", 4 * MIB), lim("b", 4 * MIB));
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::connect(dir.path().join("blob.log")).await.unwrap();
+        let shards = |a: Vec<SharedBackend>| {
+            Arc::new(Replicated::sharded(vec![(a, 1), (vec![b.clone()], 1)], Arc::new(CheapestFirst::new())).unwrap())
+        };
+        let layer = ChunkStore::open_replicated(db.clone(), shards(vec![a1.clone()]), IngestOptions::new(MIB, ChunkCodec::Raw))
+            .await
+            .unwrap();
+        let on_a = layer.put_small(Bytes::from_static(b"first")).await.unwrap();
+        let on_b = layer.put_small(Bytes::from_static(b"second")).await.unwrap();
+        let where_is = |id| {
+            let db = db.clone();
+            async move {
+                let mut ids: Vec<_> = db.get_replica_layouts(id).await.unwrap().into_iter().map(|l| l.instance).collect();
+                ids.sort();
+                ids
+            }
+        };
+        assert_eq!((where_is(on_a).await, where_is(on_b).await), (vec!["a1".to_string()], vec!["b".to_string()]));
+
+        // a2 joins the first shard: only that shard's chunk is copied to it.
+        let rep = shards(vec![a1, a2]);
+        db.sync_instances(&rep.members().iter().map(|m| m.instance().clone()).collect::<Vec<_>>()).await.unwrap();
+        let repairer = Repairer::new(db.clone(), rep, RepairConfig { scrub: false, ..RepairConfig::default() });
+        assert_eq!(repairer.scrub_enqueue().await.unwrap(), 1);
+        assert_eq!(repairer.repair_once().await.unwrap().repaired, 1);
+        assert_eq!(where_is(on_a).await, vec!["a1".to_string(), "a2".to_string()]);
+        assert_eq!(where_is(on_b).await, vec!["b".to_string()]);
+
+        // A job aimed at another shard is dropped, not executed.
+        db.enqueue_repair(on_b, "a2").await.unwrap();
+        assert_eq!(repairer.repair_once().await.unwrap().repaired, 0);
+        assert_eq!(where_is(on_b).await, vec!["b".to_string()]);
     }
 
     #[tokio::test]

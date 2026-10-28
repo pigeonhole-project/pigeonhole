@@ -90,7 +90,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         .collect();
     info!(
         ?instances,
-        placement = ?cfg.placement.group,
+        shards = ?cfg.placement.shards.iter().map(|s| s.group.clone()).collect::<Vec<_>>(),
         chunk_size = cfg.chunk_size,
         chunk_codec = %cfg.chunk_codec,
         bytestream = cfg.bytestream.enabled,

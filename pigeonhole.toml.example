@@ -43,6 +43,13 @@ chat_id = -1001234567890
 # members = ["tg-main", "dc-backup"]
 # write_quorum = 1
 
+# Parts: every chunk goes to one member (the least loaded), a store or a
+# [[replicas]] group. Telegram limits are per chat, so shards add throughput;
+# replicas inside a shard add availability.
+# [[shards]]
+# id = "spread"
+# members = ["tg-main", "tg-second", "blobs"]
+
 # Metadata tablet (docs/meta-backends.md): every metadata change is appended to
 # the command log, then applied to in-memory state; every boot loads the
 # snapshot the log starts from and replays the rest. A second process on the

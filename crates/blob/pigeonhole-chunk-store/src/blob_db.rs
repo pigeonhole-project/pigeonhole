@@ -457,11 +457,17 @@ impl BlobDb {
     }
 
     /// Referenced chunks (`refs > 0`) missing a replica on `instance_id`.
-    pub async fn chunks_missing_instance(&self, instance_id: &str) -> Result<Vec<ChunkId>> {
+    /// Live chunks of `instance_id`'s shard (a replica on one of `peers`)
+    /// that have none on `instance_id`.
+    pub async fn chunks_missing_instance(&self, instance_id: &str, peers: &[&str]) -> Result<Vec<ChunkId>> {
         Ok(self.read(|s| {
             s.chunks
                 .iter()
-                .filter(|(_, c)| c.refs > 0 && !c.replicas.contains_key(instance_id))
+                .filter(|(_, c)| {
+                    c.refs > 0
+                        && !c.replicas.contains_key(instance_id)
+                        && c.replicas.keys().any(|i| peers.contains(&i.as_str()))
+                })
                 .map(|(&id, _)| id)
                 .collect()
         }))

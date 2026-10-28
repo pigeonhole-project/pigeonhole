@@ -164,7 +164,22 @@ store = "blobs"
 ```
 
 Writes go to every member of the group; reads pick the cheapest available
-replica. A chat serves one purpose (log, snapshots or blobs). The `[repair]` task scrubs for under-replicated chunks and backfills
+replica. A chat serves one purpose (log, snapshots or blobs).
+
+`[[shards]]` spreads chunks instead of copying them: each chunk goes to one
+member (the least loaded), a store or a `[[replicas]]` group. Telegram limits
+are per chat, so more blob chats mean more throughput; a replica group as a
+shard keeps that shard readable when one provider is down. Repair keeps each
+chunk on every member of its own shard.
+
+```toml
+[[shards]]
+id = "spread"
+members = ["tg-main", "tg-second", "blobs"]   # "blobs" = the replica group above
+
+[chunk]
+store = "spread"
+``` The `[repair]` task scrubs for under-replicated chunks and backfills
 them (re-packing parts when instance blob limits differ).
 
 ## Bazel / Buck2 remote cache (REAPI)
@@ -190,10 +205,11 @@ comments. Sections:
 | TOML | Meaning |
 |---|---|
 | `[[store]]` | Where bytes live: id, kind (`dir` + `path` / `telegram` + `chat_id` / `discord` + `channel_id` / `memory`), token env, `max_blob_size` |
-| `[[replicas]]` | A group of blob stores: `members`, `write_quorum` |
+| `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
+| `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
 | `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), group commit (`batch_max_delay_ms` / `batch_max_entries`), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never), `log_straggler_window_secs` |
-| `[chunk]` | `store` (a blob store or group), `size` (max on-wire), `codec`, `block_size` |
+| `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Separate send / getFile / delete budgets, upload/download concurrency |
 | `[cache]` | `file_path` LRU, L1 unpacked blocks, L2 memory/disk blob cache |

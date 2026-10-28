@@ -1,5 +1,5 @@
 use crate::instances::{memory_instance, InstanceConfig};
-use crate::stores::{FileReplicas, FileStore, Store, Topology};
+use crate::stores::{FileReplicas, FileShards, FileStore, Store, Topology};
 use crate::repair::{
     RepairConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
 };
@@ -15,12 +15,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Blob placement (`[chunk] store`): which stores receive chunk replicas and the write quorum.
+/// Blob placement (`[chunk] store`): shards, each a replica group. A chunk
+/// goes to one shard and to every member of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementConfig {
-    /// Instance ids in the write group (read-write members).
+    pub shards: Vec<ShardPlacement>,
+}
+
+/// One shard: the stores holding a replica of each of its chunks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardPlacement {
     pub group: Vec<String>,
     pub write_quorum: usize,
+}
+
+impl PlacementConfig {
+    /// One shard, one store.
+    pub fn single(id: &str) -> Self {
+        Self { shards: vec![ShardPlacement { group: vec![id.to_string()], write_quorum: 1 }] }
+    }
 }
 
 /// Runtime config: non-secrets from TOML, secrets from environment / `.env`.
@@ -98,7 +111,7 @@ pub enum LogSettings {
 impl MetaSettings {
     /// Defaults with the log and snapshots under `dir` (tests).
     pub fn in_dir(dir: &Path) -> Self {
-        let mut topology = Topology::new(Vec::new(), Vec::new()).expect("empty topology");
+        let mut topology = Topology::new(Vec::new(), Vec::new(), Vec::new()).expect("empty topology");
         let mut meta = FileMeta::default().into_settings(&mut topology).expect("default meta settings");
         if let LogSettings::Dir { path } = &mut meta.log {
             *path = dir.join(&*path);
@@ -237,7 +250,7 @@ impl Config {
             bail!("telegram upload/download concurrency must be >= 1");
         }
 
-        let mut topology = Topology::new(file.store, file.replicas)?;
+        let mut topology = Topology::new(file.store, file.replicas, file.shards)?;
         let meta = file.meta.into_settings(&mut topology)?;
         let blob_store = file
             .chunk
@@ -300,10 +313,7 @@ impl Config {
             bytestream: BytestreamSettings::default(),
             http: HttpSettings::default(),
             instances: vec![memory_instance("mem")],
-            placement: PlacementConfig {
-                group: vec!["mem".into()],
-                write_quorum: 1,
-            },
+            placement: PlacementConfig::single("mem"),
             sweep: SweepConfig::default(),
             repair: RepairConfig::default(),
             metrics: MetricsSettings::default(),
@@ -319,9 +329,10 @@ impl Config {
     pub fn primary_instance(&self) -> Result<&InstanceConfig> {
         let id = self
             .placement
-            .group
+            .shards
             .first()
-            .context("placement.group is empty")?;
+            .and_then(|s| s.group.first())
+            .context("no blob store")?;
         self.instances
             .iter()
             .find(|i| i.info.id == *id)
@@ -361,6 +372,8 @@ struct FileConfig {
     #[serde(default)]
     replicas: Vec<FileReplicas>,
     #[serde(default)]
+    shards: Vec<FileShards>,
+    #[serde(default)]
     sweep: FileSweep,
     #[serde(default)]
     repair: FileRepair,
@@ -382,6 +395,7 @@ impl Default for FileConfig {
             http: FileHttp::default(),
             store: Vec::new(),
             replicas: Vec::new(),
+            shards: Vec::new(),
             sweep: FileSweep::default(),
             repair: FileRepair::default(),
             metrics: FileMetrics::default(),
@@ -853,8 +867,7 @@ upload_concurrency = 4
         assert_eq!(cfg.tg.send_rate_per_sec, 1.0);
         assert_eq!(cfg.tg.get_file_rate_per_sec, 20.0);
         assert_eq!(cfg.tg.upload_concurrency, 4);
-        assert_eq!(cfg.placement.group, vec!["mem".to_string()]);
-        assert_eq!(cfg.placement.write_quorum, 1);
+        assert_eq!(cfg.placement, PlacementConfig::single("mem"));
         assert_eq!(cfg.meta.batch_max_delay, Duration::ZERO);
         assert_eq!(cfg.meta.snapshot_every_entries, 10_000);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(600));
@@ -945,8 +958,10 @@ upload_concurrency = 4
         let stores = "[[store]]\nid = \"a\"\nkind = \"memory\"\n[[store]]\nid = \"b\"\nkind = \"memory\"\n";
         let group = |q: usize| format!("[[replicas]]\nid = \"ab\"\nmembers = [\"a\", \"b\"]\nwrite_quorum = {q}\n");
         let cfg = load(&format!("[chunk]\nstore = \"ab\"\n{stores}{}", group(2))).unwrap();
-        assert_eq!(cfg.placement.group, vec!["a", "b"]);
-        assert_eq!(cfg.placement.write_quorum, 2);
+        assert_eq!(
+            cfg.placement.shards,
+            vec![ShardPlacement { group: vec!["a".into(), "b".into()], write_quorum: 2 }]
+        );
         assert_eq!(cfg.instances.len(), 2);
 
         let err = load(&format!("[chunk]\nstore = \"ab\"\n{stores}{}", group(3))).unwrap_err();
@@ -958,6 +973,33 @@ upload_concurrency = 4
         assert!(format!("{err:#}").contains("replicas of groups"), "{err:#}");
         let err = load(&format!("[meta]\nlog = \"ab\"\n[chunk]\nstore = \"ab\"\n{stores}{}", group(1))).unwrap_err();
         assert!(format!("{err:#}").contains("not supported here yet"), "{err:#}");
+    }
+
+    #[test]
+    fn blobs_on_shards() {
+        let stores = "[[store]]\nid = \"a1\"\nkind = \"memory\"\n[[store]]\nid = \"a2\"\nkind = \"memory\"\n\
+                      [[store]]\nid = \"b\"\nkind = \"memory\"\n\
+                      [[replicas]]\nid = \"a\"\nmembers = [\"a1\", \"a2\"]\nwrite_quorum = 2\n";
+        let shards = "[[shards]]\nid = \"blobs\"\nmembers = [\"a\", \"b\"]\n";
+        let cfg = load(&format!("[chunk]\nstore = \"blobs\"\n{stores}{shards}")).unwrap();
+        assert_eq!(
+            cfg.placement.shards,
+            vec![
+                ShardPlacement { group: vec!["a1".into(), "a2".into()], write_quorum: 2 },
+                ShardPlacement { group: vec!["b".into()], write_quorum: 1 },
+            ]
+        );
+        assert_eq!(cfg.instances.len(), 3);
+        assert_eq!(cfg.primary_instance().unwrap().info.id, "a1");
+
+        let twice = "[[shards]]\nid = \"blobs\"\nmembers = [\"a\", \"a1\", \"b\"]\n";
+        let err = load(&format!("[chunk]\nstore = \"blobs\"\n{stores}{twice}")).unwrap_err();
+        assert!(format!("{err:#}").contains("in two shards"), "{err:#}");
+        let nested = "[[shards]]\nid = \"top\"\nmembers = [\"blobs\"]\n";
+        let err = load(&format!("[chunk]\nstore = \"top\"\n{stores}{shards}{nested}")).unwrap_err();
+        assert!(format!("{err:#}").contains("shards of shards"), "{err:#}");
+        let err = load(&format!("[chunk]\nstore = \"a\"\n{stores}{shards}")).unwrap_err();
+        assert!(format!("{err:#}").contains("group blobs is not used"), "{err:#}");
     }
 
     #[test]
