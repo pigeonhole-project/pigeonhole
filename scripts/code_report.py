@@ -27,11 +27,6 @@ RUSTDOC_TARGET = ROOT / "target" / "rustdoc-json"
 TEST_CRATES = {"pigeonhole-testkit"}
 TEST_DIRS = {"tests", "benches"}
 
-# External traits not worth a node: std, derives, codegen plumbing.
-EXTERN_TRAIT_CRATES_SKIP = {
-    "core", "alloc", "std", "serde", "serde_core", "prost", "async_trait",
-}
-
 
 def run(cmd: list[str], **kw) -> str:
     return subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE, **kw).stdout
@@ -236,7 +231,7 @@ def build_rustdoc(crates: list[Crate]) -> None:
 
 @dataclass
 class TraitGraph:
-    traits: dict[tuple[str, str], bool] = field(default_factory=dict)  # key → is workspace
+    traits: set[tuple[str, str]] = field(default_factory=set)
     types: set[tuple[str, str]] = field(default_factory=set)
     supers: set[tuple[tuple[str, str], tuple[str, str]]] = field(default_factory=set)
     impls: set[tuple[tuple[str, str], tuple[str, str], bool]] = field(default_factory=set)  # (type, trait, blanket)
@@ -284,7 +279,7 @@ def trait_graph(crates: list[Crate]) -> TraitGraph:
             inner = item["inner"]
             if "trait" in inner:
                 tk = key(int(item["id"]), paths, item["name"], crate)
-                g.traits[tk] = True
+                g.traits.add(tk)
                 for b in inner["trait"]["bounds"]:
                     tb = b.get("trait_bound")
                     if not tb:
@@ -301,19 +296,17 @@ def trait_graph(crates: list[Crate]) -> TraitGraph:
                 if span and not (ROOT / span["filename"]).resolve().is_relative_to(c.dir):
                     continue
                 tk = key(im["trait"]["id"], paths, im["trait"]["path"], crate)
-                if tk[0] in EXTERN_TRAIT_CRATES_SKIP:
-                    continue
                 ty = type_key(im["for"], paths, crate)
-                if ty is None:
+                if tk[0] not in ours or ty is None or ty[0] not in ours:
                     continue
-                g.traits.setdefault(tk, tk[0] in ours)
                 g.types.add(ty)
                 g.impls.add((ty, tk, "generic" in im["for"]))
     return g
 
 
 def mermaid_id(kind: str, k: tuple[str, str]) -> str:
-    return re.sub(r"\W", "_", f"{kind}_{k[0]}__{k[1]}")
+    crate = k[0].removeprefix("pigeonhole_") if k[0] != "pigeonhole" else "bin"
+    return re.sub(r"\W", "_", f"{crate}_{k[1]}") + ("_t" if kind == "trait" else "")
 
 
 def mermaid_label(s: str) -> str:
@@ -321,26 +314,33 @@ def mermaid_label(s: str) -> str:
     return s.replace("<", "‹").replace(">", "›").replace('"', "'")
 
 
-def render_traits(g: TraitGraph, ours: set[str]) -> list[str]:
+def render_traits(g: TraitGraph) -> list[str]:
     nodes: dict[str, list[str]] = defaultdict(list)
     annotations = []
     for k in sorted(g.traits):
-        ns, label = (k[0], k[1]) if k[0] in ours else ("external", f"{k[0]}::{k[1]}")
-        nodes[ns].append(f'    class {mermaid_id("trait", k)}["{mermaid_label(label)}"]')
+        nodes[k[0]].append(f'    class {mermaid_id("trait", k)}["{mermaid_label(k[1])}"]')
         annotations.append(f"  <<trait>> {mermaid_id('trait', k)}")
     for k in sorted(g.types):
-        ns, label = (k[0], k[1]) if k[0] in ours else ("external", f"{k[0]}::{k[1]}")
-        nodes[ns].append(f'    class {mermaid_id("type", k)}["{mermaid_label(label)}"]')
+        nodes[k[0]].append(f'    class {mermaid_id("type", k)}["{mermaid_label(k[1])}"]')
 
     out = ["```mermaid", "classDiagram", "  direction LR"]
-    for ns in sorted(nodes, key=lambda n: (n == "external", n)):
+    for ns in sorted(nodes):
         out.append(f"  namespace {ns} {{")
         out += nodes[ns]
         out.append("  }")
     out += annotations
     for sup, sub in sorted(g.supers):
         out.append(f"  {mermaid_id('trait', sup)} <|-- {mermaid_id('trait', sub)}")
+    supers_of: dict[tuple[str, str], set] = defaultdict(set)
+    for sup, sub in g.supers:
+        supers_of[sub].add(sup)
+    implemented = defaultdict(set)
+    for ty, tr, _ in g.impls:
+        implemented[ty].add(tr)
     for ty, tr, blanket in sorted(g.impls):
+        # `T: Sub` already says `T: Super`; skip the redundant arrow.
+        if any(tr in supers_of[other] for other in implemented[ty]):
+            continue
         out.append(f"  {mermaid_id('trait', tr)} <|.. {mermaid_id('type', ty)}" + (" : blanket" if blanket else ""))
     out.append("```")
     return out
@@ -453,10 +453,9 @@ def main() -> int:
     if not args.no_traits:
         build_rustdoc(crates)
         md += ["## Traits", "",
-               "Workspace traits, their supertraits (`<|--`) and implementors (`<|..`); "
-               "external traits only where a workspace type implements them. "
-               "Std and derive traits are left out.", ""]
-        md += render_traits(trait_graph(crates), {c.name.replace("-", "_") for c in crates})
+               "Workspace traits, their supertraits (`<|--`) and workspace implementors (`<|..`). "
+               "External traits and types are left out.", ""]
+        md += render_traits(trait_graph(crates))
         md.append("")
 
     text = "\n".join(md)
