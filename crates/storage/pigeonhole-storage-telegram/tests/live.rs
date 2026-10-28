@@ -132,3 +132,43 @@ async fn a_sent_message_is_visible_at_once() {
 fn uuid_like() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64
 }
+
+/// Delete the documents of a channel whose names start with one of
+/// `TG_CLEAN_PREFIXES` (comma-separated) in ids `1..=TG_LIST_TO`: test
+/// leftovers. `TG_LIST_CHAT_ID=-100… TG_LIST_TO=<id> TG_CLEAN_PREFIXES=log-
+/// cargo test -p pigeonhole-storage-telegram --test live clean -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "deletes messages in a real channel"]
+async fn clean() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let chat_id: i64 = env("TG_LIST_CHAT_ID").parse().unwrap();
+    let to: i64 = env("TG_LIST_TO").parse().unwrap();
+    let prefixes: Vec<String> = env("TG_CLEAN_PREFIXES").split(',').map(str::to_string).collect();
+    let cfg = MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env("TG_BOT_TOKEN"),
+        session: root.join(".cache/tgm-live.session"),
+    };
+    let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+    let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(ChatLimiterConfig::default()))).await.unwrap();
+    let mut lo = 1;
+    let mut deleted = 0;
+    while lo <= to {
+        let ids: Vec<i64> = (lo..=to.min(lo + 99)).collect();
+        let ours: Vec<i64> = ids
+            .iter()
+            .zip(channel.get_messages(&ids).await.unwrap())
+            .filter(|(_, m)| matches!(m, pigeonhole_storage_telegram::ChannelMessage::Document { name, .. }
+                if prefixes.iter().any(|p| name.starts_with(p.as_str()))))
+            .map(|(id, _)| *id)
+            .collect();
+        if !ours.is_empty() {
+            channel.delete_messages(&ours).await.unwrap();
+            deleted += ours.len();
+        }
+        lo += 100;
+    }
+    println!("deleted {deleted} messages");
+}
