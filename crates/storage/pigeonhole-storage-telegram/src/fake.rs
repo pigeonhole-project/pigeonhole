@@ -22,6 +22,12 @@ struct Inner {
     /// Bumped by [`FakeChannel::expire_file_references`].
     reference_epoch: u8,
     calls: Calls,
+    /// message id → reads it stays invisible for.
+    hidden: HashMap<i64, u32>,
+    /// The next send whose name starts with this is invisible for that many reads.
+    hide_next: Option<(String, u32)>,
+    /// The next send posts but answers with an error.
+    lose_next_answer: bool,
 }
 
 /// How often each call was made.
@@ -68,6 +74,45 @@ impl FakeChannel {
         g.reference_epoch = g.reference_epoch.wrapping_add(1);
     }
 
+    /// The next document posted whose name starts with `prefix` is invisible
+    /// for `reads` reads that include it.
+    pub fn hide_next(&self, prefix: &str, reads: u32) {
+        self.inner.lock().unwrap().hide_next = Some((prefix.to_string(), reads));
+    }
+
+    /// The next send posts, but the sender learns nothing.
+    pub fn lose_next_answer(&self) {
+        self.inner.lock().unwrap().lose_next_answer = true;
+    }
+
+    /// Change the bytes of document `id` in place (an edit).
+    pub fn edit(&self, id: i64) {
+        if let Some(Stored::Doc { data, .. }) = self.inner.lock().unwrap().messages.get_mut(&id) {
+            let mut changed = data.to_vec();
+            if let Some(last) = changed.last_mut() {
+                *last ^= 0xff;
+            }
+            *data = Bytes::from(changed);
+        }
+    }
+
+    /// Delete message `id` behind everyone's back.
+    pub fn remove(&self, id: i64) {
+        self.inner.lock().unwrap().messages.remove(&id);
+    }
+
+    /// Ids and names of the messages still there (`(text)` for text).
+    pub fn names(&self) -> Vec<(i64, String)> {
+        let g = self.inner.lock().unwrap();
+        g.messages
+            .iter()
+            .map(|(id, m)| match m {
+                Stored::Text => (*id, "(text)".to_string()),
+                Stored::Doc { name, .. } => (*id, name.clone()),
+            })
+            .collect()
+    }
+
     pub fn calls(&self) -> Calls {
         self.inner.lock().unwrap().calls
     }
@@ -94,9 +139,16 @@ impl ChannelApi for FakeChannel {
         }
         let mut g = self.inner.lock().unwrap();
         g.calls.get_messages += 1;
-        Ok(ids
-            .iter()
-            .map(|id| match g.messages.get(id) {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(left) = g.hidden.get_mut(id) {
+                if *left > 0 {
+                    *left -= 1;
+                    out.push(ChannelMessage::Empty);
+                    continue;
+                }
+            }
+            out.push(match g.messages.get(id) {
                 None => ChannelMessage::Empty,
                 Some(Stored::Text) => ChannelMessage::Other,
                 Some(Stored::Doc { name, data }) => ChannelMessage::Document {
@@ -104,8 +156,9 @@ impl ChannelApi for FakeChannel {
                     size: data.len() as u64,
                     file: self.location(&g, *id),
                 },
-            })
-            .collect())
+            });
+        }
+        Ok(out)
     }
 
     async fn send_document(&self, name: &str, data: Bytes, random_id: i64) -> Result<Sent> {
@@ -121,6 +174,13 @@ impl ChannelApi for FakeChannel {
         let id = g.top;
         g.messages.insert(id, Stored::Doc { name: name.into(), data });
         g.by_random_id.insert(random_id, id);
+        if g.hide_next.as_ref().is_some_and(|(prefix, _)| name.starts_with(prefix.as_str())) {
+            let (_, reads) = g.hide_next.take().unwrap();
+            g.hidden.insert(id, reads);
+        }
+        if std::mem::take(&mut g.lose_next_answer) {
+            bail!("connection reset before the answer");
+        }
         Ok(Sent { message_id: id, file: Some(self.location(&g, id)) })
     }
 

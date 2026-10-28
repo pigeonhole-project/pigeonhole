@@ -28,9 +28,9 @@ const LOCATION_CACHE: usize = 4096;
 const WINDOWS_IN_FLIGHT: usize = 4;
 
 #[derive(Clone)]
-struct Located {
-    size: u64,
-    file: FileLocation,
+pub(crate) struct Located {
+    pub(crate) size: u64,
+    pub(crate) file: FileLocation,
 }
 
 type Locations = Arc<Mutex<LruCache<i64, Located>>>;
@@ -38,13 +38,14 @@ type Locations = Arc<Mutex<LruCache<i64, Located>>>;
 pub struct TelegramBlobStore<C> {
     limits: BackendLimits,
     instance: InstanceInfo,
-    reader: Reader<C>,
-    limiter: Arc<ChatLimiter>,
+    pub(crate) reader: Reader<C>,
+    pub(crate) limiter: Arc<ChatLimiter>,
+    pub(crate) chain: crate::chain::ChainOptions,
 }
 
 /// The read side, cloned into a download stream.
-struct Reader<C> {
-    channel: Arc<C>,
+pub(crate) struct Reader<C> {
+    pub(crate) channel: Arc<C>,
     limiter: Arc<ChatLimiter>,
     locations: Locations,
 }
@@ -70,7 +71,14 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
             instance,
             reader: Reader { channel, limiter: limiter.clone(), locations },
             limiter,
+            chain: crate::chain::ChainOptions::default(),
         }
+    }
+
+    /// How a chain treats ids that read empty ([`crate::chain::ChainOptions`]).
+    pub fn with_chain_options(mut self, opts: crate::chain::ChainOptions) -> Self {
+        self.chain = opts;
+        self
     }
 
     pub fn channel(&self) -> &Arc<C> {
@@ -79,19 +87,34 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
 }
 
 impl<C: ChannelApi> Reader<C> {
-    fn remember(&self, message_id: i64, located: Located) {
+    pub(crate) fn remember(&self, message_id: i64, located: Located) {
         self.locations.lock().unwrap().put(message_id, located);
     }
 
+    /// Read messages `ids` (at most [`IDS_PER_CALL`]), remembering where
+    /// their documents are.
+    pub(crate) async fn read(&self, ids: &[i64]) -> Result<Vec<ChannelMessage>> {
+        let msgs = self.channel.get_messages(ids).await?;
+        for (id, m) in ids.iter().zip(&msgs) {
+            if let ChannelMessage::Document { size, file, .. } = m {
+                self.remember(*id, Located { size: *size, file: file.clone() });
+            }
+        }
+        Ok(msgs)
+    }
+
     /// Where blob `message_id` is: from the cache, or read the message
-    /// (`fresh` = always read it, for a new file reference).
+    /// (`fresh` = always read it, for a new file reference). A miss reads
+    /// the whole page below: a log replay walks down message by message.
     async fn locate(&self, message_id: i64, fresh: bool) -> Result<Located> {
         if !fresh {
             if let Some(l) = self.locations.lock().unwrap().get(&message_id) {
                 return Ok(l.clone());
             }
         }
-        let msg = self.channel.get_messages(&[message_id]).await?.into_iter().next();
+        let lo = if fresh { message_id } else { (message_id - IDS_PER_CALL as i64 + 1).max(1) };
+        let ids: Vec<i64> = (lo..=message_id).collect();
+        let msg = self.read(&ids).await?.pop();
         match msg {
             Some(ChannelMessage::Document { size, file, .. }) => {
                 let located = Located { size, file };

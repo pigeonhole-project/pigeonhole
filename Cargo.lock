@@ -2576,6 +2576,7 @@ dependencies = [
  "hex",
  "lru",
  "pigeonhole-blob",
+ "pigeonhole-meta",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "serde",

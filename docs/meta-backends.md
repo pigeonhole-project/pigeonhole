@@ -152,11 +152,11 @@ The log names the exact snapshot it starts from, so a boot never guesses: a
 deposed writer's late `put` is just an unreferenced copy. A store never drops
 snapshots on its own; the tablet removes the previous base once the log is
 rebased on a newer one. Implementations: `local` (`snapshot-<log id>-<at>.snap`
-files, crc-checked; the directory may be the log's) and `telegram`
-(`ChannelSnapshotStore`: one document per snapshot in a channel of its own;
-the ref is the message id and the document's crc; `newest` posts a probe to
-learn the top and walks down). The log and the snapshots cannot share a
-channel: snapshot ids would land in the log's checked ranges.
+files, crc-checked; the directory may be the log's) and `BlobSnapshotStore`
+over any store that implements `Chain` (memory, telegram): snapshots are a
+chain of blobs, the ref is the blob id and its crc, `newest` is the tail
+(chain-log.md). The log and the snapshots cannot share a store: a store holds
+one chain.
 
 ### Tablet lifecycle
 
@@ -213,9 +213,12 @@ others are tested against.
 
 ### `telegram` — a channel over MTProto, fenced by message order
 
-Implemented as `ChannelLogStore` (`pigeonhole-meta/src/log/channel.rs`,
-protocol over a `ChannelApi` trait, tested on a fake channel) with an MTProto
-adapter in the binary. Design, spike and live findings:
+The generic `ChainLogStore` over `impl Chain for TelegramBlobStore`
+([chain-log.md](chain-log.md)); the store decides "first successor wins" by
+the order of message ids. Below: the order fence as first implemented on its
+own (`ChannelLogStore`, now gone); the chain keeps its core — a put after `p`
+landing at `b` wins iff no message in `(p, b)` names `p`, with no read when
+`b == p + 1`. Design, spike and live findings:
 [telegram-mtproto.md](telegram-mtproto.md). In short:
 
 - A channel numbers every message, atomically and in increasing order, and a
@@ -492,9 +495,10 @@ Each step is a separate commit with tests green.
 5. ~~In-flight pin registry.~~ Done: upload pins + horizon, own `BlobId`s,
    read pins; watermarks, sweep grace and `InflightParts` removed.
 6. ~~`telegram` LogStore.~~ Done: first over the Bot API (pins, a description
-   fence, a straggler window), then replaced by `ChannelLogStore` over MTProto
-   (fenced by message order); the LogStore conformance suite and fault
-   injection on a fake channel; snapshots in a `SnapshotStore` of their own.
+   fence, a straggler window), then replaced by the MTProto channel log
+   (fenced by message order), now `ChainLogStore` over the Telegram store's
+   `Chain`; the LogStore conformance suite and fault injection on a fake
+   channel; snapshots in a `SnapshotStore` of their own.
 7. **Arbiter** and a second node; `s3` LogStore.
 
 ## Open questions

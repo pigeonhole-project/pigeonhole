@@ -120,10 +120,10 @@ in `telegram_log.rs`) somewhere both transports and the log adapters use, e.g.
 
 ### The log: a fence by order in the channel
 
-> **Superseded by [chain-log.md](chain-log.md)**: the log moves on top of blob
-> storage (`ChainLogStore` over `impl Chain for TelegramBlobStore`). The order
-> fence below becomes the Telegram store's way to decide "first successor
-> wins"; `ChannelApi` / `ChannelLogStore` go away (chain-log.md step 3).
+> **Superseded by [chain-log.md](chain-log.md)** (done): the log is
+> `ChainLogStore` over `impl Chain for TelegramBlobStore`. The order fence
+> below became the Telegram store's way to decide "first successor wins";
+> `ChannelApi` / `ChannelLogStore` / `ChannelSnapshotStore` are gone.
 
 Telegram gives every message in a channel an id, atomically and in increasing
 order: one total order of everything every writer posts. With

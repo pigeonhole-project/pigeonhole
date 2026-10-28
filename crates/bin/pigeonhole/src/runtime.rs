@@ -11,10 +11,10 @@ use pigeonhole_chunk_store::{
     SnapshotSettings,
 };
 use pigeonhole::index::Index;
-use crate::channel_log::{self, LogChannel};
-use pigeonhole::telegram::{Lane, TelegramBlobStore};
-use pigeonhole_meta::log::channel::{ChannelLogOptions, ChannelLogStore};
-use pigeonhole_meta::snapshot::ChannelSnapshotStore;
+use crate::channel_log;
+use pigeonhole::telegram::{Lane, MtprotoChannel, TelegramBlobStore};
+use pigeonhole_blob::{InstanceInfo, InstanceRole};
+use pigeonhole_chunk_store::TelegramLogin;
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, LocalSnapshotStore, SnapshotStore};
 use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_storage_disk::DiskBlobStore;
@@ -38,13 +38,8 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
             LocalLogStore::open(path).with_context(|| format!("open local log {}", path.display()))?,
         ),
         LogSettings::Telegram { chat_id, login } => {
-            let channel = channel_log::client(login)
-                .await?
-                .channel(parse_chat(chat_id)?, Lane::Meta, cfg.chat_limiter(&login.bot_token, chat_id))
-                .await
-                .context("log channel")?;
             info!(chat_id = %chat_id, "metadata log in a Telegram channel");
-            Arc::new(ChannelLogStore::new(Arc::new(LogChannel::new(channel)), ChannelLogOptions::default()))
+            Arc::new(ChainLogStore::new(meta_channel_store(cfg, login, chat_id, "log").await?))
         }
     })
 }
@@ -55,15 +50,34 @@ pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStor
         SnapshotSettings::LocalDisk { path } => Arc::new(LocalSnapshotStore::new(path)),
         SnapshotSettings::Memory => Arc::new(BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new()))),
         SnapshotSettings::Telegram { chat_id, login } => {
-            let channel = channel_log::client(login)
-                .await?
-                .channel(parse_chat(chat_id)?, Lane::Meta, cfg.chat_limiter(&login.bot_token, chat_id))
-                .await
-                .context("snapshot channel")?;
             info!(chat_id = %chat_id, "metadata snapshots in a Telegram channel");
-            Arc::new(ChannelSnapshotStore::new(Arc::new(LogChannel::new(channel))))
+            Arc::new(BlobSnapshotStore::new(meta_channel_store(cfg, login, chat_id, "snapshots").await?))
         }
     })
+}
+
+/// A channel holding the log or the snapshots, as a blob store whose blobs
+/// chain (on the metadata connection, apart from blob uploads).
+async fn meta_channel_store(
+    cfg: &Config,
+    login: &TelegramLogin,
+    chat_id: &str,
+    purpose: &str,
+) -> anyhow::Result<Arc<TelegramBlobStore<MtprotoChannel>>> {
+    let limiter = cfg.chat_limiter(&login.bot_token, chat_id);
+    let channel = channel_log::client(login)
+        .await?
+        .channel(parse_chat(chat_id)?, Lane::Meta, limiter.clone())
+        .await
+        .with_context(|| format!("{purpose} channel"))?;
+    let info = InstanceInfo {
+        id: format!("meta-{purpose}"),
+        kind: InstanceKind::Telegram,
+        fingerprint: format!("tg:meta:{chat_id}"),
+        location: format!("tg:chat:{chat_id}"),
+        role: InstanceRole::ReadWrite,
+    };
+    Ok(Arc::new(TelegramBlobStore::new(Arc::new(channel), limiter, info)))
 }
 
 fn parse_chat(chat_id: &str) -> anyhow::Result<i64> {

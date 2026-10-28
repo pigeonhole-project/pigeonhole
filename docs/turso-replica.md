@@ -196,7 +196,8 @@ Each step ends with `cargo test --workspace` and
    pages to a file and open it in Turso and in `sqlite3`.
 2. **Library plumbing**: move `open_log` / `open_snapshots` and the chat
    adapters from the binary into the `pigeonhole` library crate.
-3. **Crate `pigeonhole-turso`** over `MemoryLogStore` / `MemorySnapshotStore`:
+3. **Crate `pigeonhole-turso`** over `ChainLogStore` / `BlobSnapshotStore` on
+   `MemoryBlobStore`:
    ship, checkpoint bound, snapshot + rebase, restore, sidecar. Tests: a
    random SQL workload with crashes at random points (restore equals a
    reference database: same `SELECT` results, `integrity_check` ok); two

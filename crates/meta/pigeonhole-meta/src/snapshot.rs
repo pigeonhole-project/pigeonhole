@@ -9,7 +9,6 @@
 //!
 //! [`LogStore::rebase`]: crate::LogStore::rebase
 
-use crate::log::channel::{ChannelApi, ChannelMsg, PAGE};
 use crate::{LogId, Position};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -234,76 +233,6 @@ impl<C: Chain> SnapshotStore for BlobSnapshotStore<C> {
     }
 }
 
-/// Snapshots as documents in a channel read by id (no order, no fence: a
-/// snapshot counts only while the log's base names it). The ref is the
-/// message id and the document's crc, so a replaced message is detected.
-pub struct ChannelSnapshotStore<C> {
-    chat: Arc<C>,
-}
-
-const SNAPSHOT_PROBE: &str = "snapshot-probe.bin";
-
-impl<C: ChannelApi> ChannelSnapshotStore<C> {
-    pub fn new(chat: Arc<C>) -> Self {
-        Self { chat }
-    }
-
-    fn parse(r: &SnapshotRef) -> Result<(i64, u32)> {
-        let bad = || anyhow!("{:?} is not a channel snapshot", r.0);
-        let (id, crc) = r.0.split_once(':').ok_or_else(bad)?;
-        Ok((id.parse().map_err(|_| bad())?, u32::from_str_radix(crc, 16).map_err(|_| bad())?))
-    }
-
-    fn is_snapshot(msg: &ChannelMsg) -> bool {
-        matches!(msg, ChannelMsg::Doc { name } if name.starts_with("snapshot-") && name.ends_with(".snap"))
-    }
-}
-
-#[async_trait]
-impl<C: ChannelApi> SnapshotStore for ChannelSnapshotStore<C> {
-    async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
-        let data = snapshot.encode();
-        let crc = crc32fast::hash(&data);
-        let name = format!("snapshot-{}-{}.snap", snapshot.log_id, snapshot.at);
-        let id = self.chat.send_document(&name, data).await?;
-        Ok(SnapshotRef(format!("{id}:{crc:08x}")))
-    }
-
-    async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
-        let (id, crc) = Self::parse(r)?;
-        let data = self.chat.download(id).await.with_context(|| format!("download snapshot {id}"))?;
-        if crc32fast::hash(&data) != crc {
-            bail!("snapshot message {id} changed");
-        }
-        StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {id}"))
-    }
-
-    /// The highest message that is a snapshot. The top of the channel is
-    /// only learnt by posting: a probe, deleted again.
-    async fn newest(&self) -> Result<Option<StoredSnapshot>> {
-        let probe = self.chat.send_document(SNAPSHOT_PROBE, vec![0]).await?;
-        let _ = self.chat.delete(&[probe]).await;
-        let mut hi = probe - 1;
-        while hi >= 1 {
-            let lo = (hi - PAGE as i64 + 1).max(1);
-            let ids: Vec<i64> = (lo..=hi).collect();
-            let msgs = self.chat.get_messages(&ids).await?;
-            for (id, msg) in ids.iter().zip(msgs).rev() {
-                if Self::is_snapshot(&msg) {
-                    let data = self.chat.download(*id).await.with_context(|| format!("download snapshot {id}"))?;
-                    return Ok(Some(StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {id}"))?));
-                }
-            }
-            hi = lo - 1;
-        }
-        Ok(None)
-    }
-
-    async fn remove(&self, r: &SnapshotRef) -> Result<()> {
-        self.chat.delete(&[Self::parse(r)?.0]).await
-    }
-}
-
 /// Contract every [`SnapshotStore`] passes; `open` returns a new handle onto
 /// the same (initially empty) store each call.
 #[cfg(any(test, feature = "testsuite"))]
@@ -346,7 +275,6 @@ pub mod conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log::channel::fake::FakeChannel;
 
     #[tokio::test]
     async fn local_store_passes_the_conformance_suite() {
@@ -378,30 +306,6 @@ mod tests {
         let forged = BlobSnapshotStore::<MemoryBlobStore>::reference(&id, crc ^ 1);
         assert!(format!("{:#}", store.get(&forged).await.unwrap_err()).contains("changed"));
         assert!(store.get(&SnapshotRef("zz:1".into())).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn channel_store_passes_the_conformance_suite() {
-        let chat = Arc::new(FakeChannel::default());
-        conformance::run_all(|| {
-            let chat = chat.clone();
-            async move { Arc::new(ChannelSnapshotStore::new(chat)) as Arc<dyn SnapshotStore> }
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn the_channel_store_skips_other_messages_and_detects_a_replaced_one() {
-        let chat = Arc::new(FakeChannel::default());
-        let store = ChannelSnapshotStore::new(chat.clone());
-        let snap = StoredSnapshot { log_id: LogId(1), at: 1, data: vec![1] };
-        let r = store.put(&snap).await.unwrap();
-        chat.post_text();
-        chat.post_document("photo.jpg", b"x");
-        assert_eq!(store.newest().await.unwrap(), Some(snap));
-        chat.edit(ChannelSnapshotStore::<FakeChannel>::parse(&r).unwrap().0);
-        assert!(format!("{:#}", store.get(&r).await.unwrap_err()).contains("changed"));
-        assert!(store.get(&SnapshotRef("12 x".into())).await.is_err());
     }
 
     #[tokio::test]

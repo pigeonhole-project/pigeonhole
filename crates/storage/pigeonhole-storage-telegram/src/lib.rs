@@ -8,12 +8,14 @@
 //! in exact windows. Only channels and supergroups: their message ids are
 //! per chat.
 
+mod chain;
 mod channel;
 mod client;
 pub mod fake;
 mod session;
 mod store;
 
+pub use chain::ChainOptions;
 pub use channel::{windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, WINDOW};
 pub use client::{bot_id_of, channel_id_of, Lane, MtprotoChannel, MtprotoConfig, TelegramMtproto, CALL_BUDGET};
 pub use pigeonhole_blob::BlobBackend;
