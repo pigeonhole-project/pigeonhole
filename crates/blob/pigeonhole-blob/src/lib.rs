@@ -1,7 +1,6 @@
-//! Pluggable blob storage and bootstrap pin abstraction.
+//! Pluggable blob storage.
 
 mod backend;
-mod bootstrap;
 pub mod cache;
 pub mod erase;
 pub mod upload_pins;
@@ -11,7 +10,6 @@ pub mod rate_limit;
 pub mod replicated;
 pub mod typed;
 pub use backend::{bytes_stream, collect_stream, slice_range, BoxByteStream};
-pub use bootstrap::{BootstrapPointer, PinnedContent};
 pub use cache::CacheConfig;
 pub use erase::{erase, erase_sweep, DynBlobBackend, DynSweep, Erased, ErasedSweep, SharedBackend};
 pub use upload_pins::{UploadPin, UploadPins};
@@ -30,7 +28,7 @@ pub use replicated::{
 };
 pub use typed::{
     load_id, store_id, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
-    BlobId, BlobLocator, Sweepable, BlobBackend, TypedBootstrapPointer,
+    BlobId, BlobLocator, Sweepable, BlobBackend,
 };
 pub use pigeonhole_types::{
     BackendId, BackendLimits, BlobKey, ByteRange, DeleteOutcome, RangeSupport,

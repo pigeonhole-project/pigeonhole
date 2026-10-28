@@ -4,9 +4,9 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    bytes_stream, slice_range, BootstrapPointer, BoxByteStream, ChatLimiter, CostHint,
-    DeleteOutcome, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey, PinnedContent,
-    BlobBackend, BlobId, Sweepable, TypedBootstrapPointer,
+    bytes_stream, slice_range, BoxByteStream, ChatLimiter, CostHint,
+    DeleteOutcome, InstanceInfo, InstanceKind, InstanceRole, OpKind, 
+    BlobBackend, BlobId, Sweepable, 
 };
 use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,6 @@ pub fn discord_location(channel_id: &str) -> String {
     format!("dc:channel:{channel_id}")
 }
 
-const DC_TEXT_MAX: usize = 2000;
 
 /// Production adapter: blobs live as message attachments in one Discord channel.
 pub struct DiscordBlobStore {
@@ -354,103 +353,7 @@ impl Sweepable for DiscordBlobStore {
 }
 
 
-#[async_trait]
-impl BootstrapPointer for DiscordBlobStore {
-    fn scope_id(&self) -> &str {
-        &self.channel_id
-    }
 
-    async fn get_pinned(&self) -> Result<Option<PinnedContent>> {
-        self.dc
-            .get_pinned_content(&self.channel_id, Some(self.limiter.as_ref()))
-            .await
-    }
-
-    async fn send_text(&self, text: &str) -> Result<i64> {
-        self.dc
-            .send_text(&self.channel_id, text, Some(self.limiter.as_ref()))
-            .await
-    }
-
-    async fn pin_message(&self, message_id: i64) -> Result<()> {
-        self.dc
-            .pin_message(&self.channel_id, message_id, Some(self.limiter.as_ref()))
-            .await
-    }
-
-    async fn unpin_message(&self, message_id: i64) -> Result<()> {
-        self.dc
-            .unpin_message(&self.channel_id, message_id, Some(self.limiter.as_ref()))
-            .await
-    }
-}
-
-#[async_trait]
-impl TypedBootstrapPointer for DiscordBlobStore {
-    async fn read(&self) -> Result<Option<Bytes>> {
-        match BootstrapPointer::get_pinned(self).await? {
-            None => Ok(None),
-            Some(PinnedContent::Text { text, .. }) => Ok(Some(Bytes::from(text))),
-            Some(PinnedContent::Document {
-                message_id,
-                document_ref,
-            }) => {
-                let data = self
-                    .dc
-                    .download_bytes(
-                        &self.channel_id,
-                        message_id,
-                        &document_ref,
-                        Some(self.limiter.as_ref()),
-                    )
-                    .await?;
-                Ok(Some(data))
-            }
-        }
-    }
-
-    async fn pin_key(&self) -> Result<Option<Vec<u8>>> {
-        match BootstrapPointer::get_pinned(self).await? {
-            Some(PinnedContent::Text { message_id, .. })
-            | Some(PinnedContent::Document { message_id, .. }) => {
-                Ok(Some((message_id as u64).to_bytes()))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn swap(&self, new: Bytes) -> Result<()> {
-        let old = BootstrapPointer::get_pinned(self).await?;
-        let new_mid = if new.len() <= DC_TEXT_MAX {
-            let text = std::str::from_utf8(&new)
-                .map_err(|_| anyhow::anyhow!("bootstrap pin payload is not valid UTF-8"))?;
-            BootstrapPointer::send_text(self, text).await?
-        } else {
-            let (message_id, _attachment_id, _url) = self
-                .dc
-                .send_attachment(
-                    &self.channel_id,
-                    new,
-                    "superblock.bin",
-                    "pigeonhole-superblock",
-                    Some(self.limiter.as_ref()),
-                )
-                .await?;
-            message_id
-        };
-        BootstrapPointer::pin_message(self, new_mid).await?;
-        if let Some(prev) = old {
-            let old_id = match prev {
-                PinnedContent::Text { message_id, .. }
-                | PinnedContent::Document { message_id, .. } => message_id,
-            };
-            if old_id != new_mid {
-                let _ = BootstrapPointer::unpin_message(self, old_id).await;
-            }
-        }
-        Ok(())
-    }
-}
 
 impl DiscordBlobStore {
     /// List channel messages (Discord supports cursor pagination via `before` / `after`).

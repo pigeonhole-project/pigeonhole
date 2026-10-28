@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use moka::future::Cache as MokaCache;
 use reqwest::multipart::{Form, Part};
-use pigeonhole_blob::{ChatLimiter, DeleteOutcome, PinnedContent};
+use pigeonhole_blob::{ChatLimiter, DeleteOutcome};
 use serde::Deserialize;
 use std::time::Duration;
 use tracing::debug;
@@ -670,26 +670,6 @@ impl TelegramClient {
         body.result.ok_or_else(|| anyhow!("getChat missing result"))
     }
 
-    /// Latest pinned message content, if any.
-    pub async fn get_pinned_content(&self, chat_id: &str) -> Result<Option<PinnedContent>> {
-        let chat = self.get_chat(chat_id).await?;
-        let Some(msg) = chat.pinned_message else {
-            return Ok(None);
-        };
-        if let Some(text) = msg.text.filter(|t| !t.is_empty()) {
-            return Ok(Some(PinnedContent::Text {
-                message_id: msg.message_id,
-                text,
-            }));
-        }
-        if let Some(doc) = msg.document {
-            return Ok(Some(PinnedContent::Document {
-                message_id: msg.message_id,
-                document_ref: doc.file_id,
-            }));
-        }
-        Ok(None)
-    }
 
     /// Send a plain text message; returns `message_id`. Uses the **send** budget.
     pub async fn send_message(
@@ -837,7 +817,7 @@ impl TelegramClient {
             .ok_or_else(|| anyhow!("getChatMember missing result"))
     }
 
-    /// Fail fast unless the bot can administer `chat_id` and pin the bootstrap manifest.
+    /// Fail fast unless the bot can administer `chat_id` and pin (log / snapshot chats).
     ///
     /// Channels need `can_edit_messages` (pin is implemented as edit). Groups/supergroups
     /// need `can_pin_messages`. Explicit `false` fails; omitted fields are treated as ok
@@ -866,7 +846,7 @@ impl TelegramClient {
                         if member.can_edit_messages == Some(false) {
                             bail!(
                                 "bot is admin in channel {chat_id} but can_edit_messages=false; \
-                                 enable Edit messages (required to pin the snapshot manifest)"
+                                 enable Edit messages (needed to pin in log / snapshot channels)"
                             );
                         }
                     }
@@ -874,7 +854,7 @@ impl TelegramClient {
                         if member.can_pin_messages == Some(false) {
                             bail!(
                                 "bot is admin in {chat_id} but can_pin_messages=false; \
-                                 enable Pin messages for snapshot bootstrap"
+                                 enable Pin messages (needed by log / snapshot chats)"
                             );
                         }
                     }

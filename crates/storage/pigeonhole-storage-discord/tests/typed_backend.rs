@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use pigeonhole_blob::{
     collect_stream, ChatLimiter, ChatLimiterConfig, CostHint, OpKind, Sweepable, BlobBackend,
-    TypedBootstrapPointer,
 };
 use pigeonhole_storage_discord::{
     discord_fingerprint, discord_location, snowflake_timestamp_ms, DiscordBlobStore, DiscordClient,
@@ -473,130 +472,6 @@ async fn typed_old_messages_delete_one_by_one() {
     );
     let deleted = state.deleted.lock().unwrap().clone();
     assert!(deleted.contains(&old_a) && deleted.contains(&old_b));
-}
-
-#[tokio::test]
-async fn typed_bootstrap_pin_swap_read() {
-    let server = MockServer::start().await;
-    let api_base = format!("{}/api/v10", server.uri());
-    let state = Arc::new(MockState {
-        next_msg: AtomicU64::new(snowflake_age_secs_ago(10)),
-        blobs: Mutex::new(HashMap::new()),
-        messages: Mutex::new(Vec::new()),
-        message_text: Mutex::new(HashMap::new()),
-        deleted: Mutex::new(Vec::new()),
-        bulk_calls: Mutex::new(Vec::new()),
-        pins: Mutex::new(Vec::new()),
-    });
-
-    // Override pin PUT to store real content from the last sent text message.
-    let sent_text: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    let st = state.clone();
-    let texts = sent_text.clone();
-    Mock::given(method("POST"))
-        .and(path_regex(r"/api/v10/channels/.+/messages$"))
-        .respond_with(move |req: &Request| {
-            let ct = req
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if ct.starts_with("application/json") {
-                let mid = st.next_msg.fetch_add(1, Ordering::SeqCst);
-                let body: serde_json::Value =
-                    serde_json::from_slice(&req.body).unwrap_or(serde_json::json!({}));
-                let content = body
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                texts.lock().unwrap().insert(mid.to_string(), content.clone());
-                st.messages.lock().unwrap().push(mid);
-                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "id": mid.to_string(),
-                    "content": content,
-                    "attachments": []
-                }));
-            }
-            ResponseTemplate::new(400)
-        })
-        .mount(&server)
-        .await;
-
-    let st = state.clone();
-    let texts = sent_text.clone();
-    Mock::given(method("PUT"))
-        .and(path_regex(r"/api/v10/channels/.+/pins/[0-9]+$"))
-        .respond_with(move |req: &Request| {
-            let mid = req
-                .url
-                .path()
-                .rsplit('/')
-                .next()
-                .unwrap_or("0")
-                .to_string();
-            let content = texts
-                .lock()
-                .unwrap()
-                .get(&mid)
-                .cloned()
-                .unwrap_or_default();
-            let mut pins = st.pins.lock().unwrap();
-            pins.clear();
-            pins.push(serde_json::json!({
-                "id": mid,
-                "content": content,
-                "attachments": []
-            }));
-            ResponseTemplate::new(204)
-        })
-        .mount(&server)
-        .await;
-
-    let st = state.clone();
-    Mock::given(method("GET"))
-        .and(path_regex(r"/api/v10/channels/.+/pins$"))
-        .respond_with(move |_req: &Request| {
-            ResponseTemplate::new(200).set_body_json(st.pins.lock().unwrap().clone())
-        })
-        .mount(&server)
-        .await;
-
-    let st = state.clone();
-    Mock::given(method("DELETE"))
-        .and(path_regex(r"/api/v10/channels/.+/pins/[0-9]+$"))
-        .respond_with(move |req: &Request| {
-            let mid = req.url.path().rsplit('/').next().unwrap_or("");
-            st.pins
-                .lock()
-                .unwrap()
-                .retain(|p| p.get("id").and_then(|i| i.as_str()) != Some(mid));
-            ResponseTemplate::new(204)
-        })
-        .mount(&server)
-        .await;
-
-    let dc = DiscordClient::with_api_base(TOKEN.into(), api_base).unwrap();
-    let store = DiscordBlobStore::new(dc, CHANNEL.into(), fast_limiter(), None);
-
-    assert!(TypedBootstrapPointer::read(&store).await.unwrap().is_none());
-
-    let payload = Bytes::from_static(br#"{"format":1,"generation":7}"#);
-    TypedBootstrapPointer::swap(&store, payload.clone())
-        .await
-        .unwrap();
-    let got = TypedBootstrapPointer::read(&store).await.unwrap().unwrap();
-    assert_eq!(got, payload);
-
-    let payload2 = Bytes::from_static(br#"{"format":1,"generation":8}"#);
-    TypedBootstrapPointer::swap(&store, payload2.clone())
-        .await
-        .unwrap();
-    let got2 = TypedBootstrapPointer::read(&store).await.unwrap().unwrap();
-    assert_eq!(got2, payload2);
-    // Only one pin remains.
-    assert_eq!(state.pins.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

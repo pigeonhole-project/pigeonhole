@@ -3,16 +3,16 @@
 use anyhow::Result;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    collect_stream, BlobBackend, BlobId, Sweepable, TypedBootstrapPointer,
+    collect_stream, BlobBackend, BlobId, Sweepable,
 };
 
-/// Shared suite for [`BlobBackend`] + [`Sweepable`] + [`TypedBootstrapPointer`].
+/// Shared suite for [`BlobBackend`] + [`Sweepable`].
 ///
 /// Covers: put/get/range/delete, repeat delete, empty rejected, near-`max_blob_size`
-/// blob, monotonic keys, candidates covering written keys, pin swap/read.
+/// blob, monotonic keys, candidates covering written keys.
 pub async fn run_typed_conformance<B>(backend: &B) -> Result<()>
 where
-    B: BlobBackend + Sweepable + TypedBootstrapPointer,
+    B: BlobBackend + Sweepable,
 {
     // empty rejected
     assert!(
@@ -82,22 +82,6 @@ where
     backend.delete(&[del_key]).await?;
     assert!(backend.get(&id, None).await.is_err());
     backend.delete(&[del_key]).await?;
-
-    // Bootstrap pin swap / read.
-    let pin1 = Bytes::from_static(br#"{"gen":1,"typed":true}"#);
-    backend.swap(pin1.clone()).await?;
-    let got_pin = backend
-        .read()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("expected pin after swap"))?;
-    assert_eq!(got_pin, pin1);
-    let pin2 = Bytes::from_static(br#"{"gen":2}"#);
-    backend.swap(pin2.clone()).await?;
-    let got_pin2 = backend
-        .read()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("expected pin after second swap"))?;
-    assert_eq!(got_pin2, pin2);
 
     // Cleanup remaining blobs (best-effort).
     let rest: Vec<_> = ids.iter().skip(1).map(B::key).collect();

@@ -3,16 +3,13 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    bytes_stream, slice_range, BootstrapPointer, BoxByteStream, ChatLimiter, CostHint,
-    InstanceInfo, InstanceKind, InstanceRole, LimitBudget, OpKind, OrderedKey, PinnedContent,
-    Sweepable, BlobBackend, TypedBootstrapPointer,
+    bytes_stream, slice_range, BoxByteStream, ChatLimiter, CostHint,
+    InstanceInfo, InstanceKind, InstanceRole, LimitBudget, OpKind, 
+    Sweepable, BlobBackend, 
 };
 use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-/// Telegram text message size limit (Bot API).
-const TG_TEXT_MAX: usize = 4096;
 
 /// Typed identity for the Telegram backend (stage B.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,103 +228,4 @@ impl Sweepable for TelegramBlobStore {
 }
 
 
-#[async_trait]
-impl BootstrapPointer for TelegramBlobStore {
-    fn scope_id(&self) -> &str {
-        &self.chat_id
-    }
 
-    async fn get_pinned(&self) -> Result<Option<PinnedContent>> {
-        self.tg.get_pinned_content(&self.chat_id).await
-    }
-
-    async fn send_text(&self, text: &str) -> Result<i64> {
-        self.tg
-            .send_message(&self.chat_id, text, Some(self.limiter.as_ref()))
-            .await
-    }
-
-    async fn pin_message(&self, message_id: i64) -> Result<()> {
-        self.tg
-            .pin_chat_message(&self.chat_id, message_id, Some(self.limiter.as_ref()))
-            .await
-    }
-
-    async fn unpin_message(&self, message_id: i64) -> Result<()> {
-        self.tg
-            .unpin_chat_message(&self.chat_id, message_id, Some(self.limiter.as_ref()))
-            .await
-    }
-}
-
-#[async_trait]
-impl TypedBootstrapPointer for TelegramBlobStore {
-    async fn read(&self) -> Result<Option<Bytes>> {
-        match self.tg.get_pinned_content(&self.chat_id).await? {
-            None => Ok(None),
-            Some(PinnedContent::Text { text, .. }) => Ok(Some(Bytes::from(text))),
-            Some(PinnedContent::Document { document_ref, .. }) => {
-                let data = self
-                    .tg
-                    .download_file(&document_ref, Some(self.limiter.as_ref()))
-                    .await?;
-                Ok(Some(data))
-            }
-        }
-    }
-
-    async fn pin_key(&self) -> Result<Option<Vec<u8>>> {
-        match self.tg.get_pinned_content(&self.chat_id).await? {
-            Some(PinnedContent::Text { message_id, .. })
-            | Some(PinnedContent::Document { message_id, .. }) => {
-                Ok(Some(message_id.to_bytes()))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn swap(&self, new: Bytes) -> Result<()> {
-        let old_id = match self.tg.get_pinned_content(&self.chat_id).await? {
-            Some(PinnedContent::Text { message_id, .. })
-            | Some(PinnedContent::Document { message_id, .. }) => Some(message_id),
-            None => None,
-        };
-
-        let new_id = if new.len() <= TG_TEXT_MAX {
-            let text = std::str::from_utf8(&new).map_err(|e| {
-                anyhow::anyhow!(
-                    "bootstrap pin must be valid UTF-8 when ≤ {TG_TEXT_MAX} bytes: {e}"
-                )
-            })?;
-            self.tg
-                .send_message(&self.chat_id, text, Some(self.limiter.as_ref()))
-                .await?
-        } else {
-            let (_fid, mid) = self
-                .tg
-                .send_document(
-                    &self.chat_id,
-                    new,
-                    "superblock.bin",
-                    "",
-                    Some(self.limiter.as_ref()),
-                )
-                .await?;
-            mid
-        };
-
-        self.tg
-            .pin_chat_message(&self.chat_id, new_id, Some(self.limiter.as_ref()))
-            .await?;
-
-        if let Some(old) = old_id {
-            if old != new_id {
-                let _ = self
-                    .tg
-                    .unpin_chat_message(&self.chat_id, old, Some(self.limiter.as_ref()))
-                    .await;
-            }
-        }
-        Ok(())
-    }
-}

@@ -193,20 +193,7 @@ pub trait Sweepable: BlobBackend {
     ) -> Result<Vec<Self::Key>>;
 }
 
-/// Bootstrap pin as opaque bytes (superblock JSON).
-#[async_trait]
-pub trait TypedBootstrapPointer: Send + Sync {
-    async fn read(&self) -> Result<Option<Bytes>>;
-    async fn swap(&self, new: Bytes) -> Result<()>;
-    /// Sort key of the pinned bootstrap message in this instance's key space.
-    ///
-    /// Memory pins that are not real backend messages return `None`.
-    async fn pin_key(&self) -> Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-}
-
-/// Share one backend instance as both [`SharedBackend`](crate::SharedBackend) member and pin.
+/// Share one backend instance between several owners.
 #[async_trait]
 impl<B: BlobBackend> BlobBackend for std::sync::Arc<B> {
     type Id = B::Id;
@@ -247,18 +234,6 @@ impl<B: Sweepable> Sweepable for std::sync::Arc<B> {
     }
 }
 
-#[async_trait]
-impl<B: TypedBootstrapPointer + ?Sized> TypedBootstrapPointer for std::sync::Arc<B> {
-    async fn read(&self) -> Result<Option<Bytes>> {
-        (**self).read().await
-    }
-    async fn swap(&self, new: Bytes) -> Result<()> {
-        (**self).swap(new).await
-    }
-    async fn pin_key(&self) -> Result<Option<Vec<u8>>> {
-        (**self).pin_key().await
-    }
-}
 
 /// Encode a typed id into [`BlobLocator`].
 pub fn store_id<B: BlobBackend>(id: &B::Id) -> Result<BlobLocator> {

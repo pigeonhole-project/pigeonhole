@@ -36,7 +36,7 @@ pub use sweep::{
     SweepConfig, SweepStats, Sweeper, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE,
 };
 pub use pigeonhole_blob::{
-    collect_stream, BootstrapPointer, BoxByteStream, DeleteOutcome, PinnedContent, UploadPin,
+    collect_stream, BoxByteStream, DeleteOutcome, UploadPin,
     UploadPins,
 };
 pub use pigeonhole_codec::{ByteBudget, ChunkCodec, BlockRecord};

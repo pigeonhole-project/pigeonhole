@@ -1,9 +1,9 @@
-//! Wiremock tests for BlobBackend / Sweepable / TypedBootstrapPointer (no network).
+//! Wiremock tests for BlobBackend / Sweepable (no network).
 
 use bytes::Bytes;
 use pigeonhole_blob::{
     collect_stream, ChatLimiter, ChatLimiterConfig, LimitBudget, OpKind, Sweepable,
-    BlobBackend, TypedBootstrapPointer,
+    BlobBackend,
 };
 use pigeonhole_storage_telegram::{TelegramBlobStore, TelegramClient, DELETE_MESSAGES_MAX};
 use pigeonhole_testkit::run_typed_conformance;
@@ -350,19 +350,6 @@ async fn cost_get_zero_when_file_path_cached() {
     assert!(store.limiter().peek_wait(LimitBudget::GetFile) > std::time::Duration::ZERO);
     let hint2 = BlobBackend::cost(&store, OpKind::Get, Some(&id));
     assert_eq!(hint2.wait_secs, 0.0);
-}
-
-#[tokio::test]
-async fn typed_bootstrap_pin_swap_and_read() {
-    let server = MockServer::start().await;
-    let (store, _) = make_store(&server).await;
-
-    assert!(TypedBootstrapPointer::read(&store).await.unwrap().is_none());
-    TypedBootstrapPointer::swap(&store, Bytes::from_static(br#"{"gen":1}"#))
-        .await
-        .unwrap();
-    let raw = TypedBootstrapPointer::read(&store).await.unwrap().unwrap();
-    assert_eq!(raw.as_ref(), br#"{"gen":1}"#);
 }
 
 #[tokio::test]

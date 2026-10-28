@@ -3,7 +3,7 @@ use bytes::Bytes;
 use moka::future::Cache as MokaCache;
 use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::multipart::{Form, Part};
-use pigeonhole_blob::{ChatLimiter, DeleteOutcome, PinnedContent};
+use pigeonhole_blob::{ChatLimiter, DeleteOutcome};
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -777,29 +777,6 @@ impl DiscordClient {
         Ok(msgs)
     }
 
-    pub async fn get_pinned_content(
-        &self,
-        channel_id: &str,
-        limiter: Option<&ChatLimiter>,
-    ) -> Result<Option<PinnedContent>> {
-        let pins = self.get_pinned_messages(channel_id, limiter).await?;
-        let Some(msg) = pins.into_iter().next() else {
-            return Ok(None);
-        };
-        if let Some(text) = msg.content.filter(|t| !t.is_empty()) {
-            return Ok(Some(PinnedContent::Text {
-                message_id: msg.id.as_i64(),
-                text,
-            }));
-        }
-        if let Some(att) = msg.attachments.into_iter().next() {
-            return Ok(Some(PinnedContent::Document {
-                message_id: msg.id.as_i64(),
-                document_ref: att.id.to_string(),
-            }));
-        }
-        Ok(None)
-    }
 
     /// List channel messages (`before` / `after` snowflakes, max 100).
     pub async fn list_messages(
