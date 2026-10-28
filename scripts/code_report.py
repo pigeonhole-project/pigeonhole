@@ -304,45 +304,69 @@ def trait_graph(crates: list[Crate]) -> TraitGraph:
     return g
 
 
-def mermaid_id(kind: str, k: tuple[str, str]) -> str:
-    crate = k[0].removeprefix("pigeonhole_") if k[0] != "pigeonhole" else "bin"
-    return re.sub(r"\W", "_", f"{crate}_{k[1]}") + ("_t" if kind == "trait" else "")
-
-
-def mermaid_label(s: str) -> str:
-    # Mermaid labels take neither raw `<>` nor HTML entities reliably.
-    return s.replace("<", "‹").replace(">", "›").replace('"', "'")
+def short_crate(crate: str) -> str:
+    return "bin" if crate == "pigeonhole" else crate.removeprefix("pigeonhole_").removeprefix("storage_")
 
 
 def render_traits(g: TraitGraph) -> list[str]:
-    nodes: dict[str, list[str]] = defaultdict(list)
-    annotations = []
-    for k in sorted(g.traits):
-        nodes[k[0]].append(f'    class {mermaid_id("trait", k)}["{mermaid_label(k[1])}"]')
-        annotations.append(f"  <<trait>> {mermaid_id('trait', k)}")
-    for k in sorted(g.types):
-        nodes[k[0]].append(f'    class {mermaid_id("type", k)}["{mermaid_label(k[1])}"]')
+    """One Mermaid block per family (connected component), plain syntax only:
+    no namespaces or labels, which many renderers get wrong."""
+    nodes = g.traits | g.types
+    base = lambda k: k[1].split("<")[0]
+    clash = defaultdict(int)
+    for k in nodes:
+        clash[base(k)] += 1
+    ident = {k: (f"{short_crate(k[0])}_{base(k)}" if clash[base(k)] > 1 else base(k)) for k in nodes}
 
-    out = ["```mermaid", "classDiagram", "  direction LR"]
-    for ns in sorted(nodes):
-        out.append(f"  namespace {ns} {{")
-        out += nodes[ns]
-        out.append("  }")
-    out += annotations
-    for sup, sub in sorted(g.supers):
-        out.append(f"  {mermaid_id('trait', sup)} <|-- {mermaid_id('trait', sub)}")
+    edges = [(sup, sub, False) for sup, sub in g.supers]
     supers_of: dict[tuple[str, str], set] = defaultdict(set)
     for sup, sub in g.supers:
         supers_of[sub].add(sup)
     implemented = defaultdict(set)
     for ty, tr, _ in g.impls:
         implemented[ty].add(tr)
-    for ty, tr, blanket in sorted(g.impls):
+    for ty, tr, _ in g.impls:
         # `T: Sub` already says `T: Super`; skip the redundant arrow.
-        if any(tr in supers_of[other] for other in implemented[ty]):
+        if not any(tr in supers_of[other] for other in implemented[ty]):
+            edges.append((tr, ty, True))
+
+    # Union-find over edges → families.
+    parent = {k: k for k in nodes}
+
+    def find(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    for a, b, _ in edges:
+        parent[find(a)] = find(b)
+    families: dict = defaultdict(set)
+    for k in nodes:
+        families[find(k)].add(k)
+
+    out, lonely = [], []
+    for fam in sorted(families.values(), key=lambda f: (-len(f), sorted(ident[k] for k in f))):
+        if len(fam) == 1:
+            (k,) = fam
+            lonely.append(f"`{ident[k]}` ({short_crate(k[0])})")
             continue
-        out.append(f"  {mermaid_id('trait', tr)} <|.. {mermaid_id('type', ty)}" + (" : blanket" if blanket else ""))
-    out.append("```")
+        roots = sorted(ident[k] for k in fam if k in g.traits and not supers_of[k])
+        crates = sorted({short_crate(k[0]) for k in fam})
+        out += [f"### {', '.join(roots)}", "", f"Crates: {', '.join(crates)}.", "", "```mermaid", "classDiagram"]
+        for k in sorted(fam, key=lambda k: (k not in g.traits, ident[k])):
+            generic = k[1][len(base(k)):]
+            decl = ident[k] + (f"~{generic[1:-1]}~" if generic else "")
+            if k in g.traits:
+                out.append(f"  class {decl} {{\n    <<trait>>\n  }}")
+            else:
+                out.append(f"  class {decl}")
+        for a, b, impl in sorted(edges, key=lambda e: (ident[e[0]], ident[e[1]])):
+            if a in fam:
+                out.append(f"  {ident[a]} <|{'..' if impl else '--'} {ident[b]}")
+        out += ["```", ""]
+    if lonely:
+        out.append("Traits with no workspace implementors: " + ", ".join(sorted(lonely)) + ".")
     return out
 
 
