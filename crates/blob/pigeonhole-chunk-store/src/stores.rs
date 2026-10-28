@@ -3,8 +3,8 @@
 //! `[chunk] store` refer to them by id.
 
 use crate::instances::{
-    discord_app_id_from_token, discord_fingerprint, discord_location, memory_fingerprint,
-    memory_location, telegram_fingerprint, telegram_location, InstanceConfig,
+    discord_app_id_from_token, discord_fingerprint, discord_location, local_disk_location,
+    memory_fingerprint, memory_location, telegram_fingerprint, telegram_location, InstanceConfig,
 };
 use crate::{PlacementConfig, ShardPlacement};
 use anyhow::{bail, Context, Result};
@@ -58,30 +58,29 @@ pub(crate) struct FileShards {
 /// A resolved `[[store]]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Store {
-    Dir { path: PathBuf },
+    LocalDisk { path: PathBuf },
     Telegram { chat_id: String, bot_token_env: String, bot_token: String },
     Discord { channel_id: String, bot_token_env: String, bot_token: String, max_blob_size: Option<usize> },
     Memory,
 }
 
 impl Store {
-    fn kind(&self) -> &'static str {
-        match self {
-            Store::Dir { .. } => "dir",
-            Store::Telegram { .. } => "telegram",
-            Store::Discord { .. } => "discord",
-            Store::Memory => "memory",
-        }
-    }
-
-    /// A chat / channel: one purpose only (the log and snapshots use its pin,
-    /// the blob sweeper deletes everything in it).
-    fn exclusive_location(&self) -> Option<String> {
+    /// Where it lives, if two stores could name the same place.
+    fn location(&self) -> Option<String> {
         match self {
             Store::Telegram { chat_id, .. } => Some(telegram_location(chat_id)),
             Store::Discord { channel_id, .. } => Some(discord_location(channel_id)),
-            Store::Dir { .. } | Store::Memory => None,
+            Store::LocalDisk { path } => Some(local_disk_location(path)),
+            Store::Memory => None,
         }
+    }
+
+    /// One store may serve both `a` and `b`: only the log and the snapshots,
+    /// and only in a directory or memory (a chat's pinned message serves one;
+    /// the blob sweeper deletes everything it does not know in a blob store).
+    fn may_share(&self, a: &str, b: &str) -> bool {
+        let meta = |p: &str| p == "[meta] log" || p == "[meta] snapshot";
+        a == b || (meta(a) && meta(b) && matches!(self, Store::LocalDisk { .. } | Store::Memory))
     }
 }
 
@@ -115,12 +114,12 @@ impl Topology {
                 Ok(())
             };
             let store = match f.kind.as_str() {
-                "dir" => {
+                "local_disk" => {
                     refuse("chat_id", f.chat_id.is_some())?;
                     refuse("channel_id", f.channel_id.is_some())?;
                     refuse("bot_token_env", f.bot_token_env.is_some())?;
                     refuse("max_blob_size", f.max_blob_size.is_some())?;
-                    Store::Dir { path: f.path.with_context(|| format!("[[store]] {id}: dir needs path"))? }
+                    Store::LocalDisk { path: f.path.with_context(|| format!("[[store]] {id}: local_disk needs path"))? }
                 }
                 "telegram" => {
                     refuse("path", f.path.is_some())?;
@@ -150,11 +149,11 @@ impl Topology {
                     refuse("max_blob_size", f.max_blob_size.is_some())?;
                     Store::Memory
                 }
-                other => bail!("[[store]] {id}: unknown kind {other:?}; expected dir | telegram | discord | memory"),
+                other => bail!("[[store]] {id}: unknown kind {other:?}; expected local_disk | memory | telegram | discord"),
             };
-            if let Some(loc) = store.exclusive_location() {
+            if let Some(loc) = store.location() {
                 if let Some(prev) = locations.insert(loc.clone(), id.clone()) {
-                    bail!("[[store]] {prev:?} and {id:?} are the same chat ({loc})");
+                    bail!("[[store]] {prev:?} and {id:?} are the same place ({loc})");
                 }
             }
             if by_id.insert(id.clone(), store).is_some() {
@@ -208,7 +207,7 @@ impl Topology {
         })
     }
 
-    /// Take store `id` for `purpose`; a chat can serve one purpose only.
+    /// Take store `id` for `purpose` (see [`Store::may_share`]).
     fn take(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
         let store = self.stores.get(id).cloned().with_context(|| {
             if self.replicas.contains_key(id) || self.shards.contains_key(id) {
@@ -218,22 +217,24 @@ impl Topology {
             }
         })?;
         if let Some(prev) = self.used.insert(id.to_string(), purpose) {
-            if prev != purpose && store.exclusive_location().is_some() {
+            if !store.may_share(prev, purpose) {
                 bail!(
-                    "[[store]] {id} is used for both {prev} and {purpose}: a chat serves one purpose \
-                     (the log and snapshots use its pinned message, the blob sweeper deletes \
-                     everything in a blob chat)"
+                    "[[store]] {id} is used for both {prev} and {purpose}: a store serves one purpose \
+                     (a chat's pinned message serves the log or the snapshots, the blob sweeper \
+                     deletes everything it does not know in a blob store); only a local_disk or \
+                     memory store holds both the log and the snapshots"
                 );
             }
         }
         Ok(store)
     }
 
-    /// A store the metadata log or snapshots live in: `dir` or `telegram`.
+    /// A store the metadata log or snapshots live in: `local_disk`,
+    /// `memory` or `telegram` (`discord` not yet).
     pub(crate) fn meta_store(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
         let store = self.take(id, purpose)?;
-        if !matches!(store, Store::Dir { .. } | Store::Telegram { .. }) {
-            bail!("{purpose} = {id:?}: a {} store cannot hold metadata; use dir or telegram", store.kind());
+        if matches!(store, Store::Discord { .. }) {
+            bail!("{purpose} = {id:?}: a discord store cannot hold metadata yet; use local_disk, memory or telegram");
         }
         Ok(store)
     }
@@ -323,7 +324,15 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
             discord_location(channel_id),
             *max_blob_size,
         ),
-        Store::Dir { .. } => bail!("[chunk] store {id:?}: a dir store cannot hold blobs yet"),
+        Store::LocalDisk { path } => (
+            InstanceKind::LocalDisk,
+            String::new(),
+            String::new(),
+            path.display().to_string(),
+            local_disk_location(path),
+            local_disk_location(path),
+            None,
+        ),
     };
     Ok(InstanceConfig {
         info: InstanceInfo { id: id.to_string(), kind, fingerprint, location, role: InstanceRole::ReadWrite },

@@ -108,6 +108,15 @@ impl BackendLimits {
         }
     }
 
+    /// One file per blob; large enough for any chunk (`MAX_LOGICAL_CHUNK`).
+    pub fn local_disk() -> Self {
+        Self {
+            max_blob_size: 256 * 1024 * 1024,
+            supports_range: RangeSupport::BestEffort,
+            can_list: true,
+        }
+    }
+
     /// Discord attachment upload cap (~10 MiB) with on-wire margin.
     pub fn discord(max_blob_size: Option<usize>) -> Self {
         const DEFAULT: usize = 10 * 1024 * 1024 - 4096;

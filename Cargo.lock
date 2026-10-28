@@ -1658,6 +1658,7 @@ dependencies = [
  "pigeonhole-gateway-s3",
  "pigeonhole-meta",
  "pigeonhole-storage-discord",
+ "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
  "pigeonhole-storage-telegram",
  "pigeonhole-types",
@@ -1829,6 +1830,21 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "pigeonhole-storage-disk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "pigeonhole-blob",
+ "pigeonhole-testkit",
+ "pigeonhole-types",
+ "serde",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

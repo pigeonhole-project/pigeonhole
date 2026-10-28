@@ -8,15 +8,17 @@
 listen_addr = "0.0.0.0:8333"
 region = "us-east-1"
 
-# Stores: where bytes live. kind = dir (path) | telegram (chat_id) | discord
-# (channel_id) | memory. Secrets come from the env var named in bot_token_env
-# (defaults: BOT_TOKEN / DISCORD_BOT_TOKEN), never inline. A chat serves one
-# purpose: the log, snapshots or blobs (the blob sweeper deletes everything in
-# a blob chat; the log and snapshots use the pinned message). A dir may hold
-# both the log and the snapshots.
+# Stores: where bytes live. kind = local_disk (path) | memory | telegram
+# (chat_id) | discord (channel_id). Every kind holds blobs; the log and
+# snapshots go to local_disk, memory (tests: no fsync, gone with the process)
+# or telegram. Secrets come from the env var named in bot_token_env (defaults:
+# BOT_TOKEN / DISCORD_BOT_TOKEN), never inline. A store serves one purpose
+# (the blob sweeper deletes everything it does not know in a blob store; a
+# chat's pinned message serves the log or the snapshots); only a local_disk or
+# memory store holds both the log and the snapshots.
 [[store]]
 id = "meta"
-kind = "dir"
+kind = "local_disk"
 path = "pigeonhole-meta"
 
 # Telegram: the bot must be admin; blob chats need delete rights, the log also
@@ -55,12 +57,13 @@ chat_id = -1001234567890
 # snapshot the log starts from and replays the rest. A second process on the
 # same log fences (stops) the first.
 [meta]
-log = "meta"                  # a dir or telegram store; default: a dir at pigeonhole-meta
-snapshot = "meta"             # default: the log's store if it is a dir
+log = "meta"                  # default: a local_disk at pigeonhole-meta
+snapshot = "meta"             # default: the log's store if it is local_disk / memory
 # A telegram log (a dedicated channel; set batch_max_delay_ms = 1000) needs
-# telegram snapshots in another channel. A dir log with snapshots in a channel
-# or on another disk survives losing the log's disk: `pigeonhole restore
-# --lossy` starts a new log from the newest snapshot.
+# telegram snapshots in another channel; a memory log needs memory snapshots.
+# A local_disk log with snapshots in a channel or on another disk survives
+# losing the log's disk: `pigeonhole restore --lossy` starts a new log from
+# the newest snapshot.
 batch_max_delay_ms = 0        # group commit window; 0 = append when the previous append returns
 # batch_max_entries = 1024
 # log_straggler_window_secs = 90   # telegram log: a claim waits this long for a deposed writer

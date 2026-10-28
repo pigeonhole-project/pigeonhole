@@ -51,6 +51,7 @@ pub enum InstanceKind {
     Telegram,
     Discord,
     Memory,
+    LocalDisk,
 }
 
 impl InstanceKind {
@@ -59,6 +60,7 @@ impl InstanceKind {
             Self::Telegram => "telegram",
             Self::Discord => "discord",
             Self::Memory => "memory",
+            Self::LocalDisk => "local_disk",
         }
     }
 }

@@ -12,7 +12,7 @@ pub struct InstanceConfig {
     pub bot_token_env: String,
     /// Resolved token (from env); empty for memory.
     pub bot_token: String,
-    /// Telegram chat id or Discord channel id (string form).
+    /// Telegram chat id, Discord channel id or local_disk path (string form).
     pub scope_id: String,
     /// Per-message size limit override (Discord); `None` = backend default.
     pub max_blob_size: Option<usize>,
@@ -38,6 +38,11 @@ pub fn discord_fingerprint(app_id: &str, channel_id: &str) -> String {
 
 pub fn discord_location(channel_id: &str) -> String {
     format!("dc:channel:{channel_id}")
+}
+
+/// A directory; also its fingerprint (the place is the identity).
+pub fn local_disk_location(path: &std::path::Path) -> String {
+    format!("disk:{}", path.display())
 }
 
 /// Each memory instance is its own in-process store, so id = identity.

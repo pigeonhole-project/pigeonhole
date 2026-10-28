@@ -1,0 +1,20 @@
+[package]
+name = "pigeonhole-storage-disk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local disk storage backend for pigeonhole: one file per blob"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-types = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pigeonhole-testkit = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

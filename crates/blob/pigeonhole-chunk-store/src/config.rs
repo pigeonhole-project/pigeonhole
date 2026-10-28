@@ -88,7 +88,9 @@ pub struct MetaSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotSettings {
     /// Files in a directory (may be the log's).
-    Dir { path: PathBuf },
+    LocalDisk { path: PathBuf },
+    /// Process memory, with a memory log (tests).
+    Memory,
     /// A dedicated Telegram channel (the newest snapshot pinned).
     Telegram { chat_id: String, bot_token: String },
 }
@@ -97,7 +99,9 @@ pub enum SnapshotSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogSettings {
     /// Segmented files in a directory on this host.
-    Dir { path: PathBuf },
+    LocalDisk { path: PathBuf },
+    /// Process memory: gone with the process (tests, throwaway runs).
+    Memory,
     /// A dedicated Telegram channel / supergroup (pinned head chain,
     /// description fence; docs/meta-backends.md).
     Telegram {
@@ -113,10 +117,10 @@ impl MetaSettings {
     pub fn in_dir(dir: &Path) -> Self {
         let mut topology = Topology::new(Vec::new(), Vec::new(), Vec::new()).expect("empty topology");
         let mut meta = FileMeta::default().into_settings(&mut topology).expect("default meta settings");
-        if let LogSettings::Dir { path } = &mut meta.log {
+        if let LogSettings::LocalDisk { path } = &mut meta.log {
             *path = dir.join(&*path);
         }
-        if let SnapshotSettings::Dir { path } = &mut meta.snapshot {
+        if let SnapshotSettings::LocalDisk { path } = &mut meta.snapshot {
             *path = dir.join(&*path);
         }
         meta
@@ -126,9 +130,10 @@ impl MetaSettings {
     /// chat next to a local log): then a lossy restore is possible.
     pub fn snapshots_outlive_log(&self) -> bool {
         match (&self.log, &self.snapshot) {
-            (LogSettings::Dir { path: log }, SnapshotSettings::Dir { path }) => log != path,
-            (LogSettings::Dir { .. }, SnapshotSettings::Telegram { .. }) => true,
-            (LogSettings::Telegram { .. }, _) => false,
+            (LogSettings::LocalDisk { path: log }, SnapshotSettings::LocalDisk { path }) => log != path,
+            (LogSettings::LocalDisk { .. }, SnapshotSettings::Telegram { .. }) => true,
+            (LogSettings::LocalDisk { .. }, SnapshotSettings::Memory) => false,
+            (LogSettings::Telegram { .. } | LogSettings::Memory, _) => false,
         }
     }
 }
@@ -440,35 +445,41 @@ impl FileMeta {
     fn into_settings(self, topology: &mut Topology) -> Result<MetaSettings> {
         let log_store = match &self.log {
             Some(id) => topology.meta_store(id, "[meta] log")?,
-            None => Store::Dir { path: DEFAULT_META_DIR.into() },
+            None => Store::LocalDisk { path: DEFAULT_META_DIR.into() },
         };
         let log = match &log_store {
-            Store::Dir { path } => LogSettings::Dir { path: path.clone() },
+            Store::LocalDisk { path } => LogSettings::LocalDisk { path: path.clone() },
+            Store::Memory => LogSettings::Memory,
             Store::Telegram { chat_id, bot_token, .. } => LogSettings::Telegram {
                 chat_id: chat_id.clone(),
                 bot_token: bot_token.clone(),
                 straggler_window: Duration::from_secs(self.log_straggler_window_secs),
             },
-            _ => unreachable!("meta_store returns dir or telegram"),
+            Store::Discord { .. } => unreachable!("meta_store refuses discord"),
         };
         let snapshot_store = match &self.snapshot {
             Some(id) => topology.meta_store(id, "[meta] snapshot")?,
-            None if matches!(log_store, Store::Dir { .. }) => log_store.clone(),
+            None if matches!(log_store, Store::LocalDisk { .. } | Store::Memory) => log_store.clone(),
             None => bail!("[meta] snapshot is required with a telegram log"),
         };
         let snapshot = match snapshot_store {
-            Store::Dir { path } => {
-                if matches!(log, LogSettings::Telegram { .. }) {
-                    bail!(
-                        "[meta] snapshot: a telegram log needs telegram snapshots (a log off-host \
-                         cannot start from snapshots on this disk)"
-                    );
-                }
-                SnapshotSettings::Dir { path }
-            }
+            Store::LocalDisk { path } => SnapshotSettings::LocalDisk { path },
+            Store::Memory => SnapshotSettings::Memory,
             Store::Telegram { chat_id, bot_token, .. } => SnapshotSettings::Telegram { chat_id, bot_token },
-            _ => unreachable!("meta_store returns dir or telegram"),
+            Store::Discord { .. } => unreachable!("meta_store refuses discord"),
         };
+        match (&log, &snapshot) {
+            (LogSettings::Telegram { .. }, SnapshotSettings::LocalDisk { .. } | SnapshotSettings::Memory) => bail!(
+                "[meta] snapshot: a telegram log needs telegram snapshots (a log off-host cannot \
+                 start from snapshots on this host)"
+            ),
+            (LogSettings::Memory, SnapshotSettings::Memory) => {}
+            (LogSettings::Memory, _) | (_, SnapshotSettings::Memory) => bail!(
+                "[meta]: a memory log needs memory snapshots and the other way round (one is gone \
+                 after a restart, the other would not match it)"
+            ),
+            _ => {}
+        }
         Ok(MetaSettings {
             batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
             batch_max_entries: self.batch_max_entries.max(1),
@@ -578,6 +589,7 @@ pub fn check_block_size_against_instances(
     for inst in instances {
         let max = match inst.info.kind {
             InstanceKind::Telegram | InstanceKind::Memory => 20 * 1024 * 1024 - 1,
+            InstanceKind::LocalDisk => pigeonhole_types::BackendLimits::local_disk().max_blob_size,
             InstanceKind::Discord => {
                 pigeonhole_types::BackendLimits::discord(inst.max_blob_size).max_blob_size
             }
@@ -871,15 +883,15 @@ upload_concurrency = 4
         assert_eq!(cfg.meta.batch_max_delay, Duration::ZERO);
         assert_eq!(cfg.meta.snapshot_every_entries, 10_000);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(600));
-        assert_eq!(cfg.meta.log, LogSettings::Dir { path: "pigeonhole-meta".into() });
-        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Dir { path: "pigeonhole-meta".into() });
+        assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "pigeonhole-meta".into() });
+        assert_eq!(cfg.meta.snapshot, SnapshotSettings::LocalDisk { path: "pigeonhole-meta".into() });
         assert!(!cfg.meta.snapshots_outlive_log(), "same directory, same disk");
     }
 
     #[test]
     fn parses_meta_section() {
-        let dirs = "[[store]]\nid = \"disk\"\nkind = \"dir\"\npath = \"/var/log-dir\"\n\
-                    [[store]]\nid = \"backup\"\nkind = \"dir\"\npath = \"/backup\"\n";
+        let dirs = "[[store]]\nid = \"disk\"\nkind = \"local_disk\"\npath = \"/var/log-dir\"\n\
+                    [[store]]\nid = \"backup\"\nkind = \"local_disk\"\npath = \"/backup\"\n";
         let cfg = load_mem(&format!(
             "[meta]\nbatch_max_delay_ms = 250\nlog = \"disk\"\nsnapshot = \"backup\"\n\
              snapshot_every_entries = 0\nsnapshot_every_secs = 60\n{dirs}"
@@ -888,8 +900,8 @@ upload_concurrency = 4
         assert_eq!(cfg.meta.batch_max_delay, Duration::from_millis(250));
         assert_eq!(cfg.meta.snapshot_every_entries, 0);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(60));
-        assert_eq!(cfg.meta.log, LogSettings::Dir { path: "/var/log-dir".into() });
-        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Dir { path: "/backup".into() });
+        assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "/var/log-dir".into() });
+        assert_eq!(cfg.meta.snapshot, SnapshotSettings::LocalDisk { path: "/backup".into() });
         assert!(cfg.meta.snapshots_outlive_log());
 
         // One dir for both: the default layout.
@@ -901,10 +913,10 @@ upload_concurrency = 4
             "[meta]\ndb_path = \"m.db\"\n",
             "[meta]\nlog = \"nope\"\n",
             "[meta]\nlog = \"mem\"\n",
-            "[meta.log]\nkind = \"dir\"\n",
+            "[meta.log]\nkind = \"local_disk\"\n",
             "[[store]]\nid = \"x\"\nkind = \"s3\"\n",
-            "[[store]]\nid = \"x\"\nkind = \"dir\"\npath = \"/x\"\nchat_id = 1\n",
-            "[[store]]\nid = \"x\"\nkind = \"dir\"\n",
+            "[[store]]\nid = \"x\"\nkind = \"local_disk\"\npath = \"/x\"\nchat_id = 1\n",
+            "[[store]]\nid = \"x\"\nkind = \"local_disk\"\n",
         ] {
             assert!(load_mem(bad).is_err(), "{bad:?} accepted");
         }
@@ -935,21 +947,60 @@ upload_concurrency = 4
         assert!(format!("{err:#}").contains("one purpose"), "{err:#}");
         let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n{stores}{}", tg_store("again", -100)))
             .unwrap_err();
-        assert!(format!("{err:#}").contains("same chat"), "{err:#}");
+        assert!(format!("{err:#}").contains("same place"), "{err:#}");
 
         let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\n{}", tg_store("tg-log", -100))).unwrap_err();
         assert!(format!("{err:#}").contains("snapshot is required"), "{err:#}");
-        let disk = "[[store]]\nid = \"disk\"\nkind = \"dir\"\npath = \"/x\"\n";
+        let disk = "[[store]]\nid = \"disk\"\nkind = \"local_disk\"\npath = \"/x\"\n";
         let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"disk\"\n{}{disk}", tg_store("tg-log", -100)))
             .unwrap_err();
-        assert!(format!("{err:#}").contains("cannot start from snapshots on this disk"), "{err:#}");
+        assert!(format!("{err:#}").contains("cannot start from snapshots on this host"), "{err:#}");
+    }
+
+    #[test]
+    fn every_kind_serves_every_purpose_it_can() {
+        // Memory metadata (tests: no fsync), blobs on a local disk.
+        let cfg = load(
+            "[meta]\nlog = \"ram\"\n[chunk]\nstore = \"disk\"\n\
+             [[store]]\nid = \"ram\"\nkind = \"memory\"\n\
+             [[store]]\nid = \"disk\"\nkind = \"local_disk\"\npath = \"/blobs\"\n",
+        )
+        .unwrap();
+        assert_eq!((cfg.meta.log.clone(), cfg.meta.snapshot.clone()), (LogSettings::Memory, SnapshotSettings::Memory));
+        let inst = cfg.primary_instance().unwrap();
+        assert_eq!((inst.info.kind, inst.scope_id.as_str()), (InstanceKind::LocalDisk, "/blobs"));
+
+        // A memory log next to snapshots that survive it (or the other way round).
+        let mixed = "[meta]\nlog = \"ram\"\nsnapshot = \"disk\"\n[chunk]\nstore = \"mem\"\n\
+                     [[store]]\nid = \"ram\"\nkind = \"memory\"\n\
+                     [[store]]\nid = \"disk\"\nkind = \"local_disk\"\npath = \"/m\"\n\
+                     [[store]]\nid = \"mem\"\nkind = \"memory\"\n";
+        let err = load(mixed).unwrap_err();
+        assert!(format!("{err:#}").contains("memory log needs memory snapshots"), "{err:#}");
+
+        // One disk for blobs and metadata: refused.
+        let shared = "[meta]\nlog = \"disk\"\n[chunk]\nstore = \"disk\"\n\
+                      [[store]]\nid = \"disk\"\nkind = \"local_disk\"\npath = \"/x\"\n";
+        let err = load(shared).unwrap_err();
+        assert!(format!("{err:#}").contains("serves one purpose"), "{err:#}");
+
+        // Two stores on one directory: refused.
+        let twice = "[chunk]\nstore = \"a\"\n[[store]]\nid = \"a\"\nkind = \"local_disk\"\npath = \"/x\"\n\
+                     [[store]]\nid = \"b\"\nkind = \"local_disk\"\npath = \"/x\"\n";
+        assert!(format!("{:#}", load(twice).unwrap_err()).contains("same place"));
+
+        // Discord holds blobs, not metadata (yet).
+        std::env::set_var("DISCORD_BOT_TOKEN", "discord-test-token");
+        let dc = "[meta]\nlog = \"dc\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\n";
+        let err = load_mem(dc).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot hold metadata yet"), "{err:#}");
     }
 
     #[test]
     fn a_local_log_with_snapshots_in_a_chat() {
         std::env::set_var("PH_TEST_TG_TOKEN", "1:test");
         let cfg = load_mem(&format!("[meta]\nsnapshot = \"tg-snap\"\n{}", tg_store("tg-snap", -200))).unwrap();
-        assert_eq!(cfg.meta.log, LogSettings::Dir { path: "pigeonhole-meta".into() });
+        assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "pigeonhole-meta".into() });
         assert!(cfg.meta.snapshots_outlive_log());
     }
 

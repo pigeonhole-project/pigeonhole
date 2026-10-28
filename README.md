@@ -50,7 +50,8 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 | `blob/pigeonhole-chunk-store` | `ChunkStore`, the `chunk` namespace, ingest, sweeper, repair, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram Bot API storage |
 | `storage/pigeonhole-storage-discord` | Discord Bot API storage |
-| `storage/pigeonhole-storage-memory` | In-memory storage for tests / `kind = "memory"` instances |
+| `storage/pigeonhole-storage-memory` | In-memory blob storage for tests / `kind = "memory"` stores |
+| `storage/pigeonhole-storage-disk` | Blobs as files in a directory (`kind = "local_disk"`) |
 | `gateway/pigeonhole-gateway-s3` | S3 (`s3s`) gateway |
 | `gateway/pigeonhole-gateway-bytestream` | REAPI v2 remote cache |
 | `testing/pigeonhole-testkit` | Storage conformance suites |
@@ -136,8 +137,8 @@ accordingly.
 
 ## Stores and replication
 
-Every place bytes can live is a `[[store]]` (`dir`, `telegram`, `discord`,
-`memory`; tokens are referenced by env var name, never inline). Stores are
+Every place bytes can live is a `[[store]]` (`local_disk`, `memory`,
+`telegram`, `discord`; tokens are referenced by env var name, never inline). Stores are
 combined into `[[replicas]]` groups, and `[meta] log` / `snapshot` and
 `[chunk] store` name a store or a group:
 
@@ -204,7 +205,7 @@ comments. Sections:
 
 | TOML | Meaning |
 |---|---|
-| `[[store]]` | Where bytes live: id, kind (`dir` + `path` / `telegram` + `chat_id` / `discord` + `channel_id` / `memory`), token env, `max_blob_size` |
+| `[[store]]` | Where bytes live: id, kind (`local_disk` + `path` / `memory` / `telegram` + `chat_id` / `discord` + `channel_id`), token env, `max_blob_size`. Every kind holds blobs; the log and snapshots go to `local_disk`, `memory` or `telegram` |
 | `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
 | `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
@@ -237,8 +238,8 @@ snapshots are configured separately:
 
 | `[meta] log` | `[meta] snapshot` | losing this host's disk |
 |---|---|---|
-| a `dir` store | the same store (default) | loses the metadata |
-| a `dir` store | a `dir` on another disk, or a `telegram` store | `restore --lossy`: loses the changes after the newest snapshot |
+| a `local_disk` store | the same store (default) | loses the metadata |
+| a `local_disk` store | a `local_disk` on another disk, or a `telegram` store | `restore --lossy`: loses the changes after the newest snapshot |
 | a `telegram` store | another `telegram` store | loses nothing: a clean machine boots from the chats |
 
 After losing a local log whose snapshots survived:

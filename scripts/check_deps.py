@@ -17,6 +17,7 @@ ROLE = {
     "pigeonhole-storage-telegram": "storage",
     "pigeonhole-storage-discord": "storage",
     "pigeonhole-storage-memory": "storage",
+    "pigeonhole-storage-disk": "storage",
     "pigeonhole-gateway-s3": "gateway",
     "pigeonhole-gateway-bytestream": "gateway",
     "pigeonhole-gateway-kafka": "gateway",

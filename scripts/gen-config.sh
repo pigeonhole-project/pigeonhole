@@ -64,7 +64,7 @@ log = "meta"
 
 [[store]]
 id = "meta"
-kind = "dir"
+kind = "local_disk"
 path = "${META_LOG}"
 
 ${INSTANCE_BLOCK}

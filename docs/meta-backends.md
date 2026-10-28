@@ -322,15 +322,15 @@ batch_max_delay_ms = 0              # extra group commit window (local: 0;
                                     # batches still form while an append runs)
 batch_max_entries = 1024
 
-log = "meta"                        # a [[store]] id: dir | telegram (later s3)
-snapshot = "meta"                   # default: the log's store if it is a dir
+log = "meta"                        # a [[store]] id: local_disk | memory | telegram
+snapshot = "meta"                   # default: the log's store if local_disk / memory
 snapshot_every_entries = 10000      # 0 = never
 snapshot_every_secs = 600           # also by time if anything changed
 # log_straggler_window_secs = 90    # telegram log: claim waits for a deposed writer
 
 [[store]]
 id = "meta"
-kind = "dir"
+kind = "local_disk"
 path = "pigeonhole-meta"
 
 # [[store]]                         # ship the log off-host: a channel of its own
@@ -341,10 +341,11 @@ path = "pigeonhole-meta"
 
 | `[meta] log` | `[meta] snapshot` | losing this host's disk |
 |---|---|---|
-| dir | the same dir | everything |
-| dir | another dir / telegram | `restore --lossy`: the tail after the newest snapshot |
+| local_disk | the same store | everything |
+| memory | memory | everything (tests) |
+| local_disk | another local_disk / telegram | `restore --lossy`: the tail after the newest snapshot |
 | telegram | telegram (another chat) | nothing |
-| telegram | dir | refused by the config |
+| telegram | local_disk / memory | refused by the config |
 
 ## Plan
 

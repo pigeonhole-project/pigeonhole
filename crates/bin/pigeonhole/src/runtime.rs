@@ -15,8 +15,9 @@ use pigeonhole::index::Index;
 use crate::telegram_log::{self, TelegramChat};
 use pigeonhole_meta::log::chat::{ChatLogOptions, ChatLogStore};
 use pigeonhole_meta::snapshot::ChatSnapshotStore;
-use pigeonhole_meta::{LocalSnapshotStore, SnapshotStore};
+use pigeonhole_meta::{LocalSnapshotStore, MemoryLogStore, MemorySnapshotStore, SnapshotStore};
 use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
+use pigeonhole_storage_disk::DiskBlobStore;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -29,7 +30,11 @@ pub struct Runtime {
 /// The configured metadata log (`[meta] log`).
 pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
     Ok(match &cfg.meta.log {
-        LogSettings::Dir { path } => Arc::new(
+        LogSettings::Memory => {
+            warn!("metadata log in memory: everything is gone when the process exits");
+            Arc::new(MemoryLogStore::new())
+        }
+        LogSettings::LocalDisk { path } => Arc::new(
             LocalLogStore::open(path).with_context(|| format!("open local log {}", path.display()))?,
         ),
         LogSettings::Telegram { chat_id, bot_token, straggler_window } => {
@@ -52,7 +57,8 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
 /// The configured snapshot store (`[meta] snapshot`).
 pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStore>> {
     Ok(match &cfg.meta.snapshot {
-        SnapshotSettings::Dir { path } => Arc::new(LocalSnapshotStore::new(path)),
+        SnapshotSettings::LocalDisk { path } => Arc::new(LocalSnapshotStore::new(path)),
+        SnapshotSettings::Memory => Arc::new(MemorySnapshotStore::new()),
         SnapshotSettings::Telegram { chat_id, bot_token } => {
             let tg = TelegramClient::new(bot_token.clone()).context("telegram client for snapshots")?;
             tg.ensure_chat_admin(chat_id).await.context("snapshot chat access check")?;
@@ -132,6 +138,11 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
                 MemoryBlobStore::new().with_instance_info(inst.info.clone()),
             );
             MetricsBackend::wrap(Arc::new(erase_sweep(mem)))
+        }
+        InstanceKind::LocalDisk => {
+            let store = DiskBlobStore::with_instance(&inst.scope_id, inst.info.clone())
+                .with_context(|| format!("open local_disk store {}", inst.scope_id))?;
+            MetricsBackend::wrap(Arc::new(erase_sweep(Arc::new(store))))
         }
         InstanceKind::Telegram => {
             let tg = TelegramClient::new(inst.bot_token.clone()).context("telegram client")?;

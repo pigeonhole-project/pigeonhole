@@ -26,6 +26,7 @@ pigeonhole-meta = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
+pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-discord = { workspace = true, optional = true }
 pigeonhole-gateway-bytestream = { workspace = true, optional = true }
 tokio = { workspace = true }

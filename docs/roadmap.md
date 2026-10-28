@@ -158,7 +158,7 @@ so `restore --lossy` loses recent changes but never breaks an object.
 
 ### Step 6c — Stores and groups in the config ✅ done
 
-`[[store]]` (dir | telegram | discord | memory) says only where bytes live;
+`[[store]]` (local_disk | memory | telegram | discord) says only where bytes live;
 `[[replicas]]` combines blob stores; `[meta] log` / `snapshot` and
 `[chunk] store` name a store or group. A chat serves one purpose.
 
@@ -170,6 +170,13 @@ throughput (Telegram limits are per chat), replicas inside a shard add
 availability. Repair brings a chunk to the members of its own shard, not of
 every store. Metadata already records replicas per store. Later: snapshots on
 groups (replicas, then shards that split a snapshot).
+
+### Step 7a — Every kind for every purpose ✅ done (except discord metadata)
+
+Blobs on `local_disk` (`pigeonhole-storage-disk`, a file per blob); the log
+and snapshots in `memory` (tests, no fsync). Discord as a log / snapshot store
+is left for later: its limits (topic edits, at most 50 pins per channel) need
+checking on a live bot before the chat protocol is adapted to it.
 
 ### Step 8 — Raft between nodes
 
