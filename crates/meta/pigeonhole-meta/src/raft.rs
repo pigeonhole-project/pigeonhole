@@ -123,6 +123,9 @@ fn read_err(e: impl ToString) -> SErr {
     StorageIOError::read_logs(AnyError::error(e.to_string())).into()
 }
 
+/// Written entries kept in memory for reads.
+const TAIL_KEEP: u64 = 4096;
+
 /// One write to the node's log, done by the writer task in order.
 enum Op {
     Append(Vec<RaftEntry>, LogFlushed<TypeConfig>),
@@ -145,8 +148,11 @@ pub(crate) struct LogAdapter {
     history: HistoryId,
     /// Head including queued entries.
     head: Arc<Mutex<Position>>,
-    /// Queued entries not yet in the log.
-    pending: Arc<Mutex<std::collections::BTreeMap<Position, RaftEntry>>>,
+    /// The tail of the log in memory: queued entries not yet in the log
+    /// store, and the last [`TAIL_KEEP`] written ones. Commits read the
+    /// entries they apply back; serving them from here keeps that off the
+    /// store (a disk walk, a chat download).
+    tail: Arc<Mutex<std::collections::BTreeMap<Position, RaftEntry>>>,
     /// Head of what the log store holds.
     durable: Arc<AtomicU64>,
     shared: Arc<Shared>,
@@ -168,7 +174,7 @@ impl LogAdapter {
             log,
             history,
             head: Arc::new(Mutex::new(head)),
-            pending: Arc::default(),
+            tail: Arc::default(),
             durable: Arc::new(AtomicU64::new(head)),
             shared,
             tx,
@@ -214,8 +220,9 @@ impl LogAdapter {
                     let result = match self.log.append(gen, &ours).await {
                         Ok(last) => {
                             self.durable.store(last, Ordering::SeqCst);
-                            let mut pending = self.pending.lock().unwrap();
-                            *pending = pending.split_off(&(last + 1));
+                            let mut tail = self.tail.lock().unwrap();
+                            let keep_from = last.saturating_sub(TAIL_KEEP) + 1;
+                            *tail = tail.split_off(&keep_from);
                             Ok(())
                         }
                         Err(e) => {
@@ -232,7 +239,7 @@ impl LogAdapter {
                     let r = self.log.truncate(gen, from).await.map_err(|e| self.shared.log_error(e));
                     if r.is_ok() {
                         self.durable.store(from - 1, Ordering::SeqCst);
-                        self.pending.lock().unwrap().retain(|p, _| *p < from);
+                        self.tail.lock().unwrap().retain(|p, _| *p < from);
                     }
                     let _ = done.send(r);
                 }
@@ -241,6 +248,7 @@ impl LogAdapter {
                     let r = self.log.rebase(gen, base).await.map_err(|e| self.shared.log_error(e));
                     if r.is_ok() {
                         self.durable.fetch_max(at, Ordering::SeqCst);
+                        self.tail.lock().unwrap().retain(|p, _| *p > at);
                         self.shared.based.store(at, Ordering::SeqCst);
                         let old = self.shared.base_ref.lock().unwrap().replace(new_ref.clone());
                         if let Some(old) = old.filter(|o| *o != new_ref) {
@@ -272,11 +280,11 @@ impl LogAdapter {
         if from >= to {
             return Ok(Vec::new());
         }
-        // Queued entries first: one the writer moves into the log meanwhile
-        // shows up in the log read that follows.
         let mut out: std::collections::BTreeMap<Position, RaftEntry> =
-            self.pending.lock().unwrap().range(from + 1..=to).map(|(p, e)| (*p, e.clone())).collect();
-        let durable = self.durable.load(Ordering::SeqCst).min(to);
+            self.tail.lock().unwrap().range(from + 1..=to).map(|(p, e)| (*p, e.clone())).collect();
+        // Whatever the tail lacks is older: read it from the store.
+        let missing_to = out.keys().next().map_or(to, |first| first - 1);
+        let durable = self.durable.load(Ordering::SeqCst).min(missing_to);
         if durable > from {
             let entries: Vec<(Position, Entry)> = self
                 .log
@@ -366,9 +374,9 @@ impl RaftLogStorage<TypeConfig> for LogAdapter {
                 )))
                 .into());
             }
-            let mut pending = self.pending.lock().unwrap();
+            let mut tail = self.tail.lock().unwrap();
             for e in &entries {
-                pending.insert(position(&e.log_id), e.clone());
+                tail.insert(position(&e.log_id), e.clone());
             }
             *head += entries.len() as u64;
         }
