@@ -17,12 +17,13 @@ Read those first.
 - After S3-visible changes also run `make compat-s3s-e2e` (STS failure is
   expected), `make compat-s3s-boto3`, `make compat-memory`.
 - Docs, comments and commit messages are in English only.
-- Layering is enforced: `meta` and `types`/`codec` depend on crates.io only;
-  storage crates must not see chunk-store or gateways.
+- Layering is enforced: `meta` and `types`/`codec` depend on crates.io only
+  (so will `storage-api`, step 7c); storage crates must not see chunk-store or
+  gateways.
 
 ## Where we are
 
-Done (on `main`), steps 1–6a:
+Done (on `main`), steps 1–7a, 6d, 8.1–8.2:
 
 - `pigeonhole-meta` is the tablet. `MetaStore::propose::<S>(cmd)` queues a
   typed command; the batcher appends what is queued to the `LogStore` under the
@@ -38,11 +39,12 @@ Done (on `main`), steps 1–6a:
   only for REAPI).
 - `LocalLogStore`: `seg-<first>.log` records `MAGIC|len|crc|Batch`, fsync per
   batch, `claimed_gen` + `log_id` under a `flock`; claim truncates a torn tail;
-  `rebase` drops the segments behind the base. `ChatLogStore` keeps the log in
-  a Telegram channel.
+  `rebase` drops the segments behind the base. `ChannelLogStore` keeps the
+  log in a Telegram channel over MTProto, fenced by the order of message ids
+  (telegram-mtproto.md); no pins, no description register.
 - Snapshots every `[meta] snapshot_every_entries` (10000) and
   `snapshot_every_secs` (600, when anything changed), stored in a `SnapshotStore` configured apart
-  from the log (`local` | `telegram`); the log records which one it starts
+  from the log (`local_disk` | `memory` | `telegram`, pinless); the log records which one it starts
   from. `pigeonhole restore --lossy` starts an empty log from the newest one.
 - Removed: `durability.rs` (checkpoint, superblock pins, root journal,
   `start_or_restore`), `s3/index` / `cas/index` snapshots, chunk roots.
@@ -51,19 +53,26 @@ Done (on `main`), steps 1–6a:
   memory in `BlobDb`, not part of the replicated state.
 - Sweeper (sweep-invariants.md): uploads pinned before they start
   (`UploadPins`), orphans swept up to the pins' horizon, our own `BlobId` as
-  the uploaded file name (Discord sweeps only ours), read pins hold reclaim,
-  `confirm_active` before orphan deletes; no watermarks, no grace.
+  the uploaded file name, read pins hold reclaim,
+  `confirm_active` before orphan deletes; no watermarks, no grace. Telegram
+  and Discord stores list their channel and delete only our `ph-<hex>.bin`.
+- Telegram is MTProto with a bot token (`kind = "telegram"`); the Bot API
+  backend is gone. `MetaStore` runs over openraft as a cluster of one.
 
 Known gaps:
 
 - With the `local` log, disk loss loses metadata unless `[meta] snapshot`
   lives elsewhere (and restore from it is lossy); the `telegram` log avoids it.
-- Every Telegram pin leaves a "pinned message" service message; nothing
-  deletes them (one per log batch, one per stored snapshot).
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
-- Telegram blob chats are swept by id up to the horizon, ours or not: keep
-  nothing else in them (the Telegram LogStore needs its own chat).
+- Every S3 write is several log entries in a row: 8–23 s per small PUT on a
+  Telegram log (~18 sends a minute). Step 7b.
+- One log / snapshot implementation per store kind (`LocalLogStore`,
+  `MemoryLogStore`, `ChannelLogStore`, three snapshot stores), beside the blob
+  backends of the same stores. Step 7c.
+- Discord cannot hold the log or snapshots yet (step 10).
+- The grammers-mtsender patch (drop requests nobody awaits) is not applied
+  (step 6e).
 
 ## Steps
 
@@ -113,7 +122,10 @@ leaves every chunk-owned key to reclaim.
    stress test to grace-free settings and make mid-stress GETs
    strict again.
 
-### Step 6 — `telegram` LogStore ✅ done
+### Step 6 — `telegram` LogStore ✅ done, superseded by 6d
+
+History: the Bot API log (pinned head, chat description as the fence,
+straggler window). Replaced by the MTProto channel log; kept for the record.
 
 `ChatLogStore` (protocol over a `ChatApi` trait, in `pigeonhole-meta`) plus a
 Telegram adapter in the binary; `[meta.log] kind = "telegram"`. Changed from
@@ -147,20 +159,31 @@ previous base. `every_secs` snapshots an idle tablet. When snapshots outlive
 the log, reclaim deletes parts only after the base shows the chunk reclaiming,
 so `restore --lossy` loses recent changes but never breaks an object.
 
-### Step 6b — Telegram housekeeping
+### Step 6b — Telegram housekeeping — dropped
 
-- Delete the "pinned message" service messages: in a dedicated chat, delete the
-  id range behind the base, not only the chain (check on a live bot that a
-  range delete is not refused as a whole by one undeletable message).
-- Remove the leftover pinning from the Telegram blob store
-  (`storage-telegram/src/store.rs`, from the old snapshot manifest) and the pin
-  right it still asks for.
+Pins and the Bot API are gone (6d); nothing left to clean.
 
 ### Step 6c — Stores and groups in the config ✅ done
 
 `[[store]]` (local_disk | memory | telegram | discord) says only where bytes live;
 `[[replicas]]` combines blob stores; `[meta] log` / `snapshot` and
 `[chunk] store` name a store or group. A chat serves one purpose.
+
+### Step 6d — Telegram over MTProto ✅ done
+
+Design and findings: [telegram-mtproto.md](telegram-mtproto.md). A bot logged
+in over MTProto (grammers): blobs up to the chunk limit with exact ranges, a
+channel listing for the sweeper, the log fenced by the order of message ids,
+pinless snapshots. The Bot API backend removed, the kind renamed to
+`telegram`.
+
+### Step 6e — MTProto leftovers
+
+- Docs that still describe the Bot API: README (Telegram section),
+  meta-backends.md, sweep-invariants.md, glossary.md, `.env.example`
+  (`CHAT_ID` / `BOT_TOKEN` vs the `TG_*` names), `scripts/compat-telegram*.sh`.
+- The grammers-mtsender patch (telegram-mtproto.md § Steps 2): discuss, apply
+  through `[patch.crates-io]`, offer upstream.
 
 ### Step 7 — Blob shards ✅ done
 
@@ -174,9 +197,8 @@ groups (replicas, then shards that split a snapshot).
 ### Step 7a — Every kind for every purpose ✅ done (except discord metadata)
 
 Blobs on `local_disk` (`pigeonhole-storage-disk`, a file per blob); the log
-and snapshots in `memory` (tests, no fsync). Discord as a log / snapshot store
-is left for later: its limits (topic edits, at most 50 pins per channel) need
-checking on a live bot before the chat protocol is adapted to it.
+and snapshots in `memory` (tests, no fsync). Discord as a log / snapshot store:
+checked on a live bot, designed in [discord-log.md](discord-log.md) (step 10).
 
 ### Step 7b — One log entry per S3 operation
 
@@ -185,6 +207,15 @@ hand out prepared commands, the gateway commits an operation's commands as
 one Raft entry (`MetaStore::propose_all`), releases of overwritten chunks go
 after the answer. One PUT = one entry instead of n + 2; matters most on a
 Telegram log (~20 messages a minute).
+
+### Step 7c — The log on top of blob storage
+
+Design: [chain-log.md](chain-log.md) steps 1–3. A `Chain` capability ("first
+successor wins") on blob stores; one `ChainLogStore` and one
+`BlobSnapshotStore` for every store; storage traits move to
+`core/pigeonhole-storage-api`. Memory first, then Telegram (`impl Chain`
+replaces `ChannelApi` / `ChannelLogStore` / `ChannelSnapshotStore`). Can run
+in parallel with 7b (different code in `pigeonhole-meta`).
 
 ### Step 8 — Raft between nodes
 
@@ -203,6 +234,52 @@ Design: meta-backends.md § Raft between nodes. Sub-steps:
    a fake chat), leader-only side effects, forwarding.
 4. `[[node]]` config, `init-cluster`, live runs with a node on Telegram.
 5. Later: follower reads, auth between nodes.
+
+After 7b (`propose_all` changes what `MetaStore` hands to openraft); does not
+depend on 7c (`raft.rs` sees only the `LogStore` / `SnapshotStore` traits; the
+8.1 conformance suite checks `ChainLogStore` for it).
+
+### Step 9 — Disk blob store on segments
+
+[chain-log.md](chain-log.md) step 4: `DiskBlobStore` as append-only segments
+(key = byte position, one fsync per put, holes punched for deletes) with
+`impl Chain`; benchmark against `LocalLogStore` (append p50/p99, claim,
+replay of 1M entries, rebase, `sweep_stress`), then delete `LocalLogStore` and
+`LocalSnapshotStore`.
+
+### Step 10 — Discord: blobs aligned, log and snapshots
+
+[discord-log.md](discord-log.md) + chain-log.md step 5: `DiscordId` =
+`message_id`, `enforce_nonce` uploads, 20 MiB attachments; `impl Chain` on
+threads (archive links, delete a message before its thread, ~10 links a
+minute).
+
+### Step 11 — Fault injection
+
+Design to write. A decorator over `BlobBackend + Chain`: delays, errors, 429s
+/ flood waits, lost and corrupted blobs, late visibility, all from a seed; the
+`LogStore` conformance suite, the tablet and `sweep_stress` run through it.
+
+### Step 12 — OpenDAL
+
+Design to write. (1) An OpenDAL blob store (`kind = "opendal"`, scheme +
+options, secrets from env): keys that grow for the sweeper's horizon, listing
+with `start_after`, batch deletes. (2) `impl Chain` with `if_not_exists`
+writes (s3, gcs, fs): the S3 log of the original plan. (3) An OpenDAL `Access`
+over the S3 `Index` as a gateway: WebDAV (`dav-server-opendalfs`), then
+`object_store` (DataFusion), FUSE last.
+
+### Step 13 — Turso replica
+
+[turso-replica.md](turso-replica.md): a Turso database whose WAL frames go
+into any `Chain` store's log and whose checkpoints become snapshots;
+fencing between two primaries; restore and followers.
+
+### Order
+
+6e → 7b ∥ 7c → 8.3–8.4 → 9 → 10 → 11 → 12 → 13. Later: several tablets (when
+metadata outgrows RAM — never a database inside the tablet), encryption per
+block in the codec.
 
 ## Open questions
 
