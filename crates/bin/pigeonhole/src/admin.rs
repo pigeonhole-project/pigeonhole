@@ -70,8 +70,7 @@ pub async fn cmd_restore(from: Option<PathBuf>, lossy: bool) -> anyhow::Result<(
     let cfg = Config::load().context("load config")?;
     if !lossy {
         bail!(
-            "restore from an export loses every change after it, and objects whose chunks were \
-             reclaimed since then read back broken; re-run with --lossy to accept"
+            "restore from an export loses every change after it; re-run with --lossy to accept"
         );
     }
     let sink: Arc<dyn SnapshotSink> = match from {

@@ -63,6 +63,8 @@ struct NodeLocal {
     /// `(chunk, instance)` → enqueue order.
     repair_queue: BTreeMap<(ChunkId, String), u64>,
     repair_seq: u64,
+    /// Reclaiming chunk → a log position at or after its `BeginReclaim`.
+    reclaim_gates: HashMap<ChunkId, u64>,
 }
 
 /// Chunks being read right now (chunk → readers). Reclaim leaves a pinned
@@ -372,25 +374,42 @@ impl BlobDb {
     /// Atomically mark a zero-ref live chunk as reclaiming. Returns false if another
     /// worker won the race or `retain` revived the chunk.
     pub async fn try_begin_reclaim(&self, chunk_id: ChunkId) -> Result<bool> {
+        if self.local.lock().unwrap().reclaim_gates.contains_key(&chunk_id) {
+            return Ok(true);
+        }
         match self
             .propose(ChunkCommand::BeginReclaim { chunk_id })
             .await?
         {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                let at = self.meta.applied_position();
+                self.local.lock().unwrap().reclaim_gates.insert(chunk_id, at);
+                Ok(true)
+            }
             Err(ChunkReject::NotReclaimable(_)) => Ok(false),
             Err(other) => bail!("unexpected begin_reclaim rejection {other:?}"),
         }
+    }
+
+    /// Whether the newest snapshot export already has `chunk_id` reclaiming
+    /// (after [`Self::try_begin_reclaim`]), so its parts may go: a lossy
+    /// restore from that export cannot bring back an object that points at
+    /// them. Always true when the tablet exports nothing.
+    pub fn reclaim_exported(&self, chunk_id: ChunkId) -> bool {
+        let Some(exported) = self.meta.exported_position() else {
+            return true;
+        };
+        let gate = self.local.lock().unwrap().reclaim_gates.get(&chunk_id).copied();
+        gate.is_some_and(|at| exported >= at)
     }
 
     /// Forget the chunk (after its backend parts are deleted).
     pub async fn delete_chunk_metadata(&self, chunk_id: ChunkId) -> Result<()> {
         self.propose_infallible(ChunkCommand::DropChunk { chunk_id })
             .await?;
-        self.local
-            .lock()
-            .unwrap()
-            .repair_queue
-            .retain(|(id, _), _| *id != chunk_id);
+        let mut local = self.local.lock().unwrap();
+        local.repair_queue.retain(|(id, _), _| *id != chunk_id);
+        local.reclaim_gates.remove(&chunk_id);
         Ok(())
     }
 

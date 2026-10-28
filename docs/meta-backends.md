@@ -148,9 +148,10 @@ a result the next generation might not have.
 **Restore** (`pigeonhole restore [--from-export DIR] --lossy`; without the flag
 it reads the configured export) seeds an empty log
 from the newest export: the states as of the export, positions from 0. It is
-lossy: changes after the export are gone, chunks committed later become
-orphans (the sweeper deletes them) and chunks reclaimed later are referenced
-but deleted. Only an off-host LogStore makes disk loss lossless.
+lossy: changes after the export are gone and chunks committed later become
+orphans (the sweeper deletes them). Reclaim deletes parts only after an export
+shows the chunk reclaiming (sweep-invariants.md), so the newest export never
+references deleted parts. Only an off-host LogStore makes disk loss lossless.
 
 ### Arbiter / Арбитр
 

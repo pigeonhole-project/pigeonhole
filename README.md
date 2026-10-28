@@ -225,9 +225,10 @@ cargo run --release -- restore --lossy                 # the configured export
 cargo run --release -- restore --from-export DIR --lossy
 ```
 
-The restore is lossy: chunks committed after the export become orphans (the
-sweeper deletes them), and objects whose chunks were reclaimed after it read
-back broken.
+The restore is lossy: changes after the export are gone, and chunks committed
+after it become orphans (the sweeper deletes them). Objects in the export read
+back whole: the sweeper deletes a chunk's parts only after an export shows the
+chunk released.
 
 Delete every backend message tracked by the local index (server must be stopped):
 
