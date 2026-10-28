@@ -45,6 +45,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 pub mod export;
 pub mod log;
+pub mod snapshot;
 
 pub use log::{
     Batch, Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogId, LogResult,
