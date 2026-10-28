@@ -11,7 +11,7 @@ use futures::stream::{self, StreamExt};
 use pigeonhole_types::{ByteRange, RangeSupport};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::debug;
@@ -193,11 +193,20 @@ impl ReplicaSelector for CheapestFirst {
     }
 }
 
-/// Fan-out write / failover read across a placement group.
+/// Placement of chunks over shards; each shard is a replica group.
+///
+/// A chunk goes to one shard (the least loaded) and to every member of it,
+/// `write_quorum` of which must succeed. Reads fail over across the replicas
+/// recorded for the chunk. One shard = plain replication.
 pub struct Replicated {
+    /// Every member of every shard.
     members: Vec<Arc<dyn DynBlobBackend>>,
     by_id: HashMap<InstanceId, Arc<dyn DynBlobBackend>>,
-    write_quorum: usize,
+    shards: Vec<Shard>,
+    /// Instance → its shard's index.
+    shard_of: HashMap<InstanceId, usize>,
+    /// Where the next tie between equally loaded shards starts.
+    next_shard: AtomicUsize,
     selector: Arc<dyn ReplicaSelector>,
     member_timeout: Duration,
     /// Pins every upload until its part is committed; bounds the sweeper.
@@ -212,32 +221,59 @@ pub struct SealedChunk {
     pub pins: Vec<UploadPin>,
 }
 
+/// One shard: a replica group.
+struct Shard {
+    members: Vec<Arc<dyn DynBlobBackend>>,
+    write_quorum: usize,
+    /// Chunk writers open on this shard right now.
+    writing: Arc<AtomicUsize>,
+}
+
+/// One shard given to [`Replicated::sharded`]: its members and write quorum.
+pub type ShardSpec = (Vec<Arc<dyn DynBlobBackend>>, usize);
+
 impl Replicated {
+    /// One replica group (a single shard).
     pub fn new(
         members: Vec<Arc<dyn DynBlobBackend>>,
         write_quorum: usize,
         selector: Arc<dyn ReplicaSelector>,
     ) -> Result<Self> {
-        if members.is_empty() {
-            bail!("Replicated requires at least one member");
-        }
-        if write_quorum == 0 || write_quorum > members.len() {
-            bail!(
-                "write_quorum {write_quorum} out of range for {} members",
-                members.len()
-            );
+        Self::sharded(vec![(members, write_quorum)], selector)
+    }
+
+    /// Chunks spread over `shards`, each a replica group.
+    pub fn sharded(shards: Vec<ShardSpec>, selector: Arc<dyn ReplicaSelector>) -> Result<Self> {
+        if shards.is_empty() {
+            bail!("Replicated requires at least one shard");
         }
         let mut by_id = HashMap::new();
-        for m in &members {
-            let id = m.instance().id.clone();
-            if by_id.insert(id.clone(), m.clone()).is_some() {
-                bail!("duplicate Replicated member instance id {id:?}");
+        let mut shard_of = HashMap::new();
+        let mut members = Vec::new();
+        let mut out = Vec::new();
+        for (i, (group, write_quorum)) in shards.into_iter().enumerate() {
+            if group.is_empty() {
+                bail!("shard {i} requires at least one member");
             }
+            if write_quorum == 0 || write_quorum > group.len() {
+                bail!("write_quorum {write_quorum} out of range for {} members", group.len());
+            }
+            for m in &group {
+                let id = m.instance().id.clone();
+                if by_id.insert(id.clone(), m.clone()).is_some() {
+                    bail!("duplicate Replicated member instance id {id:?}");
+                }
+                shard_of.insert(id, i);
+                members.push(m.clone());
+            }
+            out.push(Shard { members: group, write_quorum, writing: Arc::default() });
         }
         Ok(Self {
             members,
             by_id,
-            write_quorum,
+            shards: out,
+            shard_of,
+            next_shard: AtomicUsize::new(0),
             selector,
             member_timeout: Duration::from_secs(60),
             pins: UploadPins::shared(),
@@ -254,16 +290,23 @@ impl Replicated {
         &self.pins
     }
 
+    /// Every member of every shard.
     pub fn members(&self) -> &[Arc<dyn DynBlobBackend>] {
         &self.members
     }
 
-    pub fn member(&self, instance_id: &str) -> Option<&Arc<dyn DynBlobBackend>> {
-        self.by_id.get(instance_id)
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
     }
 
-    pub fn write_quorum(&self) -> usize {
-        self.write_quorum
+    /// The members of `instance_id`'s shard (itself included): where every
+    /// chunk stored on it should have a replica.
+    pub fn shard_peers(&self, instance_id: &str) -> Option<&[Arc<dyn DynBlobBackend>]> {
+        self.shard_of.get(instance_id).map(|&i| self.shards[i].members.as_slice())
+    }
+
+    pub fn member(&self, instance_id: &str) -> Option<&Arc<dyn DynBlobBackend>> {
+        self.by_id.get(instance_id)
     }
 
     pub fn selector(&self) -> &Arc<dyn ReplicaSelector> {
@@ -278,9 +321,19 @@ impl Replicated {
             .unwrap_or(0)
     }
 
+    /// A writer for one chunk on the least loaded shard (fewest open
+    /// writers; ties rotate, so sequential writes go round-robin).
     pub fn chunk_writer(&self) -> ChunkReplicaWriter {
+        let n = self.shards.len();
+        let start = self.next_shard.fetch_add(1, Ordering::Relaxed) % n;
+        let shard = (0..n)
+            .map(|k| &self.shards[(start + k) % n])
+            .min_by_key(|s| s.writing.load(Ordering::Relaxed))
+            .expect("at least one shard");
+        shard.writing.fetch_add(1, Ordering::Relaxed);
         ChunkReplicaWriter {
-            writers: self
+            _slot: ShardSlot(shard.writing.clone()),
+            writers: shard
                 .members
                 .iter()
                 .map(|m| MemberWriter {
@@ -290,7 +343,7 @@ impl Replicated {
                     failed: false,
                 })
                 .collect(),
-            write_quorum: self.write_quorum,
+            write_quorum: shard.write_quorum,
             timeout: self.member_timeout,
             pins: Vec::new(),
         }
@@ -367,8 +420,18 @@ struct MemberWriter {
     failed: bool,
 }
 
-/// Parallel per-member packers for one chunk.
+/// Counts an open chunk writer against its shard's load.
+struct ShardSlot(Arc<AtomicUsize>);
+
+impl Drop for ShardSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Parallel per-member packers for one chunk (the members of one shard).
 pub struct ChunkReplicaWriter {
+    _slot: ShardSlot,
     writers: Vec<MemberWriter>,
     write_quorum: usize,
     timeout: Duration,
@@ -954,6 +1017,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got_both, expect);
+    }
+
+    #[tokio::test]
+    async fn shards_take_turns_and_keep_a_chunk_in_one_shard() {
+        let (a1, a2, b) = (MockMem::new("a1", 1024), MockMem::new("a2", 1024), MockMem::new("b", 1024));
+        let rep = Replicated::sharded(
+            vec![(vec![a1.erase(), a2.erase()], 2), (vec![b.erase()], 1)],
+            Arc::new(CheapestFirst::new()),
+        )
+        .unwrap();
+        assert_eq!(rep.shard_count(), 2);
+        assert_eq!(rep.members().len(), 3);
+        let peers: Vec<_> = rep.shard_peers("a2").unwrap().iter().map(|m| m.instance().id.clone()).collect();
+        assert_eq!(peers, vec!["a1", "a2"]);
+
+        let mut on = Vec::new();
+        for i in 0..4u8 {
+            let layouts = write_blocks(&rep, &[block(i, 100)]).await.unwrap();
+            let mut ids: Vec<_> = layouts.iter().map(|l| l.instance.clone()).collect();
+            ids.sort();
+            let got = collect_stream(rep.read(&layouts, 0..1).await.unwrap()).await.unwrap();
+            assert_eq!(got, Bytes::from(vec![i; 100]));
+            on.push(ids);
+        }
+        let shard_a = vec!["a1".to_string(), "a2".to_string()];
+        let shard_b = vec!["b".to_string()];
+        assert_eq!(on, vec![shard_a.clone(), shard_b.clone(), shard_a.clone(), shard_b.clone()], "round-robin");
+
+        // A chunk still being written loads its shard: the next goes elsewhere.
+        let open = rep.chunk_writer();
+        let busy = open.writers.iter().map(|w| w.instance.clone()).next().unwrap();
+        for _ in 0..3 {
+            let layouts = write_blocks(&rep, &[block(7, 10)]).await.unwrap();
+            assert!(layouts.iter().all(|l| l.instance != busy), "{busy} is busy");
+        }
+        drop(open);
     }
 
     #[tokio::test]

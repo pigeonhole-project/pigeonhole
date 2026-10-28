@@ -26,7 +26,7 @@ pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
 pub use rate_limit::{ChatLimiter, ChatLimiterConfig, LimitBudget};
 pub use replicated::{
     CheapestFirst, ChunkReplicaWriter, InstanceId, PartLayout, ReplicaLayout, ReplicaSelector,
-    Replicated, SealedChunk,
+    Replicated, SealedChunk, ShardSpec,
 };
 pub use typed::{
     load_id, store_id, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
