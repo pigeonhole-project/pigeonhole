@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use moka::future::Cache as MokaCache;
 use reqwest::multipart::{Form, Part};
-use pigeonhole_blob::{ChatLimiter, DeleteOutcome};
+use pigeonhole_blob::{ChatLimiter, DeleteOutcome, RateLimited};
 use serde::Deserialize;
 use std::time::Duration;
 use tracing::debug;
@@ -41,21 +41,6 @@ struct ApiResponse<T> {
 struct ResponseParameters {
     retry_after: Option<i64>,
 }
-
-/// Telegram answered 429: the call was not applied; retry after this long.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RateLimited {
-    pub method: &'static str,
-    pub retry_after: Duration,
-}
-
-impl std::fmt::Display for RateLimited {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: Too Many Requests, retry after {:?}", self.method, self.retry_after)
-    }
-}
-
-impl std::error::Error for RateLimited {}
 
 /// `Some` if `body` is a 429 answer: how long to wait.
 fn rate_limited<T>(method: &'static str, status: reqwest::StatusCode, body: &ApiResponse<T>) -> Option<RateLimited> {

@@ -5,6 +5,7 @@
 mod client;
 mod store;
 
-pub use client::{Chat, ChatMember, Document, Message, RateLimited, TelegramClient, TgUser, DELETE_MESSAGES_MAX};
+pub use client::{Chat, ChatMember, Document, Message, TelegramClient, TgUser, DELETE_MESSAGES_MAX};
+pub use pigeonhole_blob::RateLimited;
 pub use pigeonhole_blob::{DeleteOutcome, BlobBackend};
 pub use store::{TelegramBackend, TelegramBlobStore, TelegramId};
