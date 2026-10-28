@@ -202,16 +202,8 @@ The chat log protocol (`meta/pigeonhole-meta/src/log/chat.rs`) changes:
 Each step ends with `cargo test --workspace` and
 `./scripts/check-deps.sh --strict` green; one logical change per commit.
 
-1. ~~**Spike**~~ Done, see Spike findings. (Throwaway binary, not merged; it ran against a
-   real test channel (ids/token: see the local `.env`): bot login over
-   grammers; `channels.getMessages` on a channel; upload / download of a
-   ≥ 50 MiB document and the real size ceiling for a bot; ranged `getFile`;
-   provoke `FILE_REFERENCE_EXPIRED` (or confirm references survive);
-   `FLOOD_WAIT` behaviour at our send rates; **what grammers does with a
-   request whose future is dropped** (if it is still sent later, the
-   straggler window's premise "a send lands within `CALL_DEADLINE` or never"
-   breaks — then the log needs its own connection that is torn down at the
-   deadline); cheapest `top_id()`. Write the findings into this doc.
+1. ~~**Spike**~~ Done: a throwaway binary against the test channels (not
+   merged); results in Spike findings above.
 2. **Crate** `pigeonhole-storage-telegram-mtproto`: client behind a small trait
    (`getMessages`, `getFile`, `saveBigFilePart` + `sendMedia`,
    `deleteMessages`) with a fake implementation; `BlobBackend` + `Sweepable`;

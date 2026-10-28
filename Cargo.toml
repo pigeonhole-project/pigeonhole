@@ -13,7 +13,7 @@ members = [
     "crates/gateway/pigeonhole-gateway-s3",
     "crates/gateway/pigeonhole-gateway-bytestream",
     "crates/bin/pigeonhole",
-    "crates/testing/pigeonhole-testkit",
+    "crates/testing/pigeonhole-testkit", ".cache/mtproto-spike",
 ]
 default-members = ["crates/bin/pigeonhole"]
 
