@@ -18,7 +18,7 @@ pub use config::{
     PlacementConfig, ShardPlacement,
 };
 pub use layer::{
-    check_block_fits_members, default_layer_opts, ChunkId, ChunkStore, Extent, Ingested,
+    check_block_fits_members, default_layer_opts, ChunkId, ChunkStore, Committing, Extent, Ingested, PendingChunks,
 };
 pub use instances::{
     check_fingerprints, discord_fingerprint, discord_location, memory_instance,

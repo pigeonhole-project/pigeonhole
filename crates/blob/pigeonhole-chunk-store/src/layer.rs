@@ -3,6 +3,8 @@
 //! Gateways see only [`ChunkId`] / [`Extent`] — not locators or instances.
 
 use crate::blob_db::{BlobDb, StoredBlock};
+use crate::commands::ChunkState;
+use pigeonhole_meta::{Outcomes, Proposal, Prepared, Slot};
 use crate::block_cache::BlockCache;
 use crate::ingest::IngestOptions;
 use anyhow::{bail, Context, Result};
@@ -33,6 +35,78 @@ pub struct Ingested {
     pub crc32: u32,
     /// Extra checksums (hex digests) for gateways; always includes md5/crc32 keys.
     pub checksums: BTreeMap<String, String>,
+    /// The chunks of `extents`, uploaded but not committed: commit them (in
+    /// the entry of whatever points at them) before using the extents.
+    pub chunks: PendingChunks,
+}
+
+/// Chunks uploaded and sealed but not committed. Their parts stay protected
+/// from the orphan sweep (upload pins) until the commit is applied; dropped
+/// uncommitted, they become orphans the sweeper deletes. Nothing else is
+/// ever needed to undo them.
+#[must_use = "commit the chunks, or drop them to leave their parts to the sweeper"]
+#[derive(Default)]
+pub struct PendingChunks {
+    chunks: Vec<PendingChunk>,
+}
+
+struct PendingChunk {
+    chunk_id: ChunkId,
+    commit: Prepared<ChunkState>,
+    layouts: Vec<pigeonhole_blob::ReplicaLayout>,
+    pins: Vec<pigeonhole_blob::UploadPin>,
+}
+
+impl std::fmt::Debug for PendingChunks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.chunks.iter().map(|c| c.chunk_id)).finish()
+    }
+}
+
+impl PendingChunks {
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Add the commits to `proposal`; once it is committed, finish with
+    /// [`Committing::done`].
+    pub fn propose_in(self, proposal: &mut Proposal) -> Committing {
+        let mut slots = Vec::with_capacity(self.chunks.len());
+        let mut rest = Vec::with_capacity(self.chunks.len());
+        for c in self.chunks {
+            slots.push(proposal.push(c.commit));
+            rest.push((c.chunk_id, c.layouts, c.pins));
+        }
+        Committing { slots, chunks: rest }
+    }
+}
+
+/// Chunk commits inside a proposal on its way.
+#[must_use = "finish with done() once the proposal is committed"]
+pub struct Committing {
+    slots: Vec<Slot<ChunkState>>,
+    chunks: Vec<(ChunkId, Vec<pigeonhole_blob::ReplicaLayout>, Vec<pigeonhole_blob::UploadPin>)>,
+}
+
+impl Committing {
+    /// Check the commits were applied, queue repair for replicas the write
+    /// missed, and release the upload pins.
+    pub async fn done(self, store: &ChunkStore, outcomes: &mut Outcomes) -> Result<()> {
+        for slot in self.slots {
+            if let Err(reason) = outcomes.take(slot)? {
+                bail!("chunk commit rejected: {reason:?}");
+            }
+        }
+        for (chunk_id, layouts, pins) in self.chunks {
+            store.enqueue_missing_replicas(chunk_id, &layouts).await?;
+            drop(pins);
+        }
+        Ok(())
+    }
 }
 
 /// Blob layer: metadata (`blob.db`) + replicated typed backends.
@@ -161,6 +235,23 @@ impl ChunkStore {
         self.db.retain(ids).await
     }
 
+    /// Commit `chunks` alone (one entry), for callers with nothing to commit
+    /// along with them.
+    pub async fn commit(&self, chunks: PendingChunks) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let mut proposal = Proposal::new();
+        let committing = chunks.propose_in(&mut proposal);
+        let mut outcomes = self.db.meta().propose_all(proposal).await?;
+        committing.done(self, &mut outcomes).await
+    }
+
+    /// The tablet the chunk state lives in (to propose prepared commands).
+    pub fn meta(&self) -> &Arc<pigeonhole_meta::MetaStore> {
+        self.db.meta()
+    }
+
     pub async fn release(&self, ids: &[ChunkId]) -> Result<()> {
         self.db.release(ids).await
     }
@@ -177,6 +268,17 @@ impl ChunkStore {
             o
         });
         self.ingest_blocks(&mut stream, opts).await
+    }
+
+    /// [`Self::ingest`] and commit the chunks at once (one entry), for
+    /// callers with nothing to commit along with them.
+    pub async fn ingest_and_commit<S>(&self, stream: S, opts: Option<IngestOptions>) -> Result<Ingested>
+    where
+        S: futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
+    {
+        let mut ingested = self.ingest(stream, opts).await?;
+        self.commit(std::mem::take(&mut ingested.chunks)).await?;
+        Ok(ingested)
     }
 
     /// Read a logical byte range across extents (None = entire concatenation).
@@ -445,6 +547,7 @@ impl ChunkStore {
         let mut md5 = Md5::new();
         let mut crc = crc32fast::Hasher::new();
         let mut extents = Vec::new();
+        let mut pending = PendingChunks::default();
         let mut total = 0i64;
 
         let mut block_buf = Vec::with_capacity(block_size);
@@ -466,7 +569,7 @@ impl ChunkStore {
                         // Seal chunk under pressure so open-part + block budget can free.
                         if b.available_permits() < block_size && open.logical > 0 {
                             extents.push(
-                                self.seal_open_chunk(&mut open, &budget)
+                                self.seal_open_chunk(&mut open, &budget, &mut pending)
                                     .await?,
                             );
                         }
@@ -488,7 +591,7 @@ impl ChunkStore {
                     )
                     .await?;
                     if open.logical >= chunk_logical as i64 {
-                        extents.push(self.seal_open_chunk(&mut open, &budget).await?);
+                        extents.push(self.seal_open_chunk(&mut open, &budget, &mut pending).await?);
                     }
                 }
             }
@@ -506,7 +609,7 @@ impl ChunkStore {
             .await?;
         }
         if open.logical > 0 || !open.blocks.is_empty() {
-            extents.push(self.seal_open_chunk(&mut open, &budget).await?);
+            extents.push(self.seal_open_chunk(&mut open, &budget, &mut pending).await?);
         }
 
         let digest = md5.finalize();
@@ -522,6 +625,7 @@ impl ChunkStore {
             md5: md5_bytes,
             crc32,
             checksums,
+            chunks: pending,
         })
     }
 
@@ -587,6 +691,7 @@ impl ChunkStore {
         &self,
         open: &mut OpenChunk,
         _budget: &Option<ByteBudget>,
+        pending: &mut PendingChunks,
     ) -> Result<Extent> {
         let blocks = std::mem::take(&mut open.blocks);
         let logical = open.logical;
@@ -601,14 +706,10 @@ impl ChunkStore {
             h.update(b.codec.as_bytes());
         }
         let crc = h.finalize();
-        let chunk_id = self
-            .db
-            .commit_chunk(logical, crc, &blocks, &sealed.layouts)
-            .await?;
-        self.enqueue_missing_replicas(chunk_id, &sealed.layouts)
-            .await?;
-        // Unpin the uploads only once the commit is applied.
-        drop(sealed.pins);
+        // Committed by the caller, with whatever points at it; the uploads
+        // stay pinned until then.
+        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts);
+        pending.chunks.push(PendingChunk { chunk_id, commit, layouts: sealed.layouts, pins: sealed.pins });
         Ok(Extent {
             chunk: chunk_id,
             offset: 0,
@@ -696,7 +797,7 @@ mod tests {
             joins.push(tokio::spawn(async move {
                 let body = Bytes::from(vec![i; 256 * 1024]);
                 layer
-                    .ingest(
+                    .ingest_and_commit(
                         stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]),
                         None,
                     )
@@ -712,6 +813,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ingest_commits_its_chunks_in_one_entry_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer = open_memory_chunk_store(dir.path().join("blob.log")).await.unwrap();
+        let body = Bytes::from(vec![3u8; 200_000]);
+        let before = layer.meta().applied_position();
+
+        // Uploaded, not committed: nothing in the state, nothing readable.
+        let ing = layer.ingest(stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]), None).await.unwrap();
+        assert!(ing.chunks.len() >= 3, "several chunks: {:?}", ing.chunks);
+        assert_eq!(layer.meta().applied_position(), before);
+        assert!(layer.read(&ing.extents, None).await.is_err());
+
+        layer.commit(ing.chunks).await.unwrap();
+        assert_eq!(layer.meta().applied_position(), before + 1, "every chunk in one entry");
+        assert_eq!(layer.read(&ing.extents, None).await.unwrap(), body);
+
+        // Dropped uncommitted: the chunk ids are never known to the state.
+        let ing = layer.ingest(stream::iter(vec![Ok::<_, anyhow::Error>(body)]), None).await.unwrap();
+        let id = ing.extents[0].chunk;
+        drop(ing);
+        assert!(layer.db().chunk_meta(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn ingest_read_retain_release_root() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
@@ -719,7 +844,7 @@ mod tests {
 
         let body = Bytes::from(vec![7u8; 200_000]);
         let ingested = layer
-            .ingest(stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]), None)
+            .ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]), None)
             .await
             .unwrap();
         assert_eq!(ingested.size, body.len() as i64);
@@ -790,7 +915,7 @@ mod tests {
             }
             Some((Ok::<_, anyhow::Error>(Bytes::from(v)), off + len))
         });
-        let ingested = layer.ingest(Box::pin(body_stream), None).await.unwrap();
+        let ingested = layer.ingest_and_commit(Box::pin(body_stream), None).await.unwrap();
         assert_eq!(ingested.size, n as i64);
 
         let expect: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
@@ -876,7 +1001,7 @@ mod tests {
         let layer = ChunkStore::open_replicated(db, rep, opts).await.unwrap();
         let data = Bytes::from(vec![9u8; 3 * MIB]);
         let ingested = layer
-            .ingest(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None)
+            .ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None)
             .await
             .unwrap();
         flag.store(true, Ordering::Relaxed);
@@ -908,7 +1033,7 @@ mod tests {
             Some((Ok::<_, anyhow::Error>(Bytes::from(vec![0u8; len])), off + len))
         });
         let r = layer
-            .ingest(Box::pin(body), None)
+            .ingest_and_commit(Box::pin(body), None)
             .await
             .expect("300 MiB ingest under 32 MiB budget");
         assert_eq!(r.size, n as i64);
@@ -941,7 +1066,7 @@ mod tests {
                     let len = (n - off).min(piece);
                     Some((Ok::<_, anyhow::Error>(Bytes::from(vec![1u8; len])), off + len))
                 });
-                layer.ingest(Box::pin(body), None).await
+                layer.ingest_and_commit(Box::pin(body), None).await
             }));
         }
         for j in joins {
@@ -980,7 +1105,7 @@ mod tests {
                     let len = (n - off).min(piece);
                     Some((Ok::<_, anyhow::Error>(Bytes::from(vec![3u8; len])), off + len))
                 });
-                layer.ingest(Box::pin(body), None).await
+                layer.ingest_and_commit(Box::pin(body), None).await
             }));
         }
         let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
@@ -1026,7 +1151,7 @@ mod tests {
                 Some((Ok::<_, anyhow::Error>(Bytes::from(vec![2u8; len])), off + len))
             });
             let _ = budget_c;
-            layer_c.ingest(Box::pin(body), None).await
+            layer_c.ingest_and_commit(Box::pin(body), None).await
         });
         for _ in 0..200 {
             if budget.available_permits() < budget.capacity() {

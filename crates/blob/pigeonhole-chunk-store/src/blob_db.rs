@@ -9,7 +9,7 @@ use crate::commands::{ChunkCommand, ChunkRec, ChunkReject, ChunkState, InstanceR
 use anyhow::{bail, Result};
 use chrono::Utc;
 use pigeonhole_blob::{InstanceInfo, ReplicaLayout};
-use pigeonhole_meta::{MetaStore, Namespaces};
+use pigeonhole_meta::{MetaStore, Namespaces, Prepared, Proposal};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -210,17 +210,39 @@ impl BlobDb {
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
     ) -> Result<ChunkId> {
+        let (chunk_id, prepared) = self.prepare_commit(logical_size, crc32, blocks, replicas);
+        let mut proposal = Proposal::new();
+        let slot = proposal.push(prepared);
+        match self.meta.propose_all(proposal).await?.take(slot)? {
+            Ok(()) => Ok(chunk_id),
+            Err(reason) => bail!("unexpected rejection {reason:?}"),
+        }
+    }
+
+    /// The `CommitChunk` of a new chunk (its id chosen now), to be proposed
+    /// with other commands in one entry. Never rejected.
+    pub fn prepare_commit(
+        &self,
+        logical_size: i64,
+        crc32: u32,
+        blocks: &[StoredBlock],
+        replicas: &[ReplicaLayout],
+    ) -> (ChunkId, Prepared<ChunkState>) {
         let chunk_id = self.next_chunk_id.fetch_add(1, Ordering::SeqCst);
-        self.propose_infallible(ChunkCommand::CommitChunk {
+        let command = ChunkCommand::CommitChunk {
             chunk_id,
             logical_size,
             crc32,
             blocks: blocks.to_vec(),
             replicas: replicas.iter().map(Replica::from).collect(),
             created_at: Utc::now().to_rfc3339(),
-        })
-        .await?;
-        Ok(chunk_id)
+        };
+        (chunk_id, Prepared::new(&command))
+    }
+
+    /// The tablet this layer's state lives in.
+    pub fn meta(&self) -> &Arc<MetaStore> {
+        &self.meta
     }
 
     /// Atomically bump refs for every id. Fails with [`ChunkGone`] (nothing retained)

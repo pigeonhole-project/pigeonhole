@@ -146,7 +146,7 @@ impl CasStore {
         opts.block_size = 1024 * 1024;
         let ingested = self
             .store
-            .ingest(stream, Some(opts))
+            .ingest_and_commit(stream, Some(opts))
             .await
             .context("CAS ingest")?;
         let new_ids: Vec<_> = {

@@ -425,7 +425,7 @@ mod tests {
         let n = 18 * MIB;
         let body = Bytes::from((0..n).map(|i| (i % 251) as u8).collect::<Vec<_>>());
         let ingested = layer
-            .ingest(
+            .ingest_and_commit(
                 stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]),
                 None,
             )
@@ -562,7 +562,7 @@ mod tests {
 
         let data = Bytes::from(vec![7u8; 3 * MIB]);
         let ingested = layer
-            .ingest(
+            .ingest_and_commit(
                 stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]),
                 None,
             )

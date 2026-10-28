@@ -884,7 +884,7 @@ impl S3 for S3Gateway {
 
         let ingested = self
             .store
-            .ingest(stream, Some(self.ingest_options()))
+            .ingest_and_commit(stream, Some(self.ingest_options()))
             .await
             .map_err(Self::map_err)?;
 
@@ -1344,7 +1344,7 @@ impl S3 for S3Gateway {
 
         let ingested = self
             .store
-            .ingest(stream, Some(self.ingest_options()))
+            .ingest_and_commit(stream, Some(self.ingest_options()))
             .await
             .map_err(Self::map_err)?;
 
