@@ -1,6 +1,6 @@
 # Telegram over MTProto (bot token)
 
-Status: **proposal**. A brief for implementing a second Telegram backend that
+Status: **proposal**; spike done (see Spike findings). A brief for implementing a second Telegram backend that
 talks MTProto instead of the Bot API, still logged in as a **bot** (no user
 account). Read [roadmap.md](roadmap.md) § Ground rules,
 [meta-backends.md](meta-backends.md), [sweep-invariants.md](sweep-invariants.md)
@@ -88,14 +88,17 @@ chat_id = -1001234567890
   and retry once. Check the document's file name matches the expected
   `BlobId` when the caller knows it.
 - **put**: `upload.saveBigFilePart` (512 KiB parts, a few in parallel), then
-  `messages.sendMedia` with a random `random_id` (the server deduplicates a
-  resend with the same `random_id`, so a send may be retried after a network
-  error). Return the new `message_id`.
-- **get**: `upload.getFile` in windows: `offset % 4096 == 0`,
-  `limit % 4096 == 0`, `1 MiB % limit == 0`, a window never crosses a 1 MiB
-  boundary. A range is rounded out to windows and sliced. Pass
-  `cdn_supported = false`; follow `FILE_MIGRATE_X` (export/import auth to the
-  file's DC; grammers may do this already — check).
+  `messages.sendMedia` with a random `random_id`: the server deduplicates a
+  resend with the same `random_id` (also from another session: verified), so
+  a send may be retried after any error without a duplicate. Derive
+  `random_id` from the `BlobId` (a retry then can never post twice). Return
+  the new `message_id`.
+- **get**: `upload.getFile` in windows of at most **512 KiB** (grammers 0.11
+  asserts on a 1 MiB answer: it exceeds an MTProto container), `offset %
+  4096 == 0`, `limit % 4096 == 0`, a window never crossing a 1 MiB boundary.
+  A range is rounded out to windows and sliced; windows of one blob can be
+  fetched in parallel (~360 ms per 512 KiB window measured, single stream).
+  Pass `cdn_supported = false`; follow `FILE_MIGRATE_X`.
 - **delete**: `channels.deleteMessages` (≤ 100 ids per call); missing ids are
   success.
 - **Sweepable / listing**: candidates are produced by reading id ranges up to
@@ -132,10 +135,20 @@ The chat log protocol (`meta/pigeonhole-meta/src/log/chat.rs`) changes:
   then find the head: `top_id()`, walk back in batches of 100 with
   `get_docs` to the first message that decodes as a log message of this
   `log_id`; follow `prev` links as now.
-- **Stragglers**: unchanged reasoning. A deposed writer's batch landing inside
-  the window is the newest by id and links to its own complete chain (as its
-  pin did). One landing after the window is overtaken by the next message of
-  the new generation, which has a higher id.
+- **The head is the newest log message by (generation, id)**, not by id: a
+  deposed writer's message can land arbitrarily late (see Spike findings: a
+  dropped grammers future still sends), and a later id must not make it the
+  head over a newer generation. Every claim writes its own (empty) message
+  right away, so the claiming generation always has one. Finding the head:
+  walk down from the top in batches of 100; the claimant knows the previous
+  generation from the description it overwrote, so the head is the first
+  message of that generation met on the way down (lower generations above it
+  are stragglers, skipped); if that generation has none (it crashed between
+  its description write and its claim message), continue to the next lower.
+- **Stragglers** then need no time bound for safety: a straggler has a lower
+  generation and never becomes the head. The straggler window becomes an
+  optimisation (fewer stragglers to skip) and may go away; decide with the
+  Raft node design (a node's log has one writer anyway).
 - **Semantics change to document**: today a message sent but never pinned
   (writer died between send and pin) cannot become the head; without pins it
   can. Entries never acknowledged may survive, which a Raft log allows. State
@@ -149,12 +162,47 @@ The chat log protocol (`meta/pigeonhole-meta/src/log/chat.rs`) changes:
   same, so probe forward from a known id, or send a message — a claim writes
   anyway). For the Bot API: send a message and take its id.
 
+## Spike findings (2026-10-28, grammers 0.11.0, bot token, test channels)
+
+- **Login**: `auth.importBotAuthorization` (grammers `bot_sign_in`) in 1.8 s;
+  the SQLite session then makes later starts authorised at once (~250 ms).
+- **No access hash needed**: `channels.getChannels` with `access_hash = 0`
+  works for a bot that is admin of the channel and returns the real hash.
+- **Listing works**: `channels.getMessages` for 25–70 ids in 60–100 ms.
+  Answers: our documents (file name, size, dc), `messageService` for id 1
+  ("channel created"), `messageEmpty` for deleted ids **and** for ids past the
+  top (indistinguishable).
+- **Top id**: not exposed by `channels.getFullChannel` (`read_outbox_max_id`
+  is 0 for a bot); the id of a message we send is the top. A claim sends one
+  anyway; a reader walks down from the last id it knows.
+- **Fence reads are cheap**: `channels.getFullChannel` (the description,
+  `about`) 30 times in a row in 3.2 s (~105 ms each), no flood wait.
+- **Send rate per channel is the Bot API's**: 40 `sendMedia` back to back
+  took 80 s: bursts of ~5, then FLOOD_WAIT 3–5 s, and a 40 s wait near the
+  end: ~20–30 messages a minute sustained. The win is one message per log
+  append (no pin, no pin service message), not a higher limit.
+- **Idempotent sends**: a resend with the same `random_id` returns the same
+  message (also from a later session).
+- **A dropped future still sends**: `sendMedia` cut by a 20 ms timeout was
+  posted anyway. The request is queued in the sender pool and goes out when it
+  goes out; "lands within `CALL_DEADLINE` or never" does not hold. Hence the
+  (generation, id) head rule above.
+- **grammers retries flood waits itself** (`AutoSleep`, below a threshold):
+  use `NoRetries` for our calls and let the `ChatLimiter` handle
+  `FLOOD_WAIT_X` as it handles 429s (one rate-limited error type).
+- **Big files**: 60 MB uploaded in 2.3 s, 300 MB in 16 s (~20 MB/s, 4 parallel
+  parts); reads at any 4 KiB-aligned offset; `getFile` windows ≤ 512 KiB.
+  The bot size ceiling is above our 256 MiB chunk limit (not probed further).
+- **File references** (33 bytes) were fresh on every fetch; expiry not
+  provoked (re-fetching by `getMessages` on `FILE_REFERENCE_EXPIRED` stays the
+  plan).
+
 ## Steps
 
 Each step ends with `cargo test --workspace` and
 `./scripts/check-deps.sh --strict` green; one logical change per commit.
 
-1. **Spike** (throwaway binary or `examples/`, not merged as is), against a
+1. ~~**Spike**~~ Done, see Spike findings. (Throwaway binary, not merged; it ran against a
    real test channel (ids/token: see the local `.env`): bot login over
    grammers; `channels.getMessages` on a channel; upload / download of a
    ≥ 50 MiB document and the real size ceiling for a bot; ranged `getFile`;
@@ -187,5 +235,6 @@ Each step ends with `cargo test --workspace` and
   to a scratch chat to read the head) or become blob-only?
 - Chunk size is global (`[chunk] size`); with ≫ 20 MiB blobs on one store and
   Discord / Bot API stores beside it, should it become per store?
-- Flood limits for a bot over MTProto vs the Bot API: same per-chat ~20
-  messages/min for sends? Measure before choosing `ChatLimiter` defaults.
+- Flood limits: measured, the same ~20–30 sends a minute per channel; keep the
+  `ChatLimiter` send default (18/min) for both transports.
+- Does the straggler window stay once the head is chosen by (generation, id)?
