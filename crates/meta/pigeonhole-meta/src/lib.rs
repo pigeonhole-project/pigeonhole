@@ -35,6 +35,7 @@ use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::any::Any;
+use std::marker::PhantomData;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -100,6 +101,86 @@ pub fn decode_state<S: StateMachine>(data: &[u8]) -> Result<S> {
     let mut state: S = postcard::from_bytes(data).with_context(|| format!("decode {} state", S::NAME))?;
     state.rebuild();
     Ok(state)
+}
+
+/// A command for `S`, built by the layer that owns `S` and opaque to anyone
+/// else: a caller may order and propose it ([`Proposal`]) without seeing it.
+pub struct Prepared<S: StateMachine> {
+    command: Command,
+    _s: PhantomData<fn() -> S>,
+}
+
+impl<S: StateMachine> Prepared<S> {
+    pub fn new(command: &S::Command) -> Self {
+        Self { command: self::command::<S>(command), _s: PhantomData }
+    }
+}
+
+impl<S: StateMachine> fmt::Debug for Prepared<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Prepared<{}>", S::NAME)
+    }
+}
+
+/// Commands to commit as one entry ([`MetaStore::propose_all`]).
+#[derive(Default)]
+pub struct Proposal {
+    commands: Vec<Command>,
+}
+
+/// Where the outcome of one command of a [`Proposal`] is.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Slot<S> {
+    index: usize,
+    _s: PhantomData<fn() -> S>,
+}
+
+impl<S> Clone for Slot<S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S> Copy for Slot<S> {}
+
+impl Proposal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push<S: StateMachine>(&mut self, prepared: Prepared<S>) -> Slot<S> {
+        self.commands.push(prepared.command);
+        Slot { index: self.commands.len() - 1, _s: PhantomData }
+    }
+
+    pub fn extend<S: StateMachine>(&mut self, prepared: impl IntoIterator<Item = Prepared<S>>) -> Vec<Slot<S>> {
+        prepared.into_iter().map(|p| self.push(p)).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+}
+
+/// The outcomes of a committed [`Proposal`].
+pub struct Outcomes {
+    outcomes: Vec<Option<Vec<u8>>>,
+}
+
+impl Outcomes {
+    /// The outcome of the command at `slot` (each taken once).
+    pub fn take<S: StateMachine>(&mut self, slot: Slot<S>) -> Result<Outcome<S>> {
+        let bytes = self
+            .outcomes
+            .get_mut(slot.index)
+            .and_then(Option::take)
+            .with_context(|| format!("no outcome at {} (taken already?)", slot.index))?;
+        postcard::from_bytes(&bytes).with_context(|| format!("decode the outcome of a {} command", S::NAME))
+    }
 }
 
 /// One layer command: what an entry's payload holds. `version` is the
@@ -266,13 +347,15 @@ impl Default for MetaOptions {
 
 pub(crate) type States = HashMap<&'static str, Arc<dyn AnyState>>;
 
-/// A proposal waiting for its batch: answered with its position and outcome.
+/// A proposal waiting for its batch: one or more commands that go into one
+/// entry together, answered with the entry's position and their outcomes.
 struct Pending {
-    command: Command,
-    reply: tokio::sync::oneshot::Sender<Result<(Position, Vec<u8>)>>,
+    commands: Vec<Command>,
+    reply: tokio::sync::oneshot::Sender<Result<(Position, Vec<Vec<u8>>)>>,
 }
 
-/// Commands per Raft entry at most.
+/// Commands per Raft entry at most, unless one proposal alone has more (a
+/// proposal is never split across entries).
 const MAX_BATCH: usize = 1024;
 
 /// Group commit: openraft 0.9 writes and flushes one entry per
@@ -280,27 +363,45 @@ const MAX_BATCH: usize = 1024;
 /// the next entry (one fsync, one chat message).
 async fn batcher(raft: raft::Raft, shared: Arc<raft::Shared>, mut rx: tokio::sync::mpsc::UnboundedReceiver<Pending>) {
     while let Some(first) = rx.recv().await {
+        let mut size = first.commands.len();
         let mut batch = vec![first];
-        while batch.len() < MAX_BATCH {
+        let mut next = None;
+        while size < MAX_BATCH {
             match rx.try_recv() {
-                Ok(p) => batch.push(p),
+                Ok(p) if size + p.commands.len() > MAX_BATCH => {
+                    next = Some(p);
+                    break;
+                }
+                Ok(p) => {
+                    size += p.commands.len();
+                    batch.push(p);
+                }
                 Err(_) => break,
             }
         }
-        let commands = batch.iter().map(|p| p.command.clone()).collect();
-        match raft.client_write(commands).await {
-            Ok(resp) => {
-                let position = raft::position(&resp.log_id);
-                for (p, outcome) in batch.into_iter().zip(resp.data) {
-                    let _ = p.reply.send(Ok((position, outcome)));
-                }
+        write_batch(&raft, &shared, batch).await;
+        if let Some(p) = next {
+            write_batch(&raft, &shared, vec![p]).await;
+        }
+    }
+}
+
+async fn write_batch(raft: &raft::Raft, shared: &raft::Shared, batch: Vec<Pending>) {
+    let commands = batch.iter().flat_map(|p| p.commands.iter().cloned()).collect();
+    match raft.client_write(commands).await {
+        Ok(resp) => {
+            let position = raft::position(&resp.log_id);
+            let mut outcomes = resp.data.into_iter();
+            for p in batch {
+                let mine = outcomes.by_ref().take(p.commands.len()).collect();
+                let _ = p.reply.send(Ok((position, mine)));
             }
-            Err(e) => {
-                let stop = shared.stop.borrow().clone().unwrap_or_else(|| Stop::Failed(e.to_string()));
-                shared.stop.send_replace(Some(stop.clone()));
-                for p in batch {
-                    let _ = p.reply.send(Err(stop.clone().into()));
-                }
+        }
+        Err(e) => {
+            let stop = shared.stop.borrow().clone().unwrap_or_else(|| Stop::Failed(e.to_string()));
+            shared.stop.send_replace(Some(stop.clone()));
+            for p in batch {
+                let _ = p.reply.send(Err(stop.clone().into()));
             }
         }
     }
@@ -523,14 +624,38 @@ impl MetaStore {
         if let Some(stop) = self.stop.borrow().clone() {
             return Err(stop.into());
         }
+        let mut proposal = Proposal::new();
+        let slot = proposal.push(Prepared::<S>::new(&command));
+        let (position, mut outcomes) = self.propose_all_at(proposal).await?;
+        Ok((position, outcomes.take(slot)?))
+    }
+
+    /// Commit every command of `proposal` in one entry, in order, and apply
+    /// each in its own namespace: all or none are durable, and a rejection of
+    /// one undoes nothing else. Outcomes are taken by the slots `push` gave.
+    pub async fn propose_all(&self, proposal: Proposal) -> Result<Outcomes> {
+        Ok(self.propose_all_at(proposal).await?.1)
+    }
+
+    /// [`Self::propose_all`], also returning the entry's log position.
+    pub async fn propose_all_at(&self, proposal: Proposal) -> Result<(Position, Outcomes)> {
+        for c in &proposal.commands {
+            if !self.has_namespace(&c.namespace) {
+                bail!("unknown namespace {:?}", c.namespace);
+            }
+        }
+        if let Some(stop) = self.stop.borrow().clone() {
+            return Err(stop.into());
+        }
+        if proposal.commands.is_empty() {
+            return Ok((self.applied_position(), Outcomes { outcomes: Vec::new() }));
+        }
         let (reply, rx) = tokio::sync::oneshot::channel();
-        if self.queue.send(Pending { command: self::command::<S>(&command), reply }).is_err() {
+        if self.queue.send(Pending { commands: proposal.commands, reply }).is_err() {
             bail!("the tablet's batcher is gone");
         }
-        let (position, outcome) = rx.await.context("the tablet's batcher dropped the proposal")??;
-        let outcome: Outcome<S> =
-            postcard::from_bytes(&outcome).with_context(|| format!("decode the outcome of a {} command", S::NAME))?;
-        Ok((position, outcome))
+        let (position, outcomes) = rx.await.context("the tablet's batcher dropped the proposal")??;
+        Ok((position, Outcomes { outcomes: outcomes.into_iter().map(Some).collect() }))
     }
 
     /// Prove the tablet still holds its generation: Raft confirms it leads

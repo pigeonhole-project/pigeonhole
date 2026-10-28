@@ -136,6 +136,74 @@ async fn unknown_namespace_fails_without_a_position() {
     assert!(MetaStore::open_local(dir.path().join("log2"), twice).await.is_err());
 }
 
+/// A second namespace: names seen, in order.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Names(Vec<String>);
+
+impl StateMachine for Names {
+    const NAME: &'static str = "names";
+    const VERSION: u32 = 1;
+    type Command = String;
+    type Reply = usize;
+    type Reject = Never;
+
+    fn apply(&mut self, name: String) -> Result<Outcome<Self>> {
+        self.0.push(name);
+        Ok(Ok(self.0.len()))
+    }
+}
+
+#[tokio::test]
+async fn propose_all_commits_commands_of_several_namespaces_as_one_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespaces::new().with::<Counter>().with::<Names>();
+    let store = MetaStore::open_local(dir.path().join("log"), ns).await.unwrap();
+    let booted = store.applied_position();
+
+    let mut p = Proposal::new();
+    let ups = p.extend([op(1, 5), op(2, -9), op(3, 1)].iter().map(Prepared::<Counter>::new));
+    let named = p.push(Prepared::<Names>::new(&"a".to_string()));
+    let (position, mut outcomes) = store.propose_all_at(p).await.unwrap();
+    assert_eq!(position, booted + 1, "one entry for all four");
+    assert_eq!(outcomes.take(ups[0]).unwrap(), Ok(5));
+    assert_eq!(outcomes.take(ups[1]).unwrap(), Err("negative".into()), "rejected on its own");
+    assert_eq!(outcomes.take(ups[2]).unwrap(), Ok(6), "applied after the rejection, in order");
+    assert_eq!(outcomes.take(named).unwrap(), Ok(1));
+    assert!(outcomes.take(named).is_err(), "an outcome is taken once");
+    assert_eq!(op_ids(&store), vec![1, 3]);
+
+    // Durable together: a new incarnation replays all of them.
+    drop(store);
+    let ns = Namespaces::new().with::<Counter>().with::<Names>();
+    let again = MetaStore::open_local(dir.path().join("log"), ns).await.unwrap();
+    assert_eq!(value(&again), 6);
+    assert_eq!(again.read::<Names, _>(|n| n.0.clone()), vec!["a".to_string()]);
+
+    // A fenced tablet fails the whole proposal.
+    let ns = Namespaces::new().with::<Counter>().with::<Names>();
+    let newer = MetaStore::open_local(dir.path().join("log"), ns).await.unwrap();
+    let mut p = Proposal::new();
+    p.push(Prepared::<Counter>::new(&op(4, 1)));
+    p.push(Prepared::<Names>::new(&"b".to_string()));
+    assert!(again.propose_all(p).await.is_err());
+    assert_eq!(value(&newer), 6);
+}
+
+#[tokio::test]
+async fn a_proposal_larger_than_a_batch_stays_one_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_on(dir.path()).await;
+    let booted = store.applied_position();
+    let mut p = Proposal::new();
+    p.extend((0..MAX_BATCH as u64 + 10).map(|i| Prepared::<Counter>::new(&op(i, 1))));
+    let small = store.propose_at::<Counter>(op(u64::MAX, 1));
+    let (big, small) = tokio::join!(store.propose_all_at(p), small);
+    let (big, small) = (big.unwrap().0, small.unwrap().0);
+    assert!(big == booted + 1 || big == booted + 2, "{big}");
+    assert_ne!(big, small);
+    assert_eq!(value(&store), MAX_BATCH as i64 + 11);
+}
+
 #[tokio::test]
 async fn concurrent_proposals_get_distinct_positions() {
     let dir = tempfile::tempdir().unwrap();
