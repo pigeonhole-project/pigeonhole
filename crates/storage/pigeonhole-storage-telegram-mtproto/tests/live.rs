@@ -94,3 +94,41 @@ async fn list() {
         lo += 100;
     }
 }
+
+/// A message is readable by id as soon as its send returns, also from another
+/// session (the log treats an empty id below a returned one as "not visible
+/// yet"). Posts to `TG_LOG_CHAT_ID` and deletes what it posted.
+#[tokio::test]
+#[ignore = "needs a Telegram bot, api id and a test channel"]
+async fn a_sent_message_is_visible_at_once() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let chat_id: i64 = env("TG_LOG_CHAT_ID").parse().unwrap();
+    let login = |session: &str| MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env("TG_BOT_TOKEN"),
+        session: root.join(".cache").join(session),
+    };
+    let limiter = || Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let writer = TelegramMtproto::connect(&login("tgm-live.session")).await.unwrap();
+    let reader = TelegramMtproto::connect(&login("tgm-live2.session")).await.unwrap();
+    let w = writer.channel(chat_id, Lane::Meta, limiter()).await.unwrap();
+    let r = reader.channel(chat_id, Lane::Meta, limiter()).await.unwrap();
+    let mut posted = Vec::new();
+    for k in 0..8 {
+        let id = w.send_document("visibility-probe.bin", Bytes::from_static(b"x"), k + uuid_like()).await.unwrap().message_id;
+        posted.push(id);
+        let seen = r.get_messages(&[id]).await.unwrap();
+        assert!(
+            matches!(seen[0], pigeonhole_storage_telegram_mtproto::ChannelMessage::Document { .. }),
+            "message {id} not visible to another session right after its send: {seen:?}"
+        );
+    }
+    println!("8 messages visible at once to another session: {posted:?}");
+    w.delete_messages(&posted).await.unwrap();
+}
+
+fn uuid_like() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64
+}

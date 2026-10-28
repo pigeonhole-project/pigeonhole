@@ -133,7 +133,7 @@ async fn racing_claims_leave_one_writer() {
 }
 
 #[tokio::test]
-async fn a_claim_visible_late_still_fences() {
+async fn a_claim_visible_late_still_fences_and_a_deleted_id_is_skipped() {
     let chat = Arc::new(FakeChannel::default());
     let a = store(&chat);
     a.claim(1).await.unwrap();
@@ -143,13 +143,15 @@ async fn a_claim_visible_late_still_fences() {
     store(&chat).claim(2).await.unwrap();
     assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Fenced { current: 2 })));
 
-    // One that stays invisible: the outcome is unknown, never Ok.
+    // A message deleted inside a checked range does not stop the log.
     let chat = Arc::new(FakeChannel::default());
     let a = store(&chat);
     a.claim(1).await.unwrap();
-    chat.hide_next(100);
-    store(&chat).claim(2).await.unwrap();
-    assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Other(_))));
+    let gone = chat.post_text();
+    chat.inner.lock().unwrap().messages.remove(&gone);
+    a.append(1, &[entry(1)]).await.unwrap();
+    let b = store(&chat);
+    assert_eq!(b.claim(2).await.unwrap().position, 1);
 }
 
 #[tokio::test]

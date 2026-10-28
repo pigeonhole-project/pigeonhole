@@ -26,9 +26,10 @@
 //! the highest valid batch, then check the claims between.
 //!
 //! Empty ids (`messageEmpty`: deleted, or not visible yet) inside a range the
-//! fence depends on are read again; one that stays empty makes the outcome
-//! unknown (`Other`). Nothing above the oldest batch a reader needs is ever
-//! deleted, and the probes `discover` sends stay.
+//! fence depends on are read again a few times, then taken as deleted. A sent
+//! message was readable at once in every live check, also from another
+//! session; the re-reads only cover a lag never seen. Our collection deletes
+//! nothing a fence check reads; someone deleting a claim by hand defeats it.
 
 use super::{
     Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position, LOG_FORMAT,
@@ -272,8 +273,8 @@ impl<C: ChannelApi> ChannelLogStore<C> {
         Ok(())
     }
 
-    /// Read the empty ids of `(lo, hi)` again until they show up; `Other`
-    /// if one stays empty.
+    /// Read the empty ids of `(lo, hi)` again a few times: a message that
+    /// is not visible yet shows up. One that stays empty was deleted.
     async fn settle(&self, view: &mut BTreeMap<i64, ChannelMsg>, lo: i64, hi: i64) -> LogResult<()> {
         for attempt in 0..=self.opts.empty_retries {
             let empty: Vec<i64> =
@@ -282,10 +283,8 @@ impl<C: ChannelApi> ChannelLogStore<C> {
                 return Ok(());
             }
             if attempt == self.opts.empty_retries {
-                return Err(LogError::Other(anyhow!(
-                    "message {} between {lo} and {hi} stays empty: deleted from the log channel, or not visible",
-                    empty[0]
-                )));
+                tracing::debug!(lo, hi, deleted = ?empty, "empty ids in a checked range: taken as deleted");
+                return Ok(());
             }
             tokio::time::sleep(self.opts.empty_retry_delay).await;
             for ids in empty.chunks(PAGE) {
