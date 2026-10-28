@@ -212,7 +212,7 @@ comments. Sections:
 | `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never), `log_straggler_window_secs` |
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
-| `[telegram]` | Separate send / getFile / delete budgets, upload/download concurrency |
+| `[telegram]` | Rate limits on two levels: per bot (`bot_rate_per_sec`) and per chat (send + pin / getFile / delete / info budgets); a 429 freezes the bucket it hit; upload/download concurrency |
 | `[cache]` | `file_path` LRU, L1 unpacked blocks, L2 memory/disk blob cache |
 | `[sweep]` | Garbage collector: `interval_secs`, `batch_size` |
 | `[repair]` | Replica repair/backfill: interval, batch, cost limit, `scrub` |

@@ -4,7 +4,7 @@ use crate::repair::{
     RepairConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
 };
 use crate::sweep::{SweepConfig, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};
-use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind};
+use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind, LimiterRegistry};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
 use anyhow::{bail, Context, Result};
@@ -53,6 +53,8 @@ pub struct Config {
     /// Process-wide ingest buffer budget (shared across PUTs).
     pub ingest_budget: Option<ByteBudget>,
     pub tg: ChatLimiterConfig,
+    /// One rate limiter per (bot, chat), sharing one per bot.
+    pub limiters: Arc<LimiterRegistry>,
     pub cache: CacheConfig,
     pub bytestream: BytestreamSettings,
     pub http: HttpSettings,
@@ -273,6 +275,7 @@ impl Config {
             chunk_codec,
             block_size,
             ingest_budget,
+            limiters: Arc::new(LimiterRegistry::new(tg.clone())),
             tg,
             cache: file.cache.into_cache_config()?,
             bytestream: file.bytestream.into_settings(),
@@ -284,6 +287,23 @@ impl Config {
             metrics: file.metrics.into_settings(),
             config_path,
         })
+    }
+
+    fn test_limits() -> ChatLimiterConfig {
+        ChatLimiterConfig {
+            bot_rate_per_sec: 1000.0,
+            bot_burst: 100.0,
+            send_rate_per_sec: 1000.0,
+            send_burst: 100.0,
+            get_file_rate_per_sec: 1000.0,
+            get_file_burst: 100.0,
+            delete_rate_per_sec: 1000.0,
+            delete_burst: 100.0,
+            info_rate_per_sec: 1000.0,
+            info_burst: 100.0,
+            upload_concurrency: 8,
+            download_concurrency: 8,
+        }
     }
 
     /// Defaults for in-process tests; metadata files go under `dir`.
@@ -298,16 +318,8 @@ impl Config {
             chunk_codec: ChunkCodec::Zstd,
             block_size: chunker::DEFAULT_BLOCK_SIZE,
             ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
-            tg: ChatLimiterConfig {
-                send_rate_per_sec: 1000.0,
-                send_burst: 100.0,
-                get_file_rate_per_sec: 1000.0,
-                get_file_burst: 100.0,
-                delete_rate_per_sec: 1000.0,
-                delete_burst: 100.0,
-                upload_concurrency: 8,
-                download_concurrency: 8,
-            },
+            tg: Self::test_limits(),
+            limiters: Arc::new(LimiterRegistry::new(Self::test_limits())),
             cache: CacheConfig {
                 enabled: false,
                 ..CacheConfig::default()
@@ -323,8 +335,12 @@ impl Config {
         }
     }
 
-    pub fn chat_limiter(&self) -> Arc<ChatLimiter> {
-        Arc::new(ChatLimiter::new(self.tg.clone()))
+    /// The limiter of `chat` for the bot holding `bot_token` (shared by every
+    /// user of that chat, and bot-wide with the bot's other chats).
+    pub fn chat_limiter(&self, bot_token: &str, chat: &str) -> Arc<ChatLimiter> {
+        // The bot id (before ':'); never the secret part.
+        let bot = bot_token.split(':').next().unwrap_or_default();
+        self.limiters.chat(bot, chat)
     }
 
     /// Primary blob store (first member of `[chunk] store`).
@@ -778,6 +794,10 @@ impl Default for FileIngest {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileTelegram {
+    bot_rate_per_sec: Option<f64>,
+    bot_burst: Option<f64>,
+    info_rate_per_sec: Option<f64>,
+    info_burst: Option<f64>,
     send_rate_per_sec: Option<f64>,
     send_burst: Option<f64>,
     get_file_rate_per_sec: Option<f64>,
@@ -792,6 +812,10 @@ impl Default for FileTelegram {
     fn default() -> Self {
         let d = ChatLimiterConfig::default();
         Self {
+            bot_rate_per_sec: None,
+            bot_burst: None,
+            info_rate_per_sec: None,
+            info_burst: None,
             send_rate_per_sec: None,
             send_burst: None,
             get_file_rate_per_sec: None,
@@ -808,6 +832,10 @@ impl FileTelegram {
     fn into_limiter_config(self) -> ChatLimiterConfig {
         let d = ChatLimiterConfig::default();
         ChatLimiterConfig {
+            bot_rate_per_sec: self.bot_rate_per_sec.unwrap_or(d.bot_rate_per_sec),
+            bot_burst: self.bot_burst.unwrap_or(d.bot_burst),
+            info_rate_per_sec: self.info_rate_per_sec.unwrap_or(d.info_rate_per_sec),
+            info_burst: self.info_burst.unwrap_or(d.info_burst),
             send_rate_per_sec: self.send_rate_per_sec.unwrap_or(d.send_rate_per_sec),
             send_burst: self.send_burst.unwrap_or(d.send_burst),
             get_file_rate_per_sec: self

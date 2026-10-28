@@ -85,9 +85,19 @@ block_size = 1048576
 memory_budget = 268435456
 
 [telegram]
-# Separate Bot API budgets (sends must not starve reads / deletes).
-send_rate_per_sec = 0.5
+# Bot API budgets on two levels. Bot: every call of one token, across all its
+# chats (Telegram: ~30/s). Chat: per chat and per kind of call, each call also
+# taking a bot token. A 429 freezes the bucket it hit for its retry_after (a
+# getFile 429 the whole bot: getFile is not tied to a chat).
+bot_rate_per_sec = 25.0
+bot_burst = 30.0
+# Sends and pins (a pin posts a service message): ~20 messages a minute in a
+# channel or group, so 18.
+send_rate_per_sec = 0.3
 send_burst = 3.0
+# getChat, descriptions (the metadata log's fence).
+info_rate_per_sec = 2.0
+info_burst = 5.0
 get_file_rate_per_sec = 15.0
 get_file_burst = 30.0
 delete_rate_per_sec = 1.0

@@ -721,7 +721,10 @@ impl TelegramClient {
         body.result.ok_or_else(|| anyhow!("getMe missing result"))
     }
 
-    pub async fn get_chat(&self, chat_id: &str) -> Result<Chat> {
+    pub async fn get_chat(&self, chat_id: &str, limiter: Option<&ChatLimiter>) -> Result<Chat> {
+        if let Some(lim) = limiter {
+            lim.acquire_info().await;
+        }
         let resp = self
             .http
             .post(self.api_url("getChat"))
@@ -732,6 +735,9 @@ impl TelegramClient {
         let status = resp.status();
         let body: ApiResponse<Chat> = resp.json().await.context("getChat json")?;
         if let Some(limited) = rate_limited("getChat", status, &body) {
+            if let Some(lim) = limiter {
+                lim.penalize_info(limited.retry_after);
+            }
             return Err(limited.into());
         }
         if !status.is_success() || !body.ok {
@@ -783,7 +789,15 @@ impl TelegramClient {
     }
 
     /// Set the chat description. `Ok(false)`: it already had this value.
-    pub async fn set_chat_description(&self, chat_id: &str, description: &str) -> Result<bool> {
+    pub async fn set_chat_description(
+        &self,
+        chat_id: &str,
+        description: &str,
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<bool> {
+        if let Some(lim) = limiter {
+            lim.acquire_info().await;
+        }
         let resp = self
             .http
             .post(self.api_url("setChatDescription"))
@@ -797,6 +811,9 @@ impl TelegramClient {
             return Ok(true);
         }
         if let Some(limited) = rate_limited("setChatDescription", status, &body) {
+            if let Some(lim) = limiter {
+                lim.penalize_info(limited.retry_after);
+            }
             return Err(limited.into());
         }
         let why = body.description.unwrap_or_else(|| status.to_string());
@@ -906,7 +923,7 @@ impl TelegramClient {
     /// (Bot API variance).
     pub async fn ensure_chat_admin(&self, chat_id: &str) -> Result<()> {
         let me = self.get_me().await.context("getMe")?;
-        let chat = self.get_chat(chat_id).await.context("getChat")?;
+        let chat = self.get_chat(chat_id, None).await.context("getChat")?;
         let member = self
             .get_chat_member(chat_id, me.id)
             .await

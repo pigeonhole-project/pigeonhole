@@ -46,7 +46,7 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
             }
             let tg = TelegramClient::new(bot_token.clone()).context("telegram client for the log")?;
             tg.ensure_chat_admin(chat_id).await.context("log chat access check")?;
-            let chat = TelegramChat::new(tg, chat_id.clone(), cfg.chat_limiter());
+            let chat = TelegramChat::new(tg, chat_id.clone(), cfg.chat_limiter(bot_token, chat_id));
             let opts = ChatLogOptions { straggler_window: *straggler_window, ..ChatLogOptions::default() };
             info!(chat_id = %chat_id, "metadata log in a Telegram chat");
             Arc::new(ChatLogStore::new(Arc::new(chat), opts))
@@ -62,7 +62,7 @@ pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStor
         SnapshotSettings::Telegram { chat_id, bot_token } => {
             let tg = TelegramClient::new(bot_token.clone()).context("telegram client for snapshots")?;
             tg.ensure_chat_admin(chat_id).await.context("snapshot chat access check")?;
-            let chat = TelegramChat::new(tg, chat_id.clone(), cfg.chat_limiter());
+            let chat = TelegramChat::new(tg, chat_id.clone(), cfg.chat_limiter(bot_token, chat_id));
             info!(chat_id = %chat_id, "metadata snapshots in a Telegram chat");
             Arc::new(ChatSnapshotStore::new(Arc::new(chat)))
         }
@@ -108,7 +108,6 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
 }
 
 async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {
-    let limiter = cfg.chat_limiter();
     let mut shards = Vec::new();
     for shard in &cfg.placement.shards {
         let mut members: Vec<SharedBackend> = Vec::new();
@@ -118,6 +117,7 @@ async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {
                 .iter()
                 .find(|i| i.info.id == *id)
                 .with_context(|| format!("blob store {id:?} not resolved"))?;
+            let limiter = cfg.chat_limiter(&inst.bot_token, &inst.scope_id);
             members.push(build_member(inst, &limiter).await?);
         }
         shards.push((members, shard.write_quorum));

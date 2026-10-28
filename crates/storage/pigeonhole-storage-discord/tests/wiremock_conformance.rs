@@ -161,6 +161,10 @@ async fn wiremock_conformance_suite() {
 
     let dc = DiscordClient::with_api_base("test-token".into(), api_base).unwrap();
     let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig {
+        bot_rate_per_sec: 1000.0,
+        bot_burst: 100.0,
+        info_rate_per_sec: 1000.0,
+        info_burst: 100.0,
         send_rate_per_sec: 1000.0,
         send_burst: 100.0,
         get_file_rate_per_sec: 1000.0,

@@ -21,7 +21,7 @@ pub use metrics::{
     record_sweep, set_repair_queue_depth, MetricsBackend,
 };
 pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
-pub use rate_limit::{ChatLimiter, ChatLimiterConfig, LimitBudget};
+pub use rate_limit::{BotLimiter, ChatLimiter, ChatLimiterConfig, LimitBudget, LimiterRegistry};
 pub use replicated::{
     CheapestFirst, ChunkReplicaWriter, InstanceId, PartLayout, ReplicaLayout, ReplicaSelector,
     Replicated, SealedChunk, ShardSpec,

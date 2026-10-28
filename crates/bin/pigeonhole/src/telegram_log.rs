@@ -98,7 +98,7 @@ impl ChatApi for TelegramChat {
     }
 
     async fn registers(&self) -> anyhow::Result<Registers> {
-        let chat = retrying("getChat", Retry::Any, RETRY_BUDGET, || self.tg.get_chat(&self.chat_id)).await?;
+        let chat = retrying("getChat", Retry::Any, RETRY_BUDGET, || self.tg.get_chat(&self.chat_id, Some(self.limiter.as_ref()))).await?;
         let (pinned, pinned_other) = match chat.pinned_message {
             Some(m) => match m.document {
                 Some(d) => (Some(ChatDoc { message_id: m.message_id, download_ref: d.file_id }), false),
@@ -113,7 +113,7 @@ impl ChatApi for TelegramChat {
         // Not retried on other failures: a repeat of an applied write reads
         // "not modified", which a claim takes for a rival claimant.
         retrying("setChatDescription", Retry::RateLimits, RETRY_BUDGET, || {
-            self.tg.set_chat_description(&self.chat_id, text)
+            self.tg.set_chat_description(&self.chat_id, text, Some(self.limiter.as_ref()))
         })
         .await
     }
