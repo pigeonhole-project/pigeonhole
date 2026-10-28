@@ -1,10 +1,10 @@
 //! Metadata tablet (see `docs/meta-backends.md`).
 //!
 //! Every metadata change is a **command** owned by one layer (namespace).
-//! [`MetaStore::propose`] is the only write path: it queues the command, a
-//! batcher appends a batch of queued commands to the [`LogStore`] under the
-//! tablet's generation, applies them in order and only then answers the
-//! callers. The log is the source of truth; each namespace keeps its state in
+//! [`MetaStore::propose`] is the only write path: it hands the command to
+//! Raft ([`raft`], openraft), which appends it to the node's [`LogStore`],
+//! commits it and applies it in order; only then the caller gets its
+//! outcome. The log is the source of truth; each namespace keeps its state in
 //! memory ([`StateMachine`], read via [`MetaStore::read`]).
 //!
 //! Commands must be deterministic: ids, timestamps and locators are chosen by
@@ -21,18 +21,17 @@
 //! same way for snapshots ([`encode_state`] / [`decode_state`]).
 //!
 //! Every [`MetaOptions::snapshot_every`] entries (and, with new entries,
-//! every [`MetaOptions::snapshot_interval`]) the batcher encodes all states
-//! into one [`TabletSnapshot`], stores it in the [`SnapshotStore`] in the
-//! background and then [rebases](LogStore::rebase) the log on it, which drops
-//! the log behind it.
+//! every [`MetaOptions::snapshot_interval`]) Raft snapshots all states into
+//! one [`TabletSnapshot`], stored in the [`SnapshotStore`]; the log is then
+//! [rebased](LogStore::rebase) on it, which drops the log behind it.
 //!
-//! Boot ([`MetaStore::open`]): claim the next generation, load the snapshot
-//! the log starts from and replay the log after it, append the zero entry, go active. Once a newer
-//! generation claims the log the tablet stops ([`Stop::Fenced`]) and every
-//! later `propose` fails.
+//! Boot ([`MetaStore::open`]): claim the next generation of the node's log
+//! (a second process on it is fenced), load the snapshot the log starts from,
+//! start Raft (a cluster of one for now): it elects itself, appends a blank
+//! entry and applies the log. Once a newer generation claims the log the
+//! tablet stops ([`Stop::Fenced`]) and every later `propose` fails.
 
 use anyhow::{bail, Context, Result};
-use futures::TryStreamExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::any::Any;
@@ -40,11 +39,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::watch;
 
 pub mod log;
+pub mod raft;
 pub mod snapshot;
 
 pub use log::{
@@ -158,12 +158,10 @@ impl TabletSnapshot {
     }
 }
 
-/// [`Outcome`] behind `dyn Any`, so one batcher serves every namespace.
-type AnyOutcome = Box<dyn Any + Send>;
-
 /// Object-safe face of a [`StateMachine`] behind its lock.
 trait AnyState: Send + Sync {
-    fn apply(&self, entry: &Command) -> Result<AnyOutcome>;
+    /// Apply and encode the [`Outcome`] for the proposer.
+    fn apply(&self, command: &Command) -> Result<Vec<u8>>;
     /// `(VERSION, encode_state)`.
     fn snapshot(&self) -> (u32, Vec<u8>);
     fn restore(&self, version: u32, data: &[u8]) -> Result<()>;
@@ -173,19 +171,19 @@ trait AnyState: Send + Sync {
 struct StateCell<S>(RwLock<S>);
 
 impl<S: StateMachine> AnyState for StateCell<S> {
-    fn apply(&self, entry: &Command) -> Result<AnyOutcome> {
-        if entry.version != S::VERSION {
+    fn apply(&self, command: &Command) -> Result<Vec<u8>> {
+        if command.version != S::VERSION {
             bail!(
                 "{} command in format {}, this binary reads {}",
                 S::NAME,
-                entry.version,
+                command.version,
                 S::VERSION
             );
         }
-        let command: S::Command =
-            postcard::from_bytes(&entry.command).with_context(|| format!("decode {} command", S::NAME))?;
-        let outcome = self.0.write().unwrap().apply(command)?;
-        Ok(Box::new(outcome))
+        let cmd: S::Command =
+            postcard::from_bytes(&command.command).with_context(|| format!("decode {} command", S::NAME))?;
+        let outcome = self.0.write().unwrap().apply(cmd)?;
+        Ok(postcard::to_stdvec(&outcome).expect("an outcome always encodes"))
     }
 
     fn snapshot(&self) -> (u32, Vec<u8>) {
@@ -230,7 +228,7 @@ pub enum Stop {
     /// A newer generation claimed the log.
     Fenced { current: u64 },
     /// The log failed or a command could not be applied; the outcome of the
-    /// last batch is unknown until the next boot replays the log.
+    /// last command is unknown until the next boot replays the log.
     Failed(String),
 }
 
@@ -248,17 +246,12 @@ impl std::error::Error for Stop {}
 /// Tablet knobs (`[meta]`).
 #[derive(Clone, Debug)]
 pub struct MetaOptions {
-    /// Extra time to wait for more commands before appending a batch. Zero =
-    /// append as soon as the previous append finished (batches still form from
-    /// whatever queued meanwhile).
-    pub batch_max_delay: Duration,
-    pub batch_max_entries: usize,
     /// Take a snapshot (and collect the log behind it) after this many
     /// entries since the last one; 0 = never.
     pub snapshot_every: u64,
-    /// Also take one when this long has passed since the last and there are
-    /// new entries, even with no traffic; zero = never. Bounds how stale the
-    /// newest snapshot can get.
+    /// Also take one when this long has passed and there are new entries,
+    /// even with no traffic; zero = never. Bounds how stale the newest
+    /// snapshot can get.
     pub snapshot_interval: Duration,
     /// The snapshot store can survive the log (another disk, a chat), so a
     /// lossy restore from it is possible: see [`MetaStore::restorable_position`].
@@ -267,41 +260,83 @@ pub struct MetaOptions {
 
 impl Default for MetaOptions {
     fn default() -> Self {
-        Self {
-            batch_max_delay: Duration::ZERO,
-            batch_max_entries: 1024,
-            snapshot_every: 10_000,
-            snapshot_interval: Duration::ZERO,
-            snapshots_outlive_log: false,
-        }
+        Self { snapshot_every: 10_000, snapshot_interval: Duration::ZERO, snapshots_outlive_log: false }
     }
 }
 
-type States = HashMap<&'static str, Arc<dyn AnyState>>;
+pub(crate) type States = HashMap<&'static str, Arc<dyn AnyState>>;
 
+/// A proposal waiting for its batch: answered with its position and outcome.
 struct Pending {
-    /// `None` = a barrier ([`MetaStore::confirm_active`]): no entry, answered
-    /// once its batch is appended.
-    entry: Option<Command>,
-    reply: oneshot::Sender<Result<(Position, AnyOutcome)>>,
+    command: Command,
+    reply: tokio::sync::oneshot::Sender<Result<(Position, Vec<u8>)>>,
+}
+
+/// Commands per Raft entry at most.
+const MAX_BATCH: usize = 1024;
+
+/// Group commit: openraft 0.9 writes and flushes one entry per
+/// `client_write`, so proposals queued while one is in flight go together in
+/// the next entry (one fsync, one chat message).
+async fn batcher(raft: raft::Raft, shared: Arc<raft::Shared>, mut rx: tokio::sync::mpsc::UnboundedReceiver<Pending>) {
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        while batch.len() < MAX_BATCH {
+            match rx.try_recv() {
+                Ok(p) => batch.push(p),
+                Err(_) => break,
+            }
+        }
+        let commands = batch.iter().map(|p| p.command.clone()).collect();
+        match raft.client_write(commands).await {
+            Ok(resp) => {
+                let position = raft::position(&resp.log_id);
+                for (p, outcome) in batch.into_iter().zip(resp.data) {
+                    let _ = p.reply.send(Ok((position, outcome)));
+                }
+            }
+            Err(e) => {
+                let stop = shared.stop.borrow().clone().unwrap_or_else(|| Stop::Failed(e.to_string()));
+                shared.stop.send_replace(Some(stop.clone()));
+                for p in batch {
+                    let _ = p.reply.send(Err(stop.clone().into()));
+                }
+            }
+        }
+    }
 }
 
 /// The metadata tablet shared by every layer.
 pub struct MetaStore {
     states: Arc<States>,
     gen: u64,
-    /// Position of the last applied entry.
-    applied: Arc<AtomicU64>,
-    /// Position of the snapshot the log starts from.
-    based: Arc<AtomicU64>,
+    raft: raft::Raft,
+    log: Arc<dyn LogStore>,
+    shared: Arc<raft::Shared>,
     snapshots_outlive_log: bool,
-    queue: mpsc::UnboundedSender<Pending>,
     stop: watch::Receiver<Option<Stop>>,
+    /// Proposals waiting for the batcher.
+    queue: tokio::sync::mpsc::UnboundedSender<Pending>,
+    /// The periodic snapshot task; ends with the store.
+    ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for MetaStore {
+    fn drop(&mut self) {
+        if let Some(t) = self.ticker.lock().unwrap().take() {
+            t.abort();
+        }
+        let raft = self.raft.clone();
+        tokio::spawn(async move {
+            let _ = raft.shutdown().await;
+        });
+    }
 }
 
 impl MetaStore {
-    /// Boot the tablet: claim the next generation of `log`, load the snapshot
-    /// it starts from out of `snapshots`, replay the rest, append the zero entry.
+    /// Boot the tablet: claim the next generation of the node's `log`, load
+    /// the snapshot it starts from out of `snapshots`, start Raft as a cluster
+    /// of one and wait until it has applied the log.
     pub async fn open(
         log: Arc<dyn LogStore>,
         snapshots: Arc<dyn SnapshotStore>,
@@ -330,42 +365,106 @@ impl MetaStore {
             }
         }
         let (gen, head) = claim_next(log.as_ref(), known.map_or(0, |d| d.gen)).await?;
-        let (base, head_term) = recover(&states, log.as_ref(), snapshots.as_ref(), head).await?;
-        let base_at = base.as_ref().map_or(0, |b| b.at);
+        let d = log.discover().await.context("discover log")?.context("a claimed log is discovered")?;
 
-        let zero = log.append(gen, &[]).await.context("append zero entry")?;
-        if zero != head.position {
-            bail!("zero entry of generation {gen} at {zero}, expected {}", head.position);
-        }
-
-        let applied = Arc::new(AtomicU64::new(head.position));
-        let (queue, rx) = mpsc::unbounded_channel();
         let (stop_tx, stop) = watch::channel(None);
-        let based = Arc::new(AtomicU64::new(base_at));
-        let snapshots_outlive_log = opts.snapshots_outlive_log;
-        let (stored_tx, stored_rx) = mpsc::unbounded_channel();
-        tokio::spawn(batcher(
-            Batcher {
-                states: states.clone(),
-                applied: applied.clone(),
-                log_id: head.log_id,
-                snapshot_at: base_at,
-                head_term,
-                snapshot_tried: tokio::time::Instant::now(),
-                putting: false,
-                stored_tx,
-                base,
-                based: based.clone(),
-                log,
-                snapshots,
-                gen,
-                opts,
-                stop: stop_tx,
+        let shared = Arc::new(raft::Shared {
+            stop: stop_tx,
+            applied: AtomicU64::new(0),
+            based: AtomicU64::new(d.base.as_ref().map_or(0, |b| b.at)),
+            current: Mutex::new(None),
+            base_ref: Mutex::new(d.base.as_ref().map(|b| b.snapshot.clone())),
+        });
+        let mut sm = raft::StateMachine {
+            states: states.clone(),
+            snapshots: snapshots.clone(),
+            history: head.log_id,
+            last_applied: None,
+            membership: Default::default(),
+            shared: shared.clone(),
+        };
+        if let Some(base) = &d.base {
+            let stored = snapshots
+                .get(&base.snapshot)
+                .await
+                .with_context(|| format!("load snapshot {:?} the log starts from", base.snapshot.0))?;
+            if stored.log_id != head.log_id {
+                bail!("snapshot {:?} is of log {}, not of log {}", base.snapshot.0, stored.log_id, head.log_id);
+            }
+            let snap = raft::RaftSnapshot::decode(&stored.data)?;
+            if snap.meta.last_log_id.as_ref().map_or(0, raft::position) < base.at {
+                bail!("snapshot {:?} is behind the log's base {}", base.snapshot.0, base.at);
+            }
+            restore_states(&states, &snap.tablet)?;
+            sm.last_applied = snap.meta.last_log_id;
+            sm.membership = snap.meta.last_membership.clone();
+            shared.applied.store(snap.tablet.position, Ordering::SeqCst);
+            *shared.current.lock().unwrap() =
+                Some(raft::CurrentSnapshot { meta: snap.meta, data: stored.data, snapshot: base.snapshot.clone() });
+        }
+        let fresh = d.head.position == 0 && d.base.is_none() && d.vote.is_none();
+
+        let adapter =
+            raft::LogAdapter::new(log.clone(), gen, head.log_id, d.head.position, shared.clone(), snapshots.clone());
+        let config = openraft::Config {
+            cluster_name: "pigeonhole".into(),
+            heartbeat_interval: 50,
+            election_timeout_min: 100,
+            election_timeout_max: 150,
+            snapshot_policy: match opts.snapshot_every {
+                0 => openraft::SnapshotPolicy::Never,
+                n => openraft::SnapshotPolicy::LogsSinceLast(n),
             },
-            rx,
-            stored_rx,
-        ));
-        Ok(Arc::new(Self { states, gen, applied, based, snapshots_outlive_log, queue, stop }))
+            max_in_snapshot_log_to_keep: 0,
+            purge_batch_size: 1,
+            ..Default::default()
+        }
+        .validate()
+        .context("raft config")?;
+        let raft = raft::Raft::new(raft::SOLO, Arc::new(config), raft::NoNetwork, adapter, sm)
+            .await
+            .context("start raft")?;
+        if fresh {
+            let mut nodes = std::collections::BTreeMap::new();
+            nodes.insert(raft::SOLO, openraft::BasicNode::default());
+            raft.initialize(nodes).await.context("initialize a cluster of one")?;
+        }
+        let (queue, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(batcher(raft.clone(), shared.clone(), rx));
+        let store = Self {
+            states,
+            gen,
+            queue,
+            raft: raft.clone(),
+            log,
+            shared: shared.clone(),
+            snapshots_outlive_log: opts.snapshots_outlive_log,
+            stop,
+            ticker: Mutex::new(None),
+        };
+        // Leader, and everything the log holds applied.
+        raft.wait(Some(Duration::from_secs(30)))
+            .state(openraft::ServerState::Leader, "become the leader of a cluster of one")
+            .await
+            .map_err(|e| store.stopped_by(e))
+            .context("boot the tablet")?;
+        store.confirm_active().await.context("boot the tablet")?;
+        let ticker = (!opts.snapshot_interval.is_zero()).then(|| {
+            let (raft, shared, every) = (raft.clone(), shared.clone(), opts.snapshot_interval);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(every);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let snapshotted = raft.metrics().borrow().snapshot.as_ref().map_or(0, raft::position);
+                    if shared.applied.load(Ordering::SeqCst) > snapshotted && raft.trigger().snapshot().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        });
+        *store.ticker.lock().unwrap() = ticker;
+        Ok(Arc::new(store))
     }
 
     /// Boot over a [`LocalLogStore`] in `dir`, snapshots in the same directory.
@@ -400,8 +499,18 @@ impl MetaStore {
         self.gen
     }
 
-    /// Append `command` for `S` to the log and apply it. `Err` = the tablet
-    /// could not commit it (fenced, stopped, I/O); `Ok(Err(_))` = `S` rejected it.
+    /// The stop reason, or `err` turned into one (the tablet is stopped).
+    fn stopped_by(&self, err: impl fmt::Display) -> anyhow::Error {
+        if let Some(stop) = self.stop.borrow().clone() {
+            return stop.into();
+        }
+        let stop = Stop::Failed(err.to_string());
+        self.shared.stop.send_replace(Some(stop.clone()));
+        stop.into()
+    }
+
+    /// Commit `command` for `S` and apply it. `Err` = the tablet could not
+    /// commit it (fenced, stopped, I/O); `Ok(Err(_))` = `S` rejected it.
     pub async fn propose<S: StateMachine>(&self, command: S::Command) -> Result<Outcome<S>> {
         Ok(self.propose_at::<S>(command).await?.1)
     }
@@ -414,31 +523,36 @@ impl MetaStore {
         if let Some(stop) = self.stop.borrow().clone() {
             return Err(stop.into());
         }
-        let (reply, rx) = oneshot::channel();
-        if self.queue.send(Pending { entry: Some(self::command::<S>(&command)), reply }).is_err() {
-            bail!("tablet batcher is gone");
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self.queue.send(Pending { command: self::command::<S>(&command), reply }).is_err() {
+            bail!("the tablet's batcher is gone");
         }
-        let (position, outcome) = rx.await.context("tablet batcher dropped the proposal")??;
-        let outcome = outcome
-            .downcast::<Outcome<S>>()
-            .unwrap_or_else(|_| panic!("namespace {:?} has another state type", S::NAME));
-        Ok((position, *outcome))
+        let (position, outcome) = rx.await.context("the tablet's batcher dropped the proposal")??;
+        let outcome: Outcome<S> =
+            postcard::from_bytes(&outcome).with_context(|| format!("decode the outcome of a {} command", S::NAME))?;
+        Ok((position, outcome))
     }
 
-    /// Prove the tablet still holds its generation: a round trip through the
-    /// log (an empty batch if nothing else is queued). `Err` = fenced or
-    /// stopped. Call it right before a side effect the log cannot undo, such
-    /// as deleting backend blobs.
+    /// Prove the tablet still holds its generation: Raft confirms it leads
+    /// and has applied everything, and the log confirms nobody claimed it
+    /// since. `Err` = fenced or stopped. Call it right before a side effect
+    /// the log cannot undo, such as deleting backend blobs.
     pub async fn confirm_active(&self) -> Result<()> {
         if let Some(stop) = self.stop.borrow().clone() {
             return Err(stop.into());
         }
-        let (reply, rx) = oneshot::channel();
-        if self.queue.send(Pending { entry: None, reply }).is_err() {
-            bail!("tablet batcher is gone");
+        if let Err(e) = self.raft.ensure_linearizable().await {
+            return Err(self.stopped_by(e));
         }
-        rx.await.context("tablet batcher dropped the barrier")??;
-        Ok(())
+        match self.log.confirm(self.gen).await {
+            Ok(()) => Ok(()),
+            Err(LogError::Fenced { current }) => {
+                let stop = Stop::Fenced { current };
+                self.shared.stop.send_replace(Some(stop.clone()));
+                Err(stop.into())
+            }
+            Err(e) => Err(anyhow::Error::new(e).context("confirm the log's generation")),
+        }
     }
 
     /// Whether the tablet has stopped (fenced or failed).
@@ -451,14 +565,14 @@ impl MetaStore {
         let mut rx = self.stop.clone();
         let stop = match rx.wait_for(Option::is_some).await {
             Ok(stop) => stop.clone().unwrap(),
-            Err(_) => Stop::Failed("tablet batcher is gone".into()),
+            Err(_) => Stop::Failed("the tablet is gone".into()),
         };
         stop
     }
 
     /// Position of the snapshot the log now starts from (0: none yet).
     pub fn base_position(&self) -> Position {
-        self.based.load(Ordering::SeqCst)
+        self.shared.based.load(Ordering::SeqCst)
     }
 
     /// When snapshots outlive the log ([`MetaOptions::snapshots_outlive_log`]):
@@ -470,7 +584,7 @@ impl MetaStore {
 
     /// Position of the last applied entry (0 before the first).
     pub fn applied_position(&self) -> Position {
-        self.applied.load(Ordering::SeqCst)
+        self.shared.applied.load(Ordering::SeqCst)
     }
 }
 
@@ -487,109 +601,41 @@ async fn claim_next(log: &dyn LogStore, known: u64) -> Result<(u64, Head)> {
     bail!("could not claim a generation (last tried {gen})")
 }
 
-/// Load the newest snapshot into the empty states and replay the log after
-/// it up to `head`. Returns the snapshot's position (0 without one).
-/// Load the snapshot the log starts from (if any) and replay the rest;
-/// returns the base and the term of the entry at the head.
-async fn recover(
-    states: &States,
-    log: &dyn LogStore,
-    snapshots: &dyn SnapshotStore,
-    head: Head,
-) -> Result<(Option<Base>, u64)> {
-    let discovered = log.discover().await.context("discover log")?;
-    let head_term = discovered.as_ref().map_or(0, |d| d.head_term);
-    let base = discovered.and_then(|d| d.base);
-    let from = match &base {
-        Some(base) => {
-            let at = base.at;
-            let stored = snapshots
-                .get(&base.snapshot)
-                .await
-                .with_context(|| format!("load snapshot {:?} the log starts from", base.snapshot.0))?;
-            if stored.log_id != head.log_id || stored.at != at {
-                bail!(
-                    "snapshot {:?} is of log {} at {}, but log {} starts at {at}",
-                    base.snapshot.0,
-                    stored.log_id,
-                    stored.at,
-                    head.log_id
-                );
-            }
-            let snap = TabletSnapshot::decode(&stored.data)?;
-            if snap.position != at {
-                bail!("snapshot stored at {at} says it covers {}", snap.position);
-            }
-            for (name, version, data) in &snap.states {
-                let state = states
-                    .get(name.as_str())
-                    .with_context(|| format!("snapshot has unknown namespace {name:?}"))?;
-                state.restore(*version, data)?;
-            }
-            at
-        }
-        None => 0,
-    };
-    if from > head.position {
-        bail!(LogError::Lost(format!("snapshot at {from} is past the log head {}", head.position)));
-    }
-    replay(states, log, from, head).await?;
-    Ok((base, head_term))
-}
-
 /// Start a new log from the newest stored snapshot (after the log is lost):
-/// the states as of that snapshot, positions numbered from 0 again. Lossy:
-/// whatever the old log held after the snapshot is gone. Refuses a log that
-/// has entries. Returns the position the snapshot covered in the old log.
+/// a cluster of one with the states as of that snapshot. Lossy: whatever the
+/// old log held after the snapshot is gone. Refuses a log that has entries.
+/// Returns the position the snapshot covered in the old log.
 pub async fn restore_lossy(log: &dyn LogStore, snapshots: &dyn SnapshotStore) -> Result<Position> {
     let known = log.discover().await.context("discover log")?;
     if known.as_ref().is_some_and(|d| d.head.position != 0 || d.base.is_some()) {
         bail!("the log is not empty; restore only seeds a new log");
     }
     let newest = snapshots.newest().await?.context("no stored snapshot to restore from")?;
-    let mut snap = TabletSnapshot::decode(&newest.data)?;
-    let old = snap.position;
-    snap.position = 0;
+    let old = raft::RaftSnapshot::decode(&newest.data)?;
+    let old_position = old.tablet.position;
+    let meta = raft::solo_meta(0);
+    let tablet = TabletSnapshot { position: 1, ..old.tablet };
     let (gen, head) = claim_next(log, known.map_or(0, |d| d.gen)).await?;
-    let stored = StoredSnapshot { log_id: head.log_id, at: 0, data: snap.encode() };
+    let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
+    let stored = StoredSnapshot { log_id: head.log_id, at: 1, data };
     let snapshot = snapshots.put(&stored).await.context("store the restored snapshot")?;
-    log.rebase(gen, Base { at: 0, term: 0, snapshot }).await.context("start the new log from it")?;
-    Ok(old)
+    log.rebase(gen, raft::base_of(&meta, snapshot)).await.context("start the new log from it")?;
+    Ok(old_position)
 }
 
-/// Apply log entries `(from, head]`.
-async fn replay(states: &States, log: &dyn LogStore, from: Position, head: Head) -> Result<()> {
-    if from == head.position {
-        return Ok(());
-    }
-    let mut entries = log.read(from, head);
-    let mut next = from + 1;
-    while let Some((pos, entry)) = entries.try_next().await.context("read log")? {
-        if pos != next {
-            bail!(LogError::Lost(format!("replay expected {next}, got {pos}")));
-        }
-        apply_entry(states, pos, &entry)?;
-        next += 1;
-    }
-    if next - 1 != head.position {
-        bail!(LogError::Lost(format!("replay stopped at {}, head is {}", next - 1, head.position)));
-    }
-    Ok(())
-}
-
-fn apply_entry(states: &States, pos: Position, entry: &Entry) -> Result<AnyOutcome> {
-    let entry = &Command::decode(entry).with_context(|| format!("entry {pos}"))?;
+/// Apply one command to its namespace; the encoded outcome.
+pub(crate) fn apply_command(states: &States, pos: Position, command: &Command) -> Result<Vec<u8>> {
     let state = states
-        .get(entry.namespace.as_str())
-        .with_context(|| format!("entry {pos}: unknown namespace {:?}", entry.namespace))?;
+        .get(command.namespace.as_str())
+        .with_context(|| format!("entry {pos}: unknown namespace {:?}", command.namespace))?;
     state
-        .apply(entry)
-        .with_context(|| format!("apply {} entry {pos}", entry.namespace))
+        .apply(command)
+        .with_context(|| format!("apply {} entry {pos}", command.namespace))
 }
 
-/// Encode every state as of `position` (between batches, so nothing is half
+/// Encode every state as of `position` (between applies, so nothing is half
 /// applied).
-fn take_snapshot(states: &States, position: Position) -> TabletSnapshot {
+pub(crate) fn take_snapshot(states: &States, position: Position) -> TabletSnapshot {
     let mut snap: Vec<(String, u32, Vec<u8>)> = states
         .iter()
         .map(|(name, state)| {
@@ -601,222 +647,15 @@ fn take_snapshot(states: &States, position: Position) -> TabletSnapshot {
     TabletSnapshot { format: SNAPSHOT_FORMAT, position, states: snap }
 }
 
-struct Batcher {
-    states: Arc<States>,
-    applied: Arc<AtomicU64>,
-    log_id: LogId,
-    /// Position of the newest snapshot taken (stored or not).
-    snapshot_at: Position,
-    /// Term of the entry at the applied position.
-    head_term: u64,
-    /// When the last snapshot was taken (or the tablet booted).
-    snapshot_tried: tokio::time::Instant,
-    /// A snapshot is being stored; the next one waits for it.
-    putting: bool,
-    /// Where a finished put reports `(position, result)`.
-    stored_tx: mpsc::UnboundedSender<(Position, u64, Result<SnapshotRef>)>,
-    /// What the log starts from now.
-    base: Option<Base>,
-    based: Arc<AtomicU64>,
-    log: Arc<dyn LogStore>,
-    snapshots: Arc<dyn SnapshotStore>,
-    gen: u64,
-    opts: MetaOptions,
-    stop: watch::Sender<Option<Stop>>,
-}
-
-/// Sleep until `at`, or forever.
-async fn until(at: Option<tokio::time::Instant>) {
-    match at {
-        Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
+/// Load every namespace's state from `snap`.
+pub(crate) fn restore_states(states: &States, snap: &TabletSnapshot) -> Result<()> {
+    for (name, version, data) in &snap.states {
+        let state = states
+            .get(name.as_str())
+            .with_context(|| format!("snapshot has unknown namespace {name:?}"))?;
+        state.restore(*version, data)?;
     }
-}
-
-/// Group commit: take what is queued, append it, apply it, answer. Ends when
-/// every [`MetaStore`] handle is dropped.
-async fn batcher(
-    mut b: Batcher,
-    mut rx: mpsc::UnboundedReceiver<Pending>,
-    mut stored_rx: mpsc::UnboundedReceiver<(Position, u64, Result<SnapshotRef>)>,
-) {
-    let max = b.opts.batch_max_entries.max(1);
-    loop {
-        let first = tokio::select! {
-            first = rx.recv() => first,
-            Some((at, term, stored)) = stored_rx.recv() => {
-                if let Some(stop) = b.rebase(at, term, stored).await {
-                    return stop_for_good(b, stop, Vec::new(), rx).await;
-                }
-                continue;
-            }
-            () = until(b.snapshot_deadline()) => {
-                b.maybe_snapshot();
-                continue;
-            }
-        };
-        let Some(first) = first else { return };
-        let mut batch = vec![first];
-        if !b.opts.batch_max_delay.is_zero() {
-            let deadline = tokio::time::Instant::now() + b.opts.batch_max_delay;
-            while batch.len() < max {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some(p)) => batch.push(p),
-                    _ => break,
-                }
-            }
-        }
-        while batch.len() < max {
-            match rx.try_recv() {
-                Ok(p) => batch.push(p),
-                Err(_) => break,
-            }
-        }
-
-        let entries: Vec<Entry> = batch.iter().filter_map(|p| p.entry.as_ref()).map(|c| c.entry(b.gen)).collect();
-        let result = match b.log.append(b.gen, &entries).await {
-            Ok(last) => {
-                let first = last + 1 - entries.len() as u64;
-                // A failure half way leaves the batch partly applied and its
-                // callers unanswered: stop; the next boot rebuilds from the log.
-                let mut applied = Vec::with_capacity(entries.len());
-                let mut failure = None;
-                for (i, entry) in entries.iter().enumerate() {
-                    match apply_entry(&b.states, first + i as u64, entry) {
-                        Ok(a) => applied.push(a),
-                        Err(e) => {
-                            failure = Some(Stop::Failed(format!("{e:#}")));
-                            break;
-                        }
-                    }
-                }
-                match failure {
-                    None => {
-                        b.applied.store(last, Ordering::SeqCst);
-                        if !entries.is_empty() {
-                            b.head_term = b.gen;
-                        }
-                        Ok((first, applied))
-                    }
-                    Some(stop) => Err(stop),
-                }
-            }
-            Err(LogError::Fenced { current }) => Err(Stop::Fenced { current }),
-            Err(e) => Err(Stop::Failed(format!("append: {e}"))),
-        };
-        let (stop, unanswered) = match result {
-            Ok((first, applied)) => {
-                b.maybe_snapshot();
-                let mut outcomes = applied.into_iter();
-                let mut position = first;
-                for p in batch {
-                    let reply = match p.entry {
-                        Some(_) => {
-                            position += 1;
-                            (position - 1, outcomes.next().expect("one outcome per entry"))
-                        }
-                        None => (position - 1, Box::new(()) as AnyOutcome),
-                    };
-                    let _ = p.reply.send(Ok(reply));
-                }
-                continue;
-            }
-            Err(stop) => (stop, batch),
-        };
-        return stop_for_good(b, stop, unanswered, rx).await;
-    }
-}
-
-/// Stopped for good: fail `unanswered` and whatever is still queued or arrives.
-async fn stop_for_good(b: Batcher, stop: Stop, unanswered: Vec<Pending>, mut rx: mpsc::UnboundedReceiver<Pending>) {
-    b.stop.send_replace(Some(stop.clone()));
-    for p in unanswered {
-        let _ = p.reply.send(Err(stop.clone().into()));
-    }
-    while let Some(p) = rx.recv().await {
-        let _ = p.reply.send(Err(stop.clone().into()));
-    }
-}
-
-impl Batcher {
-    /// When an idle tablet should wake up to snapshot by time: there are
-    /// entries after the last snapshot, an interval is set, and no put runs.
-    fn snapshot_deadline(&self) -> Option<tokio::time::Instant> {
-        let interval = self.opts.snapshot_interval;
-        let behind = self.applied.load(Ordering::SeqCst) > self.snapshot_at;
-        (!interval.is_zero() && behind && !self.putting).then(|| self.snapshot_tried + interval)
-    }
-
-    /// Take a snapshot when due (between batches, so nothing is half applied)
-    /// and store it in the background: a slow store (a chat) must not hold up
-    /// proposals. The log is rebased once the put reports back.
-    fn maybe_snapshot(&mut self) {
-        if self.putting {
-            return;
-        }
-        let position = self.applied.load(Ordering::SeqCst);
-        let every = self.opts.snapshot_every;
-        let by_count = every != 0 && position >= self.snapshot_at + every;
-        let by_time = self.snapshot_deadline().is_some_and(|at| tokio::time::Instant::now() >= at);
-        if !by_count && !by_time {
-            return;
-        }
-        self.snapshot_tried = tokio::time::Instant::now();
-        self.snapshot_at = position;
-        self.putting = true;
-        let stored = StoredSnapshot {
-            log_id: self.log_id,
-            at: position,
-            data: take_snapshot(&self.states, position).encode(),
-        };
-        let (snapshots, tx, term) = (self.snapshots.clone(), self.stored_tx.clone(), self.head_term);
-        tokio::spawn(async move {
-            let _ = tx.send((position, term, snapshots.put(&stored).await));
-        });
-    }
-
-    /// A put finished: start the log from it and drop the snapshot it started
-    /// from before. Only a fence stops the tablet: on any failure the log
-    /// keeps its old base and the next snapshot tries again.
-    async fn rebase(&mut self, at: Position, term: u64, stored: Result<SnapshotRef>) -> Option<Stop> {
-        self.putting = false;
-        let snapshot = match stored {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(position = at, error = %format!("{e:#}"), "storing a snapshot failed; the log is kept");
-                return None;
-            }
-        };
-        let base = Base { at, term, snapshot };
-        match self.log.rebase(self.gen, base.clone()).await {
-            Ok(()) => {
-                self.based.store(at, Ordering::SeqCst);
-                let new = base.snapshot.clone();
-                if let Some(old) = self.base.replace(base) {
-                    if old.snapshot != new {
-                        self.forget(old.snapshot);
-                    }
-                }
-                None
-            }
-            Err(LogError::Fenced { current }) => Some(Stop::Fenced { current }),
-            Err(e) => {
-                tracing::warn!(position = at, error = %e, "rebasing the log failed; the log is kept");
-                self.forget(base.snapshot);
-                None
-            }
-        }
-    }
-
-    /// Remove a snapshot nothing starts from (best effort, in the background).
-    fn forget(&self, r: SnapshotRef) {
-        let snapshots = self.snapshots.clone();
-        tokio::spawn(async move {
-            if let Err(e) = snapshots.remove(&r).await {
-                tracing::debug!(snapshot = %r.0, error = %format!("{e:#}"), "removing an old snapshot failed");
-            }
-        });
-    }
+    Ok(())
 }
 
 #[cfg(test)]

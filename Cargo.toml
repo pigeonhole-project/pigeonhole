@@ -24,7 +24,7 @@ license = "MIT"
 description = "Pluggable blob storage with protocol gateways (S3, ByteStream, …)"
 
 [workspace.dependencies]
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 anyhow = "1"
 async-trait = "0.1.92"
 axum = { version = "0.8", features = ["macros"] }

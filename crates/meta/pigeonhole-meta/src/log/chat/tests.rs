@@ -144,7 +144,7 @@ async fn a_rebase_deletes_the_messages_it_covers() {
     for i in 1..=5 {
         a.append(1, &[entry(i)]).await.unwrap();
     }
-    a.rebase(1, Base { at: 3, term: 1, snapshot: crate::snapshot::SnapshotRef("s3".into()) }).await.unwrap();
+    a.rebase(1, Base { at: 3, term: 1, leader: 0, snapshot: crate::snapshot::SnapshotRef("s3".into()) }).await.unwrap();
     // Batches 4 and 5 and the rebase message stay.
     assert_eq!(chat.inner.lock().unwrap().docs.len(), 3);
     a.append(1, &[entry(6)]).await.unwrap();

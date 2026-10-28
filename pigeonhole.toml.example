@@ -59,13 +59,11 @@ chat_id = -1001234567890
 [meta]
 log = "meta"                  # default: a local_disk at pigeonhole-meta
 snapshot = "meta"             # default: the log's store if it is local_disk / memory
-# A telegram log (a dedicated channel; set batch_max_delay_ms = 1000) needs
+# A telegram log (a dedicated channel) needs
 # telegram snapshots in another channel; a memory log needs memory snapshots.
 # A local_disk log with snapshots in a channel or on another disk survives
 # losing the log's disk: `pigeonhole restore --lossy` starts a new log from
 # the newest snapshot.
-batch_max_delay_ms = 0        # group commit window; 0 = append when the previous append returns
-# batch_max_entries = 1024
 # log_straggler_window_secs = 90   # telegram log: a claim waits this long for a deposed writer
 snapshot_every_entries = 10000     # snapshot all states, drop the log behind it; 0 = never
 snapshot_every_secs = 600          # and this often if anything changed; 0 = never

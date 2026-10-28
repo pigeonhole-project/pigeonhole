@@ -185,7 +185,11 @@ Design: meta-backends.md § Raft between nodes. Sub-steps:
 1. ~~Node storage contract~~ Done: entries carry their term, `truncate`
    (a replacing batch), `save_vote`, `discover` returns the head term and the
    vote; the conformance suite covers them for local_disk, memory, telegram.
-2. `MetaStore` over openraft as a cluster of one; old tablet batcher removed.
+2. ~~`MetaStore` over openraft as a cluster of one.~~ Done: `raft.rs` adapts
+   the node's LogStore / SnapshotStore to openraft 0.9; `MetaStore` keeps its
+   API and batches concurrent proposals into one Raft entry (openraft 0.9
+   flushes one entry per `client_write`, see its PR #2163). Open: sweep_stress
+   55 s against 35 s before Raft; find where the rest goes.
 3. gRPC network, in-process multi-node tests (failover, partitions, a node on
    a fake chat), leader-only side effects, forwarding.
 4. `[[node]]` config, `init-cluster`, live runs with a node on Telegram.

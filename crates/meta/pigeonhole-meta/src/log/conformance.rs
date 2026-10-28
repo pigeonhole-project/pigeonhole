@@ -17,7 +17,7 @@ fn termed(term: u64, i: u64) -> Entry {
 }
 
 fn base(at: Position) -> Base {
-    Base { at, term: 1, snapshot: SnapshotRef(format!("s{at}")) }
+    Base { at, term: 1, leader: 0, snapshot: SnapshotRef(format!("s{at}")) }
 }
 
 async fn read_all(log: &dyn LogStore, from: Position, head: Head) -> Result<Vec<(Position, Entry)>, LogError> {
@@ -50,7 +50,7 @@ where
     let log = open().await;
     let head = log.claim(1).await.unwrap();
     log.append(1, &[entry(1), entry(2)]).await.unwrap();
-    log.rebase(1, Base { at: 10, term: 4, snapshot: SnapshotRef("s10".into()) }).await.unwrap();
+    log.rebase(1, Base { at: 10, term: 4, leader: 0, snapshot: SnapshotRef("s10".into()) }).await.unwrap();
     assert_eq!(log.append(1, &[termed(5, 11)]).await.unwrap(), 11);
 
     let again = open().await;

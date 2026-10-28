@@ -277,7 +277,6 @@ Costs and caveats:
 - an append is one send, one pin, one `getChat`; appends are batched — a single
   chat should stay under about one message per second
   ([Bot FAQ](https://core.telegram.org/bots/faq)), groups under 20 per minute;
-  set `[meta] batch_max_delay_ms` (e.g. 1000) for a Telegram log;
 - a claim (boot, failover) takes the straggler window;
 - recovery walks the chain back to the base (one `getFile` per batch), so
   snapshots bound recovery time; a snapshot in a chat is one document, so it
@@ -328,9 +327,6 @@ deleted by `rebase` (`deleteMessage`), the previous base snapshot by the tablet.
 
 ```toml
 [meta]
-batch_max_delay_ms = 0              # extra group commit window (local: 0;
-                                    # batches still form while an append runs)
-batch_max_entries = 1024
 
 log = "meta"                        # a [[store]] id: local_disk | memory | telegram
 snapshot = "meta"                   # default: the log's store if local_disk / memory

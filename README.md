@@ -209,7 +209,7 @@ comments. Sections:
 | `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
 | `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), group commit (`batch_max_delay_ms` / `batch_max_entries`), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never), `log_straggler_window_secs` |
+| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never), `log_straggler_window_secs` |
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Separate send / getFile / delete budgets, upload/download concurrency |

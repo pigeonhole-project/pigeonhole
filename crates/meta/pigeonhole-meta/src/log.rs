@@ -107,6 +107,8 @@ pub struct Base {
     pub at: Position,
     /// Term of the entry at `at` (0 for position 0).
     pub term: u64,
+    /// Node that led that term (Raft's log id is term + leader + index).
+    pub leader: u64,
     pub snapshot: SnapshotRef,
 }
 

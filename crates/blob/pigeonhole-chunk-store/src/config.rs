@@ -73,9 +73,6 @@ pub struct Config {
 /// store (`[meta]`, `log` / `snapshot` naming a `[[store]]`).
 #[derive(Clone, Debug)]
 pub struct MetaSettings {
-    /// Group commit window; `0` = append as soon as the previous append returns.
-    pub batch_max_delay: Duration,
-    pub batch_max_entries: usize,
     /// Snapshot (and collect the log behind it) every this many entries; 0 = never.
     pub snapshot_every_entries: u64,
     /// Also snapshot this often when there are new entries; zero = never.
@@ -411,8 +408,6 @@ impl Default for FileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileMeta {
-    batch_max_delay_ms: u64,
-    batch_max_entries: usize,
     /// `[[store]]` id of the log (`dir` | `telegram`); unset = a `dir` store
     /// at `pigeonhole-meta`.
     log: Option<String>,
@@ -427,8 +422,6 @@ struct FileMeta {
 impl Default for FileMeta {
     fn default() -> Self {
         Self {
-            batch_max_delay_ms: 0,
-            batch_max_entries: 1024,
             log: None,
             snapshot: None,
             log_straggler_window_secs: 90,
@@ -481,8 +474,6 @@ impl FileMeta {
             _ => {}
         }
         Ok(MetaSettings {
-            batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
-            batch_max_entries: self.batch_max_entries.max(1),
             snapshot_every_entries: self.snapshot_every_entries,
             snapshot_interval: Duration::from_secs(self.snapshot_every_secs),
             log,
@@ -880,7 +871,6 @@ upload_concurrency = 4
         assert_eq!(cfg.tg.get_file_rate_per_sec, 20.0);
         assert_eq!(cfg.tg.upload_concurrency, 4);
         assert_eq!(cfg.placement, PlacementConfig::single("mem"));
-        assert_eq!(cfg.meta.batch_max_delay, Duration::ZERO);
         assert_eq!(cfg.meta.snapshot_every_entries, 10_000);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(600));
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "pigeonhole-meta".into() });
@@ -893,11 +883,10 @@ upload_concurrency = 4
         let dirs = "[[store]]\nid = \"disk\"\nkind = \"local_disk\"\npath = \"/var/log-dir\"\n\
                     [[store]]\nid = \"backup\"\nkind = \"local_disk\"\npath = \"/backup\"\n";
         let cfg = load_mem(&format!(
-            "[meta]\nbatch_max_delay_ms = 250\nlog = \"disk\"\nsnapshot = \"backup\"\n\
+            "[meta]\nlog = \"disk\"\nsnapshot = \"backup\"\n\
              snapshot_every_entries = 0\nsnapshot_every_secs = 60\n{dirs}"
         ))
         .unwrap();
-        assert_eq!(cfg.meta.batch_max_delay, Duration::from_millis(250));
         assert_eq!(cfg.meta.snapshot_every_entries, 0);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(60));
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "/var/log-dir".into() });

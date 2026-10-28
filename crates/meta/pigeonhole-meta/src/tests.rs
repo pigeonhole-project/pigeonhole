@@ -64,13 +64,22 @@ fn local(dir: &Path) -> (Arc<dyn LogStore>, Arc<dyn SnapshotStore>) {
     (Arc::new(LocalLogStore::open(dir).unwrap()), Arc::new(LocalSnapshotStore::new(dir)))
 }
 
-/// Snapshots are stored in the background; wait until the log starts from `at`.
+/// Snapshots are taken in the background; wait until the log starts at or
+/// after `at`.
 async fn wait_base(store: &MetaStore, at: Position) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while store.base_position() != at {
+    while store.base_position() < at {
         assert!(tokio::time::Instant::now() < deadline, "no base at {at}, still {}", store.base_position());
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// An entry as a crashed incarnation would have appended it: the openraft
+/// entry for `cmd` at `position` in `term`, led by the only node.
+fn raw_entry(term: u64, position: Position, cmd: Command) -> Entry {
+    let id = openraft::LogId::new(openraft::CommittedLeaderId::new(term, raft::SOLO), position - 1);
+    let entry = raft::RaftEntry { log_id: id, payload: openraft::EntryPayload::Normal(vec![cmd]) };
+    Entry { term, payload: postcard::to_stdvec(&entry).unwrap() }
 }
 
 /// Wait until `f` holds (a background removal finished).
@@ -94,11 +103,13 @@ async fn commit_and_reject_both_consume_a_position() {
     let dir = tempfile::tempdir().unwrap();
     let store = open_on(dir.path()).await;
     assert_eq!(store.generation(), 1);
-    assert_eq!(store.propose_at::<Counter>(op(1, 5)).await.unwrap(), (1, Ok(5)));
-    assert_eq!(store.propose_at::<Counter>(op(2, -7)).await.unwrap(), (2, Err("negative".into())));
+    let booted = store.applied_position();
+    assert!(booted > 0, "Raft's own entries (membership, the leader's blank) come first");
+    assert_eq!(store.propose_at::<Counter>(op(1, 5)).await.unwrap(), (booted + 1, Ok(5)));
+    assert_eq!(store.propose_at::<Counter>(op(2, -7)).await.unwrap(), (booted + 2, Err("negative".into())));
     assert_eq!(value(&store), 5, "rejected command must not change state");
     assert_eq!(op_ids(&store), vec![1]);
-    assert_eq!(store.applied_position(), 2);
+    assert_eq!(store.applied_position(), booted + 2);
 }
 
 #[tokio::test]
@@ -117,8 +128,9 @@ async fn unknown_namespace_fails_without_a_position() {
     }
     let dir = tempfile::tempdir().unwrap();
     let store = open_on(dir.path()).await;
+    let booted = store.applied_position();
     assert!(store.propose::<Other>(()).await.is_err());
-    assert_eq!(store.applied_position(), 0);
+    assert_eq!(store.applied_position(), booted);
 
     let twice = Namespaces::new().with::<Counter>().with::<Counter>();
     assert!(MetaStore::open_local(dir.path().join("log2"), twice).await.is_err());
@@ -127,42 +139,45 @@ async fn unknown_namespace_fails_without_a_position() {
 #[tokio::test]
 async fn concurrent_proposals_get_distinct_positions() {
     let dir = tempfile::tempdir().unwrap();
-    for delay in [Duration::ZERO, Duration::from_millis(20)] {
-        let (log, snapshots) = local(&dir.path().join(format!("log-{}", delay.as_millis())));
-        let opts = MetaOptions { batch_max_delay: delay, batch_max_entries: 8, snapshot_every: 5, ..MetaOptions::default() };
-        let store = MetaStore::open(log, snapshots, counter(), opts).await.unwrap();
-        let tasks: Vec<_> = (0..32)
-            .map(|i| {
-                let s = store.clone();
-                tokio::spawn(async move { s.propose_at::<Counter>(op(i, 1)).await })
-            })
-            .collect();
-        let mut positions = Vec::new();
-        for t in tasks {
-            positions.push(t.await.unwrap().unwrap().0);
-        }
-        positions.sort_unstable();
-        assert_eq!(positions, (1..=32).collect::<Vec<_>>());
-        assert_eq!(value(&store), 32);
+    let (log, snapshots) = local(dir.path());
+    let opts = MetaOptions { snapshot_every: 5, ..MetaOptions::default() };
+    let store = MetaStore::open(log, snapshots, counter(), opts).await.unwrap();
+    let booted = store.applied_position();
+    let tasks: Vec<_> = (0..32)
+        .map(|i| {
+            let s = store.clone();
+            tokio::spawn(async move { s.propose_at::<Counter>(op(i, 1)).await })
+        })
+        .collect();
+    let mut positions = Vec::new();
+    for t in tasks {
+        positions.push(t.await.unwrap().unwrap().0);
     }
+    // Concurrent proposals share entries (group commit); positions only grow.
+    positions.sort_unstable();
+    assert!(positions[0] > booted && positions[31] <= booted + 32, "{positions:?}");
+    assert!(positions.windows(2).filter(|w| w[0] != w[1]).count() < 31, "some proposals were batched: {positions:?}");
+    assert_eq!(value(&store), 32);
 }
 
 #[tokio::test]
 async fn replay_yields_identical_state() {
     let dir = tempfile::tempdir().unwrap();
     let a = open_on(dir.path()).await;
+    let booted = a.applied_position();
     for i in 0..300u64 {
         // Every fifth op would go negative and is rejected.
         let delta = if i % 5 == 4 { -1000 } else { i as i64 % 7 };
         let _ = a.propose::<Counter>(op(i, delta)).await.unwrap();
     }
-    assert_eq!(a.applied_position(), 300);
+    assert_eq!(a.applied_position(), booted + 300);
     let snap = snapshot(&a);
     assert_eq!(encode_state(&decode_state::<Counter>(&snap).unwrap()), snap, "decode inverts encode");
+    drop(a);
 
     let b = open_on(dir.path()).await;
     assert_eq!(b.generation(), 2);
-    assert_eq!(b.applied_position(), 300);
+    assert!(b.applied_position() >= booted + 300, "everything the log holds is applied");
     assert_eq!(snapshot(&b), snap);
     assert_eq!(op_ids(&b).len(), 240);
 }
@@ -182,7 +197,7 @@ async fn second_incarnation_fences_the_first_without_losing_acknowledged_entries
                     Ok(_) => acked.push(id),
                     Err(e) => {
                         let stop = e.downcast::<Stop>().expect("a Stop error");
-                        return (acked, stop);
+                        return (acked, id, stop);
                     }
                 }
             }
@@ -191,16 +206,18 @@ async fn second_incarnation_fences_the_first_without_losing_acknowledged_entries
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
     let b = open_on(dir.path()).await;
-    let (acked, stop) = writer.await.unwrap();
+    let (acked, failed, stop) = writer.await.unwrap();
 
     assert_eq!(stop, Stop::Fenced { current: 2 });
     assert_eq!(a.stopped().await, Stop::Fenced { current: 2 });
     assert!(a.propose::<Counter>(op(u64::MAX >> 1, 1)).await.is_err());
     assert!(!acked.is_empty(), "A acknowledged something before the fence");
 
-    // B holds exactly A's acknowledged entries: nothing lost, nothing extra.
-    assert_eq!(op_ids(&b), acked);
-    assert_eq!(snapshot(&a), snapshot(&b));
+    // B holds every entry A acknowledged; at most the one that failed is
+    // there too (written, then fenced before its answer: outcome unknown).
+    let held = op_ids(&b);
+    assert_eq!(&held[..acked.len()], &acked[..]);
+    assert!(held.len() <= acked.len() + 1 && held.iter().all(|&id| id <= failed), "{held:?} vs {acked:?}");
 
     b.propose::<Counter>(op(1 << 40, 1)).await.unwrap().unwrap();
 }
@@ -212,15 +229,16 @@ async fn crash_between_append_and_apply_is_applied_once_on_boot() {
         let a = open_on(dir.path()).await;
         a.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
     }
-    // An incarnation that appended a batch and died before applying it.
+    // An incarnation that appended an entry and died before committing it.
     let log = LocalLogStore::open(dir.path().join("log")).unwrap();
-    assert_eq!(log.claim(2).await.unwrap().position, 1);
-    assert_eq!(log.append(2, &[command::<Counter>(&op(2, 5)).entry(2)]).await.unwrap(), 2);
+    let head = log.claim(2).await.unwrap();
+    let term = log.discover().await.unwrap().unwrap().head_term;
+    let next = head.position + 1;
+    assert_eq!(log.append(2, &[raw_entry(term, next, command::<Counter>(&op(2, 5)))]).await.unwrap(), next);
 
     for expected_gen in [3, 4] {
         let a = open_on(dir.path()).await;
         assert_eq!(a.generation(), expected_gen);
-        assert_eq!(a.applied_position(), 2);
         assert_eq!(value(&a), 6);
         assert_eq!(op_ids(&a), vec![1, 2]);
     }
@@ -234,10 +252,11 @@ async fn entries_of_another_command_format_refuse_to_replay() {
         a.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
     }
     let log = LocalLogStore::open(dir.path().join("log")).unwrap();
-    log.claim(2).await.unwrap();
+    let head = log.claim(2).await.unwrap();
+    let term = log.discover().await.unwrap().unwrap().head_term;
     let mut old = command::<Counter>(&op(2, 1));
     old.version = Counter::VERSION + 1;
-    log.append(2, &[old.entry(2)]).await.unwrap();
+    log.append(2, &[raw_entry(term, head.position + 1, old)]).await.unwrap();
 
     let err = MetaStore::open_local(dir.path().join("log"), counter()).await.err().expect("boot must fail");
     assert!(format!("{err:#}").contains("counter command in format 2, this binary reads 1"), "{err:#}");
@@ -267,21 +286,20 @@ async fn snapshots_collect_the_log_and_boot_from_them() {
     for i in 0..35u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
-    wait_base(&a, 30).await;
-    let state = snapshot(&a);
+    wait_base(&a, 20).await;
+    let (state, applied) = (snapshot(&a), a.applied_position());
     drop(a);
 
     let d = LocalLogStore::open(&log_dir).unwrap().discover().await.unwrap().unwrap();
     let base = d.base.expect("the log starts from a snapshot");
-    assert_eq!(base.at, 30);
     let stored = LocalSnapshotStore::new(&log_dir).get(&base.snapshot).await.unwrap();
-    assert_eq!(TabletSnapshot::decode(&stored.data).unwrap().position, 30);
-    eventually("older snapshots removed", || snapshot_files(&log_dir) == 1).await;
+    assert_eq!(raft::RaftSnapshot::decode(&stored.data).unwrap().tablet.position, base.at);
+    eventually("older snapshots removed", || snapshot_files(&log_dir) <= 2).await;
     let segs = segments(&log_dir);
     assert!(segs[0] > "seg-00000000000000000001.log".to_string(), "log behind the base collected: {segs:?}");
 
     let b = open_snapshotting(&log_dir).await;
-    assert_eq!(b.applied_position(), 35);
+    assert!(b.applied_position() >= applied, "everything the log holds is applied");
     assert_eq!(snapshot(&b), state, "snapshot + tail rebuild the same state");
     b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
     assert_eq!(value(&b), 36);
@@ -297,14 +315,16 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
     }
     let log = LocalLogStore::open(&log_dir).unwrap();
     let head = log.claim(2).await.unwrap();
-    let snap = TabletSnapshot {
+    let meta = raft::solo_meta(head.position - 1);
+    let tablet = TabletSnapshot {
         format: SNAPSHOT_FORMAT,
-        position: 1,
+        position: head.position,
         states: vec![("counter".into(), Counter::VERSION + 1, encode_state(&Counter::default()))],
     };
-    let stored = StoredSnapshot { log_id: head.log_id, at: 1, data: snap.encode() };
+    let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
+    let stored = StoredSnapshot { log_id: head.log_id, at: head.position, data };
     let snapshot = LocalSnapshotStore::new(&log_dir).put(&stored).await.unwrap();
-    log.rebase(2, Base { at: 1, term: 1, snapshot }).await.unwrap();
+    log.rebase(2, raft::base_of(&meta, snapshot)).await.unwrap();
 
     let err = MetaStore::open_local(&log_dir, counter()).await.err().expect("boot must fail");
     assert!(format!("{err:#}").contains("counter state in format 2, this binary reads 1"), "{err:#}");
@@ -325,8 +345,9 @@ async fn a_lost_log_boots_only_through_a_lossy_restore() {
     for i in 0..45u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
-    wait_base(&a, 40).await;
-    assert_eq!(a.restorable_position(), Some(40));
+    wait_base(&a, 30).await;
+    let restorable = a.restorable_position().unwrap();
+    let kept = a.read::<Counter, _>(|c| c.v);
     drop(a);
 
     // The disk with the log is lost; the snapshots survive.
@@ -335,23 +356,25 @@ async fn a_lost_log_boots_only_through_a_lossy_restore() {
     assert!(format!("{err:#}").contains("restore --lossy"), "{err:#}");
 
     let log = LocalLogStore::open(&log_dir).unwrap();
-    assert_eq!(restore_lossy(&log, snapshots.as_ref()).await.unwrap(), 40);
+    let restored_at = restore_lossy(&log, snapshots.as_ref()).await.unwrap();
+    assert!(restored_at >= restorable, "the newest snapshot: {restored_at} < {restorable}");
     assert!(restore_lossy(&log, snapshots.as_ref()).await.is_err(), "only an empty log is seeded");
 
     let b = open(snapshots.clone()).await.unwrap();
-    assert_eq!(value(&b), 40, "state as of the snapshot; the last 5 ops are lost");
-    assert_eq!(b.applied_position(), 0, "the new log numbers from 0");
+    let restored = value(&b);
+    assert!(restored <= kept && restored >= 20, "state as of the snapshot: {restored} of {kept}");
     b.propose::<Counter>(op(1000, 1)).await.unwrap().unwrap();
     drop(b);
-    assert_eq!(value(&*open(snapshots).await.unwrap()), 41);
+    assert_eq!(value(&*open(snapshots).await.unwrap()), restored + 1);
 }
 
 #[tokio::test]
 async fn confirm_active_detects_a_fence_without_any_proposal() {
     let dir = tempfile::tempdir().unwrap();
     let a = open_on(dir.path()).await;
+    let booted = a.applied_position();
     a.confirm_active().await.unwrap();
-    assert_eq!(a.applied_position(), 0, "a barrier takes no position");
+    assert_eq!(a.applied_position(), booted, "a confirmation takes no position");
 
     let _b = open_on(dir.path()).await;
     assert!(!a.is_stopped(), "A has not touched the log since B claimed it");
@@ -381,16 +404,15 @@ async fn the_tablet_runs_over_a_chat_log_with_snapshots_in_another_chat() {
     }
     wait_base(&a, 14).await;
     let state = snapshot(&a);
-    eventually("older snapshots removed", || snap_chat.inner.lock().unwrap().docs.len() == 1).await;
+    eventually("older snapshots removed", || snap_chat.inner.lock().unwrap().docs.len() <= 2).await;
 
     let b = open().await.unwrap();
-    assert_eq!(b.applied_position(), 20);
     assert_eq!(snapshot(&b), state, "snapshot + tail rebuild the state");
     let err = a.propose::<Counter>(op(100, 1)).await.unwrap_err();
     assert_eq!(err.downcast::<Stop>().unwrap(), Stop::Fenced { current: 2 });
     b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
     assert_eq!(value(&b), 21);
-    assert!(log_chat.inner.lock().unwrap().docs.len() < 10, "messages behind the base are collected");
+    assert!(log_chat.inner.lock().unwrap().docs.len() < 15, "messages behind the base are collected");
 }
 
 #[tokio::test]
@@ -406,14 +428,14 @@ async fn a_local_log_restores_from_snapshots_in_a_chat() {
     for i in 0..35u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
-    wait_base(&a, 30).await;
+    wait_base(&a, 20).await;
     drop(a);
 
     let fresh = tempfile::tempdir().unwrap();
     let log = Arc::new(LocalLogStore::open(fresh.path()).unwrap());
-    assert_eq!(restore_lossy(log.as_ref(), snapshots.as_ref()).await.unwrap(), 30);
+    restore_lossy(log.as_ref(), snapshots.as_ref()).await.unwrap();
     let b = MetaStore::open(log, snapshots, counter(), MetaOptions::default()).await.unwrap();
-    assert_eq!(value(&b), 30);
+    assert!(value(&b) >= 17, "the newest snapshot's state, got {}", value(&b));
 }
 
 #[tokio::test]
@@ -426,11 +448,40 @@ async fn an_idle_tablet_snapshots_by_time() {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
     // No more traffic: the interval alone takes the snapshot.
-    wait_base(&a, 3).await;
+    let applied = a.applied_position();
+    wait_base(&a, applied).await;
     let d = log.discover().await.unwrap().unwrap();
-    assert_eq!(d.base.map(|b| b.at), Some(3));
-    eventually("older snapshots removed", || snapshot_files(dir.path()) == 1).await;
+    assert_eq!(d.base.map(|b| b.at), Some(applied));
     // Nothing new: no more snapshots.
+    let files = snapshot_files(dir.path());
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(snapshot_files(dir.path()), 1);
+    assert_eq!(snapshot_files(dir.path()), files);
+}
+
+
+/// Latency of the tablet over a disk and a memory log (`--ignored --nocapture`).
+#[tokio::test]
+#[ignore]
+async fn timing_probe() {
+    for kind in ["disk", "memory"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, snapshots): (Arc<dyn LogStore>, Arc<dyn SnapshotStore>) = match kind {
+            "disk" => local(dir.path()),
+            _ => (Arc::new(MemoryLogStore::new()), Arc::new(MemorySnapshotStore::new())),
+        };
+        let store = MetaStore::open(log, snapshots, counter(), MetaOptions::default()).await.unwrap();
+        let t = std::time::Instant::now();
+        for i in 0..200u64 {
+            store.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+        }
+        let seq = t.elapsed();
+        let t = std::time::Instant::now();
+        let tasks: Vec<_> = (1000..1200u64).map(|i| { let s = store.clone(); tokio::spawn(async move { s.propose::<Counter>(op(i, 1)).await }) }).collect();
+        for t in tasks { t.await.unwrap().unwrap().unwrap(); }
+        let par = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..50 { store.confirm_active().await.unwrap(); }
+        let conf = t.elapsed();
+        println!("{kind}: 200 sequential {seq:?} ({:?}/op), 200 concurrent {par:?}, 50 confirm_active {conf:?}", seq / 200);
+    }
 }

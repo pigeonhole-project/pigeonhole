@@ -532,7 +532,7 @@ mod tests {
     }
 
     fn base(at: Position) -> Base {
-        Base { at, term: 1, snapshot: crate::snapshot::SnapshotRef(format!("s{at}")) }
+        Base { at, term: 1, leader: 0, snapshot: crate::snapshot::SnapshotRef(format!("s{at}")) }
     }
 
     async fn read_all(log: &dyn LogStore, from: Position, head: Position) -> LogResult<Vec<(Position, Entry)>> {

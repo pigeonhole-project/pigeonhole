@@ -76,8 +76,6 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     let log = open_log(cfg).await?;
     let snapshots = open_snapshots(cfg).await?;
     let opts = MetaOptions {
-        batch_max_delay: cfg.meta.batch_max_delay,
-        batch_max_entries: cfg.meta.batch_max_entries,
         snapshot_every: cfg.meta.snapshot_every_entries,
         snapshot_interval: cfg.meta.snapshot_interval,
         snapshots_outlive_log: cfg.meta.snapshots_outlive_log(),
