@@ -118,3 +118,95 @@ async fn discover_reads_only_the_tail() {
     let d = store(&mem).discover().await.unwrap().unwrap();
     assert_eq!((d.head, d.gen, d.vote.as_deref()), (Head { position: 1, ..head }, 1, Some(&b"v"[..])));
 }
+
+mod disk {
+    use super::*;
+    use pigeonhole_storage_disk::DiskBlobStore;
+    use std::time::{Duration, Instant};
+
+    fn disk(dir: &std::path::Path) -> Arc<DiskBlobStore> {
+        Arc::new(DiskBlobStore::open(dir).unwrap())
+    }
+
+    #[tokio::test]
+    async fn passes_the_logstore_conformance_suite_on_disk() {
+        conformance::run_all(|| {
+            let dir = Arc::new(tempfile::tempdir().unwrap());
+            move || {
+                let dir = dir.clone();
+                async move { Arc::new(ChainLogStore::new(disk(dir.path()))) as Arc<dyn LogStore> }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_deposed_writer_in_another_handle_loses_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (ChainLogStore::new(disk(dir.path())), ChainLogStore::new(disk(dir.path())));
+        a.claim(1).await.unwrap();
+        a.append(1, &[entry(1)]).await.unwrap();
+        b.claim(2).await.unwrap();
+        assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Fenced { current: 2 })));
+        b.append(2, &[entry(3)]).await.unwrap();
+        assert_eq!(history(&ChainLogStore::new(disk(dir.path()))).await, vec![1, 3]);
+    }
+
+    fn pct(mut v: Vec<Duration>, p: f64) -> Duration {
+        v.sort();
+        v[((v.len() as f64 - 1.0) * p).round() as usize]
+    }
+
+    /// The two disk logs side by side: append latency (one entry, fsync),
+    /// open + claim, replay of 1M entries, rebase.
+    /// `cargo test --release -p pigeonhole-meta bench_disk_logs -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "a benchmark"]
+    async fn bench_disk_logs() {
+        async fn run(name: &str, open: &dyn Fn(&std::path::Path) -> Arc<dyn LogStore>) {
+            let dir = tempfile::tempdir().unwrap();
+            let log = open(dir.path());
+            log.claim(1).await.unwrap();
+            let mut lat = Vec::new();
+            for i in 0..1000u64 {
+                let t = Instant::now();
+                log.append(1, &[entry(i)]).await.unwrap();
+                lat.push(t.elapsed());
+            }
+            let (p50, p99) = (pct(lat.clone(), 0.5), pct(lat, 0.99));
+
+            // 1M entries of 100 bytes in batches of 1000.
+            let batch: Vec<Entry> = (0..1000u64).map(|_| Entry { term: 1, payload: vec![7; 100] }).collect();
+            let t = Instant::now();
+            for _ in 0..1000 {
+                log.append(1, &batch).await.unwrap();
+            }
+            let fill = t.elapsed();
+
+            let t = Instant::now();
+            let again = open(dir.path());
+            let head = again.claim(2).await.unwrap();
+            let claim = t.elapsed();
+            let t = Instant::now();
+            let n = again.read(0, head).try_fold(0u64, |n, _| async move { Ok(n + 1) }).await.unwrap();
+            let replay = t.elapsed();
+            assert_eq!(n, head.position);
+
+            let t = Instant::now();
+            let base = crate::log::Base {
+                at: head.position - 10,
+                term: 1,
+                leader: 0,
+                snapshot: crate::snapshot::SnapshotRef("s".into()),
+            };
+            again.rebase(2, base).await.unwrap();
+            let rebase = t.elapsed();
+            println!(
+                "{name:>10}: append p50 {p50:?} p99 {p99:?}; 1M entries written in {fill:?}; open + claim {claim:?}; \
+                 replay {n} entries {replay:?}; rebase {rebase:?}"
+            );
+        }
+        run("local", &|d| Arc::new(crate::log::LocalLogStore::open(d).unwrap())).await;
+        run("disk chain", &|d| Arc::new(ChainLogStore::new(Arc::new(DiskBlobStore::open(d).unwrap())))).await;
+    }
+}

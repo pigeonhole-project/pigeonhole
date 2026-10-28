@@ -182,6 +182,13 @@ impl Locked<'_> {
     /// Index whatever was appended since we last looked (by us at open, or
     /// by another process), truncating a torn record at the very end.
     pub fn catch_up(&mut self) -> Result<()> {
+        // Nothing new if the active segment did not grow and is not full
+        // (only a full segment rolls over): one fstat, no directory listing.
+        if let Some(s) = self.segs.values().next_back() {
+            if s.len < self.segment_bytes && s.file.metadata()?.len() == s.len {
+                return Ok(());
+            }
+        }
         let last_known = self.segs.keys().next_back().copied();
         let mut seqs = self.seqs_on_disk()?;
         seqs.retain(|s| last_known.is_none_or(|l| *s >= l));
