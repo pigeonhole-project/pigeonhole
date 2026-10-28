@@ -155,6 +155,56 @@ impl SnapshotStore for LocalSnapshotStore {
     }
 }
 
+/// Snapshots in process memory (tests, throwaway runs). Clones share the store.
+#[derive(Clone, Default)]
+pub struct MemorySnapshotStore {
+    inner: Arc<std::sync::Mutex<MemorySnapshots>>,
+}
+
+#[derive(Default)]
+struct MemorySnapshots {
+    next: u64,
+    by_seq: std::collections::BTreeMap<u64, StoredSnapshot>,
+}
+
+impl MemorySnapshotStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn seq(r: &SnapshotRef) -> Result<u64> {
+        r.0.strip_prefix("mem-")
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| anyhow!("{:?} is not a memory snapshot", r.0))
+    }
+}
+
+#[async_trait]
+impl SnapshotStore for MemorySnapshotStore {
+    async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
+        let mut g = self.inner.lock().unwrap();
+        g.next += 1;
+        let seq = g.next;
+        g.by_seq.insert(seq, snapshot.clone());
+        Ok(SnapshotRef(format!("mem-{seq}")))
+    }
+
+    async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
+        let seq = Self::seq(r)?;
+        self.inner.lock().unwrap().by_seq.get(&seq).cloned().with_context(|| format!("no snapshot {:?}", r.0))
+    }
+
+    async fn newest(&self) -> Result<Option<StoredSnapshot>> {
+        Ok(self.inner.lock().unwrap().by_seq.values().next_back().cloned())
+    }
+
+    async fn remove(&self, r: &SnapshotRef) -> Result<()> {
+        let seq = Self::seq(r)?;
+        self.inner.lock().unwrap().by_seq.remove(&seq);
+        Ok(())
+    }
+}
+
 /// Snapshots as documents in a dedicated chat; the newest is pinned, so a
 /// restore finds it without reading the history.
 pub struct ChatSnapshotStore<C> {
@@ -261,6 +311,16 @@ mod tests {
         conformance::run_all(|| {
             let dir = dir.clone();
             async move { Arc::new(LocalSnapshotStore::new(dir.path())) as Arc<dyn SnapshotStore> }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn memory_store_passes_the_conformance_suite() {
+        let store = MemorySnapshotStore::new();
+        conformance::run_all(|| {
+            let store = store.clone();
+            async move { Arc::new(store) as Arc<dyn SnapshotStore> }
         })
         .await;
     }

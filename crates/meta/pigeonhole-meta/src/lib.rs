@@ -49,9 +49,9 @@ pub mod snapshot;
 
 pub use log::{
     Base, Batch, Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogId, LogResult,
-    LogStore, Position, LOG_FORMAT,
+    LogStore, MemoryLogStore, Position, LOG_FORMAT,
 };
-pub use snapshot::{LocalSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
+pub use snapshot::{LocalSnapshotStore, MemorySnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 
 /// Outcome of a command: its reply or its deterministic rejection.
 pub type Outcome<S> = std::result::Result<<S as StateMachine>::Reply, <S as StateMachine>::Reject>;

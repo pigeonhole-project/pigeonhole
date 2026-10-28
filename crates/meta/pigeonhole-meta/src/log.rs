@@ -11,8 +11,10 @@ pub mod chat;
 #[cfg(any(test, feature = "testsuite"))]
 pub mod conformance;
 mod local;
+mod memory;
 
 pub use local::{LocalLogStore, DEFAULT_SEGMENT_BYTES};
+pub use memory::MemoryLogStore;
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.
