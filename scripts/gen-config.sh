@@ -4,10 +4,10 @@
 #
 # Recognized env (all optional except where noted):
 #   CONFIG_OUT           output path (required)
-#   CONFIG_INSTANCE      memory | telegram_mtproto | discord (default memory)
-#   CONFIG_SCOPE_ID      chat id (telegram_mtproto) / channel id (discord); required for those
-#   CONFIG_BOT_TOKEN_ENV env var with the bot token (telegram_mtproto; default BOT_TOKEN)
-#   CONFIG_SESSION       MTProto session file (telegram_mtproto; default per bot in cwd)
+#   CONFIG_INSTANCE      memory | telegram | discord (default memory)
+#   CONFIG_SCOPE_ID      chat id (telegram) / channel id (discord); required for those
+#   CONFIG_BOT_TOKEN_ENV env var with the bot token (telegram; default BOT_TOKEN)
+#   CONFIG_SESSION       MTProto session file (telegram; default per bot in cwd)
 #   CONFIG_LISTEN_ADDR   default 0.0.0.0:8333
 #   CONFIG_META_LOG      local metadata log directory (default pigeonhole-meta)
 #   CONFIG_REGION        default us-east-1
@@ -33,12 +33,12 @@ case "$INSTANCE" in
     # MemoryBlobStore is process-local; quiet background tasks under heavy suites.
     EXTRA_BG=$'\n[repair]\nscrub = false\ninterval_secs = 3600\n\n[sweep]\ninterval_secs = 3600\n'
     ;;
-  telegram_mtproto)
-    : "${CONFIG_SCOPE_ID:?CONFIG_SCOPE_ID (chat id) required for telegram_mtproto}"
+  telegram)
+    : "${CONFIG_SCOPE_ID:?CONFIG_SCOPE_ID (chat id) required for telegram}"
     BLOB_ID="tgm"
     INSTANCE_BLOCK="[[store]]
 id = \"tgm\"
-kind = \"telegram_mtproto\"
+kind = \"telegram\"
 chat_id = ${CONFIG_SCOPE_ID}
 bot_token_env = \"${CONFIG_BOT_TOKEN_ENV:-BOT_TOKEN}\""
     if [[ -n "${CONFIG_SESSION:-}" ]]; then
@@ -54,7 +54,7 @@ kind = \"discord\"
 channel_id = ${CONFIG_SCOPE_ID}"
     ;;
   *)
-    echo "unknown CONFIG_INSTANCE=$INSTANCE (memory|telegram_mtproto|discord)" >&2
+    echo "unknown CONFIG_INSTANCE=$INSTANCE (memory|telegram|discord)" >&2
     exit 1
     ;;
 esac

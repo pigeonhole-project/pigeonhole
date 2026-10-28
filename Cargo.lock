@@ -2343,7 +2343,7 @@ dependencies = [
  "pigeonhole-storage-discord",
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
- "pigeonhole-storage-telegram-mtproto",
+ "pigeonhole-storage-telegram",
  "pigeonhole-types",
  "pin-project-lite",
  "s3s",
@@ -2547,7 +2547,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pigeonhole-storage-telegram-mtproto"
+name = "pigeonhole-storage-telegram"
 version = "0.1.0"
 dependencies = [
  "anyhow",

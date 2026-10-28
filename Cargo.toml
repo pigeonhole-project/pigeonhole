@@ -6,7 +6,7 @@ members = [
     "crates/meta/pigeonhole-meta",
     "crates/blob/pigeonhole-blob",
     "crates/blob/pigeonhole-chunk-store",
-    "crates/storage/pigeonhole-storage-telegram-mtproto",
+    "crates/storage/pigeonhole-storage-telegram",
     "crates/storage/pigeonhole-storage-discord",
     "crates/storage/pigeonhole-storage-memory",
     "crates/storage/pigeonhole-storage-disk",
@@ -77,7 +77,7 @@ pigeonhole-types = { path = "crates/core/pigeonhole-types" }
 pigeonhole-codec = { path = "crates/core/pigeonhole-codec" }
 pigeonhole-blob = { path = "crates/blob/pigeonhole-blob" }
 pigeonhole-chunk-store = { path = "crates/blob/pigeonhole-chunk-store" }
-pigeonhole-storage-telegram-mtproto = { path = "crates/storage/pigeonhole-storage-telegram-mtproto" }
+pigeonhole-storage-telegram = { path = "crates/storage/pigeonhole-storage-telegram" }
 pigeonhole-storage-discord = { path = "crates/storage/pigeonhole-storage-discord" }
 pigeonhole-storage-memory = { path = "crates/storage/pigeonhole-storage-memory" }
 pigeonhole-storage-disk = { path = "crates/storage/pigeonhole-storage-disk" }

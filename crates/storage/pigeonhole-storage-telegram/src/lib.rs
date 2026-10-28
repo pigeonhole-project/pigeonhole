@@ -18,4 +18,4 @@ pub use channel::{windows, ChannelApi, ChannelMessage, FileLocation, FileReferen
 pub use client::{bot_id_of, channel_id_of, Lane, MtprotoChannel, MtprotoConfig, TelegramMtproto, CALL_BUDGET};
 pub use pigeonhole_blob::BlobBackend;
 pub use session::FileSession;
-pub use store::{blob_random_id, MtprotoBlobStore, TelegramMtprotoId};
+pub use store::{blob_random_id, TelegramBlobStore, TelegramId};

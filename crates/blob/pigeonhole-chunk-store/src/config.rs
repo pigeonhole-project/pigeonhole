@@ -91,7 +91,7 @@ pub enum SnapshotSettings {
     /// Process memory, with a memory log (tests).
     Memory,
     /// A dedicated Telegram channel read over MTProto.
-    TelegramMtproto { chat_id: String, login: TelegramLogin },
+    Telegram { chat_id: String, login: TelegramLogin },
 }
 
 /// Where the command log lives (`[meta] log`).
@@ -103,7 +103,7 @@ pub enum LogSettings {
     Memory,
     /// A dedicated Telegram channel read over MTProto (fenced by the order
     /// of its messages; docs/telegram-mtproto.md).
-    TelegramMtproto { chat_id: String, login: TelegramLogin },
+    Telegram { chat_id: String, login: TelegramLogin },
 }
 
 impl MetaSettings {
@@ -125,9 +125,9 @@ impl MetaSettings {
     pub fn snapshots_outlive_log(&self) -> bool {
         match (&self.log, &self.snapshot) {
             (LogSettings::LocalDisk { path: log }, SnapshotSettings::LocalDisk { path }) => log != path,
-            (LogSettings::LocalDisk { .. }, SnapshotSettings::TelegramMtproto { .. }) => true,
+            (LogSettings::LocalDisk { .. }, SnapshotSettings::Telegram { .. }) => true,
             (LogSettings::LocalDisk { .. }, SnapshotSettings::Memory) => false,
-            (LogSettings::TelegramMtproto { .. } | LogSettings::Memory, _) => false,
+            (LogSettings::Telegram { .. } | LogSettings::Memory, _) => false,
         }
     }
 }
@@ -451,8 +451,8 @@ impl FileMeta {
         let log = match &log_store {
             Store::LocalDisk { path } => LogSettings::LocalDisk { path: path.clone() },
             Store::Memory => LogSettings::Memory,
-            Store::TelegramMtproto { chat_id, login, .. } => {
-                LogSettings::TelegramMtproto { chat_id: chat_id.clone(), login: login.clone() }
+            Store::Telegram { chat_id, login, .. } => {
+                LogSettings::Telegram { chat_id: chat_id.clone(), login: login.clone() }
             }
             Store::Discord { .. } => unreachable!("meta_store refuses discord"),
         };
@@ -464,12 +464,12 @@ impl FileMeta {
         let snapshot = match snapshot_store {
             Store::LocalDisk { path } => SnapshotSettings::LocalDisk { path },
             Store::Memory => SnapshotSettings::Memory,
-            Store::TelegramMtproto { chat_id, login, .. } => SnapshotSettings::TelegramMtproto { chat_id, login },
+            Store::Telegram { chat_id, login, .. } => SnapshotSettings::Telegram { chat_id, login },
             Store::Discord { .. } => unreachable!("meta_store refuses discord"),
         };
         match (&log, &snapshot) {
             (
-                LogSettings::TelegramMtproto { .. },
+                LogSettings::Telegram { .. },
                 SnapshotSettings::LocalDisk { .. } | SnapshotSettings::Memory,
             ) => bail!(
                 "[meta] snapshot: a telegram log needs telegram snapshots (a log off-host cannot \
@@ -590,7 +590,7 @@ pub fn check_block_size_against_instances(
         let max = match inst.info.kind {
             InstanceKind::Memory => 20 * 1024 * 1024 - 1,
             InstanceKind::LocalDisk => pigeonhole_types::BackendLimits::local_disk().max_blob_size,
-            InstanceKind::TelegramMtproto => pigeonhole_types::BackendLimits::telegram_mtproto().max_blob_size,
+            InstanceKind::Telegram => pigeonhole_types::BackendLimits::telegram().max_blob_size,
             InstanceKind::Discord => {
                 pigeonhole_types::BackendLimits::discord(inst.max_blob_size).max_blob_size
             }
@@ -941,8 +941,8 @@ upload_concurrency = 4
         let stores = format!("{}{}", tg_store("tg-log", -100), tg_store("tg-snap", -101));
         let cfg = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n{stores}")).unwrap();
         assert!(!cfg.meta.snapshots_outlive_log());
-        assert!(matches!(&cfg.meta.log, LogSettings::TelegramMtproto { chat_id, .. } if chat_id == "-100"));
-        assert!(matches!(&cfg.meta.snapshot, SnapshotSettings::TelegramMtproto { chat_id, .. } if chat_id == "-101"));
+        assert!(matches!(&cfg.meta.log, LogSettings::Telegram { chat_id, .. } if chat_id == "-100"));
+        assert!(matches!(&cfg.meta.snapshot, SnapshotSettings::Telegram { chat_id, .. } if chat_id == "-101"));
 
         let err = load(&format!(
             "[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n[chunk]\nstore = \"tg-log\"\n{stores}"
@@ -965,13 +965,13 @@ upload_concurrency = 4
 
     fn tgm_store(id: &str, chat: i64) -> String {
         format!(
-            "[[store]]\nid = \"{id}\"\nkind = \"telegram_mtproto\"\nchat_id = {chat}\nbot_token_env = \"PH_TEST_TGM_TOKEN\"\n\
+            "[[store]]\nid = \"{id}\"\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_env = \"PH_TEST_TGM_TOKEN\"\n\
              api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n"
         )
     }
 
     #[test]
-    fn telegram_mtproto_stores_log_in_one_session_per_bot() {
+    fn telegram_stores_log_in_one_session_per_bot() {
         std::env::set_var("PH_TEST_TGM_TOKEN", "42:secret");
         std::env::set_var("PH_TEST_TGM_API_ID", "12345");
         std::env::set_var("PH_TEST_TGM_API_HASH", "hash");
@@ -983,10 +983,10 @@ upload_concurrency = 4
             api_hash: "hash".into(),
             session: "pigeonhole-tg-42.session".into(),
         };
-        assert_eq!(cfg.meta.log, LogSettings::TelegramMtproto { chat_id: "-1001".into(), login: login.clone() });
-        assert_eq!(cfg.meta.snapshot, SnapshotSettings::TelegramMtproto { chat_id: "-1002".into(), login: login.clone() });
+        assert_eq!(cfg.meta.log, LogSettings::Telegram { chat_id: "-1001".into(), login: login.clone() });
+        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Telegram { chat_id: "-1002".into(), login: login.clone() });
         let inst = cfg.primary_instance().unwrap();
-        assert_eq!((inst.info.kind, inst.info.fingerprint.as_str()), (InstanceKind::TelegramMtproto, "tgm:42:-1003"));
+        assert_eq!((inst.info.kind, inst.info.fingerprint.as_str()), (InstanceKind::Telegram, "tg:42:-1003"));
         assert_eq!(inst.info.location, "tg:chat:-1003", "the same place as a Bot API store of that chat");
         assert_eq!(inst.telegram, Some(login));
         assert!(!format!("{:?}", inst.telegram).contains("secret"));

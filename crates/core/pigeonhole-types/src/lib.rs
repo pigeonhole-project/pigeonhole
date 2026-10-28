@@ -91,18 +91,9 @@ pub struct BackendLimits {
 }
 
 impl BackendLimits {
-    pub fn telegram() -> Self {
-        Self {
-            // Bot API getFile hard cap is 20 MiB; keep the existing on-wire margin.
-            max_blob_size: 20 * 1024 * 1024 - 1,
-            supports_range: RangeSupport::BestEffort,
-            can_list: false,
-        }
-    }
-
     /// MTProto: a bot posts files far larger than any chunk (`MAX_LOGICAL_CHUNK`)
     /// and reads any 4 KiB-aligned window; the channel can be listed.
-    pub fn telegram_mtproto() -> Self {
+    pub fn telegram() -> Self {
         Self {
             max_blob_size: 256 * 1024 * 1024,
             supports_range: RangeSupport::BestEffort,

@@ -1,5 +1,5 @@
 //! Binary-only: the MTProto side of the channel LogStore and snapshots
-//! (`[meta] log` / `snapshot` naming a `telegram_mtproto` `[[store]]`), and
+//! (`[meta] log` / `snapshot` naming a `telegram` `[[store]]`), and
 //! one MTProto login per bot for the whole process.
 
 use anyhow::{bail, Context};
@@ -8,7 +8,7 @@ use bytes::Bytes;
 use pigeonhole_chunk_store::TelegramLogin;
 use pigeonhole_meta::log::channel::{ChannelApi, ChannelMsg};
 use lru::LruCache;
-use pigeonhole_storage_telegram_mtproto::{
+use pigeonhole_storage_telegram::{
     windows, ChannelApi as _, ChannelMessage, FileLocation, FileReferenceExpired, MtprotoChannel, MtprotoConfig,
     TelegramMtproto, IDS_PER_CALL, WINDOW,
 };
@@ -22,7 +22,7 @@ use std::sync::{Mutex, OnceLock};
 static CLIENTS: OnceLock<tokio::sync::Mutex<HashMap<i64, (PathBuf, TelegramMtproto)>>> = OnceLock::new();
 
 pub async fn client(login: &TelegramLogin) -> anyhow::Result<TelegramMtproto> {
-    let bot_id = pigeonhole_storage_telegram_mtproto::bot_id_of(&login.bot_token)?;
+    let bot_id = pigeonhole_storage_telegram::bot_id_of(&login.bot_token)?;
     let mut clients = CLIENTS.get_or_init(Default::default).lock().await;
     if let Some((session, client)) = clients.get(&bot_id) {
         if *session != login.session {

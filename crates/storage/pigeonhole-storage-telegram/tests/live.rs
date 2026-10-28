@@ -1,5 +1,5 @@
 //! Against the channel `TG_BLOBS_CHAT_ID`: `cargo test -p
-//! pigeonhole-storage-telegram-mtproto --test live -- --ignored --nocapture`
+//! pigeonhole-storage-telegram --test live -- --ignored --nocapture`
 //! with it, `TG_BOT_TOKEN`, `TG_API_ID` and `TG_API_HASH` in the workspace `.env`.
 //! Deletes only what it posted.
 
@@ -7,7 +7,7 @@ use bytes::Bytes;
 use pigeonhole_blob::{
     collect_stream, BlobBackend, BlobId, ChatLimiter, ChatLimiterConfig, InstanceInfo, InstanceKind, InstanceRole,
 };
-use pigeonhole_storage_telegram_mtproto::{ChannelApi, Lane, MtprotoBlobStore, MtprotoConfig, TelegramMtproto};
+use pigeonhole_storage_telegram::{ChannelApi, Lane, TelegramBlobStore, MtprotoConfig, TelegramMtproto};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,12 +36,12 @@ async fn blob_store_against_a_live_channel() {
     let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
     let info = InstanceInfo {
         id: "live".into(),
-        kind: InstanceKind::TelegramMtproto,
-        fingerprint: format!("tgm:{}:{}", tg.bot_id(), channel.channel_id()),
+        kind: InstanceKind::Telegram,
+        fingerprint: format!("tg:{}:{}", tg.bot_id(), channel.channel_id()),
         location: format!("tg:chat:{chat_id}"),
         role: InstanceRole::ReadWrite,
     };
-    let store = MtprotoBlobStore::new(channel.clone(), limiter, info);
+    let store = TelegramBlobStore::new(channel.clone(), limiter, info);
 
     // A 12 MiB blob: a "big" upload, windows across 1 MiB boundaries.
     let data: Bytes = (0..12 * 1024 * 1024 + 4321).map(|i: usize| (i * 7 % 253) as u8).collect::<Vec<_>>().into();
@@ -63,7 +63,7 @@ async fn blob_store_against_a_live_channel() {
 }
 
 /// Print what a channel holds: `TG_LIST_CHAT_ID=-100… TG_LIST_TO=<id>
-/// cargo test -p pigeonhole-storage-telegram-mtproto --test live list -- --ignored --nocapture`
+/// cargo test -p pigeonhole-storage-telegram --test live list -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "needs a Telegram bot, api id and a channel"]
 async fn list() {
@@ -84,9 +84,9 @@ async fn list() {
         let ids: Vec<i64> = (lo..=to.min(lo + 99)).collect();
         for (id, m) in ids.iter().zip(channel.get_messages(&ids).await.unwrap()) {
             match m {
-                pigeonhole_storage_telegram_mtproto::ChannelMessage::Empty => {}
-                pigeonhole_storage_telegram_mtproto::ChannelMessage::Other => println!("{id} (not a document)"),
-                pigeonhole_storage_telegram_mtproto::ChannelMessage::Document { name, size, .. } => {
+                pigeonhole_storage_telegram::ChannelMessage::Empty => {}
+                pigeonhole_storage_telegram::ChannelMessage::Other => println!("{id} (not a document)"),
+                pigeonhole_storage_telegram::ChannelMessage::Document { name, size, .. } => {
                     println!("{id} {name} {size}")
                 }
             }
@@ -121,7 +121,7 @@ async fn a_sent_message_is_visible_at_once() {
         posted.push(id);
         let seen = r.get_messages(&[id]).await.unwrap();
         assert!(
-            matches!(seen[0], pigeonhole_storage_telegram_mtproto::ChannelMessage::Document { .. }),
+            matches!(seen[0], pigeonhole_storage_telegram::ChannelMessage::Document { .. }),
             "message {id} not visible to another session right after its send: {seen:?}"
         );
     }

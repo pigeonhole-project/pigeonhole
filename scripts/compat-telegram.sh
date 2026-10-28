@@ -13,15 +13,15 @@
 #   4. smoke + ceph/s3-tests + s3s boto3 + s3s-e2e + rclone
 #
 # Usage:
-#   ./scripts/compat-telegram-mtproto.sh           # curated s3-tests + other suites
-#   ./scripts/compat-telegram-mtproto.sh --all     # full s3-tests functional (slow)
+#   ./scripts/compat-telegram.sh           # curated s3-tests + other suites
+#   ./scripts/compat-telegram.sh --all     # full s3-tests functional (slow)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LOG="${PIGEONHOLE_TG_LOG:-$ROOT/.cache/pigeonhole-telegram-mtproto.log}"
-PIDFILE="${PIGEONHOLE_TG_PID:-$ROOT/.cache/pigeonhole-telegram-mtproto.pid}"
-REPORT="${PIGEONHOLE_TG_REPORT:-$ROOT/.cache/telegram-mtproto-suite-report.txt}"
+LOG="${PIGEONHOLE_TG_LOG:-$ROOT/.cache/pigeonhole-telegram.log}"
+PIDFILE="${PIGEONHOLE_TG_PID:-$ROOT/.cache/pigeonhole-telegram.pid}"
+REPORT="${PIGEONHOLE_TG_REPORT:-$ROOT/.cache/telegram-suite-report.txt}"
 S3S_DIR="${S3S_DIR:-$ROOT/.cache/s3s-upstream}"
 S3S_REPO="${S3S_REPO:-https://github.com/s3s-project/s3s.git}"
 S3S_REF="${S3S_REF:-main}"
@@ -102,15 +102,15 @@ log_step "build release"
 cargo build --release -q
 
 if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "port $PORT busy; stop the existing server before compat-telegram-mtproto" >&2
+  echo "port $PORT busy; stop the existing server before compat-telegram" >&2
   exit 1
 fi
 
-CFG="$ROOT/.cache/pigeonhole-telegram-mtproto-config.toml"
-META_DB="$ROOT/.cache/pigeonhole-telegram-mtproto.db"
+CFG="$ROOT/.cache/pigeonhole-telegram-config.toml"
+META_DB="$ROOT/.cache/pigeonhole-telegram.db"
 rm -rf "$META_DB.log"
 CONFIG_OUT="$CFG" \
-  CONFIG_INSTANCE=telegram_mtproto \
+  CONFIG_INSTANCE=telegram \
   CONFIG_SCOPE_ID="$CHAT_ID" \
   CONFIG_BOT_TOKEN_ENV=TG_BOT_TOKEN \
   CONFIG_SESSION="$ROOT/.cache/tgm-compat.session" \
@@ -119,7 +119,7 @@ CONFIG_OUT="$CFG" \
   "$ROOT/scripts/gen-config.sh"
 export PIGEONHOLE_CONFIG="$CFG"
 
-log_step "purge Telegram (MTProto)"
+log_step "purge Telegram"
 ./target/release/pigeonhole purge --yes --expect-chat "$CHAT_ID" 2>&1 | tee -a "$REPORT"
 
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-pigeonhole}"
@@ -145,10 +145,10 @@ for _ in $(seq 1 80); do
   sleep 0.15
 done
 if [[ -z "${code:-}" || "$code" == "000" ]]; then
-  echo "telegram_mtproto server failed to start; see $LOG" >&2
+  echo "telegram server failed to start; see $LOG" >&2
   exit 1
 fi
-log_step "pigeonhole telegram_mtproto listening on $ENDPOINT_URL (pid $(cat "$PIDFILE"))"
+log_step "pigeonhole telegram listening on $ENDPOINT_URL (pid $(cat "$PIDFILE"))"
 
 log_step "smoke"
 set +e
@@ -227,7 +227,7 @@ fi
 
 log_step "s3s-e2e (STS assume_role expected to fail without STS)"
 set +e
-"$E2E_BIN" --json "$ROOT/.cache/s3s-e2e-telegram-mtproto-report.json" 2>&1 | tee -a "$REPORT"
+"$E2E_BIN" --json "$ROOT/.cache/s3s-e2e-telegram-report.json" 2>&1 | tee -a "$REPORT"
 e2e_rc=${PIPESTATUS[0]}
 set -e
 # Accept exit!=0 if the only failure is STS.
@@ -282,4 +282,4 @@ echo "report: $REPORT" | tee -a "$REPORT"
 if [[ "$fail" -ne 0 ]]; then
   exit 1
 fi
-echo "telegram_mtproto suite OK"
+echo "telegram suite OK"

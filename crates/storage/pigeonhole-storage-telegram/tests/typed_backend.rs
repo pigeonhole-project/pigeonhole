@@ -5,11 +5,11 @@ use pigeonhole_blob::{
     collect_stream, BlobBackend, BlobId, ChatLimiter, ChatLimiterConfig, InstanceInfo, InstanceKind, InstanceRole,
     Sweepable,
 };
-use pigeonhole_storage_telegram_mtproto::fake::FakeChannel;
-use pigeonhole_storage_telegram_mtproto::{MtprotoBlobStore, TelegramMtprotoId, WINDOW};
+use pigeonhole_storage_telegram::fake::FakeChannel;
+use pigeonhole_storage_telegram::{TelegramBlobStore, TelegramId, WINDOW};
 use std::sync::Arc;
 
-fn store() -> (Arc<FakeChannel>, MtprotoBlobStore<FakeChannel>) {
+fn store() -> (Arc<FakeChannel>, TelegramBlobStore<FakeChannel>) {
     let channel = Arc::new(FakeChannel::new(77));
     let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig {
         bot_rate_per_sec: 1000.0,
@@ -20,12 +20,12 @@ fn store() -> (Arc<FakeChannel>, MtprotoBlobStore<FakeChannel>) {
     }));
     let info = InstanceInfo {
         id: "tgm".into(),
-        kind: InstanceKind::TelegramMtproto,
-        fingerprint: "tgm:1:77".into(),
+        kind: InstanceKind::Telegram,
+        fingerprint: "tg:1:77".into(),
         location: "tg:chat:-10077".into(),
         role: InstanceRole::ReadWrite,
     };
-    (channel.clone(), MtprotoBlobStore::new(channel, limiter, info))
+    (channel.clone(), TelegramBlobStore::new(channel, limiter, info))
 }
 
 fn pattern(len: usize) -> Bytes {
@@ -93,7 +93,7 @@ async fn sweeps_only_our_blobs_and_reads_ranges_of_100_ids() {
 
     // The listing also tells where the blobs are: reading them needs no lookup.
     let before = channel.calls().get_messages;
-    collect_stream(store.get(&TelegramMtprotoId { message_id: late }, None).await.unwrap()).await.unwrap();
+    collect_stream(store.get(&TelegramId { message_id: late }, None).await.unwrap()).await.unwrap();
     assert_eq!(channel.calls().get_messages, before);
 }
 
@@ -107,5 +107,5 @@ async fn deletes_in_batches_of_100() {
     store.delete(&keys).await.unwrap();
     assert!(channel.message_ids().is_empty());
     assert_eq!(channel.calls().delete_messages, 2);
-    assert!(store.get(&TelegramMtprotoId { message_id: keys[0] }, None).await.is_err());
+    assert!(store.get(&TelegramId { message_id: keys[0] }, None).await.is_err());
 }

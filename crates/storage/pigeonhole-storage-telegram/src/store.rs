@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 /// A blob is a message; everything else (file reference, DC, size) is
 /// fetched with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TelegramMtprotoId {
+pub struct TelegramId {
     pub message_id: i64,
 }
 
@@ -35,7 +35,7 @@ struct Located {
 
 type Locations = Arc<Mutex<LruCache<i64, Located>>>;
 
-pub struct MtprotoBlobStore<C> {
+pub struct TelegramBlobStore<C> {
     limits: BackendLimits,
     instance: InstanceInfo,
     reader: Reader<C>,
@@ -62,11 +62,11 @@ pub fn blob_random_id(channel_id: i64, name: &str) -> i64 {
     i64::from_le_bytes(digest[..8].try_into().unwrap())
 }
 
-impl<C: ChannelApi> MtprotoBlobStore<C> {
+impl<C: ChannelApi> TelegramBlobStore<C> {
     pub fn new(channel: Arc<C>, limiter: Arc<ChatLimiter>, instance: InstanceInfo) -> Self {
         let locations = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())));
         Self {
-            limits: BackendLimits::telegram_mtproto(),
+            limits: BackendLimits::telegram(),
             instance,
             reader: Reader { channel, limiter: limiter.clone(), locations },
             limiter,
@@ -123,8 +123,8 @@ impl<C: ChannelApi> Reader<C> {
 }
 
 #[async_trait]
-impl<C: ChannelApi> BlobBackend for MtprotoBlobStore<C> {
-    type Id = TelegramMtprotoId;
+impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
+    type Id = TelegramId;
     type Key = i64;
 
     fn instance(&self) -> &InstanceInfo {
@@ -165,7 +165,7 @@ impl<C: ChannelApi> BlobBackend for MtprotoBlobStore<C> {
         if let Some(file) = sent.file {
             self.reader.remember(sent.message_id, Located { size, file });
         }
-        Ok(TelegramMtprotoId { message_id: sent.message_id })
+        Ok(TelegramId { message_id: sent.message_id })
     }
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
@@ -202,7 +202,7 @@ impl<C: ChannelApi> BlobBackend for MtprotoBlobStore<C> {
 }
 
 #[async_trait]
-impl<C: ChannelApi> Sweepable for MtprotoBlobStore<C> {
+impl<C: ChannelApi> Sweepable for TelegramBlobStore<C> {
     /// Our blobs (documents named by a [`BlobId`]) with ids in `(after,
     /// upto]`, read from the channel 100 ids at a time; nothing else in the
     /// channel is ever a candidate.

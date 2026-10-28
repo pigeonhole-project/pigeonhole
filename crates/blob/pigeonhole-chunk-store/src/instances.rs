@@ -17,7 +17,7 @@ pub struct InstanceConfig {
     pub scope_id: String,
     /// Per-message size limit override (Discord); `None` = backend default.
     pub max_blob_size: Option<usize>,
-    /// `telegram_mtproto`: how the bot logs in.
+    /// `telegram`: how the bot logs in.
     pub telegram: Option<TelegramLogin>,
 }
 
@@ -37,11 +37,6 @@ impl std::fmt::Debug for TelegramLogin {
         let bot = self.bot_token.split(':').next().unwrap_or_default();
         f.debug_struct("TelegramLogin").field("bot", &bot).field("api_id", &self.api_id).field("session", &self.session).finish()
     }
-}
-
-/// MTProto fingerprint: `tgm:{bot_id}:{chat_id}`.
-pub fn telegram_mtproto_fingerprint(bot_token: &str, chat_id: &str) -> Result<String> {
-    Ok(telegram_fingerprint(bot_token, chat_id)?.replacen("tg:", "tgm:", 1))
 }
 
 /// Telegram fingerprint: `{bot_id}:{chat_id}` where bot_id is the token prefix.
@@ -164,7 +159,7 @@ mod tests {
         let a = InstanceConfig {
             info: InstanceInfo {
                 id: "a".into(),
-                kind: InstanceKind::TelegramMtproto,
+                kind: InstanceKind::Telegram,
                 fingerprint: "tg:1:-100".into(),
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,
@@ -185,7 +180,7 @@ mod tests {
         let a = InstanceConfig {
             info: InstanceInfo {
                 id: "rw".into(),
-                kind: InstanceKind::TelegramMtproto,
+                kind: InstanceKind::Telegram,
                 fingerprint: "tg:1:-100".into(),
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,
@@ -208,7 +203,7 @@ mod tests {
         let cfg = InstanceConfig {
             info: InstanceInfo {
                 id: "tg-main".into(),
-                kind: InstanceKind::TelegramMtproto,
+                kind: InstanceKind::Telegram,
                 fingerprint: "tg:1:-100".into(),
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,

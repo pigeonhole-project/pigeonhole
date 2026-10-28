@@ -8,10 +8,10 @@
 listen_addr = "0.0.0.0:8333"
 region = "us-east-1"
 
-# Stores: where bytes live. kind = local_disk (path) | memory | telegram_mtproto
+# Stores: where bytes live. kind = local_disk (path) | memory | telegram
 # (chat_id) | discord (channel_id). Every kind holds blobs; the log and
 # snapshots go to local_disk, memory (tests: no fsync, gone with the process)
-# or telegram_mtproto. Secrets come from env vars named in the store (defaults:
+# or telegram. Secrets come from env vars named in the store (defaults:
 # BOT_TOKEN, TG_API_ID, TG_API_HASH / DISCORD_BOT_TOKEN), never inline. A store
 # serves one purpose (the blob sweeper deletes our blobs it does not know; the
 # log's fence reads its channel's message order); only a local_disk or memory
@@ -27,7 +27,7 @@ path = "pigeonhole-meta"
 # bot, shared by its stores; secret, 0600).
 [[store]]
 id = "tg-main"
-kind = "telegram_mtproto"
+kind = "telegram"
 chat_id = -1001234567890
 # bot_token_env = "BOT_TOKEN"
 # api_id_env = "TG_API_ID"
@@ -65,8 +65,8 @@ chat_id = -1001234567890
 [meta]
 log = "meta"                  # default: a local_disk at pigeonhole-meta
 snapshot = "meta"             # default: the log's store if it is local_disk / memory
-# A telegram_mtproto log (a dedicated channel, fenced by the order of its
-# messages) needs telegram_mtproto snapshots in another channel; a memory log
+# A telegram log (a dedicated channel, fenced by the order of its
+# messages) needs telegram snapshots in another channel; a memory log
 # needs memory snapshots.
 # A local_disk log with snapshots in a channel or on another disk survives
 # losing the log's disk: `pigeonhole restore --lossy` starts a new log from

@@ -1,5 +1,5 @@
 [package]
-name = "pigeonhole-storage-telegram-mtproto"
+name = "pigeonhole-storage-telegram"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

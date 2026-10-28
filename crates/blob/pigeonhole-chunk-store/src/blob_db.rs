@@ -501,7 +501,7 @@ mod tests {
         let db = BlobDb::connect(&log_dir).await.unwrap();
         let info = InstanceInfo {
             id: "tg-main".into(),
-            kind: InstanceKind::TelegramMtproto,
+            kind: InstanceKind::Telegram,
             fingerprint: "tg:1:-100".into(),
             location: "tg:chat:-100".into(),
             role: InstanceRole::ReadWrite,

@@ -48,7 +48,7 @@ impl OrderedKey for i64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InstanceKind {
-    TelegramMtproto,
+    Telegram,
     Discord,
     Memory,
     LocalDisk,
@@ -57,7 +57,7 @@ pub enum InstanceKind {
 impl InstanceKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::TelegramMtproto => "telegram_mtproto",
+            Self::Telegram => "telegram",
             Self::Discord => "discord",
             Self::Memory => "memory",
             Self::LocalDisk => "local_disk",
