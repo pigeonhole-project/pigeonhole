@@ -53,6 +53,10 @@ pub use log::{
 };
 pub use snapshot::{LocalSnapshotStore, MemorySnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 
+/// A rejection that cannot happen (a namespace whose commands never fail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum Never {}
+
 /// Outcome of a command: its reply or its deterministic rejection.
 pub type Outcome<S> = std::result::Result<<S as StateMachine>::Reply, <S as StateMachine>::Reject>;
 
@@ -72,9 +76,10 @@ pub trait StateMachine: Default + Serialize + DeserializeOwned + Send + Sync + '
     const VERSION: u32;
 
     type Command: Serialize + DeserializeOwned + Send + 'static;
-    /// Returned to the proposer in-process; never serialized.
-    type Reply: Send + 'static;
-    type Reject: Send + 'static;
+    /// Returned to the proposer; serialized, since the proposer may be
+    /// another node.
+    type Reply: Serialize + DeserializeOwned + Send + 'static;
+    type Reject: Serialize + DeserializeOwned + Send + 'static;
 
     /// Apply one command; must be deterministic. Validate before mutating: a
     /// rejection must leave the state untouched. `Err` is a command that cannot

@@ -118,6 +118,14 @@ impl LogStore for LocalLogStore {
         self.blocking(move |s| s.save_vote(gen, &vote)).await
     }
 
+    async fn confirm(&self, gen: u64) -> LogResult<()> {
+        self.blocking(move |s| {
+            let _lock = s.lock()?;
+            s.check_owner(gen)
+        })
+        .await
+    }
+
     async fn discover(&self) -> LogResult<Option<Discovered>> {
         self.blocking(|s| s.discover()).await
     }
@@ -434,10 +442,13 @@ impl Shared {
         let w = self.walk(false, None)?;
         let old = self.base()?.map_or(0, |b| b.at);
         let at = base.at;
-        if at > w.head || at < old {
-            return Err(LogError::Other(anyhow!("rebase at {at} outside [{old}, {}]", w.head)));
+        if at < old {
+            return Err(LogError::Other(anyhow!("rebase at {at} behind the base {old}")));
         }
         self.write_atomic("base", &postcard::to_stdvec(&base).expect("a base always encodes"))?;
+        if let Some(o) = self.owner.lock().unwrap().as_mut().filter(|o| o.gen == gen) {
+            o.head = o.head.max(at);
+        }
         // Leading segments whose every record ends at or before the base are
         // garbage; keep the last one (it is open for append).
         let keep_from = w.segs.iter().position(|(_, _, max)| *max > at).unwrap_or(w.segs.len());

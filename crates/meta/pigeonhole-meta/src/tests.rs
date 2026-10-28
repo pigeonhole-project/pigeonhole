@@ -22,11 +22,11 @@ impl StateMachine for Counter {
     const VERSION: u32 = 1;
     type Command = Op;
     type Reply = i64;
-    type Reject = &'static str;
+    type Reject = String;
 
     fn apply(&mut self, op: Op) -> Result<Outcome<Self>> {
         if self.v + op.delta < 0 {
-            return Ok(Err("negative"));
+            return Ok(Err("negative".into()));
         }
         self.v += op.delta;
         self.ops.insert(op.id, op.delta);
@@ -95,7 +95,7 @@ async fn commit_and_reject_both_consume_a_position() {
     let store = open_on(dir.path()).await;
     assert_eq!(store.generation(), 1);
     assert_eq!(store.propose_at::<Counter>(op(1, 5)).await.unwrap(), (1, Ok(5)));
-    assert_eq!(store.propose_at::<Counter>(op(2, -7)).await.unwrap(), (2, Err("negative")));
+    assert_eq!(store.propose_at::<Counter>(op(2, -7)).await.unwrap(), (2, Err("negative".into())));
     assert_eq!(value(&store), 5, "rejected command must not change state");
     assert_eq!(op_ids(&store), vec![1]);
     assert_eq!(store.applied_position(), 2);

@@ -56,7 +56,7 @@ pub enum S3Command {
 }
 
 /// Deterministic failure of an [`S3Command`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum S3Reject {
     BucketExists,
     BucketNotFound,

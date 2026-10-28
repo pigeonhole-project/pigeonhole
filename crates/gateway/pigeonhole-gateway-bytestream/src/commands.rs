@@ -7,7 +7,6 @@ use pigeonhole_chunk_store::{ChunkId, Extent};
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 
 pub(crate) const NAMESPACE: &str = "cas";
 
@@ -22,7 +21,7 @@ pub enum CasCommand {
     DropEntry { hash: String, size: i64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CasReply {
     Stored,
     /// `PutEntry` found the digest already stored with these extents.
@@ -51,7 +50,7 @@ impl StateMachine for CasState {
     const VERSION: u32 = 1;
     type Command = CasCommand;
     type Reply = CasReply;
-    type Reject = Infallible;
+    type Reject = pigeonhole_meta::Never;
 
     fn apply(&mut self, command: CasCommand) -> Result<Outcome<Self>> {
         Ok(Ok(match command {

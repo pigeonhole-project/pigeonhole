@@ -38,6 +38,26 @@ where
     reading_past_the_head_is_lost(fresh()).await;
     truncate_replaces_a_divergent_tail(fresh()).await;
     the_vote_survives_and_is_fenced(fresh()).await;
+    a_rebase_past_the_head_empties_the_log(fresh()).await;
+}
+
+/// A follower installing a snapshot from elsewhere: the log jumps to it.
+pub async fn a_rebase_past_the_head_empties_the_log<Open, Fut>(open: Open)
+where
+    Open: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn LogStore>>,
+{
+    let log = open().await;
+    let head = log.claim(1).await.unwrap();
+    log.append(1, &[entry(1), entry(2)]).await.unwrap();
+    log.rebase(1, Base { at: 10, term: 4, snapshot: SnapshotRef("s10".into()) }).await.unwrap();
+    assert_eq!(log.append(1, &[termed(5, 11)]).await.unwrap(), 11);
+
+    let again = open().await;
+    let d = again.discover().await.unwrap().unwrap();
+    assert_eq!((d.base.map(|b| b.at), d.head.position, d.head_term), (Some(10), 11, 5));
+    assert_eq!(read_all(again.as_ref(), 10, Head { position: 11, ..head }).await.unwrap(), vec![(11, termed(5, 11))]);
+    assert!(matches!(read_all(again.as_ref(), 2, Head { position: 11, ..head }).await, Err(LogError::Lost(_))));
 }
 
 pub async fn append_read_and_reopen<Open, Fut>(open: Open)
@@ -102,7 +122,6 @@ where
     log.rebase(1, base(2)).await.unwrap();
     log.rebase(1, base(4)).await.unwrap();
     assert!(log.rebase(1, base(3)).await.is_err(), "a base never moves back");
-    assert!(log.rebase(1, base(5)).await.is_err(), "nor past the head");
     log.append(1, &[entry(5)]).await.unwrap();
     log.append(1, &[entry(6)]).await.unwrap();
 
@@ -178,7 +197,10 @@ where
     a.append(1, &[entry(1)]).await.unwrap();
     assert_eq!(open().await.discover().await.unwrap().unwrap().vote.as_deref(), Some(&b"term 1 for n1"[..]));
 
+    a.confirm(1).await.unwrap();
     b.claim(2).await.unwrap();
+    assert!(matches!(a.confirm(1).await, Err(LogError::Fenced { current: 2 })), "a lease check sees the fence");
+    b.confirm(2).await.unwrap();
     assert!(matches!(a.save_vote(1, b"stale").await, Err(LogError::Fenced { current: 2 })));
     assert!(matches!(a.truncate(1, 1).await, Err(LogError::Fenced { current: 2 })));
     b.save_vote(2, b"term 2 for n2").await.unwrap();

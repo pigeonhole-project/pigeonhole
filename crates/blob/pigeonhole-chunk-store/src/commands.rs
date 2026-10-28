@@ -44,7 +44,7 @@ pub enum ChunkCommand {
 }
 
 /// Deterministic failure of a [`ChunkCommand`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChunkReject {
     /// Retain: chunk missing, refs = 0, or reclaiming.
     ChunkGone(ChunkId),

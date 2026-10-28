@@ -193,6 +193,10 @@ pub trait LogStore: Send + Sync + 'static {
     /// Durably store the Raft vote (opaque to the log).
     async fn save_vote(&self, gen: u64, vote: &[u8]) -> LogResult<()>;
 
+    /// `Ok` if `gen` still holds the log, without writing (a lease check
+    /// before side effects); `Fenced` otherwise.
+    async fn confirm(&self, gen: u64) -> LogResult<()>;
+
     /// Base + log head (bootstrap without any local state); `None` if the
     /// log was never claimed.
     async fn discover(&self) -> LogResult<Option<Discovered>>;
@@ -200,7 +204,8 @@ pub trait LogStore: Send + Sync + 'static {
     /// Entries after `from` up to `head`, in order (replay).
     fn read(&self, from: Position, head: Head) -> EntryStream;
 
-    /// Start the log from `base` (a snapshot already stored, as of a
-    /// position ≤ the head) and drop entries ≤ `base.at` (collect).
+    /// Start the log from `base` (a snapshot already stored) and drop
+    /// entries ≤ `base.at` (collect). `base.at` may be past the head (a
+    /// snapshot installed from elsewhere): the log is then empty up to it.
     async fn rebase(&self, gen: u64, base: Base) -> LogResult<()>;
 }

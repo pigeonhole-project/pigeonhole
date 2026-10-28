@@ -415,6 +415,18 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
         self.write(gen, w).await.map(|_| ())
     }
 
+    async fn confirm(&self, gen: u64) -> LogResult<()> {
+        let (log_id, _) = match self.owned(gen) {
+            Ok(owned) => owned,
+            Err(_) => return Err(LogError::Fenced { current: self.current_gen().await? }),
+        };
+        match parse_description(self.registers().await?.description.as_deref())? {
+            Some((id, g)) if id == log_id && g == gen => Ok(()),
+            Some((_, g)) => Err(LogError::Fenced { current: g }),
+            None => Err(LogError::Other(anyhow!("the log's description is gone"))),
+        }
+    }
+
     async fn discover(&self) -> LogResult<Option<Discovered>> {
         let Some((log_id, gen)) = parse_description(self.registers().await?.description.as_deref())? else {
             return Ok(None);
@@ -451,16 +463,16 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
             Err(_) => return Err(LogError::Fenced { current: self.current_gen().await? }),
         };
         let (at, old_at) = (base.at, old_tip.base_at());
-        if at > old_tip.position || at < old_at {
-            return Err(LogError::Other(anyhow!("rebase at {at} outside [{old_at}, {}]", old_tip.position)));
+        if at < old_at {
+            return Err(LogError::Other(anyhow!("rebase at {at} behind the base {old_at}")));
         }
-        let w = Write {
-            first: old_tip.position + 1,
-            entries: Vec::new(),
-            head_term: old_tip.head_term,
-            base: Some(base),
-            vote: None,
+        // Past the head (a snapshot from elsewhere): the log jumps to `at`.
+        let (first, head_term) = if at > old_tip.position {
+            (at + 1, base.term)
+        } else {
+            (old_tip.position + 1, old_tip.head_term)
         };
+        let w = Write { first, entries: Vec::new(), head_term, base: Some(base), vote: None };
         let tip = self.write(gen, w).await?;
 
         // Collect (best effort: a leftover message is unreachable garbage).

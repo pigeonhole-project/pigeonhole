@@ -100,6 +100,10 @@ impl LogStore for MemoryLogStore {
         Ok(())
     }
 
+    async fn confirm(&self, gen: u64) -> LogResult<()> {
+        self.owned(gen).map(|_| ())
+    }
+
     async fn discover(&self) -> LogResult<Option<Discovered>> {
         let s = self.shared.lock().unwrap();
         let (Some(gen), Some(log_id)) = (s.claimed, s.log_id) else {
@@ -136,11 +140,12 @@ impl LogStore for MemoryLogStore {
     async fn rebase(&self, gen: u64, base: Base) -> LogResult<()> {
         let mut s = self.owned(gen)?;
         let old = s.base_at();
-        if base.at > s.head || base.at < old {
-            return Err(LogError::Other(anyhow!("rebase at {} outside [{old}, {}]", base.at, s.head)));
+        if base.at < old {
+            return Err(LogError::Other(anyhow!("rebase at {} behind the base {old}", base.at)));
         }
         let at = base.at;
         s.entries.retain(|(p, _)| *p > at);
+        s.head = s.head.max(at);
         s.base = Some(base);
         Ok(())
     }
