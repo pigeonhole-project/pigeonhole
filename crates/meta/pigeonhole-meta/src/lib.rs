@@ -97,9 +97,29 @@ pub fn decode_state<S: StateMachine>(data: &[u8]) -> Result<S> {
     Ok(state)
 }
 
-/// A log entry carrying `command` for `S`.
-pub fn entry<S: StateMachine>(command: &S::Command) -> Entry {
-    Entry {
+/// One layer command: what an entry's payload holds. `version` is the
+/// namespace's command format ([`StateMachine::VERSION`]) it was encoded with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Command {
+    pub namespace: String,
+    pub version: u32,
+    pub command: Vec<u8>,
+}
+
+impl Command {
+    /// The log entry carrying this command, written in `term`.
+    pub fn entry(&self, term: u64) -> Entry {
+        Entry { term, payload: postcard::to_stdvec(self).expect("a command always encodes") }
+    }
+
+    pub fn decode(entry: &Entry) -> Result<Self> {
+        postcard::from_bytes(&entry.payload).context("decode the command of an entry")
+    }
+}
+
+/// `command` for `S`, ready to go into an entry.
+pub fn command<S: StateMachine>(command: &S::Command) -> Command {
+    Command {
         namespace: S::NAME.to_string(),
         version: S::VERSION,
         command: postcard::to_stdvec(command).expect("command always encodes"),
@@ -138,7 +158,7 @@ type AnyOutcome = Box<dyn Any + Send>;
 
 /// Object-safe face of a [`StateMachine`] behind its lock.
 trait AnyState: Send + Sync {
-    fn apply(&self, entry: &Entry) -> Result<AnyOutcome>;
+    fn apply(&self, entry: &Command) -> Result<AnyOutcome>;
     /// `(VERSION, encode_state)`.
     fn snapshot(&self) -> (u32, Vec<u8>);
     fn restore(&self, version: u32, data: &[u8]) -> Result<()>;
@@ -148,7 +168,7 @@ trait AnyState: Send + Sync {
 struct StateCell<S>(RwLock<S>);
 
 impl<S: StateMachine> AnyState for StateCell<S> {
-    fn apply(&self, entry: &Entry) -> Result<AnyOutcome> {
+    fn apply(&self, entry: &Command) -> Result<AnyOutcome> {
         if entry.version != S::VERSION {
             bail!(
                 "{} command in format {}, this binary reads {}",
@@ -257,7 +277,7 @@ type States = HashMap<&'static str, Arc<dyn AnyState>>;
 struct Pending {
     /// `None` = a barrier ([`MetaStore::confirm_active`]): no entry, answered
     /// once its batch is appended.
-    entry: Option<Entry>,
+    entry: Option<Command>,
     reply: oneshot::Sender<Result<(Position, AnyOutcome)>>,
 }
 
@@ -305,7 +325,7 @@ impl MetaStore {
             }
         }
         let (gen, head) = claim_next(log.as_ref(), known.map_or(0, |d| d.gen)).await?;
-        let base = recover(&states, log.as_ref(), snapshots.as_ref(), head).await?;
+        let (base, head_term) = recover(&states, log.as_ref(), snapshots.as_ref(), head).await?;
         let base_at = base.as_ref().map_or(0, |b| b.at);
 
         let zero = log.append(gen, &[]).await.context("append zero entry")?;
@@ -325,6 +345,7 @@ impl MetaStore {
                 applied: applied.clone(),
                 log_id: head.log_id,
                 snapshot_at: base_at,
+                head_term,
                 snapshot_tried: tokio::time::Instant::now(),
                 putting: false,
                 stored_tx,
@@ -389,7 +410,7 @@ impl MetaStore {
             return Err(stop.into());
         }
         let (reply, rx) = oneshot::channel();
-        if self.queue.send(Pending { entry: Some(entry::<S>(&command)), reply }).is_err() {
+        if self.queue.send(Pending { entry: Some(self::command::<S>(&command)), reply }).is_err() {
             bail!("tablet batcher is gone");
         }
         let (position, outcome) = rx.await.context("tablet batcher dropped the proposal")??;
@@ -463,9 +484,17 @@ async fn claim_next(log: &dyn LogStore, known: u64) -> Result<(u64, Head)> {
 
 /// Load the newest snapshot into the empty states and replay the log after
 /// it up to `head`. Returns the snapshot's position (0 without one).
-/// Load the snapshot the log starts from (if any) and replay the rest.
-async fn recover(states: &States, log: &dyn LogStore, snapshots: &dyn SnapshotStore, head: Head) -> Result<Option<Base>> {
-    let base = log.discover().await.context("discover log")?.and_then(|d| d.base);
+/// Load the snapshot the log starts from (if any) and replay the rest;
+/// returns the base and the term of the entry at the head.
+async fn recover(
+    states: &States,
+    log: &dyn LogStore,
+    snapshots: &dyn SnapshotStore,
+    head: Head,
+) -> Result<(Option<Base>, u64)> {
+    let discovered = log.discover().await.context("discover log")?;
+    let head_term = discovered.as_ref().map_or(0, |d| d.head_term);
+    let base = discovered.and_then(|d| d.base);
     let from = match &base {
         Some(base) => {
             let at = base.at;
@@ -500,7 +529,7 @@ async fn recover(states: &States, log: &dyn LogStore, snapshots: &dyn SnapshotSt
         bail!(LogError::Lost(format!("snapshot at {from} is past the log head {}", head.position)));
     }
     replay(states, log, from, head).await?;
-    Ok(base)
+    Ok((base, head_term))
 }
 
 /// Start a new log from the newest stored snapshot (after the log is lost):
@@ -519,7 +548,7 @@ pub async fn restore_lossy(log: &dyn LogStore, snapshots: &dyn SnapshotStore) ->
     let (gen, head) = claim_next(log, known.map_or(0, |d| d.gen)).await?;
     let stored = StoredSnapshot { log_id: head.log_id, at: 0, data: snap.encode() };
     let snapshot = snapshots.put(&stored).await.context("store the restored snapshot")?;
-    log.rebase(gen, Base { at: 0, snapshot }).await.context("start the new log from it")?;
+    log.rebase(gen, Base { at: 0, term: 0, snapshot }).await.context("start the new log from it")?;
     Ok(old)
 }
 
@@ -544,6 +573,7 @@ async fn replay(states: &States, log: &dyn LogStore, from: Position, head: Head)
 }
 
 fn apply_entry(states: &States, pos: Position, entry: &Entry) -> Result<AnyOutcome> {
+    let entry = &Command::decode(entry).with_context(|| format!("entry {pos}"))?;
     let state = states
         .get(entry.namespace.as_str())
         .with_context(|| format!("entry {pos}: unknown namespace {:?}", entry.namespace))?;
@@ -572,12 +602,14 @@ struct Batcher {
     log_id: LogId,
     /// Position of the newest snapshot taken (stored or not).
     snapshot_at: Position,
+    /// Term of the entry at the applied position.
+    head_term: u64,
     /// When the last snapshot was taken (or the tablet booted).
     snapshot_tried: tokio::time::Instant,
     /// A snapshot is being stored; the next one waits for it.
     putting: bool,
     /// Where a finished put reports `(position, result)`.
-    stored_tx: mpsc::UnboundedSender<(Position, Result<SnapshotRef>)>,
+    stored_tx: mpsc::UnboundedSender<(Position, u64, Result<SnapshotRef>)>,
     /// What the log starts from now.
     base: Option<Base>,
     based: Arc<AtomicU64>,
@@ -601,14 +633,14 @@ async fn until(at: Option<tokio::time::Instant>) {
 async fn batcher(
     mut b: Batcher,
     mut rx: mpsc::UnboundedReceiver<Pending>,
-    mut stored_rx: mpsc::UnboundedReceiver<(Position, Result<SnapshotRef>)>,
+    mut stored_rx: mpsc::UnboundedReceiver<(Position, u64, Result<SnapshotRef>)>,
 ) {
     let max = b.opts.batch_max_entries.max(1);
     loop {
         let first = tokio::select! {
             first = rx.recv() => first,
-            Some((at, stored)) = stored_rx.recv() => {
-                if let Some(stop) = b.rebase(at, stored).await {
+            Some((at, term, stored)) = stored_rx.recv() => {
+                if let Some(stop) = b.rebase(at, term, stored).await {
                     return stop_for_good(b, stop, Vec::new(), rx).await;
                 }
                 continue;
@@ -636,7 +668,7 @@ async fn batcher(
             }
         }
 
-        let entries: Vec<Entry> = batch.iter().filter_map(|p| p.entry.clone()).collect();
+        let entries: Vec<Entry> = batch.iter().filter_map(|p| p.entry.as_ref()).map(|c| c.entry(b.gen)).collect();
         let result = match b.log.append(b.gen, &entries).await {
             Ok(last) => {
                 let first = last + 1 - entries.len() as u64;
@@ -656,6 +688,9 @@ async fn batcher(
                 match failure {
                     None => {
                         b.applied.store(last, Ordering::SeqCst);
+                        if !entries.is_empty() {
+                            b.head_term = b.gen;
+                        }
                         Ok((first, applied))
                     }
                     Some(stop) => Err(stop),
@@ -729,16 +764,16 @@ impl Batcher {
             at: position,
             data: take_snapshot(&self.states, position).encode(),
         };
-        let (snapshots, tx) = (self.snapshots.clone(), self.stored_tx.clone());
+        let (snapshots, tx, term) = (self.snapshots.clone(), self.stored_tx.clone(), self.head_term);
         tokio::spawn(async move {
-            let _ = tx.send((position, snapshots.put(&stored).await));
+            let _ = tx.send((position, term, snapshots.put(&stored).await));
         });
     }
 
     /// A put finished: start the log from it and drop the snapshot it started
     /// from before. Only a fence stops the tablet: on any failure the log
     /// keeps its old base and the next snapshot tries again.
-    async fn rebase(&mut self, at: Position, stored: Result<SnapshotRef>) -> Option<Stop> {
+    async fn rebase(&mut self, at: Position, term: u64, stored: Result<SnapshotRef>) -> Option<Stop> {
         self.putting = false;
         let snapshot = match stored {
             Ok(r) => r,
@@ -747,7 +782,7 @@ impl Batcher {
                 return None;
             }
         };
-        let base = Base { at, snapshot };
+        let base = Base { at, term, snapshot };
         match self.log.rebase(self.gen, base.clone()).await {
             Ok(()) => {
                 self.based.store(at, Ordering::SeqCst);

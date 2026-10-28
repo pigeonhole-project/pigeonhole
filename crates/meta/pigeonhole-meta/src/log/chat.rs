@@ -3,8 +3,10 @@
 //!
 //! - **head** — the pinned message: the newest pinned message *by sending
 //!   date*. Every log message is a document: a batch with its generation, the
-//!   log's current [`Base`] and a link to the previous log message, so the
-//!   pinned head leads back through the chain to the base.
+//!   log's registers (base, vote, head term) and a link to the previous log
+//!   message, so the pinned head leads back through the chain to the base. A
+//!   batch replaces older entries from its `first` on, so a truncate is a
+//!   message too.
 //! - **fence** — the chat description, `pigeonhole-log id=<log id> gen=<g>`.
 //!
 //! `append(g)`: send the batch linked to the current head, pin it, read the
@@ -123,18 +125,21 @@ struct Link {
     download_ref: String,
     /// crc32 of the linked document: a replaced or edited message is detected.
     crc: u32,
-    /// Position of its last entry: a reader stops before following a link
-    /// into what the base already covers (possibly deleted).
-    last: Position,
 }
 
-/// One log message.
+/// One log message: a batch plus the log's registers as of it, so the
+/// pinned head alone tells the base, the head's term and the vote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LogDoc {
     format: u32,
     log_id: LogId,
     gen: u64,
     base: Option<Base>,
+    vote: Option<Vec<u8>>,
+    /// Term of the entry at the head once this message is the head.
+    head_term: u64,
+    /// Every log message with an id at or below this was collected.
+    collected: i64,
     prev: Option<Link>,
     batch: Batch,
 }
@@ -157,7 +162,7 @@ impl LogDoc {
 
     /// Position of the last entry the log holds once this message is the head.
     fn head_position(&self) -> Position {
-        self.batch.first + self.batch.entries.len() as u64 - 1
+        self.batch.first - 1 + self.batch.entries.len() as u64
     }
 
     fn base_at(&self) -> Position {
@@ -165,18 +170,47 @@ impl LogDoc {
     }
 }
 
-/// Head of the chain as this handle knows it.
-#[derive(Debug, Clone)]
+/// The log as this handle knows it (its head message's registers).
+#[derive(Debug, Clone, Default)]
 struct Tip {
     link: Option<Link>,
     position: Position,
     base: Option<Base>,
+    vote: Option<Vec<u8>>,
+    head_term: u64,
+    collected: i64,
+}
+
+impl Tip {
+    fn of(doc: &LogDoc, link: Link) -> Self {
+        Self {
+            position: doc.head_position(),
+            base: doc.base.clone(),
+            vote: doc.vote.clone(),
+            head_term: doc.head_term,
+            collected: doc.collected,
+            link: Some(link),
+        }
+    }
+
+    fn base_at(&self) -> Position {
+        self.base.as_ref().map_or(0, |b| b.at)
+    }
 }
 
 struct Owner {
     gen: u64,
     log_id: LogId,
     tip: Tip,
+}
+
+/// One write: a batch at `first` and the registers that change with it.
+struct Write {
+    first: Position,
+    entries: Vec<Entry>,
+    head_term: u64,
+    base: Option<Base>,
+    vote: Option<Vec<u8>>,
 }
 
 pub struct ChatLogStore<C> {
@@ -197,9 +231,8 @@ impl<C: ChatApi> ChatLogStore<C> {
     async fn fetch(&self, doc: &ChatDoc) -> LogResult<(LogDoc, Link)> {
         let data = self.chat.download(&doc.download_ref).await?;
         let crc = crc32fast::hash(&data);
-        let head = LogDoc::decode(&data)?;
-        let link = Link { message_id: doc.message_id, download_ref: doc.download_ref.clone(), crc, last: head.head_position() };
-        Ok((head, link))
+        let link = Link { message_id: doc.message_id, download_ref: doc.download_ref.clone(), crc };
+        Ok((LogDoc::decode(&data)?, link))
     }
 
     async fn follow(&self, link: &Link) -> LogResult<LogDoc> {
@@ -234,25 +267,47 @@ impl<C: ChatApi> ChatLogStore<C> {
         Ok(None)
     }
 
-    /// Send `entries` linked to the owner's tip as generation `gen` (with a new
-    /// base, if given), pin it, and prove the fence still holds `gen`.
-    /// Overrides a newer straggler on top.
-    async fn write(&self, gen: u64, entries: Vec<Entry>, rebase: Option<Base>) -> LogResult<Tip> {
-        let (log_id, mut tip) = {
-            let owner = self.owner.lock().unwrap();
-            let o = owner
-                .as_ref()
-                .filter(|o| o.gen == gen)
-                .ok_or_else(|| LogError::Other(anyhow!("generation {gen} not claimed by this handle")))?;
-            (o.log_id, o.tip.clone())
-        };
-        let base = rebase.or_else(|| tip.base.clone());
-        let mut entries = entries;
+    /// This handle's tip, if it holds generation `gen`.
+    fn owned(&self, gen: u64) -> LogResult<(LogId, Tip)> {
+        let owner = self.owner.lock().unwrap();
+        let o = owner
+            .as_ref()
+            .filter(|o| o.gen == gen)
+            .ok_or_else(|| LogError::Other(anyhow!("generation {gen} not claimed by this handle")))?;
+        Ok((o.log_id, o.tip.clone()))
+    }
+
+    /// The generation in the description now (for a `Fenced` answer).
+    async fn current_gen(&self) -> LogResult<u64> {
+        Ok(parse_description(self.registers().await?.description.as_deref())?.map_or(0, |(_, g)| g))
+    }
+
+    /// Send `w` linked to the owner's tip as generation `gen`, pin it, and
+    /// prove the fence still holds `gen`. Overrides a newer straggler on top.
+    async fn write(&self, gen: u64, w: Write) -> LogResult<Tip> {
+        let (log_id, mut tip) = self.owned(gen)?;
+        let mut w = Some(w);
         // A straggler may top our pin; then link a newer (empty) batch to our
         // tip and pin that. Bounded: each fenced writer has at most one.
         for _ in 0..4 {
-            let batch = Batch::new(gen, tip.position + 1, std::mem::take(&mut entries));
-            let doc = LogDoc { format: LOG_FORMAT, log_id, gen, base: base.clone(), prev: tip.link.clone(), batch };
+            let this = w.take().unwrap_or_else(|| Write {
+                first: tip.position + 1,
+                entries: Vec::new(),
+                head_term: tip.head_term,
+                base: None,
+                vote: None,
+            });
+            let doc = LogDoc {
+                format: LOG_FORMAT,
+                log_id,
+                gen,
+                base: this.base.or_else(|| tip.base.clone()),
+                vote: this.vote.or_else(|| tip.vote.clone()),
+                head_term: this.head_term,
+                collected: tip.collected,
+                prev: tip.link.clone(),
+                batch: Batch::new(gen, this.first, this.entries),
+            };
             let bytes = doc.encode();
             let crc = crc32fast::hash(&bytes);
             let sent = self.chat.send_document(&format!("log-{gen}-{}.bin", doc.head_position()), bytes).await?;
@@ -263,16 +318,7 @@ impl<C: ChatApi> ChatLogStore<C> {
                 Some((_, g)) => return Err(LogError::Fenced { current: g }),
                 None => return Err(LogError::Other(anyhow!("the log's description is gone"))),
             }
-            tip = Tip {
-                link: Some(Link {
-                    message_id: sent.message_id,
-                    download_ref: sent.download_ref.clone(),
-                    crc,
-                    last: doc.head_position(),
-                }),
-                position: doc.head_position(),
-                base: base.clone(),
-            };
+            tip = Tip::of(&doc, Link { message_id: sent.message_id, download_ref: sent.download_ref.clone(), crc });
             if let Some(o) = self.owner.lock().unwrap().as_mut() {
                 o.tip = tip.clone();
             }
@@ -283,19 +329,8 @@ impl<C: ChatApi> ChatLogStore<C> {
         Err(LogError::Other(anyhow!("could not keep the log head pinned")))
     }
 
-    /// Log messages from the head back to the first one holding entries
-    /// after `stop_at` (never behind the head's base); newest first.
-    async fn chain(&self, head: (LogDoc, Link), stop_at: Position) -> LogResult<Vec<(LogDoc, Link)>> {
-        let floor = stop_at.max(head.0.base_at());
-        let mut out = vec![head];
-        loop {
-            let (doc, _) = out.last().unwrap();
-            let Some(prev) = doc.prev.clone().filter(|p| p.last > floor) else {
-                return Ok(out);
-            };
-            let doc = self.follow(&prev).await?;
-            out.push((doc, prev));
-        }
+    fn reader(&self) -> ReadCtx<C> {
+        ReadCtx { chat: self.chat.clone(), opts: self.opts.clone() }
     }
 }
 
@@ -326,11 +361,11 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
                     "a new log needs a chat with nothing pinned (a dedicated chat)"
                 )));
             }
-            Tip { link: None, position: 0, base: None }
+            Tip::default()
         } else {
             match self.head_doc(log_id).await? {
-                Some((doc, link)) => Tip { position: doc.head_position(), base: doc.base, link: Some(link) },
-                None => Tip { link: None, position: 0, base: None },
+                Some((doc, link)) => Tip::of(&doc, link),
+                None => Tip::default(),
             }
         };
         let position = tip.position;
@@ -339,7 +374,45 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
     }
 
     async fn append(&self, gen: u64, batch: &[Entry]) -> LogResult<Position> {
-        Ok(self.write(gen, batch.to_vec(), None).await?.position)
+        let (_, tip) = self.owned(gen)?;
+        let head_term = batch.last().map_or(tip.head_term, |e| e.term);
+        let w = Write { first: tip.position + 1, entries: batch.to_vec(), head_term, base: None, vote: None };
+        Ok(self.write(gen, w).await?.position)
+    }
+
+    async fn truncate(&self, gen: u64, from: Position) -> LogResult<()> {
+        let (log_id, tip) = self.owned(gen)?;
+        let base_at = tip.base_at();
+        if from <= base_at || from > tip.position + 1 {
+            return Err(LogError::Other(anyhow!("truncate at {from} outside ({base_at}, {}]", tip.position + 1)));
+        }
+        if from == tip.position + 1 {
+            return Ok(());
+        }
+        let head_term = if from - 1 == base_at {
+            tip.base.as_ref().map_or(0, |b| b.term)
+        } else {
+            let head = Head { log_id, position: from - 1 };
+            let entries = self.reader().read_all(from - 2, head).await?;
+            entries.last().map_or(0, |(_, e)| e.term)
+        };
+        let w = Write { first: from, entries: Vec::new(), head_term, base: None, vote: None };
+        self.write(gen, w).await.map(|_| ())
+    }
+
+    async fn save_vote(&self, gen: u64, vote: &[u8]) -> LogResult<()> {
+        let (_, tip) = match self.owned(gen) {
+            Ok(owned) => owned,
+            Err(_) => return Err(LogError::Fenced { current: self.current_gen().await? }),
+        };
+        let w = Write {
+            first: tip.position + 1,
+            entries: Vec::new(),
+            head_term: tip.head_term,
+            base: None,
+            vote: Some(vote.to_vec()),
+        };
+        self.write(gen, w).await.map(|_| ())
     }
 
     async fn discover(&self) -> LogResult<Option<Discovered>> {
@@ -347,14 +420,20 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
             return Ok(None);
         };
         let Some((head, _)) = self.head_doc(log_id).await? else {
-            return Ok(Some(Discovered { base: None, head: Head { log_id, position: 0 }, gen }));
+            let head = Head { log_id, position: 0 };
+            return Ok(Some(Discovered { base: None, head, head_term: 0, vote: None, gen }));
         };
-        let position = head.head_position();
-        Ok(Some(Discovered { base: head.base, head: Head { log_id, position }, gen }))
+        Ok(Some(Discovered {
+            head: Head { log_id, position: head.head_position() },
+            head_term: head.head_term,
+            vote: head.vote,
+            base: head.base,
+            gen,
+        }))
     }
 
     fn read(&self, from: Position, head: Head) -> EntryStream {
-        let this = ReadCtx { chat: self.chat.clone(), opts: self.opts.clone() };
+        let this = self.reader();
         let fut = async move { this.read_all(from, head).await };
         Box::pin(
             futures::stream::once(fut)
@@ -367,84 +446,108 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
     }
 
     async fn rebase(&self, gen: u64, base: Base) -> LogResult<()> {
-        let owned = {
-            let owner = self.owner.lock().unwrap();
-            owner.as_ref().filter(|o| o.gen == gen).map(|o| (o.tip.clone(), o.log_id))
+        let (log_id, old_tip) = match self.owned(gen) {
+            Ok(owned) => owned,
+            Err(_) => return Err(LogError::Fenced { current: self.current_gen().await? }),
         };
-        let Some((old_tip, log_id)) = owned else {
-            let regs = self.registers().await?;
-            let current = parse_description(regs.description.as_deref())?.map_or(0, |(_, g)| g);
-            return Err(LogError::Fenced { current });
-        };
-        let (at, old_at) = (base.at, old_tip.base.as_ref().map_or(0, |b| b.at));
+        let (at, old_at) = (base.at, old_tip.base_at());
         if at > old_tip.position || at < old_at {
             return Err(LogError::Other(anyhow!("rebase at {at} outside [{old_at}, {}]", old_tip.position)));
         }
-        self.write(gen, Vec::new(), Some(base)).await?;
+        let w = Write {
+            first: old_tip.position + 1,
+            entries: Vec::new(),
+            head_term: old_tip.head_term,
+            base: Some(base),
+            vote: None,
+        };
+        let tip = self.write(gen, w).await?;
 
-        // Collect the messages the new base covers (best effort: a leftover
-        // message is unreachable garbage, not a problem).
-        let mut ids = Vec::new();
-        let mut next = old_tip.link.filter(|l| l.last > old_at);
+        // Collect (best effort: a leftover message is unreachable garbage).
+        // Walk back as a reader from `at` would; it stops once newer messages
+        // cover every position after `at`, and everything behind that point
+        // down to the last collection is garbage.
+        let mut limit = Position::MAX;
+        let mut next = tip.link.clone();
+        let mut garbage = None;
         while let Some(link) = next {
-            if link.last <= at {
-                ids.push(link.message_id);
+            let Ok(doc) = self.follow(&link).await else { break };
+            limit = limit.min(doc.batch.first);
+            if limit <= at + 1 {
+                garbage = doc.prev;
+                break;
             }
+            next = doc.prev;
+        }
+        let mut ids = Vec::new();
+        let mut next = garbage.clone();
+        while let Some(link) = next.filter(|l| l.message_id > old_tip.collected) {
+            ids.push(link.message_id);
             next = match self.follow(&link).await {
-                Ok(doc) if doc.log_id == log_id => doc.prev.filter(|l| l.last > old_at),
+                Ok(doc) if doc.log_id == log_id => doc.prev,
                 _ => None,
             };
         }
         if !ids.is_empty() {
             let _ = self.chat.delete(&ids).await;
         }
+        if let (Some(g), Some(o)) = (garbage, self.owner.lock().unwrap().as_mut()) {
+            o.tip.collected = o.tip.collected.max(g.message_id);
+        }
         Ok(())
     }
 }
 
-/// What a read stream needs, detached from the store's borrow.
+/// What a read needs, detached from the store's borrow.
 struct ReadCtx<C> {
     chat: Arc<C>,
     opts: ChatLogOptions,
 }
 
 impl<C: ChatApi> ReadCtx<C> {
+    /// Entries `(from, head]`: walk back from the pinned head; a newer
+    /// message's batch replaces older entries from its `first` on.
     async fn read_all(self, from: Position, head: Head) -> LogResult<Vec<(Position, Entry)>> {
-        let store = ChatLogStore { chat: self.chat, opts: self.opts, owner: Mutex::new(None) };
         if from >= head.position {
             return Ok(Vec::new());
         }
-        let tip = store
+        let store = ChatLogStore { chat: self.chat, opts: self.opts, owner: Mutex::new(None) };
+        let (tip, _) = store
             .head_doc(head.log_id)
             .await?
             .ok_or_else(|| LogError::Lost(format!("no pinned head, expected entries up to {}", head.position)))?;
-        if tip.0.head_position() < head.position {
+        if tip.head_position() < head.position {
             return Err(LogError::Lost(format!(
                 "the log ends at {}, before {}",
-                tip.0.head_position(),
+                tip.head_position(),
                 head.position
             )));
         }
-        let base_at = tip.0.base_at();
+        let base_at = tip.base_at();
         if from < base_at {
             return Err(LogError::Lost(format!("entries after {from} collected up to base {base_at}")));
         }
-        let chain = store.chain(tip, from).await?;
-        let mut out = Vec::new();
-        let mut next = from + 1;
-        for (doc, _) in chain.into_iter().rev() {
-            for (i, entry) in doc.batch.entries.into_iter().enumerate() {
-                let pos = doc.batch.first + i as u64;
-                if pos == next && pos <= head.position {
-                    out.push((pos, entry));
-                    next += 1;
+        let mut out = std::collections::BTreeMap::new();
+        let mut limit = Position::MAX;
+        let mut doc = tip;
+        loop {
+            for (k, entry) in doc.batch.entries.into_iter().enumerate() {
+                let pos = doc.batch.first + k as u64;
+                if pos > from && pos < limit && pos <= head.position {
+                    out.insert(pos, entry);
                 }
             }
+            limit = limit.min(doc.batch.first);
+            if limit <= from + 1 {
+                break;
+            }
+            let Some(prev) = doc.prev else { break };
+            doc = store.follow(&prev).await?;
         }
-        if next <= head.position && from < head.position {
-            return Err(LogError::Lost(format!("the chain ends before position {next}")));
+        if out.len() as u64 != head.position - from {
+            return Err(LogError::Lost(format!("the chain lacks entries in ({from}, {}]", head.position)));
         }
-        Ok(out)
+        Ok(out.into_iter().collect())
     }
 }
 

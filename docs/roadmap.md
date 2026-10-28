@@ -182,8 +182,9 @@ checking on a live bot before the chat protocol is adapted to it.
 
 Design: meta-backends.md § Raft between nodes. Sub-steps:
 
-1. Node storage contract (Raft `LogId`, truncate, vote) + conformance suite
-   for local_disk, memory, telegram (fake chat).
+1. ~~Node storage contract~~ Done: entries carry their term, `truncate`
+   (a replacing batch), `save_vote`, `discover` returns the head term and the
+   vote; the conformance suite covers them for local_disk, memory, telegram.
 2. `MetaStore` over openraft as a cluster of one; old tablet batcher removed.
 3. gRPC network, in-process multi-node tests (failover, partitions, a node on
    a fake chat), leader-only side effects, forwarding.

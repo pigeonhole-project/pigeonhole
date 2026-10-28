@@ -23,6 +23,20 @@ struct Shared {
     /// Entries after the base, in order.
     entries: Vec<(Position, Entry)>,
     head: Position,
+    vote: Option<Vec<u8>>,
+}
+
+impl Shared {
+    fn base_at(&self) -> Position {
+        self.base.as_ref().map_or(0, |b| b.at)
+    }
+
+    fn head_term(&self) -> u64 {
+        match self.entries.last() {
+            Some((_, e)) => e.term,
+            None => self.base.as_ref().map_or(0, |b| b.term),
+        }
+    }
 }
 
 impl MemoryLogStore {
@@ -71,17 +85,38 @@ impl LogStore for MemoryLogStore {
         Ok(s.head)
     }
 
+    async fn truncate(&self, gen: u64, from: Position) -> LogResult<()> {
+        let mut s = self.owned(gen)?;
+        if from <= s.base_at() || from > s.head + 1 {
+            return Err(LogError::Other(anyhow!("truncate at {from} outside ({}, {}]", s.base_at(), s.head + 1)));
+        }
+        s.entries.retain(|(p, _)| *p < from);
+        s.head = from - 1;
+        Ok(())
+    }
+
+    async fn save_vote(&self, gen: u64, vote: &[u8]) -> LogResult<()> {
+        self.owned(gen)?.vote = Some(vote.to_vec());
+        Ok(())
+    }
+
     async fn discover(&self) -> LogResult<Option<Discovered>> {
         let s = self.shared.lock().unwrap();
         let (Some(gen), Some(log_id)) = (s.claimed, s.log_id) else {
             return Ok(None);
         };
-        Ok(Some(Discovered { base: s.base.clone(), head: Head { log_id, position: s.head }, gen }))
+        Ok(Some(Discovered {
+            base: s.base.clone(),
+            head: Head { log_id, position: s.head },
+            head_term: s.head_term(),
+            vote: s.vote.clone(),
+            gen,
+        }))
     }
 
     fn read(&self, from: Position, head: Head) -> EntryStream {
         let s = self.shared.lock().unwrap();
-        let base_at = s.base.as_ref().map_or(0, |b| b.at);
+        let base_at = s.base_at();
         let result = if s.log_id != Some(head.log_id) {
             Err(LogError::Lost(format!("log {} is not this one", head.log_id)))
         } else if from < base_at {
@@ -100,7 +135,7 @@ impl LogStore for MemoryLogStore {
 
     async fn rebase(&self, gen: u64, base: Base) -> LogResult<()> {
         let mut s = self.owned(gen)?;
-        let old = s.base.as_ref().map_or(0, |b| b.at);
+        let old = s.base_at();
         if base.at > s.head || base.at < old {
             return Err(LogError::Other(anyhow!("rebase at {} outside [{old}, {}]", base.at, s.head)));
         }

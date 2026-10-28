@@ -16,7 +16,7 @@ fn store(chat: &Arc<FakeChat>, window_ms: u64) -> Arc<ChatLogStore<FakeChat>> {
 }
 
 fn entry(i: u64) -> Entry {
-    Entry { namespace: "t".into(), version: 1, command: i.to_le_bytes().to_vec() }
+    Entry { term: 1, payload: i.to_le_bytes().to_vec() }
 }
 
 async fn history(log: &dyn LogStore) -> Vec<u64> {
@@ -26,7 +26,7 @@ async fn history(log: &dyn LogStore) -> Vec<u64> {
         .await
         .unwrap()
         .into_iter()
-        .map(|(_, e)| u64::from_le_bytes(e.command.try_into().unwrap()))
+        .map(|(_, e)| u64::from_le_bytes(e.payload.try_into().unwrap()))
         .collect()
 }
 
@@ -144,7 +144,7 @@ async fn a_rebase_deletes_the_messages_it_covers() {
     for i in 1..=5 {
         a.append(1, &[entry(i)]).await.unwrap();
     }
-    a.rebase(1, Base { at: 3, snapshot: crate::snapshot::SnapshotRef("s3".into()) }).await.unwrap();
+    a.rebase(1, Base { at: 3, term: 1, snapshot: crate::snapshot::SnapshotRef("s3".into()) }).await.unwrap();
     // Batches 4 and 5 and the rebase message stay.
     assert_eq!(chat.inner.lock().unwrap().docs.len(), 3);
     a.append(1, &[entry(6)]).await.unwrap();

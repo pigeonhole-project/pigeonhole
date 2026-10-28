@@ -102,6 +102,12 @@ trait LogStore {
     /// about this batch may be acknowledged.
     async fn append(&self, gen: u64, batch: &[Entry]) -> Result<Position, LogError>;
 
+    /// Drop the entries at `from` and after (Raft: a divergent tail).
+    async fn truncate(&self, gen: u64, from: Position) -> Result<(), LogError>;
+
+    /// Durably store the Raft vote (opaque).
+    async fn save_vote(&self, gen: u64, vote: &[u8]) -> Result<(), LogError>;
+
     /// Base + log head + newest generation (bootstrap without local state).
     async fn discover(&self) -> Result<Option<Discovered>>;
 
@@ -114,8 +120,12 @@ trait LogStore {
 }
 ```
 
-`Entry` = `{ namespace, version, command }`, a `Batch` = `{ format, gen, first,
-entries }`, both postcard. Every log has a `LogId` fixed by its first claim.
+`Entry` = `{ term, payload }` (the tablet's payload is a `Command { namespace,
+version, command }`), a `Batch` = `{ format, gen, first, entries }`, both
+postcard. A batch replaces whatever the log held from `first` on, so a
+truncate is a batch with no entries and `first` ≤ the head; every store keeps
+the records in write order and the log is the result of applying them. The
+log also keeps the Raft registers: the head's term and the vote (`discover`). Every log has a `LogId` fixed by its first claim.
 One error type for every call:
 `LogError::Fenced { current }` (a claim at or below `current` also gets it, so
 the tablet retries with `current + 1`), `Lost` (entries the caller needs are

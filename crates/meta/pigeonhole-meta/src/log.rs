@@ -18,19 +18,20 @@ pub use memory::MemoryLogStore;
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.
-pub const LOG_FORMAT: u32 = 2;
+pub const LOG_FORMAT: u32 = 3;
 
-/// One layer command. `version` is the namespace's command format
-/// ([`crate::StateMachine::VERSION`]) it was encoded with.
+/// One log entry: the Raft term it was written in and an opaque payload (a
+/// tablet command; later an openraft entry).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
-    pub namespace: String,
-    pub version: u32,
-    pub command: Vec<u8>,
+    pub term: u64,
+    pub payload: Vec<u8>,
 }
 
-/// One LogStore write. Entries get consecutive positions starting at `first`;
-/// an empty batch is the zero entry of generation `gen` and takes no position.
+/// One LogStore write. Entries get consecutive positions starting at
+/// `first`, replacing any the log held at `first` and after (a truncate is
+/// a batch with `first` ≤ the head and no entries). An empty batch at
+/// `head + 1` changes nothing: the zero entry, a barrier, a vote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Batch {
     /// [`LOG_FORMAT`]; first, so it can be read before the rest.
@@ -104,6 +105,8 @@ pub struct Head {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Base {
     pub at: Position,
+    /// Term of the entry at `at` (0 for position 0).
+    pub term: u64,
     pub snapshot: SnapshotRef,
 }
 
@@ -113,6 +116,10 @@ pub struct Discovered {
     /// `None`: the log starts at position 0 from empty states.
     pub base: Option<Base>,
     pub head: Head,
+    /// Term of the entry at the head (the base's if the head is the base).
+    pub head_term: u64,
+    /// The last vote saved ([`LogStore::save_vote`]), opaque.
+    pub vote: Option<Vec<u8>>,
     /// Newest claimed generation.
     pub gen: u64,
 }
@@ -173,11 +180,18 @@ pub trait LogStore: Send + Sync + 'static {
     /// generation is ≤ that head.
     async fn claim(&self, gen: u64) -> LogResult<Head>;
 
-    /// Durably append a batch for `gen`. `Ok` = committed, returns the
-    /// position of the batch's last entry (the head if the batch is empty);
-    /// `Fenced` = a newer generation exists, nothing about this batch may be
-    /// acknowledged.
+    /// Durably append a batch for `gen` after the head. `Ok` = committed,
+    /// returns the position of the batch's last entry (the head if the batch
+    /// is empty); `Fenced` = a newer generation exists, nothing about this
+    /// batch may be acknowledged.
     async fn append(&self, gen: u64, batch: &[Entry]) -> LogResult<Position>;
+
+    /// Durably drop the entries at `from` and after (a divergent tail);
+    /// `base < from <= head + 1`. The next append continues at `from`.
+    async fn truncate(&self, gen: u64, from: Position) -> LogResult<()>;
+
+    /// Durably store the Raft vote (opaque to the log).
+    async fn save_vote(&self, gen: u64, vote: &[u8]) -> LogResult<()>;
 
     /// Base + log head (bootstrap without any local state); `None` if the
     /// log was never claimed.

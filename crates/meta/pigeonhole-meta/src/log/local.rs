@@ -5,20 +5,26 @@
 //! <dir>/log_id                identity of this history, written by the first claim
 //! <dir>/claimed_gen           newest claimed generation (tmp + fsync + rename)
 //! <dir>/base                  postcard [`Base`]: where the log starts
-//! <dir>/seg-<first>.log       records; <first> = position of its first entry
+//! <dir>/vote                  the last saved vote (tmp + fsync + rename)
+//! <dir>/seg-<seq>.log         records, in write order; <seq> grows by one per segment
 //! ```
 //!
 //! A record is `MAGIC | len | crc32 | Batch` (little endian u32s). An append
 //! re-reads `claimed_gen` under the lock, writes one record and fsyncs before
 //! returning, so after a claim no older generation can acknowledge anything.
+//! A batch replaces whatever the log held from its `first` on, so a truncate
+//! is a record too; the log is the result of applying every record in order.
 //! A torn record at the very end of the last segment was never acknowledged;
 //! `claim` truncates it. Anything else that does not parse is [`LogError::Lost`].
 //! Fences only processes on this host; durability = the disk.
 
-use super::{Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position};
+use super::{
+    Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position,
+};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -44,9 +50,19 @@ struct Shared {
 struct Owner {
     gen: u64,
     head: Position,
-    /// Last segment open for append: file, length, first position. `None` on
-    /// an empty log; a new segment starts at `head + 1`.
-    seg: Option<(File, u64, Position)>,
+    /// Last segment open for append: file, length, sequence number.
+    seg: Option<(File, u64, u64)>,
+}
+
+/// The log as the records on disk make it.
+struct Walk {
+    head: Position,
+    /// Term of every entry after the base, in order.
+    terms: Vec<(Position, u64)>,
+    /// Segments in order with the highest position any of their records reached.
+    segs: Vec<(u64, PathBuf, Position)>,
+    /// Entries after the `collect_from` the walk was asked for.
+    entries: BTreeMap<Position, Entry>,
 }
 
 impl LocalLogStore {
@@ -90,7 +106,16 @@ impl LogStore for LocalLogStore {
 
     async fn append(&self, gen: u64, batch: &[Entry]) -> LogResult<Position> {
         let entries = batch.to_vec();
-        self.blocking(move |s| s.append(gen, entries)).await
+        self.blocking(move |s| s.write(gen, None, entries)).await
+    }
+
+    async fn truncate(&self, gen: u64, from: Position) -> LogResult<()> {
+        self.blocking(move |s| s.write(gen, Some(from), Vec::new()).map(|_| ())).await
+    }
+
+    async fn save_vote(&self, gen: u64, vote: &[u8]) -> LogResult<()> {
+        let vote = vote.to_vec();
+        self.blocking(move |s| s.save_vote(gen, &vote)).await
     }
 
     async fn discover(&self) -> LogResult<Option<Discovered>> {
@@ -99,42 +124,27 @@ impl LogStore for LocalLogStore {
 
     fn read(&self, from: Position, head: Head) -> EntryStream {
         let shared = self.shared.clone();
-        // One segment per step, so replay never holds the whole log in memory.
-        let state = ReadState { from, next: from + 1, head: head.position, segs: None };
-        let steps = futures::stream::unfold(Some(state), move |state| {
-            let shared = shared.clone();
-            async move {
-                let mut state = state?;
-                if state.next > state.head {
-                    return None;
-                }
-                let step = tokio::task::spawn_blocking(move || {
-                    let r = shared.read_step(&mut state);
-                    (r, state)
+        // The whole tail after `from` is assembled first: a later record may
+        // replace entries of an earlier one (a truncate), so nothing is final
+        // before the last record is read. Snapshots bound its size.
+        let fut = async move {
+            tokio::task::spawn_blocking(move || shared.read_range(from, head))
+                .await
+                .map_err(|e| LogError::Other(anyhow!("log task: {e}")))?
+        };
+        Box::pin(
+            futures::stream::once(fut)
+                .map(|r| match r {
+                    Ok(items) => futures::stream::iter(items.into_iter().map(Ok).collect::<Vec<_>>()),
+                    Err(e) => futures::stream::iter(vec![Err(e)]),
                 })
-                .await;
-                let (items, state) = match step {
-                    Ok((Ok(entries), state)) => (entries.into_iter().map(Ok).collect(), Some(state)),
-                    Ok((Err(e), _)) => (vec![Err(e)], None),
-                    Err(e) => (vec![Err(LogError::Other(anyhow!("log task: {e}")))], None),
-                };
-                Some((futures::stream::iter(items), state))
-            }
-        });
-        Box::pin(steps.flatten())
+                .flatten(),
+        )
     }
 
     async fn rebase(&self, gen: u64, base: Base) -> LogResult<()> {
         self.blocking(move |s| s.rebase(gen, base)).await
     }
-}
-
-struct ReadState {
-    from: Position,
-    next: Position,
-    head: Position,
-    /// Segments not yet read, oldest first.
-    segs: Option<Vec<(Position, PathBuf)>>,
 }
 
 impl Shared {
@@ -192,7 +202,7 @@ impl Shared {
         self.sync_dir()
     }
 
-    fn segments(&self) -> LogResult<Vec<(Position, PathBuf)>> {
+    fn segments(&self) -> LogResult<Vec<(u64, PathBuf)>> {
         numbered(&self.dir, "seg-", ".log")
     }
 
@@ -204,50 +214,31 @@ impl Shared {
         }
     }
 
-    fn base_at(&self) -> LogResult<Position> {
-        Ok(self.base()?.map_or(0, |b| b.at))
+    fn vote(&self) -> LogResult<Option<Vec<u8>>> {
+        match fs::read(self.dir.join("vote")) {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
-    /// Validate the whole log and return its head. With `repair`, a torn
-    /// record at the end of the last segment is truncated away.
-    fn scan(&self, repair: bool) -> LogResult<Position> {
-        let mut head = self.base_at()?;
+    /// Apply every record in order. With `repair`, a torn record at the end
+    /// of the last segment is truncated away; entries after `collect_from`
+    /// are kept in [`Walk::entries`].
+    fn walk(&self, repair: bool, collect_from: Option<Position>) -> LogResult<Walk> {
+        let base = self.base()?;
+        let base_at = base.as_ref().map_or(0, |b| b.at);
+        let mut w = Walk { head: base_at, terms: Vec::new(), segs: Vec::new(), entries: BTreeMap::new() };
         let segs = self.segments()?;
         let mut last_gen = 0;
-        for (i, (first, path)) in segs.iter().enumerate() {
+        for (i, (seq, path)) in segs.iter().enumerate() {
             let last_seg = i + 1 == segs.len();
-            if *first > head + 1 {
-                return Err(LogError::Lost(format!("hole before {}", path.display())));
-            }
             let data = fs::read(path)?;
             let mut off = 0;
-            let mut seen_first = None;
+            let mut seg_max = 0;
             while off < data.len() {
-                match decode_record(&data[off..]) {
-                    Record::Ok(batch, len) => {
-                        if batch.gen < last_gen {
-                            return Err(LogError::Lost(format!(
-                                "{}: generation {} after {last_gen}",
-                                path.display(),
-                                batch.gen
-                            )));
-                        }
-                        last_gen = batch.gen;
-                        seen_first.get_or_insert(batch.first);
-                        // Batches wholly behind the base (last entry ≤ head)
-                        // are already covered by it; skip them.
-                        if batch.first + batch.entries.len() as u64 > head + 1 {
-                            if batch.first != head + 1 {
-                                return Err(LogError::Lost(format!(
-                                    "{}: batch at {} after head {head}",
-                                    path.display(),
-                                    batch.first
-                                )));
-                            }
-                            head += batch.entries.len() as u64;
-                        }
-                        off += len;
-                    }
+                let (batch, len) = match decode_record(&data[off..]) {
+                    Record::Ok(batch, len) => (batch, len),
                     Record::Torn if last_seg => {
                         if repair {
                             let f = OpenOptions::new().write(true).open(path)?;
@@ -257,26 +248,55 @@ impl Shared {
                         break;
                     }
                     Record::Torn | Record::Corrupt => {
-                        return Err(LogError::Lost(format!(
-                            "{}: bad record at offset {off}",
-                            path.display()
-                        )));
+                        return Err(LogError::Lost(format!("{}: bad record at offset {off}", path.display())));
                     }
-                    Record::Unreadable(why) => {
-                        return Err(LogError::Lost(format!("{}: {why}", path.display())));
-                    }
-                }
-            }
-            if let Some(f) = seen_first {
-                if f != *first {
+                    Record::Unreadable(why) => return Err(LogError::Lost(format!("{}: {why}", path.display()))),
+                };
+                off += len;
+                if batch.gen < last_gen {
                     return Err(LogError::Lost(format!(
-                        "{}: first batch at {f}",
-                        path.display()
+                        "{}: generation {} after {last_gen}",
+                        path.display(),
+                        batch.gen
                     )));
                 }
+                last_gen = batch.gen;
+                if batch.first == 0 || batch.first > w.head + 1 {
+                    return Err(LogError::Lost(format!(
+                        "{}: batch at {} after head {}",
+                        path.display(),
+                        batch.first,
+                        w.head
+                    )));
+                }
+                let end = batch.first - 1 + batch.entries.len() as u64;
+                w.terms.retain(|(p, _)| *p < batch.first);
+                if let Some(from) = collect_from {
+                    let first = batch.first;
+                    let _ = w.entries.split_off(&first.max(from + 1));
+                }
+                for (k, entry) in batch.entries.into_iter().enumerate() {
+                    let pos = batch.first + k as u64;
+                    if pos > base_at {
+                        w.terms.push((pos, entry.term));
+                        if collect_from.is_some_and(|from| pos > from) {
+                            w.entries.insert(pos, entry);
+                        }
+                    }
+                }
+                w.head = end.max(base_at);
+                seg_max = seg_max.max(end);
             }
+            w.segs.push((*seq, path.clone(), seg_max));
         }
-        Ok(head)
+        Ok(w)
+    }
+
+    fn head_term(&self, w: &Walk) -> LogResult<u64> {
+        Ok(match w.terms.last() {
+            Some((_, t)) => *t,
+            None => self.base()?.map_or(0, |b| b.term),
+        })
     }
 
     fn claim(&self, gen: u64) -> LogResult<Head> {
@@ -288,12 +308,12 @@ impl Shared {
         }
         let log_id = self.log_id(true)?;
         self.write_atomic("claimed_gen", gen.to_string().as_bytes())?;
-        let head = self.scan(true)?;
+        let head = self.walk(true, None)?.head;
         let seg = match self.segments()?.pop() {
-            Some((first, path)) => {
+            Some((seq, path)) => {
                 let f = OpenOptions::new().append(true).open(path)?;
                 let len = f.metadata()?.len();
-                Some((f, len, first))
+                Some((f, len, seq))
             }
             None => None,
         };
@@ -301,36 +321,55 @@ impl Shared {
         Ok(Head { log_id, position: head })
     }
 
-    fn append(&self, gen: u64, entries: Vec<Entry>) -> LogResult<Position> {
-        let _lock = self.lock()?;
+    /// Check under the lock that `gen` still holds the log and this handle
+    /// claimed it.
+    fn check_owner(&self, gen: u64) -> LogResult<()> {
         let current = self.claimed_gen()?.unwrap_or(0);
         if current != gen {
             if current > gen {
                 return Err(LogError::Fenced { current });
             }
-            return Err(LogError::Other(anyhow!("append for unclaimed generation {gen}")));
+            return Err(LogError::Other(anyhow!("write for unclaimed generation {gen}")));
         }
+        Ok(())
+    }
+
+    /// Append `entries` after the head, or (`from`) truncate to `from - 1`.
+    fn write(&self, gen: u64, from: Option<Position>, entries: Vec<Entry>) -> LogResult<Position> {
+        let _lock = self.lock()?;
+        self.check_owner(gen)?;
+        let base_at = self.base()?.map_or(0, |b| b.at);
         let mut owner = self.owner.lock().unwrap();
         let o = owner
             .as_mut()
             .filter(|o| o.gen == gen)
             .ok_or_else(|| LogError::Other(anyhow!("generation {gen} not claimed by this handle")))?;
+        let first = match from {
+            None => o.head + 1,
+            Some(from) => {
+                if from <= base_at || from > o.head + 1 {
+                    return Err(LogError::Other(anyhow!("truncate at {from} outside ({base_at}, {}]", o.head + 1)));
+                }
+                from
+            }
+        };
 
-        // Roll over only if the new segment gets a fresh name: a segment that
-        // holds only zero entries keeps growing.
-        let roll = o
-            .seg
-            .as_ref()
-            .is_none_or(|(_, len, first)| *len >= self.segment_bytes && o.head + 1 > *first);
+        // Roll over only for a record with entries: a segment holding only
+        // zero entries and barriers keeps growing.
+        let roll = o.seg.as_ref().is_none_or(|(_, len, _)| *len >= self.segment_bytes && !entries.is_empty());
         if roll {
-            let path = self.dir.join(format!("seg-{:020}.log", o.head + 1));
+            let seq = o.seg.as_ref().map_or_else(
+                || self.segments().map(|s| s.last().map_or(1, |(n, _)| n + 1)),
+                |(_, _, n)| Ok(n + 1),
+            )?;
+            let path = self.dir.join(format!("seg-{seq:020}.log"));
             let f = OpenOptions::new().create_new(true).append(true).open(&path)?;
             self.sync_dir()?;
-            o.seg = Some((f, 0, o.head + 1));
+            o.seg = Some((f, 0, seq));
         }
 
         let n = entries.len() as u64;
-        let record = encode_record(&Batch::new(gen, o.head + 1, entries));
+        let record = encode_record(&Batch::new(gen, first, entries));
         let (f, len, _) = o.seg.as_mut().unwrap();
         let write = f.write_all(&record).and_then(|()| f.sync_data());
         if let Err(e) = write {
@@ -339,8 +378,14 @@ impl Shared {
             return Err(e.into());
         }
         *len += record.len() as u64;
-        o.head += n;
+        o.head = first - 1 + n;
         Ok(o.head)
+    }
+
+    fn save_vote(&self, gen: u64, vote: &[u8]) -> LogResult<()> {
+        let _lock = self.lock()?;
+        self.check_owner(gen)?;
+        self.write_atomic("vote", vote)
     }
 
     fn discover(&self) -> LogResult<Option<Discovered>> {
@@ -349,50 +394,33 @@ impl Shared {
             return Ok(None);
         };
         let log_id = self.log_id(false)?;
-        let head = self.scan(false)?;
-        Ok(Some(Discovered { base: self.base()?, head: Head { log_id, position: head }, gen }))
+        let w = self.walk(false, None)?;
+        Ok(Some(Discovered {
+            base: self.base()?,
+            head: Head { log_id, position: w.head },
+            head_term: self.head_term(&w)?,
+            vote: self.vote()?,
+            gen,
+        }))
     }
 
-    fn read_step(&self, st: &mut ReadState) -> LogResult<Vec<(Position, Entry)>> {
-        if st.segs.is_none() {
-            let base = self.base_at()?;
-            if st.from < base {
-                return Err(LogError::Lost(format!("entries after {} collected up to base {base}", st.from)));
-            }
-            let mut segs = self.segments()?;
-            // Keep the segment containing `next` and everything after it.
-            let start = segs.iter().rposition(|(first, _)| *first <= st.next).unwrap_or(0);
-            segs.drain(..start);
-            segs.reverse();
-            st.segs = Some(segs);
+    fn read_range(&self, from: Position, head: Head) -> LogResult<Vec<(Position, Entry)>> {
+        let _lock = self.lock()?;
+        if self.log_id(false)? != head.log_id {
+            return Err(LogError::Lost(format!("log {} is not this one", head.log_id)));
         }
-        let Some((_, path)) = st.segs.as_mut().unwrap().pop() else {
-            return Err(LogError::Lost(format!("log ends before position {}", st.next)));
-        };
-        let data = fs::read(&path)?;
-        let mut out = Vec::new();
-        let mut off = 0;
-        while off < data.len() && st.next <= st.head {
-            let (batch, len) = match decode_record(&data[off..]) {
-                Record::Ok(batch, len) => (batch, len),
-                Record::Unreadable(why) => {
-                    return Err(LogError::Lost(format!("{}: {why}", path.display())));
-                }
-                Record::Torn | Record::Corrupt => {
-                    return Err(LogError::Lost(format!(
-                        "{}: bad record at offset {off}",
-                        path.display()
-                    )));
-                }
-            };
-            off += len;
-            for (i, entry) in batch.entries.into_iter().enumerate() {
-                let pos = batch.first + i as u64;
-                if pos == st.next && pos <= st.head {
-                    out.push((pos, entry));
-                    st.next += 1;
-                }
-            }
+        let base_at = self.base()?.map_or(0, |b| b.at);
+        if from < base_at {
+            return Err(LogError::Lost(format!("entries after {from} collected up to base {base_at}")));
+        }
+        let w = self.walk(false, Some(from))?;
+        if head.position > w.head {
+            return Err(LogError::Lost(format!("log ends at {}, before {}", w.head, head.position)));
+        }
+        let out: Vec<_> = w.entries.into_iter().filter(|(p, _)| *p <= head.position).collect();
+        let want = head.position.saturating_sub(from) as usize;
+        if out.len() != want {
+            return Err(LogError::Lost(format!("entries ({from}, {}] incomplete", head.position)));
         }
         Ok(out)
     }
@@ -403,18 +431,19 @@ impl Shared {
         if current != gen {
             return Err(LogError::Fenced { current });
         }
-        let head = self.scan(false)?;
+        let w = self.walk(false, None)?;
+        let old = self.base()?.map_or(0, |b| b.at);
         let at = base.at;
-        if at > head || at < self.base_at()? {
-            return Err(LogError::Other(anyhow!("rebase at {at} outside [{}, {head}]", self.base_at()?)));
+        if at > w.head || at < old {
+            return Err(LogError::Other(anyhow!("rebase at {at} outside [{old}, {}]", w.head)));
         }
         self.write_atomic("base", &postcard::to_stdvec(&base).expect("a base always encodes"))?;
-        // A segment is garbage once the next one starts at or before `at + 1`.
-        let segs = self.segments()?;
-        for pair in segs.windows(2) {
-            if pair[1].0 <= at + 1 {
-                fs::remove_file(&pair[0].1)?;
-            }
+        // Leading segments whose every record ends at or before the base are
+        // garbage; keep the last one (it is open for append).
+        let keep_from = w.segs.iter().position(|(_, _, max)| *max > at).unwrap_or(w.segs.len());
+        let keep_from = keep_from.min(w.segs.len().saturating_sub(1));
+        for (_, path, _) in &w.segs[..keep_from] {
+            fs::remove_file(path)?;
         }
         self.sync_dir()
     }
@@ -488,11 +517,11 @@ mod tests {
     use futures::TryStreamExt;
 
     fn entry(i: u64) -> Entry {
-        Entry { namespace: "t".into(), version: 1, command: i.to_le_bytes().to_vec() }
+        Entry { term: 1, payload: i.to_le_bytes().to_vec() }
     }
 
     fn base(at: Position) -> Base {
-        Base { at, snapshot: crate::snapshot::SnapshotRef(format!("s{at}")) }
+        Base { at, term: 1, snapshot: crate::snapshot::SnapshotRef(format!("s{at}")) }
     }
 
     async fn read_all(log: &dyn LogStore, from: Position, head: Position) -> LogResult<Vec<(Position, Entry)>> {
@@ -580,8 +609,8 @@ mod tests {
         }
         assert_eq!(log.shared.segments().unwrap().len(), 6);
         log.rebase(1, base(4)).await.unwrap();
-        let firsts: Vec<_> = log.shared.segments().unwrap().into_iter().map(|(f, _)| f).collect();
-        assert_eq!(firsts, vec![5, 6]);
+        let seqs: Vec<_> = log.shared.segments().unwrap().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(seqs, vec![5, 6], "segments wholly behind the base are gone");
 
         let d = log.discover().await.unwrap().unwrap();
         assert_eq!(d.base, Some(base(4)));
@@ -606,8 +635,8 @@ mod tests {
         log.claim(4).await.unwrap();
         assert_eq!(log.append(4, &[entry(1)]).await.unwrap(), 1);
         assert_eq!(log.append(4, &[entry(2)]).await.unwrap(), 2);
-        let firsts: Vec<_> = log.shared.segments().unwrap().into_iter().map(|(f, _)| f).collect();
-        assert_eq!(firsts, vec![1, 2]);
+        let seqs: Vec<_> = log.shared.segments().unwrap().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(seqs, vec![1, 2, 3], "zero entries share the first segment");
         assert_eq!(read_all(&log, 0, 2).await.unwrap(), vec![(1, entry(1)), (2, entry(2))]);
     }
 
@@ -661,6 +690,31 @@ mod tests {
         assert_eq!(log.claim(2).await.unwrap().position, 6);
         assert_eq!(log.append(2, &[]).await.unwrap(), 6);
         assert_eq!(log.append(2, &[entry(7)]).await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_truncate_reaches_into_older_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = LocalLogStore::with_segment_bytes(dir.path(), 1).unwrap();
+        log.claim(1).await.unwrap();
+        for i in 1..=6 {
+            log.append(1, &[entry(i)]).await.unwrap();
+        }
+        // Positions 3..=6 sit in four older segments; the truncate is a record
+        // in the newest one and replaces them all.
+        log.truncate(1, 3).await.unwrap();
+        let other = |i: u64| Entry { term: 2, payload: i.to_le_bytes().to_vec() };
+        assert_eq!(log.append(1, &[other(30)]).await.unwrap(), 3);
+        let want = vec![(1, entry(1)), (2, entry(2)), (3, other(30))];
+        assert_eq!(read_all(&log, 0, 3).await.unwrap(), want);
+
+        log.rebase(1, base(2)).await.unwrap();
+        let again = LocalLogStore::open(dir.path()).unwrap();
+        let d = again.discover().await.unwrap().unwrap();
+        assert_eq!((d.head.position, d.head_term), (3, 2));
+        assert_eq!(read_all(&again, 2, 3).await.unwrap(), vec![(3, other(30))]);
+        assert_eq!(again.claim(2).await.unwrap().position, 3);
+        assert_eq!(again.append(2, &[entry(4)]).await.unwrap(), 4);
     }
 
     #[tokio::test]

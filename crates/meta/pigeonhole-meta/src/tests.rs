@@ -215,7 +215,7 @@ async fn crash_between_append_and_apply_is_applied_once_on_boot() {
     // An incarnation that appended a batch and died before applying it.
     let log = LocalLogStore::open(dir.path().join("log")).unwrap();
     assert_eq!(log.claim(2).await.unwrap().position, 1);
-    assert_eq!(log.append(2, &[entry::<Counter>(&op(2, 5))]).await.unwrap(), 2);
+    assert_eq!(log.append(2, &[command::<Counter>(&op(2, 5)).entry(2)]).await.unwrap(), 2);
 
     for expected_gen in [3, 4] {
         let a = open_on(dir.path()).await;
@@ -235,9 +235,9 @@ async fn entries_of_another_command_format_refuse_to_replay() {
     }
     let log = LocalLogStore::open(dir.path().join("log")).unwrap();
     log.claim(2).await.unwrap();
-    let mut old = entry::<Counter>(&op(2, 1));
+    let mut old = command::<Counter>(&op(2, 1));
     old.version = Counter::VERSION + 1;
-    log.append(2, &[old]).await.unwrap();
+    log.append(2, &[old.entry(2)]).await.unwrap();
 
     let err = MetaStore::open_local(dir.path().join("log"), counter()).await.err().expect("boot must fail");
     assert!(format!("{err:#}").contains("counter command in format 2, this binary reads 1"), "{err:#}");
@@ -304,7 +304,7 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
     };
     let stored = StoredSnapshot { log_id: head.log_id, at: 1, data: snap.encode() };
     let snapshot = LocalSnapshotStore::new(&log_dir).put(&stored).await.unwrap();
-    log.rebase(2, Base { at: 1, snapshot }).await.unwrap();
+    log.rebase(2, Base { at: 1, term: 1, snapshot }).await.unwrap();
 
     let err = MetaStore::open_local(&log_dir, counter()).await.err().expect("boot must fail");
     assert!(format!("{err:#}").contains("counter state in format 2, this binary reads 1"), "{err:#}");

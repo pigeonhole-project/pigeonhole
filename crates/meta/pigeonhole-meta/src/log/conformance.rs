@@ -9,11 +9,15 @@ use std::future::Future;
 use std::sync::Arc;
 
 fn entry(i: u64) -> Entry {
-    Entry { namespace: "t".into(), version: 1, command: i.to_le_bytes().to_vec() }
+    termed(1, i)
+}
+
+fn termed(term: u64, i: u64) -> Entry {
+    Entry { term, payload: i.to_le_bytes().to_vec() }
 }
 
 fn base(at: Position) -> Base {
-    Base { at, snapshot: SnapshotRef(format!("s{at}")) }
+    Base { at, term: 1, snapshot: SnapshotRef(format!("s{at}")) }
 }
 
 async fn read_all(log: &dyn LogStore, from: Position, head: Head) -> Result<Vec<(Position, Entry)>, LogError> {
@@ -32,6 +36,8 @@ where
     newer_claim_fences_older_generation(fresh()).await;
     rebase_covers_and_collects(fresh()).await;
     reading_past_the_head_is_lost(fresh()).await;
+    truncate_replaces_a_divergent_tail(fresh()).await;
+    the_vote_survives_and_is_fenced(fresh()).await;
 }
 
 pub async fn append_read_and_reopen<Open, Fut>(open: Open)
@@ -123,4 +129,58 @@ where
     let beyond = Head { position: 3, ..head };
     assert!(matches!(read_all(log.as_ref(), 0, beyond).await, Err(LogError::Lost(_))));
     assert_eq!(read_all(log.as_ref(), 1, Head { position: 1, ..head }).await.unwrap(), vec![]);
+}
+
+/// A follower drops entries the leader does not have and takes the leader's.
+pub async fn truncate_replaces_a_divergent_tail<Open, Fut>(open: Open)
+where
+    Open: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn LogStore>>,
+{
+    let log = open().await;
+    log.claim(1).await.unwrap();
+    for i in 1..=5 {
+        log.append(1, &[entry(i)]).await.unwrap();
+    }
+    log.truncate(1, 4).await.unwrap();
+    assert_eq!(log.append(1, &[termed(2, 40), termed(2, 50)]).await.unwrap(), 5);
+    log.truncate(1, 6).await.unwrap(); // at head + 1: nothing to drop
+    assert!(log.truncate(1, 7).await.is_err(), "past head + 1");
+
+    let again = open().await;
+    let d = again.discover().await.unwrap().unwrap();
+    assert_eq!((d.head.position, d.head_term), (5, 2));
+    let all = read_all(again.as_ref(), 0, d.head).await.unwrap();
+    let want = vec![(1, entry(1)), (2, entry(2)), (3, entry(3)), (4, termed(2, 40)), (5, termed(2, 50))];
+    assert_eq!(all, want);
+
+    // A truncate right after a rebase may not reach behind it.
+    let head = again.claim(2).await.unwrap();
+    again.rebase(2, base(3)).await.unwrap();
+    assert!(again.truncate(2, 3).await.is_err(), "behind the base");
+    again.truncate(2, 4).await.unwrap();
+    let d = again.discover().await.unwrap().unwrap();
+    assert_eq!((d.head.position, d.head_term), (3, 1), "the head term is the base's");
+    assert_eq!(again.append(2, &[termed(3, 4)]).await.unwrap(), 4);
+    assert_eq!(read_all(again.as_ref(), 3, Head { position: 4, ..head }).await.unwrap(), vec![(4, termed(3, 4))]);
+}
+
+/// The vote is durable and only the claimed generation may change it.
+pub async fn the_vote_survives_and_is_fenced<Open, Fut>(open: Open)
+where
+    Open: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn LogStore>>,
+{
+    let (a, b) = (open().await, open().await);
+    a.claim(1).await.unwrap();
+    assert_eq!(a.discover().await.unwrap().unwrap().vote, None);
+    a.save_vote(1, b"term 1 for n1").await.unwrap();
+    a.append(1, &[entry(1)]).await.unwrap();
+    assert_eq!(open().await.discover().await.unwrap().unwrap().vote.as_deref(), Some(&b"term 1 for n1"[..]));
+
+    b.claim(2).await.unwrap();
+    assert!(matches!(a.save_vote(1, b"stale").await, Err(LogError::Fenced { current: 2 })));
+    assert!(matches!(a.truncate(1, 1).await, Err(LogError::Fenced { current: 2 })));
+    b.save_vote(2, b"term 2 for n2").await.unwrap();
+    assert_eq!(open().await.discover().await.unwrap().unwrap().vote.as_deref(), Some(&b"term 2 for n2"[..]));
 }
