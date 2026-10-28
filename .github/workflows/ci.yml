@@ -24,6 +24,23 @@ jobs:
         run: ./scripts/check-deps.sh --strict
       - run: cargo test --workspace
 
+  code-report:
+    name: code report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install rust-code-analysis-cli
+        run: cargo install --locked rust-code-analysis-cli
+      - name: Size, complexity, trait graph
+        run: ./scripts/code_report.py --out code-report.md
+      - run: cat code-report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: code-report
+          path: code-report.md
+
   compat-memory:
     name: compat-memory (ceph known-good)
     runs-on: ubuntu-latest

@@ -1,4 +1,4 @@
-.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps
+.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report
 
 run:
 	cargo run --release
@@ -49,5 +49,10 @@ test:
 
 check-deps:
 	./scripts/check-deps.sh --strict
+
+# Size, complexity hotspots and the trait graph (Mermaid) → target/code-report.md.
+# Needs `cargo install --locked rust-code-analysis-cli`.
+report:
+	./scripts/code_report.py --out target/code-report.md
 
 test-all: check-deps test smoke
