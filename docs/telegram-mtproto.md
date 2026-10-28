@@ -46,9 +46,9 @@ Rejected alternatives:
   backend stays as is (comparison, mixed replicas).
 - MTProto library: [grammers](https://github.com/Lonami/grammers) (pure Rust,
   tokio, raw `invoke` for any TL function). Pin the exact version; it is pre-1.0.
-- The chat log and chat snapshots stop pinning, for **both** transports (the
-  Bot API one keeps working through `forwardMessage`, or is dropped from the
-  log/snapshot role — decide in step 3, see Open questions).
+- A new chat log over MTProto with no pins and no description: the fence is
+  the order of messages in the channel (below). It needs range reads, so the
+  Bot API `ChatLogStore` cannot use it (see Open questions).
 - Only channels / supergroups are accepted: there message ids are per chat and
   dense. In basic groups and private chats ids are a per-account counter, and
   an id-range sweep would hit other chats' ids. Check the peer type at startup.
@@ -74,7 +74,7 @@ chat_id = -1001234567890
   `flock` on it so two processes never share one session.
 - Ignore updates (no catch-up, no update loop work).
 - Resolve `chat_id` to `InputPeerChannel { channel_id, access_hash }` once at
-  startup; check the bot is an admin with post, delete, edit-info rights.
+  startup; check the bot is an admin with post and delete rights.
 - Fingerprint `tgm:{bot_id}:{channel_id}`, location `tg:chat:{chat_id}` (same
   location as the Bot API backend: one chat must not get two writers).
 
@@ -118,49 +118,123 @@ Move `RateLimited` (now in the Bot API client) and the `retrying` helper (now
 in `telegram_log.rs`) somewhere both transports and the log adapters use, e.g.
 `pigeonhole-blob`. 429 and `FLOOD_WAIT_X` map to the same type.
 
-### Log and snapshots without pins
+### The log: a fence by order in the channel
 
-The chat log protocol (`meta/pigeonhole-meta/src/log/chat.rs`) changes:
+Telegram gives every message in a channel an id, atomically and in increasing
+order: one total order of everything every writer posts. With
+`channels.getMessages` a reader sees that order, so who won is decided by the
+**position** of a message, not by time. No description register, no pins, no
+straggler window: a deposed writer's message that lands arbitrarily late (see
+Spike findings: a dropped grammers future still sends) is above the newer
+claim and invalid for every reader alike.
 
-- `ChatApi` loses `pin` and `Registers::pinned` / `pinned_other`; it gains
-  `top_id()` (the newest message id in the chat) and
-  `get_docs(ids) -> Vec<Option<ChatDoc>>` (documents among those ids). The
-  description register stays (it is the fence).
-- **head** = the newest log message of this log by message id. In a channel
-  id order is sending order, which is what "newest pinned by sending date"
-  meant.
-- **append(g)**: send the batch linked to the current head, read the
-  description: `Ok` only if it still holds `g`. No pin.
-- **claim(g)**: write the description, wait out the straggler window (as now),
-  then find the head: `top_id()`, walk back in batches of 100 with
-  `get_docs` to the first message that decodes as a log message of this
-  `log_id`; follow `prev` links as now.
-- **The head is the newest log message by (generation, id)**, not by id: a
-  deposed writer's message can land arbitrarily late (see Spike findings: a
-  dropped grammers future still sends), and a later id must not make it the
-  head over a newer generation. Every claim writes its own (empty) message
-  right away, so the claiming generation always has one. Finding the head:
-  walk down from the top in batches of 100; the claimant knows the previous
-  generation from the description it overwrote, so the head is the first
-  message of that generation met on the way down (lower generations above it
-  are stragglers, skipped); if that generation has none (it crashed between
-  its description write and its claim message), continue to the next lower.
-- **Stragglers** then need no time bound for safety: a straggler has a lower
-  generation and never becomes the head. The straggler window becomes an
-  optimisation (fewer stragglers to skip) and may go away; decide with the
-  Raft node design (a node's log has one writer anyway).
-- **Semantics change to document**: today a message sent but never pinned
-  (writer died between send and pin) cannot become the head; without pins it
-  can. Entries never acknowledged may survive, which a Raft log allows. State
-  it in meta-backends.md and cover it with a fake-chat test.
-- `ChatSnapshotStore`: the newest snapshot is the newest snapshot document by
-  id, found the same way; no pin, no "pinned message is not ours" check
-  (foreign messages are skipped by decoding).
-- `chat/fake.rs` follows: ids grow, `top_id`, `get_docs`, no pins.
-- `top_id()` for MTProto: cheapest way to be found in the spike (probing
-  `getMessages` beyond the top returns `messageEmpty`; deleted ids look the
-  same, so probe forward from a known id, or send a message — a claim writes
-  anyway). For the Bot API: send a message and take its id.
+The log chat holds two kinds of messages, both documents. Kind and generation
+are in the file name (`log-<log_id>-<gen>-claim.bin`, `…-batch.bin`) so a
+scan decides validity from `getMessages` metadata alone and downloads only the
+batches it replays; the document repeats them and a mismatch is `Lost`.
+
+- `Claim { log_id, gen }`
+- `Batch { log_id, gen, prev, base, vote, head_term, first, entries }` — as
+  `LogDoc` today; `prev` links the previous batch of the chain (for the first
+  batch of a generation, its zero entry: the previous head, and it names its
+  own claim).
+
+**Validity** depends only on messages with lower ids, which never change once
+ids are assigned:
+
+- a claim of `g` is valid iff no valid claim of a generation ≥ `g` is below it
+  (two claims of one generation: the lower id wins);
+- a batch of `g` is valid iff no valid claim of a generation > `g` lies
+  between its `prev` and itself.
+
+**Writer invariant**: a generation sends its first batch only after its claim
+is confirmed, and each next batch only after the previous one is confirmed
+(one batch in flight; group commit fills the next meanwhile). So the checked
+ranges of a generation are contiguous, and a batch's validity is a local fact:
+the range `(prev, self)`.
+
+**Reading a range** `(a, b)`: `getMessages` over the ids strictly between, 100
+per call. A claim or batch of this log with a generation above ours → fenced.
+Batches of lower generations (stragglers) and foreign messages are skipped.
+`messageEmpty` means "not visible yet" (nothing above the base is ever deleted,
+see collection): re-read after a pause; still empty after a bound → `Other`
+(outcome unknown).
+
+**append(g, batch)** with `checked` = the id of our last confirmed batch (or of
+our claim):
+
+1. Send the batch, get its id `b`. A send that failed without an answer is
+   repeated with the same `random_id` (the server returns the same message).
+2. `b == checked + 1`: nothing can lie between, `Ok` at once, without a read —
+   the common case in a dedicated chat, one call per append.
+3. Otherwise read `(checked, b)`: a higher claim → `Fenced`, nothing is
+   acknowledged and the batch is invalid for everyone; else `Ok`.
+4. `checked = b`. A failed read is simply repeated: the outcome is already
+   fixed by the order in the chat.
+
+**claim(g)** = claim + discover in one pass:
+
+1. Send `Claim(g)`, get its id `c` (also the chat's top: the spike found no
+   cheaper way to learn it).
+2. Walk down from `c` in pages of 100 to the first batch `B` that is valid by
+   its local check (its `(prev, B)` range is read as part of the walk or
+   fetched). Higher batches skipped on the way are stragglers whose range holds
+   a higher claim. By the writer invariant every valid claim below `B` has a
+   generation ≤ `B.gen`, so `B` is the head of its generation's chain. No batch
+   at all: walk to the bottom (fresh log).
+3. Evaluate the claims in `(B, c)` bottom-up starting from `B.gen`: a claim is
+   valid if its generation exceeds every valid one below it. A valid claim ≥
+   `g`, or one of `g` with a lower id → `Fenced { current }`, retry above it.
+4. Otherwise `g` holds the log. The head is `B` (or nothing); replay follows
+   `prev` down to the base. The first batch of `g` (the zero entry) links `B`.
+
+A claim reads `(B.prev, c)`: the claims and stragglers since the last batch,
+normally a page or two, not the whole log.
+
+**Rebase and collection**: a rebase is a batch carrying the new base (a
+snapshot ref). Only after it is `Ok` does the writer delete the log messages
+below the rebase batch's `prev` (the rebase batch and its `prev` stay, so its
+local check still reads a range without collected holes) and the snapshot the
+old base named. A fenced writer deletes nothing.
+
+**Semantics**: a batch sent but never confirmed (writer died before its check)
+is valid if no higher claim precedes it and then becomes the head: entries
+never acknowledged may survive, which a Raft log allows. A batch is the commit
+point, not an acknowledgement. State it in meta-backends.md; fake-chat tests
+cover it, the straggler cases and two racing claims.
+
+`ChatApi` shrinks to what the protocol uses: `send_document(name, data) ->
+id`, `get_messages(ids) -> [Empty | Other | Doc { name, download_ref }]`,
+`download`, `delete`. `chat/fake.rs` follows (ids grow, a message can be made
+visible late).
+
+### Snapshots
+
+In a chat of their own: a `SnapshotStore` is plain storage, no order, no
+fence; a snapshot counts only while a valid rebase names it.
+
+- `SnapshotRef` = `message_id` + crc; `get` reads the message by id
+  (fresh `file_reference`), the crc catches a replaced message.
+- `put` = send; `remove` = delete.
+- `newest()` (lossy restore only): learn the top by sending a probe message
+  (then delete it) and walk down to the first document that decodes as a
+  snapshot. The snapshot carries `(log_id, gen, at)`; `restore --lossy` prints
+  it and can filter by `log_id` when a chat holds several logs' snapshots.
+- A deposed writer's snapshot is harmless (its rebase is invalid): garbage,
+  removed best effort (everything no current base names).
+
+Snapshots in the log chat would work too, but they would take ids in the log's
+order and break the `b == checked + 1` fast path; a separate chat also keeps
+the snapshots when the log chat is lost.
+
+### With a local log
+
+`[meta] log` on `local_disk`, snapshots in a channel: the local `LogStore`
+fences (one process per directory) and the channel only stores snapshots, as
+above. Snapshots are taken of applied state, and a local log applies only what
+was appended, so every snapshot — even one whose rebase never happened — is a
+committed state; `newest()` is safe for lossy restore here. The tablet cannot
+move between machines with a local log; that is what the channel log is for.
 
 ## Spike findings (2026-10-28, grammers 0.11.0, bot token, test channels)
 
@@ -186,7 +260,7 @@ The chat log protocol (`meta/pigeonhole-meta/src/log/chat.rs`) changes:
 - **A dropped future still sends**: `sendMedia` cut by a 20 ms timeout was
   posted anyway. The request is queued in the sender pool and goes out when it
   goes out; "lands within `CALL_DEADLINE` or never" does not hold. Hence the
-  (generation, id) head rule above. Why, in grammers-mtsender 0.11: a request
+  order fence above. Why, in grammers-mtsender 0.11: a request
   travels `SenderPoolHandle` → mpsc → `SenderPoolRunner::process_request`
   (which awaits `create_connection` when there is no connection yet: seconds)
   → the connection's mpsc → `Sender::enqueue_body` → `Sender.requests`, and is
@@ -220,7 +294,7 @@ Each step ends with `cargo test --workspace` and
    `process_request` / `run_sender` do not enqueue one whose `tx` is already
    closed. Then a request abandoned before its bytes reach the socket is never
    sent; one already written lands within the network's delivery time, as
-   over HTTP. Safety does not rest on it (the head rule does); it removes
+   over HTTP. Safety does not rest on it (the order fence does); it removes
    useless late sends and makes latency predictable. The log and snapshots get
    a sender pool (connection) of their own, so their sends never queue behind
    blob upload parts. Then the client behind a small trait
@@ -228,10 +302,12 @@ Each step ends with `cargo test --workspace` and
    `deleteMessages`) with a fake implementation; `BlobBackend` + `Sweepable`;
    the testkit conformance suites and a `typed_backend` test on the fake.
    No wiremock: MTProto is not HTTP.
-3. **Log/snapshots without pins** in `pigeonhole-meta` (new `ChatApi`, fake chat,
-   tests incl. the unpinned-head case), then the adapters: MTProto `ChatApi`,
-   and either a Bot API `ChatApi` via `forwardMessage` or the Bot API backend
-   dropped from the log/snapshot role.
+3. **Order-fenced log and pinless snapshots** in `pigeonhole-meta`: the
+   protocol over the new `ChatApi`, the fake chat (late visibility), tests for
+   the fast path, a gap read, stragglers, racing claims, an unconfirmed batch
+   becoming the head, rebase and collection. Then the MTProto `ChatApi`
+   adapter, and a live check that an id below one returned by a send is never
+   `messageEmpty` for long.
 4. **Wiring**: config (`kind = "telegram_mtproto"`, env names, session path),
    `runtime.rs` (`build_member`, `open_log`, `open_snapshots`), startup checks,
    `pigeonhole.toml.example`, `.env.example`.
@@ -242,10 +318,9 @@ Each step ends with `cargo test --workspace` and
 
 ## Open questions
 
-- Does the Bot API backend keep the log/snapshot role (needs `forwardMessage`
-  to a scratch chat to read the head) or become blob-only?
+- The Bot API log cannot read ranges: keep its current pin + description
+  protocol beside the new one, or make the Bot API backend blob-only?
 - Chunk size is global (`[chunk] size`); with ≫ 20 MiB blobs on one store and
   Discord / Bot API stores beside it, should it become per store?
 - Flood limits: measured, the same ~20–30 sends a minute per channel; keep the
   `ChatLimiter` send default (18/min) for both transports.
-- Does the straggler window stay once the head is chosen by (generation, id)?
