@@ -657,3 +657,58 @@ async fn delete_everything_releases_every_object_chunk() {
     assert_eq!(s3.index.count_objects().await.unwrap(), 0);
     assert!(s3.index.list_buckets().await.unwrap().is_empty());
 }
+
+/// One tablet for the index and the chunk store, as in the binary.
+async fn setup_one_tablet(chunk_size: usize) -> (pigeonhole::service::S3Gateway, Arc<pigeonhole_meta::MetaStore>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_test(dir.path());
+    cfg.chunk_size = chunk_size;
+    cfg.block_size = 64 * 1024;
+    let namespaces = Index::register(BlobDb::register(pigeonhole_meta::Namespaces::new()));
+    let meta = pigeonhole_meta::MetaStore::open_local(dir.path().join("meta"), namespaces).await.unwrap();
+    let index = Index::open(meta.clone()).await.unwrap();
+    let db = BlobDb::open(meta.clone()).await.unwrap();
+    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
+    opts.block_size = cfg.block_size;
+    let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
+    (build_s3_gateway(cfg, index, store), meta, dir)
+}
+
+#[tokio::test]
+async fn a_put_is_one_log_entry_and_a_bad_digest_commits_nothing() {
+    let (s3, meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    let payload = Bytes::from((0..300_000u32).map(|i| (i * 7 % 251) as u8).collect::<Vec<_>>());
+    let tagged = |body: Bytes, md5: Option<String>| PutObjectInput {
+        bucket: "b".into(),
+        key: "k".into(),
+        body: Some(StreamingBlob::from_bytes(body)),
+        tagging: Some("a=1".into()),
+        content_md5: md5,
+        ..Default::default()
+    };
+
+    let before = meta.applied_position();
+    s3.put_object(req(tagged(payload.clone(), None))).await.unwrap();
+    assert_eq!(meta.applied_position(), before + 1, "chunks, object and tags in one entry");
+    let tags = s3
+        .get_object_tagging(req(GetObjectTaggingInput { bucket: "b".into(), key: "k".into(), ..Default::default() }))
+        .await
+        .unwrap();
+    assert_eq!(tags.output.tag_set.len(), 1);
+
+    let before = meta.applied_position();
+    let wrong = "AAAAAAAAAAAAAAAAAAAAAA==".to_string(); // md5 of nothing we send
+    assert!(s3.put_object(req(tagged(payload.clone(), Some(wrong)))).await.is_err());
+    assert_eq!(meta.applied_position(), before, "a bad digest commits nothing");
+
+    // Overwrite: the old object's chunks are released after the answer.
+    let before = meta.applied_position();
+    s3.put_object(req(tagged(payload, None))).await.unwrap();
+    assert_eq!(meta.applied_position(), before + 1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while meta.applied_position() < before + 2 {
+        assert!(tokio::time::Instant::now() < deadline, "the release never came");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}

@@ -8,7 +8,7 @@ use crate::commands::{ObjectRec, S3Command, S3Reject, S3State, UploadRec, NAMESP
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
-use pigeonhole_meta::{MetaStore, Namespaces};
+use pigeonhole_meta::{MetaStore, Namespaces, Prepared};
 use serde::{Deserialize, Serialize};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -102,6 +102,11 @@ impl Index {
             anyhow::bail!("metadata tablet opened without the s3 namespace");
         }
         Ok(Self { meta })
+    }
+
+    /// The tablet the index lives in.
+    pub fn meta(&self) -> &Arc<MetaStore> {
+        &self.meta
     }
 
     fn read<R>(&self, f: impl FnOnce(&S3State) -> R) -> R {
@@ -210,6 +215,59 @@ impl Index {
             mtime: mtime.into(),
         })
         .await
+    }
+
+    /// The `PutObject` of [`Self::put_object`], to commit with the object's
+    /// chunks in one entry. Outcome: the previous object's chunk ids, or
+    /// `BucketNotFound`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        etag: &str,
+        size: i64,
+        content_type: Option<&str>,
+        extents: &[Extent],
+        user_meta: &[(String, String)],
+        checksums_json: &str,
+    ) -> Prepared<S3State> {
+        Prepared::new(&S3Command::PutObject {
+            bucket: bucket.into(),
+            key: key.into(),
+            etag: etag.into(),
+            size,
+            content_type: content_type.map(Into::into),
+            extents: extents.to_vec(),
+            user_meta: user_meta.to_vec(),
+            checksums_json: checksums_json.into(),
+            mtime: Utc::now().to_rfc3339(),
+        })
+    }
+
+    /// The `PutObjectTags` of [`Self::put_object_tags`] (`NoSuchKey` if the
+    /// object is not there when it applies).
+    pub fn prepare_put_object_tags(&self, bucket: &str, key: &str, tags: &[(String, String)]) -> Prepared<S3State> {
+        Prepared::new(&S3Command::PutObjectTags { bucket: bucket.into(), key: key.into(), tags: tags.to_vec() })
+    }
+
+    /// The `PutPart` of [`Self::put_multipart_part`]. Outcome: the replaced
+    /// part's chunk ids, or `NoSuchUpload`.
+    pub fn prepare_put_part(
+        &self,
+        upload_id: &str,
+        part_number: i64,
+        etag: &str,
+        size: i64,
+        extents: &[Extent],
+    ) -> Prepared<S3State> {
+        Prepared::new(&S3Command::PutPart {
+            upload_id: upload_id.into(),
+            part_number,
+            etag: etag.into(),
+            size,
+            extents: extents.to_vec(),
+        })
     }
 
     fn object<R>(&self, bucket: &str, key: &str, f: impl FnOnce(&ObjectRec) -> R) -> Option<R> {

@@ -1,4 +1,6 @@
 use crate::cas_index::{CasEntry, CasIndex};
+use crate::commands::CasReply;
+use pigeonhole_meta::Proposal;
 use crate::digest::{digest_hash_hex, verify_sha256};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -144,43 +146,35 @@ impl CasStore {
 
         let mut opts = IngestOptions::new(self.chunk_size, ChunkCodec::Zstd);
         opts.block_size = 1024 * 1024;
-        let ingested = self
-            .store
-            .ingest_and_commit(stream, Some(opts))
-            .await
-            .context("CAS ingest")?;
+        let mut ingested = self.store.ingest(stream, Some(opts)).await.context("CAS ingest")?;
+        if ingested.size != size {
+            // Nothing committed: the parts are orphans for the sweeper.
+            anyhow::bail!("CAS ingest size {} != digest size {size}", ingested.size);
+        }
         let new_ids: Vec<_> = {
             let mut ids: Vec<_> = ingested.extents.iter().map(|e| e.chunk).collect();
             ids.sort_unstable();
             ids.dedup();
             ids
         };
-        if ingested.size != size {
-            let _ = self.store.release(&new_ids).await;
-            anyhow::bail!(
-                "CAS ingest size {} != digest size {size}",
-                ingested.size
-            );
-        }
 
-        let entry = CasEntry {
-            hash: hash_hex.to_string(),
-            size,
-            extents: ingested.extents.clone(),
-        };
-        match self.cas.store_or_get_existing(&entry).await {
-            Ok(None) => Ok(()),
+        // The chunks and the entry: one log entry.
+        let entry = CasEntry { hash: hash_hex.to_string(), size, extents: ingested.extents.clone() };
+        let mut proposal = Proposal::new();
+        let slot = proposal.push(self.cas.prepare_store(&entry));
+        let chunks = std::mem::take(&mut ingested.chunks);
+        let mut outcomes = self.store.commit_along(chunks, self.cas.meta(), proposal).await?;
+        let Ok(reply) = outcomes.take(slot)?;
+        match reply {
+            CasReply::Stored => Ok(()),
             // Another writer already stored this digest. Its row holds the one ref
             // that `CasIndex::release` drops on GC; drop ours and leave theirs as is
             // (an extra retain here would never be released).
-            Ok(Some(_existing)) => {
+            CasReply::Existing(_) => {
                 let _ = self.store.release(&new_ids).await;
                 Ok(())
             }
-            Err(e) => {
-                let _ = self.store.release(&new_ids).await;
-                Err(e)
-            }
+            other => anyhow::bail!("unexpected cas reply {other:?}"),
         }
     }
 }

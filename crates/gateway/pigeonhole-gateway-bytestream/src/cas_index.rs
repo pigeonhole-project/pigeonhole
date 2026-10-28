@@ -8,7 +8,7 @@ use crate::commands::{CasCommand, CasReply, CasState, NAMESPACE};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
-use pigeonhole_meta::{MetaStore, Namespaces};
+use pigeonhole_meta::{MetaStore, Namespaces, Prepared};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -99,6 +99,23 @@ impl CasIndex {
             CasReply::Existing(extents) => Ok(Some(extents)),
             other => anyhow::bail!("unexpected cas reply {other:?}"),
         }
+    }
+
+    /// The `PutEntry` of [`Self::store_or_get_existing`], to commit with the
+    /// entry's chunks in one entry. Outcome `Existing` = another writer stored
+    /// the digest first; release ours.
+    pub fn prepare_store(&self, entry: &CasEntry) -> Prepared<CasState> {
+        Prepared::new(&CasCommand::PutEntry {
+            hash: entry.hash.clone(),
+            size: entry.size,
+            extents: entry.extents.clone(),
+            at: Utc::now().to_rfc3339(),
+        })
+    }
+
+    /// The tablet the CAS index lives in.
+    pub fn meta(&self) -> &Arc<MetaStore> {
+        &self.meta
     }
 
     /// Remove CAS row; returns chunk ids to `release`.

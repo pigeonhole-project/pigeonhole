@@ -247,6 +247,25 @@ impl ChunkStore {
         committing.done(self, &mut outcomes).await
     }
 
+    /// Commit `chunks` along with `proposal` (another layer's commands for
+    /// `meta`): one entry when both live in one tablet (always, in the
+    /// binary), else the chunks first. The outcomes of `proposal`.
+    pub async fn commit_along(
+        &self,
+        chunks: PendingChunks,
+        meta: &Arc<pigeonhole_meta::MetaStore>,
+        mut proposal: Proposal,
+    ) -> Result<Outcomes> {
+        if !Arc::ptr_eq(meta, self.db.meta()) {
+            self.commit(chunks).await?;
+            return meta.propose_all(proposal).await;
+        }
+        let committing = chunks.propose_in(&mut proposal);
+        let mut outcomes = meta.propose_all(proposal).await?;
+        committing.done(self, &mut outcomes).await?;
+        Ok(outcomes)
+    }
+
     /// The tablet the chunk state lives in (to propose prepared commands).
     pub fn meta(&self) -> &Arc<pigeonhole_meta::MetaStore> {
         self.db.meta()

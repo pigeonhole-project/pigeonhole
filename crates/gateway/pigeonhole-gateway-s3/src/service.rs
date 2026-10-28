@@ -1,8 +1,10 @@
 //! S3 API implementation on top of gateway index + ChunkStore (via s3s).
 
+use crate::commands::{S3Reject, S3State};
 use crate::index::{
     parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, SourceSnapshot,
 };
+use pigeonhole_meta::{Outcome, Prepared, Proposal};
 use pigeonhole_chunk_store::Extent;
 use pigeonhole_chunk_store::{config::Config, ChunkStore, IngestOptions};
 use async_trait::async_trait;
@@ -54,6 +56,40 @@ impl S3Gateway {
         if let Err(e) = self.store.release(ids).await {
             tracing::warn!(error = %e, "chunk release failed");
         }
+    }
+
+    /// Release chunks nothing points at any more, after the answer: they go
+    /// into whatever entry is next. A crash before leaves their `refs` one
+    /// too high (space, never data).
+    fn release_later(&self, ids: Vec<i64>) {
+        if ids.is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store.release(&ids).await {
+                tracing::warn!(error = %e, "chunk release failed");
+            }
+        });
+    }
+
+    /// Commit an ingest's chunks and `command` (and `then`, if any) as one
+    /// entry; the outcome of `command`. The chunks are committed even if
+    /// `command` is rejected: the caller releases them then.
+    async fn commit_with(
+        &self,
+        chunks: pigeonhole_chunk_store::PendingChunks,
+        command: Prepared<S3State>,
+        then: Option<Prepared<S3State>>,
+    ) -> S3Result<Outcome<S3State>> {
+        let mut proposal = Proposal::new();
+        let slot = proposal.push(command);
+        if let Some(t) = then {
+            proposal.push(t);
+        }
+        let mut outcomes =
+            self.store.commit_along(chunks, self.index.meta(), proposal).await.map_err(Self::map_err)?;
+        outcomes.take(slot).map_err(Self::map_err)
     }
 
     fn map_err(e: impl std::fmt::Display) -> s3s::S3Error {
@@ -882,15 +918,14 @@ impl S3 for S3Gateway {
         };
         let stream = maybe_hash_stream(stream, hasher.clone());
 
-        let ingested = self
+        let mut ingested = self
             .store
-            .ingest_and_commit(stream, Some(self.ingest_options()))
+            .ingest(stream, Some(self.ingest_options()))
             .await
             .map_err(Self::map_err)?;
 
         if let Some(exp) = expected_md5 {
             if let Err(e) = verify_content_md5_digest(exp, &ingested.md5) {
-                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
                 return Err(e);
             }
         }
@@ -905,19 +940,16 @@ impl S3 for S3Gateway {
         if let Some(trailers) = trailing_headers {
             if let Some(trailers) = trailers.take() {
                 if let Err(e) = merge_trailer_checksums(&mut expected_checksum, &trailers) {
-                    self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
                     return Err(e);
                 }
             }
         }
 
         if let Some(field) = checksum_mismatch(&computed, &expected_checksum) {
-            self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
             return Err(s3_error!(BadDigest, "{} mismatch", field));
         }
         if !use_hasher {
             if let Err(e) = verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32) {
-                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
                 return Err(e);
             }
         }
@@ -935,34 +967,31 @@ impl S3 for S3Gateway {
         };
         let etag = Self::etag_of(&ingested.md5);
 
-        let old = match self
-            .index
-            .put_object(
-                &input.bucket,
-                &input.key,
-                &etag,
-                ingested.size,
-                content_type,
-                &ingested.extents,
-                &user_meta,
-                &checksums_json,
-            )
-            .await
-        {
+        // The chunks, the object and its tags: one entry.
+        let put = self.index.prepare_put_object(
+            &input.bucket,
+            &input.key,
+            &etag,
+            ingested.size,
+            content_type,
+            &ingested.extents,
+            &user_meta,
+            &checksums_json,
+        );
+        let tagging = (!tags.is_empty()).then(|| self.index.prepare_put_object_tags(&input.bucket, &input.key, &tags));
+        let chunks = std::mem::take(&mut ingested.chunks);
+        let old = match self.commit_with(chunks, put, tagging).await? {
             Ok(old) => old,
-            Err(e) => {
+            Err(reject) => {
+                // The bucket went away meanwhile: nothing points at the chunks.
                 self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
-                return Err(Self::map_err(e));
+                return Err(match reject {
+                    S3Reject::BucketNotFound => s3_error!(NoSuchBucket),
+                    other => Self::map_err(format!("PutObject rejected: {other:?}")),
+                });
             }
         };
-        self.release_ids(&old).await;
-
-        if !tags.is_empty() {
-            self.index
-                .put_object_tags(&input.bucket, &input.key, &tags)
-                .await
-                .map_err(Self::map_err)?;
-        }
+        self.release_later(old);
 
         info!(
             bucket = %input.bucket,
@@ -1125,7 +1154,7 @@ impl S3 for S3Gateway {
             .await
             .map_err(Self::map_err)?
         {
-            self.release_ids(&ids).await;
+            self.release_later(ids);
         }
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
@@ -1141,7 +1170,7 @@ impl S3 for S3Gateway {
             let key = obj.key;
             match self.index.delete_object(&input.bucket, &key).await {
                 Ok(Some(ids)) => {
-                    self.release_ids(&ids).await;
+                    self.release_later(ids);
                     deleted.push(DeletedObject {
                         key: Some(key),
                         ..Default::default()
@@ -1235,7 +1264,7 @@ impl S3 for S3Gateway {
                 return Err(Self::map_err(e));
             }
         };
-        self.release_ids(&old).await;
+        self.release_later(old);
 
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
@@ -1342,15 +1371,14 @@ impl S3 for S3Gateway {
         };
         let stream = maybe_hash_stream(stream, hasher.clone());
 
-        let ingested = self
+        let mut ingested = self
             .store
-            .ingest_and_commit(stream, Some(self.ingest_options()))
+            .ingest(stream, Some(self.ingest_options()))
             .await
             .map_err(Self::map_err)?;
 
         if let Some(exp) = expected_md5 {
             if let Err(e) = verify_content_md5_digest(exp, &ingested.md5) {
-                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
                 return Err(e);
             }
         }
@@ -1365,42 +1393,34 @@ impl S3 for S3Gateway {
         if let Some(trailers) = trailing_headers {
             if let Some(trailers) = trailers.take() {
                 if let Err(e) = merge_trailer_checksums(&mut expected_checksum, &trailers) {
-                    self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
                     return Err(e);
                 }
             }
         }
 
         if let Some(field) = checksum_mismatch(&computed, &expected_checksum) {
-            self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
             return Err(s3_error!(BadDigest, "{} mismatch", field));
         }
         if !use_hasher {
             if let Err(e) = verify_checksum_crc32(input.checksum_crc32.as_deref(), ingested.crc32) {
-                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
                 return Err(e);
             }
         }
 
         let etag = Self::etag_of(&ingested.md5);
-        let old = match self
-            .index
-            .put_multipart_part(
-                &upload_id,
-                part_number,
-                &etag,
-                ingested.size,
-                &ingested.extents,
-            )
-            .await
-        {
+        let put = self.index.prepare_put_part(&upload_id, part_number, &etag, ingested.size, &ingested.extents);
+        let chunks = std::mem::take(&mut ingested.chunks);
+        let old = match self.commit_with(chunks, put, None).await? {
             Ok(old) => old,
-            Err(e) => {
+            Err(reject) => {
                 self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
-                return Err(Self::map_err(e));
+                return Err(match reject {
+                    S3Reject::NoSuchUpload => s3_error!(NoSuchUpload),
+                    other => Self::map_err(format!("UploadPart rejected: {other:?}")),
+                });
             }
         };
-        self.release_ids(&old).await;
+        self.release_later(old);
 
         let mut output = UploadPartOutput {
             e_tag: Some(etag_hex(&etag)),
@@ -1479,7 +1499,7 @@ impl S3 for S3Gateway {
                 return Err(Self::map_err(e));
             }
         };
-        self.release_ids(&old).await;
+        self.release_later(old);
 
         let part = self
             .index
@@ -1731,7 +1751,7 @@ impl S3 for S3Gateway {
             .complete_multipart_upload(&upload, &part_numbers, &etag, total_size)
             .await
             .map_err(Self::map_err)?;
-        self.release_ids(&old).await;
+        self.release_later(old);
 
         Ok(S3Response::new(CompleteMultipartUploadOutput {
             bucket: Some(upload.bucket),
@@ -1755,7 +1775,7 @@ impl S3 for S3Gateway {
         {
             None => Err(s3_error!(NoSuchUpload)),
             Some(ids) => {
-                self.release_ids(&ids).await;
+                self.release_later(ids);
                 Ok(S3Response::new(AbortMultipartUploadOutput::default()))
             }
         }
