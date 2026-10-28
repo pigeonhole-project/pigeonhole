@@ -892,7 +892,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl BlobBackend for Arc<MockMem> {
+    impl BlobBackend for MockMem {
         type Id = Id;
         type Key = u64;
         fn instance(&self) -> &InstanceInfo {
