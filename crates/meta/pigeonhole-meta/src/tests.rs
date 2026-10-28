@@ -532,7 +532,12 @@ async fn timing_probe() {
         let dir = tempfile::tempdir().unwrap();
         let (log, snapshots): (Arc<dyn LogStore>, Arc<dyn SnapshotStore>) = match kind {
             "disk" => local(dir.path()),
-            _ => (Arc::new(MemoryLogStore::new()), Arc::new(MemorySnapshotStore::new())),
+            _ => {
+                use pigeonhole_storage_memory::MemoryBlobStore;
+                let log = crate::ChainLogStore::new(Arc::new(MemoryBlobStore::new()));
+                let snapshots = crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new()));
+                (Arc::new(log), Arc::new(snapshots))
+            }
         };
         let store = MetaStore::open(log, snapshots, counter(), MetaOptions::default()).await.unwrap();
         let t = std::time::Instant::now();

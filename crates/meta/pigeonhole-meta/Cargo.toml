@@ -8,9 +8,11 @@ description = "Metadata tablet: layer commands logged to a fencing LogStore and 
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 crc32fast = { workspace = true }
 futures = { workspace = true }
 openraft = { workspace = true }
+pigeonhole-storage-api = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
@@ -22,4 +24,5 @@ uuid = { workspace = true }
 testsuite = []
 
 [dev-dependencies]
+pigeonhole-storage-memory = { workspace = true }
 tempfile = { workspace = true }

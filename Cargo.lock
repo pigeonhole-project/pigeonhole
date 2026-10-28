@@ -2486,9 +2486,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "crc32fast",
  "futures",
  "openraft",
+ "pigeonhole-storage-api",
+ "pigeonhole-storage-memory",
  "postcard",
  "serde",
  "tempfile",

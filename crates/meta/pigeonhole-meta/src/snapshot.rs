@@ -18,6 +18,8 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use bytes::Bytes;
+use pigeonhole_storage_api::{collect_stream, After, BlobBackend, Chain};
 
 /// Version of the stored envelope ([`StoredSnapshot`] on disk / in a chat).
 pub const SNAPSHOT_STORE_FORMAT: u32 = 1;
@@ -155,53 +157,80 @@ impl SnapshotStore for LocalSnapshotStore {
     }
 }
 
-/// Snapshots in process memory (tests, throwaway runs). Clones share the store.
-#[derive(Clone, Default)]
-pub struct MemorySnapshotStore {
-    inner: Arc<std::sync::Mutex<MemorySnapshots>>,
+/// Snapshots as blobs of any store that can chain them ([`Chain`]): no
+/// order or fence is needed (a snapshot counts only while the log's base
+/// names it), the chain only tells which one is newest. The ref is the blob
+/// id (postcard, hex) and its crc, so a replaced blob is detected.
+pub struct BlobSnapshotStore<C> {
+    chain: Arc<C>,
 }
 
-#[derive(Default)]
-struct MemorySnapshots {
-    next: u64,
-    by_seq: std::collections::BTreeMap<u64, StoredSnapshot>,
-}
-
-impl MemorySnapshotStore {
-    pub fn new() -> Self {
-        Self::default()
+impl<C: Chain> BlobSnapshotStore<C> {
+    pub fn new(chain: Arc<C>) -> Self {
+        Self { chain }
     }
 
-    fn seq(r: &SnapshotRef) -> Result<u64> {
-        r.0.strip_prefix("mem-")
-            .and_then(|n| n.parse().ok())
-            .ok_or_else(|| anyhow!("{:?} is not a memory snapshot", r.0))
+    fn reference(id: &C::Id, crc: u32) -> SnapshotRef {
+        let bytes = postcard::to_stdvec(id).expect("a blob id encodes");
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        SnapshotRef(format!("{hex}:{crc:08x}"))
+    }
+
+    fn parse(r: &SnapshotRef) -> Result<(C::Id, u32)> {
+        let bad = || anyhow!("{:?} is not a blob snapshot", r.0);
+        let (hex, crc) = r.0.split_once(':').ok_or_else(bad)?;
+        if hex.len() % 2 != 0 {
+            return Err(bad());
+        }
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|_| bad())?;
+        let id = postcard::from_bytes(&bytes).map_err(|_| bad())?;
+        Ok((id, u32::from_str_radix(crc, 16).map_err(|_| bad())?))
+    }
+
+    async fn download(&self, id: &C::Id) -> Result<Vec<u8>> {
+        Ok(collect_stream(self.chain.get(id, None).await?).await?.to_vec())
     }
 }
 
 #[async_trait]
-impl SnapshotStore for MemorySnapshotStore {
+impl<C: Chain> SnapshotStore for BlobSnapshotStore<C> {
     async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
-        let mut g = self.inner.lock().unwrap();
-        g.next += 1;
-        let seq = g.next;
-        g.by_seq.insert(seq, snapshot.clone());
-        Ok(SnapshotRef(format!("mem-{seq}")))
+        let data = Bytes::from(snapshot.encode());
+        let crc = crc32fast::hash(&data);
+        let label = format!("snapshot-{}-{}.snap", snapshot.log_id, snapshot.at);
+        // Another writer may link first: put after the new tail then.
+        loop {
+            let tail = self.chain.tail().await?;
+            match self.chain.put_after(tail.as_ref().map(|t| &t.id), &label, data.clone()).await? {
+                After::Won(id) => return Ok(Self::reference(&id, crc)),
+                After::Lost(_) => continue,
+            }
+        }
     }
 
     async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
-        let seq = Self::seq(r)?;
-        self.inner.lock().unwrap().by_seq.get(&seq).cloned().with_context(|| format!("no snapshot {:?}", r.0))
+        let (id, crc) = Self::parse(r)?;
+        let data = self.download(&id).await.with_context(|| format!("download snapshot {:?}", r.0))?;
+        if crc32fast::hash(&data) != crc {
+            bail!("snapshot blob {:?} changed", r.0);
+        }
+        StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {:?}", r.0))
     }
 
+    /// The tail of the chain: the most recently stored snapshot.
     async fn newest(&self) -> Result<Option<StoredSnapshot>> {
-        Ok(self.inner.lock().unwrap().by_seq.values().next_back().cloned())
+        let Some(tail) = self.chain.tail().await? else { return Ok(None) };
+        let data = self.download(&tail.id).await.with_context(|| format!("download snapshot {:?}", tail.label))?;
+        Ok(Some(StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {:?}", tail.label))?))
     }
 
     async fn remove(&self, r: &SnapshotRef) -> Result<()> {
-        let seq = Self::seq(r)?;
-        self.inner.lock().unwrap().by_seq.remove(&seq);
-        Ok(())
+        let (id, _) = Self::parse(r)?;
+        self.chain.delete(&[C::key(&id)]).await
     }
 }
 
@@ -330,13 +359,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_store_passes_the_conformance_suite() {
-        let store = MemorySnapshotStore::new();
+    async fn blob_store_passes_the_conformance_suite() {
+        let mem = Arc::new(pigeonhole_storage_memory::MemoryBlobStore::new());
         conformance::run_all(|| {
-            let store = store.clone();
-            async move { Arc::new(store) as Arc<dyn SnapshotStore> }
+            let mem = mem.clone();
+            async move { Arc::new(BlobSnapshotStore::new(mem)) as Arc<dyn SnapshotStore> }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn the_blob_store_detects_a_replaced_snapshot_and_a_bad_ref() {
+        use pigeonhole_storage_memory::MemoryBlobStore;
+        let mem = Arc::new(MemoryBlobStore::new());
+        let store = BlobSnapshotStore::new(mem.clone());
+        let r = store.put(&StoredSnapshot { log_id: LogId(1), at: 1, data: vec![1] }).await.unwrap();
+        let (id, crc) = BlobSnapshotStore::<MemoryBlobStore>::parse(&r).unwrap();
+        let forged = BlobSnapshotStore::<MemoryBlobStore>::reference(&id, crc ^ 1);
+        assert!(format!("{:#}", store.get(&forged).await.unwrap_err()).contains("changed"));
+        assert!(store.get(&SnapshotRef("zz:1".into())).await.is_err());
     }
 
     #[tokio::test]

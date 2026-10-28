@@ -15,7 +15,7 @@ use crate::channel_log::{self, LogChannel};
 use pigeonhole::telegram::{Lane, TelegramBlobStore};
 use pigeonhole_meta::log::channel::{ChannelLogOptions, ChannelLogStore};
 use pigeonhole_meta::snapshot::ChannelSnapshotStore;
-use pigeonhole_meta::{LocalSnapshotStore, MemoryLogStore, MemorySnapshotStore, SnapshotStore};
+use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, LocalSnapshotStore, SnapshotStore};
 use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_storage_disk::DiskBlobStore;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
     Ok(match &cfg.meta.log {
         LogSettings::Memory => {
             warn!("metadata log in memory: everything is gone when the process exits");
-            Arc::new(MemoryLogStore::new())
+            Arc::new(ChainLogStore::new(Arc::new(MemoryBlobStore::new())))
         }
         LogSettings::LocalDisk { path } => Arc::new(
             LocalLogStore::open(path).with_context(|| format!("open local log {}", path.display()))?,
@@ -53,7 +53,7 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
 pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStore>> {
     Ok(match &cfg.meta.snapshot {
         SnapshotSettings::LocalDisk { path } => Arc::new(LocalSnapshotStore::new(path)),
-        SnapshotSettings::Memory => Arc::new(MemorySnapshotStore::new()),
+        SnapshotSettings::Memory => Arc::new(BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new()))),
         SnapshotSettings::Telegram { chat_id, login } => {
             let channel = channel_log::client(login)
                 .await?
