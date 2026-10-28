@@ -177,17 +177,13 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
             {
                 use pigeonhole_storage_discord::{DiscordBlobStore, DiscordClient};
                 let dc = DiscordClient::new(inst.bot_token.clone()).context("discord client")?;
-                dc.ensure_channel_permissions(&inst.scope_id, Some(limiter.as_ref()))
+                let channel_id: u64 = inst.scope_id.parse().with_context(|| format!("store {id:?}: channel id"))?;
+                dc.ensure_permissions(channel_id, false, limiter)
                     .await
-                    .context("channel_id permission check")?;
-                let store = Arc::new(DiscordBlobStore::with_instance(
-                    dc,
-                    inst.scope_id.clone(),
-                    limiter.clone(),
-                    inst.max_blob_size,
-                    inst.info.clone(),
-                ));
-                MetricsBackend::wrap(Arc::new(erase_sweep(store)))
+                    .with_context(|| format!("store {id:?}: permission check"))?;
+                let channel = Arc::new(dc.channel(channel_id, limiter.clone()));
+                let store = DiscordBlobStore::new(channel, limiter.clone(), inst.max_blob_size, inst.info.clone());
+                MetricsBackend::wrap(Arc::new(erase_sweep(Arc::new(store))))
             }
             #[cfg(not(feature = "discord"))]
             {

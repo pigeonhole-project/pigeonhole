@@ -1,23 +1,25 @@
-use crate::client::{snowflake_bulk_deletable, Message as DiscordMessage, RateBudget};
-use crate::DiscordClient;
-use anyhow::{bail, Result};
+//! [`BlobBackend`] + [`Sweepable`] over one channel.
+
+use crate::api::{CdnStale, DcMessage, DiscordApi, PAGE};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use lru::LruCache;
+use pigeonhole_blob::text::{self, DISCORD_MAX_CHARS};
 use pigeonhole_blob::{
-    bytes_stream, slice_range, BoxByteStream, ChatLimiter, CostHint,
-    DeleteOutcome, InstanceInfo, InstanceKind, InstanceRole, OpKind, 
-    BlobBackend, BlobId, Sweepable, 
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget,
+    OpKind, Sweepable,
 };
-use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
+use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
-/// Typed identity for Discord attachments (stage B.2).
+/// A blob is a message; its URL (or its bytes, for a text) is fetched with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscordId {
     pub message_id: u64,
-    pub attachment_id: String,
 }
 
 /// `dc:{app_id}:{channel_id}` — matches `pigeonhole_chunk_store::instances::discord_fingerprint`.
@@ -30,148 +32,129 @@ pub fn discord_location(channel_id: &str) -> String {
     format!("dc:channel:{channel_id}")
 }
 
+/// Locations of recently seen blobs (saves a fetch per read).
+const LOCATION_CACHE: usize = 4096;
 
-/// Production adapter: blobs live as message attachments in one Discord channel.
-pub struct DiscordBlobStore {
-    limits: BackendLimits,
-    instance: InstanceInfo,
-    dc: DiscordClient,
-    channel_id: String,
-    limiter: Arc<ChatLimiter>,
+/// Where a blob's bytes are: an attachment, or the bytes themselves (a text
+/// message, [`pigeonhole_blob::text`]).
+#[derive(Clone)]
+pub(crate) enum Located {
+    Cdn { url: String, size: u64 },
+    Inline(Bytes),
 }
 
-pub type DiscordBackend = DiscordBlobStore;
-
-impl DiscordBlobStore {
-    pub fn new(
-        dc: DiscordClient,
-        channel_id: String,
-        limiter: Arc<ChatLimiter>,
-        max_blob_size: Option<usize>,
-    ) -> Self {
-        let app_id = dc.app_id();
-        Self::with_instance(
-            dc,
-            channel_id.clone(),
-            limiter,
-            max_blob_size,
-            InstanceInfo {
-                id: format!("discord-{channel_id}"),
-                kind: InstanceKind::Discord,
-                fingerprint: discord_fingerprint(&app_id, &channel_id),
-                location: discord_location(&channel_id),
-                role: InstanceRole::ReadWrite,
-            },
-        )
+impl Located {
+    pub(crate) fn of(m: &DcMessage) -> Option<Self> {
+        match &m.attachment {
+            Some(a) => Some(Located::Cdn { url: a.url.clone(), size: a.size }),
+            None => text::decode(&m.content).map(|(_, data)| Located::Inline(data)),
+        }
     }
+}
 
-    /// Build with a pre-resolved [`InstanceInfo`] (from `[[store]]`).
-    pub fn with_instance(
-        dc: DiscordClient,
-        channel_id: String,
-        limiter: Arc<ChatLimiter>,
-        max_blob_size: Option<usize>,
-        instance: InstanceInfo,
-    ) -> Self {
+/// The name a blob message was put under (attachment or text).
+pub(crate) fn blob_name(m: &DcMessage) -> Option<&str> {
+    match &m.attachment {
+        Some(a) => Some(&a.filename),
+        None => text::name_of(&m.content),
+    }
+}
+
+/// A nonce (≤ 25 characters) for blob `name` in `channel`: a repeated put of
+/// one blob within a few minutes posts it once. Discord scopes nonces to the
+/// bot across channels, so the channel is part of it.
+pub fn blob_nonce(channel: u64, name: &str) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (channel, name).hash(&mut h);
+    let a = h.finish();
+    name.hash(&mut h);
+    format!("b{:016x}{:08x}", a, h.finish() as u32)
+}
+
+pub struct DiscordBlobStore<A> {
+    limits: BackendLimits,
+    instance: InstanceInfo,
+    pub(crate) api: Arc<A>,
+    limiter: Arc<ChatLimiter>,
+    locations: Mutex<LruCache<u64, Located>>,
+    /// Blobs that fit a message's content go as text.
+    inline: bool,
+    /// The chain's anchor message, once found ([`crate::chain`]).
+    pub(crate) anchor: tokio::sync::Mutex<Option<u64>>,
+}
+
+impl<A: DiscordApi> DiscordBlobStore<A> {
+    pub fn new(api: Arc<A>, limiter: Arc<ChatLimiter>, max_blob_size: Option<usize>, instance: InstanceInfo) -> Self {
         Self {
             limits: BackendLimits::discord(max_blob_size),
             instance,
-            dc,
-            channel_id,
+            api,
             limiter,
+            locations: Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())),
+            inline: true,
+            anchor: tokio::sync::Mutex::new(None),
         }
     }
 
-    pub fn channel_id(&self) -> &str {
-        &self.channel_id
+    /// Whether small blobs go as text messages (default) or always as attachments.
+    pub fn with_inline(mut self, inline: bool) -> Self {
+        self.inline = inline;
+        self
     }
 
-    pub fn client(&self) -> &DiscordClient {
-        &self.dc
+    pub fn api(&self) -> &Arc<A> {
+        &self.api
     }
 
-    pub fn limiter(&self) -> &ChatLimiter {
-        &self.limiter
-    }
-
-    fn unix_now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    async fn delete_one_message(&self, message_id: u64) -> Result<()> {
-        let out = self
-            .dc
-            .delete_message(
-                &self.channel_id,
-                message_id as i64,
-                Some(self.limiter.as_ref()),
-            )
-            .await?;
-        match out {
-            DeleteOutcome::Deleted | DeleteOutcome::Gone => Ok(()),
-            DeleteOutcome::Failed => bail!("discord delete failed for message {message_id}"),
+    pub(crate) fn remember(&self, m: &DcMessage) {
+        if let Some(l) = Located::of(m) {
+            self.locations.lock().unwrap().put(m.id, l);
         }
     }
 
-    /// Bulk-delete young messages (2–100, < ~14 days); older / singles one-by-one.
-    async fn delete_message_keys(&self, keys: &[u64]) -> Result<()> {
-        if keys.is_empty() {
-            return Ok(());
+    /// Post blob `name` as text if it fits, else as an attachment; the message.
+    pub(crate) async fn post_blob(&self, name: &str, data: Bytes, nonce: &str) -> Result<DcMessage> {
+        let m = if self.inline && text::fits(name, data.len(), DISCORD_MAX_CHARS) {
+            self.api.send(&text::encode(name, &data), None, nonce).await?
+        } else {
+            self.api.send("", Some((name, data)), nonce).await?
+        };
+        self.remember(&m);
+        Ok(m)
+    }
+
+    /// Bytes `want` (all for `None`) of the attachment at `url`; a CDN that
+    /// refuses the range gives the whole blob, sliced here.
+    async fn fetch(&self, url: &str, want: Option<(u64, u64)>) -> Result<Bytes> {
+        match self.api.download(url, want).await {
+            Ok(b) => Ok(b),
+            Err(e) if want.is_some() && !e.is::<CdnStale>() => {
+                tracing::debug!(error = %format!("{e:#}"), "ranged download failed; whole blob");
+                let all = self.api.download(url, None).await?;
+                let (start, end) = want.unwrap();
+                slice_range(all, Some(start..end))
+            }
+            Err(e) => Err(e),
         }
-        let now_ms = Self::unix_now_ms();
-        let mut young = Vec::new();
-        let mut old = Vec::new();
-        for &k in keys {
-            if snowflake_bulk_deletable(k, now_ms) {
-                young.push(k);
-            } else {
-                old.push(k);
+    }
+
+    /// Where blob `id` is: from the cache, or fetch the message (`fresh`:
+    /// always, for a new URL).
+    async fn locate(&self, id: u64, fresh: bool) -> Result<Located> {
+        if !fresh {
+            if let Some(l) = self.locations.lock().unwrap().get(&id) {
+                return Ok(l.clone());
             }
         }
-        // Dedup while preserving order for stable requests.
-        young.sort_unstable();
-        young.dedup();
-        old.sort_unstable();
-        old.dedup();
-
-        for chunk in young.chunks(100) {
-            match chunk {
-                [] => {}
-                [one] => self.delete_one_message(*one).await?,
-                many => {
-                    if let Err(e) = self
-                        .dc
-                        .bulk_delete_messages(
-                            &self.channel_id,
-                            many,
-                            Some(self.limiter.as_ref()),
-                        )
-                        .await
-                    {
-                        tracing::debug!(
-                            error = %e,
-                            n = many.len(),
-                            "bulk-delete failed; falling back to one-by-one"
-                        );
-                        for &id in many {
-                            self.delete_one_message(id).await?;
-                        }
-                    }
-                }
-            }
-        }
-        for id in old {
-            self.delete_one_message(id).await?;
-        }
-        Ok(())
+        let m = self.api.get_message(id).await?.with_context(|| format!("blob message {id} is gone"))?;
+        let l = Located::of(&m).with_context(|| format!("message {id} is not a blob"))?;
+        self.locations.lock().unwrap().put(id, l.clone());
+        Ok(l)
     }
 }
 
 #[async_trait]
-impl BlobBackend for DiscordBlobStore {
+impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
     type Id = DiscordId;
     type Key = u64;
 
@@ -187,17 +170,16 @@ impl BlobBackend for DiscordBlobStore {
         id.message_id
     }
 
-    fn cost(&self, op: OpKind, _id: Option<&Self::Id>) -> CostHint {
-        let budget = match op {
-            OpKind::Put => RateBudget::Send,
-            OpKind::Get | OpKind::List => RateBudget::Read,
-            OpKind::Delete => RateBudget::Delete,
+    fn cost(&self, op: OpKind, id: Option<&Self::Id>) -> CostHint {
+        let wait = match op {
+            OpKind::Put => self.limiter.peek_wait(LimitBudget::Send),
+            OpKind::Get if id.is_some_and(|i| self.locations.lock().unwrap().contains(&i.message_id)) => {
+                std::time::Duration::ZERO
+            }
+            OpKind::Get | OpKind::List => self.limiter.peek_wait(LimitBudget::GetFile),
+            OpKind::Delete => self.limiter.peek_wait(LimitBudget::Delete),
         };
-        CostHint {
-            wait_secs: self.dc.route_wait_secs(budget),
-            latency_ewma_secs: 0.0,
-            inflight: 0,
-        }
+        CostHint { wait_secs: wait.as_secs_f64(), latency_ewma_secs: 0.0, inflight: 0 }
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
@@ -205,172 +187,77 @@ impl BlobBackend for DiscordBlobStore {
             bail!("refusing empty blob upload");
         }
         if data.len() > self.limits.max_blob_size {
-            bail!(
-                "blob size {} exceeds backend max {}",
-                data.len(),
-                self.limits.max_blob_size
-            );
+            bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
         }
-        let (message_id, attachment_id, _url) = self
-            .dc
-            .send_attachment(
-                &self.channel_id,
-                data,
-                name,
-                "",
-                Some(self.limiter.as_ref()),
-            )
-            .await?;
-        Ok(DiscordId {
-            message_id: message_id as u64,
-            attachment_id,
-        })
+        let nonce = blob_nonce(self.api.channel_id(), name);
+        let m = self.post_blob(name, data, &nonce).await?;
+        Ok(DiscordId { message_id: m.id })
     }
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
-        let message_id = id.message_id as i64;
-        let attachment_id = id.attachment_id.as_str();
-
-        if let Some(ref r) = range {
-            if self.limits.supports_range == RangeSupport::BestEffort {
-                match self
-                    .dc
-                    .download_bytes_range(
-                        &self.channel_id,
-                        message_id,
-                        attachment_id,
-                        r.start,
-                        r.end,
-                        Some(self.limiter.as_ref()),
-                    )
-                    .await
-                {
-                    Ok(bytes) => return Ok(bytes_stream(bytes)),
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            start = r.start,
-                            end = r.end,
-                            "discord ranged get failed; falling back to full download"
-                        );
-                    }
-                }
+        let mid = id.message_id;
+        let (url, size) = match self.locate(mid, false).await? {
+            Located::Inline(data) => return Ok(bytes_stream(slice_range(data, range)?)),
+            Located::Cdn { url, size } => (url, size),
+        };
+        let want = match range {
+            Some(r) if r.start > r.end || r.end > size => {
+                bail!("byte range {}..{} outside blob of {size} bytes", r.start, r.end)
             }
+            Some(r) if r.start == r.end => return Ok(bytes_stream(Bytes::new())),
+            Some(r) => Some((r.start, r.end)),
+            None => None,
+        };
+        let bytes = match self.fetch(&url, want).await {
+            Err(e) if e.is::<CdnStale>() => {
+                let Located::Cdn { url, .. } = self.locate(mid, true).await? else {
+                    bail!("blob {mid} is no longer an attachment")
+                };
+                self.fetch(&url, want).await
+            }
+            other => other,
         }
-
-        let data = self
-            .dc
-            .download_bytes(
-                &self.channel_id,
-                message_id,
-                attachment_id,
-                Some(self.limiter.as_ref()),
-            )
-            .await?;
-        let sliced = slice_range(data, range)?;
-        Ok(bytes_stream(sliced))
+        .with_context(|| format!("download blob {mid}"))?;
+        Ok(bytes_stream(bytes))
     }
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
-        self.delete_message_keys(keys).await
+        for ids in keys.chunks(PAGE) {
+            self.api.delete_messages(ids).await?;
+            let mut cache = self.locations.lock().unwrap();
+            for id in ids {
+                cache.pop(id);
+            }
+        }
+        Ok(())
     }
 }
 
 #[async_trait]
-impl Sweepable for DiscordBlobStore {
-    async fn candidates(
-        &self,
-        after: Option<Self::Key>,
-        upto: Self::Key,
-        limit: usize,
-    ) -> Result<Vec<Self::Key>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+impl<A: DiscordApi> Sweepable for DiscordBlobStore<A> {
+    /// Our blobs (attachments or texts named by a [`BlobId`]) with ids in
+    /// `(after, upto]`, listed 100 at a time; nothing else is a candidate.
+    async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
         let mut out = Vec::new();
         let mut cursor = after.unwrap_or(0);
-        // Discord returns newest→oldest; we sort ascending and page with `after`.
         while out.len() < limit {
-            let batch_limit = ((limit - out.len()).min(100)) as u8;
-            let msgs = self
-                .dc
-                .list_messages(
-                    &self.channel_id,
-                    None,
-                    Some(cursor as i64),
-                    Some(batch_limit.max(1)),
-                    Some(self.limiter.as_ref()),
-                )
-                .await?;
-            if msgs.is_empty() {
-                break;
-            }
-            // Only our blobs: anything else in the channel is not ours to sweep.
-            let mut ids: Vec<u64> = msgs
-                .iter()
-                .filter(|m| m.attachment_filename().and_then(BlobId::from_name).is_some())
-                .map(|m| m.message_id())
-                .filter(|&k| k <= upto && after.map(|a| k > a).unwrap_or(true))
-                .collect();
-            if ids.is_empty() {
-                // Page may contain only ids above upto (newest-first); stop.
-                let min_in_page = msgs.iter().map(|m| m.message_id()).min().unwrap_or(0);
-                if min_in_page > upto {
+            let page = self.api.list(None, Some(cursor), PAGE).await?;
+            let Some(last) = page.last().map(|m| m.id) else { break };
+            for m in &page {
+                if m.id > upto {
                     break;
                 }
-                // Advance past this page anyway.
-                cursor = msgs.iter().map(|m| m.message_id()).max().unwrap_or(cursor);
-                if msgs.len() < batch_limit as usize {
-                    break;
+                if blob_name(m).and_then(BlobId::from_name).is_some() {
+                    self.remember(m);
+                    out.push(m.id);
                 }
-                continue;
             }
-            ids.sort_unstable();
-            ids.dedup();
-            let page_max = *ids.last().unwrap_or(&cursor);
-            for k in ids {
-                if out.len() >= limit {
-                    break;
-                }
-                if after.map(|a| k <= a).unwrap_or(false) {
-                    continue;
-                }
-                out.push(k);
-            }
-            if page_max <= cursor {
+            if last >= upto || page.len() < PAGE {
                 break;
             }
-            cursor = page_max;
-            if msgs.len() < batch_limit as usize {
-                break;
-            }
+            cursor = last;
         }
-        out.sort_unstable();
-        out.dedup();
         out.truncate(limit);
         Ok(out)
-    }
-}
-
-
-
-
-impl DiscordBlobStore {
-    /// List channel messages (Discord supports cursor pagination via `before` / `after`).
-    pub async fn list_messages(
-        &self,
-        before: Option<i64>,
-        after: Option<i64>,
-        limit: Option<u8>,
-    ) -> Result<Vec<DiscordMessage>> {
-        self.dc
-            .list_messages(
-                &self.channel_id,
-                before,
-                after,
-                limit,
-                Some(self.limiter.as_ref()),
-            )
-            .await
     }
 }

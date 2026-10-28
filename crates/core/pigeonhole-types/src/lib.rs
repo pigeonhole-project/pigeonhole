@@ -118,9 +118,10 @@ impl BackendLimits {
         }
     }
 
-    /// Discord attachment upload cap (~10 MiB) with on-wire margin.
+    /// Discord's attachment limit: exactly 20 MiB per file since September
+    /// 2026 (more on boosted servers: set `max_blob_size`).
     pub fn discord(max_blob_size: Option<usize>) -> Self {
-        const DEFAULT: usize = 10 * 1024 * 1024 - 4096;
+        const DEFAULT: usize = 20 * 1024 * 1024;
         Self {
             max_blob_size: max_blob_size.unwrap_or(DEFAULT),
             supports_range: RangeSupport::BestEffort,

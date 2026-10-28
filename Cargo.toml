@@ -62,7 +62,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 zstd = "0.13"
-wiremock = "0.6"
 prost = "0.13"
 prost-types = "0.13"
 prost-build = "0.13"
