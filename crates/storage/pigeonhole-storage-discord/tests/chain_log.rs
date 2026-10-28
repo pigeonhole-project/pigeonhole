@@ -148,7 +148,7 @@ async fn a_changed_log_blob_is_detected() {
 }
 
 #[tokio::test]
-async fn a_rebase_prunes_messages_and_keeps_their_links() {
+async fn a_rebase_prunes_messages_and_their_links() {
     let channel = Arc::new(FakeDiscord::new(77));
     let foreign = channel.post_text("hello");
     let a = store(&channel);
@@ -156,11 +156,13 @@ async fn a_rebase_prunes_messages_and_keeps_their_links() {
     for i in 1..=5 {
         a.append(1, &[entry(i)]).await.unwrap();
     }
-    let (messages, threads) = (channel.message_ids().len(), channel.thread_ids().len());
+    let messages = channel.message_ids().len();
     a.rebase(1, Base { at: 3, term: 1, leader: 0, snapshot: SnapshotRef("s3".into()) }).await.unwrap();
     assert!(channel.message_ids().contains(&foreign));
     assert!(channel.message_ids().len() < messages, "pruned");
-    assert!(channel.thread_ids().len() > threads, "links are tombstones: never deleted");
+    let alive = channel.message_ids();
+    let dangling: Vec<u64> = channel.thread_ids().into_iter().filter(|t| !alive.contains(t)).collect();
+    assert!(dangling.len() <= 1, "only the link into the first survivor outlives its message: {dangling:?}");
     a.append(1, &[entry(6)]).await.unwrap();
     let b = store(&channel);
     assert_eq!(b.claim(2).await.unwrap().position, 6);
@@ -181,4 +183,24 @@ async fn a_replay_of_small_batches_downloads_nothing() {
     }
     assert_eq!(history(store(&channel).as_ref()).await, (1..=30).collect::<Vec<_>>());
     assert_eq!(channel.calls().download, 0);
+}
+
+/// Removed snapshots take their links with them: one dangling link at most.
+#[tokio::test]
+async fn removed_snapshots_leave_no_links_behind() {
+    let channel = Arc::new(FakeDiscord::new(79));
+    let store = BlobSnapshotStore::new(channel_store(&channel));
+    let mut refs = Vec::new();
+    for at in 1..=6u64 {
+        let snap = pigeonhole_meta::StoredSnapshot { log_id: pigeonhole_meta::LogId(1), at, data: vec![at as u8] };
+        refs.push(store.put(&snap).await.unwrap());
+        if refs.len() > 1 {
+            let old = refs.remove(0);
+            store.remove(&old).await.unwrap();
+        }
+    }
+    assert_eq!(store.newest().await.unwrap().map(|s| s.at), Some(6));
+    let alive = channel.message_ids();
+    let dangling: Vec<u64> = channel.thread_ids().into_iter().filter(|t| !alive.contains(t)).collect();
+    assert!(dangling.len() <= 1, "{dangling:?}");
 }

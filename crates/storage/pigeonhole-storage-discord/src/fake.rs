@@ -225,6 +225,11 @@ impl DiscordApi for FakeDiscord {
         Ok(())
     }
 
+    async fn delete_thread(&self, message_id: u64) -> Result<()> {
+        self.inner.lock().unwrap().threads.remove(&message_id);
+        Ok(())
+    }
+
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes> {
         let mut g = self.inner.lock().unwrap();
         g.calls.download += 1;

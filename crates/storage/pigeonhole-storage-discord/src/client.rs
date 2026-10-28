@@ -452,6 +452,16 @@ impl DiscordApi for DiscordChannel {
         }
     }
 
+    async fn delete_thread(&self, message_id: u64) -> Result<()> {
+        let path = format!("channels/{message_id}");
+        let c = &self.client;
+        let a = c.request(&self.limiter, RateBudget::Delete, "delete thread", || c.http.delete(c.url(&path))).await?;
+        match a.status {
+            200..=299 | 404 => Ok(()),
+            s => bail!("delete thread {message_id}: {s} {}", a.body),
+        }
+    }
+
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes> {
         let _permit = self.limiter.acquire_download().await;
         let mut req = self.client.http.get(url);

@@ -12,11 +12,15 @@
 //! A chain blob is named `<label>~<prev>.bin`, as on Telegram.
 //!
 //! The tail is the newest member that won its link: the thread of the
-//! message it names as `prev` names it back. Threads are never deleted:
-//! one could be started again on a message that still exists, and a thread
-//! outlives its starter (it stays readable after the message is pruned or
-//! a snapshot removed), so links are tombstones that keep telling who won.
-//! They are archived right away (archived threads still answer `160004`;
+//! message it names as `prev` names it back. A thread outlives its starter
+//! and stays readable, so when members are deleted (pruning, a removed
+//! snapshot) the link into the first surviving member is kept: it still
+//! tells that member won. Every other link of a deleted member goes. A
+//! thread is only ever deleted after its message: on a message that still
+//! exists a new thread could be started (the compare-and-set would reopen),
+//! on a deleted one it cannot. The anchor and its link stay.
+//!
+//! Links are archived right away (archived threads still answer `160004`;
 //! the guild's active-thread limit). Starting a thread more than ~4 messages
 //! back posts a "thread created" system message (type 18): skipped like any
 //! foreign message.
@@ -115,6 +119,37 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
         Ok(found)
     }
 
+    /// After chain members `gone` were deleted: drop the links that no
+    /// longer lead to a surviving member. A member's incoming link (on its
+    /// `prev`) goes once `prev` is gone too; its outgoing link goes once its
+    /// successor is gone. So only the link into the first survivor stays.
+    pub(crate) async fn retire_links(&self, gone: &[u64]) -> Result<()> {
+        let anchor = *self.anchor.lock().await;
+        let gone_set: std::collections::HashSet<u64> = gone.iter().copied().collect();
+        let exists = |id: u64| {
+            let api = self.api.clone();
+            let gone = gone_set.contains(&id);
+            async move { Ok::<bool, anyhow::Error>(!gone && api.get_message(id).await?.is_some()) }
+        };
+        for &m in gone {
+            let name = self.names.lock().unwrap().pop(&m);
+            let Some((_, prev)) = name.as_deref().and_then(parse_name) else { continue };
+            // Incoming: the link on `prev` names `m`, which is gone.
+            if let Some(p) = prev {
+                if Some(p) != anchor && !exists(p).await? {
+                    self.api.delete_thread(p).await?;
+                }
+            }
+            // Outgoing: the link on `m` (gone) to a successor that is gone too.
+            if let Some(next) = self.link_of(m).await? {
+                if !exists(next.id.message_id).await? {
+                    self.api.delete_thread(m).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// What `p`'s thread names, if it has one (also after `p` is gone).
     async fn link_of(&self, p: u64) -> Result<Option<Linked<DiscordId>>> {
         let name = self.api.thread_name(p).await?;
@@ -192,7 +227,7 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
     }
 
     /// Our messages below `below` (not the anchor), walking down until a page
-    /// holds none of ours. Their threads stay (see the module doc).
+    /// holds none of ours, and their links but the one into `below`.
     async fn prune(&self, below: &DiscordId) -> Result<()> {
         let mut before = Some(below.message_id);
         loop {
@@ -201,8 +236,12 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
             if ours.is_empty() {
                 return Ok(());
             }
+            for m in &ours {
+                self.remember(m);
+            }
             let ids: Vec<u64> = ours.iter().map(|m| m.id).collect();
             self.api.delete_messages(&ids).await?;
+            self.retire_links(&ids).await?;
             match page.first() {
                 Some(m) if page.len() == PAGE => before = Some(m.id),
                 _ => return Ok(()),

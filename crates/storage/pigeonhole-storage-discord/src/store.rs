@@ -77,6 +77,9 @@ pub struct DiscordBlobStore<A> {
     pub(crate) api: Arc<A>,
     limiter: Arc<ChatLimiter>,
     locations: Mutex<LruCache<u64, Located>>,
+    /// Names of recently seen blob messages (a chain member's name tells
+    /// what it follows, which deleting it needs).
+    pub(crate) names: Mutex<LruCache<u64, String>>,
     /// Blobs that fit a message's content go as text.
     inline: bool,
     /// The chain's anchor message, once found ([`crate::chain`]).
@@ -91,6 +94,7 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
             api,
             limiter,
             locations: Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())),
+            names: Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())),
             inline: true,
             anchor: tokio::sync::Mutex::new(None),
         }
@@ -109,6 +113,9 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
     pub(crate) fn remember(&self, m: &DcMessage) {
         if let Some(l) = Located::of(m) {
             self.locations.lock().unwrap().put(m.id, l);
+        }
+        if let Some(name) = blob_name(m) {
+            self.names.lock().unwrap().put(m.id, name.to_string());
         }
     }
 
@@ -229,7 +236,8 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
                 cache.pop(id);
             }
         }
-        Ok(())
+        // Chain members (a removed snapshot): their links go too.
+        self.retire_links(keys).await
     }
 }
 

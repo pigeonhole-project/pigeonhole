@@ -43,6 +43,13 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
             info!(chat_id = %chat_id, "metadata log in a Telegram channel");
             Arc::new(ChainLogStore::new(meta_channel_store(cfg, login, chat_id, "log").await?))
         }
+        #[cfg(not(feature = "discord"))]
+        LogSettings::Discord { .. } => anyhow::bail!("[meta] log is discord: build with `--features discord`"),
+        #[cfg(feature = "discord")]
+        LogSettings::Discord { channel_id, bot_token, max_blob_size } => {
+            info!(channel_id = %channel_id, "metadata log in a Discord channel");
+            meta_discord(cfg, channel_id, bot_token, *max_blob_size, "log", |s| Arc::new(ChainLogStore::new(s))).await?
+        }
     })
 }
 
@@ -57,6 +64,14 @@ pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStor
         SnapshotSettings::Telegram { chat_id, login } => {
             info!(chat_id = %chat_id, "metadata snapshots in a Telegram channel");
             Arc::new(BlobSnapshotStore::new(meta_channel_store(cfg, login, chat_id, "snapshots").await?))
+        }
+        #[cfg(not(feature = "discord"))]
+        SnapshotSettings::Discord { .. } => anyhow::bail!("[meta] snapshot is discord: build with `--features discord`"),
+        #[cfg(feature = "discord")]
+        SnapshotSettings::Discord { channel_id, bot_token, max_blob_size } => {
+            info!(channel_id = %channel_id, "metadata snapshots in a Discord channel");
+            meta_discord(cfg, channel_id, bot_token, *max_blob_size, "snapshots", |s| Arc::new(BlobSnapshotStore::new(s)))
+                .await?
         }
     })
 }
@@ -83,6 +98,33 @@ async fn meta_channel_store(
         role: InstanceRole::ReadWrite,
     };
     Ok(Arc::new(TelegramBlobStore::new(Arc::new(channel), limiter, info)))
+}
+
+/// A Discord channel holding the log or the snapshots: its store, handed to
+/// `wrap` (a chain over threads; the bot needs thread rights there).
+#[cfg(feature = "discord")]
+async fn meta_discord<T: ?Sized>(
+    cfg: &Config,
+    channel_id: &str,
+    bot_token: &str,
+    max_blob_size: Option<usize>,
+    purpose: &str,
+    wrap: impl FnOnce(Arc<pigeonhole_storage_discord::DiscordBlobStore<pigeonhole_storage_discord::DiscordChannel>>) -> Arc<T>,
+) -> anyhow::Result<Arc<T>> {
+    use pigeonhole_storage_discord::{discord_fingerprint, discord_location, DiscordBlobStore, DiscordClient};
+    let limiter = cfg.chat_limiter(bot_token, channel_id);
+    let dc = DiscordClient::new(bot_token.to_string()).context("discord client")?;
+    let id: u64 = channel_id.parse().with_context(|| format!("{purpose} channel id {channel_id:?}"))?;
+    dc.ensure_permissions(id, true, &limiter).await.with_context(|| format!("{purpose} channel"))?;
+    let info = InstanceInfo {
+        id: format!("meta-{purpose}"),
+        kind: InstanceKind::Discord,
+        fingerprint: discord_fingerprint(&dc.app_id(), channel_id),
+        location: discord_location(channel_id),
+        role: InstanceRole::ReadWrite,
+    };
+    let channel = Arc::new(dc.channel(id, limiter.clone()));
+    Ok(wrap(Arc::new(DiscordBlobStore::new(channel, limiter, max_blob_size, info))))
 }
 
 fn parse_chat(chat_id: &str) -> anyhow::Result<i64> {

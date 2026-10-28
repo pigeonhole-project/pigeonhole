@@ -84,6 +84,11 @@ pub trait DiscordApi: Send + Sync + 'static {
     /// Archive the thread of message `message_id` (it still blocks a new one).
     async fn archive_thread(&self, message_id: u64) -> Result<()>;
 
+    /// Delete the thread of message `message_id`; a missing one is fine.
+    /// Only safe once the message is gone: on an existing message a new
+    /// thread could be started again.
+    async fn delete_thread(&self, message_id: u64) -> Result<()>;
+
     /// Bytes `[start, end)` of an attachment (all of it for `None`);
     /// [`CdnStale`] when the URL expired.
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes>;

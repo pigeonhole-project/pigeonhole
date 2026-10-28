@@ -92,6 +92,8 @@ pub enum SnapshotSettings {
     Memory,
     /// A dedicated Telegram channel read over MTProto.
     Telegram { chat_id: String, login: TelegramLogin },
+    /// A dedicated Discord channel (a chain over threads; docs/discord-log.md).
+    Discord { channel_id: String, bot_token: String, max_blob_size: Option<usize> },
 }
 
 /// Where the command log lives (`[meta] log`).
@@ -104,6 +106,15 @@ pub enum LogSettings {
     /// A dedicated Telegram channel read over MTProto (fenced by the order
     /// of its messages; docs/telegram-mtproto.md).
     Telegram { chat_id: String, login: TelegramLogin },
+    /// A dedicated Discord channel, fenced by threads (docs/discord-log.md).
+    Discord { channel_id: String, bot_token: String, max_blob_size: Option<usize> },
+}
+
+impl LogSettings {
+    /// The log lives off this host (a chat), so its snapshots must too.
+    fn off_host(&self) -> bool {
+        matches!(self, LogSettings::Telegram { .. } | LogSettings::Discord { .. })
+    }
 }
 
 impl MetaSettings {
@@ -125,9 +136,11 @@ impl MetaSettings {
     pub fn snapshots_outlive_log(&self) -> bool {
         match (&self.log, &self.snapshot) {
             (LogSettings::LocalDisk { path: log }, SnapshotSettings::LocalDisk { path }) => log != path,
-            (LogSettings::LocalDisk { .. }, SnapshotSettings::Telegram { .. }) => true,
+            (LogSettings::LocalDisk { .. }, SnapshotSettings::Telegram { .. } | SnapshotSettings::Discord { .. }) => {
+                true
+            }
             (LogSettings::LocalDisk { .. }, SnapshotSettings::Memory) => false,
-            (LogSettings::Telegram { .. } | LogSettings::Memory, _) => false,
+            (LogSettings::Telegram { .. } | LogSettings::Discord { .. } | LogSettings::Memory, _) => false,
         }
     }
 }
@@ -454,26 +467,29 @@ impl FileMeta {
             Store::Telegram { chat_id, login, .. } => {
                 LogSettings::Telegram { chat_id: chat_id.clone(), login: login.clone() }
             }
-            Store::Discord { .. } => unreachable!("meta_store refuses discord"),
+            Store::Discord { channel_id, bot_token, max_blob_size, .. } => LogSettings::Discord {
+                channel_id: channel_id.clone(),
+                bot_token: bot_token.clone(),
+                max_blob_size: *max_blob_size,
+            },
         };
         let snapshot_store = match &self.snapshot {
             Some(id) => topology.meta_store(id, "[meta] snapshot")?,
             None if matches!(log_store, Store::LocalDisk { .. } | Store::Memory) => log_store.clone(),
-            None => bail!("[meta] snapshot is required with a telegram log"),
+            None => bail!("[meta] snapshot is required with a telegram or discord log"),
         };
         let snapshot = match snapshot_store {
             Store::LocalDisk { path } => SnapshotSettings::LocalDisk { path },
             Store::Memory => SnapshotSettings::Memory,
             Store::Telegram { chat_id, login, .. } => SnapshotSettings::Telegram { chat_id, login },
-            Store::Discord { .. } => unreachable!("meta_store refuses discord"),
+            Store::Discord { channel_id, bot_token, max_blob_size, .. } => {
+                SnapshotSettings::Discord { channel_id, bot_token, max_blob_size }
+            }
         };
         match (&log, &snapshot) {
-            (
-                LogSettings::Telegram { .. },
-                SnapshotSettings::LocalDisk { .. } | SnapshotSettings::Memory,
-            ) => bail!(
-                "[meta] snapshot: a telegram log needs telegram snapshots (a log off-host cannot \
-                 start from snapshots on this host)"
+            (log, SnapshotSettings::LocalDisk { .. } | SnapshotSettings::Memory) if log.off_host() => bail!(
+                "[meta] snapshot: a telegram or discord log needs its snapshots in a channel too (a \
+                 log off-host cannot start from snapshots on this host)"
             ),
             (LogSettings::Memory, SnapshotSettings::Memory) => {}
             (LogSettings::Memory, _) | (_, SnapshotSettings::Memory) => bail!(
@@ -1029,11 +1045,16 @@ upload_concurrency = 4
                      [[store]]\nid = \"b\"\nkind = \"local_disk\"\npath = \"/x\"\n";
         assert!(format!("{:#}", load(twice).unwrap_err()).contains("same place"));
 
-        // Discord holds blobs, not metadata (yet).
+        // A discord log needs its snapshots in a channel too.
         std::env::set_var("DISCORD_BOT_TOKEN", "discord-test-token");
         let dc = "[meta]\nlog = \"dc\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\n";
         let err = load_mem(dc).unwrap_err();
-        assert!(format!("{err:#}").contains("cannot hold metadata yet"), "{err:#}");
+        assert!(format!("{err:#}").contains("snapshot is required"), "{err:#}");
+        let both = format!("[meta]\nlog = \"dc\"\nsnapshot = \"dc-snap\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\n\
+                            [[store]]\nid = \"dc-snap\"\nkind = \"discord\"\nchannel_id = 2\n");
+        let cfg = load_mem(&both).unwrap();
+        assert!(matches!(cfg.meta.log, LogSettings::Discord { ref channel_id, .. } if channel_id == "1"));
+        assert!(matches!(cfg.meta.snapshot, SnapshotSettings::Discord { ref channel_id, .. } if channel_id == "2"));
     }
 
     #[test]

@@ -258,11 +258,7 @@ impl Topology {
     /// A store the metadata log or snapshots live in: `local_disk`,
     /// `memory` or `telegram` (`discord` not yet).
     pub(crate) fn meta_store(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
-        let store = self.take(id, purpose)?;
-        if matches!(store, Store::Discord { .. }) {
-            bail!("{purpose} = {id:?}: a discord store cannot hold metadata yet; use local_disk, memory or telegram");
-        }
-        Ok(store)
+        self.take(id, purpose)
     }
 
     /// `[chunk] store`: a blob store, a `[[replicas]]` group of them, or
