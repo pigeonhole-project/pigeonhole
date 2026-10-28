@@ -11,8 +11,10 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 futures = { workspace = true }
+metrics = { workspace = true }
 openraft = { workspace = true }
 pigeonhole-storage-api = { workspace = true }
+pigeonhole-types = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }

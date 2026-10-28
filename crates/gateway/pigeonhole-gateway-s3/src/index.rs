@@ -106,6 +106,17 @@ impl Index {
         self.meta.read::<S3State, _>(f)
     }
 
+    /// Bucket / object / upload counts and object bytes, for gauges (a pass
+    /// over every object).
+    pub fn stats(&self) -> IndexStats {
+        self.read(|s| IndexStats {
+            buckets: s.buckets.len() as u64,
+            objects: s.objects.len() as u64,
+            object_bytes: s.objects.values().map(|o| o.size.max(0) as u64).sum(),
+            uploads: s.uploads.len() as u64,
+        })
+    }
+
     /// Propose one s3 command; `Ok(Err(reason))` is a deterministic rejection.
     async fn propose(
         &self,
@@ -848,4 +859,15 @@ pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+/// What [`Index::stats`] counts.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IndexStats {
+    pub buckets: u64,
+    pub objects: u64,
+    /// Logical bytes of all objects.
+    pub object_bytes: u64,
+    /// Multipart uploads in progress.
+    pub uploads: u64,
 }

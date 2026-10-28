@@ -27,6 +27,9 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
 
     let s3_gateway = build_s3_gateway(cfg.clone(), index.clone(), rt.store.clone());
     spawn_background_tasks(&cfg, &rt);
+    if cfg.metrics.enabled {
+        pigeonhole::state_metrics::spawn(rt.meta.clone(), index.clone(), rt.store.db().clone());
+    }
 
     #[cfg(feature = "bytestream")]
     if cfg.bytestream.enabled {

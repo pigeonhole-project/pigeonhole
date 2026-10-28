@@ -74,7 +74,10 @@ impl Sweeper {
                 info!("metadata tablet stopped; sweeper exits");
                 return;
             }
-            match self.sweep_once().await {
+            let t0 = std::time::Instant::now();
+            let pass = self.sweep_once().await;
+            pigeonhole_blob::record_background_pass("sweep", pass.is_ok(), t0.elapsed());
+            match pass {
                 Ok(stats) => {
                     pigeonhole_blob::record_sweep("deleted", stats.keys_deleted);
                     pigeonhole_blob::record_sweep("skipped_live", stats.keys_skipped_live);

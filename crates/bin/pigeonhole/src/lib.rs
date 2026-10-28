@@ -2,6 +2,7 @@
 
 pub mod gateway_metrics;
 pub mod http_timeout;
+pub mod state_metrics;
 #[cfg(feature = "metrics-prometheus")]
 pub mod prometheus;
 
@@ -26,4 +27,9 @@ pub use pigeonhole_gateway_s3::{Index, S3Gateway};
 /// Rate-limit module path used by older imports.
 pub mod rate_limit {
     pub use pigeonhole_blob::{ChatLimiter, ChatLimiterConfig};
+}
+
+/// Every metric the binary records, crate by crate (docs/metrics.md).
+pub fn metric_docs() -> [&'static [pigeonhole_types::MetricDoc]; 3] {
+    [pigeonhole_blob::METRICS, pigeonhole_meta::METRICS, state_metrics::METRICS]
 }

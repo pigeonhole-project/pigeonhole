@@ -77,7 +77,10 @@ impl Repairer {
                 info!("metadata tablet stopped; repair exits");
                 return;
             }
-            match self.repair_once().await {
+            let t0 = std::time::Instant::now();
+            let pass = self.repair_once().await;
+            pigeonhole_blob::record_background_pass("repair", pass.is_ok(), t0.elapsed());
+            match pass {
                 Ok(stats) => {
                     pigeonhole_blob::record_repair("repaired", stats.repaired);
                     pigeonhole_blob::record_repair("scrub_enqueued", stats.scrub_enqueued);

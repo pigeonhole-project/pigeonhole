@@ -5,7 +5,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
-use pigeonhole_blob::describe_metrics;
+use pigeonhole_blob::describe;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 use tracing::{info, warn};
@@ -42,7 +42,9 @@ pub fn install_recorder() -> anyhow::Result<&'static PrometheusHandle> {
         .map_err(buckets)?
         .install_recorder()
         .map_err(|e| anyhow::anyhow!("install prometheus recorder: {e}"))?;
-    describe_metrics();
+    for docs in crate::metric_docs() {
+        describe(docs);
+    }
     let _ = HANDLE.set(handle);
     Ok(HANDLE.get().expect("prometheus handle just set"))
 }
