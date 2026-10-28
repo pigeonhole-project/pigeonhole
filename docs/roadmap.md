@@ -37,12 +37,10 @@ Done (on `main`), steps 1–7a, 6d, 8.1–8.2:
   Postcard everywhere, versioned (`LOG_FORMAT`, `VERSION`, `SNAPSHOT_FORMAT`);
   golden tests pin command encodings. No SQLite, no proto in metadata (proto
   only for REAPI).
-- `LocalLogStore`: `seg-<first>.log` records `MAGIC|len|crc|Batch`, fsync per
-  batch, `claimed_gen` + `log_id` under a `flock`; claim truncates a torn tail;
-  `rebase` drops the segments behind the base. `ChainLogStore` keeps the
-  log on any store that implements `Chain` (memory, a Telegram channel over
-  MTProto fenced by the order of message ids), `BlobSnapshotStore` the
-  snapshots (chain-log.md); no pins, no description register.
+- `ChainLogStore` keeps the log on any store that implements `Chain`: the
+  local disk (segment files, one fsync per append, decided under `flock`),
+  memory, a Telegram channel over MTProto fenced by the order of message
+  ids; `BlobSnapshotStore` the snapshots (chain-log.md). No per-kind logs.
 - Snapshots every `[meta] snapshot_every_entries` (10000) and
   `snapshot_every_secs` (600, when anything changed), stored in a `SnapshotStore` configured apart
   from the log (`local_disk` | `memory` | `telegram`, pinless); the log records which one it starts
@@ -62,12 +60,10 @@ Done (on `main`), steps 1–7a, 6d, 8.1–8.2:
 
 Known gaps:
 
-- With the `local` log, disk loss loses metadata unless `[meta] snapshot`
+- With the `local_disk` log, disk loss loses metadata unless `[meta] snapshot`
   lives elsewhere (and restore from it is lossy); the `telegram` log avoids it.
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
-- `LocalLogStore` / `LocalSnapshotStore` are still apart from the disk blob
-  store. Step 9.
 - Discord cannot hold the log or snapshots yet (step 10).
 
 ## Steps
@@ -236,7 +232,7 @@ changes what `MetaStore` hands to openraft), and `raft.rs` sees only the
 `LogStore` / `SnapshotStore` traits, so 7c and 9 change nothing for it (the
 8.1 conformance suite checks `ChainLogStore`).
 
-### Step 9 — Disk blob store on segments
+### Step 9 — Disk blob store on segments ✅ done
 
 [chain-log.md](chain-log.md) step 4: `DiskBlobStore` as append-only segments
 (key = byte position, one fsync per put, holes punched for deletes) with

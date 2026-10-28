@@ -324,7 +324,7 @@ make compat-discord
 
 - **One active process per log.** A process booting on the same `[meta] log`
   claims a newer generation and fences the running one, which exits. The
-  `local` log fences only processes on the same host.
+  `local_disk` log fences only processes on the same host.
 - **Blobs are bot-bound.** A blob is a message id in a channel; another bot
   admin of the same channel reads it, but the store's fingerprint includes the
   bot id, so changing the bot is refused at startup (a moved store would need

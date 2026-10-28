@@ -1,7 +1,7 @@
 # Metadata as a tablet
 
 Status: **steps 1–6 implemented** — typed commands, in-memory state machines,
-a tablet over the `local` or `telegram` LogStore, snapshots in a
+a tablet over a `local_disk`, `memory` or `telegram` LogStore, snapshots in a
 `SnapshotStore` of their own, lossy restore. The arbiter and the `s3` LogStore
 are a proposal. No backward compatibility: configs, on-disk and in-chat formats
 are replaced, existing data is not migrated (formats are versioned, so a
@@ -151,9 +151,8 @@ trait SnapshotStore {
 The log names the exact snapshot it starts from, so a boot never guesses: a
 deposed writer's late `put` is just an unreferenced copy. A store never drops
 snapshots on its own; the tablet removes the previous base once the log is
-rebased on a newer one. Implementations: `local` (`snapshot-<log id>-<at>.snap`
-files, crc-checked; the directory may be the log's) and `BlobSnapshotStore`
-over any store that implements `Chain` (memory, telegram): snapshots are a
+rebased on a newer one. One implementation, `BlobSnapshotStore`
+over any store that implements `Chain` (local disk, memory, telegram): snapshots are a
 chain of blobs, the ref is the blob id and its crc, `newest` is the tail
 (chain-log.md). The log and the snapshots cannot share a store: a store holds
 one chain.
@@ -208,13 +207,15 @@ node; restart = process restart). Later: a small watcher over the same LogStore
 
 ## LogStore implementations
 
-### `local` — file on disk
+Every kind is `ChainLogStore` over a store that implements `Chain`
+(chain-log.md); what differs is how the store decides the first successor.
 
-Segmented append-only files + a `claimed_gen` file updated with fsync before
-use, and a `base` file written by `rebase`; `append` checks the generation
-under a lock. Fences only processes on the
-same host; durability = the disk. Default, and the reference implementation the
-others are tested against.
+### `local_disk` — segment files
+
+The disk blob store: records in append-only segment files, one fsync per
+append, the first successor decided under the directory's `flock` (a claim
+reads the tail and appends under the same lock). Fences only processes on
+the same host; durability = the disk. Default.
 
 ### `telegram` — a channel over MTProto, fenced by message order
 
@@ -355,11 +356,11 @@ What openraft needs from a node's log, and how each store kind provides it:
 
 | need | local_disk | memory | telegram (channel) |
 |---|---|---|---|
-| `append(entries)`, durable at callback | segment record + fsync | push | one send per batch (+ a gap read if something lies between) |
-| `truncate(from)` (drop a divergent tail) | cut the segment | pop | a new message linking to the entry before `from`: the chain forks, the old tail is unreachable garbage |
+| `append(entries)`, durable at callback | a chain record + fsync | push | one send per batch (+ a gap read if something lies between) |
+| `truncate(from)` (drop a divergent tail) | a record linking to the entry before `from` | pop | a new message linking to the entry before `from`: the chain forks, the old tail is unreachable garbage |
 | `purge(upto)` (behind a snapshot) | `rebase` (exists) | drop | `rebase` (exists) |
 | `save_vote` / `read_vote`, durable | a `vote` file (tmp + rename) | field | carried in every message; a vote change alone sends an empty message |
-| one process per node | `flock` + `claimed_gen` (exists) | — | claims ordered by message id (exists) |
+| one process per node | claims in the chain, under `flock` (exists) | — | claims ordered by message id (exists) |
 
 Entries carry their Raft `LogId` (term, index) instead of our generation;
 `claim` stays, now meaning "this process is node X" so two processes started
@@ -381,8 +382,8 @@ so the node's store fences them, the way the tablet's log fences writers now:
 - **Every durable change is fenced.** Granting a vote (`save_vote`),
   acknowledging entries (`append` / `truncate`) and campaigning (a vote for
   itself) first write to the store; the write succeeds only while the process
-  holds the store's generation (`flock` + `claimed_gen`, or in a channel no
-  newer claim below its message: the order fence of the `telegram` log).
+  holds the store's generation (no newer claim linked after its blob: on
+  disk decided under `flock`, in a channel by the order of message ids).
   A process that lost the store can neither vote nor acknowledge.
 - **Answers without a write are leased.** A heartbeat answered from memory
   ("I match up to i") writes nothing. A process confirms its fence at least
@@ -513,4 +514,4 @@ Each step is a separate commit with tests green.
   is taken as deleted. Someone deleting a claim by hand defeats the fence.
 - Snapshots are taken between batches under read locks: O(state). Fine at our
   scale; persistent maps (imbl) would make them O(1) if it ever matters.
-- Batch size / delay defaults per LogStore kind (`local`: no extra delay).
+- Batch size / delay defaults per LogStore kind (`local_disk`: no extra delay).

@@ -1,6 +1,6 @@
 # The log on top of blob storage: `Chain`
 
-Status: **steps 1–3 implemented** (see Implementation notes). Read [meta-backends.md](meta-backends.md) (the `LogStore`
+Status: **steps 1–4 implemented** (see Implementation notes). Read [meta-backends.md](meta-backends.md) (the `LogStore`
 and `SnapshotStore` contracts), [telegram-mtproto.md](telegram-mtproto.md) (the
 order-fenced channel log, implemented), [discord-log.md](discord-log.md) (the
 thread-fenced log, proposed) and [sweep-invariants.md](sweep-invariants.md)
@@ -197,7 +197,7 @@ on it; `scripts/check_deps.py` learns the new layer. A log or snapshot store
 is configured as any `[[store]]`; one store serves one purpose (blobs, a log,
 or snapshots), as today.
 
-## Implementation notes (steps 1–3)
+## Implementation notes (steps 1–4)
 
 Where the code differs from the design above:
 
@@ -205,7 +205,12 @@ Where the code differs from the design above:
   snapshots) holds nothing else that chains. The trait is
   `put_after(prev, label, data)`, `tail()`, `successor(id)` and
   `prune(below)` ("delete every blob below `below`, members and losers
-  alike"); `ChainMeta` is a free-form `label` the log parses
+  alike"), plus a provided `put_after_tail(label, make)`: the blob is built
+  from the tail (id and data) and put after it. A claim uses it. The
+  default loops (read the tail, put after it, again on `Lost`, so `make`
+  must be pure); a store that can decide it atomically overrides it (disk:
+  under one `flock`; without it a claimant lost 600 times in a row to a
+  writer appending every few ms); `ChainMeta` is a free-form `label` the log parses
   (`log-claim-<gen>`, `log-batch-<gen>`, `snapshot-<log>-<at>.snap`).
 - **No `chain_from`.** Replay walks back along the `prev` links in the blobs
   (as the channel log did); the Telegram store reads the whole page below a
@@ -229,8 +234,23 @@ Where the code differs from the design above:
   (telegram-mtproto.md § Text messages); a replay of small batches
   downloads nothing.
 - **Memory** decides links under a mutex; `MemoryLogStore` and
-  `MemorySnapshotStore` are gone. `LocalLogStore` / `LocalSnapshotStore` stay
-  until step 4.
+  `MemorySnapshotStore` are gone.
+- **Disk** (step 4): records `magic | flags | label_len | data_len | prev |
+  crc | label | data` in `seg-<seq>` files; key = `(seq << 40) | offset`.
+  Every write holds the directory's `flock` and first indexes what another
+  process appended (an `fstat` of the active segment; the directory is
+  listed only when it grew or is full). The chain (`next`, `tail`) is an
+  in-memory index rebuilt by a scan on open; the last record's crc is
+  checked and a torn one truncated. A delete sets `DEAD` in the header and
+  punches a hole over the data (`F_PUNCHHOLE` / `FALLOC_FL_PUNCH_HOLE`); a
+  segment with no live record is removed. A `local_disk` `[meta]` store
+  keeps the log in `<path>/log` and the snapshots in `<path>/snapshots`.
+  `LocalLogStore` / `LocalSnapshotStore` are gone.
+- **Benchmark** (`log::chain::tests::disk::bench_disk_logs`, release, macOS,
+  before the old log was deleted): append p50 ~4.1 ms for both (one
+  `F_FULLFSYNC`); 1M entries in batches of 1000 in ~4.5 s for both; open +
+  claim 9–20 ms (old: 210–245 ms); replay of 1M entries 140 ms (290 ms);
+  rebase 120 ms (220 ms). `sweep_stress` 38–51 s (was ~48 s).
 - Tests: the `LogStore` and `SnapshotStore` conformance suites run on
   `ChainLogStore` / `BlobSnapshotStore` over memory (in `pigeonhole-meta`) and
   over the Telegram store on a fake channel
@@ -251,7 +271,7 @@ Each step ends with `cargo test --workspace` and
    becomes a fake `TelegramClient` under `TelegramBlobStore`; live run on the
    test channels. Delete `ChannelApi`, `ChannelLogStore`,
    `ChannelSnapshotStore`.
-4. **Segmented `DiskBlobStore`** with `impl Chain`; the benchmark against
+4. ✅ **Segmented `DiskBlobStore`** with `impl Chain`; the benchmark against
    `LocalLogStore`; then delete `LocalLogStore` / `LocalSnapshotStore`.
    Repeated `sweep_stress`.
 5. **Discord `impl Chain`** (discord-log.md).
