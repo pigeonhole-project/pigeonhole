@@ -178,6 +178,14 @@ and snapshots in `memory` (tests, no fsync). Discord as a log / snapshot store
 is left for later: its limits (topic edits, at most 50 pins per channel) need
 checking on a live bot before the chat protocol is adapted to it.
 
+### Step 7b — One log entry per S3 operation
+
+Design: [one-entry-per-operation.md](one-entry-per-operation.md). Layers
+hand out prepared commands, the gateway commits an operation's commands as
+one Raft entry (`MetaStore::propose_all`), releases of overwritten chunks go
+after the answer. One PUT = one entry instead of n + 2; matters most on a
+Telegram log (~20 messages a minute).
+
 ### Step 8 — Raft between nodes
 
 Design: meta-backends.md § Raft between nodes. Sub-steps:
