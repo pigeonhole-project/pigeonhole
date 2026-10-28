@@ -239,11 +239,9 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
 
 fn with_optional_caches(layer: ChunkStore, cfg: &Config) -> ChunkStore {
     if cfg.cache.enabled {
-        let l1 = Arc::new(BlockCache::new(
-            cfg.cache.block_memory_bytes,
-            cfg.cache.readahead_blocks,
-        ));
-        layer.with_caches(Some(l1), None)
+        let l1 = Arc::new(BlockCache::new("l1", cfg.cache.l1_bytes));
+        let l2 = (cfg.cache.l2_bytes > 0).then(|| Arc::new(BlockCache::new("l2", cfg.cache.l2_bytes)));
+        layer.with_caches(Some(l1), l2, cfg.cache.write_through)
     } else {
         layer
     }

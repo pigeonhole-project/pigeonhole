@@ -230,7 +230,7 @@ comments. Sections:
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Rate limits on two levels: per bot (`bot_rate_per_sec`) and per channel (send / getFile / delete / info budgets); a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency |
-| `[cache]` | L1 unpacked blocks, L2 memory/disk blob cache |
+| `[cache]` | In-memory block caches: L1 decoded, L2 stored (compressed) blocks |
 | `[sweep]` | Garbage collector: `interval_secs`, `batch_size` |
 | `[repair]` | Replica repair/backfill: interval, batch, cost limit, `scrub` |
 | `[http]` | Body/header timeouts, concurrency limit, max headers |

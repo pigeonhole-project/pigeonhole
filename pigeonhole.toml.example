@@ -111,20 +111,13 @@ upload_concurrency = 2
 download_concurrency = 8
 
 [cache]
-# L1 blocks + L2 compressed blobs.
+# In-memory block caches: a read looks in L1 (decoded blocks), then L2
+# (stored, compressed blocks), then the backend. Raw chunks are not cached.
 enabled = true
-# L2 in-memory capacity (bytes).
-memory_bytes = 268435456
-# Empty disk_path = memory-only L2 (no foyer disk tier).
-disk_path = ""
-# Required when disk_path is set (do not rely on foyer free-space defaults).
-# disk_bytes = 1073741824
-# L1 unpacked-block memory budget.
-block_memory_bytes = 134217728
-readahead_blocks = 2
+l1_bytes = 134217728
+l2_bytes = 268435456          # 0 = no L2
+# Chunks written put their stored blocks into L2 (read-after-write is free).
 write_through = true
-# Blobs larger than this are not admitted to L2 disk.
-max_object_bytes = 20971520
 
 # Bazel/Buck2 remote cache (REAPI v2 + ByteStream). Requires building pigeonhole with
 # `--features bytestream`. Disabled by default.

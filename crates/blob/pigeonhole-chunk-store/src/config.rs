@@ -702,58 +702,25 @@ impl FileBytestream {
 #[serde(default, deny_unknown_fields)]
 struct FileCache {
     enabled: bool,
-    memory_bytes: usize,
-    disk_path: String,
-    disk_bytes: Option<usize>,
-    block_memory_bytes: Option<usize>,
-    readahead_blocks: Option<usize>,
+    l1_bytes: usize,
+    l2_bytes: usize,
     write_through: bool,
-    max_object_bytes: usize,
-    metrics_interval_secs: u64,
 }
 
 impl Default for FileCache {
     fn default() -> Self {
         let d = CacheConfig::default();
-        Self {
-            enabled: d.enabled,
-            memory_bytes: d.memory_bytes,
-            disk_path: String::new(),
-            disk_bytes: None,
-            block_memory_bytes: None,
-            readahead_blocks: None,
-            write_through: d.write_through,
-            max_object_bytes: d.max_object_bytes,
-            metrics_interval_secs: d.metrics_interval_secs,
-        }
+        Self { enabled: d.enabled, l1_bytes: d.l1_bytes, l2_bytes: d.l2_bytes, write_through: d.write_through }
     }
 }
 
 impl FileCache {
     fn into_cache_config(self) -> Result<CacheConfig> {
-        let disk_path = if self.disk_path.trim().is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(self.disk_path))
-        };
-        if disk_path.is_some() && self.disk_bytes.is_none() {
-            bail!("cache.disk_bytes is required when cache.disk_path is set");
-        }
-        let defaults = CacheConfig::default();
-        let block_memory_bytes = self
-            .block_memory_bytes
-            .unwrap_or(defaults.block_memory_bytes);
-        let readahead_blocks = self.readahead_blocks.unwrap_or(defaults.readahead_blocks);
         Ok(CacheConfig {
             enabled: self.enabled,
-            memory_bytes: self.memory_bytes.max(1024 * 1024),
-            disk_path,
-            disk_bytes: self.disk_bytes,
-            block_memory_bytes: block_memory_bytes.max(1024 * 1024),
-            readahead_blocks,
+            l1_bytes: self.l1_bytes.max(1024 * 1024),
+            l2_bytes: self.l2_bytes,
             write_through: self.write_through,
-            max_object_bytes: self.max_object_bytes.max(1024),
-            metrics_interval_secs: self.metrics_interval_secs,
         })
     }
 }
