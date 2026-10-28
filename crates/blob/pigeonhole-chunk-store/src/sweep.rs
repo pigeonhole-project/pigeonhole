@@ -273,7 +273,7 @@ mod tests {
 
     async fn setup() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let db = BlobDb::connect(dir.path().join("blob.log")).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
         let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
         let backend: SharedBackend = Arc::new(erase_sweep(mem.clone()));
         let (layer, pins) = open_layer(db.clone(), backend.clone()).await;
@@ -310,7 +310,7 @@ mod tests {
         let f = setup().await;
         let loc = orphan(&f, b"orphan").await;
         // A newer incarnation claims the same log; this one has not written since.
-        let _newer = BlobDb::connect(f._dir.path().join("blob.log")).await.unwrap();
+        let _newer = BlobDb::open(pigeonhole_testkit::tablet(f._dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
 
         let err = sweeper(&f).sweep_once().await.unwrap_err();
         assert!(format!("{err:#}").contains("fenced"), "{err:#}");
@@ -435,10 +435,9 @@ mod tests {
             snapshots_outlive_log: true,
             ..Default::default()
         };
-        let log = pigeonhole_meta::LocalLogStore::open(dir.path().join("log")).unwrap();
-        let snapshots = pigeonhole_meta::LocalSnapshotStore::new(dir.path().join("snapshots"));
+        let (log, snapshots) = pigeonhole_testkit::disk_meta(dir.path());
         let namespaces = BlobDb::register(Default::default());
-        let meta = pigeonhole_meta::MetaStore::open(Arc::new(log), Arc::new(snapshots), namespaces, opts)
+        let meta = pigeonhole_meta::MetaStore::open(log, snapshots, namespaces, opts)
             .await
             .unwrap();
         let db = BlobDb::open(meta.clone()).await.unwrap();

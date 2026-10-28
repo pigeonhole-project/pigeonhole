@@ -1,4 +1,5 @@
 use super::*;
+use pigeonhole_storage_disk::DiskBlobStore;
 use pigeonhole_storage_memory::MemoryBlobStore;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -42,8 +43,28 @@ fn counter() -> Namespaces {
     Namespaces::new().with::<Counter>()
 }
 
+/// A disk log in `<meta_dir>/log`, as a `local_disk` `[meta] log`.
+fn log_of(meta_dir: &Path) -> Arc<crate::ChainLogStore<DiskBlobStore>> {
+    Arc::new(crate::ChainLogStore::new(Arc::new(DiskBlobStore::open(meta_dir.join("log")).unwrap())))
+}
+
+/// Snapshots in `<meta_dir>/snapshots`, as a `local_disk` `[meta] snapshot`.
+fn snaps_of(meta_dir: &Path) -> Arc<crate::BlobSnapshotStore<DiskBlobStore>> {
+    Arc::new(crate::BlobSnapshotStore::new(Arc::new(DiskBlobStore::open(meta_dir.join("snapshots")).unwrap())))
+}
+
+/// Live snapshot blobs in `<meta_dir>/snapshots`.
+fn snapshot_count(meta_dir: &Path) -> usize {
+    let store = DiskBlobStore::open(meta_dir.join("snapshots")).unwrap();
+    futures::executor::block_on(pigeonhole_storage_api::Sweepable::candidates(&store, None, u64::MAX, 1000)).unwrap().len()
+}
+
+async fn open_dir(meta_dir: &Path, namespaces: Namespaces) -> Result<Arc<MetaStore>> {
+    MetaStore::open(log_of(meta_dir), snaps_of(meta_dir), namespaces, MetaOptions::default()).await
+}
+
 async fn open_on(dir: &Path) -> Arc<MetaStore> {
-    MetaStore::open_local(dir.join("log"), counter()).await.unwrap()
+    open_dir(&dir.join("log"), counter()).await.unwrap()
 }
 
 fn value(store: &MetaStore) -> i64 {
@@ -58,10 +79,9 @@ fn snapshot(store: &MetaStore) -> Vec<u8> {
     store.read::<Counter, _>(encode_state)
 }
 
-/// Log and snapshots in one directory, as `[meta] log` / `snapshot`
-/// with the same `path`.
+/// Log and snapshots of one `local_disk` `[meta]` store at `dir`.
 fn local(dir: &Path) -> (Arc<dyn LogStore>, Arc<dyn SnapshotStore>) {
-    (Arc::new(LocalLogStore::open(dir).unwrap()), Arc::new(LocalSnapshotStore::new(dir)))
+    (log_of(dir), snaps_of(dir))
 }
 
 /// Snapshots are taken in the background; wait until the log starts at or
@@ -91,12 +111,6 @@ async fn eventually(what: &str, f: impl Fn() -> bool) {
     }
 }
 
-fn snapshot_files(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".snap"))
-        .count()
-}
 
 #[tokio::test]
 async fn commit_and_reject_both_consume_a_position() {
@@ -133,7 +147,7 @@ async fn unknown_namespace_fails_without_a_position() {
     assert_eq!(store.applied_position(), booted);
 
     let twice = Namespaces::new().with::<Counter>().with::<Counter>();
-    assert!(MetaStore::open_local(dir.path().join("log2"), twice).await.is_err());
+    assert!(open_dir(&dir.path().join("log2"), twice).await.is_err());
 }
 
 /// A second namespace: names seen, in order.
@@ -157,7 +171,7 @@ impl StateMachine for Names {
 async fn propose_all_commits_commands_of_several_namespaces_as_one_entry() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespaces::new().with::<Counter>().with::<Names>();
-    let store = MetaStore::open_local(dir.path().join("log"), ns).await.unwrap();
+    let store = open_dir(&dir.path().join("log"), ns).await.unwrap();
     let booted = store.applied_position();
 
     let mut p = Proposal::new();
@@ -175,13 +189,13 @@ async fn propose_all_commits_commands_of_several_namespaces_as_one_entry() {
     // Durable together: a new incarnation replays all of them.
     drop(store);
     let ns = Namespaces::new().with::<Counter>().with::<Names>();
-    let again = MetaStore::open_local(dir.path().join("log"), ns).await.unwrap();
+    let again = open_dir(&dir.path().join("log"), ns).await.unwrap();
     assert_eq!(value(&again), 6);
     assert_eq!(again.read::<Names, _>(|n| n.0.clone()), vec!["a".to_string()]);
 
     // A fenced tablet fails the whole proposal.
     let ns = Namespaces::new().with::<Counter>().with::<Names>();
-    let newer = MetaStore::open_local(dir.path().join("log"), ns).await.unwrap();
+    let newer = open_dir(&dir.path().join("log"), ns).await.unwrap();
     let mut p = Proposal::new();
     p.push(Prepared::<Counter>::new(&op(4, 1)));
     p.push(Prepared::<Names>::new(&"b".to_string()));
@@ -298,7 +312,7 @@ async fn crash_between_append_and_apply_is_applied_once_on_boot() {
         a.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
     }
     // An incarnation that appended an entry and died before committing it.
-    let log = LocalLogStore::open(dir.path().join("log")).unwrap();
+    let log = log_of(&dir.path().join("log"));
     let head = log.claim(2).await.unwrap();
     let term = log.discover().await.unwrap().unwrap().head_term;
     let next = head.position + 1;
@@ -319,18 +333,19 @@ async fn entries_of_another_command_format_refuse_to_replay() {
         let a = open_on(dir.path()).await;
         a.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
     }
-    let log = LocalLogStore::open(dir.path().join("log")).unwrap();
+    let log = log_of(&dir.path().join("log"));
     let head = log.claim(2).await.unwrap();
     let term = log.discover().await.unwrap().unwrap().head_term;
     let mut old = command::<Counter>(&op(2, 1));
     old.version = Counter::VERSION + 1;
     log.append(2, &[raw_entry(term, head.position + 1, old)]).await.unwrap();
 
-    let err = MetaStore::open_local(dir.path().join("log"), counter()).await.err().expect("boot must fail");
+    let err = open_dir(&dir.path().join("log"), counter()).await.err().expect("boot must fail");
     assert!(format!("{err:#}").contains("counter command in format 2, this binary reads 1"), "{err:#}");
 }
 
 fn segments(dir: &Path) -> Vec<String> {
+    let dir = &dir.join("log");
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -341,9 +356,9 @@ fn segments(dir: &Path) -> Vec<String> {
 }
 
 async fn open_snapshotting(dir: &Path) -> Arc<MetaStore> {
-    let log = LocalLogStore::with_segment_bytes(dir, 64).unwrap();
+    let log = crate::ChainLogStore::new(Arc::new(DiskBlobStore::with_segment_bytes(dir.join("log"), 64).unwrap()));
     let opts = MetaOptions { snapshot_every: 10, ..MetaOptions::default() };
-    MetaStore::open(Arc::new(log), Arc::new(LocalSnapshotStore::new(dir)), counter(), opts).await.unwrap()
+    MetaStore::open(Arc::new(log), snaps_of(dir), counter(), opts).await.unwrap()
 }
 
 #[tokio::test]
@@ -358,13 +373,13 @@ async fn snapshots_collect_the_log_and_boot_from_them() {
     let (state, applied) = (snapshot(&a), a.applied_position());
     drop(a);
 
-    let d = LocalLogStore::open(&log_dir).unwrap().discover().await.unwrap().unwrap();
+    let d = log_of(&log_dir).discover().await.unwrap().unwrap();
     let base = d.base.expect("the log starts from a snapshot");
-    let stored = LocalSnapshotStore::new(&log_dir).get(&base.snapshot).await.unwrap();
+    let stored = snaps_of(&log_dir).get(&base.snapshot).await.unwrap();
     assert_eq!(raft::RaftSnapshot::decode(&stored.data).unwrap().tablet.position, base.at);
-    eventually("older snapshots removed", || snapshot_files(&log_dir) <= 2).await;
+    eventually("older snapshots removed", || snapshot_count(&log_dir) <= 2).await;
     let segs = segments(&log_dir);
-    assert!(segs[0] > "seg-00000000000000000001.log".to_string(), "log behind the base collected: {segs:?}");
+    assert!(segs[0] > "seg-0000000001".to_string(), "log behind the base collected: {segs:?}");
 
     let b = open_snapshotting(&log_dir).await;
     assert!(b.applied_position() >= applied, "everything the log holds is applied");
@@ -381,7 +396,7 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
         let a = open_on(dir.path()).await;
         a.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
     }
-    let log = LocalLogStore::open(&log_dir).unwrap();
+    let log = log_of(&log_dir);
     let head = log.claim(2).await.unwrap();
     let meta = raft::solo_meta(head.position - 1);
     let tablet = TabletSnapshot {
@@ -391,10 +406,11 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
     };
     let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
     let stored = StoredSnapshot { log_id: head.log_id, at: head.position, data };
-    let snapshot = LocalSnapshotStore::new(&log_dir).put(&stored).await.unwrap();
+    let snapshot = snaps_of(&log_dir).put(&stored).await.unwrap();
     log.rebase(2, raft::base_of(&meta, snapshot)).await.unwrap();
+    drop(log);
 
-    let err = MetaStore::open_local(&log_dir, counter()).await.err().expect("boot must fail");
+    let err = open_dir(&log_dir, counter()).await.err().expect("boot must fail");
     assert!(format!("{err:#}").contains("counter state in format 2, this binary reads 1"), "{err:#}");
 }
 
@@ -402,9 +418,9 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
 async fn a_lost_log_boots_only_through_a_lossy_restore() {
     let dir = tempfile::tempdir().unwrap();
     let (log_dir, snap_dir) = (dir.path().join("log"), dir.path().join("snapshots"));
-    let snapshots: Arc<dyn SnapshotStore> = Arc::new(LocalSnapshotStore::new(&snap_dir));
+    let snapshots: Arc<dyn SnapshotStore> = snaps_of(&snap_dir);
     let open = |snapshots: Arc<dyn SnapshotStore>| {
-        let log = Arc::new(LocalLogStore::open(&log_dir).unwrap());
+        let log = log_of(&log_dir);
         let opts = MetaOptions { snapshot_every: 10, snapshots_outlive_log: true, ..MetaOptions::default() };
         MetaStore::open(log, snapshots, counter(), opts)
     };
@@ -423,10 +439,10 @@ async fn a_lost_log_boots_only_through_a_lossy_restore() {
     let err = open(snapshots.clone()).await.err().expect("an empty log next to snapshots must not boot");
     assert!(format!("{err:#}").contains("restore --lossy"), "{err:#}");
 
-    let log = LocalLogStore::open(&log_dir).unwrap();
-    let restored_at = restore_lossy(&log, snapshots.as_ref()).await.unwrap();
+    let log = log_of(&log_dir);
+    let restored_at = restore_lossy(log.as_ref(), snapshots.as_ref()).await.unwrap();
     assert!(restored_at >= restorable, "the newest snapshot: {restored_at} < {restorable}");
-    assert!(restore_lossy(&log, snapshots.as_ref()).await.is_err(), "only an empty log is seeded");
+    assert!(restore_lossy(log.as_ref(), snapshots.as_ref()).await.is_err(), "only an empty log is seeded");
 
     let b = open(snapshots.clone()).await.unwrap();
     let restored = value(&b);
@@ -488,7 +504,7 @@ async fn a_local_log_restores_from_snapshots_in_a_blob_store() {
     let chat = Arc::new(MemoryBlobStore::new());
     let snapshots: Arc<dyn SnapshotStore> = Arc::new(crate::BlobSnapshotStore::new(chat.clone()));
     let opts = MetaOptions { snapshot_every: 10, snapshots_outlive_log: true, ..MetaOptions::default() };
-    let a = MetaStore::open(Arc::new(LocalLogStore::open(dir.path()).unwrap()), snapshots.clone(), counter(), opts)
+    let a = MetaStore::open(log_of(dir.path()), snapshots.clone(), counter(), opts)
         .await
         .unwrap();
     for i in 0..35u64 {
@@ -498,7 +514,7 @@ async fn a_local_log_restores_from_snapshots_in_a_blob_store() {
     drop(a);
 
     let fresh = tempfile::tempdir().unwrap();
-    let log = Arc::new(LocalLogStore::open(fresh.path()).unwrap());
+    let log = log_of(fresh.path());
     restore_lossy(log.as_ref(), snapshots.as_ref()).await.unwrap();
     let b = MetaStore::open(log, snapshots, counter(), MetaOptions::default()).await.unwrap();
     assert!(value(&b) >= 17, "the newest snapshot's state, got {}", value(&b));
@@ -518,10 +534,10 @@ async fn an_idle_tablet_snapshots_by_time() {
     wait_base(&a, applied).await;
     let d = log.discover().await.unwrap().unwrap();
     assert_eq!(d.base.map(|b| b.at), Some(applied));
-    // Nothing new: no more snapshots.
-    let files = snapshot_files(dir.path());
+    // Nothing new: no more snapshots (an older one may still be on its way out).
+    eventually("only the base snapshot is kept", || snapshot_count(dir.path()) == 1).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(snapshot_files(dir.path()), files);
+    assert_eq!(snapshot_count(dir.path()), 1);
 }
 
 

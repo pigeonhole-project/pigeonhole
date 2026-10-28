@@ -790,7 +790,7 @@ pub fn default_layer_opts() -> IngestOptions {
 pub async fn open_memory_chunk_store(log_dir: impl AsRef<std::path::Path>) -> Result<ChunkStore> {
     use pigeonhole_codec::DEFAULT_BLOCK_SIZE;
     use pigeonhole_storage_memory::MemoryBlobStore;
-    let db = BlobDb::connect(log_dir).await?;
+    let db = BlobDb::open(pigeonhole_testkit::tablet(log_dir, BlobDb::register).await).await?;
     let mut opts = default_layer_opts();
     opts.chunk_size = 64 * 1024;
     opts.block_size = DEFAULT_BLOCK_SIZE.min(64 * 1024);
@@ -889,7 +889,7 @@ mod tests {
         const MIB: usize = 1024 * 1024;
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
 
         let a = MemoryBlobStore::with_limits(BackendLimits {
             max_blob_size: 19 * MIB,
@@ -998,7 +998,7 @@ mod tests {
         const MIB: usize = 1024 * 1024;
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let a = MemoryBlobStore::with_limits(BackendLimits::memory())
             .with_instance_id("a")
             .with_unavailable_flag();
@@ -1038,7 +1038,7 @@ mod tests {
         let mut opts = IngestOptions::new(8 * 1024 * 1024, ChunkCodec::Zstd);
         opts.block_size = 1024 * 1024;
         opts.memory_budget = Some(budget.clone());
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
             .await
             .unwrap();
@@ -1072,7 +1072,7 @@ mod tests {
                 let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
                 opts.block_size = 512 * 1024;
                 opts.memory_budget = Some(budget);
-                let db = BlobDb::connect(&log_dir).await.unwrap();
+                let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
                 let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
                     .await
                     .unwrap();
@@ -1111,7 +1111,7 @@ mod tests {
                 let mut opts = IngestOptions::new(2 * 1024 * 1024, ChunkCodec::Raw);
                 opts.block_size = frame;
                 opts.memory_budget = Some(budget);
-                let db = BlobDb::connect(&log_dir).await.unwrap();
+                let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
                 let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
                     .await
                     .unwrap();
@@ -1150,7 +1150,7 @@ mod tests {
         let mut opts = IngestOptions::new(4 * 1024 * 1024, ChunkCodec::Zstd);
         opts.block_size = 512 * 1024;
         opts.memory_budget = Some(budget.clone());
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let layer = Arc::new(
             ChunkStore::open(db, MemoryBlobStore::new(), opts)
                 .await

@@ -38,7 +38,6 @@ use std::any::Any;
 use std::marker::PhantomData;
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -49,10 +48,10 @@ pub mod raft;
 pub mod snapshot;
 
 pub use log::{
-    Base, Batch, Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogId, LogResult,
+    Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult,
     LogStore, Position, LOG_FORMAT, ChainLogStore,
 };
-pub use snapshot::{BlobSnapshotStore, LocalSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
+pub use snapshot::{BlobSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 
 /// A rejection that cannot happen (a namespace whose commands never fail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -555,24 +554,31 @@ impl MetaStore {
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(every);
                 tick.tick().await;
+                // The metrics show a snapshot only once it is built: while one
+                // asked for is being built, asking again builds a copy. Ask
+                // again only once the metrics moved (or after a while).
+                let mut pending: Option<(Position, u32)> = None;
                 loop {
                     tick.tick().await;
                     let snapshotted = raft.metrics().borrow().snapshot.as_ref().map_or(0, raft::position);
-                    if shared.applied.load(Ordering::SeqCst) > snapshotted && raft.trigger().snapshot().await.is_err() {
-                        return;
+                    if let Some((at, ticks)) = pending {
+                        if snapshotted == at && ticks < 20 {
+                            pending = Some((at, ticks + 1));
+                            continue;
+                        }
+                        pending = None;
+                    }
+                    if shared.applied.load(Ordering::SeqCst) > snapshotted {
+                        pending = Some((snapshotted, 0));
+                        if raft.trigger().snapshot().await.is_err() {
+                            return;
+                        }
                     }
                 }
             })
         });
         *store.ticker.lock().unwrap() = ticker;
         Ok(Arc::new(store))
-    }
-
-    /// Boot over a [`LocalLogStore`] in `dir`, snapshots in the same directory.
-    pub async fn open_local(dir: impl AsRef<Path>, namespaces: Namespaces) -> Result<Arc<Self>> {
-        let log = LocalLogStore::open(dir.as_ref())?;
-        let snapshots = LocalSnapshotStore::new(dir.as_ref());
-        Self::open(Arc::new(log), Arc::new(snapshots), namespaces, MetaOptions::default()).await
     }
 
     pub fn has_namespace(&self, name: &str) -> bool {

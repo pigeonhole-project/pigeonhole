@@ -157,7 +157,7 @@ mod disk {
         v[((v.len() as f64 - 1.0) * p).round() as usize]
     }
 
-    /// The two disk logs side by side: append latency (one entry, fsync),
+    /// The disk log: append latency (one entry, fsync),
     /// open + claim, replay of 1M entries, rebase.
     /// `cargo test --release -p pigeonhole-meta bench_disk_logs -- --ignored --nocapture`
     #[tokio::test]
@@ -206,7 +206,6 @@ mod disk {
                  replay {n} entries {replay:?}; rebase {rebase:?}"
             );
         }
-        run("local", &|d| Arc::new(crate::log::LocalLogStore::open(d).unwrap())).await;
         run("disk chain", &|d| Arc::new(ChainLogStore::new(Arc::new(DiskBlobStore::open(d).unwrap())))).await;
     }
 }

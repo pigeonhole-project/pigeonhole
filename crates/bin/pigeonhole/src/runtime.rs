@@ -15,8 +15,8 @@ use crate::channel_log;
 use pigeonhole::telegram::{Lane, MtprotoChannel, TelegramBlobStore};
 use pigeonhole_blob::{InstanceInfo, InstanceRole};
 use pigeonhole_chunk_store::TelegramLogin;
-use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, LocalSnapshotStore, SnapshotStore};
-use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
+use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, SnapshotStore};
+use pigeonhole_meta::{LogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_storage_disk::DiskBlobStore;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -34,9 +34,11 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
             warn!("metadata log in memory: everything is gone when the process exits");
             Arc::new(ChainLogStore::new(Arc::new(MemoryBlobStore::new())))
         }
-        LogSettings::LocalDisk { path } => Arc::new(
-            LocalLogStore::open(path).with_context(|| format!("open local log {}", path.display()))?,
-        ),
+        // A local_disk store holds the log in `log/` and snapshots in
+        // `snapshots/` (one chain each), so one store may serve both.
+        LogSettings::LocalDisk { path } => Arc::new(ChainLogStore::new(Arc::new(
+            DiskBlobStore::open(path.join("log")).with_context(|| format!("open local log {}", path.display()))?,
+        ))),
         LogSettings::Telegram { chat_id, login } => {
             info!(chat_id = %chat_id, "metadata log in a Telegram channel");
             Arc::new(ChainLogStore::new(meta_channel_store(cfg, login, chat_id, "log").await?))
@@ -47,7 +49,10 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
 /// The configured snapshot store (`[meta] snapshot`).
 pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStore>> {
     Ok(match &cfg.meta.snapshot {
-        SnapshotSettings::LocalDisk { path } => Arc::new(LocalSnapshotStore::new(path)),
+        SnapshotSettings::LocalDisk { path } => Arc::new(BlobSnapshotStore::new(Arc::new(
+            DiskBlobStore::open(path.join("snapshots"))
+                .with_context(|| format!("open local snapshots {}", path.display()))?,
+        ))),
         SnapshotSettings::Memory => Arc::new(BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new()))),
         SnapshotSettings::Telegram { chat_id, login } => {
             info!(chat_id = %chat_id, "metadata snapshots in a Telegram channel");

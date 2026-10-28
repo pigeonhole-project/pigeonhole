@@ -88,3 +88,28 @@ where
     let _ = backend.delete(&rest).await;
     Ok(())
 }
+
+/// A tablet over a disk log in `dir/log` with snapshots in `dir/snapshots`
+/// (as a `local_disk` `[meta]` store), namespaces added by `register`;
+/// reopening the same `dir` boots from what is there.
+pub async fn tablet(
+    dir: impl AsRef<std::path::Path>,
+    register: impl FnOnce(pigeonhole_meta::Namespaces) -> pigeonhole_meta::Namespaces,
+) -> std::sync::Arc<pigeonhole_meta::MetaStore> {
+    let (log, snapshots) = disk_meta(dir);
+    pigeonhole_meta::MetaStore::open(log, snapshots, register(pigeonhole_meta::Namespaces::new()), Default::default())
+        .await
+        .expect("boot a test tablet")
+}
+
+/// The log and snapshot stores of a `local_disk` `[meta]` store at `dir`.
+pub fn disk_meta(
+    dir: impl AsRef<std::path::Path>,
+) -> (std::sync::Arc<dyn pigeonhole_meta::LogStore>, std::sync::Arc<dyn pigeonhole_meta::SnapshotStore>) {
+    use pigeonhole_storage_disk::DiskBlobStore;
+    use std::sync::Arc;
+    let dir = dir.as_ref();
+    let log = Arc::new(DiskBlobStore::open(dir.join("log")).expect("open the log directory"));
+    let snapshots = Arc::new(DiskBlobStore::open(dir.join("snapshots")).expect("open the snapshot directory"));
+    (Arc::new(pigeonhole_meta::ChainLogStore::new(log)), Arc::new(pigeonhole_meta::BlobSnapshotStore::new(snapshots)))
+}

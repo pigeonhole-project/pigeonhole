@@ -405,7 +405,7 @@ mod tests {
     ) -> (tempfile::TempDir, ChunkStore, Arc<Replicated>) {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let rep = Arc::new(
             Replicated::new(members, write_quorum, Arc::new(CheapestFirst::new())).unwrap(),
         );
@@ -516,7 +516,7 @@ mod tests {
     async fn repair_stays_inside_a_chunks_shard() {
         let (a1, a2, b) = (lim("a1", 4 * MIB), lim("a2", 4 * MIB), lim("b", 4 * MIB));
         let dir = tempfile::tempdir().unwrap();
-        let db = BlobDb::connect(dir.path().join("blob.log")).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
         let shards = |a: Vec<SharedBackend>| {
             Arc::new(Replicated::sharded(vec![(a, 1), (vec![b.clone()], 1)], Arc::new(CheapestFirst::new())).unwrap())
         };

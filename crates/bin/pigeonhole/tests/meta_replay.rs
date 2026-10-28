@@ -10,7 +10,7 @@ use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_gateway_s3::S3State;
 use pigeonhole_chunk_store::ChunkState;
 use pigeonhole_meta::{
-    decode_state, encode_state, LocalLogStore, LocalSnapshotStore, LogStore, MetaOptions, MetaStore, Namespaces,
+    decode_state, encode_state, MetaOptions, MetaStore, Namespaces,
 };
 use s3s::dto::*;
 use s3s::{S3Request, S3};
@@ -32,10 +32,10 @@ fn req<T>(input: T) -> S3Request<T> {
 }
 
 async fn tablet(dir: &Path, snapshot_every: u64) -> Arc<MetaStore> {
-    let log = LocalLogStore::open(dir.join("log")).unwrap();
+    let (log, snapshots) = pigeonhole_testkit::disk_meta(dir);
     MetaStore::open(
-        Arc::new(log),
-        Arc::new(LocalSnapshotStore::new(dir.join("log"))),
+        log,
+        snapshots,
         Index::register(BlobDb::register(Namespaces::new())),
         MetaOptions { snapshot_every, ..MetaOptions::default() },
     )
@@ -106,7 +106,7 @@ async fn rebuild(snapshot_every: u64) {
     drop(s3);
 
     let replayed = tablet(dir.path(), snapshot_every).await;
-    let snapshot = LocalLogStore::open(dir.path().join("log")).unwrap().discover().await.unwrap().unwrap().base;
+    let snapshot = pigeonhole_testkit::disk_meta(dir.path()).0.discover().await.unwrap().unwrap().base;
     assert_eq!(snapshot.is_some(), snapshot_every > 0);
     assert_eq!(replayed.applied_position(), position);
     assert_eq!(replicated_state(&replayed), before);

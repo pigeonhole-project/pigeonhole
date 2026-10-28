@@ -84,13 +84,6 @@ pub enum DeleteBucketResult {
 }
 
 impl Index {
-    /// Open a standalone tablet over a local log in `log_dir` with only this
-    /// namespace.
-    pub async fn connect(log_dir: impl AsRef<std::path::Path>) -> Result<Self> {
-        let namespaces = Self::register(Namespaces::new());
-        Self::open(MetaStore::open_local(log_dir, namespaces).await?).await
-    }
-
     /// Add the `s3` namespace to the set passed to [`MetaStore::open`].
     pub fn register(namespaces: Namespaces) -> Namespaces {
         namespaces.with::<S3State>()

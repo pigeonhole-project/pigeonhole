@@ -13,9 +13,6 @@ use crate::{LogId, Position};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::PathBuf;
 use std::sync::Arc;
 use bytes::Bytes;
 use pigeonhole_storage_api::{collect_stream, After, BlobBackend, Chain};
@@ -74,86 +71,6 @@ pub trait SnapshotStore: Send + Sync + 'static {
     async fn newest(&self) -> Result<Option<StoredSnapshot>>;
     /// Drop a snapshot nothing starts from any more (best effort).
     async fn remove(&self, r: &SnapshotRef) -> Result<()>;
-}
-
-/// `snapshot-<log id>-<at>.snap` files in a directory; may be the log's own.
-pub struct LocalSnapshotStore {
-    dir: PathBuf,
-}
-
-impl LocalSnapshotStore {
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
-    }
-
-    fn path(&self, r: &SnapshotRef) -> Result<PathBuf> {
-        let name = &r.0;
-        if !(name.starts_with("snapshot-") && name.ends_with(".snap")) || name.contains(['/', '\\']) {
-            bail!("{name:?} is not a local snapshot");
-        }
-        Ok(self.dir.join(name))
-    }
-
-    fn write(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
-        fs::create_dir_all(&self.dir).with_context(|| format!("create {}", self.dir.display()))?;
-        let name = format!("snapshot-{}-{:020}.snap", snapshot.log_id, snapshot.at);
-        let tmp = self.dir.join(format!("{name}.tmp"));
-        let mut f = File::create(&tmp)?;
-        f.write_all(&snapshot.encode())?;
-        f.sync_all()?;
-        fs::rename(&tmp, self.dir.join(&name))?;
-        File::open(&self.dir)?.sync_all()?;
-        Ok(SnapshotRef(name))
-    }
-
-    fn newest_file(&self) -> Result<Option<PathBuf>> {
-        if !self.dir.exists() {
-            return Ok(None);
-        }
-        let mut best = None;
-        for e in fs::read_dir(&self.dir)? {
-            let e = e?;
-            let name = e.file_name().to_string_lossy().into_owned();
-            if !(name.starts_with("snapshot-") && name.ends_with(".snap")) {
-                continue;
-            }
-            let key = (e.metadata()?.modified()?, name);
-            if best.as_ref().is_none_or(|(k, _)| key > *k) {
-                best = Some((key, e.path()));
-            }
-        }
-        Ok(best.map(|(_, p)| p))
-    }
-}
-
-#[async_trait]
-impl SnapshotStore for LocalSnapshotStore {
-    async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
-        let this = Self::new(self.dir.clone());
-        let snapshot = snapshot.clone();
-        tokio::task::spawn_blocking(move || this.write(&snapshot)).await?
-    }
-
-    async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
-        let path = self.path(r)?;
-        let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        StoredSnapshot::decode(&data).with_context(|| format!("decode {}", path.display()))
-    }
-
-    async fn newest(&self) -> Result<Option<StoredSnapshot>> {
-        let Some(path) = self.newest_file()? else {
-            return Ok(None);
-        };
-        let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        Ok(Some(StoredSnapshot::decode(&data).with_context(|| format!("decode {}", path.display()))?))
-    }
-
-    async fn remove(&self, r: &SnapshotRef) -> Result<()> {
-        match fs::remove_file(self.path(r)?) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
-        }
-    }
 }
 
 /// Snapshots as blobs of any store that can chain them ([`Chain`]): no
@@ -277,11 +194,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn local_store_passes_the_conformance_suite() {
-        let dir = Arc::new(tempfile::tempdir().unwrap());
+    async fn the_blob_store_passes_the_conformance_suite_on_disk() {
+        let disk = Arc::new(pigeonhole_storage_disk::DiskBlobStore::open(tempfile::tempdir().unwrap().keep()).unwrap());
         conformance::run_all(|| {
-            let dir = dir.clone();
-            async move { Arc::new(LocalSnapshotStore::new(dir.path())) as Arc<dyn SnapshotStore> }
+            let disk = disk.clone();
+            async move { Arc::new(BlobSnapshotStore::new(disk)) as Arc<dyn SnapshotStore> }
         })
         .await;
     }
@@ -311,14 +228,18 @@ mod tests {
     #[tokio::test]
     async fn a_damaged_snapshot_is_detected() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalSnapshotStore::new(dir.path());
-        let r = store.put(&StoredSnapshot { log_id: LogId(7), at: 3, data: vec![1, 2, 3] }).await.unwrap();
-        let path = dir.path().join(&r.0);
-        let mut data = fs::read(&path).unwrap();
+        let store = BlobSnapshotStore::new(Arc::new(pigeonhole_storage_disk::DiskBlobStore::open(dir.path()).unwrap()));
+        store.put(&StoredSnapshot { log_id: LogId(7), at: 3, data: vec![1, 2, 3] }).await.unwrap();
+        let r = store.put(&StoredSnapshot { log_id: LogId(7), at: 4, data: vec![1, 2, 3] }).await.unwrap();
+        let seg = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("seg-"))
+            .unwrap();
+        let mut data = std::fs::read(&seg).unwrap();
         *data.last_mut().unwrap() ^= 0xff;
-        fs::write(&path, data).unwrap();
+        std::fs::write(&seg, data).unwrap();
         let err = store.get(&r).await.unwrap_err();
-        assert!(format!("{err:#}").contains("checksum"), "{err:#}");
-        assert!(store.get(&SnapshotRef("../etc/passwd".into())).await.is_err());
+        assert!(format!("{err:#}").contains("changed"), "{err:#}");
     }
 }

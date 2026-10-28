@@ -35,9 +35,9 @@ async fn setup_with_mem() -> (
     let idx_url = dir.path().join("s3.log");
     let blob_url = dir.path().join("blob.log");
     let cfg = Config::for_test(dir.path());
-    let index = Index::connect(&idx_url).await.unwrap();
+    let index = Index::open(pigeonhole_testkit::tablet(&idx_url, Index::register).await).await.unwrap();
     let mem = Arc::new(MemoryBlobStore::new());
-    let db = BlobDb::connect(&blob_url).await.unwrap();
+    let db = BlobDb::open(pigeonhole_testkit::tablet(&blob_url, BlobDb::register).await).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
     // ChunkStore takes ownership of a MemoryBlobStore; clone state is not shared.
@@ -664,8 +664,7 @@ async fn setup_one_tablet(chunk_size: usize) -> (pigeonhole::service::S3Gateway,
     let mut cfg = Config::for_test(dir.path());
     cfg.chunk_size = chunk_size;
     cfg.block_size = 64 * 1024;
-    let namespaces = Index::register(BlobDb::register(pigeonhole_meta::Namespaces::new()));
-    let meta = pigeonhole_meta::MetaStore::open_local(dir.path().join("meta"), namespaces).await.unwrap();
+    let meta = pigeonhole_testkit::tablet(dir.path().join("meta"), |ns| Index::register(BlobDb::register(ns))).await;
     let index = Index::open(meta.clone()).await.unwrap();
     let db = BlobDb::open(meta.clone()).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);

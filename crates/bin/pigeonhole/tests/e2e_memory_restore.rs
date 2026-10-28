@@ -13,7 +13,7 @@ use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_blob::{
     erase_sweep, CheapestFirst, Replicated, SharedBackend,
 };
-use pigeonhole_meta::{LocalLogStore, LocalSnapshotStore, MetaOptions, MetaStore, Namespaces};
+use pigeonhole_meta::{MetaOptions, MetaStore, Namespaces};
 use s3s::dto::*;
 use s3s::{S3, S3Request};
 use std::path::Path;
@@ -51,8 +51,8 @@ async fn open_with_shared_mem(
     mem: Arc<MemoryBlobStore>,
 ) -> pigeonhole::S3Gateway {
     let cfg = Config::for_test(dir);
-    let index = Index::connect(idx_log).await.unwrap();
-    let db = BlobDb::connect(blob_log).await.unwrap();
+    let index = Index::open(pigeonhole_testkit::tablet(idx_log, Index::register).await).await.unwrap();
+    let db = BlobDb::open(pigeonhole_testkit::tablet(blob_log, BlobDb::register).await).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
 
@@ -113,8 +113,7 @@ async fn s3s2_get(s3: &pigeonhole::S3Gateway) -> Vec<u8> {
 /// One tablet for both namespaces, as the binary runs it, with snapshots in
 /// another directory, taken after every batch (and when idle).
 async fn open_snapshotting(dir: &Path, mem: Arc<MemoryBlobStore>) -> (pigeonhole::S3Gateway, Arc<MetaStore>) {
-    let log = LocalLogStore::open(dir.join("log")).unwrap();
-    let snapshots = LocalSnapshotStore::new(dir.join("snapshots"));
+    let (log, snapshots) = pigeonhole_testkit::disk_meta(dir);
     let opts = MetaOptions {
         snapshot_every: 1,
         snapshot_interval: std::time::Duration::from_millis(10),
@@ -122,7 +121,7 @@ async fn open_snapshotting(dir: &Path, mem: Arc<MemoryBlobStore>) -> (pigeonhole
         ..MetaOptions::default()
     };
     let namespaces = Index::register(BlobDb::register(Namespaces::new()));
-    let meta = MetaStore::open(Arc::new(log), Arc::new(snapshots), namespaces, opts).await.unwrap();
+    let meta = MetaStore::open(log, snapshots, namespaces, opts).await.unwrap();
     let cfg = Config::for_test(dir);
     let index = Index::open(meta.clone()).await.unwrap();
     let db = BlobDb::open(meta.clone()).await.unwrap();
@@ -159,9 +158,9 @@ async fn lost_log_restores_from_stored_snapshots() {
 
     // The disk with the log is gone; the snapshot directory survived.
     std::fs::remove_dir_all(dir.path().join("log")).unwrap();
-    let log = LocalLogStore::open(dir.path().join("log")).unwrap();
-    let snapshots = LocalSnapshotStore::new(dir.path().join("snapshots"));
-    pigeonhole_meta::restore_lossy(&log, &snapshots).await.unwrap();
+    let (log, snapshots) = pigeonhole_testkit::disk_meta(dir.path());
+    pigeonhole_meta::restore_lossy(log.as_ref(), snapshots.as_ref()).await.unwrap();
+    drop((log, snapshots));
 
     let (s3, _meta) = open_snapshotting(dir.path(), mem).await;
     assert_eq!(s3s2_get(&s3).await, payload.as_ref());

@@ -108,13 +108,6 @@ impl std::fmt::Debug for BlobDb {
 }
 
 impl BlobDb {
-    /// Open a standalone tablet over a local log in `log_dir` with only this
-    /// namespace.
-    pub async fn connect(log_dir: impl AsRef<std::path::Path>) -> Result<Self> {
-        let namespaces = Self::register(Namespaces::new());
-        Self::open(MetaStore::open_local(log_dir, namespaces).await?).await
-    }
-
     /// Add the `chunk` namespace to the set passed to [`MetaStore::open`].
     pub fn register(namespaces: Namespaces) -> Namespaces {
         namespaces.with::<ChunkState>()
@@ -520,7 +513,7 @@ mod tests {
     async fn instances_and_refs_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let info = InstanceInfo {
             id: "tg-main".into(),
             kind: InstanceKind::Telegram,
@@ -566,7 +559,7 @@ mod tests {
     async fn missing_from_config_becomes_retired() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let a = InstanceInfo {
             id: "a".into(),
             kind: InstanceKind::Memory,
@@ -583,7 +576,7 @@ mod tests {
     async fn reclaim_then_retain_returns_chunk_gone() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let info = InstanceInfo {
             id: "mem".into(),
             kind: InstanceKind::Memory,
@@ -649,7 +642,7 @@ mod tests {
     async fn reclaimed_chunk_ids_are_never_reused() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         db.sync_instances(&[InstanceInfo {
             id: "mem".into(),
             kind: InstanceKind::Memory,
@@ -697,7 +690,7 @@ mod tests {
         db.release(&[new]).await.unwrap();
         assert!(db.try_begin_reclaim(new).await.unwrap());
         db.delete_chunk_metadata(new).await.unwrap();
-        let replayed = BlobDb::connect(dir.path().join("blob.log")).await.unwrap();
+        let replayed = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
         let after = replayed.insert_chunk(8, 1).await.unwrap();
         assert!(after > new, "chunk id {new} reused as {after} after replay");
     }
@@ -705,7 +698,7 @@ mod tests {
     #[tokio::test]
     async fn decoded_state_rebuilds_the_key_index() {
         let dir = tempfile::tempdir().unwrap();
-        let db = BlobDb::connect(dir.path().join("blob.log")).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
         db.sync_instances(&[InstanceInfo {
             id: "mem".into(),
             kind: InstanceKind::Memory,
@@ -736,7 +729,7 @@ mod tests {
     async fn double_release_errors() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
-        let db = BlobDb::connect(&log_dir).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let info = InstanceInfo {
             id: "mem".into(),
             kind: InstanceKind::Memory,

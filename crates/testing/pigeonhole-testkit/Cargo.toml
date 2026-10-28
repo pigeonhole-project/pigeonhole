@@ -10,3 +10,5 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 pigeonhole-blob = { workspace = true }
 pigeonhole-types = { workspace = true }
+pigeonhole-meta = { workspace = true }
+pigeonhole-storage-disk = { workspace = true }

@@ -48,6 +48,7 @@ bytestream = ["dep:pigeonhole-gateway-bytestream"]
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
 
 [dev-dependencies]
+pigeonhole-testkit = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }

@@ -117,8 +117,8 @@ async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
     cfg.chunk_size = CHUNK_SIZE;
     cfg.block_size = BLOCK_SIZE;
 
-    let index = Index::connect(&idx_log).await.unwrap();
-    let db = BlobDb::connect(&blob_log).await.unwrap();
+    let index = Index::open(pigeonhole_testkit::tablet(&idx_log, Index::register).await).await.unwrap();
+    let db = BlobDb::open(pigeonhole_testkit::tablet(&blob_log, BlobDb::register).await).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
 
