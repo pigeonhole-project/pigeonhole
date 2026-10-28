@@ -1,10 +1,10 @@
-# Sweep invariants / Инварианты уборки
+# Sweep invariants
 
 The sweeper deletes two kinds of backend blobs: parts of **released chunks**
 (reclaim) and **orphans** — blobs no chunk owns (failed or abandoned uploads, a
 dead writer's leftovers). Both run only while the tablet holds its generation.
 
-## Orphans: the upload horizon / Сироты: горизонт заливок
+## Orphans: the upload horizon
 
 Every upload is pinned **before** it sends anything (`UploadPins::pin`, in
 `PartPacker`); the pin records the highest key the instance had returned at
@@ -45,7 +45,7 @@ and the delete of one batch. The deleted keys are still garbage for this
 incarnation's state and below its horizon; the newer generation's own uploads
 have higher keys than anything this process returned before them.
 
-## Reclaim and reads / Освобождение и чтения
+## Reclaim and reads
 
 ```
 live (refs ≥ 1)

@@ -1,4 +1,4 @@
-# Metadata as a tablet / Метаданные как таблетка
+# Metadata as a tablet
 
 Status: **steps 1–3 implemented** — typed commands, in-memory state machines,
 a tablet over the `local` LogStore, snapshots, export and restore. The rest
@@ -12,7 +12,7 @@ kept in a storage that can **fence** old writers; an external **arbiter** only
 restarts the tablet somewhere else. Correctness comes from the log store, not
 from the arbiter.
 
-## Why / Зачем
+## Why
 
 The old design made metadata durable from inside the chunk store: a periodic
 checkpoint of the chunk tables, a superblock pinned in every read-write chat
@@ -21,7 +21,7 @@ separately. Commits between checkpoints were lost with the disk, the layers
 could disagree after a restore, and publishing the superblock was
 check-then-write, so two writers could both win. All of it is gone (step 3).
 
-## Goals / Цели
+## Goals
 
 1. Every metadata change is a typed command; state = commands applied in order.
 2. The command log lives in a pluggable **`LogStore`** that fences old
@@ -36,7 +36,7 @@ check-then-write, so two writers could both win. All of it is gone (step 3).
 
 Non-goals for now: several tablets / sharding metadata; follower reads.
 
-## Model / Модель
+## Model
 
 ```
                  arbiter (bootstrapper)                 liveness only
@@ -53,7 +53,7 @@ Non-goals for now: several tablets / sharding metadata; follower reads.
               LogStore: claim / append / discover / read / install_snapshot
 ```
 
-### Namespaces / Пространства имён
+### Namespaces
 
 Each layer (`chunk`, `s3`, `cas`) is a `StateMachine`:
 
@@ -77,14 +77,14 @@ at boot; golden tests pin each command encoding so a shape change has to bump
 `VERSION`. State uses ordered containers only, so equal states encode to equal
 bytes.
 
-### Generations / Поколения
+### Generations
 
 Every tablet incarnation runs under a **generation** `g`, strictly greater than
 every generation that ran before. All log writes carry `g`. After a newer
 generation has **claimed** the log, every `append` of an older one fails with
 `Fenced`; the older incarnation stops and never acknowledges again.
 
-### LogStore contract / Контракт журнала
+### LogStore contract
 
 ```rust
 trait LogStore {
@@ -120,7 +120,7 @@ outcome unknown). Positions number entries 1, 2, …; an empty batch (the zero
 entry) takes no position. A batch is one log write: commits are grouped
 (group commit) because some stores (Telegram) allow a write every few seconds.
 
-### Tablet lifecycle / Жизненный цикл
+### Tablet lifecycle
 
 1. **Boot** (`claim`): `gen = 1 + discover().gen` (`Fenced { current }` moves
    past a racing claim); `claim(gen)` → head.
@@ -153,7 +153,7 @@ orphans (the sweeper deletes them). Reclaim deletes parts only after an export
 shows the chunk reclaiming (sweep-invariants.md), so the newest export never
 references deleted parts. Only an off-host LogStore makes disk loss lossless.
 
-### Arbiter / Арбитр
+### Arbiter
 
 Liveness only, like YDB's Bootstrapper / Hive: watch the tablet's node, start it
 elsewhere when it is gone. It may be wrong (two incarnations at once) — the
@@ -161,7 +161,7 @@ elsewhere when it is gone. It may be wrong (two incarnations at once) — the
 node; restart = process restart). Later: a small watcher over the same LogStore
 (e.g. the claim message's age).
 
-## LogStore implementations / Реализации
+## LogStore implementations
 
 ### `local` — file on disk
 
@@ -254,9 +254,9 @@ Entries as objects `log/<position>` written with `If-None-Match: *`; a claim is
 an object at the next position, so two generations cannot both write it. Fast and
 cheap compared to Telegram; needs an S3-compatible store with conditional writes.
 
-## Contracts / Контракты
+## Contracts
 
-### Side effects / Побочные эффекты
+### Side effects
 
 - Only the active tablet runs the sweeper and repair; on `Fenced` they stop
   before the next backend call. Orphan deletes are preceded by
@@ -280,7 +280,7 @@ like YDB's `CollectGarbage` barrier on `generation:step`; ids of log objects are
 chosen by the writer, so collection needs no listing. Old Telegram messages are
 deleted by the tablet after a snapshot (`deleteMessage`).
 
-## Config / Конфигурация
+## Config
 
 ```toml
 [meta]
@@ -303,7 +303,7 @@ every_secs = 600                    # also by time if anything changed
 # path = "/mnt/backup/pigeonhole"
 ```
 
-## Plan / План
+## Plan
 
 Each step is a separate commit with tests green.
 
@@ -322,7 +322,7 @@ Each step is a separate commit with tests green.
    LogStore conformance suite and fault injection on a fake chat.
 7. **Arbiter** and a second node; `s3` LogStore.
 
-## Open questions / Открытые вопросы
+## Open questions
 
 - Telegram: the description is not a compare-and-swap; the protocol's safety
   rests on reading it right after the pin (read-after-write held on a live

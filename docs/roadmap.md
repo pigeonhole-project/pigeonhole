@@ -1,11 +1,11 @@
-# Roadmap / План работ
+# Roadmap
 
 Working plan for the metadata redesign. Design rationale lives in
 [meta-backends.md](meta-backends.md); GC rules in
 [sweep-invariants.md](sweep-invariants.md); terms in [glossary.md](glossary.md).
 Read those first.
 
-## Ground rules / Правила
+## Ground rules
 
 - Educational project: **no backward compatibility** — change formats, schemas
   and configs outright, no aliases or migrations.
@@ -16,10 +16,11 @@ Read those first.
   at the end of a step or before a push, not after every commit (~50 s a run).
 - After S3-visible changes also run `make compat-s3s-e2e` (STS failure is
   expected), `make compat-s3s-boto3`, `make compat-memory`.
+- Docs, comments and commit messages are in English only.
 - Layering is enforced: `meta` and `types`/`codec` depend on crates.io only;
   storage crates must not see chunk-store or gateways.
 
-## Where we are / Текущее состояние
+## Where we are
 
 Done (on `main`), steps 1–5:
 
@@ -62,7 +63,7 @@ Known gaps:
 - Telegram blob chats are swept by id up to the horizon, ours or not: keep
   nothing else in them (the Telegram LogStore needs its own chat).
 
-## Steps / Шаги
+## Steps
 
 ### Step 2 — Tablet over a local `LogStore` ✅ done
 
@@ -148,7 +149,7 @@ newest export loses recent changes but never breaks an object in it.
 Bootstrapper-like watcher that restarts the tablet elsewhere; write forwarding
 to the active node; `s3` LogStore with conditional writes (`If-None-Match`).
 
-## Open questions / Открытые вопросы
+## Open questions
 
 - Default batch window per LogStore kind (`local`: 0, no extra wait).
 - Plain `fsync` instead of `F_FULLFSYNC` for the local log on macOS.
