@@ -26,20 +26,23 @@ EXTRA_BG=""
 
 case "$INSTANCE" in
   memory)
-    INSTANCE_BLOCK=$'[[instances]]\nid = "mem"\nkind = "memory"'
+    BLOB_ID="mem"
+    INSTANCE_BLOCK=$'[[store]]\nid = "mem"\nkind = "memory"'
     # MemoryBlobStore is process-local; quiet background tasks under heavy suites.
     EXTRA_BG=$'\n[repair]\nscrub = false\ninterval_secs = 3600\n\n[sweep]\ninterval_secs = 3600\n'
     ;;
   telegram)
     : "${CONFIG_SCOPE_ID:?CONFIG_SCOPE_ID (chat id) required for telegram}"
-    INSTANCE_BLOCK="[[instances]]
+    BLOB_ID="tg"
+    INSTANCE_BLOCK="[[store]]
 id = \"tg\"
 kind = \"telegram\"
 chat_id = ${CONFIG_SCOPE_ID}"
     ;;
   discord)
     : "${CONFIG_SCOPE_ID:?CONFIG_SCOPE_ID (channel id) required for discord}"
-    INSTANCE_BLOCK="[[instances]]
+    BLOB_ID="dc"
+    INSTANCE_BLOCK="[[store]]
 id = \"dc\"
 kind = \"discord\"
 channel_id = ${CONFIG_SCOPE_ID}"
@@ -56,13 +59,18 @@ cat >"$CONFIG_OUT" <<EOF
 listen_addr = "${LISTEN_ADDR}"
 region = "${REGION}"
 
-[meta.log]
-kind = "local"
+[meta]
+log = "meta"
+
+[[store]]
+id = "meta"
+kind = "dir"
 path = "${META_LOG}"
 
 ${INSTANCE_BLOCK}
 
 [chunk]
+store = "${BLOB_ID}"
 size = ${CHUNK_SIZE}
 codec = "${CHUNK_CODEC}"
 block_size = 1048576

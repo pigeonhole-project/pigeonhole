@@ -66,7 +66,7 @@ impl DiscordBlobStore {
         )
     }
 
-    /// Build with a pre-resolved [`InstanceInfo`] (from `[[instances]]`).
+    /// Build with a pre-resolved [`InstanceInfo`] (from `[[store]]`).
     pub fn with_instance(
         dc: DiscordClient,
         channel_id: String,

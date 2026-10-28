@@ -1,9 +1,10 @@
-use crate::instances::{memory_instance, resolve_instances, FileInstance, InstanceConfig};
+use crate::instances::{memory_instance, InstanceConfig};
+use crate::stores::{FileReplicas, FileStore, Store, Topology};
 use crate::repair::{
     RepairConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
 };
 use crate::sweep::{SweepConfig, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};
-use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind, InstanceRole};
+use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
 use anyhow::{bail, Context, Result};
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Placement group: which instances receive chunk replicas and the write quorum.
+/// Blob placement (`[chunk] store`): which stores receive chunk replicas and the write quorum.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementConfig {
     /// Instance ids in the write group (read-write members).
@@ -42,9 +43,9 @@ pub struct Config {
     pub cache: CacheConfig,
     pub bytestream: BytestreamSettings,
     pub http: HttpSettings,
-    /// Resolved backend instances (`[[instances]]`).
+    /// The blob stores of `[chunk] store`.
     pub instances: Vec<InstanceConfig>,
-    /// Replica placement (`[placement]`); defaults to a single read-write instance.
+    /// How chunks are placed on them.
     pub placement: PlacementConfig,
     /// Stage H sweeper (`[sweep]`).
     pub sweep: SweepConfig,
@@ -56,7 +57,7 @@ pub struct Config {
 }
 
 /// Metadata tablet: group commit knobs, the command log and the snapshot
-/// store (`[meta]`, `[meta.log]`, `[meta.snapshot]`).
+/// store (`[meta]`, `log` / `snapshot` naming a `[[store]]`).
 #[derive(Clone, Debug)]
 pub struct MetaSettings {
     /// Group commit window; `0` = append as soon as the previous append returns.
@@ -70,20 +71,20 @@ pub struct MetaSettings {
     pub snapshot: SnapshotSettings,
 }
 
-/// Where snapshots live (`[meta.snapshot] kind = ...`).
+/// Where snapshots live (`[meta] snapshot`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotSettings {
-    /// Files in a directory; by default the log's own.
-    Local { path: PathBuf },
+    /// Files in a directory (may be the log's).
+    Dir { path: PathBuf },
     /// A dedicated Telegram channel (the newest snapshot pinned).
     Telegram { chat_id: String, bot_token: String },
 }
 
-/// Where the command log lives (`[meta.log] kind = ...`).
+/// Where the command log lives (`[meta] log`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogSettings {
     /// Segmented files in a directory on this host.
-    Local { path: PathBuf },
+    Dir { path: PathBuf },
     /// A dedicated Telegram channel / supergroup (pinned head chain,
     /// description fence; docs/meta-backends.md).
     Telegram {
@@ -97,11 +98,12 @@ pub enum LogSettings {
 impl MetaSettings {
     /// Defaults with the log and snapshots under `dir` (tests).
     pub fn in_dir(dir: &Path) -> Self {
-        let mut meta = FileMeta::default().into_settings().expect("default meta settings");
-        if let LogSettings::Local { path } = &mut meta.log {
+        let mut topology = Topology::new(Vec::new(), Vec::new()).expect("empty topology");
+        let mut meta = FileMeta::default().into_settings(&mut topology).expect("default meta settings");
+        if let LogSettings::Dir { path } = &mut meta.log {
             *path = dir.join(&*path);
         }
-        if let SnapshotSettings::Local { path } = &mut meta.snapshot {
+        if let SnapshotSettings::Dir { path } = &mut meta.snapshot {
             *path = dir.join(&*path);
         }
         meta
@@ -111,8 +113,8 @@ impl MetaSettings {
     /// chat next to a local log): then a lossy restore is possible.
     pub fn snapshots_outlive_log(&self) -> bool {
         match (&self.log, &self.snapshot) {
-            (LogSettings::Local { path: log }, SnapshotSettings::Local { path }) => log != path,
-            (LogSettings::Local { .. }, SnapshotSettings::Telegram { .. }) => true,
+            (LogSettings::Dir { path: log }, SnapshotSettings::Dir { path }) => log != path,
+            (LogSettings::Dir { .. }, SnapshotSettings::Telegram { .. }) => true,
             (LogSettings::Telegram { .. }, _) => false,
         }
     }
@@ -235,43 +237,15 @@ impl Config {
             bail!("telegram upload/download concurrency must be >= 1");
         }
 
-        if file.instances.is_empty() {
-            bail!("pigeonhole.toml: at least one [[instances]] entry is required");
-        }
-        let instances = resolve_instances(&file.instances)?;
-        let meta = file.meta.into_settings()?;
-        if let LogSettings::Telegram { chat_id, .. } = &meta.log {
-            if let Some(i) = instances
-                .iter()
-                .find(|i| i.info.kind == InstanceKind::Telegram && i.scope_id == *chat_id)
-            {
-                bail!(
-                    "[meta.log] chat_id {chat_id} is also instance {:?}: the sweeper deletes every \
-                     message of a blob chat, so the log needs a chat of its own",
-                    i.info.id
-                );
-            }
-        }
-        if let SnapshotSettings::Telegram { chat_id, .. } = &meta.snapshot {
-            if let Some(i) = instances
-                .iter()
-                .find(|i| i.info.kind == InstanceKind::Telegram && i.scope_id == *chat_id)
-            {
-                bail!(
-                    "[meta.snapshot] chat_id {chat_id} is also instance {:?}: the sweeper deletes \
-                     every message of a blob chat, so snapshots need a chat of their own",
-                    i.info.id
-                );
-            }
-            if matches!(&meta.log, LogSettings::Telegram { chat_id: log, .. } if log == chat_id) {
-                bail!(
-                    "[meta.snapshot] chat_id {chat_id} is the log chat: both use the pinned \
-                     message, so snapshots need a chat of their own"
-                );
-            }
-        }
-
-        let placement = resolve_placement(file.placement, &instances)?;
+        let mut topology = Topology::new(file.store, file.replicas)?;
+        let meta = file.meta.into_settings(&mut topology)?;
+        let blob_store = file
+            .chunk
+            .store
+            .as_deref()
+            .context("[chunk] store is required: the [[store]] or [[replicas]] id chunks go to")?;
+        let (instances, placement) = topology.blob_placement(blob_store)?;
+        topology.check_all_used()?;
         check_block_size_against_instances(block_size, &instances)?;
 
         Ok(Self {
@@ -341,7 +315,7 @@ impl Config {
         Arc::new(ChatLimiter::new(self.tg.clone()))
     }
 
-    /// Primary write instance (first member of `[placement].group`).
+    /// Primary blob store (first member of `[chunk] store`).
     pub fn primary_instance(&self) -> Result<&InstanceConfig> {
         let id = self
             .placement
@@ -351,7 +325,7 @@ impl Config {
         self.instances
             .iter()
             .find(|i| i.info.id == *id)
-            .with_context(|| format!("placement primary instance {id:?} not in [[instances]]"))
+            .with_context(|| format!("primary blob store {id:?} not resolved"))
     }
 
     /// Scope id (chat/channel) of the primary write instance.
@@ -383,9 +357,9 @@ struct FileConfig {
     #[serde(default)]
     http: FileHttp,
     #[serde(default)]
-    instances: Vec<FileInstance>,
+    store: Vec<FileStore>,
     #[serde(default)]
-    placement: Option<FilePlacement>,
+    replicas: Vec<FileReplicas>,
     #[serde(default)]
     sweep: FileSweep,
     #[serde(default)]
@@ -406,8 +380,8 @@ impl Default for FileConfig {
             cache: FileCache::default(),
             bytestream: FileBytestream::default(),
             http: FileHttp::default(),
-            instances: Vec::new(),
-            placement: None,
+            store: Vec::new(),
+            replicas: Vec::new(),
             sweep: FileSweep::default(),
             repair: FileRepair::default(),
             metrics: FileMetrics::default(),
@@ -420,58 +394,15 @@ impl Default for FileConfig {
 struct FileMeta {
     batch_max_delay_ms: u64,
     batch_max_entries: usize,
-    log: FileLog,
-    snapshot: FileMetaSnapshot,
-}
-
-/// Flat rather than a tagged enum: the timing keys sit next to the kind's.
-#[derive(Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct FileMetaSnapshot {
-    kind: String,
-    /// `local`: defaults to the log's path.
-    path: Option<PathBuf>,
-    /// `telegram`.
-    chat_id: Option<i64>,
-    bot_token_env: Option<String>,
-    every_entries: u64,
-    every_secs: u64,
-}
-
-impl Default for FileMetaSnapshot {
-    fn default() -> Self {
-        Self {
-            kind: "local".into(),
-            path: None,
-            chat_id: None,
-            bot_token_env: None,
-            every_entries: 10_000,
-            every_secs: 600,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
-enum FileLog {
-    Local {
-        path: PathBuf,
-    },
-    Telegram {
-        chat_id: i64,
-        #[serde(default = "default_bot_token_env")]
-        bot_token_env: String,
-        #[serde(default = "default_straggler_window_secs")]
-        straggler_window_secs: u64,
-    },
-}
-
-fn default_bot_token_env() -> String {
-    "BOT_TOKEN".into()
-}
-
-fn default_straggler_window_secs() -> u64 {
-    90
+    /// `[[store]]` id of the log (`dir` | `telegram`); unset = a `dir` store
+    /// at `pigeonhole-meta`.
+    log: Option<String>,
+    /// `[[store]]` id of the snapshots; unset = the log's store if it is a `dir`.
+    snapshot: Option<String>,
+    /// Telegram log: a claim waits this long for a deposed writer's last batch.
+    log_straggler_window_secs: u64,
+    snapshot_every_entries: u64,
+    snapshot_every_secs: u64,
 }
 
 impl Default for FileMeta {
@@ -479,67 +410,56 @@ impl Default for FileMeta {
         Self {
             batch_max_delay_ms: 0,
             batch_max_entries: 1024,
-            log: FileLog::default(),
-            snapshot: FileMetaSnapshot::default(),
+            log: None,
+            snapshot: None,
+            log_straggler_window_secs: 90,
+            snapshot_every_entries: 10_000,
+            snapshot_every_secs: 600,
         }
     }
 }
 
-impl Default for FileLog {
-    fn default() -> Self {
-        FileLog::Local { path: "pigeonhole-meta".into() }
-    }
-}
+/// Where the metadata goes when `[meta] log` is unset.
+const DEFAULT_META_DIR: &str = "pigeonhole-meta";
 
 impl FileMeta {
-    fn into_settings(self) -> Result<MetaSettings> {
-        let log = match self.log {
-            FileLog::Local { path } => LogSettings::Local { path },
-            FileLog::Telegram { chat_id, bot_token_env, straggler_window_secs } => {
-                let bot_token = env::var(&bot_token_env)
-                    .with_context(|| format!("[meta.log] bot_token_env {bot_token_env} is not set"))?;
-                LogSettings::Telegram {
-                    chat_id: chat_id.to_string(),
-                    bot_token,
-                    straggler_window: Duration::from_secs(straggler_window_secs),
-                }
-            }
+    fn into_settings(self, topology: &mut Topology) -> Result<MetaSettings> {
+        let log_store = match &self.log {
+            Some(id) => topology.meta_store(id, "[meta] log")?,
+            None => Store::Dir { path: DEFAULT_META_DIR.into() },
         };
-        let snap = self.snapshot;
-        let snapshot = match snap.kind.as_str() {
-            "local" => {
-                if snap.chat_id.is_some() || snap.bot_token_env.is_some() {
-                    bail!("[meta.snapshot] kind = \"local\" takes path, not chat_id / bot_token_env");
+        let log = match &log_store {
+            Store::Dir { path } => LogSettings::Dir { path: path.clone() },
+            Store::Telegram { chat_id, bot_token, .. } => LogSettings::Telegram {
+                chat_id: chat_id.clone(),
+                bot_token: bot_token.clone(),
+                straggler_window: Duration::from_secs(self.log_straggler_window_secs),
+            },
+            _ => unreachable!("meta_store returns dir or telegram"),
+        };
+        let snapshot_store = match &self.snapshot {
+            Some(id) => topology.meta_store(id, "[meta] snapshot")?,
+            None if matches!(log_store, Store::Dir { .. }) => log_store.clone(),
+            None => bail!("[meta] snapshot is required with a telegram log"),
+        };
+        let snapshot = match snapshot_store {
+            Store::Dir { path } => {
+                if matches!(log, LogSettings::Telegram { .. }) {
+                    bail!(
+                        "[meta] snapshot: a telegram log needs telegram snapshots (a log off-host \
+                         cannot start from snapshots on this disk)"
+                    );
                 }
-                let path = match (snap.path, &log) {
-                    (_, LogSettings::Telegram { .. }) => bail!(
-                        "[meta.log] kind = \"telegram\" needs [meta.snapshot] kind = \"telegram\": \
-                         a log off-host cannot start from snapshots on this disk"
-                    ),
-                    (Some(path), _) => path,
-                    (None, LogSettings::Local { path }) => path.clone(),
-                };
-                SnapshotSettings::Local { path }
+                SnapshotSettings::Dir { path }
             }
-            "telegram" => {
-                if snap.path.is_some() {
-                    bail!("[meta.snapshot] kind = \"telegram\" takes chat_id, not path");
-                }
-                let chat_id = snap.chat_id.context("[meta.snapshot] kind = \"telegram\" needs chat_id")?;
-                let bot_token_env = snap.bot_token_env.unwrap_or_else(default_bot_token_env);
-                SnapshotSettings::Telegram {
-                    chat_id: chat_id.to_string(),
-                    bot_token: env::var(&bot_token_env)
-                        .with_context(|| format!("[meta.snapshot] bot_token_env {bot_token_env} is not set"))?,
-                }
-            }
-            other => bail!("[meta.snapshot] kind = {other:?}: expected \"local\" or \"telegram\""),
+            Store::Telegram { chat_id, bot_token, .. } => SnapshotSettings::Telegram { chat_id, bot_token },
+            _ => unreachable!("meta_store returns dir or telegram"),
         };
         Ok(MetaSettings {
             batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
             batch_max_entries: self.batch_max_entries.max(1),
-            snapshot_every_entries: snap.every_entries,
-            snapshot_interval: Duration::from_secs(snap.every_secs),
+            snapshot_every_entries: self.snapshot_every_entries,
+            snapshot_interval: Duration::from_secs(self.snapshot_every_secs),
             log,
             snapshot,
         })
@@ -632,15 +552,7 @@ impl FileRepair {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilePlacement {
-    group: Vec<String>,
-    write_quorum: usize,
-}
-
-/// E.4: `block_size` (+ margin) must fit under every instance's max_blob_size,
-/// including read-only / retired members that may still serve repair reads.
+/// `block_size` (+ margin) must fit under every blob store's max_blob_size.
 pub fn check_block_size_against_instances(
     block_size: usize,
     instances: &[InstanceConfig],
@@ -673,61 +585,6 @@ pub fn check_block_size_against_instances(
     Ok(())
 }
 
-fn resolve_placement(
-    raw: Option<FilePlacement>,
-    instances: &[InstanceConfig],
-) -> Result<PlacementConfig> {
-    match raw {
-        None => {
-            // Without [placement]: single read-write instance group.
-            let rw: Vec<&InstanceConfig> = instances
-                .iter()
-                .filter(|i| i.info.role == InstanceRole::ReadWrite)
-                .collect();
-            let chosen = match rw.as_slice() {
-                [] => bail!("placement: no read-write instance available"),
-                [one] => one,
-                _ => bail!("placement: several read-write instances; set [placement].group"),
-            };
-            Ok(PlacementConfig {
-                group: vec![chosen.info.id.clone()],
-                write_quorum: 1,
-            })
-        }
-        Some(p) => {
-            if p.group.is_empty() {
-                bail!("placement.group must not be empty");
-            }
-            if p.write_quorum == 0 || p.write_quorum > p.group.len() {
-                bail!(
-                    "placement.write_quorum {} out of range for group of {}",
-                    p.write_quorum,
-                    p.group.len()
-                );
-            }
-            let known: std::collections::HashSet<&str> =
-                instances.iter().map(|i| i.info.id.as_str()).collect();
-            for id in &p.group {
-                if !known.contains(id.as_str()) {
-                    bail!("placement.group references unknown instance {id:?}");
-                }
-            }
-            for id in &p.group {
-                let inst = instances.iter().find(|i| i.info.id == *id).unwrap();
-                if inst.info.role != InstanceRole::ReadWrite {
-                    bail!(
-                        "placement.group member {id:?} is {:?}; write group requires read-write",
-                        inst.info.role
-                    );
-                }
-            }
-            Ok(PlacementConfig {
-                group: p.group,
-                write_quorum: p.write_quorum,
-            })
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -861,6 +718,8 @@ impl FileCache {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileChunk {
+    /// `[[store]]` or `[[replicas]]` id chunks go to.
+    store: Option<String>,
     size: usize,
     codec: ChunkCodec,
     block_size: Option<usize>,
@@ -869,6 +728,7 @@ struct FileChunk {
 impl Default for FileChunk {
     fn default() -> Self {
         Self {
+            store: None,
             size: chunker::DEFAULT_CHUNK_SIZE,
             codec: ChunkCodec::Zstd,
             block_size: None,
@@ -958,15 +818,23 @@ mod tests {
         Config::load_from_path(f.path())
     }
 
-    const MEM: &str = r#"
-[[instances]]
-id = "mem"
-kind = "memory"
-"#;
+    /// `toml` plus a memory blob store as `[chunk] store`.
+    fn load_mem(toml: &str) -> Result<Config> {
+        let toml = if toml.contains("[chunk]\n") {
+            toml.replacen("[chunk]\n", "[chunk]\nstore = \"mem\"\n", 1)
+        } else {
+            format!("{toml}\n[chunk]\nstore = \"mem\"\n")
+        };
+        load(&format!("{toml}\n[[store]]\nid = \"mem\"\nkind = \"memory\"\n"))
+    }
+
+    fn tg_store(id: &str, chat: i64) -> String {
+        format!("[[store]]\nid = \"{id}\"\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_env = \"PH_TEST_TG_TOKEN\"\n")
+    }
 
     #[test]
     fn parses_example_shape() {
-        let cfg = load(&format!(
+        let cfg = load_mem(
             r#"
 listen_addr = "127.0.0.1:9"
 [chunk]
@@ -977,8 +845,8 @@ send_rate_per_sec = 1.0
 send_burst = 2.0
 get_file_rate_per_sec = 20.0
 upload_concurrency = 4
-{MEM}"#
-        ))
+"#,
+        )
         .unwrap();
         assert_eq!(cfg.chunk_size, 1024);
         assert_eq!(cfg.chunk_codec, ChunkCodec::Raw);
@@ -990,34 +858,50 @@ upload_concurrency = 4
         assert_eq!(cfg.meta.batch_max_delay, Duration::ZERO);
         assert_eq!(cfg.meta.snapshot_every_entries, 10_000);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(600));
-        assert_eq!(cfg.meta.log, LogSettings::Local { path: "pigeonhole-meta".into() });
-        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Local { path: "pigeonhole-meta".into() });
+        assert_eq!(cfg.meta.log, LogSettings::Dir { path: "pigeonhole-meta".into() });
+        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Dir { path: "pigeonhole-meta".into() });
         assert!(!cfg.meta.snapshots_outlive_log(), "same directory, same disk");
     }
 
     #[test]
     fn parses_meta_section() {
-        let cfg = load(&format!(
-            "[meta]\nbatch_max_delay_ms = 250\n[meta.snapshot]\nevery_entries = 0\nevery_secs = 60\nkind = \"local\"\npath = \"/backup\"\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
+        let dirs = "[[store]]\nid = \"disk\"\nkind = \"dir\"\npath = \"/var/log-dir\"\n\
+                    [[store]]\nid = \"backup\"\nkind = \"dir\"\npath = \"/backup\"\n";
+        let cfg = load_mem(&format!(
+            "[meta]\nbatch_max_delay_ms = 250\nlog = \"disk\"\nsnapshot = \"backup\"\n\
+             snapshot_every_entries = 0\nsnapshot_every_secs = 60\n{dirs}"
         ))
         .unwrap();
         assert_eq!(cfg.meta.batch_max_delay, Duration::from_millis(250));
         assert_eq!(cfg.meta.snapshot_every_entries, 0);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(60));
-        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Local { path: "/backup".into() });
+        assert_eq!(cfg.meta.log, LogSettings::Dir { path: "/var/log-dir".into() });
+        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Dir { path: "/backup".into() });
         assert!(cfg.meta.snapshots_outlive_log());
-        assert_eq!(cfg.meta.log, LogSettings::Local { path: "/var/log-dir".into() });
-        for bad in ["[meta]\ndb_path = \"m.db\"\n", "[meta.log]\nkind = \"s3\"\n", "[meta.log]\nkind = \"local\"\nchat_id = 1\n", "[meta.snapshot]\nkind = \"dir\"\n", "[meta.snapshot]\nchat_id = 1\n", "[meta.snapshot]\nkind = \"telegram\"\n"] {
-            assert!(load(&format!("{bad}{MEM}")).is_err(), "{bad:?} accepted");
+
+        // One dir for both: the default layout.
+        let cfg = load_mem(&format!("[meta]\nlog = \"disk\"\nsnapshot = \"disk\"\n{}", &dirs[..dirs.find("[[store]]\nid = \"backup\"").unwrap()]))
+            .unwrap();
+        assert!(!cfg.meta.snapshots_outlive_log());
+
+        for bad in [
+            "[meta]\ndb_path = \"m.db\"\n",
+            "[meta]\nlog = \"nope\"\n",
+            "[meta]\nlog = \"mem\"\n",
+            "[meta.log]\nkind = \"dir\"\n",
+            "[[store]]\nid = \"x\"\nkind = \"s3\"\n",
+            "[[store]]\nid = \"x\"\nkind = \"dir\"\npath = \"/x\"\nchat_id = 1\n",
+            "[[store]]\nid = \"x\"\nkind = \"dir\"\n",
+        ] {
+            assert!(load_mem(bad).is_err(), "{bad:?} accepted");
         }
     }
 
     #[test]
     fn telegram_log_needs_a_chat_of_its_own() {
-        std::env::set_var("PH_TEST_LOG_TOKEN", "1:test");
-        let log = "[meta.log]\nkind = \"telegram\"\nchat_id = -100\nbot_token_env = \"PH_TEST_LOG_TOKEN\"\n\
-                   [meta.snapshot]\nkind = \"telegram\"\nchat_id = -101\nbot_token_env = \"PH_TEST_LOG_TOKEN\"\n";
-        let cfg = load(&format!("{log}{MEM}")).unwrap();
+        std::env::set_var("PH_TEST_TG_TOKEN", "1:test");
+        let stores = format!("{}{}", tg_store("tg-log", -100), tg_store("tg-snap", -101));
+        let cfg = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n{stores}")).unwrap();
         assert!(!cfg.meta.snapshots_outlive_log());
         assert_eq!(
             cfg.meta.log,
@@ -1027,33 +911,53 @@ upload_concurrency = 4
                 straggler_window: Duration::from_secs(90),
             }
         );
-        let blob_chat = "[[instances]]\nid = \"tg\"\nkind = \"telegram\"\nchat_id = -100\nbot_token_env = \"PH_TEST_LOG_TOKEN\"\n";
-        let err = load(&format!("{log}{blob_chat}")).unwrap_err();
-        assert!(format!("{err:#}").contains("chat of its own"), "{err:#}");
+        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Telegram { chat_id: "-101".into(), bot_token: "1:test".into() });
 
-        let local_snapshots = "[meta.log]\nkind = \"telegram\"\nchat_id = -100\nbot_token_env = \"PH_TEST_LOG_TOKEN\"\n";
-        let err = load(&format!("{local_snapshots}{MEM}")).unwrap_err();
+        let err = load(&format!(
+            "[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n[chunk]\nstore = \"tg-log\"\n{stores}"
+        ))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("one purpose"), "{err:#}");
+        let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-log\"\n{stores}")).unwrap_err();
+        assert!(format!("{err:#}").contains("one purpose"), "{err:#}");
+        let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n{stores}{}", tg_store("again", -100)))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("same chat"), "{err:#}");
+
+        let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\n{}", tg_store("tg-log", -100))).unwrap_err();
+        assert!(format!("{err:#}").contains("snapshot is required"), "{err:#}");
+        let disk = "[[store]]\nid = \"disk\"\nkind = \"dir\"\npath = \"/x\"\n";
+        let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"disk\"\n{}{disk}", tg_store("tg-log", -100)))
+            .unwrap_err();
         assert!(format!("{err:#}").contains("cannot start from snapshots on this disk"), "{err:#}");
     }
 
     #[test]
-    fn telegram_snapshots_need_a_chat_of_their_own() {
-        std::env::set_var("PH_TEST_EXPORT_TOKEN", "1:test");
-        let export = |chat: i64| {
-            format!("[meta.snapshot]\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_env = \"PH_TEST_EXPORT_TOKEN\"\n")
-        };
-        let cfg = load(&format!("{}{MEM}", export(-200))).unwrap();
-        assert_eq!(
-            cfg.meta.snapshot,
-            SnapshotSettings::Telegram { chat_id: "-200".into(), bot_token: "1:test".into() }
-        );
-        assert!(cfg.meta.snapshots_outlive_log(), "a local log, snapshots in a chat");
-        let blob_chat = "[[instances]]\nid = \"tg\"\nkind = \"telegram\"\nchat_id = -200\nbot_token_env = \"PH_TEST_EXPORT_TOKEN\"\n";
-        let err = load(&format!("{}{blob_chat}", export(-200))).unwrap_err();
-        assert!(format!("{err:#}").contains("chat of their own"), "{err:#}");
-        let log = "[meta.log]\nkind = \"telegram\"\nchat_id = -200\nbot_token_env = \"PH_TEST_EXPORT_TOKEN\"\n";
-        let err = load(&format!("{}{log}{MEM}", export(-200))).unwrap_err();
-        assert!(format!("{err:#}").contains("log chat"), "{err:#}");
+    fn a_local_log_with_snapshots_in_a_chat() {
+        std::env::set_var("PH_TEST_TG_TOKEN", "1:test");
+        let cfg = load_mem(&format!("[meta]\nsnapshot = \"tg-snap\"\n{}", tg_store("tg-snap", -200))).unwrap();
+        assert_eq!(cfg.meta.log, LogSettings::Dir { path: "pigeonhole-meta".into() });
+        assert!(cfg.meta.snapshots_outlive_log());
+    }
+
+    #[test]
+    fn blobs_on_a_replica_group() {
+        let stores = "[[store]]\nid = \"a\"\nkind = \"memory\"\n[[store]]\nid = \"b\"\nkind = \"memory\"\n";
+        let group = |q: usize| format!("[[replicas]]\nid = \"ab\"\nmembers = [\"a\", \"b\"]\nwrite_quorum = {q}\n");
+        let cfg = load(&format!("[chunk]\nstore = \"ab\"\n{stores}{}", group(2))).unwrap();
+        assert_eq!(cfg.placement.group, vec!["a", "b"]);
+        assert_eq!(cfg.placement.write_quorum, 2);
+        assert_eq!(cfg.instances.len(), 2);
+
+        let err = load(&format!("[chunk]\nstore = \"ab\"\n{stores}{}", group(3))).unwrap_err();
+        assert!(format!("{err:#}").contains("write_quorum"), "{err:#}");
+        let err = load(&format!("[chunk]\nstore = \"a\"\n{stores}")).unwrap_err();
+        assert!(format!("{err:#}").contains("[[store]] b is not used"), "{err:#}");
+        let nested = "[[replicas]]\nid = \"top\"\nmembers = [\"ab\"]\n";
+        let err = load(&format!("[chunk]\nstore = \"top\"\n{stores}{}{nested}", group(1))).unwrap_err();
+        assert!(format!("{err:#}").contains("replicas of groups"), "{err:#}");
+        let err = load(&format!("[meta]\nlog = \"ab\"\n[chunk]\nstore = \"ab\"\n{stores}{}", group(1))).unwrap_err();
+        assert!(format!("{err:#}").contains("not supported here yet"), "{err:#}");
     }
 
     #[test]
@@ -1065,42 +969,30 @@ upload_concurrency = 4
     }
 
     #[test]
-    fn requires_instances() {
+    fn requires_a_blob_store() {
         let msg = format!("{:#}", load("listen_addr = \"127.0.0.1:9\"\n").unwrap_err());
-        assert!(msg.contains("[[instances]]"), "unexpected error: {msg}");
+        assert!(msg.contains("[chunk] store"), "unexpected error: {msg}");
     }
 
     #[test]
     fn rejects_unknown_keys() {
         for stale in ["database_url = \"sqlite:x.db\"\n", "memory = true\n", "chat_id = \"-1001\"\n", "[telegram]\nrate_per_sec = 1.0\n"] {
-            let err = load(&format!("{stale}{MEM}")).unwrap_err();
+            let err = load_mem(stale).unwrap_err();
             assert!(format!("{err:#}").contains("unknown field"), "{stale:?} accepted");
+        }
+        for stale in ["[[instances]]\nid = \"x\"\nkind = \"memory\"\n", "[placement]\ngroup = [\"mem\"]\n"] {
+            assert!(load_mem(stale).is_err(), "{stale:?} accepted");
         }
     }
 
     #[test]
-    fn several_read_write_instances_need_placement() {
-        let two = r#"
-[[instances]]
-id = "a"
-kind = "memory"
-[[instances]]
-id = "b"
-kind = "memory"
-"#;
-        let msg = format!("{:#}", load(two).unwrap_err());
-        assert!(msg.contains("[placement]"), "unexpected error: {msg}");
-        let cfg = load(&format!("{two}[placement]\ngroup = [\"a\", \"b\"]\nwrite_quorum = 2\n")).unwrap();
-        assert_eq!(cfg.placement.group, vec!["a", "b"]);
-        assert_eq!(cfg.placement.write_quorum, 2);
-    }
-
-    #[test]
-    fn parses_discord_instance() {
+    fn parses_discord_store() {
         std::env::set_var("DISCORD_BOT_TOKEN", "discord-test-token");
         let cfg = load(
             r#"
-[[instances]]
+[chunk]
+store = "dc"
+[[store]]
 id = "dc"
 kind = "discord"
 channel_id = 123456789
@@ -1117,10 +1009,7 @@ max_blob_size = 8388608
 
     #[test]
     fn rejects_memory_budget_below_two_blocks() {
-        let err = load(&format!(
-            "[chunk]\nblock_size = 1048576\n[ingest]\nmemory_budget = 1048576\n{MEM}"
-        ))
-        .unwrap_err();
+        let err = load_mem("[chunk]\nblock_size = 1048576\n[ingest]\nmemory_budget = 1048576\n").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("ingest.memory_budget"), "unexpected error: {msg}");
     }

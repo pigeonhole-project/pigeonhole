@@ -8,6 +8,7 @@ pub mod ingest;
 pub mod instances;
 pub mod layer;
 pub mod repair;
+pub mod stores;
 pub mod sweep;
 
 pub use blob_db::{is_chunk_gone, BlobDb, ChunkGone, ReadPin, StoredBlock};

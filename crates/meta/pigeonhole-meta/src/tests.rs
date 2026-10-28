@@ -58,7 +58,7 @@ fn snapshot(store: &MetaStore) -> Vec<u8> {
     store.read::<Counter, _>(encode_state)
 }
 
-/// Log and snapshots in one directory, as `[meta.log]` / `[meta.snapshot]`
+/// Log and snapshots in one directory, as `[meta] log` / `snapshot`
 /// with the same `path`.
 fn local(dir: &Path) -> (Arc<dyn LogStore>, Arc<dyn SnapshotStore>) {
     (Arc::new(LocalLogStore::open(dir).unwrap()), Arc::new(LocalSnapshotStore::new(dir)))

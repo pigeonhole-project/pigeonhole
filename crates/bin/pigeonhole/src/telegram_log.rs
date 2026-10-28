@@ -1,4 +1,4 @@
-//! Binary-only: the Telegram side of the chat LogStore (`[meta.log] kind = "telegram"`).
+//! Binary-only: the Telegram side of the chat LogStore (`[meta] log` naming a telegram `[[store]]`).
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;

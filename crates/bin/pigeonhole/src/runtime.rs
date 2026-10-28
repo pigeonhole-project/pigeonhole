@@ -25,16 +25,16 @@ pub struct Runtime {
     pub store: Arc<ChunkStore>,
 }
 
-/// The configured metadata log (`[meta.log]`).
+/// The configured metadata log (`[meta] log`).
 pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
     Ok(match &cfg.meta.log {
-        LogSettings::Local { path } => Arc::new(
+        LogSettings::Dir { path } => Arc::new(
             LocalLogStore::open(path).with_context(|| format!("open local log {}", path.display()))?,
         ),
         LogSettings::Telegram { chat_id, bot_token, straggler_window } => {
             if *straggler_window <= telegram_log::CALL_DEADLINE {
                 bail!(
-                    "[meta.log] straggler_window_secs must exceed the {:?} call deadline",
+                    "[meta] log_straggler_window_secs must exceed the {:?} call deadline",
                     telegram_log::CALL_DEADLINE
                 );
             }
@@ -48,10 +48,10 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
     })
 }
 
-/// The configured snapshot store (`[meta.snapshot]`).
+/// The configured snapshot store (`[meta] snapshot`).
 pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStore>> {
     Ok(match &cfg.meta.snapshot {
-        SnapshotSettings::Local { path } => Arc::new(LocalSnapshotStore::new(path)),
+        SnapshotSettings::Dir { path } => Arc::new(LocalSnapshotStore::new(path)),
         SnapshotSettings::Telegram { chat_id, bot_token } => {
             let tg = TelegramClient::new(bot_token.clone()).context("telegram client for snapshots")?;
             tg.ensure_chat_admin(chat_id).await.context("snapshot chat access check")?;

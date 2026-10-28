@@ -62,7 +62,7 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
 }
 
 /// Start a new metadata log from the newest stored snapshot (after losing the
-/// log, with `[meta.snapshot]` elsewhere). Lossy: everything after it is gone.
+/// log, with `[meta] snapshot` elsewhere). Lossy: everything after it is gone.
 pub async fn cmd_restore(lossy: bool) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     if !lossy {

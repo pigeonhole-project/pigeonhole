@@ -62,7 +62,7 @@ impl TelegramBlobStore {
         )
     }
 
-    /// Build with a pre-resolved [`InstanceInfo`] (from `[[instances]]`).
+    /// Build with a pre-resolved [`InstanceInfo`] (from `[[store]]`).
     pub fn with_instance(
         tg: TelegramClient,
         chat_id: String,

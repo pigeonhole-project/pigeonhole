@@ -1,8 +1,7 @@
-//! Backend instances from `[[instances]]`.
+//! Blob stores as the chunk store sees them (resolved from `[[store]]`).
 
 use anyhow::{bail, Context, Result};
 use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole};
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
 /// One configured backend instance after secret resolution.
@@ -58,111 +57,6 @@ pub fn discord_app_id_from_token(token: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("unknown")
         .to_string()
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FileInstance {
-    pub id: String,
-    pub kind: String,
-    pub bot_token_env: Option<String>,
-    pub chat_id: Option<i64>,
-    pub channel_id: Option<u64>,
-    pub max_blob_size: Option<usize>,
-    #[serde(default = "default_role")]
-    pub role: String,
-}
-
-fn default_role() -> String {
-    "read-write".into()
-}
-
-fn parse_role(s: &str) -> Result<InstanceRole> {
-    match s {
-        "read-write" | "rw" => Ok(InstanceRole::ReadWrite),
-        "read-only" | "ro" => Ok(InstanceRole::ReadOnly),
-        "retired" => Ok(InstanceRole::Retired),
-        other => bail!("unknown instance role {other:?}; expected read-write|read-only|retired"),
-    }
-}
-
-fn parse_kind(s: &str) -> Result<InstanceKind> {
-    match s {
-        "telegram" | "tg" => Ok(InstanceKind::Telegram),
-        "discord" | "dc" => Ok(InstanceKind::Discord),
-        "memory" => Ok(InstanceKind::Memory),
-        other => bail!("unknown instance kind {other:?}"),
-    }
-}
-
-/// Resolve `[[instances]]` entries; secrets loaded from env.
-pub(crate) fn resolve_instances(raw: &[FileInstance]) -> Result<Vec<InstanceConfig>> {
-    let mut out = Vec::with_capacity(raw.len());
-    for f in raw {
-        let kind = parse_kind(&f.kind)?;
-        let role = parse_role(&f.role)?;
-        let id = f.id.trim();
-        if id.is_empty() {
-            bail!("instance id must be non-empty");
-        }
-        let (bot_token_env, bot_token, scope_id, fingerprint, location) = match kind {
-            InstanceKind::Memory => (
-                String::new(),
-                String::new(),
-                "local".into(),
-                memory_fingerprint(id),
-                memory_location(id),
-            ),
-            InstanceKind::Telegram => {
-                let chat = f
-                    .chat_id
-                    .context("telegram instance requires chat_id")?;
-                let env_name = f
-                    .bot_token_env
-                    .clone()
-                    .unwrap_or_else(|| "BOT_TOKEN".into());
-                let token = std::env::var(&env_name).with_context(|| {
-                    format!("instance {id}: missing env {env_name}")
-                })?;
-                let scope = chat.to_string();
-                let fp = telegram_fingerprint(&token, &scope)?;
-                let loc = telegram_location(&scope);
-                (env_name, token, scope, fp, loc)
-            }
-            InstanceKind::Discord => {
-                let channel = f
-                    .channel_id
-                    .context("discord instance requires channel_id")?;
-                let env_name = f
-                    .bot_token_env
-                    .clone()
-                    .unwrap_or_else(|| "DISCORD_BOT_TOKEN".into());
-                let token = std::env::var(&env_name).with_context(|| {
-                    format!("instance {id}: missing env {env_name}")
-                })?;
-                let scope = channel.to_string();
-                let app_id = discord_app_id_from_token(&token);
-                let fp = discord_fingerprint(&app_id, &scope);
-                let loc = discord_location(&scope);
-                (env_name, token, scope, fp, loc)
-            }
-        };
-        out.push(InstanceConfig {
-            info: InstanceInfo {
-                id: id.to_string(),
-                kind,
-                fingerprint,
-                location,
-                role,
-            },
-            bot_token_env,
-            bot_token,
-            scope_id,
-            max_blob_size: f.max_blob_size,
-        });
-    }
-    validate_instances(&out)?;
-    Ok(out)
 }
 
 /// In-process memory instance (tests, local runs).

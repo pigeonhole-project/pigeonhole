@@ -1,5 +1,5 @@
 //! Where tablet snapshots live: a [`SnapshotStore`], configured apart from the
-//! log (`[meta.snapshot]`).
+//! log (`[meta] snapshot`).
 //!
 //! The log records which snapshot it starts from ([`LogStore::rebase`] with
 //! the [`SnapshotRef`] `put` returned), so a boot loads exactly that one and
