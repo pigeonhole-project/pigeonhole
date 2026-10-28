@@ -65,8 +65,6 @@ Known gaps:
   lives elsewhere (and restore from it is lossy); the `telegram` log avoids it.
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
-- Every S3 write is several log entries in a row: 8–23 s per small PUT on a
-  Telegram log (~18 sends a minute). Step 7b.
 - One log / snapshot implementation per store kind (`LocalLogStore`,
   `MemoryLogStore`, `ChannelLogStore`, three snapshot stores), beside the blob
   backends of the same stores. Step 7c.
@@ -197,7 +195,7 @@ Blobs on `local_disk` (`pigeonhole-storage-disk`, a file per blob); the log
 and snapshots in `memory` (tests, no fsync). Discord as a log / snapshot store:
 checked on a live bot, designed in [discord-log.md](discord-log.md) (step 10).
 
-### Step 7b — One log entry per S3 operation
+### Step 7b — One log entry per S3 operation ✅ done
 
 Design: [one-entry-per-operation.md](one-entry-per-operation.md). Layers
 hand out prepared commands, the gateway commits an operation's commands as
