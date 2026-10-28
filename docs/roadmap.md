@@ -134,6 +134,15 @@ Protocol: meta-backends.md § `telegram` (pinned head of a chain of log batches,
 4. The log chat must not be a blob chat (the sweeper deletes every id up to
    its horizon there): refuse such a config.
 
+### Step 6a — Off-host snapshot exports ✅ done
+
+For a local log that should survive its disk without a remote log:
+`[meta.snapshot.export] kind = "dir" | "telegram"` (a `SnapshotSink`; the
+newest export stays pinned in a dedicated chat), exports in the background,
+newest wins; `every_secs` snapshots an idle tablet; reclaim deletes parts only
+after an export shows the chunk reclaiming, so `restore --lossy` from the
+newest export loses recent changes but never breaks an object in it.
+
 ### Step 7 — Arbiter, second node, `s3` LogStore
 
 Bootstrapper-like watcher that restarts the tablet elsewhere; write forwarding
