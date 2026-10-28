@@ -162,8 +162,8 @@ share a chat: both use the pinned message.
    answers the callers. `Fenced` → stop the tablet (proposals fail, side effects
    stop, `serve` exits). A command that cannot be applied stops it too; the next
    boot rebuilds from the log.
-5. **Snapshot**: every `[meta.snapshot] every_entries` entries, and every
-   `every_secs` when anything changed (an idle tablet wakes up for it), between
+5. **Snapshot**: every `[meta] snapshot_every_entries` entries, and every
+   `snapshot_every_secs` when anything changed (an idle tablet wakes up for it), between
    batches: one `TabletSnapshot` of all states, stored with `put` in the
    background (one at a time); when it is stored, the batcher `rebase`s the log
    on it (dropping the log behind it) and removes the previous base snapshot.
@@ -322,28 +322,29 @@ batch_max_delay_ms = 0              # extra group commit window (local: 0;
                                     # batches still form while an append runs)
 batch_max_entries = 1024
 
-[meta.log]
-kind = "local"                      # local (default) | telegram | s3
-path = "pigeonhole-meta"
-# kind = "telegram"                 # ship the log off-host
-# bot_token_env = "BOT_TOKEN"
-# chat_id = -1009876543210          # channel / supergroup (fence = description)
+log = "meta"                        # a [[store]] id: dir | telegram (later s3)
+snapshot = "meta"                   # default: the log's store if it is a dir
+snapshot_every_entries = 10000      # 0 = never
+snapshot_every_secs = 600           # also by time if anything changed
+# log_straggler_window_secs = 90    # telegram log: claim waits for a deposed writer
 
-[meta.snapshot]
-kind = "local"                      # local (default) | telegram
-# path = "/mnt/backup/pigeonhole"   # default: the log's path
-# kind = "telegram"                 # required with a telegram log
-# chat_id = -1001111111111          # a chat of its own (not the log's)
-every_entries = 10000               # 0 = never
-every_secs = 600                    # also by time if anything changed
+[[store]]
+id = "meta"
+kind = "dir"
+path = "pigeonhole-meta"
+
+# [[store]]                         # ship the log off-host: a channel of its own
+# id = "tg-log"                     # (fence = description); snapshots then go to
+# kind = "telegram"                 # another telegram store
+# chat_id = -1009876543210
 ```
 
-| `[meta.log]` | `[meta.snapshot]` | losing this host's disk |
+| `[meta] log` | `[meta] snapshot` | losing this host's disk |
 |---|---|---|
-| local | local, same path | everything |
-| local | local elsewhere / telegram | `restore --lossy`: the tail after the newest snapshot |
-| telegram | telegram | nothing |
-| telegram | local | refused by the config |
+| dir | the same dir | everything |
+| dir | another dir / telegram | `restore --lossy`: the tail after the newest snapshot |
+| telegram | telegram (another chat) | nothing |
+| telegram | dir | refused by the config |
 
 ## Plan
 

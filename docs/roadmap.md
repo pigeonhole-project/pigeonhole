@@ -40,8 +40,8 @@ Done (on `main`), steps 1–6a:
   batch, `claimed_gen` + `log_id` under a `flock`; claim truncates a torn tail;
   `rebase` drops the segments behind the base. `ChatLogStore` keeps the log in
   a Telegram channel.
-- Snapshots every `[meta.snapshot] every_entries` (10000) and `every_secs`
-  (600, when anything changed), stored in a `SnapshotStore` configured apart
+- Snapshots every `[meta] snapshot_every_entries` (10000) and
+  `snapshot_every_secs` (600, when anything changed), stored in a `SnapshotStore` configured apart
   from the log (`local` | `telegram`); the log records which one it starts
   from. `pigeonhole restore --lossy` starts an empty log from the newest one.
 - Removed: `durability.rs` (checkpoint, superblock pins, root journal,
@@ -56,7 +56,7 @@ Done (on `main`), steps 1–6a:
 
 Known gaps:
 
-- With the `local` log, disk loss loses metadata unless `[meta.snapshot]`
+- With the `local` log, disk loss loses metadata unless `[meta] snapshot`
   lives elsewhere (and restore from it is lossy); the `telegram` log avoids it.
 - Every Telegram pin leaves a "pinned message" service message; nothing
   deletes them (one per log batch, one per stored snapshot).
@@ -140,7 +140,7 @@ Protocol: meta-backends.md § `telegram` (pinned head of a chain of log batches,
 ### Step 6a — Snapshots in a store of their own ✅ done
 
 `SnapshotStore` (`local` | `telegram`, contract tests) next to the
-`LogStore`, configured independently in `[meta.snapshot]`. The log records its
+`LogStore`, configured independently (`[meta] snapshot`). The log records its
 base (`rebase(gen, { at, snapshot ref })`), so boot loads exactly that snapshot
 and a deposed writer's late put cannot confuse it; the tablet removes the
 previous base. `every_secs` snapshots an idle tablet. When snapshots outlive
@@ -156,17 +156,29 @@ so `restore --lossy` loses recent changes but never breaks an object.
   (`storage-telegram/src/store.rs`, from the old snapshot manifest) and the pin
   right it still asks for.
 
-### Step 7 — Placement with copies (blob sharding)
+### Step 6c — Stores and groups in the config ✅ done
 
-`[placement] copies = k`: write each chunk to `k` of the group's members (least
-loaded first) instead of all of them, and let repair bring each chunk to `k`
-replicas. Several blob channels then add throughput (Telegram limits are per
-chat) instead of only copies. Metadata already records replicas per instance.
+`[[store]]` (dir | telegram | discord | memory) says only where bytes live;
+`[[replicas]]` combines blob stores; `[meta] log` / `snapshot` and
+`[chunk] store` name a store or group. A chat serves one purpose.
 
-### Step 8 — Arbiter, second node, `s3` LogStore
+### Step 7 — Blob shards
 
-Bootstrapper-like watcher that restarts the tablet elsewhere; write forwarding
-to the active node; `s3` LogStore with conditional writes (`If-None-Match`).
+`[[shards]]`: each chunk goes to one member (least loaded), a member being a
+store or a `[[replicas]]` group; `[chunk] store` may name it. Shards add
+throughput (Telegram limits are per chat), replicas inside a shard add
+availability. Repair brings a chunk to the members of its own shard, not of
+every store. Metadata already records replicas per store. Later: snapshots on
+groups (replicas, then shards that split a snapshot).
+
+### Step 8 — Raft between nodes
+
+Nodes are processes of this binary talking Raft (openraft); each node keeps
+its own Raft log and snapshots in a store of its own (a dir, or a chat with its
+own bot), so a node is defined by its store, not by its machine. Terms and
+quorums fence; the per-node store needs only local durability plus the claim
+that keeps two processes from running as the same node. The leader is the
+tablet (sweeper, repair, writes). Design in meta-backends.md first.
 
 ## Open questions
 

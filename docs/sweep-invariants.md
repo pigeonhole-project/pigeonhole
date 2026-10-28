@@ -65,7 +65,7 @@ gone
 - `BeginReclaim` is committed to the log before any part is deleted
   (`propose` returns only after the append), so a restart or failover never
   brings back a reference to deleted parts.
-- **Snapshots that outlive the log** (`[meta.snapshot]` on another path or in
+- **Snapshots that outlive the log** (`[meta] snapshot` on another path or in
   a chat next to a local log): parts are deleted only once
   `MetaStore::restorable_position` (the base) reaches a position at or after
   the chunk's `BeginReclaim` (`BlobDb::reclaim_in_snapshot`; the gate is

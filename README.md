@@ -63,9 +63,9 @@ Dependency layering is enforced by `./scripts/check-deps.sh --strict` in CI.
 ```bash
 cp pigeonhole.toml.example pigeonhole.toml
 cp .env.example .env
-# in pigeonhole.toml replace the telegram [[instances]] entry with:
-#   [[instances]]
-#   id = "mem"
+# in pigeonhole.toml replace the "tg-main" [[store]] with a memory one:
+#   [[store]]
+#   id = "tg-main"
 #   kind = "memory"
 cargo run --release
 ```
@@ -118,11 +118,14 @@ Bot API limits that shape the design:
 Discord is enabled by default (`--features discord`):
 
 ```toml
-[[instances]]
+[[store]]
 id = "dc"
 kind = "discord"
 channel_id = 123456789012345678
 # optional: max_blob_size = 10485760
+
+[chunk]
+store = "dc"
 ```
 
 Secret: `DISCORD_BOT_TOKEN` in `.env` (or the env var named by `bot_token_env`). The bot needs permission to view the
@@ -131,33 +134,37 @@ Attachment CDN URLs are cached (~50 min) and refreshed on 403/404. Default
 `max_blob_size` is ~10 MiB (Discord limit minus margin) — set `[chunk].size`
 accordingly.
 
-## Multiple instances / replication
+## Stores and replication
 
-Declare several `[[instances]]` (tokens are referenced by env var name, never
-inline) and list the write group in `[placement]`:
+Every place bytes can live is a `[[store]]` (`dir`, `telegram`, `discord`,
+`memory`; tokens are referenced by env var name, never inline). Stores are
+combined into `[[replicas]]` groups, and `[meta] log` / `snapshot` and
+`[chunk] store` name a store or a group:
 
 ```toml
-[[instances]]
+[[store]]
 id = "tg-main"
 kind = "telegram"
 bot_token_env = "BOT_TOKEN"
 chat_id = -1001234567890
-role = "read-write"   # read-write | read-only | retired
 
-[[instances]]
+[[store]]
 id = "dc-backup"
 kind = "discord"
 bot_token_env = "DISCORD_BOT_TOKEN"
 channel_id = 123456789012345678
-role = "read-write"
 
-[placement]
-group = ["tg-main", "dc-backup"]
+[[replicas]]
+id = "blobs"
+members = ["tg-main", "dc-backup"]
 write_quorum = 1
+
+[chunk]
+store = "blobs"
 ```
 
-Writes go to the read-write instances; reads pick the cheapest available
-replica. The `[repair]` task scrubs for under-replicated chunks and backfills
+Writes go to every member of the group; reads pick the cheapest available
+replica. A chat serves one purpose (log, snapshots or blobs). The `[repair]` task scrubs for under-replicated chunks and backfills
 them (re-packing parts when instance blob limits differ).
 
 ## Bazel / Buck2 remote cache (REAPI)
@@ -182,13 +189,11 @@ comments. Sections:
 
 | TOML | Meaning |
 |---|---|
-| `[[instances]]` | Backends (≥ 1): id, kind (`telegram` / `discord` / `memory`), token env, chat/channel, role, `max_blob_size` |
-| `[placement]` | Write group + quorum; required with several read-write instances |
+| `[[store]]` | Where bytes live: id, kind (`dir` + `path` / `telegram` + `chat_id` / `discord` + `channel_id` / `memory`), token env, `max_blob_size` |
+| `[[replicas]]` | A group of blob stores: `members`, `write_quorum` |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `[meta]` | Metadata tablet: `batch_max_delay_ms` / `batch_max_entries` (group commit) |
-| `[meta.log]` | Command log: `kind = "local"` + `path`, or `kind = "telegram"` + `chat_id` (a dedicated channel) |
-| `[meta.snapshot]` | Snapshot store: `kind = "local"` + `path` (default: the log's), or `kind = "telegram"` + `chat_id` (a dedicated channel); `every_entries` / `every_secs`: when to snapshot and drop the log behind it (`0` = never) |
-| `[chunk]` | `size` (max on-wire), `codec`, `block_size` |
+| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), group commit (`batch_max_delay_ms` / `batch_max_entries`), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never), `log_straggler_window_secs` |
+| `[chunk]` | `store` (a blob store or group), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Separate send / getFile / delete budgets, upload/download concurrency |
 | `[cache]` | `file_path` LRU, L1 unpacked blocks, L2 memory/disk blob cache |
@@ -204,26 +209,26 @@ half-applied.
 ## Durability and restore
 
 Every metadata change is a layer command. `pigeonhole-meta` appends it to the
-command log (`[meta.log]`, fsynced per batch) and then applies it to the
+command log (`[meta] log`, fsynced per batch) and then applies it to the
 in-memory state of its layer (`chunk`, `s3`, `cas`); the log is the source of
 truth and every boot rebuilds the state by replaying it (see
 [docs/meta-backends.md](docs/meta-backends.md)). There is no local database.
 
-Every `[meta.snapshot] every_entries` entries (and every `every_secs` when
-anything changed) the tablet snapshots all states into the snapshot store and
+Every `[meta] snapshot_every_entries` entries (and every `snapshot_every_secs`
+when anything changed) the tablet snapshots all states into the snapshot store and
 drops the log behind it, so boot = that snapshot + the log after it. Log and
 snapshots are configured separately:
 
-| `[meta.log]` | `[meta.snapshot]` | losing this host's disk |
+| `[meta] log` | `[meta] snapshot` | losing this host's disk |
 |---|---|---|
-| `local` | `local`, same path (default) | loses the metadata |
-| `local` | `local` on another disk, or `telegram` | `restore --lossy`: loses the changes after the newest snapshot |
-| `telegram` | `telegram` (another channel) | loses nothing: a clean machine boots from the chats |
+| a `dir` store | the same store (default) | loses the metadata |
+| a `dir` store | a `dir` on another disk, or a `telegram` store | `restore --lossy`: loses the changes after the newest snapshot |
+| a `telegram` store | another `telegram` store | loses nothing: a clean machine boots from the chats |
 
 After losing a local log whose snapshots survived:
 
 ```bash
-# starts an empty [meta.log] from the newest snapshot; changes after it are lost
+# starts an empty [meta] log from the newest snapshot; changes after it are lost
 cargo run --release -- restore --lossy
 ```
 
@@ -287,7 +292,7 @@ make compat-discord
 
 ## Limitations / ops notes
 
-- **One active process per log.** A process booting on the same `[meta.log]`
+- **One active process per log.** A process booting on the same `[meta] log`
   claims a newer generation and fences the running one, which exits. The
   `local` log fences only processes on the same host.
 - **`file_id` is bot-bound.** Telegram `file_id`s are only valid for the bot
