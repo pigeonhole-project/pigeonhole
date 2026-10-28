@@ -172,7 +172,12 @@ channel: snapshot ids would land in the log's checked ranges.
    (group commit), applies it in order, takes a snapshot if one is due, then
    answers the callers. `Fenced` → stop the tablet (proposals fail, side effects
    stop, `serve` exits). A command that cannot be applied stops it too; the next
-   boot rebuilds from the log.
+   boot rebuilds from the log. Several commands of different namespaces can be
+   proposed together (`Prepared<S>` built by the owning layer, collected into a
+   `Proposal`, `propose_all`): they go into one entry, never split, each applied
+   by its own namespace with its own outcome. An S3 or CAS write is one entry:
+   its chunks' `CommitChunk`s plus the index command
+   ([one-entry-per-operation.md](one-entry-per-operation.md)).
 5. **Snapshot**: every `[meta] snapshot_every_entries` entries, and every
    `snapshot_every_secs` when anything changed (an idle tablet wakes up for it), between
    batches: one `TabletSnapshot` of all states, stored with `put` in the

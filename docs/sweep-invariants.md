@@ -9,7 +9,11 @@ dead writer's leftovers). Both run only while the tablet holds its generation.
 Every upload is pinned **before** it sends anything (`UploadPins::pin`, in
 `PartPacker`); the pin records the highest key the instance had returned at
 that moment and is dropped only after the commit that references the part
-(`CommitChunk` / `AddReplica`) is applied, or when the upload fails. Backend
+(`CommitChunk` / `AddReplica`) is applied, or when the upload fails. An
+ingest's chunks are committed with the operation that points at them (one
+entry, see one-entry-per-operation.md), so their pins live across the whole
+S3 / CAS write; a write that fails before (a checksum mismatch) commits
+nothing and leaves the parts as orphans. Backend
 keys grow with time (Telegram / Discord message ids, the memory store's
 counter), so whatever an in-flight upload gets lies above every pin's floor.
 

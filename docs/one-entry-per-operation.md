@@ -1,6 +1,7 @@
 # One log entry per S3 operation
 
-Status: **proposal**. Read [meta-backends.md](meta-backends.md) and
+Status: **implemented** (steps 1–3; see Implementation notes). Read
+[meta-backends.md](meta-backends.md) and
 [sweep-invariants.md](sweep-invariants.md) first.
 
 ## Why
@@ -151,6 +152,23 @@ group with `PutObject`); the threshold is a constant, not config.
    answer. CAS (bytestream) gets the same treatment for `PutEntry`.
 4. Docs: meta-backends.md (proposals and entries), sweep-invariants.md (pins
    held across the whole operation).
+
+## Implementation notes (2026-10-28)
+
+- Outcomes are taken by slot (`Proposal::push` → `Slot<S>`,
+  `Outcomes::take(slot)`), not by tuple types.
+- `ingest` returns `PendingChunks` (commits + upload pins);
+  `PendingChunks::propose_in` + `Committing::done` (queue repair, drop the
+  pins) or `ChunkStore::commit`; `ingest_and_commit` for callers with
+  nothing to commit along.
+- `ChunkStore::commit_along(chunks, meta, proposal)`: one entry when the
+  other layer shares the tablet (always in the binary); tests that give each
+  layer a tablet of its own get two entries, the chunks first.
+- No grouping of commits for huge objects yet: every chunk of an object goes
+  into its one entry (a few KiB per chunk).
+- Releases after the answer are a `tokio::spawn` per operation, not a queue.
+- CopyObject is unchanged (Retain, then PutObject); its Release moved after
+  the answer.
 
 ## Open questions
 
