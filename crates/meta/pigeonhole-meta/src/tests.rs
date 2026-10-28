@@ -416,6 +416,36 @@ async fn the_tablet_runs_over_a_chat_log_with_snapshots_in_another_chat() {
 }
 
 #[tokio::test]
+async fn the_tablet_runs_over_a_channel_log_with_snapshots_in_another_channel() {
+    use crate::log::channel::fake::FakeChannel;
+    use crate::log::channel::{ChannelLogOptions, ChannelLogStore};
+    use crate::snapshot::ChannelSnapshotStore;
+    let (log_chat, snap_chat) = (Arc::new(FakeChannel::default()), Arc::new(FakeChannel::default()));
+    let open = || {
+        let opts = ChannelLogOptions { empty_retries: 1, empty_retry_delay: Duration::from_millis(1) };
+        let log = Arc::new(ChannelLogStore::new(log_chat.clone(), opts));
+        let snapshots = Arc::new(ChannelSnapshotStore::new(snap_chat.clone()));
+        MetaStore::open(log, snapshots, counter(), MetaOptions { snapshot_every: 7, ..MetaOptions::default() })
+    };
+    let a = open().await.unwrap();
+    for i in 0..20u64 {
+        a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    wait_base(&a, 14).await;
+    let state = snapshot(&a);
+    eventually("older snapshots removed", || snap_chat.inner.lock().unwrap().messages.len() <= 2).await;
+
+    let b = open().await.unwrap();
+    assert_eq!(snapshot(&b), state, "snapshot + tail rebuild the state");
+    let err = a.propose::<Counter>(op(100, 1)).await.unwrap_err();
+    assert_eq!(err.downcast::<Stop>().unwrap(), Stop::Fenced { current: 2 });
+    b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
+    assert_eq!(value(&b), 21);
+    let batches = log_chat.names().iter().filter(|(_, n)| n.ends_with("-batch.bin")).count();
+    assert!(batches < 15, "batches behind the base are collected: {batches} left");
+}
+
+#[tokio::test]
 async fn a_local_log_restores_from_snapshots_in_a_chat() {
     use crate::snapshot::ChatSnapshotStore;
     let dir = tempfile::tempdir().unwrap();
