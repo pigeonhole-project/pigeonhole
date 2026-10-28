@@ -12,6 +12,6 @@ pub use backend::{
     BlobBackend, BlobId, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
     Sweepable,
 };
-pub use chain::{After, Chain, Linked};
+pub use chain::{After, Chain, Linked, MakeAfter};
 pub use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 pub use stream::{bytes_stream, collect_stream, slice_range, BoxByteStream};

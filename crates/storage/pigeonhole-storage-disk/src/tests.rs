@@ -2,18 +2,8 @@ use super::*;
 use pigeonhole_blob::collect_stream;
 use std::fs;
 
-fn info(dir: &Path) -> InstanceInfo {
-    InstanceInfo {
-        id: "d".into(),
-        kind: InstanceKind::LocalDisk,
-        fingerprint: disk_location(dir),
-        location: disk_location(dir),
-        role: InstanceRole::ReadWrite,
-    }
-}
-
 fn small(dir: &Path, segment_bytes: u64) -> DiskBlobStore {
-    DiskBlobStore::with_segment_bytes(dir, info(dir), segment_bytes).unwrap()
+    DiskBlobStore::with_segment_bytes(dir, segment_bytes).unwrap()
 }
 
 async fn read(store: &DiskBlobStore, id: &DiskId) -> Vec<u8> {

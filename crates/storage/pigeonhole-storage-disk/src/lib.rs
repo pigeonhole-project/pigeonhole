@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
     bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceKind, InstanceRole,
-    Linked, OpKind, Sweepable,
+    Linked, MakeAfter, OpKind, Sweepable,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use segments::Segments;
@@ -49,6 +49,12 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 impl DiskBlobStore {
     /// Open (or create) the directory; instance id `local_disk`.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::with_segment_bytes(dir, DEFAULT_SEGMENT_BYTES)
+    }
+
+    /// [`Self::open`], rolling over to a new segment past `segment_bytes`
+    /// (tests use tiny ones).
+    pub fn with_segment_bytes(dir: impl Into<PathBuf>, segment_bytes: u64) -> Result<Self> {
         let dir = dir.into();
         let info = InstanceInfo {
             id: "local_disk".into(),
@@ -57,17 +63,15 @@ impl DiskBlobStore {
             location: disk_location(&dir),
             role: InstanceRole::ReadWrite,
         };
-        Self::with_instance(dir, info)
+        Self::open_as(dir, info, segment_bytes)
     }
 
     /// Open with a pre-resolved [`InstanceInfo`] (from `[[store]]`).
     pub fn with_instance(dir: impl Into<PathBuf>, info: InstanceInfo) -> Result<Self> {
-        Self::with_segment_bytes(dir, info, DEFAULT_SEGMENT_BYTES)
+        Self::open_as(dir.into(), info, DEFAULT_SEGMENT_BYTES)
     }
 
-    /// Roll over to a new segment file past `segment_bytes` (tests use tiny ones).
-    pub fn with_segment_bytes(dir: impl Into<PathBuf>, info: InstanceInfo, segment_bytes: u64) -> Result<Self> {
-        let dir = dir.into();
+    fn open_as(dir: PathBuf, info: InstanceInfo, segment_bytes: u64) -> Result<Self> {
         let segments = Segments::open(&dir, segment_bytes)?;
         Ok(Self {
             dir,
@@ -210,6 +214,32 @@ impl Chain for DiskBlobStore {
     async fn successor(&self, id: &Self::Id) -> Result<Option<Linked<Self::Id>>> {
         let key = id.key;
         self.locked(move |s| Ok(s.next.get(&Some(key)).map(|&n| Self::linked(s, n)))).await
+    }
+
+    /// Atomic: the tail is read and the blob appended under one `flock`.
+    async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
+        let segments = self.segments.clone();
+        let label = label.to_string();
+        // `make` is borrowed, so this runs on the caller's thread: one
+        // append and its fsync, the price of every claim.
+        (move || {
+            let mut guard = segments.lock().unwrap();
+            let mut s = guard.locked()?;
+            s.catch_up()?;
+            let tail = s.tail;
+            let data = match tail {
+                Some(t) => {
+                    let len = s.records.get(&t).map_or(0, |r| r.data_len);
+                    Some(s.read(t, 0, len)?)
+                }
+                None => None,
+            };
+            let tail_id = tail.map(|key| DiskId { key });
+            let Some(blob) = make(tail_id.as_ref().zip(data.as_deref()))? else { return Ok(None) };
+            self.check_size(&blob)?;
+            let key = s.append(Some((tail, &label)), &label, &blob)?;
+            Ok(Some(DiskId { key }))
+        })()
     }
 
     async fn prune(&self, below: &Self::Id) -> Result<()> {

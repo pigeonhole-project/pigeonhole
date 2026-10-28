@@ -48,7 +48,34 @@ pub trait Chain: BlobBackend {
     /// Delete every blob the store holds below `below` (by key): members and
     /// losers alike. The chain's tail is never below it. Best effort.
     async fn prune(&self, below: &Self::Id) -> Result<()>;
+
+    /// Put a blob built from the current tail after it: `make` gets the
+    /// tail's id and data (`None` for an empty chain) and returns the blob,
+    /// or `None` to put nothing (then the result is `None`). Returns the new
+    /// blob's id once it won.
+    ///
+    /// The default reads the tail and puts after it, again while another
+    /// blob wins first, so it may call `make` more than once: `make` must be
+    /// pure. A store that can decide it atomically (under a lock) should, or
+    /// a busy writer wins every gap between reading the tail and the put.
+    async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
+        let mut tail = self.tail().await?.map(|t| t.id);
+        loop {
+            let data = match &tail {
+                Some(id) => Some(crate::collect_stream(self.get(id, None).await?).await?),
+                None => None,
+            };
+            let Some(blob) = make(tail.as_ref().zip(data.as_deref()))? else { return Ok(None) };
+            match self.put_after(tail.as_ref(), label, blob).await? {
+                After::Won(id) => return Ok(Some(id)),
+                After::Lost(winner) => tail = Some(winner.id),
+            }
+        }
+    }
 }
+
+/// What [`Chain::put_after_tail`] builds a blob with.
+pub type MakeAfter<'a, Id> = dyn Fn(Option<(&Id, &[u8])>) -> Result<Option<Bytes>> + Send + Sync + 'a;
 
 #[async_trait]
 impl<C: Chain> Chain for std::sync::Arc<C> {
@@ -63,5 +90,8 @@ impl<C: Chain> Chain for std::sync::Arc<C> {
     }
     async fn prune(&self, below: &Self::Id) -> Result<()> {
         (**self).prune(below).await
+    }
+    async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
+        (**self).put_after_tail(label, make).await
     }
 }

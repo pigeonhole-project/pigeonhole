@@ -246,16 +246,24 @@ impl<C: Chain> ChainLogStore<C> {
 #[async_trait]
 impl<C: Chain> LogStore for ChainLogStore<C> {
     async fn claim(&self, gen: u64) -> LogResult<Head> {
-        loop {
-            let (log_id, tip, tail_gen) = match self.chain.tail().await? {
+        // What `make` decided, for the last call (it may run more than once).
+        enum Made<Id> {
+            Fenced(u64),
+            Claim { log_id: LogId, position: Position, doc: ChainDoc<Id>, crc: u32 },
+        }
+        let made: Mutex<Option<Made<C::Id>>> = Mutex::new(None);
+        let make = |tail: Option<(&C::Id, &[u8])>| -> anyhow::Result<Option<Bytes>> {
+            let (log_id, tip, tail_gen) = match tail {
                 None => (LogId::random(), Tip::default(), 0),
-                Some(tail) => {
-                    let (doc, at) = self.reader().fetch(&tail.id).await?;
+                Some((id, data)) => {
+                    let doc = ChainDoc::<C::Id>::decode(data)?;
+                    let at = Prev { id: id.clone(), crc: crc32fast::hash(data) };
                     (doc.log_id, Tip::of(&doc, at), doc.gen)
                 }
             };
             if tail_gen >= gen {
-                return Err(LogError::Fenced { current: tail_gen });
+                *made.lock().unwrap() = Some(Made::Fenced(tail_gen));
+                return Ok(None);
             }
             let doc = ChainDoc {
                 format: LOG_FORMAT,
@@ -270,21 +278,18 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             };
             let bytes = doc.encode();
             let crc = crc32fast::hash(&bytes);
-            let prev = tip.at.as_ref().map(|p| &p.id);
-            match self.chain.put_after(prev, &label(Kind::Claim, gen), Bytes::from(bytes)).await? {
-                After::Won(id) => {
-                    let position = tip.position;
-                    let tip = Tip::of(&doc, Prev { id, crc });
-                    self.state.lock().unwrap().owner = Some(Owner { gen, log_id, tip, failed: None });
-                    return Ok(Head { log_id, position });
-                }
-                After::Lost(winner) => match label_gen(&winner.label) {
-                    Some(current) if current >= gen => return Err(LogError::Fenced { current }),
-                    // An older generation appended meanwhile: claim after it.
-                    Some(_) => continue,
-                    None => return Err(LogError::Lost(format!("blob {:?} is not a log blob", winner.label))),
-                },
+            *made.lock().unwrap() = Some(Made::Claim { log_id, position: tip.position, doc, crc });
+            Ok(Some(Bytes::from(bytes)))
+        };
+        let won = self.chain.put_after_tail(&label(Kind::Claim, gen), &make).await?;
+        match (won, made.into_inner().unwrap()) {
+            (None, Some(Made::Fenced(current))) => Err(LogError::Fenced { current }),
+            (Some(id), Some(Made::Claim { log_id, position, doc, crc })) => {
+                let tip = Tip::of(&doc, Prev { id, crc });
+                self.state.lock().unwrap().owner = Some(Owner { gen, log_id, tip, failed: None });
+                Ok(Head { log_id, position })
             }
+            _ => Err(LogError::Other(anyhow!("claim: the store and the claim disagree"))),
         }
     }
 
