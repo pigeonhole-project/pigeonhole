@@ -2539,6 +2539,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "crc32fast",
+ "libc",
  "pigeonhole-blob",
  "pigeonhole-testkit",
  "pigeonhole-types",

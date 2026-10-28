@@ -3,12 +3,14 @@ name = "pigeonhole-storage-disk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Local disk storage backend for pigeonhole: one file per blob"
+description = "Local disk storage backend for pigeonhole: blobs as records in append-only segments"
 
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+crc32fast = { workspace = true }
+libc = "0.2"
 pigeonhole-blob = { workspace = true }
 pigeonhole-types = { workspace = true }
 serde = { workspace = true }
