@@ -368,3 +368,38 @@ async fn http_errors_do_not_leak_bot_token() {
     );
     assert!(!err.contains("TEST-SECRET"));
 }
+
+#[tokio::test]
+async fn a_batch_refused_for_one_undeletable_message_is_deleted_one_by_one() {
+    let server = MockServer::start().await;
+    // The channel's first message ("channel created") cannot be deleted, and
+    // deleteMessages refuses the whole batch for it.
+    Mock::given(method("POST"))
+        .and(path_regex(r"/bot.+/deleteMessages"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "ok": false, "error_code": 400, "description": "Bad Request: message can't be deleted"
+        })))
+        .mount(&server)
+        .await;
+    let single = Arc::new(Mutex::new(Vec::new()));
+    let seen = single.clone();
+    Mock::given(method("POST"))
+        .and(path_regex(r"/bot.+/deleteMessage$"))
+        .respond_with(move |req: &Request| {
+            let body = String::from_utf8_lossy(&req.body);
+            let id: i64 = form_field(&body, "message_id").unwrap().parse().unwrap();
+            seen.lock().unwrap().push(id);
+            if id == 1 {
+                ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "ok": false, "error_code": 400, "description": "Bad Request: message can't be deleted"
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true, "result": true}))
+            }
+        })
+        .mount(&server)
+        .await;
+    let tg = TelegramClient::with_api_base(TOKEN.into(), server.uri()).unwrap();
+    tg.delete_messages(CHAT, &[1, 2, 3], None).await.unwrap();
+    assert_eq!(*single.lock().unwrap(), vec![1, 2, 3]);
+}

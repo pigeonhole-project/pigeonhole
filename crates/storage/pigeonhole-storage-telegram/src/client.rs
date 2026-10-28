@@ -42,6 +42,30 @@ struct ResponseParameters {
     retry_after: Option<i64>,
 }
 
+/// Telegram answered 429: the call was not applied; retry after this long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimited {
+    pub method: &'static str,
+    pub retry_after: Duration,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: Too Many Requests, retry after {:?}", self.method, self.retry_after)
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// `Some` if `body` is a 429 answer: how long to wait.
+fn rate_limited<T>(method: &'static str, status: reqwest::StatusCode, body: &ApiResponse<T>) -> Option<RateLimited> {
+    let flood = status.as_u16() == 429 || body.description.as_deref().is_some_and(|d| d.contains("Too Many Requests"));
+    flood.then(|| {
+        let secs = body.parameters.as_ref().and_then(|p| p.retry_after).unwrap_or(3).max(1) as u64;
+        RateLimited { method, retry_after: Duration::from_secs(secs) }
+    })
+}
+
 enum SendErr {
     /// Ambiguous: request may have reached Telegram — do not retry.
     Ambiguous(anyhow::Error),
@@ -628,9 +652,55 @@ impl TelegramClient {
             if delete_not_found(&desc) {
                 continue;
             }
+            if chunk.len() > 1 && desc.to_ascii_lowercase().contains("can't be deleted") {
+                // One undeletable message (a service message such as "channel
+                // created") refuses the whole batch: go one by one.
+                for &id in chunk {
+                    self.delete_one_skipping_undeletable(chat_id, id, limiter).await?;
+                }
+                continue;
+            }
             bail!("deleteMessages failed: {desc}");
         }
         Ok(())
+    }
+
+    /// `deleteMessage` for the batch fallback: a message that cannot be
+    /// deleted at all (a service message; an admin bot can delete any other
+    /// message of a channel) counts as done.
+    async fn delete_one_skipping_undeletable(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        limiter: Option<&ChatLimiter>,
+    ) -> Result<()> {
+        if let Some(lim) = limiter {
+            lim.acquire_delete().await;
+        }
+        let resp = self
+            .http
+            .post(self.api_url("deleteMessage"))
+            .form(&[("chat_id", chat_id), ("message_id", &message_id.to_string())])
+            .send()
+            .await
+            .map_err(|e| Self::http_err("deleteMessage http", e))?;
+        let status = resp.status();
+        let body: ApiResponse<bool> = resp.json().await.context("deleteMessage json")?;
+        if status.is_success() && body.ok {
+            return Ok(());
+        }
+        if let Some(limited) = rate_limited("deleteMessage", status, &body) {
+            if let Some(lim) = limiter {
+                lim.penalize_delete(limited.retry_after);
+            }
+            return Err(limited.into());
+        }
+        let desc = body.description.unwrap_or_else(|| status.to_string());
+        if delete_not_found(&desc) || desc.to_ascii_lowercase().contains("can't be deleted") {
+            debug!(chat_id, message_id, %desc, "skipping a message that cannot be deleted");
+            return Ok(());
+        }
+        bail!("deleteMessage {message_id} failed: {desc}")
     }
 
     pub async fn get_me(&self) -> Result<TgUser> {
@@ -661,6 +731,9 @@ impl TelegramClient {
             .context("getChat http")?;
         let status = resp.status();
         let body: ApiResponse<Chat> = resp.json().await.context("getChat json")?;
+        if let Some(limited) = rate_limited("getChat", status, &body) {
+            return Err(limited.into());
+        }
         if !status.is_success() || !body.ok {
             return Err(anyhow!(
                 "getChat failed: {}",
@@ -723,6 +796,9 @@ impl TelegramClient {
         if status.is_success() && body.ok {
             return Ok(true);
         }
+        if let Some(limited) = rate_limited("setChatDescription", status, &body) {
+            return Err(limited.into());
+        }
         let why = body.description.unwrap_or_else(|| status.to_string());
         if why.contains("not modified") {
             return Ok(false);
@@ -754,6 +830,12 @@ impl TelegramClient {
         let body: ApiResponse<bool> = resp.json().await.context("pinChatMessage json")?;
         if status.is_success() && body.ok {
             return Ok(());
+        }
+        if let Some(limited) = rate_limited("pinChatMessage", status, &body) {
+            if let Some(lim) = limiter {
+                lim.penalize_send(limited.retry_after);
+            }
+            return Err(limited.into());
         }
         Err(anyhow!(
             "pinChatMessage failed: {}",
