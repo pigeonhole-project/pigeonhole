@@ -235,9 +235,11 @@ Design: meta-backends.md § Raft between nodes. Sub-steps:
 4. `[[node]]` config, `init-cluster`, live runs with a node on Telegram.
 5. Later: follower reads, auth between nodes.
 
-After 7b (`propose_all` changes what `MetaStore` hands to openraft); does not
-depend on 7c (`raft.rs` sees only the `LogStore` / `SnapshotStore` traits; the
-8.1 conformance suite checks `ChainLogStore` for it).
+A separate axis, after the single node is polished (steps 6e–13): nothing
+there needs a second node. When it resumes, 7b is already in (`propose_all`
+changes what `MetaStore` hands to openraft), and `raft.rs` sees only the
+`LogStore` / `SnapshotStore` traits, so 7c and 9 change nothing for it (the
+8.1 conformance suite checks `ChainLogStore`).
 
 ### Step 9 — Disk blob store on segments
 
@@ -277,7 +279,8 @@ fencing between two primaries; restore and followers.
 
 ### Order
 
-6e → 7b ∥ 7c → 8.3–8.4 → 9 → 10 → 11 → 12 → 13. Later: several tablets (when
+Single node first: 6e → 7b ∥ 7c → 9 → 10 → 11 → 12 → 13. Then Raft between
+nodes (8.3–8.5), a separate axis. Later: several tablets (when
 metadata outgrows RAM — never a database inside the tablet), encryption per
 block in the codec.
 
