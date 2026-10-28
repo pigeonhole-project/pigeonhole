@@ -1,0 +1,32 @@
+[package]
+name = "pigeonhole-storage-telegram-mtproto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Telegram storage backend for pigeonhole over MTProto, logged in as a bot"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+grammers-mtsender = { workspace = true }
+grammers-session = { workspace = true }
+grammers-tl-types = { workspace = true }
+hex = { workspace = true }
+lru = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+pigeonhole-testkit = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+dotenvy = { workspace = true }
+tracing-subscriber = { workspace = true }

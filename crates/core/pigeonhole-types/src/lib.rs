@@ -100,6 +100,16 @@ impl BackendLimits {
         }
     }
 
+    /// MTProto: a bot posts files far larger than any chunk (`MAX_LOGICAL_CHUNK`)
+    /// and reads any 4 KiB-aligned window; the channel can be listed.
+    pub fn telegram_mtproto() -> Self {
+        Self {
+            max_blob_size: 256 * 1024 * 1024,
+            supports_range: RangeSupport::BestEffort,
+            can_list: true,
+        }
+    }
+
     pub fn memory() -> Self {
         Self {
             max_blob_size: 20 * 1024 * 1024 - 1,

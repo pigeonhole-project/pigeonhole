@@ -597,6 +597,7 @@ pub fn check_block_size_against_instances(
         let max = match inst.info.kind {
             InstanceKind::Telegram | InstanceKind::Memory => 20 * 1024 * 1024 - 1,
             InstanceKind::LocalDisk => pigeonhole_types::BackendLimits::local_disk().max_blob_size,
+            InstanceKind::TelegramMtproto => pigeonhole_types::BackendLimits::telegram_mtproto().max_blob_size,
             InstanceKind::Discord => {
                 pigeonhole_types::BackendLimits::discord(inst.max_blob_size).max_blob_size
             }

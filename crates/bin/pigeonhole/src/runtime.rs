@@ -155,6 +155,7 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
             ));
             MetricsBackend::wrap(Arc::new(erase_sweep(store)))
         }
+        InstanceKind::TelegramMtproto => bail!("store {id:?}: telegram_mtproto is not wired yet"),
         InstanceKind::Discord => {
             #[cfg(feature = "discord")]
             {

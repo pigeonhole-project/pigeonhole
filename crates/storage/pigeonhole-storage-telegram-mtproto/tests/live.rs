@@ -1,0 +1,63 @@
+//! Against the channel `TG_BLOBS_CHAT_ID`: `cargo test -p
+//! pigeonhole-storage-telegram-mtproto --test live -- --ignored --nocapture`
+//! with it, `TG_BOT_TOKEN`, `TG_API_ID` and `TG_API_HASH` in the workspace `.env`.
+//! Deletes only what it posted.
+
+use bytes::Bytes;
+use pigeonhole_blob::{
+    collect_stream, BlobBackend, BlobId, ChatLimiter, ChatLimiterConfig, InstanceInfo, InstanceKind, InstanceRole,
+};
+use pigeonhole_storage_telegram_mtproto::{ChannelApi, Lane, MtprotoBlobStore, MtprotoConfig, TelegramMtproto};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
+
+fn env(k: &str) -> String {
+    std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"))
+}
+
+#[tokio::test]
+#[ignore = "needs a Telegram bot, api id and a test channel"]
+async fn blob_store_against_a_live_channel() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
+    let cfg = MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env("TG_BOT_TOKEN"),
+        session: root.join(".cache/tgm-live.session"),
+    };
+    let t = Instant::now();
+    let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+    println!("connected as bot {} in {:?}", tg.bot_id(), t.elapsed());
+    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
+    let info = InstanceInfo {
+        id: "live".into(),
+        kind: InstanceKind::TelegramMtproto,
+        fingerprint: format!("tgm:{}:{}", tg.bot_id(), channel.channel_id()),
+        location: format!("tg:chat:{chat_id}"),
+        role: InstanceRole::ReadWrite,
+    };
+    let store = MtprotoBlobStore::new(channel.clone(), limiter, info);
+
+    // A 12 MiB blob: a "big" upload, windows across 1 MiB boundaries.
+    let data: Bytes = (0..12 * 1024 * 1024 + 4321).map(|i: usize| (i * 7 % 253) as u8).collect::<Vec<_>>().into();
+    let t = Instant::now();
+    let name = BlobId::random().name();
+    let id = store.put(data.clone(), &name).await.unwrap();
+    println!("put {} B as message {} in {:?}", data.len(), id.message_id, t.elapsed());
+    assert_eq!(store.put(data.clone(), &name).await.unwrap(), id, "a repeat posts nothing new");
+    let t = Instant::now();
+    let got = collect_stream(store.get(&id, None).await.unwrap()).await.unwrap();
+    println!("get in {:?}", t.elapsed());
+    assert!(got == data);
+    let range = 1_048_000..3_200_000u64;
+    let part = collect_stream(store.get(&id, Some(range.clone())).await.unwrap()).await.unwrap();
+    assert!(part == data.slice(range.start as usize..range.end as usize));
+
+    pigeonhole_testkit::run_typed_conformance(&store).await.unwrap();
+    store.delete(&[id.message_id]).await.unwrap();
+}
