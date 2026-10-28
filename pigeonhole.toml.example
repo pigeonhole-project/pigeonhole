@@ -9,7 +9,8 @@ listen_addr = "0.0.0.0:8333"
 region = "us-east-1"
 
 # Metadata tablet (docs/meta-backends.md): every metadata change is appended to
-# the command log, then applied to in-memory state; every boot replays the log.
+# the command log, then applied to in-memory state; every boot loads the
+# snapshot the log starts from and replays the rest.
 # A second process on the same log fences (stops) the first.
 [meta]
 batch_max_delay_ms = 0        # group commit window; 0 = append when the previous append returns
@@ -17,7 +18,7 @@ batch_max_delay_ms = 0        # group commit window; 0 = append when the previou
 
 [meta.log]
 kind = "local"                # segmented files on this host
-path = "pigeonhole-log"
+path = "pigeonhole-meta"
 # Off-host log in a dedicated Telegram channel (not a blob chat): the bot needs
 # change-info, pin and delete rights. Set [meta] batch_max_delay_ms = 1000.
 # kind = "telegram"
@@ -26,18 +27,18 @@ path = "pigeonhole-log"
 # straggler_window_secs = 90  # a claim waits this long for a deposed writer
 
 [meta.snapshot]
-every_entries = 10000         # snapshot all states, drop the log behind it; 0 = never
-every_secs = 600              # and this often if anything changed; 0 = never
-# Also copy each snapshot off the log's disk; after losing it:
-# `pigeonhole restore --lossy` seeds a new log from the newest export.
-# [meta.snapshot.export]
-# kind = "dir"
+kind = "local"                # files; path defaults to [meta.log] path
 # path = "/mnt/backup/pigeonhole"
-# Or pinned in a dedicated Telegram channel (not the log chat, not a blob chat);
-# the bot needs pin and delete rights:
+# Or in a dedicated Telegram channel (not the log chat, not a blob chat; the
+# newest snapshot stays pinned): the bot needs pin and delete rights. Required
+# with a telegram log. With a local log on another disk or here, losing the log
+# keeps the snapshots: `pigeonhole restore --lossy` starts a new log from the
+# newest one.
 # kind = "telegram"
 # chat_id = -1001111111111
 # bot_token_env = "BOT_TOKEN"
+every_entries = 10000         # snapshot all states, drop the log behind it; 0 = never
+every_secs = 600              # and this often if anything changed; 0 = never
 
 # Backend instances (at least one). Secrets come from the env var named in
 # bot_token_env (defaults: BOT_TOKEN / DISCORD_BOT_TOKEN), never inline.

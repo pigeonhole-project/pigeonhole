@@ -23,21 +23,14 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("restore") => {
-            let mut from = None;
             let mut lossy = false;
-            let mut rest = args;
-            while let Some(a) = rest.next() {
+            for a in args {
                 match a.as_str() {
                     "--lossy" => lossy = true,
-                    "--from-export" => {
-                        from = Some(rest.next().context("--from-export requires a directory")?.into());
-                    }
-                    other => bail!(
-                        "unknown restore flag {other}; usage: pigeonhole restore [--from-export DIR] --lossy"
-                    ),
+                    other => bail!("unknown restore flag {other}; usage: pigeonhole restore --lossy"),
                 }
             }
-            cmd_restore(from, lossy).await
+            cmd_restore(lossy).await
         }
         Some("purge") => {
             let mut yes = false;
@@ -67,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         Some(other) => {
             bail!(
                 "unknown command {other:?}; usage: pigeonhole \
-                 [purge --yes | restore [--from-export DIR] --lossy]"
+                 [purge --yes | restore --lossy]"
             )
         }
         None => cmd_serve().await,

@@ -131,6 +131,26 @@ async fn a_changed_log_message_is_detected() {
         let first = *g.docs.keys().next().unwrap();
         g.docs.get_mut(&first).unwrap().1.push(0);
     }
-    let d = a.discover().await;
-    assert!(matches!(d, Err(LogError::Lost(_))), "{d:?}");
+    let head = a.discover().await.unwrap().unwrap().head;
+    let read: Result<Vec<_>, _> = a.read(0, head).try_collect().await;
+    assert!(matches!(read, Err(LogError::Lost(_))), "{read:?}");
+}
+
+#[tokio::test]
+async fn a_rebase_deletes_the_messages_it_covers() {
+    let chat = Arc::new(FakeChat::default());
+    let a = store(&chat, 0);
+    a.claim(1).await.unwrap();
+    for i in 1..=5 {
+        a.append(1, &[entry(i)]).await.unwrap();
+    }
+    a.rebase(1, Base { at: 3, snapshot: crate::snapshot::SnapshotRef("s3".into()) }).await.unwrap();
+    // Batches 4 and 5 and the rebase message stay.
+    assert_eq!(chat.inner.lock().unwrap().docs.len(), 3);
+    a.append(1, &[entry(6)]).await.unwrap();
+    let b = store(&chat, 0);
+    assert_eq!(b.claim(2).await.unwrap().position, 6);
+    let head = b.discover().await.unwrap().unwrap().head;
+    let got: Vec<_> = b.read(3, head).try_collect().await.unwrap();
+    assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![4, 5, 6]);
 }

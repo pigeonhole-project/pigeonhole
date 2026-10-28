@@ -391,16 +391,16 @@ impl BlobDb {
         }
     }
 
-    /// Whether the newest snapshot export already has `chunk_id` reclaiming
-    /// (after [`Self::try_begin_reclaim`]), so its parts may go: a lossy
-    /// restore from that export cannot bring back an object that points at
-    /// them. Always true when the tablet exports nothing.
-    pub fn reclaim_exported(&self, chunk_id: ChunkId) -> bool {
-        let Some(exported) = self.meta.exported_position() else {
+    /// Whether the stored snapshot the log starts from already has
+    /// `chunk_id` reclaiming (after [`Self::try_begin_reclaim`]), so its parts
+    /// may go: a lossy restore from it cannot bring back an object that points
+    /// at them. Always true when snapshots do not outlive the log.
+    pub fn reclaim_in_snapshot(&self, chunk_id: ChunkId) -> bool {
+        let Some(restorable) = self.meta.restorable_position() else {
             return true;
         };
         let gate = self.local.lock().unwrap().reclaim_gates.get(&chunk_id).copied();
-        gate.is_some_and(|at| exported >= at)
+        gate.is_some_and(|at| restorable >= at)
     }
 
     /// Forget the chunk (after its backend parts are deleted).

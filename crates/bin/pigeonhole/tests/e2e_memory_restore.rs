@@ -13,8 +13,7 @@ use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_blob::{
     erase_sweep, CheapestFirst, Replicated, SharedBackend,
 };
-use pigeonhole_meta::export::{self, DirSink, SnapshotSink};
-use pigeonhole_meta::{LocalLogStore, MetaOptions, MetaStore, Namespaces};
+use pigeonhole_meta::{LocalLogStore, LocalSnapshotStore, MetaOptions, MetaStore, Namespaces};
 use s3s::dto::*;
 use s3s::{S3, S3Request};
 use std::path::Path;
@@ -111,17 +110,19 @@ async fn s3s2_get(s3: &pigeonhole::S3Gateway) -> Vec<u8> {
     collect_body(got.body).await
 }
 
-/// One tablet for both namespaces, as the binary runs it, snapshotting and
-/// exporting after every batch.
-async fn open_exporting(dir: &Path, mem: Arc<MemoryBlobStore>) -> (pigeonhole::S3Gateway, Arc<MetaStore>) {
+/// One tablet for both namespaces, as the binary runs it, with snapshots in
+/// another directory, taken after every batch (and when idle).
+async fn open_snapshotting(dir: &Path, mem: Arc<MemoryBlobStore>) -> (pigeonhole::S3Gateway, Arc<MetaStore>) {
     let log = LocalLogStore::open(dir.join("log")).unwrap();
+    let snapshots = LocalSnapshotStore::new(dir.join("snapshots"));
     let opts = MetaOptions {
         snapshot_every: 1,
-        snapshot_export: Some(Arc::new(DirSink::new(dir.join("export")))),
+        snapshot_interval: std::time::Duration::from_millis(10),
+        snapshots_outlive_log: true,
         ..MetaOptions::default()
     };
     let namespaces = Index::register(BlobDb::register(Namespaces::new()));
-    let meta = MetaStore::open(Arc::new(log), namespaces, opts).await.unwrap();
+    let meta = MetaStore::open(Arc::new(log), Arc::new(snapshots), namespaces, opts).await.unwrap();
     let cfg = Config::for_test(dir);
     let index = Index::open(meta.clone()).await.unwrap();
     let db = BlobDb::open(meta.clone()).await.unwrap();
@@ -134,10 +135,10 @@ async fn open_exporting(dir: &Path, mem: Arc<MemoryBlobStore>) -> (pigeonhole::S
 }
 
 #[tokio::test]
-async fn lost_log_restores_from_a_snapshot_export() {
+async fn lost_log_restores_from_stored_snapshots() {
     let dir = tempfile::tempdir().unwrap();
     let mem = Arc::new(MemoryBlobStore::new());
-    let (s3, meta) = open_exporting(dir.path(), mem.clone()).await;
+    let (s3, meta) = open_snapshotting(dir.path(), mem.clone()).await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() }))
         .await
         .unwrap();
@@ -150,18 +151,18 @@ async fn lost_log_restores_from_a_snapshot_export() {
     }))
     .await
     .unwrap();
-    // Exports run in the background; wait for the one covering the PUT.
-    while meta.exported_position() != Some(meta.applied_position()) {
+    // Snapshots are stored in the background; wait for the one covering the PUT.
+    while meta.base_position() != meta.applied_position() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     drop((s3, meta));
 
-    // The disk with the log is gone; the export directory survived.
+    // The disk with the log is gone; the snapshot directory survived.
     std::fs::remove_dir_all(dir.path().join("log")).unwrap();
-    let snapshot = DirSink::new(dir.path().join("export")).newest().await.unwrap().expect("an export");
     let log = LocalLogStore::open(dir.path().join("log")).unwrap();
-    export::seed_log(&log, snapshot).await.unwrap();
+    let snapshots = LocalSnapshotStore::new(dir.path().join("snapshots"));
+    pigeonhole_meta::restore_lossy(&log, &snapshots).await.unwrap();
 
-    let (s3, _meta) = open_exporting(dir.path(), mem).await;
+    let (s3, _meta) = open_snapshotting(dir.path(), mem).await;
     assert_eq!(s3s2_get(&s3).await, payload.as_ref());
 }

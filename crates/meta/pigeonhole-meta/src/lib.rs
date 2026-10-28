@@ -22,11 +22,12 @@
 //!
 //! Every [`MetaOptions::snapshot_every`] entries (and, with new entries,
 //! every [`MetaOptions::snapshot_interval`]) the batcher encodes all states
-//! into one [`TabletSnapshot`] and hands it to [`LogStore::install_snapshot`],
-//! which drops the log behind it.
+//! into one [`TabletSnapshot`], stores it in the [`SnapshotStore`] in the
+//! background and then [rebases](LogStore::rebase) the log on it, which drops
+//! the log behind it.
 //!
-//! Boot ([`MetaStore::open`]): claim the next generation, load the newest
-//! snapshot and replay the log after it, append the zero entry, go active. Once a newer
+//! Boot ([`MetaStore::open`]): claim the next generation, load the snapshot
+//! the log starts from and replay the log after it, append the zero entry, go active. Once a newer
 //! generation claims the log the tablet stops ([`Stop::Fenced`]) and every
 //! later `propose` fails.
 
@@ -39,18 +40,18 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
-pub mod export;
 pub mod log;
 pub mod snapshot;
 
 pub use log::{
-    Batch, Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogId, LogResult,
-    LogStore, Position, Snapshot, LOG_FORMAT,
+    Base, Batch, Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogId, LogResult,
+    LogStore, Position, LOG_FORMAT,
 };
+pub use snapshot::{LocalSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 
 /// Outcome of a command: its reply or its deterministic rejection.
 pub type Outcome<S> = std::result::Result<<S as StateMachine>::Reply, <S as StateMachine>::Reject>;
@@ -108,7 +109,7 @@ pub fn entry<S: StateMachine>(command: &S::Command) -> Entry {
 /// Version of the [`TabletSnapshot`] envelope.
 pub const SNAPSHOT_FORMAT: u32 = 1;
 
-/// Every namespace's state as of `position`, in one LogStore snapshot.
+/// Every namespace's state as of `position`, in one stored snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct TabletSnapshot {
     /// [`SNAPSHOT_FORMAT`]; first, so it can be read before the rest.
@@ -220,7 +221,7 @@ impl fmt::Display for Stop {
 impl std::error::Error for Stop {}
 
 /// Tablet knobs (`[meta]`).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MetaOptions {
     /// Extra time to wait for more commands before appending a batch. Zero =
     /// append as soon as the previous append finished (batches still form from
@@ -232,22 +233,11 @@ pub struct MetaOptions {
     pub snapshot_every: u64,
     /// Also take one when this long has passed since the last and there are
     /// new entries, even with no traffic; zero = never. Bounds how stale the
-    /// newest export can get.
+    /// newest snapshot can get.
     pub snapshot_interval: Duration,
-    /// Also export every snapshot here (see [`export`]), in the background.
-    pub snapshot_export: Option<Arc<dyn export::SnapshotSink>>,
-}
-
-impl fmt::Debug for MetaOptions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MetaOptions")
-            .field("batch_max_delay", &self.batch_max_delay)
-            .field("batch_max_entries", &self.batch_max_entries)
-            .field("snapshot_every", &self.snapshot_every)
-            .field("snapshot_interval", &self.snapshot_interval)
-            .field("snapshot_export", &self.snapshot_export.is_some())
-            .finish()
-    }
+    /// The snapshot store can survive the log (another disk, a chat), so a
+    /// lossy restore from it is possible: see [`MetaStore::restorable_position`].
+    pub snapshots_outlive_log: bool,
 }
 
 impl Default for MetaOptions {
@@ -257,7 +247,7 @@ impl Default for MetaOptions {
             batch_max_entries: 1024,
             snapshot_every: 10_000,
             snapshot_interval: Duration::ZERO,
-            snapshot_export: None,
+            snapshots_outlive_log: false,
         }
     }
 }
@@ -277,18 +267,19 @@ pub struct MetaStore {
     gen: u64,
     /// Position of the last applied entry.
     applied: Arc<AtomicU64>,
-    /// Position of the newest snapshot exported by this incarnation; `None`
-    /// without an export sink.
-    exported: Option<Arc<AtomicU64>>,
+    /// Position of the snapshot the log starts from.
+    based: Arc<AtomicU64>,
+    snapshots_outlive_log: bool,
     queue: mpsc::UnboundedSender<Pending>,
     stop: watch::Receiver<Option<Stop>>,
 }
 
 impl MetaStore {
-    /// Boot the tablet: claim the next generation of `log`, replay the whole
-    /// log into the namespaces' empty states, append the zero entry.
+    /// Boot the tablet: claim the next generation of `log`, load the snapshot
+    /// it starts from out of `snapshots`, replay the rest, append the zero entry.
     pub async fn open(
         log: Arc<dyn LogStore>,
+        snapshots: Arc<dyn SnapshotStore>,
         namespaces: Namespaces,
         opts: MetaOptions,
     ) -> Result<Arc<Self>> {
@@ -300,9 +291,22 @@ impl MetaStore {
         }
         let states = Arc::new(states);
 
-        let known = log.discover().await.context("discover log")?.map_or(0, |d| d.gen);
-        let (gen, head) = claim_next(log.as_ref(), known).await?;
-        let snapshot_at = recover(&states, log.as_ref(), head).await?;
+        let known = log.discover().await.context("discover log")?;
+        if known.is_none() {
+            // A lost log would otherwise boot empty, and the sweeper would
+            // take every blob for an orphan.
+            if let Some(s) = snapshots.newest().await.context("look for stored snapshots")? {
+                bail!(
+                    "the log was never claimed but the snapshot store holds log {} at {}: \
+                     run `pigeonhole restore --lossy`, or use an empty snapshot store",
+                    s.log_id,
+                    s.at
+                );
+            }
+        }
+        let (gen, head) = claim_next(log.as_ref(), known.map_or(0, |d| d.gen)).await?;
+        let base = recover(&states, log.as_ref(), snapshots.as_ref(), head).await?;
+        let base_at = base.as_ref().map_or(0, |b| b.at);
 
         let zero = log.append(gen, &[]).await.context("append zero entry")?;
         if zero != head.position {
@@ -312,29 +316,37 @@ impl MetaStore {
         let applied = Arc::new(AtomicU64::new(head.position));
         let (queue, rx) = mpsc::unbounded_channel();
         let (stop_tx, stop) = watch::channel(None);
-        let exported = opts.snapshot_export.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
+        let based = Arc::new(AtomicU64::new(base_at));
+        let snapshots_outlive_log = opts.snapshots_outlive_log;
+        let (stored_tx, stored_rx) = mpsc::unbounded_channel();
         tokio::spawn(batcher(
             Batcher {
                 states: states.clone(),
                 applied: applied.clone(),
-                snapshot_at,
+                log_id: head.log_id,
+                snapshot_at: base_at,
                 snapshot_tried: tokio::time::Instant::now(),
-                exported: exported.clone(),
-                export_queue: Arc::default(),
+                putting: false,
+                stored_tx,
+                base,
+                based: based.clone(),
                 log,
+                snapshots,
                 gen,
                 opts,
                 stop: stop_tx,
             },
             rx,
+            stored_rx,
         ));
-        Ok(Arc::new(Self { states, gen, applied, exported, queue, stop }))
+        Ok(Arc::new(Self { states, gen, applied, based, snapshots_outlive_log, queue, stop }))
     }
 
-    /// Boot over a [`LocalLogStore`] in `dir`.
+    /// Boot over a [`LocalLogStore`] in `dir`, snapshots in the same directory.
     pub async fn open_local(dir: impl AsRef<Path>, namespaces: Namespaces) -> Result<Arc<Self>> {
         let log = LocalLogStore::open(dir.as_ref())?;
-        Self::open(Arc::new(log), namespaces, MetaOptions::default()).await
+        let snapshots = LocalSnapshotStore::new(dir.as_ref());
+        Self::open(Arc::new(log), Arc::new(snapshots), namespaces, MetaOptions::default()).await
     }
 
     pub fn has_namespace(&self, name: &str) -> bool {
@@ -418,11 +430,16 @@ impl MetaStore {
         stop
     }
 
-    /// Position of the newest snapshot this incarnation exported (0 before the
-    /// first); `None` without an export sink. A restore from the export
-    /// brings back the state as of at least this position.
-    pub fn exported_position(&self) -> Option<Position> {
-        self.exported.as_ref().map(|e| e.load(Ordering::SeqCst))
+    /// Position of the snapshot the log now starts from (0: none yet).
+    pub fn base_position(&self) -> Position {
+        self.based.load(Ordering::SeqCst)
+    }
+
+    /// When snapshots outlive the log ([`MetaOptions::snapshots_outlive_log`]):
+    /// [`Self::base_position`], the least a lossy restore brings back.
+    /// `None` when there is no such restore.
+    pub fn restorable_position(&self) -> Option<Position> {
+        self.snapshots_outlive_log.then(|| self.base_position())
     }
 
     /// Position of the last applied entry (0 before the first).
@@ -446,11 +463,26 @@ async fn claim_next(log: &dyn LogStore, known: u64) -> Result<(u64, Head)> {
 
 /// Load the newest snapshot into the empty states and replay the log after
 /// it up to `head`. Returns the snapshot's position (0 without one).
-async fn recover(states: &States, log: &dyn LogStore, head: Head) -> Result<Position> {
-    let snapshot = log.discover().await.context("discover log")?.and_then(|d| d.snapshot);
-    let from = match snapshot {
-        Some((at, snapshot)) => {
-            let snap = TabletSnapshot::decode(&snapshot.data)?;
+/// Load the snapshot the log starts from (if any) and replay the rest.
+async fn recover(states: &States, log: &dyn LogStore, snapshots: &dyn SnapshotStore, head: Head) -> Result<Option<Base>> {
+    let base = log.discover().await.context("discover log")?.and_then(|d| d.base);
+    let from = match &base {
+        Some(base) => {
+            let at = base.at;
+            let stored = snapshots
+                .get(&base.snapshot)
+                .await
+                .with_context(|| format!("load snapshot {:?} the log starts from", base.snapshot.0))?;
+            if stored.log_id != head.log_id || stored.at != at {
+                bail!(
+                    "snapshot {:?} is of log {} at {}, but log {} starts at {at}",
+                    base.snapshot.0,
+                    stored.log_id,
+                    stored.at,
+                    head.log_id
+                );
+            }
+            let snap = TabletSnapshot::decode(&stored.data)?;
             if snap.position != at {
                 bail!("snapshot stored at {at} says it covers {}", snap.position);
             }
@@ -468,7 +500,27 @@ async fn recover(states: &States, log: &dyn LogStore, head: Head) -> Result<Posi
         bail!(LogError::Lost(format!("snapshot at {from} is past the log head {}", head.position)));
     }
     replay(states, log, from, head).await?;
-    Ok(from)
+    Ok(base)
+}
+
+/// Start a new log from the newest stored snapshot (after the log is lost):
+/// the states as of that snapshot, positions numbered from 0 again. Lossy:
+/// whatever the old log held after the snapshot is gone. Refuses a log that
+/// has entries. Returns the position the snapshot covered in the old log.
+pub async fn restore_lossy(log: &dyn LogStore, snapshots: &dyn SnapshotStore) -> Result<Position> {
+    let known = log.discover().await.context("discover log")?;
+    if known.as_ref().is_some_and(|d| d.head.position != 0 || d.base.is_some()) {
+        bail!("the log is not empty; restore only seeds a new log");
+    }
+    let newest = snapshots.newest().await?.context("no stored snapshot to restore from")?;
+    let mut snap = TabletSnapshot::decode(&newest.data)?;
+    let old = snap.position;
+    snap.position = 0;
+    let (gen, head) = claim_next(log, known.map_or(0, |d| d.gen)).await?;
+    let stored = StoredSnapshot { log_id: head.log_id, at: 0, data: snap.encode() };
+    let snapshot = snapshots.put(&stored).await.context("store the restored snapshot")?;
+    log.rebase(gen, Base { at: 0, snapshot }).await.context("start the new log from it")?;
+    Ok(old)
 }
 
 /// Apply log entries `(from, head]`.
@@ -517,36 +569,54 @@ fn take_snapshot(states: &States, position: Position) -> TabletSnapshot {
 struct Batcher {
     states: Arc<States>,
     applied: Arc<AtomicU64>,
-    /// Position of the newest installed snapshot.
+    log_id: LogId,
+    /// Position of the newest snapshot taken (stored or not).
     snapshot_at: Position,
-    /// When the last snapshot was attempted (or the tablet booted).
+    /// When the last snapshot was taken (or the tablet booted).
     snapshot_tried: tokio::time::Instant,
-    exported: Option<Arc<AtomicU64>>,
-    /// The newest snapshot waiting for the running export to finish; `Some`
-    /// slot = an export task is running.
-    export_queue: Arc<Mutex<Option<Option<(Position, Vec<u8>)>>>>,
+    /// A snapshot is being stored; the next one waits for it.
+    putting: bool,
+    /// Where a finished put reports `(position, result)`.
+    stored_tx: mpsc::UnboundedSender<(Position, Result<SnapshotRef>)>,
+    /// What the log starts from now.
+    base: Option<Base>,
+    based: Arc<AtomicU64>,
     log: Arc<dyn LogStore>,
+    snapshots: Arc<dyn SnapshotStore>,
     gen: u64,
     opts: MetaOptions,
     stop: watch::Sender<Option<Stop>>,
 }
 
+/// Sleep until `at`, or forever.
+async fn until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Group commit: take what is queued, append it, apply it, answer. Ends when
 /// every [`MetaStore`] handle is dropped.
-async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
+async fn batcher(
+    mut b: Batcher,
+    mut rx: mpsc::UnboundedReceiver<Pending>,
+    mut stored_rx: mpsc::UnboundedReceiver<(Position, Result<SnapshotRef>)>,
+) {
     let max = b.opts.batch_max_entries.max(1);
     loop {
-        let first = match b.snapshot_deadline() {
-            Some(at) => match tokio::time::timeout_at(at, rx.recv()).await {
-                Ok(first) => first,
-                Err(_) => {
-                    if let Some(stop) = b.maybe_snapshot().await {
-                        return stop_for_good(b, stop, Vec::new(), rx).await;
-                    }
-                    continue;
+        let first = tokio::select! {
+            first = rx.recv() => first,
+            Some((at, stored)) = stored_rx.recv() => {
+                if let Some(stop) = b.rebase(at, stored).await {
+                    return stop_for_good(b, stop, Vec::new(), rx).await;
                 }
-            },
-            None => rx.recv().await,
+                continue;
+            }
+            () = until(b.snapshot_deadline()) => {
+                b.maybe_snapshot();
+                continue;
+            }
         };
         let Some(first) = first else { return };
         let mut batch = vec![first];
@@ -596,10 +666,7 @@ async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
         };
         let (stop, unanswered) = match result {
             Ok((first, applied)) => {
-                // Snapshot before answering: once `propose` returns, a snapshot
-                // (and export) due at this batch is in place. The batch is
-                // committed either way, so a fence here still answers Ok.
-                let stop = b.maybe_snapshot().await;
+                b.maybe_snapshot();
                 let mut outcomes = applied.into_iter();
                 let mut position = first;
                 for p in batch {
@@ -612,10 +679,7 @@ async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
                     };
                     let _ = p.reply.send(Ok(reply));
                 }
-                match stop {
-                    None => continue,
-                    Some(stop) => (stop, Vec::new()),
-                }
+                continue;
             }
             Err(stop) => (stop, batch),
         };
@@ -635,73 +699,83 @@ async fn stop_for_good(b: Batcher, stop: Stop, unanswered: Vec<Pending>, mut rx:
 }
 
 impl Batcher {
-    /// Export in the background, one at a time, newest wins: a slow sink (a
-    /// chat) must not hold up proposals, and a snapshot taken while an export
-    /// runs replaces any older one waiting behind it.
-    fn export(&self, sink: Arc<dyn export::SnapshotSink>, exported: Arc<AtomicU64>, position: Position, data: Vec<u8>) {
-        {
-            let mut queue = self.export_queue.lock().unwrap();
-            if let Some(waiting) = queue.as_mut() {
-                *waiting = Some((position, data));
-                return;
-            }
-            *queue = Some(None);
-        }
-        let queue = self.export_queue.clone();
-        tokio::spawn(async move {
-            let mut next = Some((position, data));
-            while let Some((position, data)) = next {
-                match sink.put(position, data).await {
-                    Ok(()) => {
-                        exported.fetch_max(position, Ordering::SeqCst);
-                    }
-                    Err(e) => tracing::warn!(position, error = %e, "snapshot export failed"),
-                }
-                let mut q = queue.lock().unwrap();
-                next = q.as_mut().and_then(Option::take);
-                if next.is_none() {
-                    *q = None;
-                }
-            }
-        });
-    }
-
     /// When an idle tablet should wake up to snapshot by time: there are
-    /// entries after the last snapshot and an interval is set.
+    /// entries after the last snapshot, an interval is set, and no put runs.
     fn snapshot_deadline(&self) -> Option<tokio::time::Instant> {
         let interval = self.opts.snapshot_interval;
         let behind = self.applied.load(Ordering::SeqCst) > self.snapshot_at;
-        (!interval.is_zero() && behind).then(|| self.snapshot_tried + interval)
+        (!interval.is_zero() && behind && !self.putting).then(|| self.snapshot_tried + interval)
     }
 
-    /// Snapshot when due. Only a fence stops the tablet: a failed snapshot
-    /// leaves the log intact, so it is retried after the next batch (or the
-    /// next interval).
-    async fn maybe_snapshot(&mut self) -> Option<Stop> {
+    /// Take a snapshot when due (between batches, so nothing is half applied)
+    /// and store it in the background: a slow store (a chat) must not hold up
+    /// proposals. The log is rebased once the put reports back.
+    fn maybe_snapshot(&mut self) {
+        if self.putting {
+            return;
+        }
         let position = self.applied.load(Ordering::SeqCst);
         let every = self.opts.snapshot_every;
         let by_count = every != 0 && position >= self.snapshot_at + every;
         let by_time = self.snapshot_deadline().is_some_and(|at| tokio::time::Instant::now() >= at);
         if !by_count && !by_time {
-            return None;
+            return;
         }
         self.snapshot_tried = tokio::time::Instant::now();
-        let data = take_snapshot(&self.states, position).encode();
-        let copy = self.opts.snapshot_export.clone().map(|sink| (sink, data.clone()));
-        match self.log.install_snapshot(self.gen, position, Snapshot { data }).await {
+        self.snapshot_at = position;
+        self.putting = true;
+        let stored = StoredSnapshot {
+            log_id: self.log_id,
+            at: position,
+            data: take_snapshot(&self.states, position).encode(),
+        };
+        let (snapshots, tx) = (self.snapshots.clone(), self.stored_tx.clone());
+        tokio::spawn(async move {
+            let _ = tx.send((position, snapshots.put(&stored).await));
+        });
+    }
+
+    /// A put finished: start the log from it and drop the snapshot it started
+    /// from before. Only a fence stops the tablet: on any failure the log
+    /// keeps its old base and the next snapshot tries again.
+    async fn rebase(&mut self, at: Position, stored: Result<SnapshotRef>) -> Option<Stop> {
+        self.putting = false;
+        let snapshot = match stored {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(position = at, error = %format!("{e:#}"), "storing a snapshot failed; the log is kept");
+                return None;
+            }
+        };
+        let base = Base { at, snapshot };
+        match self.log.rebase(self.gen, base.clone()).await {
             Ok(()) => {
-                self.snapshot_at = position;
-                if let (Some((sink, data)), Some(exported)) = (copy, self.exported.clone()) {
-                    self.export(sink, exported, position, data);
+                self.based.store(at, Ordering::SeqCst);
+                let new = base.snapshot.clone();
+                if let Some(old) = self.base.replace(base) {
+                    if old.snapshot != new {
+                        self.forget(old.snapshot);
+                    }
                 }
                 None
             }
             Err(LogError::Fenced { current }) => Some(Stop::Fenced { current }),
             Err(e) => {
-                tracing::warn!(position, error = %e, "snapshot failed; the log is kept");
+                tracing::warn!(position = at, error = %e, "rebasing the log failed; the log is kept");
+                self.forget(base.snapshot);
                 None
             }
         }
+    }
+
+    /// Remove a snapshot nothing starts from (best effort, in the background).
+    fn forget(&self, r: SnapshotRef) {
+        let snapshots = self.snapshots.clone();
+        tokio::spawn(async move {
+            if let Err(e) = snapshots.remove(&r).await {
+                tracing::debug!(snapshot = %r.0, error = %format!("{e:#}"), "removing an old snapshot failed");
+            }
+        });
     }
 }
 

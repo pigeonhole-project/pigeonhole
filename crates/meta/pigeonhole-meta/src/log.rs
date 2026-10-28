@@ -1,6 +1,7 @@
 //! The tablet's command log: a [`LogStore`] that fences old generations
 //! (see `docs/meta-backends.md` § LogStore contract).
 
+use crate::snapshot::SnapshotRef;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ pub use local::{LocalLogStore, DEFAULT_SEGMENT_BYTES};
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.
-pub const LOG_FORMAT: u32 = 1;
+pub const LOG_FORMAT: u32 = 2;
 
 /// One layer command. `version` is the namespace's command format
 /// ([`crate::StateMachine::VERSION`]) it was encoded with.
@@ -96,17 +97,19 @@ pub struct Head {
     pub position: Position,
 }
 
-/// Opaque image of the state as of some position.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Snapshot {
-    pub data: Vec<u8>,
+/// Where the log starts: the state as of `at` is the stored snapshot
+/// `snapshot`; entries ≤ `at` may be gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Base {
+    pub at: Position,
+    pub snapshot: SnapshotRef,
 }
 
 /// What a booting tablet finds in the log without any local state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
-    /// Newest snapshot and the position it covers.
-    pub snapshot: Option<(Position, Snapshot)>,
+    /// `None`: the log starts at position 0 from empty states.
+    pub base: Option<Base>,
     pub head: Head,
     /// Newest claimed generation.
     pub gen: u64,
@@ -174,13 +177,14 @@ pub trait LogStore: Send + Sync + 'static {
     /// acknowledged.
     async fn append(&self, gen: u64, batch: &[Entry]) -> LogResult<Position>;
 
-    /// Newest snapshot + log head (bootstrap without any local state);
-    /// `None` if the log was never claimed.
+    /// Base + log head (bootstrap without any local state); `None` if the
+    /// log was never claimed.
     async fn discover(&self) -> LogResult<Option<Discovered>>;
 
     /// Entries after `from` up to `head`, in order (replay).
     fn read(&self, from: Position, head: Head) -> EntryStream;
 
-    /// Store a snapshot of the state as of `at` and drop entries ≤ `at` (collect).
-    async fn install_snapshot(&self, gen: u64, at: Position, snapshot: Snapshot) -> LogResult<()>;
+    /// Start the log from `base` (a snapshot already stored, as of a
+    /// position ≤ the head) and drop entries ≤ `base.at` (collect).
+    async fn rebase(&self, gen: u64, base: Base) -> LogResult<()>;
 }

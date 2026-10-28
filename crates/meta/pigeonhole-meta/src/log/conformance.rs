@@ -2,13 +2,18 @@
 //! contract). `open` returns a new handle onto the **same** log each call, as
 //! a new process (or tablet incarnation) would get.
 
-use super::{Entry, Head, LogError, LogStore, Position, Snapshot};
+use super::{Base, Entry, Head, LogError, LogStore, Position};
+use crate::snapshot::SnapshotRef;
 use futures::TryStreamExt;
 use std::future::Future;
 use std::sync::Arc;
 
 fn entry(i: u64) -> Entry {
     Entry { namespace: "t".into(), version: 1, command: i.to_le_bytes().to_vec() }
+}
+
+fn base(at: Position) -> Base {
+    Base { at, snapshot: SnapshotRef(format!("s{at}")) }
 }
 
 async fn read_all(log: &dyn LogStore, from: Position, head: Head) -> Result<Vec<(Position, Entry)>, LogError> {
@@ -25,7 +30,7 @@ where
 {
     append_read_and_reopen(fresh()).await;
     newer_claim_fences_older_generation(fresh()).await;
-    snapshot_covers_and_collects(fresh()).await;
+    rebase_covers_and_collects(fresh()).await;
     reading_past_the_head_is_lost(fresh()).await;
 }
 
@@ -68,7 +73,7 @@ where
     assert_eq!(b.claim(2).await.unwrap().position, 1, "acknowledged entries are ≤ the head");
     assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Fenced { current: 2 })));
     assert!(matches!(
-        a.install_snapshot(1, 1, Snapshot { data: vec![] }).await,
+        a.rebase(1, base(1)).await,
         Err(LogError::Fenced { current: 2 })
     ));
     let head = b.append(2, &[entry(2)]).await.unwrap();
@@ -77,8 +82,8 @@ where
     assert_eq!(read_all(b.as_ref(), 0, d.head).await.unwrap(), vec![(1, entry(1)), (2, entry(2))]);
 }
 
-/// The tablet snapshots at its head; entries after the snapshot stay readable.
-pub async fn snapshot_covers_and_collects<Open, Fut>(open: Open)
+/// The tablet rebases on a stored snapshot; entries after the base stay readable.
+pub async fn rebase_covers_and_collects<Open, Fut>(open: Open)
 where
     Open: Fn() -> Fut,
     Fut: Future<Output = Arc<dyn LogStore>>,
@@ -88,18 +93,21 @@ where
     for i in 1..=4 {
         log.append(1, &[entry(i)]).await.unwrap();
     }
-    log.install_snapshot(1, 4, Snapshot { data: b"s4".to_vec() }).await.unwrap();
+    log.rebase(1, base(2)).await.unwrap();
+    log.rebase(1, base(4)).await.unwrap();
+    assert!(log.rebase(1, base(3)).await.is_err(), "a base never moves back");
+    assert!(log.rebase(1, base(5)).await.is_err(), "nor past the head");
     log.append(1, &[entry(5)]).await.unwrap();
     log.append(1, &[entry(6)]).await.unwrap();
 
     let again = open().await;
     let d = again.discover().await.unwrap().unwrap();
-    assert_eq!(d.snapshot, Some((4, Snapshot { data: b"s4".to_vec() })));
+    assert_eq!(d.base, Some(base(4)));
     assert_eq!(d.head.position, 6);
     assert_eq!(read_all(again.as_ref(), 4, d.head).await.unwrap(), vec![(5, entry(5)), (6, entry(6))]);
     assert!(
         matches!(read_all(again.as_ref(), 2, d.head).await, Err(LogError::Lost(_))),
-        "entries behind the snapshot are collected"
+        "entries behind the base are collected"
     );
     assert_eq!(again.claim(2).await.unwrap().position, 6);
 }

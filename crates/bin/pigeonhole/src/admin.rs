@@ -5,9 +5,6 @@ use anyhow::{bail, Context};
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole_chunk_store::Sweeper;
-use pigeonhole_meta::export::{self, DirSink, SnapshotSink};
-use std::path::PathBuf;
-use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Delete every upload, object and bucket, releasing their chunks. Backend
@@ -64,28 +61,16 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
     Ok(())
 }
 
-/// Start a new metadata log from the newest snapshot export (after losing the
-/// disk with the log). Lossy: everything after the export is gone.
-pub async fn cmd_restore(from: Option<PathBuf>, lossy: bool) -> anyhow::Result<()> {
+/// Start a new metadata log from the newest stored snapshot (after losing the
+/// log, with `[meta.snapshot]` elsewhere). Lossy: everything after it is gone.
+pub async fn cmd_restore(lossy: bool) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     if !lossy {
-        bail!(
-            "restore from an export loses every change after it; re-run with --lossy to accept"
-        );
+        bail!("restore from a snapshot loses every change after it; re-run with --lossy to accept");
     }
-    let sink: Arc<dyn SnapshotSink> = match from {
-        Some(dir) => Arc::new(DirSink::new(dir)),
-        None => crate::runtime::open_export(&cfg)
-            .await?
-            .context("no export: pass --from-export DIR or set [meta.snapshot.export]")?,
-    };
-    let snapshot = sink.newest().await?.context("no snapshot export found")?;
     let log = crate::runtime::open_log(&cfg).await?;
-    let position = snapshot.position;
-    export::seed_log(log.as_ref(), snapshot).await?;
-    warn!(
-        position,
-        "metadata restored from a snapshot export; changes after it are lost"
-    );
+    let snapshots = crate::runtime::open_snapshots(&cfg).await?;
+    let position = pigeonhole_meta::restore_lossy(log.as_ref(), snapshots.as_ref()).await?;
+    warn!(position, "metadata restored from a stored snapshot; changes after it are lost");
     Ok(())
 }

@@ -2,9 +2,9 @@
 //! (meta-backends.md § `telegram`):
 //!
 //! - **head** — the pinned message: the newest pinned message *by sending
-//!   date*. Every log message is a document: a batch (or a snapshot) with its
-//!   generation and a link to the previous log message, so the pinned head
-//!   leads back through the whole chain to the last snapshot.
+//!   date*. Every log message is a document: a batch with its generation, the
+//!   log's current [`Base`] and a link to the previous log message, so the
+//!   pinned head leads back through the chain to the base.
 //! - **fence** — the chat description, `pigeonhole-log id=<log id> gen=<g>`.
 //!
 //! `append(g)`: send the batch linked to the current head, pin it, read the
@@ -20,8 +20,8 @@
 //! chat in tests; the binary adapts the Telegram client.
 
 use super::{
-    Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position,
-    Snapshot, LOG_FORMAT,
+    Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position,
+    LOG_FORMAT,
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -123,13 +123,9 @@ struct Link {
     download_ref: String,
     /// crc32 of the linked document: a replaced or edited message is detected.
     crc: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum Body {
-    Batch(Batch),
-    /// The state as of `at`; the chain ends here.
-    Snapshot { at: Position, data: Vec<u8> },
+    /// Position of its last entry: a reader stops before following a link
+    /// into what the base already covers (possibly deleted).
+    last: Position,
 }
 
 /// One log message.
@@ -138,8 +134,9 @@ struct LogDoc {
     format: u32,
     log_id: LogId,
     gen: u64,
+    base: Option<Base>,
     prev: Option<Link>,
-    body: Body,
+    batch: Batch,
 }
 
 impl LogDoc {
@@ -160,10 +157,11 @@ impl LogDoc {
 
     /// Position of the last entry the log holds once this message is the head.
     fn head_position(&self) -> Position {
-        match &self.body {
-            Body::Batch(b) => b.first + b.entries.len() as u64 - 1,
-            Body::Snapshot { at, .. } => *at,
-        }
+        self.batch.first + self.batch.entries.len() as u64 - 1
+    }
+
+    fn base_at(&self) -> Position {
+        self.base.as_ref().map_or(0, |b| b.at)
     }
 }
 
@@ -172,6 +170,7 @@ impl LogDoc {
 struct Tip {
     link: Option<Link>,
     position: Position,
+    base: Option<Base>,
 }
 
 struct Owner {
@@ -197,8 +196,10 @@ impl<C: ChatApi> ChatLogStore<C> {
 
     async fn fetch(&self, doc: &ChatDoc) -> LogResult<(LogDoc, Link)> {
         let data = self.chat.download(&doc.download_ref).await?;
-        let link = Link { message_id: doc.message_id, download_ref: doc.download_ref.clone(), crc: crc32fast::hash(&data) };
-        Ok((LogDoc::decode(&data)?, link))
+        let crc = crc32fast::hash(&data);
+        let head = LogDoc::decode(&data)?;
+        let link = Link { message_id: doc.message_id, download_ref: doc.download_ref.clone(), crc, last: head.head_position() };
+        Ok((head, link))
     }
 
     async fn follow(&self, link: &Link) -> LogResult<LogDoc> {
@@ -233,9 +234,10 @@ impl<C: ChatApi> ChatLogStore<C> {
         Ok(None)
     }
 
-    /// Send `body` linked to the owner's tip as generation `gen`, pin it, and
-    /// prove the fence still holds `gen`. Overrides a newer straggler on top.
-    async fn write(&self, gen: u64, body: impl Fn(&Tip) -> Body) -> LogResult<Tip> {
+    /// Send `entries` linked to the owner's tip as generation `gen` (with a new
+    /// base, if given), pin it, and prove the fence still holds `gen`.
+    /// Overrides a newer straggler on top.
+    async fn write(&self, gen: u64, entries: Vec<Entry>, rebase: Option<Base>) -> LogResult<Tip> {
         let (log_id, mut tip) = {
             let owner = self.owner.lock().unwrap();
             let o = owner
@@ -244,15 +246,13 @@ impl<C: ChatApi> ChatLogStore<C> {
                 .ok_or_else(|| LogError::Other(anyhow!("generation {gen} not claimed by this handle")))?;
             (o.log_id, o.tip.clone())
         };
-        let mut body = body(&tip);
+        let base = rebase.or_else(|| tip.base.clone());
+        let mut entries = entries;
         // A straggler may top our pin; then link a newer (empty) batch to our
         // tip and pin that. Bounded: each fenced writer has at most one.
         for _ in 0..4 {
-            let prev = match &body {
-                Body::Snapshot { .. } => None,
-                Body::Batch(_) => tip.link.clone(),
-            };
-            let doc = LogDoc { format: LOG_FORMAT, log_id, gen, prev, body };
+            let batch = Batch::new(gen, tip.position + 1, std::mem::take(&mut entries));
+            let doc = LogDoc { format: LOG_FORMAT, log_id, gen, base: base.clone(), prev: tip.link.clone(), batch };
             let bytes = doc.encode();
             let crc = crc32fast::hash(&bytes);
             let sent = self.chat.send_document(&format!("log-{gen}-{}.bin", doc.head_position()), bytes).await?;
@@ -264,8 +264,14 @@ impl<C: ChatApi> ChatLogStore<C> {
                 None => return Err(LogError::Other(anyhow!("the log's description is gone"))),
             }
             tip = Tip {
-                link: Some(Link { message_id: sent.message_id, download_ref: sent.download_ref.clone(), crc }),
+                link: Some(Link {
+                    message_id: sent.message_id,
+                    download_ref: sent.download_ref.clone(),
+                    crc,
+                    last: doc.head_position(),
+                }),
                 position: doc.head_position(),
+                base: base.clone(),
             };
             if let Some(o) = self.owner.lock().unwrap().as_mut() {
                 o.tip = tip.clone();
@@ -273,21 +279,18 @@ impl<C: ChatApi> ChatLogStore<C> {
             if regs.pinned.as_ref().is_some_and(|p| p.message_id == sent.message_id) {
                 return Ok(tip);
             }
-            body = Body::Batch(Batch::new(gen, tip.position + 1, Vec::new()));
         }
         Err(LogError::Other(anyhow!("could not keep the log head pinned")))
     }
 
-    /// Log messages from the head back to (and including) the first snapshot,
-    /// or to the start of the log; newest first.
+    /// Log messages from the head back to the first one holding entries
+    /// after `stop_at` (never behind the head's base); newest first.
     async fn chain(&self, head: (LogDoc, Link), stop_at: Position) -> LogResult<Vec<(LogDoc, Link)>> {
+        let floor = stop_at.max(head.0.base_at());
         let mut out = vec![head];
         loop {
             let (doc, _) = out.last().unwrap();
-            if matches!(doc.body, Body::Snapshot { .. }) || doc.head_position() <= stop_at {
-                return Ok(out);
-            }
-            let Some(prev) = doc.prev.clone() else {
+            let Some(prev) = doc.prev.clone().filter(|p| p.last > floor) else {
                 return Ok(out);
             };
             let doc = self.follow(&prev).await?;
@@ -323,11 +326,11 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
                     "a new log needs a chat with nothing pinned (a dedicated chat)"
                 )));
             }
-            Tip { link: None, position: 0 }
+            Tip { link: None, position: 0, base: None }
         } else {
             match self.head_doc(log_id).await? {
-                Some((doc, link)) => Tip { position: doc.head_position(), link: Some(link) },
-                None => Tip { link: None, position: 0 },
+                Some((doc, link)) => Tip { position: doc.head_position(), base: doc.base, link: Some(link) },
+                None => Tip { link: None, position: 0, base: None },
             }
         };
         let position = tip.position;
@@ -336,27 +339,18 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
     }
 
     async fn append(&self, gen: u64, batch: &[Entry]) -> LogResult<Position> {
-        let entries = batch.to_vec();
-        let tip = self
-            .write(gen, |tip| Body::Batch(Batch::new(gen, tip.position + 1, entries.clone())))
-            .await?;
-        Ok(tip.position)
+        Ok(self.write(gen, batch.to_vec(), None).await?.position)
     }
 
     async fn discover(&self) -> LogResult<Option<Discovered>> {
         let Some((log_id, gen)) = parse_description(self.registers().await?.description.as_deref())? else {
             return Ok(None);
         };
-        let Some(head) = self.head_doc(log_id).await? else {
-            return Ok(Some(Discovered { snapshot: None, head: Head { log_id, position: 0 }, gen }));
+        let Some((head, _)) = self.head_doc(log_id).await? else {
+            return Ok(Some(Discovered { base: None, head: Head { log_id, position: 0 }, gen }));
         };
-        let position = head.0.head_position();
-        let chain = self.chain(head, 0).await?;
-        let snapshot = chain.iter().find_map(|(doc, _)| match &doc.body {
-            Body::Snapshot { at, data } => Some((*at, Snapshot { data: data.clone() })),
-            Body::Batch(_) => None,
-        });
-        Ok(Some(Discovered { snapshot, head: Head { log_id, position }, gen }))
+        let position = head.head_position();
+        Ok(Some(Discovered { base: head.base, head: Head { log_id, position }, gen }))
     }
 
     fn read(&self, from: Position, head: Head) -> EntryStream {
@@ -372,7 +366,7 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
         )
     }
 
-    async fn install_snapshot(&self, gen: u64, at: Position, snapshot: Snapshot) -> LogResult<()> {
+    async fn rebase(&self, gen: u64, base: Base) -> LogResult<()> {
         let owned = {
             let owner = self.owner.lock().unwrap();
             owner.as_ref().filter(|o| o.gen == gen).map(|o| (o.tip.clone(), o.log_id))
@@ -382,27 +376,26 @@ impl<C: ChatApi> LogStore for ChatLogStore<C> {
             let current = parse_description(regs.description.as_deref())?.map_or(0, |(_, g)| g);
             return Err(LogError::Fenced { current });
         };
-        if at != old_tip.position {
-            return Err(LogError::Other(anyhow!(
-                "a chat log snapshots only at its head ({}), not at {at}",
-                old_tip.position
-            )));
+        let (at, old_at) = (base.at, old_tip.base.as_ref().map_or(0, |b| b.at));
+        if at > old_tip.position || at < old_at {
+            return Err(LogError::Other(anyhow!("rebase at {at} outside [{old_at}, {}]", old_tip.position)));
         }
-        let data = snapshot.data;
-        self.write(gen, move |_| Body::Snapshot { at, data: data.clone() }).await?;
+        self.write(gen, Vec::new(), Some(base)).await?;
 
-        // Collect the chain behind the snapshot (best effort: a leftover
+        // Collect the messages the new base covers (best effort: a leftover
         // message is unreachable garbage, not a problem).
-        if let Some(link) = old_tip.link {
-            let mut ids = Vec::new();
-            let mut next = Some(link);
-            while let Some(link) = next {
+        let mut ids = Vec::new();
+        let mut next = old_tip.link.filter(|l| l.last > old_at);
+        while let Some(link) = next {
+            if link.last <= at {
                 ids.push(link.message_id);
-                next = match self.follow(&link).await {
-                    Ok(doc) if doc.log_id == log_id => doc.prev,
-                    _ => None,
-                };
             }
+            next = match self.follow(&link).await {
+                Ok(doc) if doc.log_id == log_id => doc.prev.filter(|l| l.last > old_at),
+                _ => None,
+            };
+        }
+        if !ids.is_empty() {
             let _ = self.chat.delete(&ids).await;
         }
         Ok(())
@@ -432,26 +425,19 @@ impl<C: ChatApi> ReadCtx<C> {
                 head.position
             )));
         }
+        let base_at = tip.0.base_at();
+        if from < base_at {
+            return Err(LogError::Lost(format!("entries after {from} collected up to base {base_at}")));
+        }
         let chain = store.chain(tip, from).await?;
         let mut out = Vec::new();
         let mut next = from + 1;
         for (doc, _) in chain.into_iter().rev() {
-            match doc.body {
-                Body::Snapshot { at, .. } => {
-                    if at > from {
-                        return Err(LogError::Lost(format!(
-                            "entries after {from} collected up to snapshot {at}"
-                        )));
-                    }
-                }
-                Body::Batch(batch) => {
-                    for (i, entry) in batch.entries.into_iter().enumerate() {
-                        let pos = batch.first + i as u64;
-                        if pos == next && pos <= head.position {
-                            out.push((pos, entry));
-                            next += 1;
-                        }
-                    }
+            for (i, entry) in doc.batch.entries.into_iter().enumerate() {
+                let pos = doc.batch.first + i as u64;
+                if pos == next && pos <= head.position {
+                    out.push((pos, entry));
+                    next += 1;
                 }
             }
         }

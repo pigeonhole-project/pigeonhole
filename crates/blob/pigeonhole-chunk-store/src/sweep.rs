@@ -124,10 +124,10 @@ impl Sweeper {
                 debug!(chunk_id, "reclaim deferred: chunk is being read");
                 continue;
             }
-            // Until an export shows the chunk reclaiming, restoring from the
+            // Until a stored snapshot shows the chunk reclaiming, restoring from the
             // newest one would resurrect objects that point at these parts.
-            if !self.db.reclaim_exported(chunk_id) {
-                debug!(chunk_id, "reclaim deferred: waiting for a snapshot export");
+            if !self.db.reclaim_in_snapshot(chunk_id) {
+                debug!(chunk_id, "reclaim deferred: waiting for a snapshot");
                 continue;
             }
             let layouts = self.db.get_replica_layouts(chunk_id).await?;
@@ -427,16 +427,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_waits_for_an_export_that_shows_it() {
+    async fn reclaim_waits_for_a_snapshot_that_shows_it() {
         let dir = tempfile::tempdir().unwrap();
         let opts = pigeonhole_meta::MetaOptions {
             snapshot_every: 0,
             snapshot_interval: Duration::from_millis(50),
-            snapshot_export: Some(Arc::new(pigeonhole_meta::export::DirSink::new(dir.path().join("export")))),
+            snapshots_outlive_log: true,
             ..Default::default()
         };
         let log = pigeonhole_meta::LocalLogStore::open(dir.path().join("log")).unwrap();
-        let meta = pigeonhole_meta::MetaStore::open(Arc::new(log), BlobDb::register(Default::default()), opts)
+        let snapshots = pigeonhole_meta::LocalSnapshotStore::new(dir.path().join("snapshots"));
+        let namespaces = BlobDb::register(Default::default());
+        let meta = pigeonhole_meta::MetaStore::open(Arc::new(log), Arc::new(snapshots), namespaces, opts)
             .await
             .unwrap();
         let db = BlobDb::open(meta.clone()).await.unwrap();
@@ -449,13 +451,13 @@ mod tests {
         let keys = f.mem.message_keys();
         f.layer.release(&[id]).await.unwrap();
         let stats = sweeper(&f).sweep_once().await.unwrap();
-        assert_eq!(stats.zero_ref_chunks, 0, "no export shows the release yet");
+        assert_eq!(stats.zero_ref_chunks, 0, "no snapshot shows the release yet");
         assert_eq!(f.mem.message_keys(), keys);
         let position = meta.applied_position();
         assert_eq!(sweeper(&f).sweep_once().await.unwrap().zero_ref_chunks, 0);
         assert_eq!(meta.applied_position(), position, "a deferred reclaim proposes nothing again");
 
-        while meta.exported_position() < Some(position) {
+        while meta.restorable_position() < Some(position) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(sweeper(&f).sweep_once().await.unwrap().zero_ref_chunks, 1);

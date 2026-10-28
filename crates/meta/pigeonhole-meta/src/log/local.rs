@@ -1,11 +1,11 @@
 //! `local` LogStore: a directory of segmented append-only files.
 //!
 //! ```text
-//! <dir>/lock                  flock'ed around every claim / append / snapshot
+//! <dir>/lock                  flock'ed around every claim / append / rebase
 //! <dir>/log_id                identity of this history, written by the first claim
 //! <dir>/claimed_gen           newest claimed generation (tmp + fsync + rename)
+//! <dir>/base                  postcard [`Base`]: where the log starts
 //! <dir>/seg-<first>.log       records; <first> = position of its first entry
-//! <dir>/snapshot-<at>.snap    newest snapshot; segments wholly ≤ <at> are dropped
 //! ```
 //!
 //! A record is `MAGIC | len | crc32 | Batch` (little endian u32s). An append
@@ -15,10 +15,7 @@
 //! `claim` truncates it. Anything else that does not parse is [`LogError::Lost`].
 //! Fences only processes on this host; durability = the disk.
 
-use super::{
-    Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position,
-    Snapshot,
-};
+use super::{Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -127,8 +124,8 @@ impl LogStore for LocalLogStore {
         Box::pin(steps.flatten())
     }
 
-    async fn install_snapshot(&self, gen: u64, at: Position, snapshot: Snapshot) -> LogResult<()> {
-        self.blocking(move |s| s.install_snapshot(gen, at, snapshot)).await
+    async fn rebase(&self, gen: u64, base: Base) -> LogResult<()> {
+        self.blocking(move |s| s.rebase(gen, base)).await
     }
 }
 
@@ -168,7 +165,7 @@ impl Shared {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let empty = self.claimed_gen()?.is_none()
                     && self.segments()?.is_empty()
-                    && self.snapshot_at()?.is_none();
+                    && self.base()?.is_none();
                 if !(create && empty) {
                     return Err(LogError::Lost(format!("{}: no log_id", self.dir.display())));
                 }
@@ -199,14 +196,22 @@ impl Shared {
         numbered(&self.dir, "seg-", ".log")
     }
 
-    fn snapshot_at(&self) -> LogResult<Option<(Position, PathBuf)>> {
-        Ok(numbered(&self.dir, "snapshot-", ".snap")?.pop())
+    fn base(&self) -> LogResult<Option<Base>> {
+        match fs::read(self.dir.join("base")) {
+            Ok(data) => Ok(Some(postcard::from_bytes(&data).map_err(|e| LogError::Lost(format!("base: {e}")))?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn base_at(&self) -> LogResult<Position> {
+        Ok(self.base()?.map_or(0, |b| b.at))
     }
 
     /// Validate the whole log and return its head. With `repair`, a torn
     /// record at the end of the last segment is truncated away.
     fn scan(&self, repair: bool) -> LogResult<Position> {
-        let mut head = self.snapshot_at()?.map_or(0, |(at, _)| at);
+        let mut head = self.base_at()?;
         let segs = self.segments()?;
         let mut last_gen = 0;
         for (i, (first, path)) in segs.iter().enumerate() {
@@ -229,7 +234,7 @@ impl Shared {
                         }
                         last_gen = batch.gen;
                         seen_first.get_or_insert(batch.first);
-                        // Batches wholly behind a snapshot (last entry ≤ head)
+                        // Batches wholly behind the base (last entry ≤ head)
                         // are already covered by it; skip them.
                         if batch.first + batch.entries.len() as u64 > head + 1 {
                             if batch.first != head + 1 {
@@ -345,21 +350,14 @@ impl Shared {
         };
         let log_id = self.log_id(false)?;
         let head = self.scan(false)?;
-        let snapshot = match self.snapshot_at()? {
-            Some((at, path)) => Some((at, Snapshot { data: fs::read(path)? })),
-            None => None,
-        };
-        Ok(Some(Discovered { snapshot, head: Head { log_id, position: head }, gen }))
+        Ok(Some(Discovered { base: self.base()?, head: Head { log_id, position: head }, gen }))
     }
 
     fn read_step(&self, st: &mut ReadState) -> LogResult<Vec<(Position, Entry)>> {
         if st.segs.is_none() {
-            let snap = self.snapshot_at()?.map_or(0, |(at, _)| at);
-            if st.from < snap {
-                return Err(LogError::Lost(format!(
-                    "entries after {} collected up to snapshot {snap}",
-                    st.from
-                )));
+            let base = self.base_at()?;
+            if st.from < base {
+                return Err(LogError::Lost(format!("entries after {} collected up to base {base}", st.from)));
             }
             let mut segs = self.segments()?;
             // Keep the segment containing `next` and everything after it.
@@ -399,23 +397,18 @@ impl Shared {
         Ok(out)
     }
 
-    fn install_snapshot(&self, gen: u64, at: Position, snapshot: Snapshot) -> LogResult<()> {
+    fn rebase(&self, gen: u64, base: Base) -> LogResult<()> {
         let _lock = self.lock()?;
         let current = self.claimed_gen()?.unwrap_or(0);
         if current != gen {
             return Err(LogError::Fenced { current });
         }
         let head = self.scan(false)?;
-        if at > head {
-            return Err(LogError::Other(anyhow!("snapshot at {at} beyond head {head}")));
+        let at = base.at;
+        if at > head || at < self.base_at()? {
+            return Err(LogError::Other(anyhow!("rebase at {at} outside [{}, {head}]", self.base_at()?)));
         }
-        let old = numbered(&self.dir, "snapshot-", ".snap")?;
-        self.write_atomic(&format!("snapshot-{at:020}.snap"), &snapshot.data)?;
-        for (pos, path) in old {
-            if pos < at {
-                fs::remove_file(path)?;
-            }
-        }
+        self.write_atomic("base", &postcard::to_stdvec(&base).expect("a base always encodes"))?;
         // A segment is garbage once the next one starts at or before `at + 1`.
         let segs = self.segments()?;
         for pair in segs.windows(2) {
@@ -498,6 +491,10 @@ mod tests {
         Entry { namespace: "t".into(), version: 1, command: i.to_le_bytes().to_vec() }
     }
 
+    fn base(at: Position) -> Base {
+        Base { at, snapshot: crate::snapshot::SnapshotRef(format!("s{at}")) }
+    }
+
     async fn read_all(log: &dyn LogStore, from: Position, head: Position) -> LogResult<Vec<(Position, Entry)>> {
         let log_id = log.discover().await?.expect("claimed").head.log_id;
         log.read(from, Head { log_id, position: head }).try_collect().await
@@ -522,7 +519,7 @@ mod tests {
 
         let again = LocalLogStore::open(dir.path()).unwrap();
         let d = again.discover().await.unwrap().unwrap();
-        assert_eq!((d.gen, d.head.position, d.snapshot), (1, 20, None));
+        assert_eq!((d.gen, d.head.position, d.base), (1, 20, None));
         let head = again.claim(2).await.unwrap();
         assert_eq!((head.log_id, head.position), (d.head.log_id, 20), "identity survives claims");
         assert_eq!(again.append(2, &[entry(21)]).await.unwrap(), 21);
@@ -541,7 +538,7 @@ mod tests {
         assert_eq!(b.claim(2).await.unwrap().position, 1, "acknowledged entry ≤ head");
         assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Fenced { current: 2 })));
         assert!(matches!(
-            a.install_snapshot(1, 1, Snapshot { data: vec![] }).await,
+            a.rebase(1, base(1)).await,
             Err(LogError::Fenced { current: 2 })
         ));
         assert_eq!(b.append(2, &[entry(2)]).await.unwrap(), 2);
@@ -574,7 +571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_collects_segments_behind_it() {
+    async fn rebase_collects_segments_behind_it() {
         let dir = tempfile::tempdir().unwrap();
         let log = LocalLogStore::with_segment_bytes(dir.path(), 1).unwrap();
         log.claim(1).await.unwrap();
@@ -582,12 +579,13 @@ mod tests {
             log.append(1, &[entry(i)]).await.unwrap();
         }
         assert_eq!(log.shared.segments().unwrap().len(), 6);
-        log.install_snapshot(1, 4, Snapshot { data: b"s4".to_vec() }).await.unwrap();
+        log.rebase(1, base(4)).await.unwrap();
         let firsts: Vec<_> = log.shared.segments().unwrap().into_iter().map(|(f, _)| f).collect();
         assert_eq!(firsts, vec![5, 6]);
 
         let d = log.discover().await.unwrap().unwrap();
-        assert_eq!(d.snapshot, Some((4, Snapshot { data: b"s4".to_vec() })));
+        assert_eq!(d.base, Some(base(4)));
+        assert!(log.rebase(1, base(3)).await.is_err(), "a base never moves back");
         assert_eq!(d.head.position, 6);
         assert_eq!(read_all(&log, 4, 6).await.unwrap(), vec![(5, entry(5)), (6, entry(6))]);
         assert!(matches!(read_all(&log, 2, 6).await, Err(LogError::Lost(_))));
@@ -641,19 +639,20 @@ mod tests {
         OpenOptions::new().append(true).open(&seg).unwrap().write_all(&tail).unwrap();
 
         let err = log.discover().await.unwrap_err();
-        assert!(err.to_string().contains("log format 2, this binary reads 1"), "{err}");
+        let want = format!("log format {}, this binary reads {}", crate::LOG_FORMAT + 1, crate::LOG_FORMAT);
+        assert!(err.to_string().contains(&want), "{err}");
     }
 
     #[tokio::test]
-    async fn snapshot_inside_a_segment_keeps_it_readable() {
+    async fn rebase_inside_a_segment_keeps_it_readable() {
         let dir = tempfile::tempdir().unwrap();
         let log = LocalLogStore::open(dir.path()).unwrap();
         log.claim(1).await.unwrap();
         for i in 1..=6 {
             log.append(1, &[entry(i)]).await.unwrap();
         }
-        // One segment holds everything; the snapshot covers half of it.
-        log.install_snapshot(1, 3, Snapshot { data: b"s3".to_vec() }).await.unwrap();
+        // One segment holds everything; the base covers half of it.
+        log.rebase(1, base(3)).await.unwrap();
         let d = log.discover().await.unwrap().unwrap();
         assert_eq!(d.head.position, 6);
         assert_eq!(read_all(&log, 3, 6).await.unwrap().len(), 3);

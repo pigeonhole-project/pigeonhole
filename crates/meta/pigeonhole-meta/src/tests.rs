@@ -1,5 +1,5 @@
 use super::*;
-use crate::export::SnapshotSink;
+use crate::log::chat::fake::FakeChat;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -58,6 +58,37 @@ fn snapshot(store: &MetaStore) -> Vec<u8> {
     store.read::<Counter, _>(encode_state)
 }
 
+/// Log and snapshots in one directory, as `[meta.log]` / `[meta.snapshot]`
+/// with the same `path`.
+fn local(dir: &Path) -> (Arc<dyn LogStore>, Arc<dyn SnapshotStore>) {
+    (Arc::new(LocalLogStore::open(dir).unwrap()), Arc::new(LocalSnapshotStore::new(dir)))
+}
+
+/// Snapshots are stored in the background; wait until the log starts from `at`.
+async fn wait_base(store: &MetaStore, at: Position) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while store.base_position() != at {
+        assert!(tokio::time::Instant::now() < deadline, "no base at {at}, still {}", store.base_position());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Wait until `f` holds (a background removal finished).
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn snapshot_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".snap"))
+        .count()
+}
+
 #[tokio::test]
 async fn commit_and_reject_both_consume_a_position() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,9 +128,9 @@ async fn unknown_namespace_fails_without_a_position() {
 async fn concurrent_proposals_get_distinct_positions() {
     let dir = tempfile::tempdir().unwrap();
     for delay in [Duration::ZERO, Duration::from_millis(20)] {
-        let log = LocalLogStore::open(dir.path().join(format!("log-{}", delay.as_millis()))).unwrap();
+        let (log, snapshots) = local(&dir.path().join(format!("log-{}", delay.as_millis())));
         let opts = MetaOptions { batch_max_delay: delay, batch_max_entries: 8, snapshot_every: 5, ..MetaOptions::default() };
-        let store = MetaStore::open(Arc::new(log), counter(), opts).await.unwrap();
+        let store = MetaStore::open(log, snapshots, counter(), opts).await.unwrap();
         let tasks: Vec<_> = (0..32)
             .map(|i| {
                 let s = store.clone();
@@ -225,7 +256,7 @@ fn segments(dir: &Path) -> Vec<String> {
 async fn open_snapshotting(dir: &Path) -> Arc<MetaStore> {
     let log = LocalLogStore::with_segment_bytes(dir, 64).unwrap();
     let opts = MetaOptions { snapshot_every: 10, ..MetaOptions::default() };
-    MetaStore::open(Arc::new(log), counter(), opts).await.unwrap()
+    MetaStore::open(Arc::new(log), Arc::new(LocalSnapshotStore::new(dir)), counter(), opts).await.unwrap()
 }
 
 #[tokio::test]
@@ -236,15 +267,18 @@ async fn snapshots_collect_the_log_and_boot_from_them() {
     for i in 0..35u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
+    wait_base(&a, 30).await;
     let state = snapshot(&a);
     drop(a);
 
     let d = LocalLogStore::open(&log_dir).unwrap().discover().await.unwrap().unwrap();
-    let (at, snap) = d.snapshot.expect("a snapshot was taken");
-    assert_eq!(at, 30);
-    assert_eq!(TabletSnapshot::decode(&snap.data).unwrap().position, 30);
+    let base = d.base.expect("the log starts from a snapshot");
+    assert_eq!(base.at, 30);
+    let stored = LocalSnapshotStore::new(&log_dir).get(&base.snapshot).await.unwrap();
+    assert_eq!(TabletSnapshot::decode(&stored.data).unwrap().position, 30);
+    eventually("older snapshots removed", || snapshot_files(&log_dir) == 1).await;
     let segs = segments(&log_dir);
-    assert!(segs[0] > "seg-00000000000000000001.log".to_string(), "log behind the snapshot collected: {segs:?}");
+    assert!(segs[0] > "seg-00000000000000000001.log".to_string(), "log behind the base collected: {segs:?}");
 
     let b = open_snapshotting(&log_dir).await;
     assert_eq!(b.applied_position(), 35);
@@ -262,51 +296,54 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
         a.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
     }
     let log = LocalLogStore::open(&log_dir).unwrap();
-    log.claim(2).await.unwrap();
+    let head = log.claim(2).await.unwrap();
     let snap = TabletSnapshot {
         format: SNAPSHOT_FORMAT,
         position: 1,
         states: vec![("counter".into(), Counter::VERSION + 1, encode_state(&Counter::default()))],
     };
-    log.install_snapshot(2, 1, Snapshot { data: snap.encode() }).await.unwrap();
+    let stored = StoredSnapshot { log_id: head.log_id, at: 1, data: snap.encode() };
+    let snapshot = LocalSnapshotStore::new(&log_dir).put(&stored).await.unwrap();
+    log.rebase(2, Base { at: 1, snapshot }).await.unwrap();
 
     let err = MetaStore::open_local(&log_dir, counter()).await.err().expect("boot must fail");
     assert!(format!("{err:#}").contains("counter state in format 2, this binary reads 1"), "{err:#}");
 }
 
 #[tokio::test]
-async fn lossy_restore_from_an_export_starts_a_new_log() {
+async fn a_lost_log_boots_only_through_a_lossy_restore() {
     let dir = tempfile::tempdir().unwrap();
-    let (log_dir, export_dir) = (dir.path().join("log"), dir.path().join("export"));
-    let sink = Arc::new(export::DirSink::new(&export_dir));
-    let opts = MetaOptions { snapshot_every: 10, snapshot_export: Some(sink.clone()), ..MetaOptions::default() };
-    let a = MetaStore::open(Arc::new(LocalLogStore::open(&log_dir).unwrap()), counter(), opts).await.unwrap();
-    assert_eq!(a.exported_position(), Some(0));
+    let (log_dir, snap_dir) = (dir.path().join("log"), dir.path().join("snapshots"));
+    let snapshots: Arc<dyn SnapshotStore> = Arc::new(LocalSnapshotStore::new(&snap_dir));
+    let open = |snapshots: Arc<dyn SnapshotStore>| {
+        let log = Arc::new(LocalLogStore::open(&log_dir).unwrap());
+        let opts = MetaOptions { snapshot_every: 10, snapshots_outlive_log: true, ..MetaOptions::default() };
+        MetaStore::open(log, snapshots, counter(), opts)
+    };
+    let a = open(snapshots.clone()).await.unwrap();
+    assert_eq!(a.restorable_position(), Some(0));
     for i in 0..45u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
-    // Exports run in the background; the newest one always gets out.
-    while a.exported_position() != Some(40) {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_base(&a, 40).await;
+    assert_eq!(a.restorable_position(), Some(40));
     drop(a);
-    let exported: Vec<_> = std::fs::read_dir(&export_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert!(exported.len() <= export::KEEP_EXPORTS, "older exports pruned: {exported:?}");
 
-    // The disk with the log is lost; only the export survives.
+    // The disk with the log is lost; the snapshots survive.
     std::fs::remove_dir_all(&log_dir).unwrap();
-    let snap = sink.newest().await.unwrap().expect("an export");
-    assert_eq!(snap.position, 40);
-    let log = LocalLogStore::open(&log_dir).unwrap();
-    export::seed_log(&log, snap.clone()).await.unwrap();
-    assert!(export::seed_log(&log, snap).await.is_err(), "only an empty log is seeded");
+    let err = open(snapshots.clone()).await.err().expect("an empty log next to snapshots must not boot");
+    assert!(format!("{err:#}").contains("restore --lossy"), "{err:#}");
 
-    let b = open_on(dir.path()).await;
-    assert_eq!(value(&b), 40, "state as of the export; the last 5 ops are lost");
+    let log = LocalLogStore::open(&log_dir).unwrap();
+    assert_eq!(restore_lossy(&log, snapshots.as_ref()).await.unwrap(), 40);
+    assert!(restore_lossy(&log, snapshots.as_ref()).await.is_err(), "only an empty log is seeded");
+
+    let b = open(snapshots.clone()).await.unwrap();
+    assert_eq!(value(&b), 40, "state as of the snapshot; the last 5 ops are lost");
     assert_eq!(b.applied_position(), 0, "the new log numbers from 0");
     b.propose::<Counter>(op(1000, 1)).await.unwrap().unwrap();
     drop(b);
-    assert_eq!(value(&*open_on(dir.path()).await), 41);
+    assert_eq!(value(&*open(snapshots).await.unwrap()), 41);
 }
 
 #[tokio::test]
@@ -324,91 +361,76 @@ async fn confirm_active_detects_a_fence_without_any_proposal() {
 }
 
 #[tokio::test]
-async fn the_tablet_runs_over_a_chat_log() {
-    use crate::log::chat::{fake::FakeChat, ChatLogOptions, ChatLogStore};
-    let chat = Arc::new(FakeChat::default());
+async fn the_tablet_runs_over_a_chat_log_with_snapshots_in_another_chat() {
+    use crate::log::chat::{ChatLogOptions, ChatLogStore};
+    use crate::snapshot::ChatSnapshotStore;
+    let (log_chat, snap_chat) = (Arc::new(FakeChat::default()), Arc::new(FakeChat::default()));
     let open = || {
         let opts = ChatLogOptions {
             straggler_window: Duration::ZERO,
             head_retries: 1,
             head_retry_delay: Duration::from_millis(1),
         };
-        let log = Arc::new(ChatLogStore::new(chat.clone(), opts));
-        MetaStore::open(log, counter(), MetaOptions { snapshot_every: 7, ..MetaOptions::default() })
+        let log = Arc::new(ChatLogStore::new(log_chat.clone(), opts));
+        let snapshots = Arc::new(ChatSnapshotStore::new(snap_chat.clone()));
+        MetaStore::open(log, snapshots, counter(), MetaOptions { snapshot_every: 7, ..MetaOptions::default() })
     };
     let a = open().await.unwrap();
     for i in 0..20u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
+    wait_base(&a, 14).await;
     let state = snapshot(&a);
+    eventually("older snapshots removed", || snap_chat.inner.lock().unwrap().docs.len() == 1).await;
 
     let b = open().await.unwrap();
     assert_eq!(b.applied_position(), 20);
-    assert_eq!(snapshot(&b), state, "snapshot + tail from the chat rebuild the state");
+    assert_eq!(snapshot(&b), state, "snapshot + tail rebuild the state");
     let err = a.propose::<Counter>(op(100, 1)).await.unwrap_err();
     assert_eq!(err.downcast::<Stop>().unwrap(), Stop::Fenced { current: 2 });
     b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
     assert_eq!(value(&b), 21);
-    assert!(chat.inner.lock().unwrap().docs.len() < 20, "messages behind snapshots are collected");
+    assert!(log_chat.inner.lock().unwrap().docs.len() < 10, "messages behind the base are collected");
 }
 
 #[tokio::test]
-async fn exports_to_a_chat_keep_the_newest_pinned() {
-    use crate::log::chat::fake::FakeChat;
+async fn a_local_log_restores_from_snapshots_in_a_chat() {
+    use crate::snapshot::ChatSnapshotStore;
     let dir = tempfile::tempdir().unwrap();
     let chat = Arc::new(FakeChat::default());
-    let sink = Arc::new(export::ChatSink::new(chat.clone()));
-    assert!(sink.newest().await.unwrap().is_none());
-    let opts = MetaOptions { snapshot_every: 10, snapshot_export: Some(sink.clone()), ..MetaOptions::default() };
-    let a = MetaStore::open(Arc::new(LocalLogStore::open(dir.path()).unwrap()), counter(), opts).await.unwrap();
+    let snapshots: Arc<dyn SnapshotStore> = Arc::new(ChatSnapshotStore::new(chat.clone()));
+    let opts = MetaOptions { snapshot_every: 10, snapshots_outlive_log: true, ..MetaOptions::default() };
+    let a = MetaStore::open(Arc::new(LocalLogStore::open(dir.path()).unwrap()), snapshots.clone(), counter(), opts)
+        .await
+        .unwrap();
     for i in 0..35u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
-    while a.exported_position() != Some(30) {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert_eq!(chat.inner.lock().unwrap().docs.len(), 1, "older exports are deleted");
-    let snap = sink.newest().await.unwrap().expect("an export");
-    assert_eq!(snap.position, 30);
+    wait_base(&a, 30).await;
+    drop(a);
 
     let fresh = tempfile::tempdir().unwrap();
-    let log = LocalLogStore::open(fresh.path()).unwrap();
-    export::seed_log(&log, snap).await.unwrap();
-    let b = MetaStore::open(Arc::new(log), counter(), MetaOptions::default()).await.unwrap();
+    let log = Arc::new(LocalLogStore::open(fresh.path()).unwrap());
+    assert_eq!(restore_lossy(log.as_ref(), snapshots.as_ref()).await.unwrap(), 30);
+    let b = MetaStore::open(log, snapshots, counter(), MetaOptions::default()).await.unwrap();
     assert_eq!(value(&b), 30);
-
-    // Someone else's pin in the chat: refuse rather than guess.
-    chat.post_text_and_pin();
-    assert!(sink.newest().await.is_err());
-    assert!(sink.put(40, vec![]).await.is_err());
 }
 
 #[tokio::test]
 async fn an_idle_tablet_snapshots_by_time() {
     let dir = tempfile::tempdir().unwrap();
-    let sink = Arc::new(export::DirSink::new(dir.path().join("export")));
-    let opts = MetaOptions {
-        snapshot_every: 0,
-        snapshot_interval: Duration::from_millis(50),
-        snapshot_export: Some(sink.clone()),
-        ..MetaOptions::default()
-    };
-    let log = Arc::new(LocalLogStore::open(dir.path().join("log")).unwrap());
-    let a = MetaStore::open(log.clone(), counter(), opts).await.unwrap();
+    let opts = MetaOptions { snapshot_every: 0, snapshot_interval: Duration::from_millis(50), ..MetaOptions::default() };
+    let (log, snapshots) = local(dir.path());
+    let a = MetaStore::open(log.clone(), snapshots, counter(), opts).await.unwrap();
     for i in 0..3u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
-    // No more traffic: the interval alone takes (and exports) the snapshot.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while a.exported_position() != Some(3) {
-        assert!(tokio::time::Instant::now() < deadline, "no snapshot by time");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // No more traffic: the interval alone takes the snapshot.
+    wait_base(&a, 3).await;
     let d = log.discover().await.unwrap().unwrap();
-    assert_eq!(d.snapshot.map(|(at, _)| at), Some(3));
+    assert_eq!(d.base.map(|b| b.at), Some(3));
+    eventually("older snapshots removed", || snapshot_files(dir.path()) == 1).await;
     // Nothing new: no more snapshots.
-    let exports = || std::fs::read_dir(dir.path().join("export")).unwrap().count();
-    let before = exports();
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(exports(), before);
+    assert_eq!(snapshot_files(dir.path()), 1);
 }

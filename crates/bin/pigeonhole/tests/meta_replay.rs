@@ -9,7 +9,9 @@ use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_gateway_s3::S3State;
 use pigeonhole_chunk_store::ChunkState;
-use pigeonhole_meta::{decode_state, encode_state, LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
+use pigeonhole_meta::{
+    decode_state, encode_state, LocalLogStore, LocalSnapshotStore, LogStore, MetaOptions, MetaStore, Namespaces,
+};
 use s3s::dto::*;
 use s3s::{S3Request, S3};
 use std::path::Path;
@@ -33,6 +35,7 @@ async fn tablet(dir: &Path, snapshot_every: u64) -> Arc<MetaStore> {
     let log = LocalLogStore::open(dir.join("log")).unwrap();
     MetaStore::open(
         Arc::new(log),
+        Arc::new(LocalSnapshotStore::new(dir.join("log"))),
         Index::register(BlobDb::register(Namespaces::new())),
         MetaOptions { snapshot_every, ..MetaOptions::default() },
     )
@@ -96,10 +99,14 @@ async fn rebuild(snapshot_every: u64) {
     let before = replicated_state(&meta);
     let position = meta.applied_position();
     assert!(position > 20, "every metadata change went through the log");
+    // Snapshots are stored in the background.
+    while snapshot_every > 0 && meta.base_position() == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     drop(s3);
 
     let replayed = tablet(dir.path(), snapshot_every).await;
-    let snapshot = LocalLogStore::open(dir.path().join("log")).unwrap().discover().await.unwrap().unwrap().snapshot;
+    let snapshot = LocalLogStore::open(dir.path().join("log")).unwrap().discover().await.unwrap().unwrap().base;
     assert_eq!(snapshot.is_some(), snapshot_every > 0);
     assert_eq!(replayed.applied_position(), position);
     assert_eq!(replicated_state(&replayed), before);

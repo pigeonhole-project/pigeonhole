@@ -7,7 +7,7 @@
 #   CONFIG_INSTANCE      memory | telegram | discord (default memory)
 #   CONFIG_SCOPE_ID      chat id (telegram) / channel id (discord); required for those
 #   CONFIG_LISTEN_ADDR   default 0.0.0.0:8333
-#   CONFIG_META_LOG      local metadata log directory (default pigeonhole-log)
+#   CONFIG_META_LOG      local metadata log directory (default pigeonhole-meta)
 #   CONFIG_REGION        default us-east-1
 #   CONFIG_CHUNK_SIZE    default 19922944
 #   CONFIG_CHUNK_CODEC   default zstd
@@ -18,7 +18,7 @@ set -euo pipefail
 
 INSTANCE="${CONFIG_INSTANCE:-memory}"
 LISTEN_ADDR="${CONFIG_LISTEN_ADDR:-0.0.0.0:8333}"
-META_LOG="${CONFIG_META_LOG:-pigeonhole-log}"
+META_LOG="${CONFIG_META_LOG:-pigeonhole-meta}"
 REGION="${CONFIG_REGION:-us-east-1}"
 CHUNK_SIZE="${CONFIG_CHUNK_SIZE:-19922944}"
 CHUNK_CODEC="${CONFIG_CHUNK_CODEC:-zstd}"
