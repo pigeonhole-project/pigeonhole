@@ -63,9 +63,18 @@ pub struct MetaSettings {
     pub batch_max_entries: usize,
     /// Snapshot (and collect the log behind it) every this many entries; 0 = never.
     pub snapshot_every_entries: u64,
-    /// Also copy every snapshot into this directory (for `pigeonhole restore`).
-    pub snapshot_export: Option<PathBuf>,
+    /// Also copy every snapshot here (for `pigeonhole restore`).
+    pub snapshot_export: Option<ExportSettings>,
     pub log: LogSettings,
+}
+
+/// Where snapshot exports go (`[meta.snapshot.export] kind = ...`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportSettings {
+    /// `tablet-<pos>.snap` files in a directory (another disk, a mount).
+    Dir { path: PathBuf },
+    /// The newest export pinned in a dedicated Telegram chat.
+    Telegram { chat_id: String, bot_token: String },
 }
 
 /// Where the command log lives (`[meta.log] kind = ...`).
@@ -228,6 +237,21 @@ impl Config {
                 );
             }
         }
+        if let Some(ExportSettings::Telegram { chat_id, .. }) = &meta.snapshot_export {
+            if let Some(i) = instances
+                .iter()
+                .find(|i| i.info.kind == InstanceKind::Telegram && i.scope_id == *chat_id)
+            {
+                bail!(
+                    "[meta.snapshot.export] chat_id {chat_id} is also instance {:?}: the sweeper \
+                     deletes every message of a blob chat, so exports need a chat of their own",
+                    i.info.id
+                );
+            }
+            if matches!(&meta.log, LogSettings::Telegram { chat_id: log, .. } if log == chat_id) {
+                bail!("[meta.snapshot.export] chat_id {chat_id} is the log chat: exports need a chat of their own");
+            }
+        }
 
         let placement = resolve_placement(file.placement, &instances)?;
         check_block_size_against_instances(block_size, &instances)?;
@@ -386,7 +410,20 @@ struct FileMeta {
 #[serde(default, deny_unknown_fields)]
 struct FileMetaSnapshot {
     every_entries: u64,
-    export: Option<PathBuf>,
+    export: Option<FileExport>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+enum FileExport {
+    Dir {
+        path: PathBuf,
+    },
+    Telegram {
+        chat_id: i64,
+        #[serde(default = "default_bot_token_env")]
+        bot_token_env: String,
+    },
 }
 
 impl Default for FileMetaSnapshot {
@@ -449,11 +486,21 @@ impl FileMeta {
                 }
             }
         };
+        let snapshot_export = match self.snapshot.export {
+            None => None,
+            Some(FileExport::Dir { path }) => Some(ExportSettings::Dir { path }),
+            Some(FileExport::Telegram { chat_id, bot_token_env }) => Some(ExportSettings::Telegram {
+                chat_id: chat_id.to_string(),
+                bot_token: env::var(&bot_token_env).with_context(|| {
+                    format!("[meta.snapshot.export] bot_token_env {bot_token_env} is not set")
+                })?,
+            }),
+        };
         Ok(MetaSettings {
             batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
             batch_max_entries: self.batch_max_entries.max(1),
             snapshot_every_entries: self.snapshot.every_entries,
-            snapshot_export: self.snapshot.export,
+            snapshot_export,
             log,
         })
     }
@@ -908,12 +955,12 @@ upload_concurrency = 4
     #[test]
     fn parses_meta_section() {
         let cfg = load(&format!(
-            "[meta]\nbatch_max_delay_ms = 250\n[meta.snapshot]\nevery_entries = 0\nexport = \"/backup\"\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
+            "[meta]\nbatch_max_delay_ms = 250\n[meta.snapshot]\nevery_entries = 0\n[meta.snapshot.export]\nkind = \"dir\"\npath = \"/backup\"\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
         ))
         .unwrap();
         assert_eq!(cfg.meta.batch_max_delay, Duration::from_millis(250));
         assert_eq!(cfg.meta.snapshot_every_entries, 0);
-        assert_eq!(cfg.meta.snapshot_export, Some(PathBuf::from("/backup")));
+        assert_eq!(cfg.meta.snapshot_export, Some(ExportSettings::Dir { path: "/backup".into() }));
         assert_eq!(cfg.meta.log, LogSettings::Local { path: "/var/log-dir".into() });
         for bad in ["[meta]\ndb_path = \"m.db\"\n", "[meta.log]\nkind = \"s3\"\n", "[meta.log]\nkind = \"local\"\nchat_id = 1\n"] {
             assert!(load(&format!("{bad}{MEM}")).is_err(), "{bad:?} accepted");
@@ -936,6 +983,25 @@ upload_concurrency = 4
         let blob_chat = "[[instances]]\nid = \"tg\"\nkind = \"telegram\"\nchat_id = -100\nbot_token_env = \"PH_TEST_LOG_TOKEN\"\n";
         let err = load(&format!("{log}{blob_chat}")).unwrap_err();
         assert!(format!("{err:#}").contains("chat of its own"), "{err:#}");
+    }
+
+    #[test]
+    fn telegram_export_needs_a_chat_of_its_own() {
+        std::env::set_var("PH_TEST_EXPORT_TOKEN", "1:test");
+        let export = |chat: i64| {
+            format!("[meta.snapshot.export]\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_env = \"PH_TEST_EXPORT_TOKEN\"\n")
+        };
+        let cfg = load(&format!("{}{MEM}", export(-200))).unwrap();
+        assert_eq!(
+            cfg.meta.snapshot_export,
+            Some(ExportSettings::Telegram { chat_id: "-200".into(), bot_token: "1:test".into() })
+        );
+        let blob_chat = "[[instances]]\nid = \"tg\"\nkind = \"telegram\"\nchat_id = -200\nbot_token_env = \"PH_TEST_EXPORT_TOKEN\"\n";
+        let err = load(&format!("{}{blob_chat}", export(-200))).unwrap_err();
+        assert!(format!("{err:#}").contains("chat of their own"), "{err:#}");
+        let log = "[meta.log]\nkind = \"telegram\"\nchat_id = -200\nbot_token_env = \"PH_TEST_EXPORT_TOKEN\"\n";
+        let err = load(&format!("{}{log}{MEM}", export(-200))).unwrap_err();
+        assert!(format!("{err:#}").contains("log chat"), "{err:#}");
     }
 
     #[test]

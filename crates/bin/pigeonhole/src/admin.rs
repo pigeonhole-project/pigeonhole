@@ -5,8 +5,9 @@ use anyhow::{bail, Context};
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole_chunk_store::Sweeper;
-use pigeonhole_meta::export;
+use pigeonhole_meta::export::{self, DirSink, SnapshotSink};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Delete every upload, object and bucket, releasing their chunks. Backend
@@ -67,22 +68,23 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
 /// disk with the log). Lossy: everything after the export is gone.
 pub async fn cmd_restore(from: Option<PathBuf>, lossy: bool) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
-    let from = from
-        .or_else(|| cfg.meta.snapshot_export.clone())
-        .context("no export directory: pass --from-export DIR or set [meta.snapshot] export")?;
     if !lossy {
         bail!(
             "restore from an export loses every change after it, and objects whose chunks were \
              reclaimed since then read back broken; re-run with --lossy to accept"
         );
     }
-    let snapshot = export::newest_export(&from)?
-        .with_context(|| format!("no snapshot export in {}", from.display()))?;
+    let sink: Arc<dyn SnapshotSink> = match from {
+        Some(dir) => Arc::new(DirSink::new(dir)),
+        None => crate::runtime::open_export(&cfg)
+            .await?
+            .context("no export: pass --from-export DIR or set [meta.snapshot.export]")?,
+    };
+    let snapshot = sink.newest().await?.context("no snapshot export found")?;
     let log = crate::runtime::open_log(&cfg).await?;
     let position = snapshot.position;
     export::seed_log(log.as_ref(), snapshot).await?;
     warn!(
-        export = %from.display(),
         position,
         "metadata restored from a snapshot export; changes after it are lost"
     );

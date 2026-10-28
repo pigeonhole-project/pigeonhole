@@ -38,8 +38,8 @@ Done (on `main`), steps 1–5:
 - `LocalLogStore`: `seg-<first>.log` records `MAGIC|len|crc|Batch`, fsync per
   batch, `claimed_gen` + `log_id` under a `flock`; claim truncates a torn tail;
   snapshots drop the segments behind them.
-- Snapshots every `[meta.snapshot] every_entries` (10000); `export = DIR` copies
-  them; `pigeonhole restore [--from-export DIR] --lossy` seeds an empty log
+- Snapshots every `[meta.snapshot] every_entries` (10000); `[meta.snapshot.export]`
+  copies them to a directory or a dedicated Telegram chat; `pigeonhole restore [--from-export DIR] --lossy` seeds an empty log
   from the newest export.
 - Removed: `durability.rs` (checkpoint, superblock pins, root journal,
   `start_or_restore`), `s3/index` / `cas/index` snapshots, chunk roots.

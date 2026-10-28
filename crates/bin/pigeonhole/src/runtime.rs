@@ -8,11 +8,12 @@ use pigeonhole_blob::{
     erase_sweep, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
 };
 use pigeonhole_chunk_store::{
-    check_fingerprints, BlockCache, BlobDb, ChunkStore, IngestOptions, LogSettings,
+    check_fingerprints, BlockCache, BlobDb, ChunkStore, ExportSettings, IngestOptions, LogSettings,
 };
 use pigeonhole::index::Index;
 use crate::telegram_log::{self, TelegramChat};
 use pigeonhole_meta::log::chat::{ChatLogOptions, ChatLogStore};
+use pigeonhole_meta::export::{ChatSink, DirSink, SnapshotSink};
 use pigeonhole_meta::{LocalLogStore, LogStore, MetaOptions, MetaStore, Namespaces};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -46,6 +47,21 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
     })
 }
 
+/// The configured snapshot export sink (`[meta.snapshot.export]`).
+pub async fn open_export(cfg: &Config) -> anyhow::Result<Option<Arc<dyn SnapshotSink>>> {
+    Ok(match &cfg.meta.snapshot_export {
+        None => None,
+        Some(ExportSettings::Dir { path }) => Some(Arc::new(DirSink::new(path))),
+        Some(ExportSettings::Telegram { chat_id, bot_token }) => {
+            let tg = TelegramClient::new(bot_token.clone()).context("telegram client for exports")?;
+            tg.ensure_chat_admin(chat_id).await.context("export chat access check")?;
+            let chat = TelegramChat::new(tg, chat_id.clone(), cfg.chat_limiter());
+            info!(chat_id = %chat_id, "snapshot exports to a Telegram chat");
+            Some(Arc::new(ChatSink::new(Arc::new(chat))))
+        }
+    })
+}
+
 pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     let namespaces = Index::register(BlobDb::register(Namespaces::new()));
     #[cfg(feature = "bytestream")]
@@ -55,7 +71,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
         batch_max_delay: cfg.meta.batch_max_delay,
         batch_max_entries: cfg.meta.batch_max_entries,
         snapshot_every: cfg.meta.snapshot_every_entries,
-        snapshot_export: cfg.meta.snapshot_export.clone(),
+        snapshot_export: open_export(cfg).await?,
     };
     let meta = MetaStore::open(log, namespaces, opts)
         .await

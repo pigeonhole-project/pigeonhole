@@ -36,9 +36,9 @@ use serde::Serialize;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -218,7 +218,7 @@ impl fmt::Display for Stop {
 impl std::error::Error for Stop {}
 
 /// Tablet knobs (`[meta]`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MetaOptions {
     /// Extra time to wait for more commands before appending a batch. Zero =
     /// append as soon as the previous append finished (batches still form from
@@ -228,8 +228,19 @@ pub struct MetaOptions {
     /// Take a snapshot (and collect the log behind it) after this many
     /// entries since the last one; 0 = never.
     pub snapshot_every: u64,
-    /// Also copy every snapshot into this directory (see [`export`]).
-    pub snapshot_export: Option<PathBuf>,
+    /// Also export every snapshot here (see [`export`]), in the background.
+    pub snapshot_export: Option<Arc<dyn export::SnapshotSink>>,
+}
+
+impl fmt::Debug for MetaOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetaOptions")
+            .field("batch_max_delay", &self.batch_max_delay)
+            .field("batch_max_entries", &self.batch_max_entries)
+            .field("snapshot_every", &self.snapshot_every)
+            .field("snapshot_export", &self.snapshot_export.is_some())
+            .finish()
+    }
 }
 
 impl Default for MetaOptions {
@@ -258,6 +269,9 @@ pub struct MetaStore {
     gen: u64,
     /// Position of the last applied entry.
     applied: Arc<AtomicU64>,
+    /// Position of the newest snapshot exported by this incarnation; `None`
+    /// without an export sink.
+    exported: Option<Arc<AtomicU64>>,
     queue: mpsc::UnboundedSender<Pending>,
     stop: watch::Receiver<Option<Stop>>,
 }
@@ -290,11 +304,14 @@ impl MetaStore {
         let applied = Arc::new(AtomicU64::new(head.position));
         let (queue, rx) = mpsc::unbounded_channel();
         let (stop_tx, stop) = watch::channel(None);
+        let exported = opts.snapshot_export.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
         tokio::spawn(batcher(
             Batcher {
                 states: states.clone(),
                 applied: applied.clone(),
                 snapshot_at,
+                exported: exported.clone(),
+                export_queue: Arc::default(),
                 log,
                 gen,
                 opts,
@@ -302,7 +319,7 @@ impl MetaStore {
             },
             rx,
         ));
-        Ok(Arc::new(Self { states, gen, applied, queue, stop }))
+        Ok(Arc::new(Self { states, gen, applied, exported, queue, stop }))
     }
 
     /// Boot over a [`LocalLogStore`] in `dir`.
@@ -390,6 +407,13 @@ impl MetaStore {
             Err(_) => Stop::Failed("tablet batcher is gone".into()),
         };
         stop
+    }
+
+    /// Position of the newest snapshot this incarnation exported (0 before the
+    /// first); `None` without an export sink. A restore from the export
+    /// brings back the state as of at least this position.
+    pub fn exported_position(&self) -> Option<Position> {
+        self.exported.as_ref().map(|e| e.load(Ordering::SeqCst))
     }
 
     /// Position of the last applied entry (0 before the first).
@@ -486,6 +510,10 @@ struct Batcher {
     applied: Arc<AtomicU64>,
     /// Position of the newest installed snapshot.
     snapshot_at: Position,
+    exported: Option<Arc<AtomicU64>>,
+    /// The newest snapshot waiting for the running export to finish; `Some`
+    /// slot = an export task is running.
+    export_queue: Arc<Mutex<Option<Option<(Position, Vec<u8>)>>>>,
     log: Arc<dyn LogStore>,
     gen: u64,
     opts: MetaOptions,
@@ -580,6 +608,37 @@ async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
 }
 
 impl Batcher {
+    /// Export in the background, one at a time, newest wins: a slow sink (a
+    /// chat) must not hold up proposals, and a snapshot taken while an export
+    /// runs replaces any older one waiting behind it.
+    fn export(&self, sink: Arc<dyn export::SnapshotSink>, exported: Arc<AtomicU64>, position: Position, data: Vec<u8>) {
+        {
+            let mut queue = self.export_queue.lock().unwrap();
+            if let Some(waiting) = queue.as_mut() {
+                *waiting = Some((position, data));
+                return;
+            }
+            *queue = Some(None);
+        }
+        let queue = self.export_queue.clone();
+        tokio::spawn(async move {
+            let mut next = Some((position, data));
+            while let Some((position, data)) = next {
+                match sink.put(position, data).await {
+                    Ok(()) => {
+                        exported.fetch_max(position, Ordering::SeqCst);
+                    }
+                    Err(e) => tracing::warn!(position, error = %e, "snapshot export failed"),
+                }
+                let mut q = queue.lock().unwrap();
+                next = q.as_mut().and_then(Option::take);
+                if next.is_none() {
+                    *q = None;
+                }
+            }
+        });
+    }
+
     /// Snapshot when due. Only a fence stops the tablet: a failed snapshot
     /// leaves the log intact, so it is retried after the next batch.
     async fn maybe_snapshot(&mut self) -> Option<Stop> {
@@ -589,18 +648,12 @@ impl Batcher {
             return None;
         }
         let data = take_snapshot(&self.states, position).encode();
-        let copy = self.opts.snapshot_export.clone().map(|dir| (dir, data.clone()));
+        let copy = self.opts.snapshot_export.clone().map(|sink| (sink, data.clone()));
         match self.log.install_snapshot(self.gen, position, Snapshot { data }).await {
             Ok(()) => {
                 self.snapshot_at = position;
-                if let Some((dir, data)) = copy {
-                    let written =
-                        tokio::task::spawn_blocking(move || export::write_export(&dir, position, &data)).await;
-                    match written {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::warn!(position, error = %e, "snapshot export failed"),
-                        Err(e) => tracing::warn!(position, error = %e, "snapshot export task failed"),
-                    }
+                if let (Some((sink, data)), Some(exported)) = (copy, self.exported.clone()) {
+                    self.export(sink, exported, position, data);
                 }
                 None
             }

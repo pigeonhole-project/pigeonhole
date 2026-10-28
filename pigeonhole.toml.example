@@ -27,8 +27,16 @@ path = "pigeonhole-log"
 
 [meta.snapshot]
 every_entries = 10000         # snapshot all states, drop the log behind it; 0 = never
-# export = "/mnt/backup/pigeonhole"   # also copy each snapshot here (another disk);
-#                                     # `pigeonhole restore --from-export DIR --lossy`
+# Also copy each snapshot off the log's disk; after losing it:
+# `pigeonhole restore --lossy` seeds a new log from the newest export.
+# [meta.snapshot.export]
+# kind = "dir"
+# path = "/mnt/backup/pigeonhole"
+# Or pinned in a dedicated Telegram channel (not the log chat, not a blob chat);
+# the bot needs pin and delete rights:
+# kind = "telegram"
+# chat_id = -1001111111111
+# bot_token_env = "BOT_TOKEN"
 
 # Backend instances (at least one). Secrets come from the env var named in
 # bot_token_env (defaults: BOT_TOKEN / DISCORD_BOT_TOKEN), never inline.

@@ -135,13 +135,17 @@ entry) takes no position. A batch is one log write: commits are grouped
    boot rebuilds from the log.
 5. **Snapshot**: every `[meta.snapshot] every_entries` entries, between
    batches: one `TabletSnapshot` of all states → `install_snapshot`, which
-   drops the log behind it; with `export` set, a copy goes to a directory. A
+   drops the log behind it. With `[meta.snapshot.export]` set, a copy goes to a
+   directory or is pinned in a dedicated Telegram chat (the previous pinned
+   export deleted), in the background, one at a time, newest wins:
+   `MetaStore::exported_position` is the newest position safely exported. A
    failed snapshot keeps the log and is retried after the next batch.
 
 Responses are released only after `append` returned `Ok`, so a client never sees
 a result the next generation might not have.
 
-**Restore** (`pigeonhole restore --from-export DIR --lossy`) seeds an empty log
+**Restore** (`pigeonhole restore [--from-export DIR] --lossy`; without the flag
+it reads the configured export) seeds an empty log
 from the newest export: the states as of the export, positions from 0. It is
 lossy: changes after the export are gone, chunks committed later become
 orphans (the sweeper deletes them) and chunks reclaimed later are referenced
@@ -291,7 +295,9 @@ path = "pigeonhole-log"
 
 [meta.snapshot]
 every_entries = 10000               # 0 = never
-# export = "/mnt/backup/pigeonhole" # copy every snapshot here (for restore)
+# [meta.snapshot.export]            # copy every snapshot here (for restore)
+# kind = "dir"                      # or "telegram" + chat_id (a chat of its own)
+# path = "/mnt/backup/pigeonhole"
 ```
 
 ## Plan / План

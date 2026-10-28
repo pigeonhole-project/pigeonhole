@@ -1,4 +1,5 @@
 use super::*;
+use crate::export::SnapshotSink;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -277,18 +278,24 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
 async fn lossy_restore_from_an_export_starts_a_new_log() {
     let dir = tempfile::tempdir().unwrap();
     let (log_dir, export_dir) = (dir.path().join("log"), dir.path().join("export"));
-    let opts = MetaOptions { snapshot_every: 10, snapshot_export: Some(export_dir.clone()), ..MetaOptions::default() };
+    let sink = Arc::new(export::DirSink::new(&export_dir));
+    let opts = MetaOptions { snapshot_every: 10, snapshot_export: Some(sink.clone()), ..MetaOptions::default() };
     let a = MetaStore::open(Arc::new(LocalLogStore::open(&log_dir).unwrap()), counter(), opts).await.unwrap();
+    assert_eq!(a.exported_position(), Some(0));
     for i in 0..45u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
+    // Exports run in the background; the newest one always gets out.
+    while a.exported_position() != Some(40) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     drop(a);
     let exported: Vec<_> = std::fs::read_dir(&export_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert_eq!(exported.len(), export::KEEP_EXPORTS, "older exports pruned: {exported:?}");
+    assert!(exported.len() <= export::KEEP_EXPORTS, "older exports pruned: {exported:?}");
 
     // The disk with the log is lost; only the export survives.
     std::fs::remove_dir_all(&log_dir).unwrap();
-    let snap = export::newest_export(&export_dir).unwrap().expect("an export");
+    let snap = sink.newest().await.unwrap().expect("an export");
     assert_eq!(snap.position, 40);
     let log = LocalLogStore::open(&log_dir).unwrap();
     export::seed_log(&log, snap.clone()).await.unwrap();
@@ -343,4 +350,35 @@ async fn the_tablet_runs_over_a_chat_log() {
     b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
     assert_eq!(value(&b), 21);
     assert!(chat.inner.lock().unwrap().docs.len() < 20, "messages behind snapshots are collected");
+}
+
+#[tokio::test]
+async fn exports_to_a_chat_keep_the_newest_pinned() {
+    use crate::log::chat::fake::FakeChat;
+    let dir = tempfile::tempdir().unwrap();
+    let chat = Arc::new(FakeChat::default());
+    let sink = Arc::new(export::ChatSink::new(chat.clone()));
+    assert!(sink.newest().await.unwrap().is_none());
+    let opts = MetaOptions { snapshot_every: 10, snapshot_export: Some(sink.clone()), ..MetaOptions::default() };
+    let a = MetaStore::open(Arc::new(LocalLogStore::open(dir.path()).unwrap()), counter(), opts).await.unwrap();
+    for i in 0..35u64 {
+        a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    while a.exported_position() != Some(30) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(chat.inner.lock().unwrap().docs.len(), 1, "older exports are deleted");
+    let snap = sink.newest().await.unwrap().expect("an export");
+    assert_eq!(snap.position, 30);
+
+    let fresh = tempfile::tempdir().unwrap();
+    let log = LocalLogStore::open(fresh.path()).unwrap();
+    export::seed_log(&log, snap).await.unwrap();
+    let b = MetaStore::open(Arc::new(log), counter(), MetaOptions::default()).await.unwrap();
+    assert_eq!(value(&b), 30);
+
+    // Someone else's pin in the chat: refuse rather than guess.
+    chat.post_text_and_pin();
+    assert!(sink.newest().await.is_err());
+    assert!(sink.put(40, vec![]).await.is_err());
 }
