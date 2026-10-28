@@ -7,14 +7,13 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub mod channel;
+pub mod chain;
 #[cfg(any(test, feature = "testsuite"))]
 pub mod conformance;
 mod local;
-mod memory;
 
+pub use chain::ChainLogStore;
 pub use local::{LocalLogStore, DEFAULT_SEGMENT_BYTES};
-pub use memory::MemoryLogStore;
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.

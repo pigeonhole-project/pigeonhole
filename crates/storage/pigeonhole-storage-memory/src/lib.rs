@@ -1,8 +1,8 @@
 //! In-memory [`BlobBackend`] for tests and `memory = true`.
 
 use pigeonhole_blob::{
-    bytes_stream, slice_range, BoxByteStream, CostHint, InstanceInfo, InstanceKind, InstanceRole,
-    OpKind, Sweepable, BlobBackend,
+    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo,
+    InstanceKind, InstanceRole, Linked, OpKind, Sweepable,
 };
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -32,6 +32,14 @@ pub struct MemoryBlobStore {
     names: Mutex<HashMap<i64, String>>,
     /// When set and true, get/put fail (failover tests).
     unavailable: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The chain ([`Chain`]): successor of each message (`None`: the start).
+    chain: Mutex<ChainLinks>,
+}
+
+#[derive(Default)]
+struct ChainLinks {
+    next: HashMap<Option<i64>, i64>,
+    tail: Option<i64>,
 }
 
 /// Alias matching Stage 3 naming.
@@ -59,6 +67,7 @@ impl MemoryBlobStore {
             messages: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             unavailable: None,
+            chain: Mutex::default(),
         }
     }
 
@@ -125,6 +134,13 @@ impl MemoryBlobStore {
             .collect();
         keys.sort_unstable();
         keys
+    }
+
+    /// The id of message `message_id`, with the name it was put under.
+    fn linked(&self, message_id: i64) -> Linked<MemoryId> {
+        let file_id = self.messages.lock().unwrap().get(&message_id).cloned().unwrap_or_default();
+        let label = self.names.lock().unwrap().get(&message_id).cloned().unwrap_or_default();
+        Linked { id: MemoryId { file_id, message_id: message_id as u64 }, label }
     }
 
     /// Test hook: how many successful `get` calls completed.
@@ -237,6 +253,49 @@ impl Sweepable for MemoryBlobStore {
     }
 }
 
+/// The successor of a message is decided under a lock: the first to link wins.
+#[async_trait]
+impl Chain for MemoryBlobStore {
+    async fn put_after(&self, prev: Option<&Self::Id>, label: &str, data: Bytes) -> Result<After<Self::Id>> {
+        let prev = prev.map(|p| p.message_id as i64);
+        if let Some(&winner) = self.chain.lock().unwrap().next.get(&prev) {
+            return Ok(After::Lost(self.linked(winner)));
+        }
+        let id = self.put(data, label).await?;
+        let mine = id.message_id as i64;
+        let mut chain = self.chain.lock().unwrap();
+        if let Some(&winner) = chain.next.get(&prev) {
+            drop(chain);
+            return Ok(After::Lost(self.linked(winner)));
+        }
+        chain.next.insert(prev, mine);
+        chain.tail = Some(mine);
+        Ok(After::Won(id))
+    }
+
+    async fn tail(&self) -> Result<Option<Linked<Self::Id>>> {
+        self.check_available()?;
+        let tail = self.chain.lock().unwrap().tail;
+        Ok(tail.map(|t| self.linked(t)))
+    }
+
+    async fn successor(&self, id: &Self::Id) -> Result<Option<Linked<Self::Id>>> {
+        self.check_available()?;
+        let next = self.chain.lock().unwrap().next.get(&Some(id.message_id as i64)).copied();
+        Ok(next.map(|n| self.linked(n)))
+    }
+
+    async fn prune(&self, below: &Self::Id) -> Result<()> {
+        let below = below.message_id;
+        let doomed: Vec<u64> = self.message_keys().into_iter().filter(|&k| k < below).collect();
+        BlobBackend::delete(self, &doomed).await?;
+        let mut names = self.names.lock().unwrap();
+        for k in &doomed {
+            names.remove(&(*k as i64));
+        }
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -257,6 +316,31 @@ mod tests {
         assert!(BlobBackend::get(&store, &id, None).await.is_err());
         // Repeat delete is ok.
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_first_successor_wins() {
+        let store = MemoryBlobStore::new();
+        assert_eq!(store.tail().await.unwrap(), None);
+        let After::Won(a) = store.put_after(None, "a", Bytes::from_static(b"a")).await.unwrap() else {
+            panic!("the first blob of a chain wins")
+        };
+        let After::Lost(w) = store.put_after(None, "a2", Bytes::from_static(b"x")).await.unwrap() else {
+            panic!("a second start loses")
+        };
+        assert_eq!((w.id.message_id, w.label.as_str()), (a.message_id, "a"));
+        let After::Won(b) = store.put_after(Some(&a), "b", Bytes::from_static(b"b")).await.unwrap() else {
+            panic!("a successor of the tail wins")
+        };
+        assert!(matches!(store.put_after(Some(&a), "c", Bytes::from_static(b"c")).await.unwrap(), After::Lost(_)));
+        assert_eq!(store.tail().await.unwrap().map(|t| t.id), Some(b.clone()));
+        assert_eq!(store.successor(&a).await.unwrap().map(|s| s.label), Some("b".into()));
+        assert_eq!(store.successor(&b).await.unwrap(), None);
+
+        store.prune(&b).await.unwrap();
+        assert!(BlobBackend::get(&store, &a, None).await.is_err(), "below the prune point");
+        assert!(BlobBackend::get(&store, &b, None).await.is_ok());
+        assert_eq!(store.tail().await.unwrap().map(|t| t.label), Some("b".into()));
     }
 
     #[tokio::test]

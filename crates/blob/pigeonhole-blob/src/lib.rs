@@ -32,6 +32,7 @@ pub use typed::{
     load_id, store_id, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
     BlobId, BlobLocator, Sweepable, BlobBackend,
 };
+pub use pigeonhole_storage_api::{After, Chain, Linked};
 pub use pigeonhole_types::{
     BackendId, BackendLimits, BlobKey, ByteRange, DeleteOutcome, RangeSupport,
 };

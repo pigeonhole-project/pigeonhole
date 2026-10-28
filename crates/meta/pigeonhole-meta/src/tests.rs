@@ -1,5 +1,5 @@
 use super::*;
-use crate::log::channel::fake::FakeChannel;
+use pigeonhole_storage_memory::MemoryBlobStore;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -452,14 +452,12 @@ async fn confirm_active_detects_a_fence_without_any_proposal() {
 }
 
 #[tokio::test]
-async fn the_tablet_runs_over_a_channel_log_with_snapshots_in_another_channel() {
-    use crate::log::channel::{ChannelLogOptions, ChannelLogStore};
-    use crate::snapshot::ChannelSnapshotStore;
-    let (log_chat, snap_chat) = (Arc::new(FakeChannel::default()), Arc::new(FakeChannel::default()));
+async fn the_tablet_runs_over_a_chain_log_with_snapshots_in_another_store() {
+    use crate::{BlobSnapshotStore, ChainLogStore};
+    let (log_chat, snap_chat) = (Arc::new(MemoryBlobStore::new()), Arc::new(MemoryBlobStore::new()));
     let open = || {
-        let opts = ChannelLogOptions { empty_retries: 1, empty_retry_delay: Duration::from_millis(1) };
-        let log = Arc::new(ChannelLogStore::new(log_chat.clone(), opts));
-        let snapshots = Arc::new(ChannelSnapshotStore::new(snap_chat.clone()));
+        let log = Arc::new(ChainLogStore::new(log_chat.clone()));
+        let snapshots = Arc::new(BlobSnapshotStore::new(snap_chat.clone()));
         MetaStore::open(log, snapshots, counter(), MetaOptions { snapshot_every: 7, ..MetaOptions::default() })
     };
     let a = open().await.unwrap();
@@ -468,7 +466,7 @@ async fn the_tablet_runs_over_a_channel_log_with_snapshots_in_another_channel() 
     }
     wait_base(&a, 14).await;
     let state = snapshot(&a);
-    eventually("older snapshots removed", || snap_chat.inner.lock().unwrap().messages.len() <= 2).await;
+    eventually("older snapshots removed", || snap_chat.message_keys().len() <= 2).await;
 
     let b = open().await.unwrap();
     assert_eq!(snapshot(&b), state, "snapshot + tail rebuild the state");
@@ -476,16 +474,19 @@ async fn the_tablet_runs_over_a_channel_log_with_snapshots_in_another_channel() 
     assert_eq!(err.downcast::<Stop>().unwrap(), Stop::Fenced { current: 2 });
     b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
     assert_eq!(value(&b), 21);
-    let batches = log_chat.names().iter().filter(|(_, n)| n.ends_with("-batch.bin")).count();
+    let batches = log_chat
+        .message_keys()
+        .into_iter()
+        .filter(|k| log_chat.name_of(*k).is_some_and(|n| n.starts_with("log-batch-")))
+        .count();
     assert!(batches < 15, "batches behind the base are collected: {batches} left");
 }
 
 #[tokio::test]
-async fn a_local_log_restores_from_snapshots_in_a_channel() {
-    use crate::snapshot::ChannelSnapshotStore;
+async fn a_local_log_restores_from_snapshots_in_a_blob_store() {
     let dir = tempfile::tempdir().unwrap();
-    let chat = Arc::new(FakeChannel::default());
-    let snapshots: Arc<dyn SnapshotStore> = Arc::new(ChannelSnapshotStore::new(chat.clone()));
+    let chat = Arc::new(MemoryBlobStore::new());
+    let snapshots: Arc<dyn SnapshotStore> = Arc::new(crate::BlobSnapshotStore::new(chat.clone()));
     let opts = MetaOptions { snapshot_every: 10, snapshots_outlive_log: true, ..MetaOptions::default() };
     let a = MetaStore::open(Arc::new(LocalLogStore::open(dir.path()).unwrap()), snapshots.clone(), counter(), opts)
         .await
@@ -532,7 +533,12 @@ async fn timing_probe() {
         let dir = tempfile::tempdir().unwrap();
         let (log, snapshots): (Arc<dyn LogStore>, Arc<dyn SnapshotStore>) = match kind {
             "disk" => local(dir.path()),
-            _ => (Arc::new(MemoryLogStore::new()), Arc::new(MemorySnapshotStore::new())),
+            _ => {
+                use pigeonhole_storage_memory::MemoryBlobStore;
+                let log = crate::ChainLogStore::new(Arc::new(MemoryBlobStore::new()));
+                let snapshots = crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new()));
+                (Arc::new(log), Arc::new(snapshots))
+            }
         };
         let store = MetaStore::open(log, snapshots, counter(), MetaOptions::default()).await.unwrap();
         let t = std::time::Instant::now();

@@ -50,9 +50,9 @@ pub mod snapshot;
 
 pub use log::{
     Base, Batch, Discovered, Entry, EntryStream, Head, LocalLogStore, LogError, LogId, LogResult,
-    LogStore, MemoryLogStore, Position, LOG_FORMAT,
+    LogStore, Position, LOG_FORMAT, ChainLogStore,
 };
-pub use snapshot::{LocalSnapshotStore, MemorySnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
+pub use snapshot::{BlobSnapshotStore, LocalSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 
 /// A rejection that cannot happen (a namespace whose commands never fail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]

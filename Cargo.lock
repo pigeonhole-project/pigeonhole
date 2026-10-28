@@ -2364,6 +2364,7 @@ dependencies = [
  "bytes",
  "futures",
  "metrics",
+ "pigeonhole-storage-api",
  "pigeonhole-types",
  "serde",
  "serde_json",
@@ -2485,14 +2486,30 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "crc32fast",
  "futures",
  "openraft",
+ "pigeonhole-storage-api",
+ "pigeonhole-storage-memory",
  "postcard",
  "serde",
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "pigeonhole-storage-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures",
+ "pigeonhole-types",
+ "serde",
  "uuid",
 ]
 
@@ -2559,6 +2576,7 @@ dependencies = [
  "hex",
  "lru",
  "pigeonhole-blob",
+ "pigeonhole-meta",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "serde",

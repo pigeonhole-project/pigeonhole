@@ -12,6 +12,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 metrics = { workspace = true }
 pigeonhole-types = { workspace = true }
+pigeonhole-storage-api = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

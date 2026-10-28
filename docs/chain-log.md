@@ -1,6 +1,6 @@
 # The log on top of blob storage: `Chain`
 
-Status: **proposal**. Read [meta-backends.md](meta-backends.md) (the `LogStore`
+Status: **steps 1–3 implemented** (see Implementation notes). Read [meta-backends.md](meta-backends.md) (the `LogStore`
 and `SnapshotStore` contracts), [telegram-mtproto.md](telegram-mtproto.md) (the
 order-fenced channel log, implemented), [discord-log.md](discord-log.md) (the
 thread-fenced log, proposed) and [sweep-invariants.md](sweep-invariants.md)
@@ -197,16 +197,53 @@ on it; `scripts/check_deps.py` learns the new layer. A log or snapshot store
 is configured as any `[[store]]`; one store serves one purpose (blobs, a log,
 or snapshots), as today.
 
+## Implementation notes (steps 1–3)
+
+Where the code differs from the design above:
+
+- **One chain per store.** `tail()` takes no start: a store holding a log (or
+  snapshots) holds nothing else that chains. The trait is
+  `put_after(prev, label, data)`, `tail()`, `successor(id)` and
+  `prune(below)` ("delete every blob below `below`, members and losers
+  alike"); `ChainMeta` is a free-form `label` the log parses
+  (`log-claim-<gen>`, `log-batch-<gen>`, `snapshot-<log>-<at>.snap`).
+- **No `chain_from`.** Replay walks back along the `prev` links in the blobs
+  (as the channel log did); the Telegram store reads the whole page below a
+  location it misses, so a walk down reads each page once.
+- **Every blob carries the registers** (log id, base, vote, head term, head
+  position), a claim too (an empty batch at head + 1): `discover` reads the
+  tail only. Generations only grow along the chain, so the tail's generation
+  is the newest claim and a loser's `Fenced { current }` is the winner's.
+- **`confirm`** = `successor(our tip)` is none.
+- **Telegram**: a member is a document named `<label>~<prev>.bin` (`root`
+  for the first). `put_after` posts with a fresh `random_id` per call (two
+  writers putting the same name must get two messages), wins iff nothing in
+  `(prev, b)` names `prev` (no read when `b == prev + 1`). `tail` and
+  `successor` post a probe to learn the top (probes stay: a hole in a checked
+  range costs re-reads); `tail` walks down to the newest message that won its
+  link. `prune` deletes our members and probes below a point, walking down
+  until a page holds none of ours. Empty ids in a checked range are re-read,
+  then taken as deleted (`ChainOptions`).
+- **Memory** decides links under a mutex; `MemoryLogStore` and
+  `MemorySnapshotStore` are gone. `LocalLogStore` / `LocalSnapshotStore` stay
+  until step 4.
+- Tests: the `LogStore` and `SnapshotStore` conformance suites run on
+  `ChainLogStore` / `BlobSnapshotStore` over memory (in `pigeonhole-meta`) and
+  over the Telegram store on a fake channel
+  (`storage-telegram/tests/chain_log.rs`, with the channel log's scenarios:
+  no reads per append, a gap, a deposed writer, an unconfirmed batch, racing
+  claims, a claim visible late, a deleted id, a changed blob, pruning).
+
 ## Steps
 
 Each step ends with `cargo test --workspace` and
 `./scripts/check-deps.sh --strict` green; one logical change per commit.
 
-1. **Move the traits** into `pigeonhole-storage-api`; no behaviour change.
-2. **`Chain` for memory**, `ChainLogStore`, `BlobSnapshotStore`; the
+1. ✅ **Move the traits** into `pigeonhole-storage-api`; no behaviour change.
+2. ✅ **`Chain` for memory**, `ChainLogStore`, `BlobSnapshotStore`; the
    `LogStore` conformance suite on `ChainLogStore<MemoryBlobStore>`; the
    tablet's tests on it. Delete `MemoryLogStore` / `MemorySnapshotStore`.
-3. **Telegram `impl Chain`** from `ChannelLogStore`'s logic; the fake channel
+3. ✅ **Telegram `impl Chain`** from `ChannelLogStore`'s logic; the fake channel
    becomes a fake `TelegramClient` under `TelegramBlobStore`; live run on the
    test channels. Delete `ChannelApi`, `ChannelLogStore`,
    `ChannelSnapshotStore`.

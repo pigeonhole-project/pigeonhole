@@ -39,9 +39,10 @@ Done (on `main`), steps 1–7a, 6d, 8.1–8.2:
   only for REAPI).
 - `LocalLogStore`: `seg-<first>.log` records `MAGIC|len|crc|Batch`, fsync per
   batch, `claimed_gen` + `log_id` under a `flock`; claim truncates a torn tail;
-  `rebase` drops the segments behind the base. `ChannelLogStore` keeps the
-  log in a Telegram channel over MTProto, fenced by the order of message ids
-  (telegram-mtproto.md); no pins, no description register.
+  `rebase` drops the segments behind the base. `ChainLogStore` keeps the
+  log on any store that implements `Chain` (memory, a Telegram channel over
+  MTProto fenced by the order of message ids), `BlobSnapshotStore` the
+  snapshots (chain-log.md); no pins, no description register.
 - Snapshots every `[meta] snapshot_every_entries` (10000) and
   `snapshot_every_secs` (600, when anything changed), stored in a `SnapshotStore` configured apart
   from the log (`local_disk` | `memory` | `telegram`, pinless); the log records which one it starts
@@ -65,9 +66,8 @@ Known gaps:
   lives elsewhere (and restore from it is lossy); the `telegram` log avoids it.
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
-- One log / snapshot implementation per store kind (`LocalLogStore`,
-  `MemoryLogStore`, `ChannelLogStore`, three snapshot stores), beside the blob
-  backends of the same stores. Step 7c.
+- `LocalLogStore` / `LocalSnapshotStore` are still apart from the disk blob
+  store. Step 9.
 - Discord cannot hold the log or snapshots yet (step 10).
 
 ## Steps
@@ -203,7 +203,7 @@ one Raft entry (`MetaStore::propose_all`), releases of overwritten chunks go
 after the answer. One PUT = one entry instead of n + 2; matters most on a
 Telegram log (~20 messages a minute).
 
-### Step 7c — The log on top of blob storage
+### Step 7c — The log on top of blob storage ✅ done
 
 Design: [chain-log.md](chain-log.md) steps 1–3. A `Chain` capability ("first
 successor wins") on blob stores; one `ChainLogStore` and one

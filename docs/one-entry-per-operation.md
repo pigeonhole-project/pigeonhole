@@ -135,7 +135,7 @@ group with `PutObject`); the threshold is a constant, not config.
 - Unit: `propose_all` commits every command in one entry (one more position,
   one append), applies them in order, returns each outcome; a rejected one
   does not undo the others; a fenced tablet fails all of them.
-- Gateway: a PUT is one entry (count appends on a `MemoryLogStore` wrapper);
+- Gateway: a PUT is one entry (count entries on one tablet (`MetaStore::applied_position`));
   a checksum mismatch commits nothing and leaves only orphans that one sweep
   pass deletes; a rejected `PutObject` releases its chunks.
 - `sweep_stress` and the S3 compat suites unchanged in outcome.

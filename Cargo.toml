@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core/pigeonhole-types",
     "crates/core/pigeonhole-codec",
+    "crates/core/pigeonhole-storage-api",
     "crates/meta/pigeonhole-meta",
     "crates/blob/pigeonhole-blob",
     "crates/blob/pigeonhole-chunk-store",
@@ -75,6 +76,7 @@ grammers-tl-types = "=0.11.0"
 
 pigeonhole-meta = { path = "crates/meta/pigeonhole-meta" }
 pigeonhole-types = { path = "crates/core/pigeonhole-types" }
+pigeonhole-storage-api = { path = "crates/core/pigeonhole-storage-api" }
 pigeonhole-codec = { path = "crates/core/pigeonhole-codec" }
 pigeonhole-blob = { path = "crates/blob/pigeonhole-blob" }
 pigeonhole-chunk-store = { path = "crates/blob/pigeonhole-chunk-store" }

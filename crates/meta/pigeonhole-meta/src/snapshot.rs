@@ -9,7 +9,6 @@
 //!
 //! [`LogStore::rebase`]: crate::LogStore::rebase
 
-use crate::log::channel::{ChannelApi, ChannelMsg, PAGE};
 use crate::{LogId, Position};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -18,6 +17,8 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use bytes::Bytes;
+use pigeonhole_storage_api::{collect_stream, After, BlobBackend, Chain};
 
 /// Version of the stored envelope ([`StoredSnapshot`] on disk / in a chat).
 pub const SNAPSHOT_STORE_FORMAT: u32 = 1;
@@ -155,123 +156,80 @@ impl SnapshotStore for LocalSnapshotStore {
     }
 }
 
-/// Snapshots in process memory (tests, throwaway runs). Clones share the store.
-#[derive(Clone, Default)]
-pub struct MemorySnapshotStore {
-    inner: Arc<std::sync::Mutex<MemorySnapshots>>,
+/// Snapshots as blobs of any store that can chain them ([`Chain`]): no
+/// order or fence is needed (a snapshot counts only while the log's base
+/// names it), the chain only tells which one is newest. The ref is the blob
+/// id (postcard, hex) and its crc, so a replaced blob is detected.
+pub struct BlobSnapshotStore<C> {
+    chain: Arc<C>,
 }
 
-#[derive(Default)]
-struct MemorySnapshots {
-    next: u64,
-    by_seq: std::collections::BTreeMap<u64, StoredSnapshot>,
-}
-
-impl MemorySnapshotStore {
-    pub fn new() -> Self {
-        Self::default()
+impl<C: Chain> BlobSnapshotStore<C> {
+    pub fn new(chain: Arc<C>) -> Self {
+        Self { chain }
     }
 
-    fn seq(r: &SnapshotRef) -> Result<u64> {
-        r.0.strip_prefix("mem-")
-            .and_then(|n| n.parse().ok())
-            .ok_or_else(|| anyhow!("{:?} is not a memory snapshot", r.0))
-    }
-}
-
-#[async_trait]
-impl SnapshotStore for MemorySnapshotStore {
-    async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
-        let mut g = self.inner.lock().unwrap();
-        g.next += 1;
-        let seq = g.next;
-        g.by_seq.insert(seq, snapshot.clone());
-        Ok(SnapshotRef(format!("mem-{seq}")))
+    fn reference(id: &C::Id, crc: u32) -> SnapshotRef {
+        let bytes = postcard::to_stdvec(id).expect("a blob id encodes");
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        SnapshotRef(format!("{hex}:{crc:08x}"))
     }
 
-    async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
-        let seq = Self::seq(r)?;
-        self.inner.lock().unwrap().by_seq.get(&seq).cloned().with_context(|| format!("no snapshot {:?}", r.0))
+    fn parse(r: &SnapshotRef) -> Result<(C::Id, u32)> {
+        let bad = || anyhow!("{:?} is not a blob snapshot", r.0);
+        let (hex, crc) = r.0.split_once(':').ok_or_else(bad)?;
+        if hex.len() % 2 != 0 {
+            return Err(bad());
+        }
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|_| bad())?;
+        let id = postcard::from_bytes(&bytes).map_err(|_| bad())?;
+        Ok((id, u32::from_str_radix(crc, 16).map_err(|_| bad())?))
     }
 
-    async fn newest(&self) -> Result<Option<StoredSnapshot>> {
-        Ok(self.inner.lock().unwrap().by_seq.values().next_back().cloned())
-    }
-
-    async fn remove(&self, r: &SnapshotRef) -> Result<()> {
-        let seq = Self::seq(r)?;
-        self.inner.lock().unwrap().by_seq.remove(&seq);
-        Ok(())
-    }
-}
-
-/// Snapshots as documents in a channel read by id (no order, no fence: a
-/// snapshot counts only while the log's base names it). The ref is the
-/// message id and the document's crc, so a replaced message is detected.
-pub struct ChannelSnapshotStore<C> {
-    chat: Arc<C>,
-}
-
-const SNAPSHOT_PROBE: &str = "snapshot-probe.bin";
-
-impl<C: ChannelApi> ChannelSnapshotStore<C> {
-    pub fn new(chat: Arc<C>) -> Self {
-        Self { chat }
-    }
-
-    fn parse(r: &SnapshotRef) -> Result<(i64, u32)> {
-        let bad = || anyhow!("{:?} is not a channel snapshot", r.0);
-        let (id, crc) = r.0.split_once(':').ok_or_else(bad)?;
-        Ok((id.parse().map_err(|_| bad())?, u32::from_str_radix(crc, 16).map_err(|_| bad())?))
-    }
-
-    fn is_snapshot(msg: &ChannelMsg) -> bool {
-        matches!(msg, ChannelMsg::Doc { name } if name.starts_with("snapshot-") && name.ends_with(".snap"))
+    async fn download(&self, id: &C::Id) -> Result<Vec<u8>> {
+        Ok(collect_stream(self.chain.get(id, None).await?).await?.to_vec())
     }
 }
 
 #[async_trait]
-impl<C: ChannelApi> SnapshotStore for ChannelSnapshotStore<C> {
+impl<C: Chain> SnapshotStore for BlobSnapshotStore<C> {
     async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
-        let data = snapshot.encode();
+        let data = Bytes::from(snapshot.encode());
         let crc = crc32fast::hash(&data);
-        let name = format!("snapshot-{}-{}.snap", snapshot.log_id, snapshot.at);
-        let id = self.chat.send_document(&name, data).await?;
-        Ok(SnapshotRef(format!("{id}:{crc:08x}")))
+        let label = format!("snapshot-{}-{}.snap", snapshot.log_id, snapshot.at);
+        // Another writer may link first: put after the new tail then.
+        loop {
+            let tail = self.chain.tail().await?;
+            match self.chain.put_after(tail.as_ref().map(|t| &t.id), &label, data.clone()).await? {
+                After::Won(id) => return Ok(Self::reference(&id, crc)),
+                After::Lost(_) => continue,
+            }
+        }
     }
 
     async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
         let (id, crc) = Self::parse(r)?;
-        let data = self.chat.download(id).await.with_context(|| format!("download snapshot {id}"))?;
+        let data = self.download(&id).await.with_context(|| format!("download snapshot {:?}", r.0))?;
         if crc32fast::hash(&data) != crc {
-            bail!("snapshot message {id} changed");
+            bail!("snapshot blob {:?} changed", r.0);
         }
-        StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {id}"))
+        StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {:?}", r.0))
     }
 
-    /// The highest message that is a snapshot. The top of the channel is
-    /// only learnt by posting: a probe, deleted again.
+    /// The tail of the chain: the most recently stored snapshot.
     async fn newest(&self) -> Result<Option<StoredSnapshot>> {
-        let probe = self.chat.send_document(SNAPSHOT_PROBE, vec![0]).await?;
-        let _ = self.chat.delete(&[probe]).await;
-        let mut hi = probe - 1;
-        while hi >= 1 {
-            let lo = (hi - PAGE as i64 + 1).max(1);
-            let ids: Vec<i64> = (lo..=hi).collect();
-            let msgs = self.chat.get_messages(&ids).await?;
-            for (id, msg) in ids.iter().zip(msgs).rev() {
-                if Self::is_snapshot(&msg) {
-                    let data = self.chat.download(*id).await.with_context(|| format!("download snapshot {id}"))?;
-                    return Ok(Some(StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {id}"))?));
-                }
-            }
-            hi = lo - 1;
-        }
-        Ok(None)
+        let Some(tail) = self.chain.tail().await? else { return Ok(None) };
+        let data = self.download(&tail.id).await.with_context(|| format!("download snapshot {:?}", tail.label))?;
+        Ok(Some(StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {:?}", tail.label))?))
     }
 
     async fn remove(&self, r: &SnapshotRef) -> Result<()> {
-        self.chat.delete(&[Self::parse(r)?.0]).await
+        let (id, _) = Self::parse(r)?;
+        self.chain.delete(&[C::key(&id)]).await
     }
 }
 
@@ -317,7 +275,6 @@ pub mod conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log::channel::fake::FakeChannel;
 
     #[tokio::test]
     async fn local_store_passes_the_conformance_suite() {
@@ -330,37 +287,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_store_passes_the_conformance_suite() {
-        let store = MemorySnapshotStore::new();
+    async fn blob_store_passes_the_conformance_suite() {
+        let mem = Arc::new(pigeonhole_storage_memory::MemoryBlobStore::new());
         conformance::run_all(|| {
-            let store = store.clone();
-            async move { Arc::new(store) as Arc<dyn SnapshotStore> }
+            let mem = mem.clone();
+            async move { Arc::new(BlobSnapshotStore::new(mem)) as Arc<dyn SnapshotStore> }
         })
         .await;
     }
 
     #[tokio::test]
-    async fn channel_store_passes_the_conformance_suite() {
-        let chat = Arc::new(FakeChannel::default());
-        conformance::run_all(|| {
-            let chat = chat.clone();
-            async move { Arc::new(ChannelSnapshotStore::new(chat)) as Arc<dyn SnapshotStore> }
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn the_channel_store_skips_other_messages_and_detects_a_replaced_one() {
-        let chat = Arc::new(FakeChannel::default());
-        let store = ChannelSnapshotStore::new(chat.clone());
-        let snap = StoredSnapshot { log_id: LogId(1), at: 1, data: vec![1] };
-        let r = store.put(&snap).await.unwrap();
-        chat.post_text();
-        chat.post_document("photo.jpg", b"x");
-        assert_eq!(store.newest().await.unwrap(), Some(snap));
-        chat.edit(ChannelSnapshotStore::<FakeChannel>::parse(&r).unwrap().0);
-        assert!(format!("{:#}", store.get(&r).await.unwrap_err()).contains("changed"));
-        assert!(store.get(&SnapshotRef("12 x".into())).await.is_err());
+    async fn the_blob_store_detects_a_replaced_snapshot_and_a_bad_ref() {
+        use pigeonhole_storage_memory::MemoryBlobStore;
+        let mem = Arc::new(MemoryBlobStore::new());
+        let store = BlobSnapshotStore::new(mem.clone());
+        let r = store.put(&StoredSnapshot { log_id: LogId(1), at: 1, data: vec![1] }).await.unwrap();
+        let (id, crc) = BlobSnapshotStore::<MemoryBlobStore>::parse(&r).unwrap();
+        let forged = BlobSnapshotStore::<MemoryBlobStore>::reference(&id, crc ^ 1);
+        assert!(format!("{:#}", store.get(&forged).await.unwrap_err()).contains("changed"));
+        assert!(store.get(&SnapshotRef("zz:1".into())).await.is_err());
     }
 
     #[tokio::test]
