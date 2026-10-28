@@ -4,16 +4,24 @@ use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use pigeonhole_blob::describe_metrics;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
-/// Histogram buckets for `*_seconds` metrics (0.01 … 60).
+/// Buckets for `*_seconds` histograms: a local disk answers in well under a
+/// millisecond, a chat upload or a flood wait takes seconds to minutes.
 const SECONDS_BUCKETS: &[f64] = &[
-    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    5.0, 10.0, 30.0, 60.0, 300.0,
 ];
+
+/// Stored / logical size of a block: 0 (all zeroes) … 1 (incompressible).
+const RATIO_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0, 1.05];
+
+/// Small counts: parts per chunk, commands per log entry.
+const COUNT_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0];
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -22,9 +30,16 @@ pub fn install_recorder() -> anyhow::Result<&'static PrometheusHandle> {
     if let Some(h) = HANDLE.get() {
         return Ok(h);
     }
+    let buckets = |e| anyhow::anyhow!("prometheus buckets: {e}");
     let handle = PrometheusBuilder::new()
-        .set_buckets(SECONDS_BUCKETS)
-        .map_err(|e| anyhow::anyhow!("prometheus buckets: {e}"))?
+        .set_buckets_for_metric(Matcher::Suffix("_seconds".into()), SECONDS_BUCKETS)
+        .map_err(buckets)?
+        .set_buckets_for_metric(Matcher::Suffix("_ratio".into()), RATIO_BUCKETS)
+        .map_err(buckets)?
+        .set_buckets_for_metric(Matcher::Suffix("_per_chunk".into()), COUNT_BUCKETS)
+        .map_err(buckets)?
+        .set_buckets_for_metric(Matcher::Suffix("_per_entry".into()), COUNT_BUCKETS)
+        .map_err(buckets)?
         .install_recorder()
         .map_err(|e| anyhow::anyhow!("install prometheus recorder: {e}"))?;
     describe_metrics();

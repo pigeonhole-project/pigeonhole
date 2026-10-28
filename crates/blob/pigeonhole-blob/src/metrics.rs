@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 pub fn describe_metrics() {
     metrics::describe_histogram!(
         "pigeonhole_gateway_request_duration_seconds",
-        "Gateway HTTP request duration"
+        "Gateway request time to response headers, by operation and outcome"
     );
     metrics::describe_histogram!(
         "pigeonhole_instance_call_duration_seconds",
@@ -26,7 +26,11 @@ pub fn describe_metrics() {
     );
     metrics::describe_counter!(
         "pigeonhole_instance_rate_limited_total",
-        "HTTP 429 responses from backend instances"
+        "Backend calls that failed rate limited (429 / FLOOD_WAIT longer than the call's budget)"
+    );
+    metrics::describe_histogram!(
+        "pigeonhole_backend_throttle_wait_seconds",
+        "Waits a chat service asked for (429 retry-after / FLOOD_WAIT), by service and method"
     );
     metrics::describe_histogram!(
         "pigeonhole_limiter_wait_seconds",
@@ -38,15 +42,25 @@ pub fn describe_metrics() {
     );
     metrics::describe_counter!(
         "pigeonhole_cache_requests_total",
-        "Block cache lookups (hit / miss / collapsed)"
+        "Block cache lookups: hit, miss (loaded it), collapsed (waited for another lookup's load)"
     );
+    metrics::describe_gauge!("pigeonhole_cache_bytes", "Bytes held by a block cache level");
+    metrics::describe_gauge!("pigeonhole_cache_entries", "Blocks held by a block cache level");
     metrics::describe_counter!(
         "pigeonhole_bytes_from_backend_total",
         "Bytes read from backend instances"
     );
     metrics::describe_counter!(
+        "pigeonhole_bytes_to_backend_total",
+        "Bytes written to backend instances"
+    );
+    metrics::describe_counter!(
         "pigeonhole_bytes_to_clients_total",
-        "Bytes written to gateway clients"
+        "Response body bytes sent to gateway clients"
+    );
+    metrics::describe_counter!(
+        "pigeonhole_bytes_from_clients_total",
+        "Request body bytes received from gateway clients"
     );
     metrics::describe_histogram!(
         "pigeonhole_compression_ratio",
@@ -80,10 +94,11 @@ pub fn describe_metrics() {
     );
 }
 
-pub fn record_gateway_request(gateway: &str, outcome: &str, d: Duration) {
+pub fn record_gateway_request(gateway: &str, op: &str, outcome: &str, d: Duration) {
     metrics::histogram!(
         "pigeonhole_gateway_request_duration_seconds",
         "gateway" => gateway.to_owned(),
+        "op" => op.to_owned(),
         "outcome" => outcome.to_owned()
     )
     .record(d.as_secs_f64());
@@ -106,6 +121,16 @@ pub fn record_429(instance: &str, op: &str) {
         "op" => op.to_owned()
     )
     .increment(1);
+}
+
+/// A chat service told us to wait `d` before calling `method` again.
+pub fn record_throttle(service: &str, method: &str, d: Duration) {
+    metrics::histogram!(
+        "pigeonhole_backend_throttle_wait_seconds",
+        "service" => service.to_owned(),
+        "method" => method.to_owned()
+    )
+    .record(d.as_secs_f64());
 }
 
 pub fn record_limiter_wait(op: &str, d: Duration) {
@@ -157,15 +182,41 @@ pub fn record_bytes_from_backend(instance: &str, n: u64) {
     .increment(n);
 }
 
-pub fn record_bytes_to_clients(gateway: &str, n: u64) {
+pub fn record_bytes_to_backend(instance: &str, n: u64) {
+    metrics::counter!(
+        "pigeonhole_bytes_to_backend_total",
+        "instance" => instance.to_owned()
+    )
+    .increment(n);
+}
+
+pub fn record_bytes_to_clients(gateway: &str, op: &str, n: u64) {
     if n == 0 {
         return;
     }
     metrics::counter!(
         "pigeonhole_bytes_to_clients_total",
-        "gateway" => gateway.to_owned()
+        "gateway" => gateway.to_owned(),
+        "op" => op.to_owned()
     )
     .increment(n);
+}
+
+pub fn record_bytes_from_clients(gateway: &str, op: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    metrics::counter!(
+        "pigeonhole_bytes_from_clients_total",
+        "gateway" => gateway.to_owned(),
+        "op" => op.to_owned()
+    )
+    .increment(n);
+}
+
+pub fn set_cache_size(level: &str, bytes: u64, entries: u64) {
+    metrics::gauge!("pigeonhole_cache_bytes", "level" => level.to_owned()).set(bytes as f64);
+    metrics::gauge!("pigeonhole_cache_entries", "level" => level.to_owned()).set(entries as f64);
 }
 
 pub fn record_compression_ratio(stored: usize, logical: usize) {
@@ -234,8 +285,7 @@ pub fn record_replica_selected(instance: &str) {
 }
 
 fn outcome_from_err(err: &anyhow::Error) -> (&'static str, bool) {
-    let msg = format!("{err:#}");
-    if msg.contains("429") {
+    if err.chain().any(|e| e.is::<crate::RateLimited>()) || format!("{err:#}").contains("429") {
         ("rate_limited", true)
     } else {
         ("error", false)
@@ -270,9 +320,13 @@ impl DynBlobBackend for MetricsBackend {
     async fn put(&self, data: Bytes, name: &str) -> Result<BlobLocator> {
         let instance = self.inner.instance().id.clone();
         let op = "put";
+        let len = data.len() as u64;
         inflight_inc(&instance, op);
         let t0 = Instant::now();
         let result = self.inner.put(data, name).await;
+        if result.is_ok() {
+            record_bytes_to_backend(&instance, len);
+        }
         let elapsed = t0.elapsed();
         inflight_dec(&instance, op);
         match &result {

@@ -11,7 +11,7 @@ pub use pigeonhole_codec::blocks;
 pub use pigeonhole_chunk_store::config;
 pub use pigeonhole_gateway_s3 as service;
 pub use pigeonhole_gateway_s3::index;
-pub use pigeonhole_gateway_s3::{build_s3_service, build_s3_gateway};
+pub use pigeonhole_gateway_s3::{build_s3_service, build_s3_gateway, S3OpSlot};
 pub use pigeonhole_storage_telegram as telegram;
 pub use pigeonhole_storage_memory as memory;
 
