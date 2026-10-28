@@ -133,7 +133,8 @@ entry) takes no position. A batch is one log write: commits are grouped
    answers the callers. `Fenced` → stop the tablet (proposals fail, side effects
    stop, `serve` exits). A command that cannot be applied stops it too; the next
    boot rebuilds from the log.
-5. **Snapshot**: every `[meta.snapshot] every_entries` entries, between
+5. **Snapshot**: every `[meta.snapshot] every_entries` entries, and every
+   `every_secs` when anything changed (an idle tablet wakes up for it), between
    batches: one `TabletSnapshot` of all states → `install_snapshot`, which
    drops the log behind it. With `[meta.snapshot.export]` set, a copy goes to a
    directory or is pinned in a dedicated Telegram chat (the previous pinned
@@ -295,6 +296,7 @@ path = "pigeonhole-log"
 
 [meta.snapshot]
 every_entries = 10000               # 0 = never
+every_secs = 600                    # also by time if anything changed
 # [meta.snapshot.export]            # copy every snapshot here (for restore)
 # kind = "dir"                      # or "telegram" + chat_id (a chat of its own)
 # path = "/mnt/backup/pigeonhole"

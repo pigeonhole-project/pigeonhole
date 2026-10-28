@@ -63,6 +63,8 @@ pub struct MetaSettings {
     pub batch_max_entries: usize,
     /// Snapshot (and collect the log behind it) every this many entries; 0 = never.
     pub snapshot_every_entries: u64,
+    /// Also snapshot this often when there are new entries; zero = never.
+    pub snapshot_interval: Duration,
     /// Also copy every snapshot here (for `pigeonhole restore`).
     pub snapshot_export: Option<ExportSettings>,
     pub log: LogSettings,
@@ -410,6 +412,7 @@ struct FileMeta {
 #[serde(default, deny_unknown_fields)]
 struct FileMetaSnapshot {
     every_entries: u64,
+    every_secs: u64,
     export: Option<FileExport>,
 }
 
@@ -428,7 +431,7 @@ enum FileExport {
 
 impl Default for FileMetaSnapshot {
     fn default() -> Self {
-        Self { every_entries: 10_000, export: None }
+        Self { every_entries: 10_000, every_secs: 600, export: None }
     }
 }
 
@@ -500,6 +503,7 @@ impl FileMeta {
             batch_max_delay: Duration::from_millis(self.batch_max_delay_ms),
             batch_max_entries: self.batch_max_entries.max(1),
             snapshot_every_entries: self.snapshot.every_entries,
+            snapshot_interval: Duration::from_secs(self.snapshot.every_secs),
             snapshot_export,
             log,
         })
@@ -949,17 +953,19 @@ upload_concurrency = 4
         assert_eq!(cfg.placement.write_quorum, 1);
         assert_eq!(cfg.meta.batch_max_delay, Duration::ZERO);
         assert_eq!(cfg.meta.snapshot_every_entries, 10_000);
+        assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(600));
         assert_eq!(cfg.meta.log, LogSettings::Local { path: "pigeonhole-log".into() });
     }
 
     #[test]
     fn parses_meta_section() {
         let cfg = load(&format!(
-            "[meta]\nbatch_max_delay_ms = 250\n[meta.snapshot]\nevery_entries = 0\n[meta.snapshot.export]\nkind = \"dir\"\npath = \"/backup\"\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
+            "[meta]\nbatch_max_delay_ms = 250\n[meta.snapshot]\nevery_entries = 0\nevery_secs = 60\n[meta.snapshot.export]\nkind = \"dir\"\npath = \"/backup\"\n[meta.log]\nkind = \"local\"\npath = \"/var/log-dir\"\n{MEM}"
         ))
         .unwrap();
         assert_eq!(cfg.meta.batch_max_delay, Duration::from_millis(250));
         assert_eq!(cfg.meta.snapshot_every_entries, 0);
+        assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(60));
         assert_eq!(cfg.meta.snapshot_export, Some(ExportSettings::Dir { path: "/backup".into() }));
         assert_eq!(cfg.meta.log, LogSettings::Local { path: "/var/log-dir".into() });
         for bad in ["[meta]\ndb_path = \"m.db\"\n", "[meta.log]\nkind = \"s3\"\n", "[meta.log]\nkind = \"local\"\nchat_id = 1\n"] {

@@ -98,7 +98,7 @@ async fn concurrent_proposals_get_distinct_positions() {
     let dir = tempfile::tempdir().unwrap();
     for delay in [Duration::ZERO, Duration::from_millis(20)] {
         let log = LocalLogStore::open(dir.path().join(format!("log-{}", delay.as_millis()))).unwrap();
-        let opts = MetaOptions { batch_max_delay: delay, batch_max_entries: 8, snapshot_every: 5, snapshot_export: None };
+        let opts = MetaOptions { batch_max_delay: delay, batch_max_entries: 8, snapshot_every: 5, ..MetaOptions::default() };
         let store = MetaStore::open(Arc::new(log), counter(), opts).await.unwrap();
         let tasks: Vec<_> = (0..32)
             .map(|i| {
@@ -381,4 +381,34 @@ async fn exports_to_a_chat_keep_the_newest_pinned() {
     chat.post_text_and_pin();
     assert!(sink.newest().await.is_err());
     assert!(sink.put(40, vec![]).await.is_err());
+}
+
+#[tokio::test]
+async fn an_idle_tablet_snapshots_by_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = Arc::new(export::DirSink::new(dir.path().join("export")));
+    let opts = MetaOptions {
+        snapshot_every: 0,
+        snapshot_interval: Duration::from_millis(50),
+        snapshot_export: Some(sink.clone()),
+        ..MetaOptions::default()
+    };
+    let log = Arc::new(LocalLogStore::open(dir.path().join("log")).unwrap());
+    let a = MetaStore::open(log.clone(), counter(), opts).await.unwrap();
+    for i in 0..3u64 {
+        a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    // No more traffic: the interval alone takes (and exports) the snapshot.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while a.exported_position() != Some(3) {
+        assert!(tokio::time::Instant::now() < deadline, "no snapshot by time");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let d = log.discover().await.unwrap().unwrap();
+    assert_eq!(d.snapshot.map(|(at, _)| at), Some(3));
+    // Nothing new: no more snapshots.
+    let exports = || std::fs::read_dir(dir.path().join("export")).unwrap().count();
+    let before = exports();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(exports(), before);
 }

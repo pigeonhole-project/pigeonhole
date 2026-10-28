@@ -20,9 +20,10 @@
 //! log written in another format instead of misreading it. States encode the
 //! same way for snapshots ([`encode_state`] / [`decode_state`]).
 //!
-//! Every [`MetaOptions::snapshot_every`] entries the batcher encodes all
-//! states into one [`TabletSnapshot`] and hands it to
-//! [`LogStore::install_snapshot`], which drops the log behind it.
+//! Every [`MetaOptions::snapshot_every`] entries (and, with new entries,
+//! every [`MetaOptions::snapshot_interval`]) the batcher encodes all states
+//! into one [`TabletSnapshot`] and hands it to [`LogStore::install_snapshot`],
+//! which drops the log behind it.
 //!
 //! Boot ([`MetaStore::open`]): claim the next generation, load the newest
 //! snapshot and replay the log after it, append the zero entry, go active. Once a newer
@@ -228,6 +229,10 @@ pub struct MetaOptions {
     /// Take a snapshot (and collect the log behind it) after this many
     /// entries since the last one; 0 = never.
     pub snapshot_every: u64,
+    /// Also take one when this long has passed since the last and there are
+    /// new entries, even with no traffic; zero = never. Bounds how stale the
+    /// newest export can get.
+    pub snapshot_interval: Duration,
     /// Also export every snapshot here (see [`export`]), in the background.
     pub snapshot_export: Option<Arc<dyn export::SnapshotSink>>,
 }
@@ -238,6 +243,7 @@ impl fmt::Debug for MetaOptions {
             .field("batch_max_delay", &self.batch_max_delay)
             .field("batch_max_entries", &self.batch_max_entries)
             .field("snapshot_every", &self.snapshot_every)
+            .field("snapshot_interval", &self.snapshot_interval)
             .field("snapshot_export", &self.snapshot_export.is_some())
             .finish()
     }
@@ -249,6 +255,7 @@ impl Default for MetaOptions {
             batch_max_delay: Duration::ZERO,
             batch_max_entries: 1024,
             snapshot_every: 10_000,
+            snapshot_interval: Duration::ZERO,
             snapshot_export: None,
         }
     }
@@ -310,6 +317,7 @@ impl MetaStore {
                 states: states.clone(),
                 applied: applied.clone(),
                 snapshot_at,
+                snapshot_tried: tokio::time::Instant::now(),
                 exported: exported.clone(),
                 export_queue: Arc::default(),
                 log,
@@ -510,6 +518,8 @@ struct Batcher {
     applied: Arc<AtomicU64>,
     /// Position of the newest installed snapshot.
     snapshot_at: Position,
+    /// When the last snapshot was attempted (or the tablet booted).
+    snapshot_tried: tokio::time::Instant,
     exported: Option<Arc<AtomicU64>>,
     /// The newest snapshot waiting for the running export to finish; `Some`
     /// slot = an export task is running.
@@ -524,7 +534,20 @@ struct Batcher {
 /// every [`MetaStore`] handle is dropped.
 async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
     let max = b.opts.batch_max_entries.max(1);
-    while let Some(first) = rx.recv().await {
+    loop {
+        let first = match b.snapshot_deadline() {
+            Some(at) => match tokio::time::timeout_at(at, rx.recv()).await {
+                Ok(first) => first,
+                Err(_) => {
+                    if let Some(stop) = b.maybe_snapshot().await {
+                        return stop_for_good(b, stop, Vec::new(), rx).await;
+                    }
+                    continue;
+                }
+            },
+            None => rx.recv().await,
+        };
+        let Some(first) = first else { return };
         let mut batch = vec![first];
         if !b.opts.batch_max_delay.is_zero() {
             let deadline = tokio::time::Instant::now() + b.opts.batch_max_delay;
@@ -595,15 +618,18 @@ async fn batcher(mut b: Batcher, mut rx: mpsc::UnboundedReceiver<Pending>) {
             }
             Err(stop) => (stop, batch),
         };
-        b.stop.send_replace(Some(stop.clone()));
-        for p in unanswered {
-            let _ = p.reply.send(Err(stop.clone().into()));
-        }
-        // Stopped for good: fail whatever is still queued or arrives.
-        while let Some(p) = rx.recv().await {
-            let _ = p.reply.send(Err(stop.clone().into()));
-        }
-        return;
+        return stop_for_good(b, stop, unanswered, rx).await;
+    }
+}
+
+/// Stopped for good: fail `unanswered` and whatever is still queued or arrives.
+async fn stop_for_good(b: Batcher, stop: Stop, unanswered: Vec<Pending>, mut rx: mpsc::UnboundedReceiver<Pending>) {
+    b.stop.send_replace(Some(stop.clone()));
+    for p in unanswered {
+        let _ = p.reply.send(Err(stop.clone().into()));
+    }
+    while let Some(p) = rx.recv().await {
+        let _ = p.reply.send(Err(stop.clone().into()));
     }
 }
 
@@ -639,14 +665,26 @@ impl Batcher {
         });
     }
 
+    /// When an idle tablet should wake up to snapshot by time: there are
+    /// entries after the last snapshot and an interval is set.
+    fn snapshot_deadline(&self) -> Option<tokio::time::Instant> {
+        let interval = self.opts.snapshot_interval;
+        let behind = self.applied.load(Ordering::SeqCst) > self.snapshot_at;
+        (!interval.is_zero() && behind).then(|| self.snapshot_tried + interval)
+    }
+
     /// Snapshot when due. Only a fence stops the tablet: a failed snapshot
-    /// leaves the log intact, so it is retried after the next batch.
+    /// leaves the log intact, so it is retried after the next batch (or the
+    /// next interval).
     async fn maybe_snapshot(&mut self) -> Option<Stop> {
         let position = self.applied.load(Ordering::SeqCst);
         let every = self.opts.snapshot_every;
-        if every == 0 || position < self.snapshot_at + every {
+        let by_count = every != 0 && position >= self.snapshot_at + every;
+        let by_time = self.snapshot_deadline().is_some_and(|at| tokio::time::Instant::now() >= at);
+        if !by_count && !by_time {
             return None;
         }
+        self.snapshot_tried = tokio::time::Instant::now();
         let data = take_snapshot(&self.states, position).encode();
         let copy = self.opts.snapshot_export.clone().map(|sink| (sink, data.clone()));
         match self.log.install_snapshot(self.gen, position, Snapshot { data }).await {

@@ -27,6 +27,7 @@ path = "pigeonhole-log"
 
 [meta.snapshot]
 every_entries = 10000         # snapshot all states, drop the log behind it; 0 = never
+every_secs = 600              # and this often if anything changed; 0 = never
 # Also copy each snapshot off the log's disk; after losing it:
 # `pigeonhole restore --lossy` seeds a new log from the newest export.
 # [meta.snapshot.export]
