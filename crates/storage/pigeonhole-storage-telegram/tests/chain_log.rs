@@ -190,8 +190,10 @@ async fn a_changed_log_blob_is_detected() {
     a.append(1, &[entry(2)]).await.unwrap();
     let first_batch = channel.names().into_iter().find(|(_, n)| n.starts_with("log-batch-1")).unwrap().0;
     channel.edit(first_batch);
-    let head = a.discover().await.unwrap().unwrap().head;
-    let read: Result<Vec<_>, _> = a.read(0, head).try_collect().await;
+    // A new process: nothing cached.
+    let fresh = store(&channel);
+    let head = fresh.discover().await.unwrap().unwrap().head;
+    let read: Result<Vec<_>, _> = fresh.read(0, head).try_collect().await;
     assert!(matches!(read, Err(LogError::Lost(_))), "{read:?}");
 }
 
@@ -218,6 +220,24 @@ async fn a_rebase_prunes_our_messages_and_nothing_else() {
     let head = b.discover().await.unwrap().unwrap().head;
     let got: Vec<_> = b.read(3, head).try_collect().await.unwrap();
     assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![4, 5, 6]);
+}
+
+/// Small log blobs are text messages: a replay in a new process reads pages
+/// of messages and downloads nothing.
+#[tokio::test]
+async fn a_replay_of_small_batches_downloads_nothing() {
+    let channel = Arc::new(FakeChannel::new(77));
+    let a = store(&channel);
+    a.claim(1).await.unwrap();
+    for i in 1..=30 {
+        a.append(1, &[entry(i)]).await.unwrap();
+    }
+    assert_eq!(channel.calls().send_document, 0, "{:?}", channel.calls());
+    let before = channel.calls();
+    assert_eq!(history(store(&channel).as_ref()).await, (1..=30).collect::<Vec<_>>());
+    let after = channel.calls();
+    assert_eq!(after.get_file, before.get_file, "no downloads");
+    assert!(after.get_messages - before.get_messages <= 4, "{before:?} → {after:?}");
 }
 
 #[tokio::test]

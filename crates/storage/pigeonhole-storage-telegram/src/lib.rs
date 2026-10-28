@@ -11,6 +11,7 @@
 mod chain;
 mod channel;
 mod client;
+pub mod inline;
 pub mod fake;
 mod session;
 mod store;

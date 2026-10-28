@@ -10,7 +10,11 @@ use pigeonhole_storage_telegram::{TelegramBlobStore, TelegramId, WINDOW};
 use std::sync::Arc;
 
 fn store() -> (Arc<FakeChannel>, TelegramBlobStore<FakeChannel>) {
-    let channel = Arc::new(FakeChannel::new(77));
+    store_on(Arc::new(FakeChannel::new(77)))
+}
+
+/// A store (as a new process would open it) on `channel`.
+fn store_on(channel: Arc<FakeChannel>) -> (Arc<FakeChannel>, TelegramBlobStore<FakeChannel>) {
     let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig {
         bot_rate_per_sec: 1000.0,
         send_rate_per_sec: 1000.0,
@@ -56,10 +60,11 @@ async fn reads_any_range_of_a_multi_window_blob() {
 #[tokio::test]
 async fn an_expired_file_reference_is_refreshed() {
     let (channel, store) = store();
-    let id = store.put(pattern(100), &BlobId::random().name()).await.unwrap();
+    // Too big for a text message: a document.
+    let id = store.put(pattern(10_000), &BlobId::random().name()).await.unwrap();
     channel.expire_file_references();
     let got = collect_stream(store.get(&id, None).await.unwrap()).await.unwrap();
-    assert_eq!(got, pattern(100));
+    assert_eq!(got, pattern(10_000));
     assert_eq!(channel.calls().get_messages, 1);
 }
 
@@ -108,4 +113,31 @@ async fn deletes_in_batches_of_100() {
     assert!(channel.message_ids().is_empty());
     assert_eq!(channel.calls().delete_messages, 2);
     assert!(store.get(&TelegramId { message_id: keys[0] }, None).await.is_err());
+}
+
+/// Blobs that fit a text message go as text: no upload, and a reader of
+/// another process gets the bytes with the page that lists them.
+#[tokio::test]
+async fn small_blobs_are_text_messages() {
+    let (channel, first) = store();
+    let small = pattern(7_000);
+    let id = first.put(small.clone(), &BlobId::random().name()).await.unwrap();
+    let big = first.put(pattern(9_000), &BlobId::random().name()).await.unwrap();
+    assert_eq!((channel.calls().send_text, channel.calls().send_document), (1, 1));
+
+    let (_, other) = store_on(channel.clone());
+    assert_eq!(other.candidates(None, big.message_id, 10).await.unwrap(), vec![id.message_id, big.message_id]);
+    let reads = channel.calls();
+    assert_eq!(collect_stream(other.get(&id, None).await.unwrap()).await.unwrap(), small);
+    assert_eq!(collect_stream(other.get(&id, Some(10..20)).await.unwrap()).await.unwrap(), small.slice(10..20));
+    assert_eq!(channel.calls(), reads, "the listing brought the bytes");
+
+    let (_, fresh) = store_on(channel.clone());
+    assert_eq!(collect_stream(fresh.get(&id, None).await.unwrap()).await.unwrap(), small);
+    assert_eq!(channel.calls().get_file, reads.get_file, "a text blob is never downloaded");
+
+    let (channel, docs) = store();
+    let docs = docs.with_inline(false);
+    docs.put(pattern(10), &BlobId::random().name()).await.unwrap();
+    assert_eq!((channel.calls().send_text, channel.calls().send_document), (0, 1));
 }

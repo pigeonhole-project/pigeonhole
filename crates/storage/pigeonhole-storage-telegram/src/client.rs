@@ -429,6 +429,7 @@ fn channel_message(m: enums::Message) -> (i64, ChannelMessage) {
         enums::Message::Empty(e) => (e.id as i64, ChannelMessage::Empty),
         enums::Message::Service(s) => (s.id as i64, ChannelMessage::Other),
         enums::Message::Message(m) => {
+            let no_media = m.media.is_none();
             let doc = match m.media {
                 Some(enums::MessageMedia::Document(types::MessageMediaDocument {
                     document: Some(enums::Document::Document(d)),
@@ -437,6 +438,9 @@ fn channel_message(m: enums::Message) -> (i64, ChannelMessage) {
                 _ => None,
             };
             let Some(d) = doc else {
+                if no_media && !m.message.is_empty() {
+                    return (m.id as i64, ChannelMessage::Text { text: m.message });
+                }
                 return (m.id as i64, ChannelMessage::Other);
             };
             let name = d.attributes.iter().find_map(|a| match a {
@@ -558,6 +562,41 @@ impl ChannelApi for MtprotoChannel {
         // Repeats carry the same random_id: Telegram returns the message a
         // lost answer was about instead of posting another.
         let updates = retry_call("messages.sendMedia", CALL_BUDGET, Some(&penalize), || async {
+            self.limiter.acquire_send().await;
+            self.client.home(self.lane, &request).await
+        })
+        .await?;
+        sent_message(updates, random_id)
+    }
+
+    async fn send_text(&self, text: &str, random_id: i64) -> Result<Sent> {
+        let request = functions::messages::SendMessage {
+            no_webpage: true,
+            silent: true,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            peer: self.input_peer(),
+            reply_to: None,
+            message: text.into(),
+            random_id,
+            reply_markup: None,
+            entities: None,
+            schedule_date: None,
+            schedule_repeat_period: None,
+            send_as: None,
+            quick_reply_shortcut: None,
+            effect: None,
+            allow_paid_stars: None,
+            suggested_post: None,
+            rich_message: None,
+        };
+        let limiter = self.limiter.clone();
+        let penalize = move |d: Duration| limiter.penalize_send(d);
+        let updates = retry_call("messages.sendMessage", CALL_BUDGET, Some(&penalize), || async {
             self.limiter.acquire_send().await;
             self.client.home(self.lane, &request).await
         })

@@ -19,7 +19,7 @@
 //! times (a message not visible yet shows up), then taken as deleted.
 
 use crate::channel::{ChannelApi, ChannelMessage, IDS_PER_CALL};
-use crate::store::{Located, TelegramBlobStore, TelegramId};
+use crate::store::{blob_name, TelegramBlobStore, TelegramId};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -71,14 +71,16 @@ enum Seen {
 }
 
 fn seen(msg: &ChannelMessage) -> Seen {
-    match msg {
-        ChannelMessage::Empty => Seen::Empty,
-        ChannelMessage::Other => Seen::Foreign,
-        ChannelMessage::Document { name, .. } if name == PROBE => Seen::Probe,
-        ChannelMessage::Document { name, .. } => match parse_name(name) {
+    if *msg == ChannelMessage::Empty {
+        return Seen::Empty;
+    }
+    match blob_name(msg) {
+        Some(PROBE) => Seen::Probe,
+        Some(name) => match parse_name(name) {
             Some((label, prev)) => Seen::Member(label.to_string(), prev),
             None => Seen::Foreign,
         },
+        None => Seen::Foreign,
     }
 }
 
@@ -145,22 +147,16 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
         }))
     }
 
-    /// Post a document; its id.
+    /// Post a blob (text if it fits); its id.
     async fn post(&self, name: &str, data: Bytes) -> Result<i64> {
-        let size = data.len() as u64;
         // One random_id per put (a retry inside the call posts once); two
         // writers putting the same name must still get two messages.
         let random_id = uuid::Uuid::new_v4().as_u64_pair().0 as i64;
-        let sent = self.reader.channel.send_document(name, data, random_id).await?;
-        if let Some(file) = sent.file {
-            self.reader.remember(sent.message_id, Located { size, file });
-        }
-        Ok(sent.message_id)
+        self.post_blob(name, data, random_id).await
     }
 
     /// The top of the channel: the id of a probe posted now.
     async fn top(&self) -> Result<i64> {
-        let _upload = self.limiter.acquire_upload().await;
         self.post(PROBE, Bytes::from_static(&[0])).await
     }
 }
@@ -175,10 +171,7 @@ impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
             bail!("chain blob of {} bytes outside (0, {}]", data.len(), self.limits().max_blob_size);
         }
         let prev = prev.map(|p| p.message_id);
-        let b = {
-            let _upload = self.limiter.acquire_upload().await;
-            self.post(&chain_name(label, prev), data).await?
-        };
+        let b = self.post(&chain_name(label, prev), data).await?;
         let lo = prev.unwrap_or(0);
         if b <= lo {
             bail!("the channel gave message id {b}, not above {lo}");

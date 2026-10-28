@@ -2,6 +2,9 @@
 //! `random_id`, `get_file` checks the window rules and file references.
 
 use crate::channel::{ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, WINDOW};
+
+/// Longest text message the fake takes (Telegram: 4096).
+pub const TEXT_MAX_CHARS: usize = 4096;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -10,7 +13,9 @@ use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 enum Stored {
-    Text,
+    /// A foreign message that is neither text nor a document.
+    Other,
+    Text(String),
     Doc { name: String, data: Bytes },
 }
 
@@ -35,6 +40,7 @@ struct Inner {
 pub struct Calls {
     pub get_messages: usize,
     pub send_document: usize,
+    pub send_text: usize,
     pub get_file: usize,
     pub delete_messages: usize,
 }
@@ -50,12 +56,12 @@ impl FakeChannel {
         Self { id: channel_id, inner: Mutex::default() }
     }
 
-    /// Someone else posts a text message; returns its id.
+    /// Someone else posts a message that is not ours (a service message).
     pub fn post_text(&self) -> i64 {
         let mut g = self.inner.lock().unwrap();
         g.top += 1;
         let id = g.top;
-        g.messages.insert(id, Stored::Text);
+        g.messages.insert(id, Stored::Other);
         id
     }
 
@@ -87,12 +93,26 @@ impl FakeChannel {
 
     /// Change the bytes of document `id` in place (an edit).
     pub fn edit(&self, id: i64) {
-        if let Some(Stored::Doc { data, .. }) = self.inner.lock().unwrap().messages.get_mut(&id) {
-            let mut changed = data.to_vec();
-            if let Some(last) = changed.last_mut() {
-                *last ^= 0xff;
+        match self.inner.lock().unwrap().messages.get_mut(&id) {
+            Some(Stored::Doc { data, .. }) => {
+                let mut changed = data.to_vec();
+                if let Some(last) = changed.last_mut() {
+                    *last ^= 0xff;
+                }
+                *data = Bytes::from(changed);
             }
-            *data = Bytes::from(changed);
+            Some(Stored::Text(text)) => {
+                // The first payload character changes its top bit (always a
+                // data bit): still a valid encoding, other bytes.
+                if let Some((head, payload)) = text.split_once('\n') {
+                    let mut chars = payload.chars();
+                    if let Some(first) = chars.next() {
+                        let flipped = char::from_u32(first as u32 ^ (1 << 14)).unwrap_or(first);
+                        *text = format!("{head}\n{flipped}{}", chars.as_str());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -107,7 +127,8 @@ impl FakeChannel {
         g.messages
             .iter()
             .map(|(id, m)| match m {
-                Stored::Text => (*id, "(text)".to_string()),
+                Stored::Other => (*id, "(other)".to_string()),
+                Stored::Text(t) => (*id, t.lines().next().unwrap_or_default().to_string()),
                 Stored::Doc { name, .. } => (*id, name.clone()),
             })
             .collect()
@@ -150,7 +171,8 @@ impl ChannelApi for FakeChannel {
             }
             out.push(match g.messages.get(id) {
                 None => ChannelMessage::Empty,
-                Some(Stored::Text) => ChannelMessage::Other,
+                Some(Stored::Other) => ChannelMessage::Other,
+                Some(Stored::Text(text)) => ChannelMessage::Text { text: text.clone() },
                 Some(Stored::Doc { name, data }) => ChannelMessage::Document {
                     name: name.clone(),
                     size: data.len() as u64,
@@ -182,6 +204,29 @@ impl ChannelApi for FakeChannel {
             bail!("connection reset before the answer");
         }
         Ok(Sent { message_id: id, file: Some(self.location(&g, id)) })
+    }
+
+    async fn send_text(&self, text: &str, random_id: i64) -> Result<Sent> {
+        if text.is_empty() || text.chars().count() > TEXT_MAX_CHARS {
+            bail!("MESSAGE_TOO_LONG / MESSAGE_EMPTY: {} chars", text.chars().count());
+        }
+        let mut g = self.inner.lock().unwrap();
+        g.calls.send_text += 1;
+        if let Some(&id) = g.by_random_id.get(&random_id) {
+            return Ok(Sent { message_id: id, file: None });
+        }
+        g.top += 1;
+        let id = g.top;
+        g.messages.insert(id, Stored::Text(text.to_string()));
+        g.by_random_id.insert(random_id, id);
+        if g.hide_next.as_ref().is_some_and(|(prefix, _)| text.starts_with(prefix.as_str())) {
+            let (_, reads) = g.hide_next.take().unwrap();
+            g.hidden.insert(id, reads);
+        }
+        if std::mem::take(&mut g.lose_next_answer) {
+            bail!("connection reset before the answer");
+        }
+        Ok(Sent { message_id: id, file: None })
     }
 
     async fn get_file(&self, file: &FileLocation, offset: u64, limit: u64) -> Result<Bytes> {

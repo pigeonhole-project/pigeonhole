@@ -325,6 +325,35 @@ Measured on the test channels: boot 17 s on a fresh log, 24 s with ~50
 batches to replay; S3 smoke with every store in a channel 61 s (log appends
 are the limit: ~18 sends a minute).
 
+## Text messages (2026-10-28)
+
+Blobs that fit go as **text messages**, the rest as documents; the store
+decides (`TelegramBlobStore::with_inline`, on by default), nothing above it
+knows (`src/inline.rs`).
+
+Live spike on the test channel:
+
+- The limit is **4096 code points** (`MESSAGE_TOO_LONG` at 4097), not bytes
+  or UTF-16 units: 4096 characters outside the BMP (16 KiB of UTF-8) pass.
+- Text comes back byte for byte, except whitespace at the ends (stripped)
+  and tabs / carriage returns (rewritten); a `\n` inside is kept.
+- Reading 10 texts with their payload: 72 ms, one `getMessages`. Reading 10
+  small documents: 556 ms (`getMessages` + 10 `getFile`).
+- Sending is bound by the channel's message rate either way (~17–20 a
+  minute); a text saves the upload calls, not a send.
+
+Encoding: `<name> <len>\n<payload>`, the payload 15 bits a character in
+U+20000..U+27FFF (CJK Extension B, all assigned): up to **7595 bytes** per
+message with a `BlobId` name. A live test (`tests/live.rs`,
+`inline_blobs_against_a_live_channel`) puts 1, 256 and 7595 bytes and reads
+them back exactly through a store that cached nothing.
+
+What it changes: log batches, claims, probes and small chunks are texts, so a
+replay, a `tail` walk or a sweep reads their bytes with the page that lists
+them — a replay of small batches downloads nothing
+(`tests/chain_log.rs`). The sweeper and the chain read names from the text's
+first line as they read a document's file name.
+
 ## Steps
 
 Each step ends with `cargo test --workspace` and

@@ -224,6 +224,10 @@ Where the code differs from the design above:
   link. `prune` deletes our members and probes below a point, walking down
   until a page holds none of ours. Empty ids in a checked range are re-read,
   then taken as deleted (`ChainOptions`).
+- **Telegram text messages**: blobs up to ~7.5 KiB (log batches, claims,
+  probes) are text messages whose bytes come with `getMessages`
+  (telegram-mtproto.md § Text messages); a replay of small batches
+  downloads nothing.
 - **Memory** decides links under a mutex; `MemoryLogStore` and
   `MemorySnapshotStore` are gone. `LocalLogStore` / `LocalSnapshotStore` stay
   until step 4.

@@ -86,6 +86,9 @@ async fn list() {
             match m {
                 pigeonhole_storage_telegram::ChannelMessage::Empty => {}
                 pigeonhole_storage_telegram::ChannelMessage::Other => println!("{id} (not a document)"),
+                pigeonhole_storage_telegram::ChannelMessage::Text { text } => {
+                    println!("{id} text {:?}", text.chars().take(40).collect::<String>())
+                }
                 pigeonhole_storage_telegram::ChannelMessage::Document { name, size, .. } => {
                     println!("{id} {name} {size}")
                 }
@@ -133,7 +136,7 @@ fn uuid_like() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64
 }
 
-/// Delete the documents of a channel whose names start with one of
+/// Delete the documents and text blobs of a channel whose names start with one of
 /// `TG_CLEAN_PREFIXES` (comma-separated) in ids `1..=TG_LIST_TO`: test
 /// leftovers. `TG_LIST_CHAT_ID=-100… TG_LIST_TO=<id> TG_CLEAN_PREFIXES=log-
 /// cargo test -p pigeonhole-storage-telegram --test live clean -- --ignored --nocapture`
@@ -160,8 +163,16 @@ async fn clean() {
         let ours: Vec<i64> = ids
             .iter()
             .zip(channel.get_messages(&ids).await.unwrap())
-            .filter(|(_, m)| matches!(m, pigeonhole_storage_telegram::ChannelMessage::Document { name, .. }
-                if prefixes.iter().any(|p| name.starts_with(p.as_str()))))
+            .filter(|(_, m)| {
+                let name = match m {
+                    pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => Some(name.as_str()),
+                    pigeonhole_storage_telegram::ChannelMessage::Text { text } => {
+                        pigeonhole_storage_telegram::inline::name_of(text)
+                    }
+                    _ => None,
+                };
+                name.is_some_and(|n| prefixes.iter().any(|p| n.starts_with(p.as_str())))
+            })
             .map(|(id, _)| *id)
             .collect();
         if !ours.is_empty() {
@@ -171,4 +182,49 @@ async fn clean() {
         lo += 100;
     }
     println!("deleted {deleted} messages");
+}
+
+/// Small blobs as text messages (15 bits a character): the largest that
+/// fits, every byte value, read back by a store that cached nothing. Posts
+/// to `TG_BLOBS_CHAT_ID` and deletes what it posted.
+#[tokio::test]
+#[ignore = "needs a Telegram bot, api id and a test channel"]
+async fn inline_blobs_against_a_live_channel() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
+    let cfg = MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env("TG_BOT_TOKEN"),
+        session: root.join(".cache/tgm-live.session"),
+    };
+    let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
+    let info = InstanceInfo {
+        id: "live".into(),
+        kind: InstanceKind::Telegram,
+        fingerprint: format!("tg:{}:{}", tg.bot_id(), channel.channel_id()),
+        location: format!("tg:chat:{chat_id}"),
+        role: InstanceRole::ReadWrite,
+    };
+    let store = TelegramBlobStore::new(channel.clone(), limiter.clone(), info.clone());
+    let name = BlobId::random().name();
+    let mut max = 0;
+    while pigeonhole_storage_telegram::inline::fits(&name, max + 1) {
+        max += 1;
+    }
+    let mut posted = Vec::new();
+    for len in [1usize, 256, max] {
+        let data: Bytes = (0..len).map(|i| (i * 167 + i / 256) as u8).collect::<Vec<_>>().into();
+        let t = Instant::now();
+        let id = store.put(data.clone(), &BlobId::random().name()).await.unwrap();
+        posted.push(id.message_id);
+        let fresh = TelegramBlobStore::new(channel.clone(), limiter.clone(), info.clone());
+        let got = collect_stream(fresh.get(&id, None).await.unwrap()).await.unwrap();
+        println!("{len} B as a text message: put + fresh get in {:?}", t.elapsed());
+        assert!(got == data, "{len} B came back different");
+    }
+    store.delete(&posted).await.unwrap();
 }

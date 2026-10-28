@@ -29,8 +29,10 @@ pub enum ChannelMessage {
     /// Deleted, past the top of the channel, or (briefly) not visible yet:
     /// Telegram answers the same for all three.
     Empty,
-    /// Anything that is not a document (text, a service message, a photo).
+    /// Anything that is neither text nor a document (a service message, a photo).
     Other,
+    /// A plain text message.
+    Text { text: String },
     Document { name: String, size: u64, file: FileLocation },
 }
 
@@ -68,6 +70,10 @@ pub trait ChannelApi: Send + Sync + 'static {
     /// one `random_id` posts at most one message: a repeat returns it again,
     /// so a send may be retried after any failure.
     async fn send_document(&self, name: &str, data: Bytes, random_id: i64) -> Result<Sent>;
+
+    /// Post a text message (no formatting, no link preview); the same
+    /// `random_id` rule as [`Self::send_document`].
+    async fn send_text(&self, text: &str, random_id: i64) -> Result<Sent>;
 
     /// `limit` bytes of `file` at `offset`: one window, `offset` and `limit`
     /// multiples of 4 KiB, `limit` ≤ [`WINDOW`], not crossing a 1 MiB

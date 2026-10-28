@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use lru::LruCache;
 use pigeonhole_blob::{
-    BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget, OpKind, Sweepable,
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget, OpKind, Sweepable,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -27,10 +27,32 @@ const LOCATION_CACHE: usize = 4096;
 /// Windows of one blob fetched at a time.
 const WINDOWS_IN_FLIGHT: usize = 4;
 
+/// Where a blob's bytes are: a document's file, or the bytes themselves (a
+/// text message, [`crate::inline`]).
 #[derive(Clone)]
-pub(crate) struct Located {
-    pub(crate) size: u64,
-    pub(crate) file: FileLocation,
+pub(crate) enum Located {
+    Doc { size: u64, file: FileLocation },
+    Inline(Bytes),
+}
+
+impl Located {
+    /// What message `msg` holds, if it is a blob.
+    pub(crate) fn of(msg: &ChannelMessage) -> Option<Self> {
+        match msg {
+            ChannelMessage::Document { size, file, .. } => Some(Located::Doc { size: *size, file: file.clone() }),
+            ChannelMessage::Text { text } => crate::inline::decode(text).map(|(_, data)| Located::Inline(data)),
+            _ => None,
+        }
+    }
+}
+
+/// The name a blob message was put under (document or text).
+pub(crate) fn blob_name(msg: &ChannelMessage) -> Option<&str> {
+    match msg {
+        ChannelMessage::Document { name, .. } => Some(name),
+        ChannelMessage::Text { text } => crate::inline::name_of(text),
+        _ => None,
+    }
 }
 
 type Locations = Arc<Mutex<LruCache<i64, Located>>>;
@@ -41,6 +63,8 @@ pub struct TelegramBlobStore<C> {
     pub(crate) reader: Reader<C>,
     pub(crate) limiter: Arc<ChatLimiter>,
     pub(crate) chain: crate::chain::ChainOptions,
+    /// Blobs that fit a text message go as text ([`crate::inline`]).
+    inline: bool,
 }
 
 /// The read side, cloned into a download stream.
@@ -72,7 +96,32 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
             reader: Reader { channel, limiter: limiter.clone(), locations },
             limiter,
             chain: crate::chain::ChainOptions::default(),
+            inline: true,
         }
+    }
+
+    /// Whether small blobs go as text messages (default) or always as documents.
+    pub fn with_inline(mut self, inline: bool) -> Self {
+        self.inline = inline;
+        self
+    }
+
+    /// Post blob `name` as a text message if it fits, else as a document;
+    /// its message id. The location is remembered.
+    pub(crate) async fn post_blob(&self, name: &str, data: Bytes, random_id: i64) -> Result<i64> {
+        let _upload = self.limiter.acquire_upload().await;
+        let channel = &self.reader.channel;
+        if self.inline && crate::inline::fits(name, data.len()) {
+            let sent = channel.send_text(&crate::inline::encode(name, &data), random_id).await?;
+            self.reader.remember(sent.message_id, Located::Inline(data));
+            return Ok(sent.message_id);
+        }
+        let size = data.len() as u64;
+        let sent = channel.send_document(name, data, random_id).await?;
+        if let Some(file) = sent.file {
+            self.reader.remember(sent.message_id, Located::Doc { size, file });
+        }
+        Ok(sent.message_id)
     }
 
     /// How a chain treats ids that read empty ([`crate::chain::ChainOptions`]).
@@ -96,8 +145,8 @@ impl<C: ChannelApi> Reader<C> {
     pub(crate) async fn read(&self, ids: &[i64]) -> Result<Vec<ChannelMessage>> {
         let msgs = self.channel.get_messages(ids).await?;
         for (id, m) in ids.iter().zip(&msgs) {
-            if let ChannelMessage::Document { size, file, .. } = m {
-                self.remember(*id, Located { size: *size, file: file.clone() });
+            if let Some(located) = Located::of(m) {
+                self.remember(*id, located);
             }
         }
         Ok(msgs)
@@ -116,13 +165,8 @@ impl<C: ChannelApi> Reader<C> {
         let ids: Vec<i64> = (lo..=message_id).collect();
         let msg = self.read(&ids).await?.pop();
         match msg {
-            Some(ChannelMessage::Document { size, file, .. }) => {
-                let located = Located { size, file };
-                self.remember(message_id, located.clone());
-                Ok(located)
-            }
             Some(ChannelMessage::Empty) | None => bail!("blob message {message_id} is gone"),
-            Some(ChannelMessage::Other) => bail!("message {message_id} is not a document"),
+            Some(m) => Located::of(&m).with_context(|| format!("message {message_id} is not a blob")),
         }
     }
 
@@ -132,8 +176,10 @@ impl<C: ChannelApi> Reader<C> {
         let _permit = self.limiter.acquire_download().await;
         let bytes = match self.channel.get_file(&file, offset, WINDOW).await {
             Err(e) if e.is::<FileReferenceExpired>() => {
-                let fresh = self.locate(message_id, true).await?;
-                self.channel.get_file(&fresh.file, offset, WINDOW).await
+                let Located::Doc { file: fresh, .. } = self.locate(message_id, true).await? else {
+                    bail!("blob {message_id} is no longer a document")
+                };
+                self.channel.get_file(&fresh, offset, WINDOW).await
             }
             other => other,
         }
@@ -181,31 +227,29 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
         if data.len() > self.limits.max_blob_size {
             bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
         }
-        let size = data.len() as u64;
-        let _upload = self.limiter.acquire_upload().await;
         let random_id = blob_random_id(self.reader.channel.channel_id(), name);
-        let sent = self.reader.channel.send_document(name, data, random_id).await?;
-        if let Some(file) = sent.file {
-            self.reader.remember(sent.message_id, Located { size, file });
-        }
-        Ok(TelegramId { message_id: sent.message_id })
+        let message_id = self.post_blob(name, data, random_id).await?;
+        Ok(TelegramId { message_id })
     }
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let message_id = id.message_id;
-        let located = self.reader.locate(message_id, false).await?;
+        let (size, file) = match self.reader.locate(message_id, false).await? {
+            Located::Inline(data) => return Ok(bytes_stream(slice_range(data, range)?)),
+            Located::Doc { size, file } => (size, file),
+        };
         let (start, end) = match range {
-            Some(r) if r.start > r.end || r.end > located.size => {
-                bail!("byte range {}..{} outside blob of {} bytes", r.start, r.end, located.size)
+            Some(r) if r.start > r.end || r.end > size => {
+                bail!("byte range {}..{} outside blob of {} bytes", r.start, r.end, size)
             }
             Some(r) => (r.start, r.end),
-            None => (0, located.size),
+            None => (0, size),
         };
         // A few windows in flight, yielded in order.
         let reader = self.reader.clone();
         let stream = futures::stream::iter(windows(start, end))
             .map(move |(offset, skip, take)| {
-                let (reader, file) = (reader.clone(), located.file.clone());
+                let (reader, file) = (reader.clone(), file.clone());
                 async move { reader.window(message_id, file, offset, skip, take).await }
             })
             .buffered(WINDOWS_IN_FLIGHT);
@@ -226,7 +270,7 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
 
 #[async_trait]
 impl<C: ChannelApi> Sweepable for TelegramBlobStore<C> {
-    /// Our blobs (documents named by a [`BlobId`]) with ids in `(after,
+    /// Our blobs (documents or texts named by a [`BlobId`]) with ids in `(after,
     /// upto]`, read from the channel 100 ids at a time; nothing else in the
     /// channel is ever a candidate.
     async fn candidates(&self, after: Option<i64>, upto: i64, limit: usize) -> Result<Vec<i64>> {
@@ -235,11 +279,10 @@ impl<C: ChannelApi> Sweepable for TelegramBlobStore<C> {
         while next <= upto && out.len() < limit {
             let last = upto.min(next.saturating_add(IDS_PER_CALL as i64 - 1));
             let ids: Vec<i64> = (next..=last).collect();
-            let msgs = self.reader.channel.get_messages(&ids).await?;
+            let msgs = self.reader.read(&ids).await?;
             for (id, msg) in ids.into_iter().zip(msgs) {
-                if let ChannelMessage::Document { name, size, file } = msg {
-                    if BlobId::from_name(&name).is_some() {
-                        self.reader.remember(id, Located { size, file });
+                if let Some(name) = blob_name(&msg) {
+                    if BlobId::from_name(name).is_some() {
                         out.push(id);
                     }
                 }
