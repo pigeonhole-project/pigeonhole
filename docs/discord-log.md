@@ -198,6 +198,26 @@ spike messages and threads were deleted afterwards.
   us far below it); whether the thread bucket is per bot or per guild (needs a
   second guild).
 
+## Text messages (live check 2026-10-28)
+
+The Telegram store sends blobs that fit as text (telegram-mtproto.md § Text
+messages). The same holds in Discord:
+
+- `content` takes **2000 code points** (`BASE_TYPE_MAX_LENGTH` at 2001): 2000
+  characters outside the BMP (8000 bytes of UTF-8, 4000 UTF-16 units) pass.
+- Round trips are exact except whitespace at the ends (stripped); tabs,
+  `\r\n`, markdown and mentions stay as sent (nothing is rendered into
+  `content`).
+- The Telegram encoding (15 bits a character in U+20000..U+27FFF) round-trips:
+  about **3.6 KiB** per message with a `BlobId` name.
+- Listing 20 messages with their content: 403 ms in one call; downloading 10
+  attachments of 3.5 KB from the CDN: 2.7 s (after a fetch for fresh URLs).
+- Sends hit the same 5-per-5-s bucket as text or attachment.
+
+So the codec is shared with Telegram, parameterised by the character limit
+(4096 there, 2000 here): move `inline.rs` out of the Telegram crate when the
+Discord store uses it (step 10).
+
 ## Steps
 
 Each step ends with `cargo test --workspace` and
