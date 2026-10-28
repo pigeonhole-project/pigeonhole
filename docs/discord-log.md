@@ -44,6 +44,10 @@ that window — the timing assumption the Telegram design got rid of.
 
 ## The fence: a thread as compare-and-set
 
+> In [chain-log.md](chain-log.md) terms this is `impl Chain for
+> DiscordBlobStore`: the protocol below is the generic chain log, the thread
+> is how Discord decides "first successor wins".
+
 A message can have at most one thread started from it
 (`POST /channels/{c}/messages/{m}/threads`; the thread takes the message's id;
 a second attempt fails with HTTP 400, code `160004`). That is an atomic
@@ -202,14 +206,13 @@ Each step ends with `cargo test --workspace` and
 1. ~~**Spike**~~ Done; results in Spike findings above.
 2. **Blob backend**: `DiscordId` = `message_id`, nonce uploads, 20 MiB default
    (exactly 20 971 520 accepted), URL refresh batching. Existing wiremock conformance tests follow.
-3. **Linked log** in `pigeonhole-meta`: the protocol over a `LinkableChat`
-   trait (`send_document`, `link(from, name) -> Created | Taken(name)`,
-   `thread_of(id)`, `list(after, limit)`, `download`, `delete`), a fake with
-   racing links, tests: append, fenced append, racing claims, a late
-   straggler, an unlinked batch, rebase and collection, genesis.
-   `LogDoc` / `prev` / replay are shared with the Telegram chat log; the
-   fence is not (`SequencedChat` there, `LinkableChat` here).
-4. **Snapshot store** over the same client; split snapshots.
+3. **`impl Chain for DiscordBlobStore`** ([chain-log.md](chain-log.md) step 5):
+   `put_after` = message + thread, `successor` = the `thread` field, `tail` =
+   the newest page with threads, `chain_from` = listing pages; the log is the
+   generic `ChainLogStore`. Tests on a fake Discord client with racing links:
+   append, fenced append, racing claims, a late straggler, an unlinked batch,
+   rebase and collection (message before thread), genesis.
+4. **Snapshots**: the generic `BlobSnapshotStore`; split snapshots.
 5. **Wiring**: allow discord for `[meta] log` / `snapshot`, `init-log`
    subcommand, permission checks at startup, config example.
 6. **Live run**: extend `scripts/compat-discord.sh`; meta-backends.md,
