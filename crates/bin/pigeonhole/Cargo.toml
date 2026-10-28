@@ -56,7 +56,7 @@ pigeonhole-codec = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 s3s = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
 
 [lib]
