@@ -16,6 +16,7 @@ members = [
     "crates/testing/pigeonhole-testkit",
 ]
 default-members = ["crates/bin/pigeonhole"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -84,3 +85,7 @@ pigeonhole-storage-disk = { path = "crates/storage/pigeonhole-storage-disk" }
 pigeonhole-gateway-s3 = { path = "crates/gateway/pigeonhole-gateway-s3" }
 pigeonhole-gateway-bytestream = { path = "crates/gateway/pigeonhole-gateway-bytestream" }
 pigeonhole-testkit = { path = "crates/testing/pigeonhole-testkit" }
+
+# A request nobody awaits any more is not sent (vendor/grammers-mtsender/VENDORED.md).
+[patch.crates-io]
+grammers-mtsender = { path = "vendor/grammers-mtsender" }

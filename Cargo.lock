@@ -1150,8 +1150,6 @@ dependencies = [
 [[package]]
 name = "grammers-mtsender"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b009d7d0f571cabac15e1ac7f588fefb764f23aba13bf8b9063a0a32a036075d"
 dependencies = [
  "bytes",
  "grammers-crypto",
