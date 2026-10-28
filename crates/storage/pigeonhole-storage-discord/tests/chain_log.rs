@@ -192,7 +192,9 @@ async fn removed_snapshots_leave_no_links_behind() {
     let store = BlobSnapshotStore::new(channel_store(&channel));
     let mut refs = Vec::new();
     for at in 1..=6u64 {
-        let snap = pigeonhole_meta::StoredSnapshot { log_id: pigeonhole_meta::LogId(1), at, data: vec![at as u8] };
+        // Every other one too big for a text message: an attachment.
+        let len = if at % 2 == 0 { 9_000 } else { 10 };
+        let snap = pigeonhole_meta::StoredSnapshot { log_id: pigeonhole_meta::LogId(1), at, data: vec![at as u8; len] };
         refs.push(store.put(&snap).await.unwrap());
         if refs.len() > 1 {
             let old = refs.remove(0);

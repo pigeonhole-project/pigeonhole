@@ -52,10 +52,11 @@ impl Located {
     }
 }
 
-/// The name a blob message was put under (attachment or text).
+/// The name a blob message was put under. An attachment carries it as the
+/// message's content: Discord rewrites file names (it drops `~`, live check).
 pub(crate) fn blob_name(m: &DcMessage) -> Option<&str> {
     match &m.attachment {
-        Some(a) => Some(&a.filename),
+        Some(_) => Some(m.content.as_str()).filter(|c| !c.is_empty() && !c.contains(char::is_whitespace)),
         None => text::name_of(&m.content),
     }
 }
@@ -124,7 +125,7 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
         let m = if self.inline && text::fits(name, data.len(), DISCORD_MAX_CHARS) {
             self.api.send(&text::encode(name, &data), None, nonce).await?
         } else {
-            self.api.send("", Some((name, data)), nonce).await?
+            self.api.send(name, Some((name, data)), nonce).await?
         };
         self.remember(&m);
         Ok(m)

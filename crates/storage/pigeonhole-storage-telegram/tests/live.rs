@@ -228,3 +228,58 @@ async fn inline_blobs_against_a_live_channel() {
     }
     store.delete(&posted).await.unwrap();
 }
+
+/// Chain members too big for a text message go as documents named
+/// `<label>~<prev>.bin`: the name must come back as sent (a chat that
+/// rewrites file names would hide the chain). Posts to `TG_BLOBS_CHAT_ID`
+/// and deletes what it posted.
+#[tokio::test]
+#[ignore = "needs a Telegram bot, api id and a test channel"]
+async fn chain_names_survive_as_documents() {
+    use pigeonhole_blob::{After, Chain};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
+    let cfg = MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env("TG_BOT_TOKEN"),
+        session: root.join(".cache/tgm-live.session"),
+    };
+    let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
+    let info = InstanceInfo {
+        id: "live".into(),
+        kind: InstanceKind::Telegram,
+        fingerprint: format!("tg:{}:{}", tg.bot_id(), channel.channel_id()),
+        location: format!("tg:chat:{chat_id}"),
+        role: InstanceRole::ReadWrite,
+    };
+    let store = TelegramBlobStore::new(channel.clone(), limiter.clone(), info.clone());
+    let big = Bytes::from(vec![7u8; 9_000]);
+    let After::Won(id) = store.put_after(None, "live-doc-1", big).await.unwrap() else { panic!("a fresh chain") };
+    let names = channel.get_messages(&[id.message_id]).await.unwrap();
+    println!("document name as stored: {:?}", names.first().map(|m| match m {
+        pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => name.clone(),
+        other => format!("{other:?}"),
+    }));
+    let fresh = TelegramBlobStore::new(channel.clone(), limiter, info);
+    let tail = fresh.tail().await.unwrap();
+    // Delete everything this test posted (the member and the probes).
+    let top = fresh.tail().await.ok();
+    let hi = top.flatten().map_or(id.message_id, |t| t.id.message_id).max(id.message_id) + 3;
+    let ids: Vec<i64> = (id.message_id..=hi).collect();
+    let ours: Vec<i64> = ids
+        .iter()
+        .zip(channel.get_messages(&ids).await.unwrap())
+        .filter(|(_, m)| match m {
+            pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => name.starts_with("live-doc-") || name == "chain-probe.bin",
+            pigeonhole_storage_telegram::ChannelMessage::Text { text } => pigeonhole_blob::text::name_of(text) == Some("chain-probe.bin"),
+            _ => false,
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    channel.delete_messages(&ours).await.unwrap();
+    assert_eq!(tail.map(|t| t.id), Some(id), "the chain finds its document member");
+}

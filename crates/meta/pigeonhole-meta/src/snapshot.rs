@@ -73,6 +73,9 @@ pub trait SnapshotStore: Send + Sync + 'static {
     async fn remove(&self, r: &SnapshotRef) -> Result<()>;
 }
 
+/// Tries of a put that keeps losing its link to another writer.
+const PUT_ATTEMPTS: usize = 16;
+
 /// Snapshots as blobs of any store that can chain them ([`Chain`]): no
 /// order or fence is needed (a snapshot counts only while the log's base
 /// names it), the chain only tells which one is newest. The ref is the blob
@@ -118,14 +121,16 @@ impl<C: Chain> SnapshotStore for BlobSnapshotStore<C> {
         let data = Bytes::from(snapshot.encode());
         let crc = crc32fast::hash(&data);
         let label = format!("snapshot-{}-{}.snap", snapshot.log_id, snapshot.at);
-        // Another writer may link first: put after the new tail then.
-        loop {
+        // Another writer may link first: put after the new tail then (a
+        // bounded number of times: a chain that never settles is a bug).
+        for _ in 0..PUT_ATTEMPTS {
             let tail = self.chain.tail().await?;
             match self.chain.put_after(tail.as_ref().map(|t| &t.id), &label, data.clone()).await? {
                 After::Won(id) => return Ok(Self::reference(&id, crc)),
                 After::Lost(_) => continue,
             }
         }
+        bail!("snapshot put lost its link {PUT_ATTEMPTS} times in a row: the store's chain does not settle")
     }
 
     async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {

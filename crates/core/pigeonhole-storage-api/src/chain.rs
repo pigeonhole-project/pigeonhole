@@ -60,7 +60,9 @@ pub trait Chain: BlobBackend {
     /// a busy writer wins every gap between reading the tail and the put.
     async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
         let mut tail = self.tail().await?.map(|t| t.id);
-        loop {
+        // Bounded: writers appending meanwhile settle soon; a store whose
+        // chain never does is a bug, and must not post copies forever.
+        for _ in 0..PUT_AFTER_TAIL_ATTEMPTS {
             let data = match &tail {
                 Some(id) => Some(crate::collect_stream(self.get(id, None).await?).await?),
                 None => None,
@@ -71,8 +73,12 @@ pub trait Chain: BlobBackend {
                 After::Lost(winner) => tail = Some(winner.id),
             }
         }
+        anyhow::bail!("{label}: lost the link {PUT_AFTER_TAIL_ATTEMPTS} times in a row; the chain does not settle")
     }
 }
+
+/// Tries of the default [`Chain::put_after_tail`] before it gives up.
+pub const PUT_AFTER_TAIL_ATTEMPTS: usize = 64;
 
 /// What [`Chain::put_after_tail`] builds a blob with.
 pub type MakeAfter<'a, Id> = dyn Fn(Option<(&Id, &[u8])>) -> Result<Option<Bytes>> + Send + Sync + 'a;

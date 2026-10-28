@@ -155,7 +155,9 @@ impl DiscordApi for FakeDiscord {
         }
         g.top += 1;
         let id = g.top;
-        let stored = Stored { content: content.into(), file: file.map(|(n, d)| (n.to_string(), d)) };
+        // Discord keeps only some characters of a file name (it drops `~`).
+        let clean = |n: &str| n.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).collect::<String>();
+        let stored = Stored { content: content.into(), file: file.map(|(n, d)| (clean(n), d)) };
         g.messages.insert(id, stored.clone());
         g.by_nonce.insert(nonce.into(), id);
         if std::mem::take(&mut g.lose_next_answer) {

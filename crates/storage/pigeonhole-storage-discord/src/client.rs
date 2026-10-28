@@ -5,7 +5,7 @@ use crate::api::{CdnStale, DcAttachment, DcMessage, DiscordApi, ThreadStart, PAG
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_blob::ChatLimiter;
+use pigeonhole_blob::{ChatLimiter, RateLimited};
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -158,7 +158,7 @@ impl DiscordClient {
         &self,
         limiter: &ChatLimiter,
         budget: RateBudget,
-        what: &str,
+        what: &'static str,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<Answer> {
         let mut last = None;
@@ -193,8 +193,9 @@ impl DiscordClient {
                     RateBudget::Read => limiter.penalize_get_file(wait),
                     RateBudget::Download => {}
                 }
+                // TODO(metrics): pigeonhole_blob::record_throttle("discord", what, wait) once it lands.
                 tokio::time::sleep(wait).await;
-                last = Some(anyhow!("{what}: rate limited"));
+                last = Some(RateLimited { method: what, retry_after: wait }.into());
                 continue;
             }
             return Ok(Answer { status, body });
@@ -202,28 +203,25 @@ impl DiscordClient {
         Err(last.unwrap_or_else(|| anyhow!("{what}: failed")))
     }
 
-    /// Fail fast unless the bot can do what a store needs in `channel_id`
-    /// (`chain`: also start and manage threads).
+    /// Fail fast unless the bot sees `channel_id` as a text channel and can
+    /// read its history. A bot cannot ask Discord for its own permissions in
+    /// a channel (there is no such endpoint); send, attach, delete and thread
+    /// rights (`chain`) show at the first use.
     pub async fn ensure_permissions(&self, channel_id: u64, chain: bool, limiter: &ChatLimiter) -> Result<()> {
-        const VIEW: u64 = 1 << 10;
-        const SEND: u64 = 1 << 11;
-        const MANAGE_MESSAGES: u64 = 1 << 13;
-        const ATTACH: u64 = 1 << 15;
-        const HISTORY: u64 = 1 << 16;
-        const MANAGE_THREADS: u64 = 1 << 34;
-        const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
-        let mut required = VIEW | SEND | MANAGE_MESSAGES | ATTACH | HISTORY;
-        if chain {
-            required |= MANAGE_THREADS | CREATE_PUBLIC_THREADS;
-        }
-        let path = format!("channels/{channel_id}/permissions/@me");
-        let a = self.request(limiter, RateBudget::Read, "permissions", || self.http.get(self.url(&path))).await?;
+        let path = format!("channels/{channel_id}");
+        let a = self.request(limiter, RateBudget::Read, "get channel", || self.http.get(self.url(&path))).await?;
         if a.status != 200 {
-            bail!("channel {channel_id}: permission check answered {} (is the bot in this channel?)", a.status);
+            bail!("channel {channel_id}: answered {} (is the bot in this guild and allowed to view it?)", a.status);
         }
-        let bits: u64 = a.body["permissions"].as_str().unwrap_or("0").parse().context("permissions bitfield")?;
-        if bits & required != required {
-            bail!("bot lacks permissions in channel {channel_id}: have {bits:#x}, need {required:#x}");
+        // Threads from messages exist in text (0) and announcement (5) channels.
+        let kind = a.body["type"].as_u64().unwrap_or(u64::MAX);
+        if chain && kind != 0 && kind != 5 {
+            bail!("channel {channel_id} is of type {kind}: the log needs a text channel");
+        }
+        let path = format!("channels/{channel_id}/messages?limit=1");
+        let a = self.request(limiter, RateBudget::Read, "read history", || self.http.get(self.url(&path))).await?;
+        if a.status != 200 {
+            bail!("channel {channel_id}: cannot read the history ({})", a.status);
         }
         Ok(())
     }
