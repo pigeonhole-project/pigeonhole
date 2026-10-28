@@ -1,17 +1,20 @@
-//! Small blobs as text messages: the bytes come with `getMessages` (a page
-//! of 100 messages is 100 blobs read), no upload, no `getFile`.
+//! Small blobs as text messages: a chat hands the text out with the message
+//! (a listing of 100 messages is 100 blobs read), no upload, no download.
 //!
 //! A message is `<name> <len>\n<payload>`: the payload packs 15 bits per
 //! character into U+20000..U+27FFF (CJK Extension B, all assigned, outside
-//! the BMP). Telegram counts a message's 4096 characters as code points, so
-//! one message holds about 7.5 KiB; it strips whitespace at the ends and
-//! rewrites tabs and carriage returns, none of which the encoding uses (live
-//! check, docs/telegram-mtproto.md § Text messages).
+//! the BMP). Telegram (4096) and Discord (2000) both count a message's limit
+//! in code points, strip whitespace at the ends, and keep these characters
+//! exactly (live checks: docs/telegram-mtproto.md § Text messages,
+//! docs/discord-log.md § Text messages). The encoding has no whitespace but
+//! the header's one space and newline.
 
 use bytes::Bytes;
 
-/// Most characters in one text message.
-pub const TEXT_MAX_CHARS: usize = 4096;
+/// Characters in a Telegram text message.
+pub const TELEGRAM_MAX_CHARS: usize = 4096;
+/// Characters in a Discord message's content.
+pub const DISCORD_MAX_CHARS: usize = 2000;
 
 const BASE: u32 = 0x20000;
 const BITS: u32 = 15;
@@ -25,12 +28,13 @@ fn header(name: &str, len: usize) -> String {
     format!("{name} {len}\n")
 }
 
-/// Whether a blob named `name` of `len` bytes fits one text message.
-pub fn fits(name: &str, len: usize) -> bool {
+/// Whether a blob named `name` of `len` bytes fits one message of
+/// `max_chars` characters.
+pub fn fits(name: &str, len: usize, max_chars: usize) -> bool {
     len > 0
         && !name.is_empty()
         && name.chars().all(|c| c.is_ascii_graphic())
-        && header(name, len).chars().count() + payload_chars(len) <= TEXT_MAX_CHARS
+        && header(name, len).chars().count() + payload_chars(len) <= max_chars
 }
 
 /// The text of blob `name`: see [`fits`] first.
@@ -104,17 +108,16 @@ mod tests {
     #[test]
     fn the_limit_is_counted_in_characters() {
         let name = "ph-0123456789abcdef0123456789abcdef.bin";
-        let mut max = 0;
-        while fits(name, max + 1) {
-            max += 1;
+        for (limit, at_least) in [(TELEGRAM_MAX_CHARS, 7500), (DISCORD_MAX_CHARS, 3600)] {
+            let mut max = 0;
+            while fits(name, max + 1, limit) {
+                max += 1;
+            }
+            assert!(max > at_least, "{limit}: {max}");
+            assert!(encode(name, &vec![0xa5; max]).chars().count() <= limit);
         }
-        assert!(max > 7500, "{max}");
-        let text = encode(name, &vec![0xa5; max]);
-        assert_eq!(text.chars().count(), TEXT_MAX_CHARS.min(text.chars().count()));
-        assert!(text.chars().count() <= TEXT_MAX_CHARS);
-        assert!(!fits(name, max + 1));
-        assert!(!fits(name, 0), "empty blobs are refused anyway");
-        assert!(!fits("a name", 10), "a name with a space");
+        assert!(!fits(name, 0, TELEGRAM_MAX_CHARS), "empty blobs are refused anyway");
+        assert!(!fits("a name", 10, TELEGRAM_MAX_CHARS), "a name with a space");
     }
 
     #[test]

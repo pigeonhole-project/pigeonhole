@@ -7,6 +7,7 @@
 mod backend;
 mod chain;
 mod stream;
+pub mod text;
 
 pub use backend::{
     BlobBackend, BlobId, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,

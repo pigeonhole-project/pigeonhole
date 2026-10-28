@@ -215,8 +215,7 @@ messages). The same holds in Discord:
 - Sends hit the same 5-per-5-s bucket as text or attachment.
 
 So the codec is shared with Telegram, parameterised by the character limit
-(4096 there, 2000 here): move `inline.rs` out of the Telegram crate when the
-Discord store uses it (step 10).
+(4096 there, 2000 here): `pigeonhole_storage_api::text`.
 
 ## Steps
 

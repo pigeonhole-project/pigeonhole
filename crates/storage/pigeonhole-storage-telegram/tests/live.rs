@@ -167,7 +167,7 @@ async fn clean() {
                 let name = match m {
                     pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => Some(name.as_str()),
                     pigeonhole_storage_telegram::ChannelMessage::Text { text } => {
-                        pigeonhole_storage_telegram::inline::name_of(text)
+                        pigeonhole_blob::text::name_of(text)
                     }
                     _ => None,
                 };
@@ -212,7 +212,7 @@ async fn inline_blobs_against_a_live_channel() {
     let store = TelegramBlobStore::new(channel.clone(), limiter.clone(), info.clone());
     let name = BlobId::random().name();
     let mut max = 0;
-    while pigeonhole_storage_telegram::inline::fits(&name, max + 1) {
+    while pigeonhole_blob::text::fits(&name, max + 1, pigeonhole_blob::text::TELEGRAM_MAX_CHARS) {
         max += 1;
     }
     let mut posted = Vec::new();

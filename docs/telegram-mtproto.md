@@ -329,7 +329,7 @@ are the limit: ~18 sends a minute).
 
 Blobs that fit go as **text messages**, the rest as documents; the store
 decides (`TelegramBlobStore::with_inline`, on by default), nothing above it
-knows (`src/inline.rs`).
+knows (the codec: `pigeonhole_storage_api::text`).
 
 Live spike on the test channel:
 

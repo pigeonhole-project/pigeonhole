@@ -28,7 +28,7 @@ const LOCATION_CACHE: usize = 4096;
 const WINDOWS_IN_FLIGHT: usize = 4;
 
 /// Where a blob's bytes are: a document's file, or the bytes themselves (a
-/// text message, [`crate::inline`]).
+/// text message, [`pigeonhole_blob::text`]).
 #[derive(Clone)]
 pub(crate) enum Located {
     Doc { size: u64, file: FileLocation },
@@ -40,7 +40,7 @@ impl Located {
     pub(crate) fn of(msg: &ChannelMessage) -> Option<Self> {
         match msg {
             ChannelMessage::Document { size, file, .. } => Some(Located::Doc { size: *size, file: file.clone() }),
-            ChannelMessage::Text { text } => crate::inline::decode(text).map(|(_, data)| Located::Inline(data)),
+            ChannelMessage::Text { text } => pigeonhole_blob::text::decode(text).map(|(_, data)| Located::Inline(data)),
             _ => None,
         }
     }
@@ -50,7 +50,7 @@ impl Located {
 pub(crate) fn blob_name(msg: &ChannelMessage) -> Option<&str> {
     match msg {
         ChannelMessage::Document { name, .. } => Some(name),
-        ChannelMessage::Text { text } => crate::inline::name_of(text),
+        ChannelMessage::Text { text } => pigeonhole_blob::text::name_of(text),
         _ => None,
     }
 }
@@ -63,7 +63,7 @@ pub struct TelegramBlobStore<C> {
     pub(crate) reader: Reader<C>,
     pub(crate) limiter: Arc<ChatLimiter>,
     pub(crate) chain: crate::chain::ChainOptions,
-    /// Blobs that fit a text message go as text ([`crate::inline`]).
+    /// Blobs that fit a text message go as text ([`pigeonhole_blob::text`]).
     inline: bool,
 }
 
@@ -111,8 +111,8 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
     pub(crate) async fn post_blob(&self, name: &str, data: Bytes, random_id: i64) -> Result<i64> {
         let _upload = self.limiter.acquire_upload().await;
         let channel = &self.reader.channel;
-        if self.inline && crate::inline::fits(name, data.len()) {
-            let sent = channel.send_text(&crate::inline::encode(name, &data), random_id).await?;
+        if self.inline && pigeonhole_blob::text::fits(name, data.len(), pigeonhole_blob::text::TELEGRAM_MAX_CHARS) {
+            let sent = channel.send_text(&pigeonhole_blob::text::encode(name, &data), random_id).await?;
             self.reader.remember(sent.message_id, Located::Inline(data));
             return Ok(sent.message_id);
         }
