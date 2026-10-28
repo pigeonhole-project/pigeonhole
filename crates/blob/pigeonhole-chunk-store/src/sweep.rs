@@ -497,6 +497,7 @@ mod tests {
             bot_token: String::new(),
             scope_id: "a".into(),
             max_blob_size: None,
+            telegram: None,
         };
         let mut b = a.clone();
         b.info.id = "b".into();

@@ -200,3 +200,14 @@ async fn a_claimed_log_without_a_batch_is_discovered_empty() {
     assert!(matches!(a.claim(3).await, Err(LogError::Fenced { current: 3 })));
     assert_eq!(a.claim(4).await.unwrap().position, 0);
 }
+
+#[tokio::test]
+async fn a_fresh_walk_reads_each_page_once() {
+    let chat = Arc::new(FakeChannel::default());
+    for _ in 0..330 {
+        chat.post_text();
+    }
+    let log = store(&chat);
+    assert_eq!(log.discover().await.unwrap(), None);
+    assert!(chat.reads() <= 4, "{} reads", chat.reads());
+}

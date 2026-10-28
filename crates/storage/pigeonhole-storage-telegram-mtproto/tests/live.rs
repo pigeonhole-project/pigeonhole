@@ -61,3 +61,36 @@ async fn blob_store_against_a_live_channel() {
     pigeonhole_testkit::run_typed_conformance(&store).await.unwrap();
     store.delete(&[id.message_id]).await.unwrap();
 }
+
+/// Print what a channel holds: `TG_LIST_CHAT_ID=-100… TG_LIST_TO=<id>
+/// cargo test -p pigeonhole-storage-telegram-mtproto --test live list -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a Telegram bot, api id and a channel"]
+async fn list() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let chat_id: i64 = env("TG_LIST_CHAT_ID").parse().unwrap();
+    let to: i64 = env("TG_LIST_TO").parse().unwrap();
+    let cfg = MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env("TG_BOT_TOKEN"),
+        session: root.join(".cache/tgm-live.session"),
+    };
+    let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+    let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(ChatLimiterConfig::default()))).await.unwrap();
+    let mut lo = 1;
+    while lo <= to {
+        let ids: Vec<i64> = (lo..=to.min(lo + 99)).collect();
+        for (id, m) in ids.iter().zip(channel.get_messages(&ids).await.unwrap()) {
+            match m {
+                pigeonhole_storage_telegram_mtproto::ChannelMessage::Empty => {}
+                pigeonhole_storage_telegram_mtproto::ChannelMessage::Other => println!("{id} (not a document)"),
+                pigeonhole_storage_telegram_mtproto::ChannelMessage::Document { name, size, .. } => {
+                    println!("{id} {name} {size}")
+                }
+            }
+        }
+        lo += 100;
+    }
+}

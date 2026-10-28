@@ -12,7 +12,11 @@ use pigeonhole_chunk_store::{
     SnapshotSettings,
 };
 use pigeonhole::index::Index;
+use crate::channel_log::{self, LogChannel};
 use crate::telegram_log::{self, TelegramChat};
+use pigeonhole::telegram_mtproto::{Lane, MtprotoBlobStore};
+use pigeonhole_meta::log::channel::{ChannelLogOptions, ChannelLogStore};
+use pigeonhole_meta::snapshot::ChannelSnapshotStore;
 use pigeonhole_meta::log::chat::{ChatLogOptions, ChatLogStore};
 use pigeonhole_meta::snapshot::ChatSnapshotStore;
 use pigeonhole_meta::{LocalSnapshotStore, MemoryLogStore, MemorySnapshotStore, SnapshotStore};
@@ -51,6 +55,15 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
             info!(chat_id = %chat_id, "metadata log in a Telegram chat");
             Arc::new(ChatLogStore::new(Arc::new(chat), opts))
         }
+        LogSettings::TelegramMtproto { chat_id, login } => {
+            let channel = channel_log::client(login)
+                .await?
+                .channel(parse_chat(chat_id)?, Lane::Meta, cfg.chat_limiter(&login.bot_token, chat_id))
+                .await
+                .context("log channel")?;
+            info!(chat_id = %chat_id, "metadata log in a Telegram channel (MTProto)");
+            Arc::new(ChannelLogStore::new(Arc::new(LogChannel::new(channel)), ChannelLogOptions::default()))
+        }
     })
 }
 
@@ -66,7 +79,20 @@ pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStor
             info!(chat_id = %chat_id, "metadata snapshots in a Telegram chat");
             Arc::new(ChatSnapshotStore::new(Arc::new(chat)))
         }
+        SnapshotSettings::TelegramMtproto { chat_id, login } => {
+            let channel = channel_log::client(login)
+                .await?
+                .channel(parse_chat(chat_id)?, Lane::Meta, cfg.chat_limiter(&login.bot_token, chat_id))
+                .await
+                .context("snapshot channel")?;
+            info!(chat_id = %chat_id, "metadata snapshots in a Telegram channel (MTProto)");
+            Arc::new(ChannelSnapshotStore::new(Arc::new(LogChannel::new(channel))))
+        }
     })
+}
+
+fn parse_chat(chat_id: &str) -> anyhow::Result<i64> {
+    chat_id.parse().with_context(|| format!("chat id {chat_id:?}"))
 }
 
 pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
@@ -155,7 +181,16 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
             ));
             MetricsBackend::wrap(Arc::new(erase_sweep(store)))
         }
-        InstanceKind::TelegramMtproto => bail!("store {id:?}: telegram_mtproto is not wired yet"),
+        InstanceKind::TelegramMtproto => {
+            let login = inst.telegram.as_ref().with_context(|| format!("store {id:?}: no MTProto login"))?;
+            let channel = channel_log::client(login)
+                .await?
+                .channel(parse_chat(&inst.scope_id)?, Lane::Blobs, limiter.clone())
+                .await
+                .with_context(|| format!("store {id:?}"))?;
+            let store = MtprotoBlobStore::new(Arc::new(channel), limiter.clone(), inst.info.clone());
+            MetricsBackend::wrap(Arc::new(erase_sweep(Arc::new(store))))
+        }
         InstanceKind::Discord => {
             #[cfg(feature = "discord")]
             {

@@ -2331,6 +2331,7 @@ dependencies = [
  "futures",
  "http",
  "http-body",
+ "lru",
  "metrics",
  "metrics-exporter-prometheus",
  "pigeonhole-blob",
@@ -2343,6 +2344,7 @@ dependencies = [
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
  "pigeonhole-storage-telegram",
+ "pigeonhole-storage-telegram-mtproto",
  "pigeonhole-types",
  "pin-project-lite",
  "s3s",
@@ -2353,6 +2355,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

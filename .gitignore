@@ -16,3 +16,6 @@ readme.downloaded.md
 out.md
 .cache/
 /pigeonhole-meta/
+
+# MTProto session files (auth key caches; secret)
+*.session

@@ -1,4 +1,4 @@
-use crate::instances::{memory_instance, InstanceConfig};
+use crate::instances::{memory_instance, InstanceConfig, TelegramLogin};
 use crate::stores::{FileReplicas, FileShards, FileStore, Store, Topology};
 use crate::repair::{
     RepairConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
@@ -92,6 +92,8 @@ pub enum SnapshotSettings {
     Memory,
     /// A dedicated Telegram channel (the newest snapshot pinned).
     Telegram { chat_id: String, bot_token: String },
+    /// A dedicated Telegram channel read over MTProto.
+    TelegramMtproto { chat_id: String, login: TelegramLogin },
 }
 
 /// Where the command log lives (`[meta] log`).
@@ -109,6 +111,9 @@ pub enum LogSettings {
         /// A claim waits this long for a deposed writer's last batch.
         straggler_window: Duration,
     },
+    /// A dedicated Telegram channel read over MTProto (fenced by the order
+    /// of its messages; docs/telegram-mtproto.md).
+    TelegramMtproto { chat_id: String, login: TelegramLogin },
 }
 
 impl MetaSettings {
@@ -130,9 +135,11 @@ impl MetaSettings {
     pub fn snapshots_outlive_log(&self) -> bool {
         match (&self.log, &self.snapshot) {
             (LogSettings::LocalDisk { path: log }, SnapshotSettings::LocalDisk { path }) => log != path,
-            (LogSettings::LocalDisk { .. }, SnapshotSettings::Telegram { .. }) => true,
+            (LogSettings::LocalDisk { .. }, SnapshotSettings::Telegram { .. } | SnapshotSettings::TelegramMtproto { .. }) => {
+                true
+            }
             (LogSettings::LocalDisk { .. }, SnapshotSettings::Memory) => false,
-            (LogSettings::Telegram { .. } | LogSettings::Memory, _) => false,
+            (LogSettings::Telegram { .. } | LogSettings::TelegramMtproto { .. } | LogSettings::Memory, _) => false,
         }
     }
 }
@@ -464,6 +471,9 @@ impl FileMeta {
                 bot_token: bot_token.clone(),
                 straggler_window: Duration::from_secs(self.log_straggler_window_secs),
             },
+            Store::TelegramMtproto { chat_id, login, .. } => {
+                LogSettings::TelegramMtproto { chat_id: chat_id.clone(), login: login.clone() }
+            }
             Store::Discord { .. } => unreachable!("meta_store refuses discord"),
         };
         let snapshot_store = match &self.snapshot {
@@ -475,10 +485,14 @@ impl FileMeta {
             Store::LocalDisk { path } => SnapshotSettings::LocalDisk { path },
             Store::Memory => SnapshotSettings::Memory,
             Store::Telegram { chat_id, bot_token, .. } => SnapshotSettings::Telegram { chat_id, bot_token },
+            Store::TelegramMtproto { chat_id, login, .. } => SnapshotSettings::TelegramMtproto { chat_id, login },
             Store::Discord { .. } => unreachable!("meta_store refuses discord"),
         };
         match (&log, &snapshot) {
-            (LogSettings::Telegram { .. }, SnapshotSettings::LocalDisk { .. } | SnapshotSettings::Memory) => bail!(
+            (
+                LogSettings::Telegram { .. } | LogSettings::TelegramMtproto { .. },
+                SnapshotSettings::LocalDisk { .. } | SnapshotSettings::Memory,
+            ) => bail!(
                 "[meta] snapshot: a telegram log needs telegram snapshots (a log off-host cannot \
                  start from snapshots on this host)"
             ),
@@ -973,6 +987,40 @@ upload_concurrency = 4
         let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"disk\"\n{}{disk}", tg_store("tg-log", -100)))
             .unwrap_err();
         assert!(format!("{err:#}").contains("cannot start from snapshots on this host"), "{err:#}");
+    }
+
+    fn tgm_store(id: &str, chat: i64) -> String {
+        format!(
+            "[[store]]\nid = \"{id}\"\nkind = \"telegram_mtproto\"\nchat_id = {chat}\nbot_token_env = \"PH_TEST_TGM_TOKEN\"\n\
+             api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n"
+        )
+    }
+
+    #[test]
+    fn telegram_mtproto_stores_log_in_one_session_per_bot() {
+        std::env::set_var("PH_TEST_TGM_TOKEN", "42:secret");
+        std::env::set_var("PH_TEST_TGM_API_ID", "12345");
+        std::env::set_var("PH_TEST_TGM_API_HASH", "hash");
+        let stores = format!("{}{}{}", tgm_store("log", -1001), tgm_store("snap", -1002), tgm_store("blobs", -1003));
+        let cfg = load(&format!("[meta]\nlog = \"log\"\nsnapshot = \"snap\"\n[chunk]\nstore = \"blobs\"\n{stores}")).unwrap();
+        let login = TelegramLogin {
+            bot_token: "42:secret".into(),
+            api_id: 12345,
+            api_hash: "hash".into(),
+            session: "pigeonhole-tg-42.session".into(),
+        };
+        assert_eq!(cfg.meta.log, LogSettings::TelegramMtproto { chat_id: "-1001".into(), login: login.clone() });
+        assert_eq!(cfg.meta.snapshot, SnapshotSettings::TelegramMtproto { chat_id: "-1002".into(), login: login.clone() });
+        let inst = cfg.primary_instance().unwrap();
+        assert_eq!((inst.info.kind, inst.info.fingerprint.as_str()), (InstanceKind::TelegramMtproto, "tgm:42:-1003"));
+        assert_eq!(inst.info.location, "tg:chat:-1003", "the same place as a Bot API store of that chat");
+        assert_eq!(inst.telegram, Some(login));
+        assert!(!format!("{:?}", inst.telegram).contains("secret"));
+
+        let err = load_mem(&format!("[meta]\nlog = \"log\"\nsnapshot = \"log\"\n{}", tgm_store("log", -1001))).unwrap_err();
+        assert!(format!("{err:#}").contains("one purpose"), "{err:#}");
+        let err = load_mem("[[store]]\nid = \"x\"\nkind = \"memory\"\nsession = \"s\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("does not take session"), "{err:#}");
     }
 
     #[test]

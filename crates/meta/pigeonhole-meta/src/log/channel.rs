@@ -256,7 +256,8 @@ impl<C: ChannelApi> ChannelLogStore<C> {
         Ok(ids.into_iter().zip(msgs).collect())
     }
 
-    /// Make sure `view` holds every id in `[lo, hi]`.
+    /// Make sure `view` holds every id in `[lo, hi]`, reading whole pages
+    /// down from the highest missing id (a walk down reads each id once).
     async fn fill(&self, view: &mut BTreeMap<i64, ChannelMsg>, lo: i64, hi: i64) -> LogResult<()> {
         let mut top = hi;
         while top >= lo.max(1) {
@@ -264,7 +265,7 @@ impl<C: ChannelApi> ChannelLogStore<C> {
                 top -= 1;
                 continue;
             }
-            let bottom = lo.max(1).max(top - PAGE as i64 + 1);
+            let bottom = (top - PAGE as i64 + 1).max(1);
             view.extend(self.page(bottom, top).await?);
             top = bottom - 1;
         }

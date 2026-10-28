@@ -22,7 +22,7 @@ pub use layer::{
 };
 pub use instances::{
     check_fingerprints, discord_fingerprint, discord_location, memory_instance,
-    memory_fingerprint, memory_location, telegram_fingerprint, telegram_location, validate_instances,
+    memory_fingerprint, memory_location, telegram_fingerprint, telegram_location, telegram_mtproto_fingerprint, TelegramLogin, validate_instances,
     InstanceConfig,
 };
 pub use block_cache::BlockCache;

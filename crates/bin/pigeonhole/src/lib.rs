@@ -13,6 +13,7 @@ pub use pigeonhole_gateway_s3 as service;
 pub use pigeonhole_gateway_s3::index;
 pub use pigeonhole_gateway_s3::{build_s3_service, build_s3_gateway};
 pub use pigeonhole_storage_telegram as telegram;
+pub use pigeonhole_storage_telegram_mtproto as telegram_mtproto;
 pub use pigeonhole_storage_memory as memory;
 
 pub use pigeonhole_blob::{ChatLimiter, DeleteOutcome};

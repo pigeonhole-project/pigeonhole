@@ -3,6 +3,7 @@
 use anyhow::{bail, Context, Result};
 use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 /// One configured backend instance after secret resolution.
 #[derive(Debug, Clone)]
@@ -16,6 +17,31 @@ pub struct InstanceConfig {
     pub scope_id: String,
     /// Per-message size limit override (Discord); `None` = backend default.
     pub max_blob_size: Option<usize>,
+    /// `telegram_mtproto`: how the bot logs in.
+    pub telegram: Option<TelegramLogin>,
+}
+
+/// A Telegram bot logged in over MTProto, resolved from `[[store]]` and the
+/// environment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TelegramLogin {
+    pub bot_token: String,
+    pub api_id: i32,
+    pub api_hash: String,
+    /// The MTProto session file (auth key cache).
+    pub session: PathBuf,
+}
+
+impl std::fmt::Debug for TelegramLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bot = self.bot_token.split(':').next().unwrap_or_default();
+        f.debug_struct("TelegramLogin").field("bot", &bot).field("api_id", &self.api_id).field("session", &self.session).finish()
+    }
+}
+
+/// MTProto fingerprint: `tgm:{bot_id}:{chat_id}`.
+pub fn telegram_mtproto_fingerprint(bot_token: &str, chat_id: &str) -> Result<String> {
+    Ok(telegram_fingerprint(bot_token, chat_id)?.replacen("tg:", "tgm:", 1))
 }
 
 /// Telegram fingerprint: `{bot_id}:{chat_id}` where bot_id is the token prefix.
@@ -78,6 +104,7 @@ pub fn memory_instance(id: &str) -> InstanceConfig {
         bot_token: String::new(),
         scope_id: "local".into(),
         max_blob_size: None,
+        telegram: None,
     }
 }
 
@@ -146,6 +173,7 @@ mod tests {
             bot_token: "1:x".into(),
             scope_id: "-100".into(),
             max_blob_size: None,
+            telegram: None,
         };
         let mut b = a.clone();
         b.info.id = "b".into();
@@ -166,6 +194,7 @@ mod tests {
             bot_token: "1:x".into(),
             scope_id: "-100".into(),
             max_blob_size: None,
+            telegram: None,
         };
         let mut b = a.clone();
         b.info.id = "ro".into();
@@ -188,6 +217,7 @@ mod tests {
             bot_token: "1:x".into(),
             scope_id: "-100".into(),
             max_blob_size: None,
+            telegram: None,
         };
         let err = check_fingerprints(
             &[cfg],
