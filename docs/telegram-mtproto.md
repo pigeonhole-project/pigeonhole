@@ -186,7 +186,16 @@ The chat log protocol (`meta/pigeonhole-meta/src/log/chat.rs`) changes:
 - **A dropped future still sends**: `sendMedia` cut by a 20 ms timeout was
   posted anyway. The request is queued in the sender pool and goes out when it
   goes out; "lands within `CALL_DEADLINE` or never" does not hold. Hence the
-  (generation, id) head rule above.
+  (generation, id) head rule above. Why, in grammers-mtsender 0.11: a request
+  travels `SenderPoolHandle` → mpsc → `SenderPoolRunner::process_request`
+  (which awaits `create_connection` when there is no connection yet: seconds)
+  → the connection's mpsc → `Sender::enqueue_body` → `Sender.requests`, and is
+  serialized only by `try_fill_write`, i.e. once the previous write (say a
+  512 KiB upload part on the same connection) is fully on the socket. The
+  answer goes back through a `oneshot`, but nothing on the way checks whether
+  its receiver is still there (`tx.is_closed()`), so an abandoned request is
+  sent whenever its turn comes. The flood-wait retry loop lives in the
+  caller's future, so that part does stop with it.
 - **grammers retries flood waits itself** (`AutoSleep`, below a threshold):
   use `NoRetries` for our calls and let the `ChatLimiter` handle
   `FLOOD_WAIT_X` as it handles 429s (one rate-limited error type).
@@ -204,7 +213,17 @@ Each step ends with `cargo test --workspace` and
 
 1. ~~**Spike**~~ Done: a throwaway binary against the test channels (not
    merged); results in Spike findings above.
-2. **Crate** `pigeonhole-storage-telegram-mtproto`: client behind a small trait
+2. **Crate** `pigeonhole-storage-telegram-mtproto`. First a patched
+   grammers-mtsender (`[patch.crates-io]` to a vendored 0.11.0 copy, and the
+   same change offered upstream on codeberg): `try_fill_write` drops requests
+   whose result receiver is closed before serializing them, and
+   `process_request` / `run_sender` do not enqueue one whose `tx` is already
+   closed. Then a request abandoned before its bytes reach the socket is never
+   sent; one already written lands within the network's delivery time, as
+   over HTTP. Safety does not rest on it (the head rule does); it removes
+   useless late sends and makes latency predictable. The log and snapshots get
+   a sender pool (connection) of their own, so their sends never queue behind
+   blob upload parts. Then the client behind a small trait
    (`getMessages`, `getFile`, `saveBigFilePart` + `sendMedia`,
    `deleteMessages`) with a fake implementation; `BlobBackend` + `Sweepable`;
    the testkit conformance suites and a `typed_backend` test on the fake.
