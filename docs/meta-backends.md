@@ -1,8 +1,9 @@
 # Metadata as a tablet
 
-Status: **steps 1–3 implemented** — typed commands, in-memory state machines,
-a tablet over the `local` LogStore, snapshots, export and restore. The rest
-is a proposal. No backward compatibility: configs, on-disk and in-chat formats
+Status: **steps 1–6 implemented** — typed commands, in-memory state machines,
+a tablet over the `local` or `telegram` LogStore, snapshots in a
+`SnapshotStore` of their own, lossy restore. The arbiter and the `s3` LogStore
+are a proposal. No backward compatibility: configs, on-disk and in-chat formats
 are replaced, existing data is not migrated (formats are versioned, so a
 binary refuses old data instead of misreading it; a converter can be written
 when needed).
@@ -25,14 +26,15 @@ check-then-write, so two writers could both win. All of it is gone (step 3).
 
 1. Every metadata change is a typed command; state = commands applied in order.
 2. The command log lives in a pluggable **`LogStore`** that fences old
-   generations. State lives in memory and is rebuilt from snapshot + log on
+   generations; snapshots in a pluggable **`SnapshotStore`**, configured
+   separately. State lives in memory and is rebuilt from snapshot + log on
    every boot; there is no local database.
 3. A tablet can move to another node: boot = claim a generation, discover,
    replay, write a zero entry.
 4. Side effects outside the state machine (deleting blobs) never run ahead of
    the log and never come from a deposed writer.
-5. `LogStore` implementations are chosen in config: local file, Telegram, later
-   S3 with conditional writes.
+5. Implementations are chosen in config: a local directory or Telegram for
+   either store, later S3 with conditional writes for the log.
 
 Non-goals for now: several tablets / sharding metadata; follower reads.
 
@@ -45,12 +47,13 @@ Non-goals for now: several tablets / sharding metadata; follower reads.
  ┌──────────────────────────── tablet (one per cluster) ───────────────────────────┐
  │ propose::<S>(cmd) ─► batch ─► LogStore.append(gen, batch) ─► S::apply in memory │
  │ reads: MetaStore::read::<S> (short read lock on the namespace's state)          │
- │ every N entries: snapshot all states ─► LogStore.install_snapshot (+ export)    │
+ │ every N entries: snapshot ─► SnapshotStore.put ─► LogStore.rebase(at, ref)      │
  │ side effects (sweeper, repair) only while the tablet holds its generation       │
  └──────────────────────────────────────────────────────────────────────────────────┘
-                    │                                             ▲
-                    ▼                                             │ snapshot + tail on boot
-              LogStore: claim / append / discover / read / install_snapshot
+          │                                   │                    ▲
+          ▼                                   ▼                    │ base snapshot + tail on boot
+ LogStore: claim / append / discover /   SnapshotStore: put / get / newest / remove
+           read / rebase
 ```
 
 ### Namespaces
@@ -99,14 +102,15 @@ trait LogStore {
     /// about this batch may be acknowledged.
     async fn append(&self, gen: u64, batch: &[Entry]) -> Result<Position, LogError>;
 
-    /// Newest snapshot + log head (bootstrap without any local state).
+    /// Base + log head + newest generation (bootstrap without local state).
     async fn discover(&self) -> Result<Option<Discovered>>;
 
     /// Entries after `from` up to `head`, in order (replay).
     fn read(&self, from: Position, head: Head) -> EntryStream;
 
-    /// Store a snapshot of the state as of `at` and drop entries ≤ `at` (collect).
-    async fn install_snapshot(&self, gen: u64, at: Position, snapshot: Snapshot) -> Result<()>;
+    /// Start the log from `base` = { at, snapshot: SnapshotRef } (a snapshot
+    /// already stored) and drop entries ≤ `at` (collect). Fenced like append.
+    async fn rebase(&self, gen: u64, base: Base) -> Result<()>;
 }
 ```
 
@@ -120,37 +124,62 @@ outcome unknown). Positions number entries 1, 2, …; an empty batch (the zero
 entry) takes no position. A batch is one log write: commits are grouped
 (group commit) because some stores (Telegram) allow a write every few seconds.
 
+### SnapshotStore contract
+
+```rust
+trait SnapshotStore {
+    /// Durably store { log_id, at, data }; the ref goes into the log's base.
+    async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef>;
+    async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot>;
+    /// The most recently stored snapshot, of any log: lossy restore only.
+    async fn newest(&self) -> Result<Option<StoredSnapshot>>;
+    /// Drop one nothing starts from any more (best effort).
+    async fn remove(&self, r: &SnapshotRef) -> Result<()>;
+}
+```
+
+The log names the exact snapshot it starts from, so a boot never guesses: a
+deposed writer's late `put` is just an unreferenced copy. A store never drops
+snapshots on its own; the tablet removes the previous base once the log is
+rebased on a newer one. Implementations: `local` (`snapshot-<log id>-<at>.snap`
+files, crc-checked; the directory may be the log's) and `telegram`
+(`ChatSnapshotStore`: one document per snapshot in a dedicated chat, the
+newest pinned so `newest` needs no history). The log and the snapshots cannot
+share a chat: both use the pinned message.
+
 ### Tablet lifecycle
 
 1. **Boot** (`claim`): `gen = 1 + discover().gen` (`Fenced { current }` moves
    past a racing claim); `claim(gen)` → head.
-2. **Recover**: `discover` → load the newest snapshot into empty states →
-   `read` and apply entries after it up to head.
+2. **Recover**: `discover` → `get` the base snapshot into empty states →
+   `read` and apply entries after it up to head. A never-claimed log next to a
+   snapshot store that holds snapshots refuses to boot (the log was lost: an
+   empty state would make the sweeper take every blob for an orphan).
 3. **Zero entry**: append an empty batch for `gen` — proves the claim took effect
    and marks the start of this generation (as YDB's `WriteZeroEntry`).
 4. **Active**: `propose` queues commands; the batcher appends what is queued
-   (group commit), applies it in order, installs a snapshot if one is due, then
+   (group commit), applies it in order, takes a snapshot if one is due, then
    answers the callers. `Fenced` → stop the tablet (proposals fail, side effects
    stop, `serve` exits). A command that cannot be applied stops it too; the next
    boot rebuilds from the log.
 5. **Snapshot**: every `[meta.snapshot] every_entries` entries, and every
    `every_secs` when anything changed (an idle tablet wakes up for it), between
-   batches: one `TabletSnapshot` of all states → `install_snapshot`, which
-   drops the log behind it. With `[meta.snapshot.export]` set, a copy goes to a
-   directory or is pinned in a dedicated Telegram chat (the previous pinned
-   export deleted), in the background, one at a time, newest wins:
-   `MetaStore::exported_position` is the newest position safely exported. A
-   failed snapshot keeps the log and is retried after the next batch.
+   batches: one `TabletSnapshot` of all states, stored with `put` in the
+   background (one at a time); when it is stored, the batcher `rebase`s the log
+   on it (dropping the log behind it) and removes the previous base snapshot.
+   `MetaStore::base_position` is where the log starts now. A failed put or
+   rebase keeps the old base; the next snapshot tries again.
 
 Responses are released only after `append` returned `Ok`, so a client never sees
 a result the next generation might not have.
 
-**Restore** (`pigeonhole restore [--from-export DIR] --lossy`; without the flag
-it reads the configured export) seeds an empty log
-from the newest export: the states as of the export, positions from 0. It is
-lossy: changes after the export are gone and chunks committed later become
-orphans (the sweeper deletes them). Reclaim deletes parts only after an export
-shows the chunk reclaiming (sweep-invariants.md), so the newest export never
+**Restore** (`pigeonhole restore --lossy`) starts an empty log from the newest
+stored snapshot: the states as of it, positions from 0 (stored again under the
+new log id, then `rebase(0)`). It is for a local log lost while its snapshots
+survive (another disk, a chat). Lossy: changes after the snapshot are gone and
+chunks committed later become orphans (the sweeper deletes them). When
+snapshots outlive the log, reclaim deletes parts only after the base snapshot
+shows the chunk reclaiming (sweep-invariants.md), so the newest snapshot never
 references deleted parts. Only an off-host LogStore makes disk loss lossless.
 
 ### Arbiter
@@ -166,7 +195,8 @@ node; restart = process restart). Later: a small watcher over the same LogStore
 ### `local` — file on disk
 
 Segmented append-only files + a `claimed_gen` file updated with fsync before
-use; `append` checks the generation under a lock. Fences only processes on the
+use, and a `base` file written by `rebase`; `append` checks the generation
+under a lock. Fences only processes on the
 same host; durability = the disk. Default, and the reference implementation the
 others are tested against.
 
@@ -182,11 +212,11 @@ binary. Two registers, both read with one `getChat`
   Channels, supergroups and groups (private chats are not supported).
 
 **Log layout — a chain.** Every log message is a document (postcard `LogDoc`):
-log id, generation, a crc-checked link to the previous log message, and a
-batch — or a snapshot, where the chain ends. Recovery needs no history access:
-`getChat` → head → follow links with `getFile` back to the snapshot → apply
-forward. A snapshot is installed at the head and the messages behind it are
-deleted.
+log id, generation, the log's current base, a crc-checked link to the previous
+log message (with the position of its last entry) and a batch. Recovery needs
+no history access: `getChat` → head → base snapshot from the SnapshotStore →
+follow links with `getFile` back to the base → apply forward. `rebase` sends
+an empty batch carrying the new base and deletes the messages it covers.
 
 `append(g, batch)`:
 1. send the batch (link = this writer's tip, `gen = g`);
@@ -239,9 +269,11 @@ Costs and caveats:
   ([Bot FAQ](https://core.telegram.org/bots/faq)), groups under 20 per minute;
   set `[meta] batch_max_delay_ms` (e.g. 1000) for a Telegram log;
 - a claim (boot, failover) takes the straggler window;
-- recovery walks the chain back to the last snapshot (one `getFile` per batch),
-  so snapshots bound recovery time; a snapshot is one document, so it must fit
-  the bot download limit (20 MB);
+- recovery walks the chain back to the base (one `getFile` per batch), so
+  snapshots bound recovery time; a snapshot in a chat is one document, so it
+  must fit the bot download limit (20 MB);
+- every pin leaves a "pinned message" service message in the chat, and nothing
+  deletes them yet;
 - the bot needs `can_change_info`, `can_pin_messages` (channels: edit
   messages) and `can_delete_messages`;
 - chat admins can delete or unpin messages; crc links detect a changed
@@ -272,13 +304,15 @@ cheap compared to Telegram; needs an S3-compatible store with conditional writes
   chunks they read; reclaim waits for them (sweep-invariants.md).
 - After recovering from a snapshot older than the log head nothing special is
   needed: replay brings the state to the head before side effects start.
+- When snapshots outlive the log, reclaim waits for a base at or after its
+  `BeginReclaim` (`MetaStore::restorable_position`).
 
 ### Garbage of the log itself
 
-The tablet decides what is garbage in its own log (entries ≤ the last snapshot),
-like YDB's `CollectGarbage` barrier on `generation:step`; ids of log objects are
+The tablet decides what is garbage in its own log (entries ≤ the base), like
+YDB's `CollectGarbage` barrier on `generation:step`; ids of log objects are
 chosen by the writer, so collection needs no listing. Old Telegram messages are
-deleted by the tablet after a snapshot (`deleteMessage`).
+deleted by `rebase` (`deleteMessage`), the previous base snapshot by the tablet.
 
 ## Config
 
@@ -290,18 +324,26 @@ batch_max_entries = 1024
 
 [meta.log]
 kind = "local"                      # local (default) | telegram | s3
-path = "pigeonhole-log"
+path = "pigeonhole-meta"
 # kind = "telegram"                 # ship the log off-host
 # bot_token_env = "BOT_TOKEN"
 # chat_id = -1009876543210          # channel / supergroup (fence = description)
 
 [meta.snapshot]
+kind = "local"                      # local (default) | telegram
+# path = "/mnt/backup/pigeonhole"   # default: the log's path
+# kind = "telegram"                 # required with a telegram log
+# chat_id = -1001111111111          # a chat of its own (not the log's)
 every_entries = 10000               # 0 = never
 every_secs = 600                    # also by time if anything changed
-# [meta.snapshot.export]            # copy every snapshot here (for restore)
-# kind = "dir"                      # or "telegram" + chat_id (a chat of its own)
-# path = "/mnt/backup/pigeonhole"
 ```
+
+| `[meta.log]` | `[meta.snapshot]` | losing this host's disk |
+|---|---|---|
+| local | local, same path | everything |
+| local | local elsewhere / telegram | `restore --lossy`: the tail after the newest snapshot |
+| telegram | telegram | nothing |
+| telegram | local | refused by the config |
 
 ## Plan
 
@@ -312,14 +354,15 @@ Each step is a separate commit with tests green.
    commit, fencing, `LogId`.
 3. ~~Snapshots and removal of the old durability.~~ Done: states in memory
    (SQLite and proto gone from metadata), typed `StateMachine` with versioned
-   postcard encodings, tablet snapshots + collect, export and lossy restore;
+   postcard encodings, tablet snapshots + collect, lossy restore;
    `durability.rs`, superblock pins, index snapshots and roots deleted.
 4. ~~Sweeper contract.~~ Done: `BeginReclaim` is committed before deletes;
    `confirm_active` before each orphan delete batch; loops end on stop.
 5. ~~In-flight pin registry.~~ Done: upload pins + horizon, own `BlobId`s,
    read pins; watermarks, sweep grace and `InflightParts` removed.
 6. ~~`telegram` LogStore.~~ Done: `ChatLogStore` + Telegram adapter, the
-   LogStore conformance suite and fault injection on a fake chat.
+   LogStore conformance suite and fault injection on a fake chat; snapshots
+   moved into a `SnapshotStore` of their own (`local` | `telegram`).
 7. **Arbiter** and a second node; `s3` LogStore.
 
 ## Open questions

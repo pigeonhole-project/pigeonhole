@@ -187,8 +187,7 @@ comments. Sections:
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
 | `[meta]` | Metadata tablet: `batch_max_delay_ms` / `batch_max_entries` (group commit) |
 | `[meta.log]` | Command log: `kind = "local"` + `path`, or `kind = "telegram"` + `chat_id` (a dedicated channel) |
-| `[meta.snapshot]` | `every_entries`: snapshot every state and drop the log behind it; `every_secs`: also this often when anything changed (`0` = never) |
-| `[meta.snapshot.export]` | Also copy each snapshot: `kind = "dir"` + `path`, or `kind = "telegram"` + `chat_id` (a dedicated channel; the newest export stays pinned) |
+| `[meta.snapshot]` | Snapshot store: `kind = "local"` + `path` (default: the log's), or `kind = "telegram"` + `chat_id` (a dedicated channel); `every_entries` / `every_secs`: when to snapshot and drop the log behind it (`0` = never) |
 | `[chunk]` | `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Separate send / getFile / delete budgets, upload/download concurrency |
@@ -210,25 +209,29 @@ in-memory state of its layer (`chunk`, `s3`, `cas`); the log is the source of
 truth and every boot rebuilds the state by replaying it (see
 [docs/meta-backends.md](docs/meta-backends.md)). There is no local database.
 
-Every `[meta.snapshot] every_entries` entries the tablet snapshots all states
-and drops the log behind it, so boot = newest snapshot + the log after it.
+Every `[meta.snapshot] every_entries` entries (and every `every_secs` when
+anything changed) the tablet snapshots all states into the snapshot store and
+drops the log behind it, so boot = that snapshot + the log after it. Log and
+snapshots are configured separately:
 
-With `[meta.log] kind = "telegram"` the log (and its snapshots) live in a
-dedicated Telegram channel: a clean machine boots from it with nothing local.
-With the default `local` log, **losing the disk loses the metadata**; point
-`[meta.snapshot.export]` at another disk or a dedicated Telegram channel to
-keep copies of the snapshots; after losing the log:
+| `[meta.log]` | `[meta.snapshot]` | losing this host's disk |
+|---|---|---|
+| `local` | `local`, same path (default) | loses the metadata |
+| `local` | `local` on another disk, or `telegram` | `restore --lossy`: loses the changes after the newest snapshot |
+| `telegram` | `telegram` (another channel) | loses nothing: a clean machine boots from the chats |
+
+After losing a local log whose snapshots survived:
 
 ```bash
-# seeds an empty [meta.log] from the newest export; changes after it are lost
-cargo run --release -- restore --lossy                 # the configured export
-cargo run --release -- restore --from-export DIR --lossy
+# starts an empty [meta.log] from the newest snapshot; changes after it are lost
+cargo run --release -- restore --lossy
 ```
 
-The restore is lossy: changes after the export are gone, and chunks committed
-after it become orphans (the sweeper deletes them). Objects in the export read
-back whole: the sweeper deletes a chunk's parts only after an export shows the
-chunk released.
+Chunks committed after that snapshot become orphans (the sweeper deletes them).
+Objects in it read back whole: when snapshots outlive the log, the sweeper
+deletes a chunk's parts only after a stored snapshot shows the chunk released.
+Starting the server on an empty log next to stored snapshots is refused
+instead of booting with empty metadata.
 
 Delete every backend message tracked by the local index (server must be stopped):
 

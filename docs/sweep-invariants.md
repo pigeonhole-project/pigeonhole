@@ -55,7 +55,7 @@ live (refs = 0)          ← still visible to Retain until BeginReclaim
   │ BeginReclaim: refs = 0 and not reclaiming → reclaiming
   ▼
 reclaiming               ← Retain → ChunkGone; a new read → ChunkGone
-  │ no read pins, exported → delete backend parts, then DropChunk
+  │ no read pins, in the base snapshot → delete backend parts, then DropChunk
   ▼
 gone
 ```
@@ -65,12 +65,14 @@ gone
 - `BeginReclaim` is committed to the log before any part is deleted
   (`propose` returns only after the append), so a restart or failover never
   brings back a reference to deleted parts.
-- **Exports.** With `[meta.snapshot.export]` set, parts are deleted only once
-  `MetaStore::exported_position` reaches a position at or after the chunk's
-  `BeginReclaim` (`BlobDb::reclaim_exported`; the gate is process memory, set
-  when this process first commits or sees `BeginReclaim`). A lossy restore
-  from the newest export then has the chunk `reclaiming` or gone, never live
-  under an object. Reclaim lags exports by up to `every_secs`.
+- **Snapshots that outlive the log** (`[meta.snapshot]` on another path or in
+  a chat next to a local log): parts are deleted only once
+  `MetaStore::restorable_position` (the base) reaches a position at or after
+  the chunk's `BeginReclaim` (`BlobDb::reclaim_in_snapshot`; the gate is
+  process memory, set when this process first commits or sees `BeginReclaim`).
+  A lossy restore from the newest snapshot then has the chunk `reclaiming` or
+  gone, never live under an object. Reclaim lags snapshots by up to
+  `every_secs`.
 - **Read pins.** `ChunkStore::read` pins the chunks it reads
   (`BlobDb::pin_reads`, process memory) and then checks they are not
   reclaiming. Reclaim commits `BeginReclaim`, then checks the pins and leaves a

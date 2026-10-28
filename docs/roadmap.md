@@ -22,14 +22,14 @@ Read those first.
 
 ## Where we are
 
-Done (on `main`), steps 1–5:
+Done (on `main`), steps 1–6a:
 
 - `pigeonhole-meta` is the tablet. `MetaStore::propose::<S>(cmd)` queues a
   typed command; the batcher appends what is queued to the `LogStore` under the
-  tablet's generation, applies it to `S`'s in-memory state, installs a snapshot
+  tablet's generation, applies it to `S`'s in-memory state, takes a snapshot
   if one is due, then answers with `Result<S::Reply, S::Reject>`. Reads:
-  `MetaStore::read::<S>`. Boot = claim `1 + discover().gen` → newest snapshot →
-  replay the tail → zero entry. `Fenced` / failed append / unappliable command →
+  `MetaStore::read::<S>`. Boot = claim `1 + discover().gen` → the base snapshot
+  → replay the tail → zero entry. `Fenced` / failed append / unappliable command →
   `Stop`: proposals fail, `serve` exits.
 - Namespaces `ChunkState` (chunk-store), `S3State` (gateway-s3), `CasState`
   (bytestream): Rust command enums, serde state, `VERSION` covering both.
@@ -38,11 +38,12 @@ Done (on `main`), steps 1–5:
   only for REAPI).
 - `LocalLogStore`: `seg-<first>.log` records `MAGIC|len|crc|Batch`, fsync per
   batch, `claimed_gen` + `log_id` under a `flock`; claim truncates a torn tail;
-  snapshots drop the segments behind them.
+  `rebase` drops the segments behind the base. `ChatLogStore` keeps the log in
+  a Telegram channel.
 - Snapshots every `[meta.snapshot] every_entries` (10000) and `every_secs`
-  (600, when anything changed); `[meta.snapshot.export]`
-  copies them to a directory or a dedicated Telegram chat; `pigeonhole restore [--from-export DIR] --lossy` seeds an empty log
-  from the newest export.
+  (600, when anything changed), stored in a `SnapshotStore` configured apart
+  from the log (`local` | `telegram`); the log records which one it starts
+  from. `pigeonhole restore --lossy` starts an empty log from the newest one.
 - Removed: `durability.rs` (checkpoint, superblock pins, root journal,
   `start_or_restore`), `s3/index` / `cas/index` snapshots, chunk roots.
   `purge` deletes through commands and releases object chunks.
@@ -55,9 +56,10 @@ Done (on `main`), steps 1–5:
 
 Known gaps:
 
-- With the `local` log, disk loss loses metadata unless a snapshot export
-  lives on another disk (and restore from it is lossy); the `telegram` log
-  avoids it. Not yet run end to end against a live chat (only the fake).
+- With the `local` log, disk loss loses metadata unless `[meta.snapshot]`
+  lives elsewhere (and restore from it is lossy); the `telegram` log avoids it.
+- Every Telegram pin leaves a "pinned message" service message; nothing
+  deletes them (one per log batch, one per stored snapshot).
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
 - Telegram blob chats are swept by id up to the horizon, ours or not: keep
@@ -135,16 +137,33 @@ Protocol: meta-backends.md § `telegram` (pinned head of a chain of log batches,
 4. The log chat must not be a blob chat (the sweeper deletes every id up to
    its horizon there): refuse such a config.
 
-### Step 6a — Off-host snapshot exports ✅ done
+### Step 6a — Snapshots in a store of their own ✅ done
 
-For a local log that should survive its disk without a remote log:
-`[meta.snapshot.export] kind = "dir" | "telegram"` (a `SnapshotSink`; the
-newest export stays pinned in a dedicated chat), exports in the background,
-newest wins; `every_secs` snapshots an idle tablet; reclaim deletes parts only
-after an export shows the chunk reclaiming, so `restore --lossy` from the
-newest export loses recent changes but never breaks an object in it.
+`SnapshotStore` (`local` | `telegram`, contract tests) next to the
+`LogStore`, configured independently in `[meta.snapshot]`. The log records its
+base (`rebase(gen, { at, snapshot ref })`), so boot loads exactly that snapshot
+and a deposed writer's late put cannot confuse it; the tablet removes the
+previous base. `every_secs` snapshots an idle tablet. When snapshots outlive
+the log, reclaim deletes parts only after the base shows the chunk reclaiming,
+so `restore --lossy` loses recent changes but never breaks an object.
 
-### Step 7 — Arbiter, second node, `s3` LogStore
+### Step 6b — Telegram housekeeping
+
+- Delete the "pinned message" service messages: in a dedicated chat, delete the
+  id range behind the base, not only the chain (check on a live bot that a
+  range delete is not refused as a whole by one undeletable message).
+- Remove the leftover pinning from the Telegram blob store
+  (`storage-telegram/src/store.rs`, from the old snapshot manifest) and the pin
+  right it still asks for.
+
+### Step 7 — Placement with copies (blob sharding)
+
+`[placement] copies = k`: write each chunk to `k` of the group's members (least
+loaded first) instead of all of them, and let repair bring each chunk to `k`
+replicas. Several blob channels then add throughput (Telegram limits are per
+chat) instead of only copies. Metadata already records replicas per instance.
+
+### Step 8 — Arbiter, second node, `s3` LogStore
 
 Bootstrapper-like watcher that restarts the tablet elsewhere; write forwarding
 to the active node; `s3` LogStore with conditional writes (`If-None-Match`).
