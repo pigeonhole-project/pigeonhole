@@ -326,6 +326,12 @@ impl SenderPoolRunner {
     async fn process_request(&mut self, request: Request) -> ControlFlow<()> {
         match request {
             Request::Invoke { dc_id, body, tx } => {
+                // The caller stopped waiting (e.g. its future was dropped by a
+                // timeout): do not send a request whose answer nobody reads.
+                if tx.is_closed() {
+                    debug!("dropping a request whose caller is gone");
+                    return ControlFlow::Continue(());
+                }
                 let connection = match self
                     .connections
                     .iter()
@@ -340,6 +346,11 @@ impl SenderPoolRunner {
                         }
                     },
                 };
+                // Connecting may have taken seconds; the caller may be gone now.
+                if tx.is_closed() {
+                    debug!("dropping a request whose caller is gone");
+                    return ControlFlow::Continue(());
+                }
                 let _ = connection.rpc_tx.send(Rpc { body, tx });
                 ControlFlow::Continue(())
             }
@@ -569,6 +580,7 @@ async fn run_sender(
                 },
             },
             rpc = rpc_rx.recv() => match rpc {
+                Some(rpc) if rpc.tx.is_closed() => debug!("dropping a request whose caller is gone"),
                 Some(rpc) => sender.enqueue_body(rpc.body, rpc.tx),
                 None => break Ok(()),
             },

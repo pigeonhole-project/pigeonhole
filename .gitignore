@@ -19,3 +19,4 @@ out.md
 
 # MTProto session files (auth key caches; secret)
 *.session
+/vendor/*/target

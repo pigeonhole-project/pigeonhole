@@ -678,3 +678,95 @@ mod tests {
         assert!(err.is::<RateLimited>(), "{err:#}");
     }
 }
+
+/// Live: is a `sendMedia` whose caller gave up before it was written posted
+/// anyway? Without the vendored grammers-mtsender patch it is (the request is
+/// queued and goes out when its turn comes); with it, it must not be.
+/// `cargo test -p pigeonhole-storage-telegram --lib abandoned -- --ignored --nocapture`
+/// with `TG_BOT_TOKEN`, `TG_API_ID`, `TG_API_HASH`, `TG_BLOBS_CHAT_ID` in `.env`.
+#[cfg(test)]
+mod abandoned_send_live {
+    use super::*;
+
+    fn env(k: &str) -> String {
+        std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"))
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Telegram bot, api id and a test channel"]
+    async fn an_abandoned_send_is_not_posted() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        dotenvy::from_path(root.join(".env")).ok();
+        let cfg = MtprotoConfig {
+            api_id: env("TG_API_ID").parse().unwrap(),
+            api_hash: env("TG_API_HASH"),
+            bot_token: env("TG_BOT_TOKEN"),
+            session: root.join(".cache/tgm-live.session"),
+        };
+        let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+        let limiter = Arc::new(ChatLimiter::new(pigeonhole_blob::ChatLimiterConfig::default()));
+        let ch = tg.channel(env("TG_BLOBS_CHAT_ID").parse().unwrap(), Lane::Blobs, limiter).await.unwrap();
+
+        let probe_name = format!("abandoned-{}.bin", random_i64().unsigned_abs());
+        let probe = ch.upload(&probe_name, &Bytes::from_static(b"x")).await.unwrap();
+
+        let media: enums::InputMedia = types::InputMediaUploadedDocument {
+            nosound_video: false,
+            force_file: true,
+            spoiler: false,
+            file: probe,
+            thumb: None,
+            mime_type: "application/octet-stream".into(),
+            attributes: vec![types::DocumentAttributeFilename { file_name: probe_name.clone() }.into()],
+            stickers: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: None,
+        }
+        .into();
+        let send = functions::messages::SendMedia {
+            silent: true,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            peer: ch.input_peer(),
+            reply_to: None,
+            media,
+            message: String::new(),
+            random_id: random_i64(),
+            reply_markup: None,
+            entities: None,
+            schedule_date: None,
+            schedule_repeat_period: None,
+            send_as: None,
+            quick_reply_shortcut: None,
+            effect: None,
+            allow_paid_stars: None,
+            suggested_post: None,
+        };
+        // Polled once (the request is handed to the pool), then given up
+        // before the pool's task runs.
+        use futures::FutureExt as _;
+        assert!(ch.client.home(Lane::Blobs, &send).now_or_never().is_none());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Where the top is now, and whether the probe landed below it.
+        let marker = ch.send_document("abandoned-marker.bin", Bytes::from_static(b"m"), random_i64()).await.unwrap();
+        let ids: Vec<i64> = ((marker.message_id - 20).max(1)..marker.message_id).collect();
+        let msgs = ch.get_messages(&ids).await.unwrap();
+        let posted: Vec<i64> = ids
+            .iter()
+            .zip(&msgs)
+            .filter(|(_, m)| matches!(m, ChannelMessage::Document { name, .. } if *name == probe_name))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut ours = posted.clone();
+        ours.push(marker.message_id);
+        ch.delete_messages(&ours).await.unwrap();
+        assert!(posted.is_empty(), "the abandoned sendMedia was posted as {posted:?}");
+        println!("abandoned sendMedia posted: {}", !posted.is_empty());
+    }
+}

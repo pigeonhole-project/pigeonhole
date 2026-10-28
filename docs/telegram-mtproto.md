@@ -310,7 +310,14 @@ Where the code differs from the design above, and why:
   messages stay.
 - **No grammers-client**: only `grammers-mtsender`, `grammers-session` (no
   SQLite) and `grammers-tl-types`; the session is a JSON file of the home DC
-  and auth keys, 0600, locked. The grammers patch is not applied yet.
+  and auth keys, 0600, locked.
+- **The grammers patch** is applied to a vendored copy
+  (`vendor/grammers-mtsender`, `[patch.crates-io]`): a request whose caller
+  is gone is dropped in the pool runner (before and after connecting), when
+  the connection task takes it, and in `try_fill_write` before it is
+  serialized. A unit test covers the last; a live test
+  (`client::abandoned_send_live`) polls a `sendMedia` once and drops it: posted
+  without the patch, not with it.
 - The log adapter caches document locations and reads the page below a
   missing one, so a replay down its chain reads each page once.
 

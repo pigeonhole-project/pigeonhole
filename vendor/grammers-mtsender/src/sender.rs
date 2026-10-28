@@ -281,6 +281,17 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
             return;
         }
 
+        // A request still waiting for its turn (say, behind a large upload
+        // part) whose caller stopped waiting is dropped: once serialized, it
+        // would be sent with nobody to read the answer.
+        self.requests.retain(|r| {
+            let gone = matches!(r.state, RequestState::NotSerialized) && r.result.is_closed();
+            if gone {
+                debug!("dropping a request whose caller is gone before serializing it");
+            }
+            !gone
+        });
+
         // TODO add a test to make sure we only ever send the same request once
         for request in self
             .requests
@@ -703,4 +714,30 @@ pub async fn connect_with_auth<T: Transport>(
     auth_key: [u8; 256],
 ) -> Result<Sender<T, mtp::Encrypted>, io::Error> {
     Sender::connect(transport, mtp::Encrypted::build().finish(auth_key), addr).await
+}
+
+#[cfg(test)]
+mod abandoned_request_tests {
+    use super::*;
+    use grammers_mtproto::mtp::Plain;
+
+    #[tokio::test]
+    async fn a_request_whose_caller_is_gone_is_not_serialized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut sender = Sender::connect(transport::Full::new(), Plain::new(), ServerAddr::Tcp { address })
+            .await
+            .unwrap();
+
+        let (gone_tx, gone_rx) = oneshot::channel();
+        let (kept_tx, _kept_rx) = oneshot::channel();
+        sender.enqueue_body(b"\x01\x00\x00\x00gone".to_vec(), gone_tx);
+        sender.enqueue_body(b"\x02\x00\x00\x00kept".to_vec(), kept_tx);
+        drop(gone_rx);
+        sender.try_fill_write();
+
+        assert_eq!(sender.requests.len(), 1, "the abandoned request is dropped");
+        assert_eq!(&sender.requests[0].body[4..], b"kept");
+        assert!(matches!(sender.requests[0].state, RequestState::Serialized(_)));
+    }
 }

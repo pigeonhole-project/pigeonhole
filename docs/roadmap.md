@@ -71,8 +71,6 @@ Known gaps:
   `MemoryLogStore`, `ChannelLogStore`, three snapshot stores), beside the blob
   backends of the same stores. Step 7c.
 - Discord cannot hold the log or snapshots yet (step 10).
-- The grammers-mtsender patch (drop requests nobody awaits) is not applied
-  (step 6e).
 
 ## Steps
 
@@ -181,8 +179,8 @@ pinless snapshots. The Bot API backend removed, the kind renamed to
 
 - ~~Docs that still describe the Bot API~~ Done: README, meta-backends.md,
   sweep-invariants.md, glossary.md, `.env.example`.
-- The grammers-mtsender patch (telegram-mtproto.md § Steps 2): discuss, apply
-  through `[patch.crates-io]`, offer upstream.
+- ~~The grammers-mtsender patch~~ Applied through `[patch.crates-io]`
+  (`vendor/grammers-mtsender`); offering it upstream is left.
 
 ### Step 7 — Blob shards ✅ done
 
