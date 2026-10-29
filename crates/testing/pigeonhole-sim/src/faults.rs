@@ -31,6 +31,9 @@ pub struct FaultPlan {
     pub land_late: f64,
     pub late_by: Duration,
     pub rate_limit: f64,
+    /// A contract violation, off in the plans above: this share of blobs
+    /// reads back with a byte flipped, every time (a damaged copy).
+    pub corrupt: f64,
 }
 
 impl FaultPlan {
@@ -44,6 +47,7 @@ impl FaultPlan {
             land_late: 0.0,
             late_by: Duration::ZERO,
             rate_limit: 0.0,
+            corrupt: 0.0,
         }
     }
 
@@ -57,6 +61,7 @@ impl FaultPlan {
             land_late: 0.02,
             late_by: Duration::from_millis(200),
             rate_limit: 0.02,
+            corrupt: 0.0,
         }
     }
 }
@@ -72,6 +77,7 @@ impl FaultPlan {
             land_late: 0.08,
             late_by: Duration::from_millis(40),
             rate_limit: 0.05,
+            corrupt: 0.0,
         }
     }
 }
@@ -84,6 +90,7 @@ pub enum Fault {
     FailAfter,
     LandLate,
     RateLimit,
+    Corrupt,
 }
 
 /// One draw: the fault for an operation, if any.
@@ -157,6 +164,7 @@ impl<B> Faulty<B> {
                 Fault::FailAfter => self.plan.fail_after,
                 Fault::LandLate => self.plan.land_late,
                 Fault::RateLimit => self.plan.rate_limit,
+                Fault::Corrupt => 0.0,
             };
             if fault_draw < acc {
                 self.log.lock().unwrap().push((name, f));
@@ -239,7 +247,20 @@ impl<B: BlobBackend> BlobBackend for Faulty<B> {
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         self.before(GET, "get", READ_FAULTS).await?;
-        self.inner.get(id, range).await
+        let stream = self.inner.get(id, range).await?;
+        // The same blob is damaged on every read (a bad copy, not a flake).
+        let key = pigeonhole_blob::OrderedKey::to_bytes(&B::key(id));
+        let h = key.iter().fold(self.seed, |h, b| mix(h ^ *b as u64));
+        if self.plan.corrupt > 0.0 && ((h >> 11) as f64 / (1u64 << 53) as f64) < self.plan.corrupt {
+            let mut data = pigeonhole_blob::collect_stream(stream).await?.to_vec();
+            let at = (h as usize) % data.len().max(1);
+            if let Some(b) = data.get_mut(at) {
+                *b ^= 0x5a;
+            }
+            self.log.lock().unwrap().push(("get", Fault::Corrupt));
+            return Ok(pigeonhole_blob::bytes_stream(Bytes::from(data)));
+        }
+        Ok(stream)
     }
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {

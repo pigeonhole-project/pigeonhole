@@ -12,7 +12,7 @@ use pigeonhole_chunk_store::config::Config;
 use pigeonhole_chunk_store::{BlobDb, ChunkStore, IngestOptions, SweepConfig, Sweeper};
 use pigeonhole_gateway_s3::{build_s3_gateway, Index, S3Gateway};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, MetaOptions, MetaStore, Namespaces};
-use pigeonhole_sim::faults::{FaultPlan, Faulty};
+use pigeonhole_sim::faults::{Fault, FaultPlan, Faulty};
 use pigeonhole_sim::{random_ms, random_u64};
 use pigeonhole_storage_memory::MemoryBlobStore;
 use s3s::dto::*;
@@ -70,10 +70,11 @@ fn intact(data: &[u8]) -> bool {
 struct Node {
     s3: S3Gateway,
     store: Arc<ChunkStore>,
-    backend: SharedBackend,
+    backends: Vec<SharedBackend>,
 }
 
-async fn open_node(log: &Arc<MemoryBlobStore>, snaps: &Arc<MemoryBlobStore>, blobs: &Arc<Faulty<MemoryBlobStore>>) -> Node {
+/// Every chunk goes to every member; one success is enough.
+async fn open_node(log: &Arc<MemoryBlobStore>, snaps: &Arc<MemoryBlobStore>, members: &[Arc<Faulty<MemoryBlobStore>>]) -> Node {
     let meta = MetaStore::open(
         Arc::new(ChainLogStore::new(log.clone())),
         Arc::new(BlobSnapshotStore::new(snaps.clone())),
@@ -88,18 +89,18 @@ async fn open_node(log: &Arc<MemoryBlobStore>, snaps: &Arc<MemoryBlobStore>, blo
     cfg.block_size = 4 * 1024;
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
-    let backend: SharedBackend = Arc::new(erase_sweep(blobs.clone()));
-    let rep = Arc::new(Replicated::new(vec![backend.clone()], 1, Arc::new(CheapestFirst::new())).unwrap());
+    let backends: Vec<SharedBackend> = members.iter().map(|m| Arc::new(erase_sweep(m.clone())) as SharedBackend).collect();
+    let rep = Arc::new(Replicated::new(backends.clone(), 1, Arc::new(CheapestFirst::new())).unwrap());
     let store =
         Arc::new(ChunkStore::open_replicated(BlobDb::open(meta.clone()).await.unwrap(), rep, opts).await.unwrap());
     let s3 = build_s3_gateway(cfg, Index::open(meta).await.unwrap(), store.clone());
-    Node { s3, store, backend }
+    Node { s3, store, backends }
 }
 
 fn sweeper(node: &Node) -> Sweeper {
     Sweeper::new(
         node.store.db().clone(),
-        vec![node.backend.clone()],
+        node.backends.clone(),
         SweepConfig { batch_size: 5, interval: Duration::ZERO },
         node.store.replicated().pins().clone(),
     )
@@ -168,12 +169,9 @@ async fn read_all(s3: &S3Gateway) -> BTreeMap<String, Vec<u8>> {
     live
 }
 
-#[tokio::test]
-async fn s3_under_store_faults_keeps_objects_whole_and_reclaims_garbage() {
+async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) {
     let (log, snaps) = (Arc::new(MemoryBlobStore::new()), Arc::new(MemoryBlobStore::new()));
-    let mem = Arc::new(MemoryBlobStore::new());
-    let blobs = Arc::new(Faulty::new(mem.clone(), FaultPlan::mild()));
-    let node = open_node(&log, &snaps, &blobs).await;
+    let node = open_node(&log, &snaps, &members).await;
     node.s3.create_bucket(req(CreateBucketInput { bucket: BUCKET.into(), ..Default::default() })).await.unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -196,8 +194,10 @@ async fn s3_under_store_faults_keeps_objects_whole_and_reclaims_garbage() {
     sweep.await.unwrap();
     assert!(damaged.lock().unwrap().is_empty(), "damaged reads: {:?}", damaged.lock().unwrap());
 
-    // Faults stop; late puts land; then the sweeper reclaims all garbage.
-    blobs.quiesce();
+    // Faults stop (a damaged copy stays damaged); late puts land.
+    for m in &members {
+        m.quiesce();
+    }
     tokio::time::sleep(Duration::from_secs(1)).await;
     let s3 = Arc::try_unwrap(s3).ok().expect("workers done");
     let node = Node { s3, ..node };
@@ -214,15 +214,38 @@ async fn s3_under_store_faults_keeps_objects_whole_and_reclaims_garbage() {
         sw.sweep_once().await.unwrap();
     }
     assert_eq!(read_all(&node.s3).await, live, "the final sweeps changed objects");
-    let on_backend: BTreeSet<Vec<u8>> = mem.message_keys().iter().map(|k| k.to_bytes()).collect();
-    let instance = node.backend.instance().id.clone();
-    let expected: BTreeSet<Vec<u8>> = node.store.db().live_part_keys(&instance).await.unwrap().into_iter().collect();
-    assert_eq!(on_backend.difference(&expected).count(), 0, "garbage left after faults stopped");
-    assert_eq!(expected.difference(&on_backend).count(), 0, "live parts deleted");
+    for (m, backend) in members.iter().zip(&node.backends) {
+        let instance = backend.instance().id.clone();
+        let on_backend: BTreeSet<Vec<u8>> = m.inner().message_keys().iter().map(|k| k.to_bytes()).collect();
+        let expected: BTreeSet<Vec<u8>> =
+            node.store.db().live_part_keys(&instance).await.unwrap().into_iter().collect();
+        assert_eq!(on_backend.difference(&expected).count(), 0, "{instance}: garbage left after faults stopped");
+        assert_eq!(expected.difference(&on_backend).count(), 0, "{instance}: live parts deleted");
+    }
 
     // A restart replays the log and reads the same objects.
     drop(sw);
     drop(node);
-    let again = open_node(&log, &snaps, &blobs).await;
+    let again = open_node(&log, &snaps, &members).await;
     assert_eq!(read_all(&again.s3).await, live, "replay lost or changed objects");
+}
+
+fn member(id: &str, plan: FaultPlan) -> Arc<Faulty<MemoryBlobStore>> {
+    Arc::new(Faulty::new(Arc::new(MemoryBlobStore::new().with_instance_id(id)), plan))
+}
+
+#[tokio::test]
+async fn s3_under_store_faults_keeps_objects_whole_and_reclaims_garbage() {
+    run(vec![member("a", FaultPlan::mild())]).await;
+}
+
+/// One member also returns damaged copies of a third of its blobs: reads
+/// must notice (the block checksums) and read the other member.
+#[tokio::test]
+async fn a_damaged_replica_is_read_around() {
+    let damaged = FaultPlan { corrupt: 0.3, ..FaultPlan::mild() };
+    let members = vec![member("a", damaged), member("b", FaultPlan::none())];
+    run(members.clone()).await;
+    let served = members[0].faults().iter().filter(|(_, f)| matches!(f, Fault::Corrupt)).count();
+    assert!(served > 0, "no damaged copy was ever read");
 }

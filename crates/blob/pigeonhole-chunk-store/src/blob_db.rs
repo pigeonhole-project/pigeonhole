@@ -54,6 +54,9 @@ pub struct StoredBlock {
     pub logical_len: i64,
     pub stored_len: i64,
     pub codec: String,
+    /// crc32 of the stored bytes: a damaged replica is detected and read
+    /// around.
+    pub crc32: u32,
 }
 
 /// What [`BlobDb::stats`] counts.
