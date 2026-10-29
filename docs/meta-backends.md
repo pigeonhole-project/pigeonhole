@@ -250,6 +250,16 @@ Costs: an append is one send (~20 a minute per channel); `confirm` posts an
 empty batch; `discover` posts a probe (kept). Recovery follows `prev` down
 to the base, a page read per 100 ids. The bot needs post and delete rights.
 
+### `discord` — a channel, fenced by threads
+
+The generic `ChainLogStore` over `impl Chain for DiscordBlobStore`
+([discord-log.md](discord-log.md)): a message can start one thread, ever, so a
+put after `p` wins iff its thread on `p` was created first. No use of id order
+or time. The first member links from an anchor message; links of deleted
+members are cleaned up but the one into the first survivor. About ten appends
+a minute (thread creation: 50 per 300 s). Snapshots: `BlobSnapshotStore` in
+another channel.
+
 ### `s3` — conditional writes (later)
 
 Entries as objects `log/<position>` written with `If-None-Match: *`; a claim is

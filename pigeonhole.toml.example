@@ -10,8 +10,8 @@ region = "us-east-1"
 
 # Stores: where bytes live. kind = local_disk (path) | memory | telegram
 # (chat_id) | discord (channel_id). Every kind holds blobs; the log and
-# snapshots go to local_disk, memory (tests: no fsync, gone with the process)
-# or telegram. Secrets come from env vars named in the store (defaults:
+# snapshots go to local_disk, memory (tests: no fsync, gone with the process),
+# telegram or discord (each its own channel). Secrets come from env vars named in the store (defaults:
 # BOT_TOKEN, TG_API_ID, TG_API_HASH / DISCORD_BOT_TOKEN), never inline. A store
 # serves one purpose (the blob sweeper deletes our blobs it does not know; the
 # log's fence reads its channel's message order); only a local_disk or memory
@@ -38,7 +38,7 @@ chat_id = -1001234567890
 # id = "dc-backup"
 # kind = "discord"
 # channel_id = 123456789012345678
-# max_blob_size = 10485760   # optional, default ~10 MiB
+# max_blob_size = 20971520   # optional, default 20 MiB (more on boosted servers)
 
 # Local runs / tests without any chat:
 # [[store]]
@@ -66,8 +66,9 @@ chat_id = -1001234567890
 log = "meta"                  # default: a local_disk at pigeonhole-meta
 snapshot = "meta"             # default: the log's store if it is local_disk / memory
 # A telegram log (a dedicated channel, fenced by the order of its
-# messages) needs telegram snapshots in another channel; a memory log
-# needs memory snapshots.
+# messages) or a discord log (a dedicated text channel, fenced by threads)
+# needs its snapshots in another channel; a memory log needs memory
+# snapshots.
 # A local_disk log with snapshots in a channel or on another disk survives
 # losing the log's disk: `pigeonhole restore --lossy` starts a new log from
 # the newest snapshot.

@@ -240,12 +240,13 @@ changes what `MetaStore` hands to openraft), and `raft.rs` sees only the
 replay of 1M entries, rebase, `sweep_stress`), then delete `LocalLogStore` and
 `LocalSnapshotStore`.
 
-### Step 10 — Discord: blobs aligned, log and snapshots
+### Step 10 — Discord: blobs aligned, log and snapshots ✅ done
 
-[discord-log.md](discord-log.md) + chain-log.md step 5: `DiscordId` =
-`message_id`, `enforce_nonce` uploads, 20 MiB attachments; `impl Chain` on
-threads (archive links, delete a message before its thread, ~10 links a
-minute).
+[discord-log.md](discord-log.md) + chain-log.md step 5: `DiscordApi` with a
+fake, `DiscordId` = `message_id`, `enforce_nonce` uploads, text blobs, 20 MiB
+attachments; `impl Chain` on threads (an anchor, the tail checked through
+the predecessor's link, links cleaned up after their messages); Discord can
+hold the log and snapshots; live tests.
 
 ### Step 11 — Fault injection
 

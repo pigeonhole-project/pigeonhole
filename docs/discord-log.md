@@ -1,13 +1,11 @@
 # The metadata log and snapshots in Discord
 
-Status: **proposal**; spike done (see Spike findings). A brief for making a Discord channel a
+Status: **implemented** (see Implementation notes). A brief for making a Discord channel a
 `LogStore` and a `SnapshotStore`, and for aligning the Discord blob backend
 with the MTProto one. Read [roadmap.md](roadmap.md) § Ground rules,
 [meta-backends.md](meta-backends.md), [telegram-mtproto.md](telegram-mtproto.md)
 (the order fence this is contrasted with) and [glossary.md](glossary.md) first.
 
-Today Discord holds blobs only (`meta_store refuses discord` in the chunk-store
-config).
 
 ## What the Discord API offers
 
@@ -217,28 +215,74 @@ messages). The same holds in Discord:
 So the codec is shared with Telegram, parameterised by the character limit
 (4096 there, 2000 here): `pigeonhole_storage_api::text`.
 
+## Implementation notes (2026-10-29)
+
+Where the code (`storage/pigeonhole-storage-discord`) differs from the design
+above, and why:
+
+- **Shape as Telegram's**: the HTTP client sits behind a `DiscordApi` trait
+  (`DiscordChannel` over HTTP, `fake::FakeDiscord` in memory);
+  `DiscordBlobStore<A>` implements `BlobBackend`, `Sweepable` and `Chain`. The
+  log and snapshots are the generic `ChainLogStore` / `BlobSnapshotStore`
+  (chain-log.md); none of the protocol above is Discord code any more, only
+  "first successor wins" by a thread.
+- **Blobs**: `DiscordId` = message id; a blob that fits 2000 code points is a
+  text message (the shared codec, ~3.6 KiB), else an attachment (20 MiB per
+  file); the URL is cached and refreshed by fetching the message. Uploads
+  carry `enforce_nonce`: from the channel and the blob name for blobs (a
+  retried put posts once), random per call for chain members (two writers
+  with one name must get two messages).
+- **Names travel in the content.** Discord rewrites attachment file names
+  (it drops `~`, live): an attachment message carries its blob name as its
+  content. A chain member is named `<label>~<prev>.bin` as on Telegram.
+- **No `init-log`: an anchor.** The first blob of a chain links from an
+  anchor message the store posts on an empty channel; if two stores post one
+  at once, the oldest serves both and the other is deleted. The anchor and
+  its link are never pruned.
+- **The tail is the newest member that won its link**, checked through its
+  `prev`'s thread (`GET /channels/{prev}`: a thread outlives its message), not
+  by following links from the start: removing an old snapshot or pruning
+  leaves the start unreachable.
+- **Links of deleted members**: a thread is deleted only after its message
+  (on an existing message one could be started again). When a member goes,
+  its incoming link goes once its `prev` is gone too, its outgoing link once
+  its successor is gone: of a deleted stretch only the link into the first
+  survivor stays. Links are archived right after they are made.
+- **Retries are bounded**: a snapshot put or a claim that keeps losing its
+  link gives up (16 / 64 times) instead of posting copies forever.
+- **The permission check** reads the channel and its history: Discord has no
+  endpoint for a bot's own permissions in a channel (`permissions/@me` answers
+  405). Send, attach, delete and thread rights show at first use.
+- Exhausted 429 retries return `RateLimited`.
+
+Live (`tests/live.rs`, the test guild): 15 MiB attachment put 7.6 s, read by
+a fresh store 1.6 s; claim on an empty channel 2.2 s; 5 appends 32 s (~6.5 s
+each: a message, a thread and its archiving under the default limiter);
+racing claims leave one writer; snapshots put / remove / newest.
+
 ## Steps
 
 Each step ends with `cargo test --workspace` and
 `./scripts/check-deps.sh --strict` green; one logical change per commit.
 
 1. ~~**Spike**~~ Done; results in Spike findings above.
-2. **Blob backend**: `DiscordId` = `message_id`, nonce uploads, 20 MiB default
-   (exactly 20 971 520 accepted), URL refresh batching. Existing wiremock conformance tests follow.
-3. **`impl Chain for DiscordBlobStore`** ([chain-log.md](chain-log.md) step 5):
+2. ✅ **Blob backend**: `DiscordId` = `message_id`, nonce uploads, 20 MiB default
+   (exactly 20 971 520 accepted), text blobs; tests on the fake replace the wiremock suites.
+3. ✅ **`impl Chain for DiscordBlobStore`** ([chain-log.md](chain-log.md) step 5):
    `put_after` = message + thread, `successor` = the `thread` field, `tail` =
    the newest page with threads, `chain_from` = listing pages; the log is the
    generic `ChainLogStore`. Tests on a fake Discord client with racing links:
    append, fenced append, racing claims, a late straggler, an unlinked batch,
    rebase and collection (message before thread), genesis.
-4. **Snapshots**: the generic `BlobSnapshotStore`; split snapshots.
-5. **Wiring**: allow discord for `[meta] log` / `snapshot`, `init-log`
-   subcommand, permission checks at startup, config example.
-6. **Live run**: extend `scripts/compat-discord.sh`; meta-backends.md,
-   glossary. Repeated `sweep_stress` and the S3 compat suites at the end.
+4. ✅ **Snapshots**: the generic `BlobSnapshotStore` (a snapshot over 20 MiB is
+   refused; splitting is left for later).
+5. ✅ **Wiring**: discord for `[meta] log` / `snapshot` (an anchor instead of
+   `init-log`), permission checks at startup, config example.
+6. ✅ **Live run**: `tests/live.rs` (blobs, the chain log, snapshots);
+   meta-backends.md, README. Repeated `sweep_stress` at the end.
 
 ## Open questions
 
-- Genesis by an explicit `init-log`, or the oldest message after a pause?
+- Snapshots over 20 MiB: split over several attachments or messages.
 - Is the thread-creation bucket per bot or per guild? If per guild, one guild
   per log keeps its ~10 appends a minute to itself.

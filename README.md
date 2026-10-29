@@ -51,7 +51,7 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 | `blob/pigeonhole-blob` | `BlobBackend`, `Replicated`, rate limits, `BootstrapPointer`, cache knobs |
 | `blob/pigeonhole-chunk-store` | `ChunkStore`, the `chunk` namespace, ingest, sweeper, repair, config (no protocol crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram storage over MTProto (grammers), logged in as a bot |
-| `storage/pigeonhole-storage-discord` | Discord Bot API storage |
+| `storage/pigeonhole-storage-discord` | Discord storage: blobs, and a chain over threads for the log and snapshots |
 | `storage/pigeonhole-storage-memory` | In-memory blob storage for tests / `kind = "memory"` stores |
 | `storage/pigeonhole-storage-disk` | Blobs as files in a directory (`kind = "local_disk"`) |
 | `gateway/pigeonhole-gateway-s3` | S3 (`s3s`) gateway |
@@ -134,17 +134,23 @@ Discord is enabled by default (`--features discord`):
 id = "dc"
 kind = "discord"
 channel_id = 123456789012345678
-# optional: max_blob_size = 10485760
+# optional: max_blob_size = 20971520
 
 [chunk]
 store = "dc"
 ```
 
-Secret: `DISCORD_BOT_TOKEN` in `.env` (or the env var named by `bot_token_env`). The bot needs permission to view the
-channel, send messages, attach files, read history, and pin messages.
-Attachment CDN URLs are cached (~50 min) and refreshed on 403/404. Default
-`max_blob_size` is ~10 MiB (Discord limit minus margin) — set `[chunk].size`
-accordingly.
+Secret: `DISCORD_BOT_TOKEN` in `.env` (or the env var named by `bot_token_env`).
+The bot needs to view the (text) channel, send messages, attach files, read
+history and manage messages (delete); a channel holding the log or snapshots
+also needs create public threads and manage threads. Blobs up to ~3.6 KiB go
+as text messages (read with the listing), larger ones as attachments (20 MiB
+per file by default; more on boosted servers via `max_blob_size`); CDN URLs
+are cached and refreshed by fetching the message.
+
+A Discord channel can also hold the metadata log or snapshots (each its own
+channel): the log is fenced by threads — a message can start one thread,
+ever (docs/discord-log.md). About ten log appends a minute.
 
 ## Stores and replication
 
@@ -216,7 +222,7 @@ comments. Sections:
 
 | TOML | Meaning |
 |---|---|
-| `[[store]]` | Where bytes live: id, kind (`local_disk` + `path` / `memory` / `telegram` + `chat_id` / `discord` + `channel_id`), secret env names (`bot_token_env`; telegram also `api_id_env`, `api_hash_env`), telegram `session`, discord `max_blob_size`. Every kind holds blobs; the log and snapshots go to `local_disk`, `memory` or `telegram` |
+| `[[store]]` | Where bytes live: id, kind (`local_disk` + `path` / `memory` / `telegram` + `chat_id` / `discord` + `channel_id`), secret env names (`bot_token_env`; telegram also `api_id_env`, `api_hash_env`), telegram `session`, discord `max_blob_size`. Every kind holds blobs; the log and snapshots go to `local_disk`, `memory`, `telegram` or `discord` |
 | `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
 | `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
