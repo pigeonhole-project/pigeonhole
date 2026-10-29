@@ -467,52 +467,11 @@ impl MetaStore {
         opts: MetaOptions,
     ) -> Result<Arc<Self>> {
         let t0 = std::time::Instant::now();
-        let mut states = States::new();
-        for (name, state) in namespaces.states {
-            if states.insert(name, state).is_some() {
-                bail!("namespace {name:?} given twice");
-            }
-        }
-        let states = Arc::new(states);
-
-        let known = log.discover().await.context("discover log")?;
-        if known.is_none() {
-            // A lost log would otherwise boot empty, and the sweeper would
-            // take every blob for an orphan.
-            if let Some(s) = snapshots.newest().await.context("look for stored snapshots")? {
-                bail!(
-                    "the log was never claimed but the snapshot store holds log {} at {}: \
-                     run `pigeonhole restore --lossy`, or use an empty snapshot store",
-                    s.log_id,
-                    s.at
-                );
-            }
-        }
-        let (gen, head) = claim_next(log.as_ref(), known.map_or(0, |d| d.gen)).await?;
-        let d = log.discover().await.context("discover log")?.context("a claimed log is discovered")?;
-        tracing::info!(
-            generation = gen,
-            log = %head.log_id,
-            head = d.head.position,
-            base = d.base.as_ref().map_or(0, |b| b.at),
-            "claimed the metadata log"
-        );
+        let states = Arc::new(collect_states(namespaces)?);
+        let (gen, head, d) = claim_log(log.as_ref(), snapshots.as_ref()).await?;
 
         let (stop_tx, stop) = watch::channel(None);
-        // Whatever stops the tablet (a newer generation, a failed append, a
-        // failed commit), say so once, with the reason.
-        let mut watch_stop = stop.clone();
-        tokio::spawn(async move {
-            if let Ok(stop) = watch_stop.wait_for(Option::is_some).await {
-                let stop = stop.clone().expect("waited for a stop");
-                match stop {
-                    Stop::Fenced { current } => {
-                        tracing::warn!(generation = gen, current, "tablet stopped: a newer generation claimed the log")
-                    }
-                    Stop::Failed(why) => tracing::error!(generation = gen, reason = %why, "tablet stopped"),
-                }
-            }
-        });
+        report_stop(stop.clone(), gen);
         let shared = Arc::new(raft::Shared {
             stop: stop_tx,
             applied: AtomicU64::new(0),
@@ -529,45 +488,13 @@ impl MetaStore {
             shared: shared.clone(),
         };
         if let Some(base) = &d.base {
-            let stored = snapshots
-                .get(&base.snapshot)
-                .await
-                .with_context(|| format!("load snapshot {:?} the log starts from", base.snapshot.0))?;
-            if stored.log_id != head.log_id {
-                bail!("snapshot {:?} is of log {}, not of log {}", base.snapshot.0, stored.log_id, head.log_id);
-            }
-            telemetry::record_loaded_snapshot(stored.data.len());
-            let snap = raft::RaftSnapshot::decode(&stored.data)?;
-            if snap.meta.last_log_id.as_ref().map_or(0, raft::position) < base.at {
-                bail!("snapshot {:?} is behind the log's base {}", base.snapshot.0, base.at);
-            }
-            restore_states(&states, &snap.tablet)?;
-            sm.last_applied = snap.meta.last_log_id;
-            sm.membership = snap.meta.last_membership.clone();
-            shared.applied.store(snap.tablet.position, Ordering::SeqCst);
-            *shared.current.lock().unwrap() =
-                Some(raft::CurrentSnapshot { meta: snap.meta, data: stored.data, snapshot: base.snapshot.clone() });
+            load_base(&mut sm, snapshots.as_ref(), base, head.log_id).await?;
         }
         let fresh = d.head.position == 0 && d.base.is_none() && d.vote.is_none();
 
         let adapter =
             raft::LogAdapter::new(log.clone(), gen, head.log_id, d.head.position, shared.clone(), snapshots.clone());
-        let config = openraft::Config {
-            cluster_name: "pigeonhole".into(),
-            heartbeat_interval: 50,
-            election_timeout_min: 100,
-            election_timeout_max: 150,
-            snapshot_policy: match opts.snapshot_every {
-                0 => openraft::SnapshotPolicy::Never,
-                n => openraft::SnapshotPolicy::LogsSinceLast(n),
-            },
-            max_in_snapshot_log_to_keep: 0,
-            purge_batch_size: 1,
-            ..Default::default()
-        }
-        .validate()
-        .context("raft config")?;
-        let raft = raft::Raft::new(raft::SOLO, Arc::new(config), raft::NoNetwork, adapter, sm)
+        let raft = raft::Raft::new(raft::SOLO, Arc::new(raft_config(&opts)?), raft::NoNetwork, adapter, sm)
             .await
             .context("start raft")?;
         if fresh {
@@ -595,35 +522,8 @@ impl MetaStore {
             .map_err(|e| store.stopped_by(e))
             .context("boot the tablet")?;
         store.confirm_active().await.context("boot the tablet")?;
-        let ticker = (!opts.snapshot_interval.is_zero()).then(|| {
-            let (raft, shared, every) = (raft.clone(), shared.clone(), opts.snapshot_interval);
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(every);
-                tick.tick().await;
-                // The metrics show a snapshot only once it is built: while one
-                // asked for is being built, asking again builds a copy. Ask
-                // again only once the metrics moved (or after a while).
-                let mut pending: Option<(Position, u32)> = None;
-                loop {
-                    tick.tick().await;
-                    let snapshotted = raft.metrics().borrow().snapshot.as_ref().map_or(0, raft::position);
-                    if let Some((at, ticks)) = pending {
-                        if snapshotted == at && ticks < 20 {
-                            pending = Some((at, ticks + 1));
-                            continue;
-                        }
-                        pending = None;
-                    }
-                    if shared.applied.load(Ordering::SeqCst) > snapshotted {
-                        pending = Some((snapshotted, 0));
-                        if raft.trigger().snapshot().await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            })
-        });
-        *store.ticker.lock().unwrap() = ticker;
+        *store.ticker.lock().unwrap() =
+            (!opts.snapshot_interval.is_zero()).then(|| spawn_snapshot_ticker(raft, shared, opts.snapshot_interval));
         telemetry::record_boot(store.applied_position().saturating_sub(store.base_position()), t0.elapsed());
         tracing::info!(
             generation = gen,
@@ -803,6 +703,130 @@ async fn claim_next(log: &dyn LogStore, known: u64) -> Result<(u64, Head)> {
         }
     }
     bail!("could not claim a generation (last tried {gen})")
+}
+
+fn collect_states(namespaces: Namespaces) -> Result<States> {
+    let mut states = States::new();
+    for (name, state) in namespaces.states {
+        if states.insert(name, state).is_some() {
+            bail!("namespace {name:?} given twice");
+        }
+    }
+    Ok(states)
+}
+
+/// Claim the log's next generation: the generation, the head it claimed at
+/// and the log as discovered after the claim.
+async fn claim_log(log: &dyn LogStore, snapshots: &dyn SnapshotStore) -> Result<(u64, Head, Discovered)> {
+    let known = log.discover().await.context("discover log")?;
+    if known.is_none() {
+        // A lost log would otherwise boot empty, and the sweeper would
+        // take every blob for an orphan.
+        if let Some(s) = snapshots.newest().await.context("look for stored snapshots")? {
+            bail!(
+                "the log was never claimed but the snapshot store holds log {} at {}: \
+                 run `pigeonhole restore --lossy`, or use an empty snapshot store",
+                s.log_id,
+                s.at
+            );
+        }
+    }
+    let (gen, head) = claim_next(log, known.map_or(0, |d| d.gen)).await?;
+    let d = log.discover().await.context("discover log")?.context("a claimed log is discovered")?;
+    tracing::info!(
+        generation = gen,
+        log = %head.log_id,
+        head = d.head.position,
+        base = d.base.as_ref().map_or(0, |b| b.at),
+        "claimed the metadata log"
+    );
+    Ok((gen, head, d))
+}
+
+/// Whatever stops the tablet (a newer generation, a failed append, a failed
+/// commit), say so once, with the reason.
+fn report_stop(mut stop: watch::Receiver<Option<Stop>>, gen: u64) {
+    tokio::spawn(async move {
+        if let Ok(stop) = stop.wait_for(Option::is_some).await {
+            match stop.clone().expect("waited for a stop") {
+                Stop::Fenced { current } => {
+                    tracing::warn!(generation = gen, current, "tablet stopped: a newer generation claimed the log")
+                }
+                Stop::Failed(why) => tracing::error!(generation = gen, reason = %why, "tablet stopped"),
+            }
+        }
+    });
+}
+
+/// Restore the states from the snapshot the log starts from.
+async fn load_base(sm: &mut raft::StateMachine, snapshots: &dyn SnapshotStore, base: &Base, log_id: LogId) -> Result<()> {
+    let stored = snapshots
+        .get(&base.snapshot)
+        .await
+        .with_context(|| format!("load snapshot {:?} the log starts from", base.snapshot.0))?;
+    if stored.log_id != log_id {
+        bail!("snapshot {:?} is of log {}, not of log {}", base.snapshot.0, stored.log_id, log_id);
+    }
+    telemetry::record_loaded_snapshot(stored.data.len());
+    let snap = raft::RaftSnapshot::decode(&stored.data)?;
+    if snap.meta.last_log_id.as_ref().map_or(0, raft::position) < base.at {
+        bail!("snapshot {:?} is behind the log's base {}", base.snapshot.0, base.at);
+    }
+    restore_states(&sm.states, &snap.tablet)?;
+    sm.last_applied = snap.meta.last_log_id;
+    sm.membership = snap.meta.last_membership.clone();
+    sm.shared.applied.store(snap.tablet.position, Ordering::SeqCst);
+    *sm.shared.current.lock().unwrap() =
+        Some(raft::CurrentSnapshot { meta: snap.meta, data: stored.data, snapshot: base.snapshot.clone() });
+    Ok(())
+}
+
+fn raft_config(opts: &MetaOptions) -> Result<openraft::Config> {
+    openraft::Config {
+        cluster_name: "pigeonhole".into(),
+        heartbeat_interval: 50,
+        election_timeout_min: 100,
+        election_timeout_max: 150,
+        snapshot_policy: match opts.snapshot_every {
+            0 => openraft::SnapshotPolicy::Never,
+            n => openraft::SnapshotPolicy::LogsSinceLast(n),
+        },
+        max_in_snapshot_log_to_keep: 0,
+        purge_batch_size: 1,
+        ..Default::default()
+    }
+    .validate()
+    .context("raft config")
+}
+
+/// Ask for a snapshot every `every` while something was applied since the
+/// last one.
+fn spawn_snapshot_ticker(raft: raft::Raft, shared: Arc<raft::Shared>, every: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.tick().await;
+        // The metrics show a snapshot only once it is built: while one
+        // asked for is being built, asking again builds a copy. Ask
+        // again only once the metrics moved (or after a while).
+        let mut pending: Option<(Position, u32)> = None;
+        loop {
+            tick.tick().await;
+            let snapshotted = raft.metrics().borrow().snapshot.as_ref().map_or(0, raft::position);
+            if let Some((at, ticks)) = pending {
+                if snapshotted == at && ticks < 20 {
+                    pending = Some((at, ticks + 1));
+                    continue;
+                }
+                pending = None;
+            }
+            if shared.applied.load(Ordering::SeqCst) > snapshotted {
+                pending = Some((snapshotted, 0));
+                if raft.trigger().snapshot().await.is_err() {
+                    return;
+                }
+            }
+        }
+    })
 }
 
 /// Start a new log from the newest stored snapshot (after the log is lost):
