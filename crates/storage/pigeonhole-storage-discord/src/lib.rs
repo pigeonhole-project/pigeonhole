@@ -10,6 +10,7 @@ mod api;
 mod chain;
 mod client;
 pub mod fake;
+mod pacer;
 mod store;
 
 pub use api::{CdnStale, DcAttachment, DcMessage, DiscordApi, ThreadStart, PAGE};

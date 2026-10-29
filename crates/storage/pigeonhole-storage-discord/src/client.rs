@@ -116,6 +116,9 @@ pub struct DiscordClient {
 struct Answer {
     status: u16,
     body: serde_json::Value,
+    /// `X-RateLimit-Remaining` / `-Reset-After` of the route.
+    remaining: Option<u64>,
+    reset_after: Option<f64>,
 }
 
 impl DiscordClient {
@@ -198,7 +201,10 @@ impl DiscordClient {
                 last = Some(RateLimited { method: what, retry_after: wait }.into());
                 continue;
             }
-            return Ok(Answer { status, body });
+            let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
+            let remaining = header("x-ratelimit-remaining").and_then(|s| s.parse().ok());
+            let reset_after = header("x-ratelimit-reset-after").and_then(|s| s.parse().ok());
+            return Ok(Answer { status, body, remaining, reset_after });
         }
         Err(last.unwrap_or_else(|| anyhow!("{what}: failed")))
     }
@@ -415,9 +421,13 @@ impl DiscordApi for DiscordChannel {
         let path = self.path(&format!("messages/{message_id}/threads"));
         let body = serde_json::json!({ "name": name, "auto_archive_duration": 60 });
         let c = &self.client;
+        // Thread creation has a budget of its own, shared by the bot's channels.
+        let pacer = crate::pacer::threads_of(&c.app_id());
+        pacer.wait().await;
         let a = c
             .request(&self.limiter, RateBudget::Send, "start thread", || c.http.post(c.url(&path)).json(&body))
             .await?;
+        pacer.observe(a.remaining, a.reset_after);
         match (a.status, code(&a.body)) {
             (200..=299, _) => Ok(ThreadStart::Created),
             (_, Some(160004)) => Ok(ThreadStart::Taken),

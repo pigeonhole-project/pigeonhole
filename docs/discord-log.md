@@ -254,6 +254,15 @@ above, and why:
   endpoint for a bot's own permissions in a channel (`permissions/@me` answers
   405). Send, attach, delete and thread rights show at first use.
 - Exhausted 429 retries return `RateLimited`.
+- **Thread creation is paced** per bot (all its channels share Discord's
+  window of 50 per 300 s): a burst of 5, then one every ~6.7 s (GCRA, ≤ 50
+  in any 300 s), and when an answer reports the window used up the next one
+  waits for its reset. Going over had answered 429 with a 192 s wait and
+  frozen the log (metrics demo, 2026-10-29). So the log takes at most ~9
+  entries a minute sustained; under load the batcher puts more proposals in
+  each.
+- **Links are archived in the background**: an append is a message and a
+  thread (2 requests).
 
 Live (`tests/live.rs`, the test guild): 15 MiB attachment put 7.6 s, read by
 a fresh store 1.6 s; claim on an empty channel 2.2 s; 5 appends 32 s (~6.5 s
