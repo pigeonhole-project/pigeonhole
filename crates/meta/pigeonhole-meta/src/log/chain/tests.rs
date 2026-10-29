@@ -209,3 +209,22 @@ mod disk {
         run("disk chain", &|d| Arc::new(ChainLogStore::new(Arc::new(DiskBlobStore::open(d).unwrap())))).await;
     }
 }
+
+/// `confirm` racing our own append: the append is linked but not yet our
+/// tip. That successor is ours, not a fence; a newer claim after it is.
+#[tokio::test]
+async fn confirm_looks_past_our_own_append_in_flight() {
+    let mem = Arc::new(MemoryBlobStore::new());
+    let a = store(&mem);
+    a.claim(1).await.unwrap();
+    a.append(1, &[entry(1)]).await.unwrap();
+    // What an append in flight leaves: a batch of generation 1 after the tip.
+    let tip = mem.tail().await.unwrap().unwrap();
+    let After::Won(ours) = mem.put_after(Some(&tip.id), "log-batch-1", Bytes::from_static(b"in flight")).await.unwrap() else {
+        panic!("the tip has no successor yet")
+    };
+    a.confirm(1).await.unwrap();
+    // A newer claim after it fences.
+    mem.put_after(Some(&ours), "log-claim-2", Bytes::from_static(b"claim")).await.unwrap();
+    assert!(matches!(a.confirm(1).await, Err(LogError::Fenced { current: 2 })));
+}

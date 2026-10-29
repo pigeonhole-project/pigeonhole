@@ -338,14 +338,20 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         let Some(at) = tip.at else {
             return Err(LogError::Other(anyhow!("generation {gen} holds no blob of the chain")));
         };
-        match self.chain.successor(&at.id).await? {
-            None => Ok(()),
-            Some(next) => {
-                let e = Self::fenced_by(&next.label, gen);
-                if let LogError::Fenced { current } = e {
-                    self.fail(Failed::Fenced(current));
+        // A successor of our own generation is our own append, linked but
+        // not yet in `tip` (only this handle writes `gen`): look past it.
+        let mut at = at.id;
+        loop {
+            match self.chain.successor(&at).await? {
+                None => return Ok(()),
+                Some(next) if label_gen(&next.label) == Some(gen) => at = next.id,
+                Some(next) => {
+                    let e = Self::fenced_by(&next.label, gen);
+                    if let LogError::Fenced { current } = e {
+                        self.fail(Failed::Fenced(current));
+                    }
+                    return Err(e);
                 }
-                Err(e)
             }
         }
     }
