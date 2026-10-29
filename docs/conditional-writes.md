@@ -92,12 +92,16 @@ multi-node mode) against a local pigeonhole, etcdctl v3.7.3 as the client.
   channel. Election in ~1 s; an etcd put is 0.4–0.6 s (each one is a
   conditional PUT: a lone leader flushes every batch to the bucket);
   takeover after `kill -9` in ~10 s.
-- **Limit found.** T4's lock is valid for 6 s and renewed by `If-Match`. Our
-  write latency has tails of several seconds (a Discord lease renewal waits
-  for the thread pacer), so one renewal timed out right after the takeover
-  and puts then took 0.4–5 s, once 11 s. It held, but T4's lock timings are
-  tighter than a chat-backed store's tail; either T4 gets longer lock
-  timings or our lease renews earlier.
+- **Limit found.** T4's lock is valid for 6 s, renewed by `If-Match` with 5 s
+  per attempt (both constants in T4). Right after a takeover T4 uploads a
+  checkpoint; with objects in a Telegram channel (~20 posts a minute, the
+  lock itself is a post too) the renewal queues behind it and times out
+  while its PUT is still on the way. The PUT then lands, the lock's ETag
+  moves, the next renewal carries the old one and gets 412, and T4 steps
+  down ("lock taken"): safe, but etcd has no leader for a while. With the
+  objects in Discord it does not happen (demos/etcd-on-telegram). On our
+  side: a lock-sized object should not wait behind bulk uploads (a priority
+  lane, or small objects through a faster store).
 - **Control.** The same run against main before this change: the gateway
   answered 200 to every conditional put (`If-None-Match: *` twice, a stale
   `If-Match`), so two leaders could both "win". T4 v1.1.16 started anyway:
