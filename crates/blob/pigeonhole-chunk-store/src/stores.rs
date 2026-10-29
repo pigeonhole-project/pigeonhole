@@ -14,29 +14,81 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-/// One `[[store]]`; the fields a kind does not take must be absent.
+/// One `[[store]]`, by `kind`; a field the kind does not take is an error.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FileStore {
-    id: String,
-    kind: String,
-    /// `dir`.
-    path: Option<PathBuf>,
-    /// `telegram`.
-    chat_id: Option<i64>,
-    /// `discord`.
-    channel_id: Option<u64>,
-    /// `telegram` / `discord`.
-    bot_token_env: Option<String>,
-    /// `discord`.
-    max_blob_size: Option<usize>,
-    /// `telegram`: env var with the app's api id (my.telegram.org).
-    api_id_env: Option<String>,
-    /// `telegram`: env var with the app's api hash.
-    api_hash_env: Option<String>,
-    /// `telegram`: the MTProto session file; default
-    /// `pigeonhole-tg-<bot id>.session`. One per bot, shared by its stores.
-    session: Option<PathBuf>,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum FileStore {
+    LocalDisk {
+        id: String,
+        path: PathBuf,
+    },
+    Memory {
+        id: String,
+    },
+    Telegram {
+        id: String,
+        chat_id: i64,
+        bot_token_env: Option<String>,
+        /// Env var with the app's api id (my.telegram.org).
+        api_id_env: Option<String>,
+        /// Env var with the app's api hash.
+        api_hash_env: Option<String>,
+        /// The MTProto session file; default `pigeonhole-tg-<bot id>.session`.
+        /// One per bot, shared by its stores.
+        session: Option<PathBuf>,
+    },
+    Discord {
+        id: String,
+        channel_id: u64,
+        bot_token_env: Option<String>,
+        max_blob_size: Option<usize>,
+    },
+}
+
+impl FileStore {
+    fn id(&self) -> &str {
+        match self {
+            FileStore::LocalDisk { id, .. }
+            | FileStore::Memory { id }
+            | FileStore::Telegram { id, .. }
+            | FileStore::Discord { id, .. } => id.trim(),
+        }
+    }
+
+    /// The store, with its secrets read from the environment.
+    fn resolve(self) -> Result<Store> {
+        let id = self.id().to_string();
+        Ok(match self {
+            FileStore::LocalDisk { path, .. } => Store::LocalDisk { path },
+            FileStore::Memory { .. } => Store::Memory,
+            FileStore::Telegram { chat_id, bot_token_env, api_id_env, api_hash_env, session, .. } => {
+                let bot_token_env = bot_token_env.unwrap_or_else(|| "BOT_TOKEN".into());
+                let bot_token = token(&id, &bot_token_env)?;
+                let api_id_env = api_id_env.unwrap_or_else(|| "TG_API_ID".into());
+                let api_id = token(&id, &api_id_env)?
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("[[store]] {id}: env {api_id_env} is not a number"))?;
+                let api_hash = token(&id, api_hash_env.as_deref().unwrap_or("TG_API_HASH"))?;
+                let bot_id = bot_token.split(':').next().unwrap_or_default();
+                let session = session.unwrap_or_else(|| format!("pigeonhole-tg-{bot_id}.session").into());
+                Store::Telegram {
+                    chat_id: chat_id.to_string(),
+                    bot_token_env,
+                    login: TelegramLogin { bot_token, api_id, api_hash, session },
+                }
+            }
+            FileStore::Discord { channel_id, bot_token_env, max_blob_size, .. } => {
+                let bot_token_env = bot_token_env.unwrap_or_else(|| "DISCORD_BOT_TOKEN".into());
+                Store::Discord {
+                    channel_id: channel_id.to_string(),
+                    bot_token: token(&id, &bot_token_env)?,
+                    bot_token_env,
+                    max_blob_size,
+                }
+            }
+        })
+    }
 }
 
 /// One `[[replicas]]`: every write goes to all members, `write_quorum` of
@@ -102,96 +154,51 @@ pub(crate) struct Topology {
     used_groups: HashSet<String>,
 }
 
+/// Store, replica group and shard ids share one namespace.
+fn unique(ids: &mut HashSet<String>, id: &str) -> Result<()> {
+    if !ids.insert(id.to_string()) {
+        bail!("duplicate id {id:?}");
+    }
+    Ok(())
+}
+
+fn check_members(section: &str, id: &str, members: &[String]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for m in members {
+        if !seen.insert(m) {
+            bail!("{section} {id}: member {m:?} listed twice");
+        }
+    }
+    Ok(())
+}
+
 fn token(store: &str, env_name: &str) -> Result<String> {
     std::env::var(env_name).with_context(|| format!("[[store]] {store}: env {env_name} is not set"))
 }
 
 impl Topology {
     pub(crate) fn new(stores: Vec<FileStore>, replicas: Vec<FileReplicas>, shards: Vec<FileShards>) -> Result<Self> {
+        let mut ids = HashSet::new();
         let mut by_id = HashMap::new();
         let mut locations: HashMap<String, String> = HashMap::new();
         for f in stores {
-            let id = f.id.trim().to_string();
+            let id = f.id().to_string();
             if id.is_empty() {
                 bail!("[[store]] id must be non-empty");
             }
-            let refuse = |field: &str, present: bool| -> Result<()> {
-                if present {
-                    bail!("[[store]] {id}: kind = {:?} does not take {field}", f.kind);
-                }
-                Ok(())
-            };
-            if f.kind != "telegram" {
-                refuse("api_id_env", f.api_id_env.is_some())?;
-                refuse("api_hash_env", f.api_hash_env.is_some())?;
-                refuse("session", f.session.is_some())?;
-            }
-            let store = match f.kind.as_str() {
-                "local_disk" => {
-                    refuse("chat_id", f.chat_id.is_some())?;
-                    refuse("channel_id", f.channel_id.is_some())?;
-                    refuse("bot_token_env", f.bot_token_env.is_some())?;
-                    refuse("max_blob_size", f.max_blob_size.is_some())?;
-                    Store::LocalDisk { path: f.path.with_context(|| format!("[[store]] {id}: local_disk needs path"))? }
-                }
-                "telegram" => {
-                    refuse("path", f.path.is_some())?;
-                    refuse("channel_id", f.channel_id.is_some())?;
-                    refuse("max_blob_size", f.max_blob_size.is_some())?;
-                    let chat = f.chat_id.with_context(|| format!("[[store]] {id}: telegram needs chat_id"))?;
-                    let env_name = f.bot_token_env.clone().unwrap_or_else(|| "BOT_TOKEN".into());
-                    let bot_token = token(&id, &env_name)?;
-                    let api_id_env = f.api_id_env.clone().unwrap_or_else(|| "TG_API_ID".into());
-                    let api_id = token(&id, &api_id_env)?
-                        .trim()
-                        .parse()
-                        .with_context(|| format!("[[store]] {id}: env {api_id_env} is not a number"))?;
-                    let api_hash = token(&id, f.api_hash_env.as_deref().unwrap_or("TG_API_HASH"))?;
-                    let bot_id = bot_token.split(':').next().unwrap_or_default();
-                    let session = f.session.clone().unwrap_or_else(|| format!("pigeonhole-tg-{bot_id}.session").into());
-                    Store::Telegram {
-                        chat_id: chat.to_string(),
-                        bot_token_env: env_name,
-                        login: TelegramLogin { bot_token, api_id, api_hash, session },
-                    }
-                }
-                "discord" => {
-                    refuse("path", f.path.is_some())?;
-                    refuse("chat_id", f.chat_id.is_some())?;
-                    let channel = f.channel_id.with_context(|| format!("[[store]] {id}: discord needs channel_id"))?;
-                    let env_name = f.bot_token_env.unwrap_or_else(|| "DISCORD_BOT_TOKEN".into());
-                    Store::Discord {
-                        channel_id: channel.to_string(),
-                        bot_token: token(&id, &env_name)?,
-                        bot_token_env: env_name,
-                        max_blob_size: f.max_blob_size,
-                    }
-                }
-                "memory" => {
-                    refuse("path", f.path.is_some())?;
-                    refuse("chat_id", f.chat_id.is_some())?;
-                    refuse("channel_id", f.channel_id.is_some())?;
-                    refuse("bot_token_env", f.bot_token_env.is_some())?;
-                    refuse("max_blob_size", f.max_blob_size.is_some())?;
-                    Store::Memory
-                }
-                other => bail!("[[store]] {id}: unknown kind {other:?}; expected local_disk | memory | telegram | discord"),
-            };
+            let store = f.resolve()?;
             if let Some(loc) = store.location() {
                 if let Some(prev) = locations.insert(loc.clone(), id.clone()) {
                     bail!("[[store]] {prev:?} and {id:?} are the same place ({loc})");
                 }
             }
-            if by_id.insert(id.clone(), store).is_some() {
-                bail!("duplicate id {id:?}");
-            }
+            unique(&mut ids, &id)?;
+            by_id.insert(id, store);
         }
         let mut groups = HashMap::new();
         for r in replicas {
             let id = r.id.trim().to_string();
-            if by_id.contains_key(&id) || groups.contains_key(&id) {
-                bail!("duplicate id {id:?}");
-            }
+            unique(&mut ids, &id)?;
             if r.members.is_empty() || r.write_quorum == 0 || r.write_quorum > r.members.len() {
                 bail!(
                     "[[replicas]] {id}: needs members and 1 <= write_quorum ({}) <= {}",
@@ -199,29 +206,17 @@ impl Topology {
                     r.members.len()
                 );
             }
-            let mut seen = HashSet::new();
-            for m in &r.members {
-                if !seen.insert(m) {
-                    bail!("[[replicas]] {id}: member {m:?} listed twice");
-                }
-            }
+            check_members("[[replicas]]", &id, &r.members)?;
             groups.insert(id, r);
         }
         let mut sharded = HashMap::new();
         for g in shards {
             let id = g.id.trim().to_string();
-            if by_id.contains_key(&id) || groups.contains_key(&id) || sharded.contains_key(&id) {
-                bail!("duplicate id {id:?}");
-            }
+            unique(&mut ids, &id)?;
             if g.members.is_empty() {
                 bail!("[[shards]] {id}: needs members");
             }
-            let mut seen = HashSet::new();
-            for m in &g.members {
-                if !seen.insert(m) {
-                    bail!("[[shards]] {id}: member {m:?} listed twice");
-                }
-            }
+            check_members("[[shards]]", &id, &g.members)?;
             sharded.insert(id, g);
         }
         Ok(Self {

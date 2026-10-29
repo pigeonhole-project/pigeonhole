@@ -1054,7 +1054,7 @@ upload_concurrency = 4
         let err = load_mem(&format!("[meta]\nlog = \"log\"\nsnapshot = \"log\"\n{}", tgm_store("log", -1001))).unwrap_err();
         assert!(format!("{err:#}").contains("one purpose"), "{err:#}");
         let err = load_mem("[[store]]\nid = \"x\"\nkind = \"memory\"\nsession = \"s\"\n").unwrap_err();
-        assert!(format!("{err:#}").contains("does not take session"), "{err:#}");
+        assert!(format!("{err:#}").contains("unknown field `session`"), "{err:#}");
     }
 
     #[test]
@@ -1226,5 +1226,29 @@ max_blob_size = 8388608
         let err = load_mem("[chunk]\nblock_size = 1048576\n[ingest]\nmemory_budget = 1048576\n").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("ingest.memory_budget"), "unexpected error: {msg}");
+    }
+
+    /// Each mistake in `[[store]]` / `[[replicas]]` / `[[shards]]` names itself.
+    #[test]
+    fn store_mistakes_are_named() {
+        let cases = [
+            ("[[store]]\nid = \"x\"\nkind = \"memory\"\npath = \"/tmp\"\n", "unknown field `path`"),
+            ("[[store]]\nid = \"x\"\nkind = \"local_disk\"\nchat_id = 1\n", "unknown field `chat_id`"),
+            ("[[store]]\nid = \"x\"\nkind = \"local_disk\"\n", "missing field `path`"),
+            ("[[store]]\nid = \"x\"\nkind = \"discord\"\n", "missing field `channel_id`"),
+            ("[[store]]\nid = \"x\"\nkind = \"floppy\"\n", "unknown variant `floppy`"),
+            ("[[store]]\nid = \"x\"\n", "missing field `kind`"),
+            ("[[store]]\nid = \" \"\nkind = \"memory\"\n", "id must be non-empty"),
+            ("[[store]]\nid = \"mem\"\nkind = \"memory\"\n", "duplicate id \"mem\""),
+            ("[[replicas]]\nid = \"mem\"\nmembers = [\"mem\"]\n", "duplicate id \"mem\""),
+            ("[[replicas]]\nid = \"r\"\nmembers = [\"mem\", \"mem\"]\n", "[[replicas]] r: member \"mem\" listed twice"),
+            ("[[replicas]]\nid = \"r\"\nmembers = [\"mem\"]\nwrite_quorum = 2\n", "1 <= write_quorum (2) <= 1"),
+            ("[[shards]]\nid = \"s\"\nmembers = []\n", "[[shards]] s: needs members"),
+            ("[[shards]]\nid = \"s\"\nmembers = [\"mem\", \"mem\"]\n", "[[shards]] s: member \"mem\" listed twice"),
+        ];
+        for (toml, want) in cases {
+            let err = format!("{:#}", load_mem(toml).unwrap_err());
+            assert!(err.contains(want), "{toml:?}: want {want:?} in {err}");
+        }
     }
 }
