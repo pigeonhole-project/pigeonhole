@@ -98,7 +98,7 @@ async fn a_rebase_prunes_below_the_oldest_needed_blob() {
     }
     let before = mem.message_keys().len();
     let base = Base { at: 3, term: 1, leader: 0, snapshot: crate::snapshot::SnapshotRef("s3".into()) };
-    a.rebase(1, base).await.unwrap();
+    a.rebase(1, base, 1).await.unwrap();
     a.settle().await; // the collection runs in the background
     assert!(mem.message_keys().len() < before, "{:?}", mem.message_keys());
     a.append(1, &[entry(5)]).await.unwrap();
@@ -120,7 +120,7 @@ async fn a_rebase_does_not_wait_for_its_collection() {
     }
     let gate = mem.hold_deletes();
     let base = Base { at: 3, term: 1, leader: 0, snapshot: crate::snapshot::SnapshotRef("s3".into()) };
-    tokio::time::timeout(std::time::Duration::from_secs(5), a.rebase(1, base)).await.expect("rebase waited for its prune").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), a.rebase(1, base, 1)).await.expect("rebase waited for its prune").unwrap();
     a.append(1, &[entry(5)]).await.unwrap();
     drop(gate);
     a.settle().await;
@@ -220,7 +220,7 @@ mod disk {
                 leader: 0,
                 snapshot: crate::snapshot::SnapshotRef("s".into()),
             };
-            again.rebase(2, base).await.unwrap();
+            again.rebase(2, base, 1).await.unwrap();
             let rebase = t.elapsed();
             println!(
                 "{name:>10}: append p50 {p50:?} p99 {p99:?}; 1M entries written in {fill:?}; open + claim {claim:?}; \

@@ -416,7 +416,7 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
     let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
     let stored = StoredSnapshot { log_id: head.log_id, at: head.position, data };
     let snapshot = snaps_of(&log_dir).put(&stored).await.unwrap();
-    log.rebase(2, raft::base_of(&meta, snapshot)).await.unwrap();
+    log.rebase(2, raft::base_of(&meta, snapshot), 1).await.unwrap();
     drop(log);
 
     let err = open_dir(&log_dir, counter()).await.err().expect("boot must fail");
@@ -507,6 +507,66 @@ async fn the_tablet_runs_over_a_chain_log_with_snapshots_in_another_store() {
     assert!(batches < 15, "batches behind the base are collected: {batches} left");
 }
 
+/// A snapshot store whose `get` fails for one chosen snapshot (a damaged
+/// or lost copy).
+struct Unreadable {
+    inner: Arc<dyn SnapshotStore>,
+    bad: Mutex<Option<SnapshotRef>>,
+}
+
+#[async_trait::async_trait]
+impl SnapshotStore for Unreadable {
+    async fn put(&self, s: &StoredSnapshot) -> Result<SnapshotRef> {
+        self.inner.put(s).await
+    }
+    async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
+        if self.bad.lock().unwrap().as_ref() == Some(r) {
+            bail!("snapshot {:?} fails its checksum", r.0);
+        }
+        self.inner.get(r).await
+    }
+    async fn newest(&self) -> Result<Option<StoredSnapshot>> {
+        self.inner.newest().await
+    }
+    async fn remove(&self, r: &SnapshotRef) -> Result<()> {
+        self.inner.remove(r).await
+    }
+}
+
+/// The newest snapshot cannot be read: a boot starts from the older base the
+/// log keeps and replays from there; with one base kept it cannot boot.
+#[tokio::test]
+async fn a_boot_falls_back_to_an_older_base_when_the_newest_snapshot_is_unreadable() {
+    use crate::{BlobSnapshotStore, ChainLogStore};
+    for keep in [2, 1] {
+        let (log_chat, snap_chat) = (Arc::new(MemoryBlobStore::new()), Arc::new(MemoryBlobStore::new()));
+        let snapshots =
+            Arc::new(Unreadable { inner: Arc::new(BlobSnapshotStore::new(snap_chat)), bad: Mutex::default() });
+        let opts = MetaOptions { snapshot_every: 5, keep_snapshots: keep, ..MetaOptions::default() };
+        let open = || MetaStore::open(Arc::new(ChainLogStore::new(log_chat.clone())), snapshots.clone(), counter(), opts.clone());
+        let a = open().await.unwrap();
+        for i in 0..23u64 {
+            a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+        }
+        wait_base(&a, 15).await;
+        let state = snapshot(&a);
+        let d = a.log.discover().await.unwrap().unwrap();
+        assert_eq!(d.older.len(), keep - 1, "keep {keep}: {d:?}");
+        *snapshots.bad.lock().unwrap() = d.base.map(|b| b.snapshot);
+        drop(a);
+
+        match (keep, open().await) {
+            (2, Ok(b)) => {
+                assert_eq!(snapshot(&b), state, "an older snapshot + a longer replay rebuild the state");
+                b.propose::<Counter>(op(100, 1)).await.unwrap().unwrap();
+                assert_eq!(value(&b), 24);
+            }
+            (1, Err(e)) => assert!(format!("{e:#}").contains("fails its checksum"), "{e:#}"),
+            (_, other) => panic!("keep {keep}: {:?}", other.map(|_| ())),
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_local_log_restores_from_snapshots_in_a_blob_store() {
     let dir = tempfile::tempdir().unwrap();
@@ -532,7 +592,12 @@ async fn a_local_log_restores_from_snapshots_in_a_blob_store() {
 #[tokio::test]
 async fn an_idle_tablet_snapshots_by_time() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = MetaOptions { snapshot_every: 0, snapshot_interval: Duration::from_millis(50), ..MetaOptions::default() };
+    let opts = MetaOptions {
+        snapshot_every: 0,
+        snapshot_interval: Duration::from_millis(50),
+        keep_snapshots: 1,
+        ..MetaOptions::default()
+    };
     let (log, snapshots) = local(dir.path());
     let a = MetaStore::open(log.clone(), snapshots, counter(), opts).await.unwrap();
     for i in 0..3u64 {

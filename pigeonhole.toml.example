@@ -74,6 +74,8 @@ snapshot = "meta"             # default: the log's store if it is local_disk / m
 # the newest snapshot.
 snapshot_every_entries = 10000     # snapshot all states, drop the log behind it; 0 = never
 snapshot_every_secs = 600          # and this often if anything changed; 0 = never
+keep_snapshots = 2                 # newest snapshots kept, with the log between them (a boot
+                                   # falls back to an older one if the newest is damaged)
 
 [chunk]
 store = "tg-main"             # a blob store or a [[replicas]] group

@@ -35,6 +35,7 @@ where
     append_read_and_reopen(fresh()).await;
     newer_claim_fences_older_generation(fresh()).await;
     rebase_covers_and_collects(fresh()).await;
+    older_bases_are_kept_and_readable(fresh()).await;
     reading_past_the_head_is_lost(fresh()).await;
     truncate_replaces_a_divergent_tail(fresh()).await;
     the_vote_survives_and_is_fenced(fresh()).await;
@@ -50,7 +51,7 @@ where
     let log = open().await;
     let head = log.claim(1).await.unwrap();
     log.append(1, &[entry(1), entry(2)]).await.unwrap();
-    log.rebase(1, Base { at: 10, term: 4, leader: 0, snapshot: SnapshotRef("s10".into()) }).await.unwrap();
+    log.rebase(1, Base { at: 10, term: 4, leader: 0, snapshot: SnapshotRef("s10".into()) }, 1).await.unwrap();
     assert_eq!(log.append(1, &[termed(5, 11)]).await.unwrap(), 11);
 
     let again = open().await;
@@ -99,7 +100,7 @@ where
     assert_eq!(b.claim(2).await.unwrap().position, 1, "acknowledged entries are ≤ the head");
     assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Fenced { current: 2 })));
     assert!(matches!(
-        a.rebase(1, base(1)).await,
+        a.rebase(1, base(1), 1).await,
         Err(LogError::Fenced { current: 2 })
     ));
     let head = b.append(2, &[entry(2)]).await.unwrap();
@@ -119,9 +120,9 @@ where
     for i in 1..=4 {
         log.append(1, &[entry(i)]).await.unwrap();
     }
-    log.rebase(1, base(2)).await.unwrap();
-    log.rebase(1, base(4)).await.unwrap();
-    assert!(log.rebase(1, base(3)).await.is_err(), "a base never moves back");
+    log.rebase(1, base(2), 1).await.unwrap();
+    log.rebase(1, base(4), 1).await.unwrap();
+    assert!(log.rebase(1, base(3), 1).await.is_err(), "a base never moves back");
     log.append(1, &[entry(5)]).await.unwrap();
     log.append(1, &[entry(6)]).await.unwrap();
 
@@ -136,6 +137,36 @@ where
         "entries behind the base are collected"
     );
     assert_eq!(again.claim(2).await.unwrap().position, 6);
+}
+
+/// `keep` bases: the log stays readable from the oldest; a rebase hands
+/// back the bases it no longer keeps.
+pub async fn older_bases_are_kept_and_readable<Open, Fut>(open: Open)
+where
+    Open: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn LogStore>>,
+{
+    let log = open().await;
+    log.claim(1).await.unwrap();
+    for i in 1..=6 {
+        log.append(1, &[entry(i)]).await.unwrap();
+    }
+    assert_eq!(log.rebase(1, base(2), 2).await.unwrap(), vec![]);
+    assert_eq!(log.rebase(1, base(4), 2).await.unwrap(), vec![]);
+    assert_eq!(log.rebase(1, base(5), 2).await.unwrap(), vec![base(2)], "the third newest goes");
+    assert_eq!(log.rebase(1, base(5), 2).await.unwrap(), vec![], "the same base again changes nothing");
+    log.settle().await;
+
+    let again = open().await;
+    let d = again.discover().await.unwrap().unwrap();
+    assert_eq!((d.base, d.older), (Some(base(5)), vec![base(4)]));
+    assert_eq!(read_all(again.as_ref(), 4, d.head).await.unwrap(), vec![(5, entry(5)), (6, entry(6))], "from an older base");
+    assert!(matches!(read_all(again.as_ref(), 2, d.head).await, Err(LogError::Lost(_))), "behind the kept bases");
+
+    // Keeping fewer drops the rest at once.
+    again.claim(2).await.unwrap();
+    assert_eq!(again.rebase(2, base(6), 1).await.unwrap(), vec![base(5), base(4)]);
+    assert_eq!(again.discover().await.unwrap().unwrap().older, vec![]);
 }
 
 pub async fn reading_past_the_head_is_lost<Open, Fut>(open: Open)
@@ -176,7 +207,7 @@ where
 
     // A truncate right after a rebase may not reach behind it.
     let head = again.claim(2).await.unwrap();
-    again.rebase(2, base(3)).await.unwrap();
+    again.rebase(2, base(3), 1).await.unwrap();
     assert!(again.truncate(2, 3).await.is_err(), "behind the base");
     again.truncate(2, 4).await.unwrap();
     let d = again.discover().await.unwrap().unwrap();

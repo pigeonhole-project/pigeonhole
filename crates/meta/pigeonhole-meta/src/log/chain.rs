@@ -64,6 +64,8 @@ struct ChainDoc<Id> {
     claim: bool,
     prev: Option<Prev<Id>>,
     base: Option<Base>,
+    /// Older bases kept, newest first (`LogStore::rebase`'s `keep`).
+    older: Vec<Base>,
     vote: Option<Vec<u8>>,
     /// Term of the entry at the head once this blob is the tail.
     head_term: u64,
@@ -97,13 +99,14 @@ struct Tip<Id> {
     at: Option<Prev<Id>>,
     position: Position,
     base: Option<Base>,
+    older: Vec<Base>,
     vote: Option<Vec<u8>>,
     head_term: u64,
 }
 
 impl<Id> Default for Tip<Id> {
     fn default() -> Self {
-        Self { at: None, position: 0, base: None, vote: None, head_term: 0 }
+        Self { at: None, position: 0, base: None, older: Vec::new(), vote: None, head_term: 0 }
     }
 }
 
@@ -112,6 +115,7 @@ impl<Id: Clone> Tip<Id> {
         Self {
             position: doc.head_position(),
             base: doc.base.clone(),
+            older: doc.older.clone(),
             vote: doc.vote.clone(),
             head_term: doc.head_term,
             at: Some(at),
@@ -120,6 +124,11 @@ impl<Id: Clone> Tip<Id> {
 
     fn base_at(&self) -> Position {
         self.base.as_ref().map_or(0, |b| b.at)
+    }
+
+    /// The oldest base kept: the log is readable after it.
+    fn kept_from(&self) -> Position {
+        self.older.last().map_or(self.base_at(), |b| b.at)
     }
 }
 
@@ -154,7 +163,8 @@ struct Write {
     first: Position,
     entries: Vec<Entry>,
     head_term: u64,
-    base: Option<Base>,
+    /// A new base and the older ones kept with it.
+    base: Option<(Base, Vec<Base>)>,
     vote: Option<Vec<u8>>,
 }
 
@@ -181,18 +191,19 @@ impl<C: Chain> ChainLogStore<C> {
         Self { chain, state: Mutex::default(), collecting: Mutex::default() }
     }
 
-    /// Collect below the base of `tip` in the background: walk back as a
-    /// reader from the base would, to the oldest blob it needs, and prune
-    /// below it. Safe after a fence too: the base is in the chain before
-    /// this starts, so a newer incarnation replays from it or later and
-    /// never needs what lies below. One collection at a time; while one
-    /// runs, a rebase skips its own (the next one collects).
+    /// Collect below the oldest base `tip` keeps, in the background: walk
+    /// back as a reader from that base would, to the oldest blob it needs,
+    /// and prune below it. Safe after a fence too: the bases are in the
+    /// chain before this starts, and a newer incarnation keeps the same
+    /// ones or newer, so it never needs what lies below. One collection at
+    /// a time; while one runs, a rebase skips its own (the next one
+    /// collects).
     fn collect_behind(&self, tip: &Tip<C::Id>) {
         let mut collecting = self.collecting.lock().unwrap();
         if collecting.as_ref().is_some_and(|t| !t.is_finished()) {
             return;
         }
-        let (reader, chain, at) = (self.reader(), self.chain.clone(), tip.base_at());
+        let (reader, chain, at) = (self.reader(), self.chain.clone(), tip.kept_from());
         let mut next = tip.at.clone();
         *collecting = Some(tokio::spawn(async move {
             let t0 = std::time::Instant::now();
@@ -252,13 +263,18 @@ impl<C: Chain> ChainLogStore<C> {
     /// Put `w` as generation `gen` after the owner's tip.
     async fn write(&self, gen: u64, w: Write) -> LogResult<Tip<C::Id>> {
         let (log_id, tip) = self.owned(gen)?;
+        let (base, older) = match w.base {
+            Some((base, older)) => (Some(base), older),
+            None => (tip.base.clone(), tip.older.clone()),
+        };
         let doc = ChainDoc {
             format: LOG_FORMAT,
             log_id,
             gen,
             claim: false,
             prev: tip.at.clone(),
-            base: w.base.or_else(|| tip.base.clone()),
+            base,
+            older,
             vote: w.vote.or_else(|| tip.vote.clone()),
             head_term: w.head_term,
             batch: Batch::new(gen, w.first, w.entries),
@@ -322,6 +338,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
                 claim: true,
                 prev: tip.at.clone(),
                 base: tip.base.clone(),
+                older: tip.older.clone(),
                 vote: tip.vote.clone(),
                 head_term: tip.head_term,
                 batch: Batch::new(gen, tip.position + 1, Vec::new()),
@@ -410,6 +427,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         if let Some(o) = self.state.lock().unwrap().owner.as_ref() {
             return Ok(Some(Discovered {
                 base: o.tip.base.clone(),
+                older: o.tip.older.clone(),
                 head: Head { log_id: o.log_id, position: o.tip.position },
                 head_term: o.tip.head_term,
                 vote: o.tip.vote.clone(),
@@ -421,6 +439,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         let tip = Tip::of(&doc, at);
         let found = Discovered {
             base: tip.base.clone(),
+            older: tip.older.clone(),
             head: Head { log_id: doc.log_id, position: tip.position },
             head_term: tip.head_term,
             vote: tip.vote.clone(),
@@ -454,7 +473,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         )
     }
 
-    async fn rebase(&self, gen: u64, base: Base) -> LogResult<()> {
+    async fn rebase(&self, gen: u64, base: Base, keep: usize) -> LogResult<Vec<Base>> {
         let (_, old_tip) = self.owned(gen)?;
         let (at, old_at) = (base.at, old_tip.base_at());
         if at < old_at {
@@ -466,11 +485,14 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         } else {
             (old_tip.position + 1, old_tip.head_term)
         };
-        let w = Write { first, entries: Vec::new(), head_term, base: Some(base), vote: None };
+        // The bases kept, newest first; a repeated base counts once.
+        let mut older: Vec<Base> = old_tip.base.iter().chain(&old_tip.older).filter(|b| **b != base).cloned().collect();
+        let dropped = older.split_off(older.len().min(keep.max(1) - 1));
+        let w = Write { first, entries: Vec::new(), head_term, base: Some((base, older)), vote: None };
         let tip = self.write(gen, w).await?;
-        // The base is durable; dropping what lies behind it is best effort.
+        // The bases are durable; dropping what lies behind them is best effort.
         self.collect_behind(&tip);
-        Ok(())
+        Ok(dropped)
     }
 
     async fn settle(&self) {
@@ -516,9 +538,9 @@ impl<C: Chain> Reader<C> {
         if tip.position < head.position {
             return Err(LogError::Lost(format!("the log ends at {}, before {}", tip.position, head.position)));
         }
-        let base_at = tip.base_at();
-        if from < base_at {
-            return Err(LogError::Lost(format!("entries after {from} collected up to base {base_at}")));
+        let kept_from = tip.kept_from();
+        if from < kept_from {
+            return Err(LogError::Lost(format!("entries after {from} collected up to base {kept_from}")));
         }
         let mut out = BTreeMap::new();
         let mut limit = Position::MAX;

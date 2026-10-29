@@ -1,6 +1,7 @@
 # Log retention
 
-Status: **proposal**. Read [chain-log.md](chain-log.md) (the log over a
+Status: **implemented** (retention, idle-only collection, fallback boot);
+point-in-time restore is later. See Implementation at the end. Read [chain-log.md](chain-log.md) (the log over a
 `Chain`), [meta-backends.md](meta-backends.md) (`LogStore`, snapshots, lossy
 restore) and [sweep-invariants.md](sweep-invariants.md) (reclaim) first.
 
@@ -35,47 +36,40 @@ what is kept: a fallback boot now, a point-in-time restore later.
 ## What is kept
 
 ```toml
-[meta.retain]
-snapshots = 2     # the newest N bases the log was rebased on (≥ 1)
+[meta]
+keep_snapshots = 2   # the newest N bases the log was rebased on (≥ 1)
 ```
 
-A **retained base** is one of the `snapshots` newest bases; there is no
+A **kept base** is one of the `keep_snapshots` newest bases; there is no
 time-based policy (no clock in the decision, no time in the log). The
-**watermark** is the oldest retained base. Kept:
+**watermark** is the oldest kept base. Kept:
 
-- every retained base's snapshot;
+- every kept base's snapshot;
 - the log from the watermark up to the head.
 
 Everything older is garbage: log blobs below the watermark and the snapshots
-of bases older than the watermark. A snapshot that no base ever named (a
-newer one replaced it before the log moved onto it) is garbage at once, as
-today.
+of bases that fell out. A snapshot that no base ever named (a newer one
+replaced it before the log moved onto it) is garbage at once, as before.
 
-The chain is its own catalog: every rebase record names its snapshot, so
-walking back from the tail lists the bases (`at`, snapshot ref) without a
-separate index.
+The log is its own catalog: its registers (carried by every log blob, see
+chain-log.md) hold the base and the older bases kept, newest first, so the
+tail alone lists them (`Discovered::older`), with no walk and no index.
+`keep_snapshots = 1` is the old behaviour, minus the immediate delete.
 
-Proposed defaults: memory and `local_disk` `snapshots = 2`; chats
-`snapshots = 3`. With `snapshots = 1` the behaviour is today's, minus the
-immediate delete.
+## Collection
 
-## The collector
+The tablet decides, the log store deletes:
 
-One background task per tablet, next to the snapshot ticker, replaces the
-collection in `rebase` and the removals in the write loop:
-
-1. After each rebase (and once at boot) it walks back from the tail to the
-   watermark, listing bases. The walk reads what a boot reads anyway, plus
-   the retained log.
-2. It computes the watermark from the policy. The watermark never moves
-   back.
-3. It deletes the snapshots of bases below the watermark, then prunes the
-   chain below the watermark's rebase record (`Chain::prune`). Snapshots go
-   first: a crash in between leaves log blobs no base needs, never a base
-   without its snapshot.
-4. It deletes in batches where the store has them (Telegram deletes up to 100
-   messages per call; Discord bulk-deletes up to 100 messages younger than 14
-   days), paced as below.
+1. `LogStore::rebase(gen, base, keep)` writes the new base with the older
+   bases kept (at most `keep - 1`) and returns the ones that fell out.
+2. The tablet removes the snapshots of those, after answering the purge.
+3. The log store collects below the watermark in the background (one
+   collection at a time): it walks back to the oldest blob a reader from the
+   watermark needs and prunes the chain below it (`Chain::prune`). Order
+   does not matter: neither a dropped base's snapshot nor the log below the
+   watermark is needed by anything kept.
+4. Prunes delete in batches (Telegram up to 100 messages per call), each
+   batch on spare budget only, as below.
 
 **Pacing.** The collector has a rate of its own (a cap, e.g. one batch a
 second) and the lowest priority in the store's shared budget: before each
@@ -97,31 +91,31 @@ What idle means (built, `rate_limit.rs`):
 `Chain::prune` is background work by contract: memory, disk and Telegram
 prune a batch per idle moment already; so does Discord.
 
-**Safety across incarnations.** A newer generation sees every rebase record
-an older one saw, plus its own, so its watermark is at or above the older
-one's. An old incarnation still collecting therefore never deletes what the
-newer one keeps. Shrinking `snapshots` in the config of a newer incarnation is the one way to
-lose retained history, and that is the point of the change.
+**Safety across incarnations.** A newer generation's registers start from
+the older one's tail and only add bases, so its watermark is at or above the
+older one's. An old incarnation still collecting therefore never deletes
+what the newer one keeps. Lowering `keep_snapshots` in the config of a newer
+incarnation is the one way to lose kept history, and that is the point of
+the change.
 
 ## Fallback boot
 
-A boot that cannot use the base it found (the snapshot is missing, fails its
-checksum or does not decode) walks back to the previous retained base, loads
-its snapshot and replays the log from there to the head. The result is the
-same state: everything at or below every base is committed, so the replayed
-entries are the ones the newer snapshot was built from. The fallback is
-therefore safe on any error, transient ones included; it is only slower.
+A boot that cannot load the newest base's snapshot (missing, fails its
+checksum, does not decode) tries the older bases kept, newest first, loads
+the first that works and replays the log from there to the head. The result
+is the same state: everything at or below every base is committed, so the
+replayed entries are the ones the newer snapshot was built from. The fallback
+is therefore safe on any error, transient ones included; it is only slower.
 
-Needs:
+The stored snapshot already carries a crc (`StoredSnapshot::encode`), and its
+ref the blob's crc, so a damaged copy is told apart from a valid one. The
+log serves positions behind the current base down to the watermark;
+further back is `Lost`. The node tells Raft that its log starts at the base
+it actually loaded (`Shared::base`), not at the log's newest.
 
-- a checksum on the stored snapshot envelope (`StoredSnapshot`, a format
-  bump), so a damaged snapshot is told apart from a valid one;
-- `LogStore` lists the retained bases (`discover` returns them, newest
-  first), and `read` serves positions behind the current base down to the
-  watermark (today they are `Lost`).
-
-The tablet logs the fallback and counts it (`snapshot_fallbacks_total`), and
-stores a fresh snapshot soon after, so the damaged one stops being the base.
+The tablet logs the fallback, counts it
+(`pigeonhole_meta_snapshot_fallbacks_total`) and asks for a snapshot right
+after the boot, so the damaged one stops being the newest base.
 
 ## Point-in-time restore (later)
 
@@ -158,39 +152,46 @@ unless it falls back.
 
 ## Simulation scenarios
 
-In `pigeonhole-sim`, under the simulator with many seeds:
+`crates/testing/pigeonhole-sim/tests/retention.rs`, under the simulator with
+many seeds:
 
-1. **A damaged newest snapshot.** The tablet writes, snapshots and rebases a
-   few times; the snapshot store damages its newest snapshot (a `Faulty`
-   plan that corrupts a chosen put); a reboot falls back and holds every
-   acknowledged command. Without retention (`snapshots = 1`) the same seed
-   fails to boot: proof that the scenario tests the fallback.
-2. **Collector across a takeover.** An old incarnation collects while a newer
-   one writes and rebases; then the newer one's newest snapshot is damaged;
-   a reboot still finds a retained base.
-3. **Bounded space.** After `quiesce()` and a few rebases the stores hold at
-   most the retained snapshots and the log from the watermark: nothing older,
-   nothing retained missing.
-4. Later, **point-in-time restore**: an S3 workload records the object list
-   at some positions; a restore to a random retained position reads back
-   exactly that list, every object whole.
+1. **A damaged newest snapshot after a takeover.** Writer A is taken over by
+   B at a random moment (A's collection may still run), B writes until the
+   log keeps `keep` bases (2 or 3, drawn), its newest snapshot is then
+   damaged (`Faulty::damage`), and a third boot holds every command A and B
+   had acknowledged. Afterwards the snapshot store holds at most `keep + 1`
+   snapshots. With the fallback disabled the scenario fails at once.
+2. **One base kept**: the same damage stops the boot (proof that scenario 1
+   tests the fallback).
 
-## Steps
+Later, **point-in-time restore**: an S3 workload records the object list at
+some positions; a restore to a random kept position reads back exactly that
+list, every object whole.
 
-1. Checksum in the snapshot envelope; `discover` lists the retained bases;
-   `read` behind the current base down to the watermark. The conformance
-   case `rebase_covers_and_collects` becomes "readable down to the watermark,
-   `Lost` below".
-2. The collector and `[meta.retain]`: the watermark, snapshot removal moved
-   out of the write loop, collection out of `rebase`, batching. (Idle
-   waiting in the limiters, and `StoreLimiter` for `local_disk` and memory:
-   done.)
-   Scenario 3.
-3. Fallback boot, its metric; scenarios 1 and 2.
-4. Docs: meta-backends.md (what a boot does, retention), README § Durability.
-5. Later: the reclaim gate on the watermark, `restore --to`, scenario 4.
+## Implementation
+
+- `LogStore::rebase(gen, base, keep) -> dropped bases`; `Discovered::older`;
+  `read` down to the watermark. Chain log registers carry `older`
+  (`LOG_FORMAT` 4).
+- `[meta] keep_snapshots` (default 2) → `MetaOptions::keep_snapshots`; the
+  write loop removes dropped bases' snapshots.
+- Fallback boot in `MetaStore::open` (`load_some_base`).
+- Idle-only pacing: `ChatLimiter::wait_idle`, `StoreLimiter` for disk and
+  memory; `Chain::prune` on every store waits for idle per batch. The
+  collector's own rate cap is not built: idle-only was enough.
+- Tests: the conformance case `older_bases_are_kept_and_readable`, the
+  tablet test `a_boot_falls_back_to_an_older_base_when_the_newest_snapshot_is_unreadable`,
+  and the scenarios above.
+- Not done: the reclaim gate on the watermark, `restore --to`.
 
 ## Open questions
+
+- **Snapshots no base names.** An incarnation that stores a snapshot and is
+  fenced (or crashes) before it rebases on it leaves the snapshot behind;
+  nothing ever removes it (as before retention). The simulation found
+  three such copies after one takeover. A sweep of the snapshot store at boot
+  (this log's snapshots at or below the newest base that no kept base names)
+  would collect them; it needs listing by label on every snapshot store.
 
 - **Defaults for chats.** Three snapshots and the log between them is cheap
   for a small tablet. Is a size cap (`max_bytes`) needed as well, collecting
