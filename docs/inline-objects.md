@@ -170,6 +170,14 @@ The T4 demo with objects in Telegram (`DEMO_BACKEND=chats`,
   channel. Inline, neither the lock (223 B) nor the WAL segments (~150 B)
   post at all.
 
+## Result (2026-10-30)
+
+The same demo with inlining on (the default 1 KiB): the takeover holds and
+writes go on through the new leader; no lock renewal times out. Lock PUTs
+take 0.84 s (p50), 2 s at most: the Discord log's commit, no post. The
+Telegram channel got 2 posts in the whole run (the two objects over 1 KiB,
+a checkpoint's OPTIONS and an SST) against ~13 before.
+
 ## Steps
 
 0. ~~Measure first.~~ Done, above.

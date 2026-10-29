@@ -31,16 +31,18 @@ The demo:
 |---|---|---|---|
 | election | < 1 s | ~1 s | ~1 s |
 | etcd put (a lone leader flushes every batch to S3) | ms | ~0.5 s | 0.4–0.6 s, tails to several s |
-| takeover after `kill -9` | ~10 s | ~11 s | ~12 s, then the new leader may step down |
+| takeover after `kill -9` | ~10 s | ~11 s | ~11 s |
 
 T4's lock is valid for 6 s and each renewal gets 5 s (both fixed in T4).
-Right after a takeover T4 uploads a checkpoint, a burst of objects. In a
-Telegram channel (~20 posts a minute) the lock renewal queues behind them,
-times out, may still land, and the next renewal, carrying the old ETag, is
-refused: T4 reads that as "lock taken" and steps down. Safe (never two
-leaders), but etcd answers `no leader` until a node elects itself again.
-Discord takes posts fast enough that this does not happen.
-(docs/conditional-writes.md § Live.)
+Before small objects went inline, a Telegram channel (~20 posts a minute)
+could not keep up: right after a takeover the lock renewals queued behind
+a checkpoint's uploads, one timed out yet landed, and the next, carrying
+the old ETag, was refused, so T4 stepped down (docs/conditional-writes.md
+§ Live). Now the lock (~250 B), the manifests and most WAL segments are
+inline in pigeonhole's metadata (docs/inline-objects.md): a renewal is a
+commit to the Discord log, ~1 s, and the takeover holds with objects in
+Telegram too. With `[inline] max_object_bytes = 0` the old behaviour is
+back.
 
 ## Toward Kubernetes
 
