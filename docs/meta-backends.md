@@ -181,7 +181,7 @@ one chain.
    its chunks' `CommitChunk`s plus the index command
    ([one-entry-per-operation.md](one-entry-per-operation.md)).
 5. **Snapshot**: every `[meta] snapshot_every_entries` entries, and every
-   `snapshot_every_secs` when anything changed (an idle tablet wakes up for it), between
+   `snapshot_every` when anything changed (an idle tablet wakes up for it), between
    batches: one `TabletSnapshot` of all states, stored with `put` in the
    background (one at a time); when it is stored, the batcher `rebase`s the log
    on it, keeping `[meta] keep_snapshots` bases (and the log from the oldest),
@@ -311,7 +311,7 @@ no longer kept by the tablet.
 log = "meta"                        # a [[store]] id: local_disk | memory | telegram
 snapshot = "meta"                   # default: the log's store if local_disk / memory
 snapshot_every_entries = 10000      # 0 = never
-snapshot_every_secs = 600           # also by time if anything changed
+snapshot_every = "10m"             # also by time if anything changed
 
 [[store]]
 id = "meta"

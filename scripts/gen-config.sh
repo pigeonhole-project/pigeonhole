@@ -11,7 +11,7 @@
 #   CONFIG_LISTEN_ADDR   default 0.0.0.0:8333
 #   CONFIG_META_LOG      local metadata log directory (default pigeonhole-meta)
 #   CONFIG_REGION        default us-east-1
-#   CONFIG_CHUNK_SIZE    default 19922944
+#   CONFIG_CHUNK_SIZE    default "19 MiB" (bytes, or a binary unit)
 #   CONFIG_CHUNK_CODEC   default zstd
 
 set -euo pipefail
@@ -22,7 +22,7 @@ INSTANCE="${CONFIG_INSTANCE:-memory}"
 LISTEN_ADDR="${CONFIG_LISTEN_ADDR:-0.0.0.0:8333}"
 META_LOG="${CONFIG_META_LOG:-pigeonhole-meta}"
 REGION="${CONFIG_REGION:-us-east-1}"
-CHUNK_SIZE="${CONFIG_CHUNK_SIZE:-19922944}"
+CHUNK_SIZE="${CONFIG_CHUNK_SIZE:-19 MiB}"
 CHUNK_CODEC="${CONFIG_CHUNK_CODEC:-zstd}"
 EXTRA_BG=""
 
@@ -31,7 +31,7 @@ case "$INSTANCE" in
     BLOB_ID="mem"
     INSTANCE_BLOCK=$'[[store]]\nid = "mem"\nkind = "memory"'
     # MemoryBlobStore is process-local; quiet background tasks under heavy suites.
-    EXTRA_BG=$'\n[repair]\nscrub = false\ninterval_secs = 3600\n\n[sweep]\ninterval_secs = 3600\n'
+    EXTRA_BG=$'\n[repair]\nscrub = false\ninterval = "1h"\n\n[sweep]\ninterval = "1h"\n'
     ;;
   telegram)
     : "${CONFIG_SCOPE_ID:?CONFIG_SCOPE_ID (chat id) required for telegram}"
@@ -77,12 +77,12 @@ ${INSTANCE_BLOCK}
 
 [chunk]
 store = "${BLOB_ID}"
-size = ${CHUNK_SIZE}
+size = "${CHUNK_SIZE}"
 codec = "${CHUNK_CODEC}"
-block_size = 1048576
+block_size = "1 MiB"
 
 [ingest]
-memory_budget = 268435456
+memory_budget = "256 MiB"
 
 [telegram]
 send_rate_per_sec = 0.5

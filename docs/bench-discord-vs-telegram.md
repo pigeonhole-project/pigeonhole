@@ -135,7 +135,7 @@ stalls.
 
 ## Update: the Discord log on a lease
 
-Since the lease (`[meta] lease_secs`, 45 s by default) a Discord log entry is
+Since the lease (`[meta] lease`, 45 s by default) a Discord log entry is
 a plain post; threads are only for the lease records. The same full run on
 Discord, against the earlier ones and the first Telegram run (not rerun:
 its code did not change for this) ([raw](bench/2026-10-29-lease/discord.json)):

@@ -107,18 +107,18 @@ path = "$STATE/blobs"
 [meta]
 log = "meta"
 snapshot_every_entries = 2000
-snapshot_every_secs = 60
+snapshot_every = "1m"
 
 [chunk]
 store = "disk"
-size = 4194304
+size = "4 MiB"
 codec = "zstd"
 
 [sweep]
-interval_secs = 15
+interval = "15s"
 
 [repair]
-interval_secs = 10
+interval = "10s"
 
 [metrics]
 enabled = true
@@ -158,18 +158,18 @@ channel_id = $DISCORD_SNAP_CHANNEL_ID
 log = "dc-log"
 snapshot = "dc-snap"
 snapshot_every_entries = 500
-snapshot_every_secs = 300
+snapshot_every = "5m"
 
 [chunk]
 store = "dc-blobs"
-size = 16777216
+size = "16 MiB"
 codec = "zstd"
 
 [sweep]
-interval_secs = 60
+interval = "60s"
 
 [repair]
-interval_secs = 30
+interval = "30s"
 
 [metrics]
 enabled = true
@@ -210,18 +210,18 @@ EOF
 log = "tg-log"
 snapshot = "tg-snap"
 snapshot_every_entries = 500
-snapshot_every_secs = 300
+snapshot_every = "5m"
 
 [chunk]
 store = "tg-blobs"
-size = 16777216
+size = "16 MiB"
 codec = "zstd"
 
 [sweep]
-interval_secs = 60
+interval = "60s"
 
 [repair]
-interval_secs = 30
+interval = "30s"
 
 [metrics]
 enabled = true

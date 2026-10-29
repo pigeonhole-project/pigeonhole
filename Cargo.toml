@@ -34,6 +34,7 @@ async-trait = "0.1.92"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 bytes = "1"
+bytesize = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 crc32fast = "1"
 dotenvy = "0.15"
@@ -45,6 +46,7 @@ metrics = "0.24"
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 http = "1"
+humantime-serde = "1"
 lru = "0.12"
 md-5 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }

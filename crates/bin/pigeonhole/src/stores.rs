@@ -42,6 +42,7 @@ pub(crate) enum FileStore {
         id: String,
         channel_id: u64,
         bot_token_env: Option<String>,
+        #[serde(default, deserialize_with = "crate::config::units::opt_size")]
         max_blob_size: Option<usize>,
     },
 }

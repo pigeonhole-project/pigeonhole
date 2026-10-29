@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub(crate) mod units;
+
 /// Blob placement (`[chunk] store`): shards, each a replica group. A chunk
 /// goes to one shard and to every member of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,13 +231,13 @@ impl Default for MetricsSettings {
 /// Axum/tower HTTP server knobs.
 #[derive(Clone, Debug)]
 pub struct HttpSettings {
-    /// Idle timeout for request/response bodies (seconds). Resets on each frame.
-    /// Replaces the former whole-request timeout so large streaming PUT/GET can
-    /// run longer than this as long as bytes keep flowing.
-    pub request_timeout_secs: u64,
+    /// Idle timeout for request/response bodies. Resets on each frame, so
+    /// large streaming PUT/GET can run longer than this as long as bytes keep
+    /// flowing.
+    pub request_timeout: Duration,
     /// Max time to produce response headers after the request body reaches EOF.
-    /// `0` disables. Default matches [`Self::request_timeout_secs`].
-    pub headers_timeout_secs: u64,
+    /// Zero disables. Default matches [`Self::request_timeout`].
+    pub headers_timeout: Duration,
     /// Max concurrent in-flight HTTP requests.
     pub max_concurrent_requests: usize,
     /// Max HTTP/1 headers per request (hyper).
@@ -245,8 +247,8 @@ pub struct HttpSettings {
 impl Default for HttpSettings {
     fn default() -> Self {
         Self {
-            request_timeout_secs: 300,
-            headers_timeout_secs: 300,
+            request_timeout: Duration::from_secs(300),
+            headers_timeout: Duration::from_secs(300),
             max_concurrent_requests: 256,
             max_headers: 100,
         }
@@ -259,8 +261,9 @@ pub struct BytestreamSettings {
     pub enabled: bool,
     pub listen_addr: String,
     pub instance_name: String,
-    pub max_batch_total_size_bytes: i64,
-    pub gc_ttl_secs: u64,
+    pub max_batch_total_size: usize,
+    /// Zero = no TTL GC of CAS entries.
+    pub gc_ttl: Duration,
 }
 
 impl Default for BytestreamSettings {
@@ -269,8 +272,8 @@ impl Default for BytestreamSettings {
             enabled: false,
             listen_addr: "127.0.0.1:8980".into(),
             instance_name: "pigeonhole".into(),
-            max_batch_total_size_bytes: 4 * 1024 * 1024,
-            gc_ttl_secs: 7 * 24 * 3600,
+            max_batch_total_size: 4 * 1024 * 1024,
+            gc_ttl: Duration::from_secs(7 * 24 * 3600),
         }
     }
 }
@@ -494,18 +497,19 @@ struct FileConfig {
 struct FileLog {
     level: String,
     format: LogFormat,
-    slow_request_ms: u64,
+    #[serde(with = "humantime_serde")]
+    slow_request: Duration,
 }
 
 impl Default for FileLog {
     fn default() -> Self {
-        Self { level: DEFAULT_LOG_LEVEL.into(), format: LogFormat::Text, slow_request_ms: 5_000 }
+        Self { level: DEFAULT_LOG_LEVEL.into(), format: LogFormat::Text, slow_request: Duration::from_secs(5) }
     }
 }
 
 impl FileLog {
     fn into_settings(self) -> LoggingSettings {
-        LoggingSettings { level: self.level, format: self.format, slow_request: Duration::from_millis(self.slow_request_ms) }
+        LoggingSettings { level: self.level, format: self.format, slow_request: self.slow_request }
     }
 }
 
@@ -542,10 +546,12 @@ struct FileMeta {
     /// `[[store]]` id of the snapshots; unset = the log's store if it is a `dir`.
     snapshot: Option<String>,
     snapshot_every_entries: u64,
-    snapshot_every_secs: u64,
+    #[serde(with = "humantime_serde")]
+    snapshot_every: Duration,
     keep_snapshots: usize,
-    /// A Discord log's lease, in seconds; 0 = a thread per batch.
-    lease_secs: u64,
+    /// A Discord log's lease; zero = a thread per batch.
+    #[serde(with = "humantime_serde")]
+    lease: Duration,
 }
 
 impl Default for FileMeta {
@@ -554,9 +560,9 @@ impl Default for FileMeta {
             log: None,
             snapshot: None,
             snapshot_every_entries: 10_000,
-            snapshot_every_secs: 600,
+            snapshot_every: Duration::from_secs(600),
             keep_snapshots: 2,
-            lease_secs: 45,
+            lease: Duration::from_secs(45),
         }
     }
 }
@@ -612,9 +618,9 @@ impl FileMeta {
         }
         Ok(MetaSettings {
             snapshot_every_entries: self.snapshot_every_entries,
-            snapshot_interval: Duration::from_secs(self.snapshot_every_secs),
+            snapshot_interval: self.snapshot_every,
             keep_snapshots: self.keep_snapshots,
-            lease: Duration::from_secs(self.lease_secs),
+            lease: self.lease,
             log,
             snapshot,
         })
@@ -654,14 +660,15 @@ impl FileMetrics {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileSweep {
-    interval_secs: u64,
+    #[serde(with = "humantime_serde")]
+    interval: Duration,
     batch_size: usize,
 }
 
 impl Default for FileSweep {
     fn default() -> Self {
         Self {
-            interval_secs: DEFAULT_SWEEP_INTERVAL.as_secs(),
+            interval: DEFAULT_SWEEP_INTERVAL,
             batch_size: SWEEP_BATCH_SIZE,
         }
     }
@@ -671,7 +678,7 @@ impl FileSweep {
     fn into_sweep_config(self) -> SweepConfig {
         SweepConfig {
             batch_size: self.batch_size.max(1),
-            interval: Duration::from_secs(self.interval_secs.max(1)),
+            interval: self.interval.max(Duration::from_secs(1)),
         }
     }
 }
@@ -679,18 +686,20 @@ impl FileSweep {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileRepair {
-    interval_secs: u64,
+    #[serde(with = "humantime_serde")]
+    interval: Duration,
     batch_size: usize,
-    max_cost_wait_secs: f64,
+    #[serde(with = "humantime_serde")]
+    max_cost_wait: Duration,
     scrub: bool,
 }
 
 impl Default for FileRepair {
     fn default() -> Self {
         Self {
-            interval_secs: DEFAULT_REPAIR_INTERVAL.as_secs(),
+            interval: DEFAULT_REPAIR_INTERVAL,
             batch_size: REPAIR_BATCH_SIZE,
-            max_cost_wait_secs: DEFAULT_MAX_COST_WAIT_SECS,
+            max_cost_wait: Duration::from_secs_f64(DEFAULT_MAX_COST_WAIT_SECS),
             scrub: true,
         }
     }
@@ -699,9 +708,9 @@ impl Default for FileRepair {
 impl FileRepair {
     fn into_repair_config(self) -> RepairConfig {
         RepairConfig {
-            interval: Duration::from_secs(self.interval_secs.max(1)),
+            interval: self.interval.max(Duration::from_secs(1)),
             batch_size: self.batch_size.max(1),
-            max_cost_wait_secs: self.max_cost_wait_secs.max(0.0),
+            max_cost_wait_secs: self.max_cost_wait.as_secs_f64(),
             scrub: self.scrub,
         }
     }
@@ -746,8 +755,10 @@ pub fn check_block_size_against_instances(
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileHttp {
-    request_timeout_secs: u64,
-    headers_timeout_secs: Option<u64>,
+    #[serde(with = "humantime_serde")]
+    request_timeout: Duration,
+    #[serde(with = "humantime_serde")]
+    headers_timeout: Option<Duration>,
     max_concurrent_requests: usize,
     max_headers: usize,
 }
@@ -756,8 +767,8 @@ impl Default for FileHttp {
     fn default() -> Self {
         let d = HttpSettings::default();
         Self {
-            request_timeout_secs: d.request_timeout_secs,
-            headers_timeout_secs: None,
+            request_timeout: d.request_timeout,
+            headers_timeout: None,
             max_concurrent_requests: d.max_concurrent_requests,
             max_headers: d.max_headers,
         }
@@ -766,11 +777,11 @@ impl Default for FileHttp {
 
 impl FileHttp {
     fn into_settings(self) -> HttpSettings {
-        let idle = self.request_timeout_secs.max(1);
+        let idle = self.request_timeout.max(Duration::from_secs(1));
         HttpSettings {
-            request_timeout_secs: idle,
-            // Absent key → same as idle; explicit 0 disables headers timeout.
-            headers_timeout_secs: self.headers_timeout_secs.unwrap_or(idle),
+            request_timeout: idle,
+            // Absent key → same as idle; explicit "0s" disables headers timeout.
+            headers_timeout: self.headers_timeout.unwrap_or(idle),
             max_concurrent_requests: self.max_concurrent_requests.max(1),
             max_headers: self.max_headers.max(16),
         }
@@ -783,8 +794,10 @@ struct FileBytestream {
     enabled: bool,
     listen_addr: String,
     instance_name: String,
-    max_batch_total_size_bytes: i64,
-    gc_ttl_secs: u64,
+    #[serde(deserialize_with = "units::size")]
+    max_batch_total_size: usize,
+    #[serde(with = "humantime_serde")]
+    gc_ttl: Duration,
 }
 
 impl Default for FileBytestream {
@@ -794,8 +807,8 @@ impl Default for FileBytestream {
             enabled: d.enabled,
             listen_addr: d.listen_addr,
             instance_name: d.instance_name,
-            max_batch_total_size_bytes: d.max_batch_total_size_bytes,
-            gc_ttl_secs: d.gc_ttl_secs,
+            max_batch_total_size: d.max_batch_total_size,
+            gc_ttl: d.gc_ttl,
         }
     }
 }
@@ -806,8 +819,8 @@ impl FileBytestream {
             enabled: self.enabled,
             listen_addr: self.listen_addr,
             instance_name: self.instance_name,
-            max_batch_total_size_bytes: self.max_batch_total_size_bytes.max(1024),
-            gc_ttl_secs: self.gc_ttl_secs,
+            max_batch_total_size: self.max_batch_total_size.max(1024),
+            gc_ttl: self.gc_ttl,
         }
     }
 }
@@ -816,15 +829,17 @@ impl FileBytestream {
 #[serde(default, deny_unknown_fields)]
 struct FileCache {
     enabled: bool,
-    l1_bytes: usize,
-    l2_bytes: usize,
+    #[serde(deserialize_with = "units::size")]
+    l1_size: usize,
+    #[serde(deserialize_with = "units::size")]
+    l2_size: usize,
     write_through: bool,
 }
 
 impl Default for FileCache {
     fn default() -> Self {
         let d = CacheConfig::default();
-        Self { enabled: d.enabled, l1_bytes: d.l1_bytes, l2_bytes: d.l2_bytes, write_through: d.write_through }
+        Self { enabled: d.enabled, l1_size: d.l1_bytes, l2_size: d.l2_bytes, write_through: d.write_through }
     }
 }
 
@@ -832,8 +847,8 @@ impl FileCache {
     fn into_cache_config(self) -> Result<CacheConfig> {
         Ok(CacheConfig {
             enabled: self.enabled,
-            l1_bytes: self.l1_bytes.max(1024 * 1024),
-            l2_bytes: self.l2_bytes,
+            l1_bytes: self.l1_size.max(1024 * 1024),
+            l2_bytes: self.l2_size,
             write_through: self.write_through,
         })
     }
@@ -844,8 +859,10 @@ impl FileCache {
 struct FileChunk {
     /// `[[store]]` or `[[replicas]]` id chunks go to.
     store: Option<String>,
+    #[serde(deserialize_with = "units::size")]
     size: usize,
     codec: ChunkCodec,
+    #[serde(deserialize_with = "units::opt_size")]
     block_size: Option<usize>,
 }
 
@@ -871,6 +888,7 @@ impl FileChunk {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileIngest {
+    #[serde(deserialize_with = "units::size")]
     memory_budget: usize,
 }
 
@@ -1010,11 +1028,11 @@ upload_concurrency = 4
                     [[store]]\nid = \"backup\"\nkind = \"local_disk\"\npath = \"/backup\"\n";
         let cfg = load_mem(&format!(
             "[meta]\nlog = \"disk\"\nsnapshot = \"backup\"\n\
-             snapshot_every_entries = 0\nsnapshot_every_secs = 60\nkeep_snapshots = 3\n{dirs}"
+             snapshot_every_entries = 0\nsnapshot_every = \"1m\"\nkeep_snapshots = 3\nlease = \"0s\"\n{dirs}"
         ))
         .unwrap();
         assert_eq!(cfg.meta.keep_snapshots, 3);
-        assert_eq!(cfg.meta.lease, Duration::from_secs(45));
+        assert_eq!(cfg.meta.lease, Duration::ZERO);
         assert_eq!(cfg.meta.snapshot_every_entries, 0);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(60));
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "/var/log-dir".into() });
@@ -1236,7 +1254,7 @@ upload_concurrency = 4
         let cfg = load_mem("").unwrap();
         assert_eq!(cfg.log, LoggingSettings::default());
         assert_eq!(cfg.log.level, DEFAULT_LOG_LEVEL);
-        let cfg = load_mem("[log]\nlevel = \"debug\"\nformat = \"json\"\nslow_request_ms = 250\n").unwrap();
+        let cfg = load_mem("[log]\nlevel = \"debug\"\nformat = \"json\"\nslow_request = \"250ms\"\n").unwrap();
         assert_eq!(
             cfg.log,
             LoggingSettings { level: "debug".into(), format: LogFormat::Json, slow_request: Duration::from_millis(250) }
@@ -1256,7 +1274,7 @@ store = "dc"
 id = "dc"
 kind = "discord"
 channel_id = 123456789
-max_blob_size = 8388608
+max_blob_size = "8 MiB"
 "#,
         )
         .unwrap();
@@ -1268,8 +1286,54 @@ max_blob_size = 8388608
     }
 
     #[test]
+    fn sizes_and_durations_read_like_text() {
+        let cfg = load_mem(
+            r#"
+[chunk]
+size = "16 MiB"
+block_size = "512 KiB"
+[ingest]
+memory_budget = "64MiB"
+[cache]
+l1_size = "32 MiB"
+l2_size = 0
+[sweep]
+interval = "1m 30s"
+[repair]
+max_cost_wait = "500ms"
+[http]
+request_timeout = "2m"
+headers_timeout = "0s"
+[bytestream]
+gc_ttl = "7d"
+max_batch_total_size = "8 MiB"
+"#,
+        )
+        .unwrap();
+        assert_eq!((cfg.chunk_size, cfg.block_size), (16 << 20, 512 << 10));
+        assert_eq!((cfg.cache.l1_bytes, cfg.cache.l2_bytes), (32 << 20, 0));
+        assert_eq!(cfg.sweep.interval, Duration::from_secs(90));
+        assert_eq!(cfg.repair.max_cost_wait_secs, 0.5);
+        assert_eq!((cfg.http.request_timeout, cfg.http.headers_timeout), (Duration::from_secs(120), Duration::ZERO));
+        assert_eq!((cfg.bytestream.gc_ttl, cfg.bytestream.max_batch_total_size), (Duration::from_secs(7 * 86400), 8 << 20));
+
+        // Decimal units are not what anyone means by them here.
+        for bad in ["[chunk]\nsize = \"10MB\"\n", "[cache]\nl1_size = \"128 KB\"\n", "[ingest]\nmemory_budget = \"1g\"\n"] {
+            let err = format!("{:#}", load_mem(bad).unwrap_err());
+            assert!(err.contains("decimal units are refused"), "{bad:?}: {err}");
+        }
+        set_env("DISCORD_BOT_TOKEN", "discord-test-token");
+        let dc = "[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\nmax_blob_size = \"25MB\"\n";
+        let err = format!("{:#}", load(&format!("[chunk]\nstore = \"dc\"\n{dc}")).unwrap_err());
+        assert!(err.contains("decimal units are refused"), "{err}");
+        // Durations want a unit.
+        assert!(load_mem("[sweep]\ninterval = 60\n").is_err());
+        assert!(load_mem("[meta]\nlease = \"45\"\n").is_err());
+    }
+
+    #[test]
     fn rejects_memory_budget_below_two_blocks() {
-        let err = load_mem("[chunk]\nblock_size = 1048576\n[ingest]\nmemory_budget = 1048576\n").unwrap_err();
+        let err = load_mem("[chunk]\nblock_size = \"1 MiB\"\n[ingest]\nmemory_budget = \"1 MiB\"\n").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("ingest.memory_budget"), "unexpected error: {msg}");
     }

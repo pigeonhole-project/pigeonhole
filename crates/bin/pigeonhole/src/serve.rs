@@ -13,7 +13,6 @@ use pigeonhole::request_log::trace_request;
 use pigeonhole::index::Index;
 use pigeonhole::{build_s3_gateway, build_s3_service};
 use s3s::{Body, HttpError};
-use std::time::Duration;
 use tracing::info;
 #[cfg(any(feature = "bytestream", not(feature = "metrics-prometheus")))]
 use tracing::warn;
@@ -42,8 +41,8 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
             enabled: true,
             listen_addr: cfg.bytestream.listen_addr.clone(),
             instance_name: cfg.bytestream.instance_name.clone(),
-            max_batch_total_size_bytes: cfg.bytestream.max_batch_total_size_bytes,
-            gc_ttl_secs: cfg.bytestream.gc_ttl_secs,
+            max_batch_total_size_bytes: cfg.bytestream.max_batch_total_size as i64,
+            gc_ttl_secs: cfg.bytestream.gc_ttl.as_secs(),
             ..Default::default()
         };
         let cas = CasIndex::open(rt.meta.clone())
@@ -62,8 +61,8 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     let max_headers = cfg.http.max_headers;
     let s3_service = build_s3_service(s3_gateway, &cfg.access_key, &cfg.secret_key);
     let s3_service = HandleError::new(s3_service, handle_s3_error);
-    let body_idle = Duration::from_secs(cfg.http.request_timeout_secs);
-    let headers_timeout = Duration::from_secs(cfg.http.headers_timeout_secs);
+    let body_idle = cfg.http.request_timeout;
+    let headers_timeout = cfg.http.headers_timeout;
     let concurrency = cfg.http.max_concurrent_requests;
     let slow_request = cfg.log.slow_request;
     let mut app = Router::new();
@@ -104,8 +103,8 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         chunk_codec = %cfg.chunk_codec,
         bytestream = cfg.bytestream.enabled,
         metrics = cfg.metrics.enabled,
-        body_idle_timeout_secs = cfg.http.request_timeout_secs,
-        headers_timeout_secs = cfg.http.headers_timeout_secs,
+        body_idle_timeout = ?cfg.http.request_timeout,
+        headers_timeout = ?cfg.http.headers_timeout,
         max_concurrent = cfg.http.max_concurrent_requests,
         max_headers = cfg.http.max_headers,
         "pigeonhole listening on http://{addr}"

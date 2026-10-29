@@ -60,7 +60,7 @@ path = "app.db"          # the local Turso database (WAL mode)
 log = "tg-applog"        # a store that can hold a log (its own channel / dir / bucket)
 snapshot = "tg-appsnap"  # a store that can hold snapshots
 snapshot_every_frames = 100000
-snapshot_every_secs = 3600
+snapshot_every = "1h"
 durability = "async"     # or "sync": commits wait for the log
 ```
 

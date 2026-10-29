@@ -82,7 +82,7 @@ gone
   process memory, set when this process first commits or sees `BeginReclaim`).
   A lossy restore from the newest snapshot then has the chunk `reclaiming` or
   gone, never live under an object. Reclaim lags snapshots by up to
-  `every_secs`.
+  `snapshot_every`.
 - **Read pins.** `ChunkStore::read` pins the chunks it reads
   (`BlobDb::pin_reads`, process memory) and then checks they are not
   reclaiming. Reclaim commits `BeginReclaim`, then checks the pins and leaves a

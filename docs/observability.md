@@ -13,7 +13,7 @@ stderr (`tracing-subscriber`: text or JSON).
 [log]
 level = "info,openraft=warn,s3s=off"   # tracing directives (default shown)
 format = "text"                         # or "json"
-slow_request_ms = 5000                  # slower requests are logged at info
+slow_request = "5s"                     # slower requests are logged at info
 ```
 
 - `level` takes [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)

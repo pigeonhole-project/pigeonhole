@@ -1,6 +1,6 @@
 # A lease for the Discord log: appends without a thread each
 
-Status: **implemented** for Discord logs (`[meta] lease_secs`, default 45). See § Implementation notes for where the code differs from the design.
+Status: **implemented** for Discord logs (`[meta] lease`, default `"45s"`). See § Implementation notes for where the code differs from the design.
 Read [discord-log.md](discord-log.md) (the thread fence this changes),
 [chain-log.md](chain-log.md) and
 [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md) first.
@@ -206,7 +206,7 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
   - `list_after`: list newer blobs by label.
 
   Other stores keep the link-per-batch log.
-  `[meta] lease_secs = 0` turns the lease off for Discord too.
+  `[meta] lease = "0s"` turns the lease off for Discord too.
 - **Renewals run in the background and stay outside the log.** In the first
   live run a renewal waited for the thread pacer (~7 s with the post) in
   front of an append. The next batch then missed the deadline and the handle
@@ -245,7 +245,7 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
   probes and the margin. Live: a claim after a release took 3.0 s, against
   a 10 s wait without one.
 - **Not done**: the `flock` shortcut after a crash on the same host, and
-  simulation tests for the lease. A crash still costs up to `lease_secs`.
+  simulation tests for the lease. A crash still costs up to `lease`.
 
 ## Steps
 

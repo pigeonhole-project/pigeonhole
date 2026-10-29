@@ -8,6 +8,10 @@
 listen_addr = "0.0.0.0:8333"
 region = "us-east-1"
 
+# Sizes are bytes or strings with a binary unit ("1 MiB", "512 KiB"); decimal
+# units (KB, MB, GB, k, m) are refused. Durations are strings ("45s", "10m",
+# "7d", "1m 30s"; "0s" where zero means off).
+
 # Stores: where bytes live. kind = local_disk (path) | memory | telegram
 # (chat_id) | discord (channel_id). Every kind holds blobs; the log and
 # snapshots go to local_disk, memory (tests: no fsync, gone with the process),
@@ -38,7 +42,7 @@ chat_id = -1001234567890
 # id = "dc-backup"
 # kind = "discord"
 # channel_id = 123456789012345678
-# max_blob_size = 20971520   # optional, default 20 MiB (more on boosted servers)
+# max_blob_size = "20 MiB"   # optional, the default (more on boosted servers)
 
 # Local runs / tests without any chat:
 # [[store]]
@@ -73,24 +77,25 @@ snapshot = "meta"             # default: the log's store if it is local_disk / m
 # losing the log's disk: `pigeonhole restore --lossy` starts a new log from
 # the newest snapshot.
 snapshot_every_entries = 10000     # snapshot all states, drop the log behind it; 0 = never
-snapshot_every_secs = 600          # and this often if anything changed; 0 = never
+snapshot_every = "10m"             # and this often if anything changed; "0s" = never
 keep_snapshots = 2                 # newest snapshots kept, with the log between them (a boot
                                    # falls back to an older one if the newest is damaged)
+# lease = "45s"                    # a discord log's lease (docs/discord-lease.md); "0s" = off
 
 [chunk]
 store = "tg-main"             # a blob store or a [[replicas]] group
 # Max on-wire document size. With codec zstd/gzip, independent 1 MiB blocks are
 # packed until this size (or 256 MiB logical) is reached.
-size = 19922944
+size = "19 MiB"
 # Encoding policy for new uploads: "raw" | "gzip" | "zstd" (default zstd).
 # Compressing policies store chunks as codec "blocks" (see chunk_blocks table).
 codec = "zstd"
 # Logical block size for block packing (default 1 MiB).
-block_size = 1048576
+block_size = "1 MiB"
 
 [ingest]
 # Process-wide cap on ingest buffers across concurrent PUTs (default 256 MiB).
-memory_budget = 268435456
+memory_budget = "256 MiB"
 
 [telegram]
 # Telegram budgets on two levels. Bot: every call of one token, across all its
@@ -123,8 +128,8 @@ download_concurrency = 8
 # In-memory block caches: a read looks in L1 (decoded blocks), then L2
 # (stored, compressed blocks), then the backend. Raw chunks are not cached.
 enabled = true
-l1_bytes = 134217728
-l2_bytes = 268435456          # 0 = no L2
+l1_size = "128 MiB"
+l2_size = "256 MiB"           # 0 = no L2
 # Chunks written put their stored blocks into L2 (read-after-write is free).
 write_through = true
 
@@ -134,35 +139,35 @@ write_through = true
 enabled = false
 listen_addr = "127.0.0.1:8980"
 instance_name = "pigeonhole"
-max_batch_total_size_bytes = 4194304
-# 0 disables TTL GC for CAS entries.
-gc_ttl_secs = 604800
+max_batch_total_size = "4 MiB"
+# "0s" disables TTL GC for CAS entries.
+gc_ttl = "7d"
 
 [sweep]
 # Orphans are swept up to the upload horizon: uploads are pinned before they
 # start and unpinned once committed, so no grace period is needed.
 # Pause between full sweeper passes.
-interval_secs = 60
+interval = "1m"
 # Candidate keys fetched / deleted per batch.
 batch_size = 100
 
 [repair]
 # Pause between repair / backfill passes.
-interval_secs = 30
+interval = "30s"
 # Jobs claimed per pass (fewest-replica chunks first).
 batch_size = 16
 # Skip a job when source Get or target Put cost().wait_secs exceeds this.
-max_cost_wait_secs = 2.0
+max_cost_wait = "2s"
 # Scrub under-replicated chunks into the repair queue each pass.
 scrub = true
 
 [http]
 # Idle timeout for request/response bodies (resets on each byte frame).
 # Large streaming PUT/GET may run longer than this while bytes keep flowing.
-request_timeout_secs = 300
+request_timeout = "5m"
 # Time to produce response headers after the request body is fully received.
-# Defaults to request_timeout_secs when omitted; set 0 to disable.
-headers_timeout_secs = 300
+# Defaults to request_timeout when omitted; "0s" disables.
+headers_timeout = "5m"
 # Cap concurrent in-flight HTTP requests (tower ConcurrencyLimitLayer).
 max_concurrent_requests = 256
 # Reject requests with more headers than this (431).
@@ -173,7 +178,7 @@ max_headers = 100
 [log]
 level = "info,openraft=warn,s3s=off"   # tracing directives
 format = "text"                         # or "json" (one object per line, with spans)
-slow_request_ms = 5000                  # slower S3 requests are logged at info
+slow_request = "5s"                     # slower S3 requests are logged at info
 
 # Prometheus scrape (requires binary feature `metrics-prometheus`, on by default).
 [metrics]

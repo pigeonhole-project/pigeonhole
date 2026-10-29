@@ -137,7 +137,7 @@ Discord is enabled by default (`--features discord`):
 id = "dc"
 kind = "discord"
 channel_id = 123456789012345678
-# optional: max_blob_size = 20971520
+# optional: max_blob_size = "20 MiB"
 
 [chunk]
 store = "dc"
@@ -229,25 +229,27 @@ comments. Sections:
 | `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
 | `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never), `keep_snapshots` (the newest snapshots kept with the log between them; default 2) |
+| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every` (`0` / `"0s"` = never), `keep_snapshots` (the newest snapshots kept with the log between them; default 2) |
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Rate limits on two levels: per bot (`bot_rate_per_sec`) and per channel (send / getFile / delete / info budgets); a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency |
 | `[cache]` | In-memory block caches: L1 decoded, L2 stored (compressed) blocks |
-| `[sweep]` | Garbage collector: `interval_secs`, `batch_size` |
+| `[sweep]` | Garbage collector: `interval`, `batch_size` |
 | `[repair]` | Replica repair/backfill: interval, batch, cost limit, `scrub` |
 | `[http]` | Body/header timeouts, concurrency limit, max headers |
 | `[metrics]` | Prometheus `/metrics` (feature `metrics-prometheus`, on by default) |
 | `[bytestream]` | REAPI gRPC remote cache (feature `bytestream`) |
 
-Unknown keys are rejected, so a stale config fails at startup instead of being
-half-applied.
+Sizes are bytes or binary-unit strings (`"19 MiB"`, `"512 KiB"`; decimal
+`KB` / `MB` / `GB` are refused), durations humantime strings (`"45s"`,
+`"10m"`, `"7d"`). Unknown keys are rejected, so a stale config fails at
+startup instead of being half-applied.
 
 ## Logs and traces
 
 Logs go to stderr: `[log] level` (tracing directives, default
 `info,openraft=warn,s3s=off`; `RUST_LOG` overrides), `format = "text" |
-"json"`, `slow_request_ms`. Every S3 request runs in a span with an id, sent
+"json"`, `slow_request`. Every S3 request runs in a span with an id, sent
 back as `x-pigeonhole-request-id`; store calls and the tablet's commit run
 below it, so `RUST_LOG=debug` follows one request from the gateway to the
 blob it stored and the log position its commit landed at. Levels, spans and
@@ -261,7 +263,7 @@ in-memory state of its layer (`chunk`, `s3`, `cas`); the log is the source of
 truth and every boot rebuilds the state by replaying it (see
 [docs/meta-backends.md](docs/meta-backends.md)). There is no local database.
 
-Every `[meta] snapshot_every_entries` entries (and every `snapshot_every_secs`
+Every `[meta] snapshot_every_entries` entries (and every `snapshot_every`
 when anything changed) the tablet snapshots all states into the snapshot store and
 drops the log behind the oldest of the `keep_snapshots` newest snapshots, so
 boot = the newest snapshot + the log after it, or, if that snapshot cannot be

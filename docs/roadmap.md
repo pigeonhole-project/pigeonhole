@@ -43,7 +43,7 @@ Done (on `main`), steps 1–7d, 9, 10, 8.1–8.2:
   ids, a Discord channel fenced by threads; `BlobSnapshotStore` the
   snapshots (chain-log.md). No per-kind logs.
 - Snapshots every `[meta] snapshot_every_entries` (10000) and
-  `snapshot_every_secs` (600, when anything changed), stored in a `SnapshotStore` configured apart
+  `snapshot_every` (10m, when anything changed), stored in a `SnapshotStore` configured apart
   from the log (`local_disk` | `memory` | `telegram` | `discord`, pinless); the log records which one it starts
   from. `pigeonhole restore --lossy` starts an empty log from the newest one.
 - Removed: `durability.rs` (checkpoint, superblock pins, root journal,
@@ -149,7 +149,7 @@ Protocol: meta-backends.md § `telegram` (pinned head of a chain of log batches,
 `LogStore`, configured independently (`[meta] snapshot`). The log records its
 base (`rebase(gen, { at, snapshot ref })`), so boot loads exactly that snapshot
 and a deposed writer's late put cannot confuse it; the tablet removes the
-previous base. `every_secs` snapshots an idle tablet. When snapshots outlive
+previous base. `snapshot_every` snapshots an idle tablet. When snapshots outlive
 the log, reclaim deletes parts only after the base shows the chunk reclaiming,
 so `restore --lossy` loses recent changes but never breaks an object.
 
