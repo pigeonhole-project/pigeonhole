@@ -78,14 +78,22 @@ collection in `rebase` and the removals in the write loop:
    days), paced as below.
 
 **Pacing.** The collector has a rate of its own (a cap, e.g. one batch a
-second) and the lowest priority in the store's shared budget (the bot's and
-the chat's buckets in `rate_limit.rs`): it takes a token only when nobody
+second) and the lowest priority in the store's shared budget: it takes a
+token only when nobody
 else is waiting and the bucket has spare tokens, otherwise it sleeps and
 looks again. While the store is busy it makes no progress at all, and that
 is fine: nothing waits for it. When the store is idle it collects at its own
 rate. A 429 on a delete backs it off like any caller. The limiter needs one
 call for this, a non-blocking `try_acquire_idle(class)` that fails instead of
 queueing.
+
+Every store gets such a budget, not only the chats (the bot's and the
+chat's buckets in `rate_limit.rs`). On `local_disk` the budget is I/O: the
+collector's deletes and hole punching compete with appends and part writes
+for the disk and its syncs. In memory it is the store's lock. Either way the
+collector stays out of the way of foreground work, so a disk and a memory
+store get a limiter too (operations per second, generous by default), with
+the same idle-only class.
 
 **Safety across incarnations.** A newer generation sees every rebase record
 an older one saw, plus its own, so its watermark is at or above the older
@@ -173,7 +181,7 @@ In `pigeonhole-sim`, under the simulator with many seeds:
    `Lost` below".
 2. The collector and `[meta.retain]`: the watermark, snapshot removal moved
    out of the write loop, collection out of `rebase`, batching; idle-only
-   tokens in the limiter.
+   tokens in the limiter, and a limiter for `local_disk` and memory.
    Scenario 3.
 3. Fallback boot, its metric; scenarios 1 and 2.
 4. Docs: meta-backends.md (what a boot does, retention), README § Durability.
@@ -188,6 +196,7 @@ In `pigeonhole-sim`, under the simulator with many seeds:
   model simple. Old snapshots without their log (`restore --lossy` targets)
   would be cheaper than log, but only useful for a lossy restore.
 - **A store that is never idle.** Under a steady full load the collector
-  never gets a token and garbage grows. Accept it (load ends; disk space is
-  the only real limit, and the disk store has no rate limit), or let it take
-  a token after waiting long enough?
+  never gets a token and garbage grows. Accept it (load ends), or, on a disk
+  running out of space, let it take a token after waiting long enough?
+- **Limits for disk and memory.** Operations per second only, or bytes per
+  second as well (a disk is bound by bandwidth, a chat by calls)?
