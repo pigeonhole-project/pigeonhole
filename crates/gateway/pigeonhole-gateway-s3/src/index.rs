@@ -452,11 +452,13 @@ impl Index {
     ) -> Result<(Vec<ObjectMeta>, Vec<String>, bool, Option<String>)> {
         let max_keys = max_keys.clamp(1, 1000) as usize;
         let range_end = exclusive_prefix_end(prefix);
+        // An empty delimiter is no delimiter.
+        let delimiter = delimiter.filter(|d| !d.is_empty());
 
         if let Some(delim) = delimiter {
             let batch = (max_keys * 32).clamp(64, 10_000);
             let mut cursor: Option<(bool, String)> = match start_after {
-                Some(after) if after.ends_with(delim) => {
+                Some(after) if is_common_prefix(after, prefix, delim) => {
                     exclusive_prefix_end(after).map(|e| (true, e))
                 }
                 Some(after) => Some((false, after.to_string())),
@@ -816,19 +818,28 @@ enum DelimEntry {
     Prefix(String),
 }
 
+/// The least string above every string that starts with `prefix` (`None`:
+/// there is none). The last character steps to the next one, not the last
+/// byte: a byte step can leave invalid UTF-8 (`¿` is `C2 BF`), and keys sort
+/// by UTF-8 bytes, which is code point order.
 fn exclusive_prefix_end(prefix: &str) -> Option<String> {
-    if prefix.is_empty() {
-        return None;
-    }
-    let mut bytes = prefix.as_bytes().to_vec();
-    while let Some(b) = bytes.last_mut() {
-        if *b != 0xff {
-            *b += 1;
-            return Some(String::from_utf8_lossy(&bytes).into_owned());
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let next = (last as u32 + 1..=char::MAX as u32).find_map(char::from_u32);
+        if let Some(next) = next {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
         }
-        bytes.pop();
     }
     None
+}
+
+/// Whether `s` is a common prefix of this listing (`prefix`, then text
+/// without `delim`, then `delim`), not a key that merely ends with `delim`.
+fn is_common_prefix(s: &str, prefix: &str, delim: &str) -> bool {
+    s.strip_prefix(prefix)
+        .and_then(|rest| rest.find(delim).map(|i| i + delim.len() == rest.len()))
+        .unwrap_or(false)
 }
 
 fn group_delimiter_entries(
@@ -844,7 +855,9 @@ fn group_delimiter_entries(
             continue;
         };
         if let Some(idx) = rest.find(delim) {
-            let cp = format!("{prefix}{}", &rest[..=idx]);
+            // Up to and including the whole delimiter (it may be longer
+            // than one byte).
+            let cp = format!("{prefix}{}", &rest[..idx + delim.len()]);
             if seen_cp.insert(cp.clone()) {
                 entries.push((cp.clone(), DelimEntry::Prefix(cp)));
             }
@@ -870,4 +883,112 @@ pub struct IndexStats {
     pub object_bytes: u64,
     /// Multipart uploads in progress.
     pub uploads: u64,
+}
+
+#[cfg(test)]
+mod list_tests {
+
+    //! `list_objects` against a model of the S3 listing it implements: keys
+    //! under the prefix, rolled up into common prefixes at the first
+    //! delimiter after it, in byte order, after `start_after`, `max_keys` a
+    //! page; and paging with `next` returns the whole listing once.
+
+    use super::*;
+    use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, MetaStore, Namespaces};
+    use pigeonhole_storage_memory::MemoryBlobStore;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[(self.next() % xs.len() as u64) as usize]
+        }
+        fn word(&mut self, alphabet: &[&str], max: u64) -> String {
+            (0..=self.next() % max).map(|_| *self.pick(alphabet)).collect()
+        }
+    }
+
+    /// The model: every entry (object key or common prefix) in order.
+    fn model(keys: &[String], prefix: &str, delim: Option<&str>) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for k in keys {
+            let Some(rest) = k.strip_prefix(prefix) else { continue };
+            let entry = match delim.filter(|d| !d.is_empty()).and_then(|d| rest.find(d).map(|i| (d, i))) {
+                Some((d, i)) => (format!("{prefix}{}", &rest[..i + d.len()]), true),
+                None => (k.clone(), false),
+            };
+            out.push(entry);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    async fn index() -> Index {
+        let log = Arc::new(ChainLogStore::new(Arc::new(MemoryBlobStore::new())));
+        let snaps = Arc::new(BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())));
+        let meta = MetaStore::open(log, snaps, Index::register(Namespaces::new()), Default::default()).await.unwrap();
+        Index::open(meta).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_objects_matches_the_model_and_pages_cover_it_once() {
+        // Characters around the edges: '/', a multi-byte delimiter, bytes
+        // whose UTF-8 ends in 0xBF ('¿'), and the top of ASCII.
+        let alphabet = ["a", "b", "/", "-", "¿", "é", "z", "\u{7f}"];
+        let delimiters = [None, Some(""), Some("/"), Some("-"), Some("--"), Some("¿")];
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for case in 0..400 {
+            let ix = index().await;
+            let bucket = format!("bucket{case}");
+            ix.create_bucket(&bucket, "scope").await.unwrap();
+            let mut keys: Vec<String> = (0..25).map(|_| rng.word(&alphabet, 6)).collect();
+            keys.sort();
+            keys.dedup();
+            for k in &keys {
+                ix.put_object(&bucket, k, "etag", 0, None, &[], &[], "{}").await.unwrap();
+            }
+            for _ in 0..8 {
+                let prefix = if rng.next() % 3 == 0 { String::new() } else { rng.word(&alphabet, 2) };
+                let delim = *rng.pick(&delimiters);
+                let max_keys = 1 + (rng.next() % 5) as i64;
+                let want = model(&keys, &prefix, delim);
+                // Page through it.
+                let mut got: Vec<(String, bool)> = Vec::new();
+                let mut after: Option<String> = None;
+                for _ in 0..200 {
+                    let (objs, prefixes, truncated, next) =
+                        ix.list_objects(&bucket, &prefix, delim, max_keys, after.as_deref()).await.unwrap();
+                    let mut page: Vec<(String, bool)> = objs.into_iter().map(|o| (o.key, false)).collect();
+                    page.extend(prefixes.into_iter().map(|p| (p, true)));
+                    page.sort();
+                    assert!(page.len() as i64 <= max_keys);
+                    got.extend(page);
+                    if !truncated {
+                        break;
+                    }
+                    after = Some(next.expect("a truncated page names where to go on"));
+                }
+                assert_eq!(
+                    got, want,
+                    "case {case}: keys {keys:?}, prefix {prefix:?}, delimiter {delim:?}, max_keys {max_keys}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_prefix_end_steps_a_character() {
+        use super::exclusive_prefix_end as end;
+        assert_eq!(end("a/").as_deref(), Some("a0"));
+        assert_eq!(end("¿").as_deref(), Some("À"), "C2 BF steps to C3 80, not to invalid C2 C0");
+        assert_eq!(end("\u{d7ff}").as_deref(), Some("\u{e000}"), "surrogates are skipped");
+        assert_eq!(end(&format!("a{}", char::MAX)).as_deref(), Some("b"));
+        assert_eq!(end(""), None);
+    }
 }
