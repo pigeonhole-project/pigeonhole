@@ -54,9 +54,18 @@ fn snaps_of(meta_dir: &Path) -> Arc<crate::BlobSnapshotStore<DiskBlobStore>> {
 }
 
 /// Live snapshot blobs in `<meta_dir>/snapshots`.
-fn snapshot_count(meta_dir: &Path) -> usize {
+async fn snapshot_count(meta_dir: &Path) -> usize {
     let store = DiskBlobStore::open(meta_dir.join("snapshots")).unwrap();
-    futures::executor::block_on(pigeonhole_storage_api::Sweepable::candidates(&store, None, u64::MAX, 1000)).unwrap().len()
+    pigeonhole_storage_api::Sweepable::candidates(&store, None, u64::MAX, 1000).await.unwrap().len()
+}
+
+/// Wait until there are at most `n` snapshots in `meta_dir`.
+async fn snapshots_down_to(meta_dir: &Path, n: usize, what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while snapshot_count(meta_dir).await > n {
+        assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 async fn open_dir(meta_dir: &Path, namespaces: Namespaces) -> Result<Arc<MetaStore>> {
@@ -377,7 +386,7 @@ async fn snapshots_collect_the_log_and_boot_from_them() {
     let base = d.base.expect("the log starts from a snapshot");
     let stored = snaps_of(&log_dir).get(&base.snapshot).await.unwrap();
     assert_eq!(raft::RaftSnapshot::decode(&stored.data).unwrap().tablet.position, base.at);
-    eventually("older snapshots removed", || snapshot_count(&log_dir) <= 2).await;
+    snapshots_down_to(&log_dir, 2, "older snapshots removed").await;
     let segs = segments(&log_dir);
     assert!(segs[0] > "seg-0000000001".to_string(), "log behind the base collected: {segs:?}");
 
@@ -535,9 +544,9 @@ async fn an_idle_tablet_snapshots_by_time() {
     let d = log.discover().await.unwrap().unwrap();
     assert_eq!(d.base.map(|b| b.at), Some(applied));
     // Nothing new: no more snapshots (an older one may still be on its way out).
-    eventually("only the base snapshot is kept", || snapshot_count(dir.path()) == 1).await;
+    snapshots_down_to(dir.path(), 1, "only the base snapshot is kept").await;
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(snapshot_count(dir.path()), 1);
+    assert_eq!(snapshot_count(dir.path()).await, 1);
 }
 
 
@@ -576,6 +585,7 @@ async fn timing_probe() {
 /// Proposals queued together share entries; every one is counted in and out
 /// of the queue and its wait recorded.
 #[test]
+#[cfg(not(madsim))] // builds a runtime of its own (a thread-local recorder)
 fn batcher_metrics_add_up() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     const N: usize = 50;

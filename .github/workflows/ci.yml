@@ -38,6 +38,11 @@ jobs:
         env:
           MADSIM_TEST_NUM: "50"
           MADSIM_TEST_CHECK_DETERMINISM: "1"
+      - name: Every library's tests under the simulator, 3 seeds each
+        run: make sim-all
+        env:
+          MADSIM_TEST_NUM: "3"
+          MADSIM_TEST_CHECK_DETERMINISM: "1"
 
   code-report:
     name: code report

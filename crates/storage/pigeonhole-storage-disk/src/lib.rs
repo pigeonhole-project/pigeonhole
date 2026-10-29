@@ -125,9 +125,13 @@ impl DiskBlobStore {
         out
     }
 
-    /// Spend the virtual time a simulated disk says the I/O took.
+    /// Spend the virtual time a simulated disk says the I/O took. Under the
+    /// simulator a real disk costs a nominal millisecond per operation, or a
+    /// writer that only waits for its disk would stop the clock.
     async fn charge(&self) {
         let cost = self.fs.take_cost();
+        #[cfg(madsim)]
+        let cost = cost.max(std::time::Duration::from_millis(1));
         if !cost.is_zero() {
             tokio::time::sleep(cost).await;
         }
