@@ -357,3 +357,38 @@ async fn a_lease_log_rebase_keeps_the_newest_lease_record() {
     let got: Vec<_> = b.read(8, head).try_collect().await.unwrap();
     assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![9, 10, 11]);
 }
+
+/// A clean shutdown releases the lease: the next claim does not wait.
+#[tokio::test]
+async fn a_released_lease_is_claimed_at_once() {
+    let channel = Arc::new(FakeDiscord::new(87));
+    let a = leased(&channel);
+    a.claim(1).await.unwrap();
+    for i in 1..=3 {
+        a.append(1, &[entry(i)]).await.unwrap();
+    }
+    a.release(1).await.unwrap();
+    assert!(a.append(1, &[entry(99)]).await.is_err(), "released: writes no more");
+    let t0 = std::time::Instant::now();
+    let b = leased(&channel);
+    assert_eq!(b.claim(2).await.unwrap().position, 3);
+    assert!(t0.elapsed() < LEASE / 2, "no wait after a release: {:?}", t0.elapsed());
+    b.append(2, &[entry(4)]).await.unwrap();
+    assert_eq!(history(leased(&channel).as_ref()).await, vec![1, 2, 3, 4]);
+}
+
+/// A release while a renewal is in flight still ends the lease.
+#[tokio::test]
+async fn a_release_after_a_renewal_in_flight() {
+    let channel = Arc::new(FakeDiscord::new(88));
+    let a = leased(&channel);
+    a.claim(1).await.unwrap();
+    a.append(1, &[entry(1)]).await.unwrap();
+    tokio::time::sleep(LEASE / 2).await;
+    a.append(1, &[entry(2)]).await.unwrap(); // spawns a renewal
+    a.release(1).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let b = leased(&channel);
+    assert_eq!(b.claim(2).await.unwrap().position, 2);
+    assert!(t0.elapsed() < LEASE / 2, "no wait after a release: {:?}", t0.elapsed());
+}

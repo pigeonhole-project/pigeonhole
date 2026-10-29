@@ -236,9 +236,14 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
   - a second claim waited out the lease (10.6 s) and fenced the first
     writer;
   - a reader saw all 11 entries.
-- **Not done**: the `flock` shortcut, and a release on clean shutdown. Every
-  restart waits up to `lease_secs`. Also no simulation tests for the lease
-  yet.
+- **Release on a clean shutdown**: on SIGINT or SIGTERM, `serve` calls
+  `MetaStore::close`. It stops Raft, then `LogStore::release` links a
+  `log-release-<gen>` record after the newest lease record. A release's
+  lease ends at its own stamp, so the next claimant waits only for its
+  probes and the margin. Live: a claim after a release took 3.0 s, against
+  a 10 s wait without one.
+- **Not done**: the `flock` shortcut after a crash on the same host, and
+  simulation tests for the lease. A crash still costs up to `lease_secs`.
 
 ## Steps
 

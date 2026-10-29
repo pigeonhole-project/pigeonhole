@@ -185,6 +185,12 @@ async fn lease_log_against_a_live_channel() {
         .map(|(_, e)| u64::from_le_bytes(e.payload.try_into().unwrap()))
         .collect();
     assert_eq!((d.gen, got), (2, (1..=11).collect::<Vec<_>>()));
+
+    // A clean shutdown: the next claim goes in at once.
+    b.release(2).await.unwrap();
+    let t = Instant::now();
+    assert_eq!(open().claim(3).await.unwrap().position, 11);
+    println!("a claim after a release in {:?}", t.elapsed());
     empty(&ch).await;
 }
 

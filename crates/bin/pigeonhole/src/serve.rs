@@ -114,8 +114,30 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     tokio::select! {
         r = axum::serve(listener, app) => r.context("serve")?,
         stop = rt.meta.stopped() => anyhow::bail!("{stop}"),
+        signal = shutdown_signal() => {
+            info!(%signal, "shutting down: releasing the metadata log");
+            rt.meta.close().await?;
+        }
     }
     Ok(())
+}
+
+/// SIGINT or SIGTERM: which one came.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install a SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = term.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
 }
 
 /// Returns true when `/metrics` should be mounted on the main HTTP router.

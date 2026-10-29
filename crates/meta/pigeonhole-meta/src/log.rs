@@ -220,4 +220,10 @@ pub trait LogStore: Send + Sync + 'static {
     /// Wait for background work (the collection after a rebase); tests use
     /// it before looking at what a rebase dropped.
     async fn settle(&self) {}
+
+    /// A clean shutdown: generation `gen` writes no more, and a log held by
+    /// a lease lets the next claimant in at once. Nothing to do elsewhere.
+    async fn release(&self, _gen: u64) -> LogResult<()> {
+        Ok(())
+    }
 }
