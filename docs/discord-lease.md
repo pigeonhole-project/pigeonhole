@@ -1,6 +1,6 @@
 # A lease for the Discord log: appends without a thread each
 
-Status: **proposal**, not implemented; a live spike comes first (§ Spike).
+Status: **proposal**, not implemented; the spike ran (§ Spike findings): its assumptions hold.
 Read [discord-log.md](discord-log.md) (the thread fence this changes),
 [chain-log.md](chain-log.md) and
 [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md) first.
@@ -163,6 +163,37 @@ On a test channel, with two bots or two tokens where noted:
    `X-RateLimit-*` honoured over minutes; does the bucket span channels?
 5. **Thread budget with renewals**: a writer renewing every 15 s plus claims.
    What is left for anything else?
+
+## Spike findings (2026-10-29, one bot, the test log channel, API v10)
+
+Two writers posting text messages in parallel, 130 messages in all. After
+each 201 the writer listed the newest 50 messages. Everything was deleted
+afterwards (`/tmp/dspike/lease_spike.py`).
+
+- **Read after write (A): held, 130 of 130.** Each message was in the
+  listing right after its 201.
+- **Id order vs happened-before: no inversion.** When one message's 201
+  came back before another was sent, the second always had the higher id.
+  Concurrent sends swapped order twice, which is expected and harmless.
+- **Skew (B): ≤ ~150 ms.** Every snowflake fits `[send, receive]` shifted by
+  one clock offset (our clock vs Discord's): the offset lies in
+  [629, 780] ms for all 130. The nodes that stamped them agree to within
+  that 150 ms window, and the window includes our own timing error.
+  `ε` = 1 s is generous.
+- **Server time witness: the snowflake.** The `Date` header has whole
+  seconds. Every POST's answer gives server time to the millisecond. A
+  writer's own appends and renewals carry it for free; a claimant needs one
+  probe message.
+- **Message create: 5 per 5 s per channel.** `X-RateLimit-Limit: 5`, reset
+  about 5 s. The bucket hash is one for all channels, but counts go per
+  channel: a burst in the log and the snapshot channels at once spent 5 in
+  each. Two writers in one channel sustained 1.03 messages/s. RTT p50
+  322 ms, max 1.6 s.
+- **Not run: renewals against the thread budget (5).** At `D` = 45 s
+  renewals take ~4 threads a minute of the ~10.
+
+So A and B hold with margin. A lease's batch costs one POST (~0.3 s) and
+appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
 
 ## Steps
 
