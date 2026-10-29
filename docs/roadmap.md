@@ -282,6 +282,14 @@ disk; scenarios: log model check, takeover, power failure, `sweep_stress`
 over S3, a damaged replica. A crc per stored block (chunk `VERSION` 3).
 `make sim` in CI with 50 seeds.
 
+### Step 11a — Log retention
+
+[log-retention.md](log-retention.md) (proposal): keep the newest snapshots
+and the log from the oldest of them by a policy (`[meta.retain]`); one
+collector deletes below a watermark that only rises, paced and batched; a
+boot falls back to an older snapshot when the newest is damaged; later a
+point-in-time restore with reclaim gated on the watermark.
+
 ### Step 12 — OpenDAL
 
 Design to write. (1) An OpenDAL blob store (`kind = "opendal"`, scheme +
