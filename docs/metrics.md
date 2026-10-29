@@ -142,6 +142,10 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_s3_objects` | gauge |  | Objects |
 | `pigeonhole_s3_object_bytes` | gauge |  | Logical bytes of all objects |
 | `pigeonhole_s3_uploads` | gauge |  | Multipart uploads in progress |
+| `pigeonhole_inline_objects` | gauge |  | Objects stored inline in the metadata (docs/inline-objects.md) |
+| `pigeonhole_inline_bytes` | gauge |  | Bytes of the objects stored inline in the metadata |
+| `pigeonhole_cooled_total` | counter | `reason` | Inline objects the cooler moved out to chunks: age (not rewritten for cool_after) or budget |
+| `pigeonhole_cool_rejected_total` | counter |  | Inline objects the cooler picked that changed before it moved them (left as they are) |
 | `pigeonhole_chunks` | gauge | `state` | Chunks: live, unreferenced (the sweeper's next work), reclaiming |
 | `pigeonhole_chunk_logical_bytes` | gauge |  | Logical bytes of all chunks (shared extents count once) |
 | `pigeonhole_chunk_stored_bytes` | gauge | `instance` | Stored bytes of the chunk replicas an instance holds |

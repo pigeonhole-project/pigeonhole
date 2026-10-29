@@ -1,9 +1,11 @@
-//! Binary-only: long-running tasks spawned by `serve` (sweep, repair).
+//! Binary-only: long-running tasks spawned by `serve` (sweep, repair, cool).
 
 use crate::runtime::Runtime;
 use pigeonhole::config::Config;
 use pigeonhole_chunk_store::{Repairer, Sweeper};
-use tracing::info;
+use pigeonhole_gateway_s3::S3Gateway;
+use std::time::Instant;
+use tracing::{info, warn};
 
 pub fn spawn_background_tasks(cfg: &Config, rt: &Runtime) {
     let members: Vec<_> = rt.store.replicated().members().to_vec();
@@ -34,5 +36,41 @@ pub fn spawn_background_tasks(cfg: &Config, rt: &Runtime) {
         batch_size = cfg.repair.batch_size,
         scrub = cfg.repair.scrub,
         "repair background task started"
+    );
+}
+
+/// The cooler (docs/inline-objects.md): every `[inline] cool_every_secs`,
+/// move the inline objects that went cold, or are over budget, out to chunks.
+pub fn spawn_cooler(cfg: &Config, gateway: S3Gateway) {
+    if cfg.inline.max_object_bytes == 0 {
+        return;
+    }
+    let (policy, every) = (cfg.inline.cool.clone(), cfg.inline.cool_every);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let t0 = Instant::now();
+            match gateway.cool_pass(&policy).await {
+                Ok(s) => {
+                    metrics::counter!("pigeonhole_cooled_total", "reason" => "age").increment(s.by_age);
+                    metrics::counter!("pigeonhole_cooled_total", "reason" => "budget").increment(s.by_budget);
+                    metrics::counter!("pigeonhole_cool_rejected_total").increment(s.rejected);
+                    if s.by_age + s.by_budget + s.rejected > 0 {
+                        info!(by_age = s.by_age, by_budget = s.by_budget, rejected = s.rejected, "cooled inline objects");
+                    }
+                    pigeonhole_blob::record_background_pass("cool", true, t0.elapsed());
+                }
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "cooler pass failed");
+                    pigeonhole_blob::record_background_pass("cool", false, t0.elapsed());
+                }
+            }
+        }
+    });
+    info!(
+        max_object_bytes = cfg.inline.max_object_bytes,
+        budget_bytes = cfg.inline.cool.budget_bytes,
+        every_secs = every.as_secs(),
+        "cooler background task started"
     );
 }

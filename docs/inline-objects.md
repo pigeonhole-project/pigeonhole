@@ -1,6 +1,6 @@
 # Small objects inline in the metadata, cooled out when cold
 
-Status: design (2026-10-30).
+Status: implemented (2026-10-30).
 
 ## Why
 
@@ -85,11 +85,11 @@ always wins over cooling, and cooling never changes what a reader sees.
 `S3State` keeps `inline_bytes` (sum of inline bodies), derived in
 `rebuild()` and maintained by `apply`. `S3State::VERSION` bumps.
 
-`mtime` is already in the record; it is what "cold" is measured by, so the
-decision is deterministic in the state. Reads are not in the log; the
-cooler may still prefer objects not read lately (in-memory, on the node
-that cools), since the choice travels in the `Cool` command and replay only
-checks it.
+`mtime` is already in the record; it is what "cold" is measured by. Reads
+are not in the log; a cooler that preferred objects not read lately (an
+in-memory record on the node that cools) would still be safe, since the
+choice travels in the `Cool` command and replay only checks it. Not built:
+the cooler goes by `mtime` alone.
 
 ## Paths
 
@@ -120,17 +120,18 @@ A background task like the sweeper and the repairer (only on the node that
 holds the tablet; with Raft, the leader). Each pass:
 
 1. Candidates: inline objects with `mtime` older than `cool_after_secs`;
-   if `inline_bytes > budget_bytes`, also the oldest by last read (else by
-   `mtime`) until the projected total is under `low_watermark ×
-   budget_bytes`. Never one written within `min_inline_secs`. At most
-   `cool_batch`.
+   if `inline_bytes > budget_bytes`, also the oldest by `mtime` until the
+   projected total is under `low_watermark × budget_bytes`. Never one
+   written within `min_inline_secs`. At most `cool_batch`.
 2. For each: ingest its bytes as a chunk (the ordinary write path, so the
    placement, replication and codec settings apply), then commit the chunk
    along with `Cool { etag }` in one entry. A rejected `Cool` releases the
    chunk.
 
-It spends the stores' spare budget only, like the log's collection
-(`wait_idle`), so cooling never queues in front of client writes.
+A pass moves at most `cool_batch` objects, one after the other, every
+`cool_every_secs`. It does not yet wait for the stores' spare budget (as the
+log's collection does with `wait_idle`), so a pass in a busy channel queues
+with client writes: keep `cool_batch` small there.
 
 ## Durability and cost
 
@@ -147,10 +148,10 @@ of log a day until the next snapshot rebases it away.
 ## Observability
 
 Gauges `pigeonhole_inline_bytes`, `pigeonhole_inline_objects`; counters
-`pigeonhole_inline_writes_total`, `pigeonhole_cooled_total{reason="age"|"budget"}`,
+`pigeonhole_cooled_total{reason="age"|"budget"}`,
 `pigeonhole_cool_rejected_total`; a cooler pass in
-`pigeonhole_background_pass_seconds{task="cool"}`. A request log line says
-`inline=true` for an inline write or read.
+`pigeonhole_background_pass_seconds{task="cool"}`. The `PutObject ok` log
+line says `inline=true` for an inline write.
 
 ## Measured (step 0, 2026-10-30)
 

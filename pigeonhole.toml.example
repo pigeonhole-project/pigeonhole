@@ -93,6 +93,18 @@ codec = "zstd"
 # Logical block size for block packing (default 1 MiB).
 block_size = "1 MiB"
 
+# Small objects in the metadata (docs/inline-objects.md): stored in the log
+# entry that writes them, read from memory, no chunk and no post. A cooler
+# moves them out to chunks once cold or when the tablet holds too many.
+[inline]
+max_object_bytes = 1024       # 0 = never inline
+budget_bytes = 67108864       # all inline bytes; above it the oldest go out
+low_watermark = 0.9           # ... until under this share of the budget
+cool_after_secs = 600         # out once not rewritten this long (0 = only by budget)
+min_inline_secs = 30          # never out while written less than this long ago
+cool_every_secs = 60
+cool_batch = 64
+
 [ingest]
 # Process-wide cap on ingest buffers across concurrent PUTs (default 256 MiB).
 memory_budget = "256 MiB"

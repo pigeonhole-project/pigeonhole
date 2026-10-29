@@ -9,7 +9,7 @@ use pigeonhole_blob::CacheConfig;
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, LimiterRegistry};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
-use pigeonhole_gateway_s3::S3Options;
+use pigeonhole_gateway_s3::{CoolPolicy, S3Options};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::env;
@@ -79,7 +79,27 @@ pub struct Config {
     pub metrics: MetricsSettings,
     /// What the process logs (`[log]`).
     pub log: LoggingSettings,
+    /// Small objects in the metadata, and the cooler (`[inline]`).
+    pub inline: InlineSettings,
     pub config_path: PathBuf,
+}
+
+/// `[inline]` (docs/inline-objects.md).
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineSettings {
+    /// Objects up to this size are stored inline; 0 = never.
+    pub max_object_bytes: usize,
+    /// When the cooler moves inline objects out.
+    pub cool: CoolPolicy,
+    /// Pause between cooler passes.
+    pub cool_every: Duration,
+}
+
+impl InlineSettings {
+    /// Nothing inline (tests that count chunks).
+    pub fn off() -> Self {
+        Self { max_object_bytes: 0, cool: CoolPolicy::default(), cool_every: Duration::from_secs(60) }
+    }
 }
 
 /// Default `[log] level`: our crates at `info`; openraft's per-step chatter
@@ -357,6 +377,7 @@ impl Config {
             repair: file.repair.into_repair_config(),
             metrics: file.metrics.into_settings(),
             log: file.log.into_settings(),
+            inline: file.inline.into_settings()?,
             config_path,
         })
     }
@@ -406,6 +427,7 @@ impl Config {
             repair: RepairConfig::default(),
             metrics: MetricsSettings::default(),
             log: LoggingSettings::default(),
+            inline: InlineSettings::off(),
             config_path: PathBuf::from("(test)"),
         }
     }
@@ -418,6 +440,7 @@ impl Config {
             chunk_codec: self.chunk_codec,
             block_size: self.block_size,
             ingest_budget: self.ingest_budget.clone(),
+            inline_max_bytes: self.inline.max_object_bytes,
         }
     }
 
@@ -490,6 +513,8 @@ struct FileConfig {
     metrics: FileMetrics,
     #[serde(default)]
     log: FileLog,
+    #[serde(default)]
+    inline: FileInline,
 }
 
 #[derive(Debug, Deserialize)]
@@ -533,6 +558,7 @@ impl Default for FileConfig {
             repair: FileRepair::default(),
             metrics: FileMetrics::default(),
             log: FileLog::default(),
+            inline: FileInline::default(),
         }
     }
 }
@@ -655,6 +681,53 @@ impl FileMetrics {
             enabled: self.enabled,
             listen_addr,
         }
+    }
+}
+
+/// `[inline]`: small objects in the metadata (docs/inline-objects.md).
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileInline {
+    max_object_bytes: usize,
+    budget_bytes: u64,
+    low_watermark: f64,
+    cool_after_secs: u64,
+    min_inline_secs: u64,
+    cool_every_secs: u64,
+    cool_batch: usize,
+}
+
+impl Default for FileInline {
+    fn default() -> Self {
+        let p = CoolPolicy::default();
+        Self {
+            max_object_bytes: 1024,
+            budget_bytes: p.budget_bytes,
+            low_watermark: p.low_watermark,
+            cool_after_secs: p.cool_after.map_or(0, |d| d.as_secs()),
+            min_inline_secs: p.min_inline.as_secs(),
+            cool_every_secs: 60,
+            cool_batch: p.batch,
+        }
+    }
+}
+
+impl FileInline {
+    fn into_settings(self) -> Result<InlineSettings> {
+        if !(0.0..=1.0).contains(&self.low_watermark) {
+            bail!("inline.low_watermark must be within 0..=1");
+        }
+        Ok(InlineSettings {
+            max_object_bytes: self.max_object_bytes,
+            cool: CoolPolicy {
+                budget_bytes: self.budget_bytes,
+                low_watermark: self.low_watermark,
+                cool_after: (self.cool_after_secs > 0).then(|| Duration::from_secs(self.cool_after_secs)),
+                min_inline: Duration::from_secs(self.min_inline_secs),
+                batch: self.cool_batch.max(1),
+            },
+            cool_every: Duration::from_secs(self.cool_every_secs.max(1)),
+        })
     }
 }
 
