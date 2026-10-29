@@ -274,7 +274,7 @@ hold the log and snapshots; live tests.
 
 ### Step 11 — Fault injection
 
-Design to write. A decorator over `BlobBackend + Chain`: delays, errors, 429s
+Design: [fault-injection.md](fault-injection.md) (proposal). A decorator over `BlobBackend + Chain`: delays, errors, 429s
 / flood waits, lost and corrupted blobs, late visibility, all from a seed; the
 `LogStore` conformance suite, the tablet and `sweep_stress` run through it.
 
