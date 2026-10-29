@@ -4,7 +4,7 @@
 //! an `s3` command (see [`crate::commands`]). Chunk refcounts live in the
 //! chunk store ([`ChunkStore::retain`] / [`release`]).
 
-use crate::commands::{ObjectRec, S3Command, S3Reject, S3State, UploadRec, NAMESPACE};
+use crate::commands::{Expect, ObjectRec, S3Command, S3Reject, S3State, UploadRec, NAMESPACE};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
@@ -12,6 +12,19 @@ use pigeonhole_meta::{MetaStore, Namespaces, Prepared};
 use serde::{Deserialize, Serialize};
 use std::ops::Bound;
 use std::sync::Arc;
+
+/// A conditional write refused (docs/conditional-writes.md): the key's
+/// object was not what the write expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rejected(pub S3Reject);
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "conditional write refused: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for Rejected {}
 
 #[derive(Clone)]
 pub struct Index {
@@ -124,11 +137,26 @@ impl Index {
         self.meta.propose::<S3State>(cmd).await
     }
 
+    /// A conditional write: its refusal is a [`Rejected`] error.
+    async fn propose_expecting(&self, cmd: S3Command) -> Result<Vec<ChunkId>> {
+        match self.propose(cmd).await? {
+            Ok(ids) => Ok(ids),
+            Err(reason @ (S3Reject::PreconditionFailed | S3Reject::NoSuchKey)) => Err(Rejected(reason).into()),
+            Err(reason) => anyhow::bail!("unexpected s3 rejection {reason:?}"),
+        }
+    }
+
     async fn propose_infallible(&self, cmd: S3Command) -> Result<Vec<ChunkId>> {
         match self.propose(cmd).await? {
             Ok(ids) => Ok(ids),
             Err(reason) => anyhow::bail!("unexpected s3 rejection {reason:?}"),
         }
+    }
+
+    /// Whether a conditional write would be refused now. Only to fail early,
+    /// before the body is read: the command decides when it applies.
+    pub fn check_expect(&self, bucket: &str, key: &str, expect: Option<&Expect>) -> Result<()> {
+        self.read(|s| s.check(bucket, key, expect)).map_err(|r| Rejected(r).into())
     }
 
     /// Returns false when the bucket already exists.
@@ -183,7 +211,7 @@ impl Index {
         checksums_json: &str,
     ) -> Result<Vec<ChunkId>> {
         let mtime = Utc::now().to_rfc3339();
-        self.put_object_at(bucket, key, etag, size, content_type, extents, user_meta, checksums_json, &mtime)
+        self.put_object_at(bucket, key, etag, size, content_type, extents, user_meta, checksums_json, &mtime, None)
             .await
     }
 
@@ -199,8 +227,9 @@ impl Index {
         user_meta: &[(String, String)],
         checksums_json: &str,
         mtime: &str,
+        expect: Option<Expect>,
     ) -> Result<Vec<ChunkId>> {
-        self.propose_infallible(S3Command::PutObject {
+        self.propose_expecting(S3Command::PutObject {
             bucket: bucket.into(),
             key: key.into(),
             etag: etag.into(),
@@ -208,15 +237,18 @@ impl Index {
             content_type: content_type.map(Into::into),
             extents: extents.to_vec(),
             user_meta: user_meta.to_vec(),
+            tags: Vec::new(),
             checksums_json: checksums_json.into(),
             mtime: mtime.into(),
+            expect,
         })
         .await
     }
 
-    /// The `PutObject` of [`Self::put_object`], to commit with the object's
-    /// chunks in one entry. Outcome: the previous object's chunk ids, or
-    /// `BucketNotFound`.
+    /// The `PutObject` of [`Self::put_object`] with its tags, to commit with
+    /// the object's chunks in one entry. Outcome: the previous object's chunk
+    /// ids, or `BucketNotFound`, or a refusal of `expect` (`PreconditionFailed`,
+    /// `NoSuchKey`).
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_put_object(
         &self,
@@ -227,7 +259,9 @@ impl Index {
         content_type: Option<&str>,
         extents: &[Extent],
         user_meta: &[(String, String)],
+        tags: &[(String, String)],
         checksums_json: &str,
+        expect: Option<Expect>,
     ) -> Prepared<S3State> {
         Prepared::new(&S3Command::PutObject {
             bucket: bucket.into(),
@@ -237,15 +271,11 @@ impl Index {
             content_type: content_type.map(Into::into),
             extents: extents.to_vec(),
             user_meta: user_meta.to_vec(),
+            tags: tags.to_vec(),
             checksums_json: checksums_json.into(),
             mtime: Utc::now().to_rfc3339(),
+            expect,
         })
-    }
-
-    /// The `PutObjectTags` of [`Self::put_object_tags`] (`NoSuchKey` if the
-    /// object is not there when it applies).
-    pub fn prepare_put_object_tags(&self, bucket: &str, key: &str, tags: &[(String, String)]) -> Prepared<S3State> {
-        Prepared::new(&S3Command::PutObjectTags { bucket: bucket.into(), key: key.into(), tags: tags.to_vec() })
     }
 
     /// The `PutPart` of [`Self::put_multipart_part`]. Outcome: the replaced
@@ -341,12 +371,16 @@ impl Index {
         Ok(())
     }
 
-    /// Delete object; returns extents' chunk ids to `release`, or `None` if missing.
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<ChunkId>>> {
-        let cmd = S3Command::DeleteObject { bucket: bucket.into(), key: key.into() };
+    /// Delete object; returns extents' chunk ids to `release`, or `None` if
+    /// missing. With `expect` (`If-Match`), a missing or different object is
+    /// a [`Rejected`] error.
+    pub async fn delete_object(&self, bucket: &str, key: &str, expect: Option<Expect>) -> Result<Option<Vec<ChunkId>>> {
+        let conditional = expect.is_some();
+        let cmd = S3Command::DeleteObject { bucket: bucket.into(), key: key.into(), expect };
         match self.propose(cmd).await? {
             Ok(ids) => Ok(Some(ids)),
-            Err(S3Reject::NoSuchKey) => Ok(None),
+            Err(S3Reject::NoSuchKey) if !conditional => Ok(None),
+            Err(reason @ (S3Reject::PreconditionFailed | S3Reject::NoSuchKey)) => Err(Rejected(reason).into()),
             Err(other) => anyhow::bail!("unexpected delete_object rejection {other:?}"),
         }
     }
@@ -376,6 +410,7 @@ impl Index {
         content_type: Option<&str>,
         user_meta: &[(String, String)],
         copy_source_meta: bool,
+        expect: Option<Expect>,
     ) -> Result<(ObjectMeta, Vec<ChunkId>)> {
         let ct = content_type.or(src.content_type.as_deref());
         let meta = if copy_source_meta {
@@ -395,6 +430,7 @@ impl Index {
                 meta,
                 &src.checksums_json,
                 &mtime,
+                expect,
             )
             .await?;
 
@@ -537,7 +573,7 @@ impl Index {
         }
         let objects: Vec<(String, String)> = self.read(|s| s.objects.keys().cloned().collect());
         for (bucket, key) in objects {
-            released.extend(self.delete_object(&bucket, &key).await?.unwrap_or_default());
+            released.extend(self.delete_object(&bucket, &key, None).await?.unwrap_or_default());
         }
         for bucket in self.list_buckets().await? {
             self.delete_bucket(&bucket.name).await?;
@@ -626,6 +662,7 @@ impl Index {
         part_numbers: &[i64],
         etag: &str,
         total_size: i64,
+        expect: Option<Expect>,
     ) -> Result<Vec<ChunkId>> {
         let cmd = S3Command::CompleteUpload {
             upload_id: upload.upload_id.clone(),
@@ -633,10 +670,12 @@ impl Index {
             etag: etag.into(),
             total_size,
             mtime: Utc::now().to_rfc3339(),
+            expect,
         };
         match self.propose(cmd).await? {
             Ok(ids) => Ok(ids),
             Err(S3Reject::MissingPart(pn)) => anyhow::bail!("missing part {pn}"),
+            Err(reason @ (S3Reject::PreconditionFailed | S3Reject::NoSuchKey)) => Err(Rejected(reason).into()),
             Err(other) => anyhow::bail!("complete_multipart_upload rejected: {other:?}"),
         }
     }

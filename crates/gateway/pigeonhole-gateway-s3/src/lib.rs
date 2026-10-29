@@ -6,10 +6,10 @@ pub mod index;
 mod service;
 
 pub use index::{
-    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ObjectMeta,
+    parse_rfc3339, Rejected, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ObjectMeta,
 };
 pub use pigeonhole_chunk_store::{ChunkStore, Extent};
-pub use commands::{Pairs, Released, S3Command, S3Reject, S3State};
+pub use commands::{Expect, Pairs, Released, S3Command, S3Reject, S3State};
 pub use service::{S3Gateway, S3Options};
 
 use s3s::access::{S3Access, S3AccessContext};

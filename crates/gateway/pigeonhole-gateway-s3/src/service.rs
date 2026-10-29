@@ -1,9 +1,9 @@
 //! S3 API implementation on top of gateway index + ChunkStore (via s3s).
 
 use crate::checksums::{self, copy_checksums, IncomingChecksums};
-use crate::commands::{S3Reject, S3State};
+use crate::commands::{Expect, S3Reject, S3State};
 use crate::index::{
-    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ListPage, SourceSnapshot,
+    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ListPage, Rejected, SourceSnapshot,
 };
 use pigeonhole_meta::{Outcome, Prepared, Proposal};
 use pigeonhole_chunk_store::Extent;
@@ -95,20 +95,16 @@ impl S3Gateway {
         }));
     }
 
-    /// Commit an ingest's chunks and `command` (and `then`, if any) as one
-    /// entry; the outcome of `command`. The chunks are committed even if
-    /// `command` is rejected: the caller releases them then.
+    /// Commit an ingest's chunks and `command` as one entry; the outcome of
+    /// `command`. The chunks are committed even if `command` is rejected: the
+    /// caller releases them then.
     async fn commit_with(
         &self,
         chunks: pigeonhole_chunk_store::PendingChunks,
         command: Prepared<S3State>,
-        then: Option<Prepared<S3State>>,
     ) -> S3Result<Outcome<S3State>> {
         let mut proposal = Proposal::new();
         let slot = proposal.push(command);
-        if let Some(t) = then {
-            proposal.push(t);
-        }
         let mut outcomes =
             self.store.commit_along(chunks, self.index.meta(), proposal).await.map_err(Self::map_err)?;
         outcomes.take(slot).map_err(Self::map_err)
@@ -116,6 +112,24 @@ impl S3Gateway {
 
     fn map_err(e: impl std::fmt::Display) -> s3s::S3Error {
         s3_error!(InternalError, "{}", e)
+    }
+
+    /// A write's error: a refused condition as S3 answers it (412 / 404),
+    /// anything else as [`Self::map_err`].
+    fn write_err(e: anyhow::Error) -> s3s::S3Error {
+        match e.downcast_ref::<Rejected>() {
+            Some(Rejected(reject)) => Self::refused(*reject),
+            None => Self::map_err(format!("{e:#}")),
+        }
+    }
+
+    fn refused(reject: S3Reject) -> s3s::S3Error {
+        match reject {
+            S3Reject::PreconditionFailed => s3_error!(PreconditionFailed),
+            S3Reject::NoSuchKey => s3_error!(NoSuchKey),
+            S3Reject::BucketNotFound => s3_error!(NoSuchBucket),
+            other => Self::map_err(format!("rejected: {other:?}")),
+        }
     }
 
     /// Snapshot a copy source and take a ref on the chunks `select` picks from it.
@@ -162,6 +176,20 @@ impl S3Gateway {
 
 fn ts(rfc3339: &str) -> Timestamp {
     Timestamp::from(std::time::SystemTime::from(parse_rfc3339(rfc3339)))
+}
+
+/// The [`Expect`] of a write's `If-Match` / `If-None-Match`
+/// (docs/conditional-writes.md): `If-None-Match` takes only `*`, `If-Match`
+/// only an ETag, and not both at once.
+fn expect_of(if_match: Option<IfMatch>, if_none_match: Option<IfNoneMatch>) -> S3Result<Option<Expect>> {
+    match (if_match, if_none_match) {
+        (None, None) => Ok(None),
+        (None, Some(ETagCondition::Any)) => Ok(Some(Expect::Absent)),
+        (Some(ETagCondition::ETag(e)), None) => Ok(Some(Expect::ETag(e.value().to_string()))),
+        (None, Some(_)) => Err(s3_error!(InvalidArgument, "If-None-Match takes only *")),
+        (Some(_), None) => Err(s3_error!(InvalidArgument, "If-Match takes an ETag")),
+        (Some(_), Some(_)) => Err(s3_error!(InvalidArgument, "If-Match and If-None-Match together")),
+    }
 }
 
 fn etag_hex(hex: &str) -> ETag {
@@ -637,6 +665,11 @@ impl S3 for S3Gateway {
             return Err(s3_error!(NoSuchBucket));
         }
 
+        // Refuse a write bound to fail before reading its body; the command
+        // decides again when it applies.
+        let expect = expect_of(input.if_match.take(), input.if_none_match.take())?;
+        self.index.check_expect(&input.bucket, &input.key, expect.as_ref()).map_err(Self::write_err)?;
+
         let expected_md5 = parse_content_md5_header(input.content_md5.as_deref())?;
         let tags = match input.tagging.as_deref() {
             Some(h) => parse_tagging_header(h)?,
@@ -684,19 +717,18 @@ impl S3 for S3Gateway {
             content_type,
             &ingested.extents,
             &user_meta,
+            &tags,
             &checksums_json,
+            expect,
         );
-        let tagging = (!tags.is_empty()).then(|| self.index.prepare_put_object_tags(&input.bucket, &input.key, &tags));
         let chunks = std::mem::take(&mut ingested.chunks);
-        let old = match self.commit_with(chunks, put, tagging).await? {
+        let old = match self.commit_with(chunks, put).await? {
             Ok(old) => old,
             Err(reject) => {
-                // The bucket went away meanwhile: nothing points at the chunks.
+                // The bucket went away or the condition failed meanwhile:
+                // nothing points at the chunks.
                 self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
-                return Err(match reject {
-                    S3Reject::BucketNotFound => s3_error!(NoSuchBucket),
-                    other => Self::map_err(format!("PutObject rejected: {other:?}")),
-                });
+                return Err(Self::refused(reject));
             }
         };
         self.release_later(old);
@@ -856,11 +888,12 @@ impl S3 for S3Gateway {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
+        let expect = expect_of(input.if_match, None)?;
         if let Some(ids) = self
             .index
-            .delete_object(&input.bucket, &input.key)
+            .delete_object(&input.bucket, &input.key, expect)
             .await
-            .map_err(Self::map_err)?
+            .map_err(Self::write_err)?
         {
             self.release_later(ids);
         }
@@ -876,7 +909,7 @@ impl S3 for S3Gateway {
         let mut errors = Vec::new();
         for obj in input.delete.objects {
             let key = obj.key;
-            match self.index.delete_object(&input.bucket, &key).await {
+            match self.index.delete_object(&input.bucket, &key, None).await {
                 Ok(Some(ids)) => {
                     self.release_later(ids);
                     deleted.push(DeletedObject {
@@ -912,6 +945,8 @@ impl S3 for S3Gateway {
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let input = req.input;
+        let expect = expect_of(input.if_match, input.if_none_match)?;
+        self.index.check_expect(&input.bucket, &input.key, expect.as_ref()).map_err(Self::write_err)?;
         let (src_bucket, src_key) = match input.copy_source {
             CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
             _ => return Err(s3_error!(NotImplemented)),
@@ -963,13 +998,14 @@ impl S3 for S3Gateway {
                 content_type,
                 &user_meta,
                 copy_source_meta,
+                expect,
             )
             .await
         {
             Ok(r) => r,
             Err(e) => {
                 self.release_ids(&held).await;
-                return Err(Self::map_err(e));
+                return Err(Self::write_err(e));
             }
         };
         self.release_later(old);
@@ -1073,7 +1109,7 @@ impl S3 for S3Gateway {
         let etag = Self::etag_of(&ingested.md5);
         let put = self.index.prepare_put_part(&upload_id, part_number, &etag, ingested.size, &ingested.extents);
         let chunks = std::mem::take(&mut ingested.chunks);
-        let old = match self.commit_with(chunks, put, None).await? {
+        let old = match self.commit_with(chunks, put).await? {
             Ok(old) => old,
             Err(reject) => {
                 self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
@@ -1364,6 +1400,7 @@ impl S3 for S3Gateway {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let input = req.input;
+        let expect = expect_of(input.if_match, input.if_none_match)?;
         let upload_id = input.upload_id;
         let upload = self
             .index
@@ -1411,9 +1448,9 @@ impl S3 for S3Gateway {
 
         let old = self
             .index
-            .complete_multipart_upload(&upload, &part_numbers, &etag, total_size)
+            .complete_multipart_upload(&upload, &part_numbers, &etag, total_size, expect)
             .await
-            .map_err(Self::map_err)?;
+            .map_err(Self::write_err)?;
         self.release_later(old);
 
         Ok(S3Response::new(CompleteMultipartUploadOutput {
