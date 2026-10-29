@@ -133,6 +133,31 @@ messages (no paced thread), the same run gives
 The log is still the limit (an entry is a paced thread), but it no longer
 stalls.
 
+## Update: reading blocks in parallel does not help
+
+A chunk store that read up to n blocks of a chunk at once (an experiment,
+not kept: the reads go one block at a time). The same read phases with
+n = 1 and n = 8, back to back ([raw](bench/2026-10-29-read-concurrency/)):
+
+| cold GET, 92 MiB | n = 1 | n = 8 |
+|---|---|---|
+| Discord | 9.4 MiB/s, 0.10 s to a block's first byte | 6.8 MiB/s, 0.89 s |
+| Telegram | 5.9 MiB/s, no FLOOD_WAIT | 4.8 MiB/s, 60 FLOOD_WAITs (88 s) |
+
+- **Discord is bound by the link, not by latency**: with 8 reads at once
+  each takes ~9× longer and the sum does not grow; 9.4 MiB/s one at a time
+  is the link here. (The first run's 6.6 MiB/s had 149 ms to the first
+  byte; this one 100 ms.)
+- **Telegram floods parallel `upload.getFile`** well under our own limit
+  (15/s): 60 waits in one phase.
+
+So the code went: on these links reading ahead buys nothing, and on
+Telegram it costs flood waits. Worth trying again for a store bound by
+latency, not by the link, or once reads stream to the client (today a GET
+reads its whole range before it answers). What stayed:
+`instance_call_duration_seconds{op="get"}` times to the first byte, which
+is what showed it.
+
 ## What would move the numbers
 
 - **Telegram: more blob channels.** One chat's send budget is the ceiling
@@ -143,10 +168,9 @@ stalls.
   channels would not help. Batching already helps under load; an entry
   that links less often than once per message would lift the ceiling
   (a design question for the chain, docs/discord-log.md).
-- **Both: reads in parallel.** Cold reads fetch blocks one at a time;
-  reading ahead a few blocks (the old, never used `readahead_blocks`)
-  would multiply read throughput on both. With the cache on (the default),
-  reads after a write are free (L2 write-through).
+- ~~**Both: reads in parallel.**~~ Tried and measured (below): not faster.
+  With the cache on (the default), reads after a write are free (L2
+  write-through).
 - **Small objects and Telegram's text path**: blobs that fit a text
   message already go as text; they still cost a send each.
 

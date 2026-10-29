@@ -4,6 +4,7 @@
 #
 #   ./scripts/bench.sh discord telegram     # BENCH_MINUTES=15 per backend
 #   BENCH_MINUTES=1 ./scripts/bench.sh disk # a dry run
+#   BENCH_PHASES=blob_put,cold_get,ranged_get ./scripts/bench.sh discord   # some phases only
 #
 # Per backend: a fresh server from scripts/metrics-demo.sh (no block cache,
 # no demo traffic; Prometheus and Grafana come up too, so the run can be
@@ -59,7 +60,7 @@ for backend in "$@"; do
   "$ROOT/scripts/metrics-demo.sh" up | grep -E "running|dashboard"
   status=0
   uv run -q --with boto3 "$ROOT/scripts/bench-backends.py" run --label "$backend" --minutes "$MINUTES" \
-    --out "$OUT/$backend.json" || status=$?
+    ${BENCH_PHASES:+--phases "$BENCH_PHASES"} --out "$OUT/$backend.json" || status=$?
   "$ROOT/scripts/metrics-demo.sh" down
   after "$backend"
   [[ $status -eq 0 ]] || { echo "benchmark on $backend failed ($status)" >&2; exit "$status"; }

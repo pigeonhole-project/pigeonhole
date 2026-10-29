@@ -1,0 +1,115 @@
+{
+ "label": "discord",
+ "started": "2026-10-29T16:25:43Z",
+ "phases": [
+  {
+   "name": "blob_put",
+   "desc": "PUT 4\u00d71, 3\u00d78, 2\u00d732 MiB, incompressible, one at a time",
+   "client": {
+    "ops": 9,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 63.17756491599721,
+    "p50_s": 6.639530874992488,
+    "p95_s": 8.39118366598268,
+    "max_s": 8.39118366598268,
+    "mean_s": 6.957538717436061,
+    "ops_per_s": 0.142455632976147,
+    "mb_per_s": 1.4562131370895026
+   },
+   "server": {
+    "proposals": 9.0,
+    "log_entries": 9.0,
+    "propose_mean_s": 3.891675064777777,
+    "queue_wait_mean_s": 2.4745444444444444e-05,
+    "commit_mean_s": 3.89158369911111,
+    "log_append_mean_s": 3.8912962408888894,
+    "bytes_to_backend": 96468992.0,
+    "bytes_from_backend": 0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 4.8130999999882036e-05,
+    "calls": {
+     "dc-blobs put ok": {
+      "count": 11.0,
+      "mean_s": 2.462007496272727
+     }
+    },
+    "proposals_per_entry": 1.0
+   }
+  },
+  {
+   "name": "cold_get",
+   "desc": "GET those objects back whole (no cache)",
+   "client": {
+    "ops": 9,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 9.815959166997345,
+    "p50_s": 0.7316374580259435,
+    "p95_s": 2.6927265000122134,
+    "max_s": 2.6927265000122134,
+    "mean_s": 1.0906510833366256,
+    "ops_per_s": 0.9168742296992518,
+    "mb_per_s": 9.372492125814574
+   },
+   "server": {
+    "proposals": 0,
+    "log_entries": 0,
+    "propose_mean_s": null,
+    "queue_wait_mean_s": null,
+    "commit_mean_s": null,
+    "log_append_mean_s": null,
+    "bytes_to_backend": 0,
+    "bytes_from_backend": 96468992.0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 0,
+    "calls": {
+     "dc-blobs get ok": {
+      "count": 92.0,
+      "mean_s": 0.1019431879347826
+     }
+    }
+   }
+  },
+  {
+   "name": "ranged_get",
+   "desc": "six 1 MiB ranged GETs inside a 32 MiB object",
+   "client": {
+    "ops": 6,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 19.387336334009888,
+    "p50_s": 0.09981275000609457,
+    "p95_s": 18.926822249981342,
+    "max_s": 18.926822249981342,
+    "mean_s": 3.2312115141685354,
+    "ops_per_s": 0.3094803688671046,
+    "mb_per_s": 0.3094803688671046
+   },
+   "server": {
+    "proposals": 0,
+    "log_entries": 0,
+    "propose_mean_s": null,
+    "queue_wait_mean_s": null,
+    "commit_mean_s": null,
+    "log_append_mean_s": null,
+    "bytes_to_backend": 0,
+    "bytes_from_backend": 6291456.0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 0,
+    "calls": {
+     "dc-blobs get ok": {
+      "count": 6.0,
+      "mean_s": 3.224572610833333
+     }
+    }
+   }
+  }
+ ]
+}

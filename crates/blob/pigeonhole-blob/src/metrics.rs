@@ -24,8 +24,8 @@ pub const METRICS: &[MetricDoc] = &[
     ),
     MetricDoc::counter("pigeonhole_bytes_from_clients_total", &["gateway", "op"], "Request body bytes received from gateway clients"),
     MetricDoc::counter("pigeonhole_bytes_to_clients_total", &["gateway", "op"], "Response body bytes sent to gateway clients"),
-    MetricDoc::histogram("pigeonhole_instance_call_duration_seconds", &["instance", "op", "outcome"], "Backend call duration (get: until the stream starts)"),
-    MetricDoc::gauge("pigeonhole_instance_inflight", &["instance", "op"], "Backend calls in flight"),
+    MetricDoc::histogram("pigeonhole_instance_call_duration_seconds", &["instance", "op", "outcome"], "Backend call duration (get: until the first byte)"),
+    MetricDoc::gauge("pigeonhole_instance_inflight", &["instance", "op"], "Backend calls in flight (a get until its stream is read or dropped)"),
     MetricDoc::counter("pigeonhole_bytes_to_backend_total", &["instance"], "Bytes written to backend instances"),
     MetricDoc::counter("pigeonhole_bytes_from_backend_total", &["instance"], "Bytes read from backend instances"),
     MetricDoc::counter(
@@ -273,6 +273,25 @@ pub fn record_replica_selected(instance: &str) {
     .increment(1);
 }
 
+/// `pigeonhole_instance_inflight` up while it lives.
+struct Inflight {
+    instance: String,
+    op: &'static str,
+}
+
+impl Inflight {
+    fn new(instance: &str, op: &'static str) -> Self {
+        inflight_inc(instance, op);
+        Self { instance: instance.to_owned(), op }
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        inflight_dec(&self.instance, self.op);
+    }
+}
+
 fn outcome_from_err(err: &anyhow::Error) -> (&'static str, bool) {
     if err.chain().any(|e| e.is::<crate::RateLimited>()) || format!("{err:#}").contains("429") {
         ("rate_limited", true)
@@ -346,19 +365,25 @@ impl DynBlobBackend for MetricsBackend {
     async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let instance = self.inner.instance().id.clone();
         let op = "get";
-        inflight_inc(&instance, op);
+        // In flight until the stream is read or dropped.
+        let inflight = Inflight::new(&instance, op);
         let t0 = Instant::now();
         let span = tracing::debug_span!("store", instance = %instance, op);
         let result = self.inner.get(id, range).instrument(span.clone()).await;
         log_call(&span, &result, t0.elapsed());
         match result {
             Ok(stream) => {
-                record_instance_call(&instance, op, "ok", t0.elapsed());
-                inflight_dec(&instance, op);
-                let inst = instance;
+                // Timed to the first byte: a store may answer before any
+                // request (Telegram's stream starts lazily).
+                let mut first = Some(t0);
                 Ok(Box::pin(stream.map(move |item| {
+                    let _inflight = &inflight;
+                    if let Some(t0) = first.take() {
+                        let outcome = item.as_ref().map_or_else(|e| outcome_from_err(e).0, |_| "ok");
+                        record_instance_call(&instance, op, outcome, t0.elapsed());
+                    }
                     if let Ok(ref b) = item {
-                        record_bytes_from_backend(&inst, b.len() as u64);
+                        record_bytes_from_backend(&instance, b.len() as u64);
                     }
                     item
                 })))
@@ -369,7 +394,6 @@ impl DynBlobBackend for MetricsBackend {
                 if is_429 {
                     record_429(&instance, op);
                 }
-                inflight_dec(&instance, op);
                 Err(e)
             }
         }

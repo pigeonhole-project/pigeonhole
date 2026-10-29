@@ -145,7 +145,11 @@ def run(args):
     result = {"label": args.label, "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "phases": []}
     scale = args.minutes / 15.0
 
+    only = set(args.phases.split(",")) if args.phases else None
+
     def phase(name, desc, body, budget):
+        if only is not None and name not in only:
+            return
         print(f"== {name}: {desc} (up to {budget:.0f} s)", flush=True)
         p = Phase(name)
         before = scrape(metrics_url)
@@ -285,6 +289,7 @@ def main():
     r.add_argument("--endpoint", default="http://127.0.0.1:8333")
     r.add_argument("--metrics", default="http://127.0.0.1:9100/metrics")
     r.add_argument("--minutes", type=float, default=15.0, help="scales every phase's time box")
+    r.add_argument("--phases", help="comma-separated phases to run (default: all)")
     rep = sub.add_parser("report")
     rep.add_argument("files", nargs="+")
     a = ap.parse_args()
