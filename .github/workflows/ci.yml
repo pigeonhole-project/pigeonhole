@@ -24,6 +24,26 @@ jobs:
         run: ./scripts/check-deps.sh --strict
       - run: cargo test --workspace
 
+  simulation:
+    name: simulation (madsim)
+    # madsim makes entropy deterministic on macOS (symbol overrides); on Linux
+    # the getrandom syscall is not intercepted (docs/simulation.md).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Simulation scenarios, 50 seeds, determinism checked
+        run: make sim
+        env:
+          MADSIM_TEST_NUM: "50"
+          MADSIM_TEST_CHECK_DETERMINISM: "1"
+      - name: Every library's tests under the simulator, 3 seeds each
+        run: make sim-all
+        env:
+          MADSIM_TEST_NUM: "3"
+          MADSIM_TEST_CHECK_DETERMINISM: "1"
+
   code-report:
     name: code report
     runs-on: ubuntu-latest

@@ -114,3 +114,66 @@ async fn the_first_successor_wins_across_handles_and_reopen() {
     assert!(c.get(&x, None).await.is_err());
     assert_eq!(c.tail().await.unwrap().map(|l| l.id), Some(y));
 }
+
+mod sim {
+    use super::*;
+    use crate::io::SimFs;
+    use std::time::Duration;
+
+    fn on(fs: &SimFs) -> DiskBlobStore {
+        DiskBlobStore::open_on(Arc::new(fs.clone()), "/d", 1 << 20).unwrap()
+    }
+
+    #[tokio::test]
+    async fn what_was_acknowledged_survives_a_crash_and_a_torn_write_is_dropped() {
+        let fs = SimFs::new(Duration::ZERO);
+        let a = on(&fs);
+        let kept = a.put(Bytes::from_static(b"kept"), "x").await.unwrap();
+        let After::Won(root) = a.put_after(None, "root", Bytes::from_static(b"r")).await.unwrap() else { panic!() };
+        // A write in flight when the power goes: half of it reaches the disk.
+        let seg = std::path::Path::new("/d").join("seg-0000000001");
+        let len = fs.file_len(&seg).unwrap();
+        let file = crate::io::Fs::open(&fs, &seg, false).unwrap();
+        file.write_all_at(&[0x47, 0x53, 0x48, 0x50, 0, 0, 1, 0, 200, 0, 0, 0, 0, 0, 0, 0], len).unwrap();
+        drop(a);
+        fs.crash(Some(&mut |n| n / 2));
+
+        let b = on(&fs);
+        assert_eq!(read(&b, &kept).await, b"kept");
+        assert_eq!(b.tail().await.unwrap().map(|l| l.id), Some(root.clone()));
+        let next = b.put(Bytes::from_static(b"next"), "x").await.unwrap();
+        assert_eq!(next.key, crate::segments::key_of(1, len), "the torn bytes were cut off");
+        assert_eq!(read(&on(&fs), &next).await, b"next");
+    }
+
+    #[tokio::test]
+    async fn an_unsynced_segment_is_gone_after_a_crash() {
+        let fs = SimFs::new(Duration::ZERO);
+        let a = on(&fs);
+        a.put(Bytes::from_static(b"one"), "x").await.unwrap();
+        // A segment created but never synced (the process died right after).
+        crate::io::Fs::open(&fs, std::path::Path::new("/d/seg-0000000002"), true).unwrap();
+        drop(a);
+        fs.crash(None);
+        assert_eq!(on(&fs).candidates(None, u64::MAX, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_first_successor_wins_between_two_handles() {
+        let fs = SimFs::new(Duration::ZERO);
+        let (a, b) = (on(&fs), on(&fs));
+        let After::Won(root) = a.put_after(None, "r", Bytes::from_static(b"r")).await.unwrap() else { panic!() };
+        let After::Won(x) = b.put_after(Some(&root), "x", Bytes::from_static(b"x")).await.unwrap() else { panic!() };
+        let After::Lost(w) = a.put_after(Some(&root), "y", Bytes::from_static(b"y")).await.unwrap() else { panic!() };
+        assert_eq!(w.id, x);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sync_costs_virtual_time() {
+        let fs = SimFs::new(Duration::from_millis(4));
+        let a = on(&fs);
+        let t = tokio::time::Instant::now();
+        a.put(Bytes::from_static(b"one"), "x").await.unwrap();
+        assert!(t.elapsed() >= Duration::from_millis(4), "{:?}", t.elapsed());
+    }
+}

@@ -118,7 +118,7 @@ type Applied = std::result::Result<(), ChunkReject>;
 
 impl StateMachine for ChunkState {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     type Command = ChunkCommand;
     type Reply = ();
     type Reject = ChunkReject;
@@ -384,6 +384,6 @@ mod tests {
     fn command_encoding_is_pinned() {
         let cmd = ChunkCommand::Release { chunk_ids: vec![1, 2] };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 2, 2, 4]);
-        assert_eq!(ChunkState::VERSION, 2);
+        assert_eq!(ChunkState::VERSION, 3);
     }
 }

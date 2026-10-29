@@ -57,6 +57,7 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 | `gateway/pigeonhole-gateway-s3` | S3 (`s3s`) gateway |
 | `gateway/pigeonhole-gateway-bytestream` | REAPI v2 remote cache |
 | `testing/pigeonhole-testkit` | Storage conformance suites |
+| `testing/pigeonhole-sim` | Fault injection (`Faulty<B>`) and deterministic simulation scenarios (madsim) |
 | `bin/pigeonhole` | The `pigeonhole` binary (features select storage/gateways) |
 
 Dependency layering is enforced by `./scripts/check-deps.sh --strict` in CI.
@@ -312,7 +313,8 @@ cargo run --release -- purge --yes [--expect-chat CHAT_ID]
 GitHub Actions (`.github/workflows/ci.yml`) runs `cargo test --workspace`, the
 dependency layering check, and four in-memory client suites: `compat-memory`
 (ceph/s3-tests known-good), `compat-s3s-boto3`, `compat-s3s-e2e`, and
-`compat-rclone`. None of them touch Telegram or Discord.
+`compat-rclone`, and the simulation (`make sim`, `make sim-all`). None of
+them touch Telegram or Discord.
 
 ```bash
 cargo test --workspace         # or: make test
@@ -324,6 +326,16 @@ make compat-s3s-boto3          # s3s upstream boto3 tests
 make compat-s3s-e2e            # s3s-e2e (Basic + Advanced)
 make compat-s3s-e2e ARGS='--filter ^Basic'
 make compat-rclone             # rclone S3 e2e (downloads pinned rclone)
+```
+
+Deterministic simulation ([docs/simulation.md](docs/simulation.md)): the
+fault scenarios under madsim, one seed per run; CI runs 50 seeds.
+
+```bash
+make sim                                   # pigeonhole-sim under --cfg madsim
+MADSIM_TEST_NUM=50 MADSIM_TEST_CHECK_DETERMINISM=1 make sim
+MADSIM_TEST_SEED=1234 make sim             # replay a failing seed
+make sim-all                               # every library's tests in the simulator
 ```
 
 Manual live suites (not in CI; they purge the store first — use a throwaway

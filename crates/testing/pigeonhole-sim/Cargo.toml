@@ -1,0 +1,31 @@
+[package]
+name = "pigeonhole-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic simulation scenarios for pigeonhole (madsim; docs/simulation.md)"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-meta = { workspace = true }
+pigeonhole-storage-disk = { workspace = true }
+pigeonhole-storage-memory = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+http = { workspace = true }
+pigeonhole-chunk-store = { workspace = true }
+pigeonhole-gateway-s3 = { workspace = true }
+s3s = { workspace = true }
+
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2"
+
+[lints]
+workspace = true

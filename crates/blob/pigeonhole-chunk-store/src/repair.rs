@@ -336,6 +336,10 @@ async fn read_encoded_blocks(
         }
         let stored = blob.slice(off..off + len);
         off += len;
+        if crc32fast::hash(&stored) != b.crc32 {
+            // Never copy a damaged block onto another member.
+            bail!("repair: block {} fails its checksum on the source", b.block_no);
+        }
         out.push(EncodedBlock {
             stored,
             logical_len: b.logical_len.max(0) as u32,

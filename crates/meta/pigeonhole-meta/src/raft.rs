@@ -40,7 +40,13 @@ openraft::declare_raft_types!(
         R = Vec<Vec<u8>>,
         NodeId = u64,
         Node = BasicNode,
+        AsyncRuntime = Runtime,
 );
+
+#[cfg(not(madsim))]
+type Runtime = openraft::TokioRuntime;
+#[cfg(madsim)]
+type Runtime = crate::sim_runtime::MadsimRuntime;
 
 pub type NodeId = u64;
 pub type RaftEntry = openraft::Entry<TypeConfig>;

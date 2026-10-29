@@ -226,6 +226,7 @@ impl ChunkStore {
             logical_len: logical,
             stored_len: logical,
             codec: "raw".into(),
+            crc32: crc,
         }];
         let chunk_id = self
             .db
@@ -501,13 +502,16 @@ impl ChunkStore {
         let block_no = block.block_no as u32;
         let loader = || async {
             let hook = self.not_found_hook(chunk_id);
-            let raw = collect_stream(
+            let mut raw = collect_stream(
                 self.replicated
                     .read_with_hook(replicas, block_no..block_no + 1, hook)
                     .await
                     .context("replicated read block")?,
             )
             .await?;
+            if crc32fast::hash(&raw) != block.crc32 {
+                raw = self.read_block_around_damage(chunk_id, block, replicas).await?;
+            }
             if raw.len() as i64 != block.stored_len && block.stored_len > 0 {
                 // Best-effort: tolerate missing stored_len on migrated empty counts.
                 if raw.len() < block.stored_len as usize {
@@ -525,6 +529,30 @@ impl ChunkStore {
             return l2.get_or_load(chunk_id, block_no, loader).await;
         }
         loader().await
+    }
+
+    /// A block failed its checksum: read it from each replica in turn until
+    /// one is intact. The damaged replica stays as it is (repair rewrites
+    /// missing copies, not damaged ones).
+    async fn read_block_around_damage(
+        &self,
+        chunk_id: ChunkId,
+        block: &StoredBlock,
+        replicas: &[ReplicaLayout],
+    ) -> Result<Bytes> {
+        let block_no = block.block_no as u32;
+        for r in replicas {
+            let Ok(stream) = self.replicated.read_with_hook(std::slice::from_ref(r), block_no..block_no + 1, None).await
+            else {
+                continue;
+            };
+            let Ok(raw) = collect_stream(stream).await else { continue };
+            if crc32fast::hash(&raw) == block.crc32 {
+                return Ok(raw);
+            }
+            tracing::error!(chunk_id, block_no, instance = %r.instance, "block fails its checksum on this replica");
+        }
+        bail!("chunk {chunk_id} block {block_no} fails its checksum on every replica")
     }
 
     fn not_found_hook(
@@ -706,6 +734,7 @@ impl ChunkStore {
             logical_len: logical_len as i64,
             stored_len: stored.len() as i64,
             codec: stored_codec,
+            crc32: crc32fast::hash(&stored),
         });
         open.logical += logical_len as i64;
         // Release block permit after push (open parts live inside packers).

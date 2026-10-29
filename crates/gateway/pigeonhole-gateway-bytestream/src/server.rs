@@ -94,6 +94,7 @@ pub async fn serve(cfg: BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>)
     Ok(())
 }
 
+#[cfg(not(madsim))] // a real TCP listener: not in the simulation
 /// Bind `127.0.0.1:0` and return `(addr, join handle)` for in-process tests.
 pub async fn serve_ephemeral(
     cfg: BytestreamConfig,

@@ -45,6 +45,8 @@ use tokio::sync::watch;
 
 pub mod log;
 pub mod raft;
+#[cfg(madsim)]
+mod sim_runtime;
 pub mod snapshot;
 mod telemetry;
 

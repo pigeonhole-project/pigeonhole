@@ -15,6 +15,7 @@ members = [
     "crates/gateway/pigeonhole-gateway-bytestream",
     "crates/bin/pigeonhole",
     "crates/testing/pigeonhole-testkit",
+    "crates/testing/pigeonhole-sim",
 ]
 default-members = ["crates/bin/pigeonhole"]
 exclude = ["vendor"]
@@ -52,7 +53,7 @@ serde_json = "1"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
 tokio-stream = "0.1"
 toml = { version = "0.8", features = ["parse"] }
 tower = { version = "0.5", features = ["limit", "timeout", "util"] }
@@ -91,3 +92,7 @@ pigeonhole-testkit = { path = "crates/testing/pigeonhole-testkit" }
 # A request nobody awaits any more is not sent (vendor/grammers-mtsender/VENDORED.md).
 [patch.crates-io]
 grammers-mtsender = { path = "vendor/grammers-mtsender" }
+
+# `--cfg madsim` builds the simulation (docs/simulation.md).
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }

@@ -23,11 +23,9 @@
 //! open) truncates it. A delete sets `DEAD` in the header and punches a hole
 //! over the data; a segment whose records are all dead is removed.
 
+use crate::io::{DirLock, Fs, FsFile};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -79,7 +77,7 @@ impl Rec {
 }
 
 struct Seg {
-    file: Arc<File>,
+    file: Arc<dyn FsFile>,
     /// Bytes scanned (= the end of the last whole record).
     len: u64,
     live: usize,
@@ -87,9 +85,10 @@ struct Seg {
 
 /// The index of a directory of segments, kept in memory.
 pub(crate) struct Segments {
+    fs: Arc<dyn Fs>,
     dir: PathBuf,
     segment_bytes: u64,
-    lock: File,
+    lock: Arc<dyn DirLock>,
     segs: BTreeMap<u64, Seg>,
     pub records: BTreeMap<u64, Rec>,
     /// Chain: the winning successor of each predecessor (`None`: the start).
@@ -102,7 +101,7 @@ pub(crate) struct Locked<'a>(&'a mut Segments);
 
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
-        let _ = self.0.lock.unlock();
+        self.0.lock.unlock();
     }
 }
 
@@ -120,16 +119,11 @@ impl std::ops::DerefMut for Locked<'_> {
 }
 
 impl Segments {
-    pub fn open(dir: &Path, segment_bytes: u64) -> Result<Self> {
-        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        let lock_path = dir.join("lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("open {}", lock_path.display()))?;
+    pub fn open(fs: Arc<dyn Fs>, dir: &Path, segment_bytes: u64) -> Result<Self> {
+        fs.create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let lock = fs.dir_lock(dir).with_context(|| format!("lock file in {}", dir.display()))?;
         let mut this = Self {
+            fs,
             dir: dir.to_path_buf(),
             segment_bytes: segment_bytes.max(1),
             lock,
@@ -148,7 +142,7 @@ impl Segments {
         Ok(Locked(self))
     }
 
-    pub fn file_of(&self, key: u64) -> Option<Arc<File>> {
+    pub fn file_of(&self, key: u64) -> Option<Arc<dyn FsFile>> {
         self.segs.get(&split(key).0).map(|s| s.file.clone())
     }
 
@@ -167,9 +161,8 @@ impl Segments {
     /// Every segment sequence number in the directory.
     fn seqs_on_disk(&self) -> Result<Vec<u64>> {
         let mut seqs = Vec::new();
-        for e in fs::read_dir(&self.dir).with_context(|| format!("read {}", self.dir.display()))? {
-            let name = e?.file_name();
-            if let Some(seq) = name.to_str().and_then(|n| n.strip_prefix("seg-")).and_then(|n| n.parse().ok()) {
+        for name in self.fs.list(&self.dir).with_context(|| format!("read {}", self.dir.display()))? {
+            if let Some(seq) = name.strip_prefix("seg-").and_then(|n| n.parse().ok()) {
                 seqs.push(seq);
             }
         }
@@ -185,7 +178,7 @@ impl Locked<'_> {
         // Nothing new if the active segment did not grow and is not full
         // (only a full segment rolls over): one fstat, no directory listing.
         if let Some(s) = self.segs.values().next_back() {
-            if s.len < self.segment_bytes && s.file.metadata()?.len() == s.len {
+            if s.len < self.segment_bytes && s.file.len()? == s.len {
                 return Ok(());
             }
         }
@@ -196,9 +189,8 @@ impl Locked<'_> {
         for seq in seqs {
             if !self.segs.contains_key(&seq) {
                 let path = seg_path(&self.dir, seq);
-                let file = OpenOptions::new().read(true).write(true).open(&path)
-                    .with_context(|| format!("open {}", path.display()))?;
-                self.segs.insert(seq, Seg { file: Arc::new(file), len: 0, live: 0 });
+                let file = self.fs.open(&path, false).with_context(|| format!("open {}", path.display()))?;
+                self.segs.insert(seq, Seg { file, len: 0, live: 0 });
             }
             self.scan(seq, Some(seq) == newest)?;
         }
@@ -211,9 +203,7 @@ impl Locked<'_> {
             let s = &self.segs[&seq];
             (s.file.clone(), s.len)
         };
-        let size = file.metadata()?.len();
-        let mut reader = io::BufReader::with_capacity(64 << 10, &*file);
-        reader.seek(SeekFrom::Start(pos))?;
+        let size = file.len()?;
         while pos < size {
             let torn = |what: &str| -> Result<()> {
                 if last {
@@ -227,7 +217,7 @@ impl Locked<'_> {
                 break;
             }
             let mut h = [0u8; HEADER as usize];
-            reader.read_exact(&mut h)?;
+            file.read_exact_at(&mut h, pos)?;
             let magic = u32::from_le_bytes(h[0..4].try_into().unwrap());
             let flags = h[4];
             let label_len = u16::from_le_bytes(h[6..8].try_into().unwrap());
@@ -246,19 +236,17 @@ impl Locked<'_> {
                 break;
             }
             let mut label = vec![0; label_len as usize];
-            reader.read_exact(&mut label)?;
+            file.read_exact_at(&mut label, pos + HEADER)?;
             let dead = flags & DEAD != 0;
             // Only the last record can be torn with a whole length: check its
             // data (a dead one may be a hole).
             if last && end == size && !dead {
                 let mut data = vec![0; data_len as usize];
-                reader.read_exact(&mut data)?;
+                file.read_exact_at(&mut data, pos + HEADER + label_len as u64)?;
                 if record_crc(flags, &h, &label, &data) != crc {
                     torn("a record failing its checksum")?;
                     break;
                 }
-            } else {
-                reader.seek_relative(data_len as i64)?;
             }
             let key = key_of(seq, pos);
             let chain = (flags & CHAINED != 0).then(|| ChainRec {
@@ -280,7 +268,7 @@ impl Locked<'_> {
         if pos < size {
             // A torn tail: never acknowledged, drop it.
             file.set_len(pos)?;
-            file.sync_all()?;
+            file.sync()?;
         }
         self.segs.get_mut(&seq).unwrap().len = pos;
         Ok(())
@@ -296,10 +284,9 @@ impl Locked<'_> {
             last => {
                 let seq = last.map_or(1, |(s, _)| s + 1);
                 let path = seg_path(&self.dir, seq);
-                let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path)
-                    .with_context(|| format!("create {}", path.display()))?;
-                File::open(&self.dir)?.sync_all()?;
-                self.segs.insert(seq, Seg { file: Arc::new(file), len: 0, live: 0 });
+                let file = self.fs.open(&path, true).with_context(|| format!("create {}", path.display()))?;
+                self.fs.sync_dir(&self.dir)?;
+                self.segs.insert(seq, Seg { file, len: 0, live: 0 });
                 seq
             }
         };
@@ -322,7 +309,7 @@ impl Locked<'_> {
         head.extend_from_slice(label.as_bytes());
         seg.file.write_all_at(&head, pos)?;
         seg.file.write_all_at(data, pos + head.len() as u64)?;
-        seg.file.sync_data()?;
+        seg.file.sync()?;
         seg.len = pos + head.len() as u64 + data.len() as u64;
         seg.live += 1;
 
@@ -349,7 +336,7 @@ impl Locked<'_> {
             seg.live -= 1;
             if seg.live == 0 && Some(seq) != active {
                 let path = seg_path(&self.dir, seq);
-                fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+                self.fs.remove(&path).with_context(|| format!("remove {}", path.display()))?;
                 self.segs.remove(&seq);
                 let lo = key_of(seq, 0);
                 let hi = key_of(seq + 1, 0);
@@ -362,10 +349,10 @@ impl Locked<'_> {
             let mut flags = [0u8; 1];
             seg.file.read_exact_at(&mut flags, offset + 4)?;
             seg.file.write_all_at(&[flags[0] | DEAD], offset + 4)?;
-            punch_hole(&seg.file, data_off, data_len)?;
+            punch_hole(seg.file.as_ref(), data_off, data_len)?;
         }
         for seg in self.segs.values() {
-            seg.file.sync_data()?;
+            seg.file.sync()?;
         }
         Ok(())
     }
@@ -381,42 +368,12 @@ fn record_crc(flags: u8, header: &[u8], label: &[u8], data: &[u8]) -> u32 {
 }
 
 /// Free the blocks fully inside `[off, off + len)`; the file keeps its size.
-fn punch_hole(file: &File, off: u64, len: u64) -> io::Result<()> {
+fn punch_hole(file: &dyn FsFile, off: u64, len: u64) -> std::io::Result<()> {
     const BLOCK: u64 = 4096;
     let start = off.div_ceil(BLOCK) * BLOCK;
     let end = (off + len) / BLOCK * BLOCK;
     if end <= start {
         return Ok(());
     }
-    punch(file, start, end - start)
-}
-
-#[cfg(target_os = "macos")]
-fn punch(file: &File, off: u64, len: u64) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let arg = libc::fpunchhole_t { fp_flags: 0, reserved: 0, fp_offset: off as libc::off_t, fp_length: len as libc::off_t };
-    // SAFETY: a valid descriptor and a pointer to a live fpunchhole_t.
-    let r = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &arg) };
-    if r == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
-}
-
-#[cfg(target_os = "linux")]
-fn punch(file: &File, off: u64, len: u64) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: a valid descriptor.
-    let r = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            off as libc::off_t,
-            len as libc::off_t,
-        )
-    };
-    if r == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
-}
-
-/// Without hole punching the space stays until the whole segment dies.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn punch(_file: &File, _off: u64, _len: u64) -> io::Result<()> {
-    Ok(())
+    file.punch(start, end - start)
 }

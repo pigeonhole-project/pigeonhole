@@ -25,6 +25,7 @@ ROLE = {
     "pigeonhole-gateway-webdav": "gateway",
     "pigeonhole": "bin",
     "pigeonhole-testkit": "testkit",
+    "pigeonhole-sim": "testkit",
 }
 
 FORBIDDEN_SOFT = {

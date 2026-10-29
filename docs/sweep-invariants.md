@@ -49,6 +49,12 @@ and the delete of one batch. The deleted keys are still garbage for this
 incarnation's state and below its horizon; the newer generation's own uploads
 have higher keys than anything this process returned before them.
 
+An answer lost after the put landed (the store failed after applying it, or
+a dropped request went out late) leaves a blob whose key was never
+returned, so it may lie above the horizon. It stays until a newer upload
+returns a higher key; on an idle store it waits for the next write. The
+fault scenarios check "no garbage left" only after one more upload.
+
 ## Reclaim and reads
 
 ```

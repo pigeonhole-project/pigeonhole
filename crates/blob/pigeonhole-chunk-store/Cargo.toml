@@ -34,3 +34,6 @@ postcard = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

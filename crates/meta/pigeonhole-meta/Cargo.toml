@@ -30,3 +30,10 @@ metrics-util = { workspace = true }
 pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2"
+rand = "0.8"
+
+[lints]
+workspace = true
