@@ -4,7 +4,7 @@
 //! Deletes only what it posted.
 
 use bytes::Bytes;
-use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceKind, InstanceRole};
+use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_storage_telegram::{ChannelApi, Lane, TelegramBlobStore, MtprotoConfig, TelegramMtproto};
 use std::path::Path;
@@ -35,7 +35,7 @@ async fn blob_store_against_a_live_channel() {
     let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
     let info = InstanceInfo {
         id: "live".into(),
-        kind: InstanceKind::Telegram,
+        kind: pigeonhole_storage_telegram::KIND,
         fingerprint: format!("tg:{}:{}", tg.bot_id(), channel.channel_id()),
         location: format!("tg:chat:{chat_id}"),
         role: InstanceRole::ReadWrite,
@@ -203,7 +203,7 @@ async fn inline_blobs_against_a_live_channel() {
     let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
     let info = InstanceInfo {
         id: "live".into(),
-        kind: InstanceKind::Telegram,
+        kind: pigeonhole_storage_telegram::KIND,
         fingerprint: format!("tg:{}:{}", tg.bot_id(), channel.channel_id()),
         location: format!("tg:chat:{chat_id}"),
         role: InstanceRole::ReadWrite,
@@ -211,7 +211,7 @@ async fn inline_blobs_against_a_live_channel() {
     let store = TelegramBlobStore::new(channel.clone(), limiter.clone(), info.clone());
     let name = BlobId::random().name();
     let mut max = 0;
-    while pigeonhole_storage_api::text::fits(&name, max + 1, pigeonhole_storage_api::text::TELEGRAM_MAX_CHARS) {
+    while pigeonhole_storage_api::text::fits(&name, max + 1, pigeonhole_storage_telegram::TEXT_MAX_CHARS) {
         max += 1;
     }
     let mut posted = Vec::new();
@@ -250,7 +250,7 @@ async fn chain_names_survive_as_documents() {
     let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
     let info = InstanceInfo {
         id: "live".into(),
-        kind: InstanceKind::Telegram,
+        kind: pigeonhole_storage_telegram::KIND,
         fingerprint: format!("tg:{}:{}", tg.bot_id(), channel.channel_id()),
         location: format!("tg:chat:{chat_id}"),
         role: InstanceRole::ReadWrite,

@@ -206,7 +206,7 @@ mod tests {
             Self {
                 info: InstanceInfo {
                     id: "tiny".into(),
-                    kind: crate::typed::InstanceKind::Memory,
+                    kind: "memory",
                     fingerprint: "tiny".into(),
                     location: "tiny".into(),
                     role: crate::typed::InstanceRole::ReadWrite,

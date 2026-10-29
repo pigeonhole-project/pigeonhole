@@ -2,7 +2,7 @@
 //! [`Chain`]: threads as compare-and-set), on a fake channel.
 
 use futures::TryStreamExt;
-use pigeonhole_storage_api::{After, Chain, InstanceInfo, InstanceKind, InstanceRole};
+use pigeonhole_storage_api::{After, Chain, InstanceInfo, InstanceRole};
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_meta::log::conformance;
 use pigeonhole_meta::snapshot::conformance as snapshot_conformance;
@@ -26,7 +26,7 @@ fn channel_store(channel: &Arc<FakeDiscord>) -> Arc<Store> {
     }));
     let info = InstanceInfo {
         id: "log".into(),
-        kind: InstanceKind::Discord,
+        kind: pigeonhole_storage_discord::KIND,
         fingerprint: "dc:1:77".into(),
         location: "dc:channel:77".into(),
         role: InstanceRole::ReadWrite,

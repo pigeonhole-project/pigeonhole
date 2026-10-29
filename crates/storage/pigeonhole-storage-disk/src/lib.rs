@@ -15,8 +15,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_storage_api::{
-    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceKind,
-    InstanceRole, Linked, MakeAfter, NotFound, OpKind, Sweepable,
+    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked,
+    MakeAfter, NotFound, OpKind, Sweepable,
 };
 use pigeonhole_limits::StoreLimiter;
 use pigeonhole_types::{BackendLimits, ByteRange};
@@ -27,6 +27,9 @@ use std::sync::{Arc, Mutex};
 
 pub use io::{Fs, SimFs, StdFs};
 pub use segments::DEFAULT_SEGMENT_BYTES;
+
+/// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
+pub const KIND: &str = "local_disk";
 
 /// Identity of a blob on disk: its key, the record's position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,7 +70,7 @@ impl DiskBlobStore {
         let dir = dir.into();
         let info = InstanceInfo {
             id: "local_disk".into(),
-            kind: InstanceKind::LocalDisk,
+            kind: crate::KIND,
             fingerprint: disk_location(&dir),
             location: disk_location(&dir),
             role: InstanceRole::ReadWrite,
@@ -86,7 +89,7 @@ impl DiskBlobStore {
         let dir = dir.into();
         let info = InstanceInfo {
             id: "local_disk".into(),
-            kind: InstanceKind::LocalDisk,
+            kind: crate::KIND,
             fingerprint: disk_location(&dir),
             location: disk_location(&dir),
             role: InstanceRole::ReadWrite,

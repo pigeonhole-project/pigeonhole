@@ -1,8 +1,8 @@
 //! In-memory [`BlobBackend`] for tests and `memory = true`.
 
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceKind,
-    InstanceRole, Linked, NotFound, OpKind, Sweepable, Unavailable,
+    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole,
+    Linked, NotFound, OpKind, Sweepable, Unavailable,
 };
 use pigeonhole_limits::StoreLimiter;
 use anyhow::{bail, Result};
@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
+pub const KIND: &str = "memory";
 
 /// Typed identity for the memory backend (stage 1.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,7 +68,7 @@ impl MemoryBlobStore {
             limits,
             instance: InstanceInfo {
                 id: "memory".into(),
-                kind: InstanceKind::Memory,
+                kind: crate::KIND,
                 fingerprint: "memory:local".into(),
                 location: "memory:local".into(),
                 role: InstanceRole::ReadWrite,

@@ -25,7 +25,7 @@ pub use replicated::{
     Replicated, SealedChunk, ShardSpec,
 };
 pub use typed::{
-    load_id, store_id, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
+    load_id, store_id, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
     BlobId, BlobLocator, Sweepable, BlobBackend,
 };
 pub use pigeonhole_storage_api::{text, After, Chain, Failure, LeaseChain, Linked, MakeAfter, NotFound, RateLimited, Unavailable};

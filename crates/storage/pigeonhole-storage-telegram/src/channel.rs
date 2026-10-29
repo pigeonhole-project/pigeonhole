@@ -56,6 +56,9 @@ impl std::fmt::Display for FileReferenceExpired {
 
 impl std::error::Error for FileReferenceExpired {}
 
+/// Characters in a text message (code points).
+pub const TEXT_MAX_CHARS: usize = 4096;
+
 /// One channel (or supergroup): message ids are per channel, dense and
 /// assigned in sending order.
 #[async_trait]

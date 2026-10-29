@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use pigeonhole_storage_api::{
-    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceKind, InstanceRole, Sweepable,
+    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole, Sweepable,
 };
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_storage_discord::fake::FakeDiscord;
@@ -26,7 +26,7 @@ fn limiter() -> Arc<ChatLimiter> {
 fn store_on(channel: &Arc<FakeDiscord>) -> Store {
     let info = InstanceInfo {
         id: "dc".into(),
-        kind: InstanceKind::Discord,
+        kind: pigeonhole_storage_discord::KIND,
         fingerprint: "dc:1:77".into(),
         location: "dc:channel:77".into(),
         role: InstanceRole::ReadWrite,

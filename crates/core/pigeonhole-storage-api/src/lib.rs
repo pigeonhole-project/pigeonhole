@@ -13,7 +13,7 @@ mod stream;
 pub mod text;
 
 pub use backend::{
-    BlobBackend, BlobId, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
+    BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
     Sweepable,
 };
 pub use error::{Failure, NotFound, RateLimited, Unavailable};

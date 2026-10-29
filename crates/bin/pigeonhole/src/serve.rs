@@ -95,7 +95,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     let instances: Vec<String> = cfg
         .instances
         .iter()
-        .map(|i| format!("{}:{}", i.info.id, i.info.kind.as_str()))
+        .map(|i| format!("{}:{}", i.info.id, i.info.kind))
         .collect();
     info!(
         ?instances,

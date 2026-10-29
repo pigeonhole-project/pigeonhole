@@ -4,7 +4,8 @@ use pigeonhole_chunk_store::{
     RepairConfig, SweepConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, DEFAULT_SWEEP_INTERVAL,
     REPAIR_BATCH_SIZE, SWEEP_BATCH_SIZE,
 };
-use pigeonhole_blob::{CacheConfig, InstanceKind};
+use crate::instances::InstanceKind;
+use pigeonhole_blob::CacheConfig;
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, LimiterRegistry};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
@@ -716,7 +717,7 @@ pub fn check_block_size_against_instances(
     }
     let mut min_max = usize::MAX;
     for inst in instances {
-        let max = match inst.info.kind {
+        let max = match inst.kind {
             InstanceKind::Memory => 20 * 1024 * 1024 - 1,
             InstanceKind::LocalDisk => pigeonhole_types::BackendLimits::local_disk().max_blob_size,
             InstanceKind::Telegram => pigeonhole_types::BackendLimits::telegram().max_blob_size,
@@ -1088,7 +1089,7 @@ upload_concurrency = 4
         assert_eq!(cfg.meta.log, LogSettings::Telegram { chat_id: "-1001".into(), login: login.clone() });
         assert_eq!(cfg.meta.snapshot, SnapshotSettings::Telegram { chat_id: "-1002".into(), login: login.clone() });
         let inst = cfg.primary_instance().unwrap();
-        assert_eq!((inst.info.kind, inst.info.fingerprint.as_str()), (InstanceKind::Telegram, "tg:42:-1003"));
+        assert_eq!((inst.kind, inst.info.fingerprint.as_str()), (InstanceKind::Telegram, "tg:42:-1003"));
         assert_eq!(inst.info.location, "tg:chat:-1003", "the same place as a Bot API store of that chat");
         assert_eq!(inst.telegram, Some(login));
         assert!(!format!("{:?}", inst.telegram).contains("secret"));
@@ -1110,7 +1111,7 @@ upload_concurrency = 4
         .unwrap();
         assert_eq!((cfg.meta.log.clone(), cfg.meta.snapshot.clone()), (LogSettings::Memory, SnapshotSettings::Memory));
         let inst = cfg.primary_instance().unwrap();
-        assert_eq!((inst.info.kind, inst.scope_id.as_str()), (InstanceKind::LocalDisk, "/blobs"));
+        assert_eq!((inst.kind, inst.scope_id.as_str()), (InstanceKind::LocalDisk, "/blobs"));
 
         // A memory log next to snapshots that survive it (or the other way round).
         let mixed = "[meta]\nlog = \"ram\"\nsnapshot = \"disk\"\n[chunk]\nstore = \"mem\"\n\
@@ -1261,7 +1262,7 @@ max_blob_size = 8388608
         .unwrap();
         std::env::remove_var("DISCORD_BOT_TOKEN");
         let inst = cfg.primary_instance().unwrap();
-        assert_eq!(inst.info.kind, InstanceKind::Discord);
+        assert_eq!(inst.kind, InstanceKind::Discord);
         assert_eq!(inst.scope_id, "123456789");
         assert_eq!(inst.max_blob_size, Some(8388608));
     }

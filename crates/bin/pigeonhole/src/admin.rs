@@ -14,7 +14,7 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
     if cfg
         .instances
         .iter()
-        .all(|i| i.info.kind == pigeonhole_blob::InstanceKind::Memory)
+        .all(|i| i.kind == pigeonhole::instances::InstanceKind::Memory)
     {
         bail!("refuse to purge: only memory instances are configured");
     }

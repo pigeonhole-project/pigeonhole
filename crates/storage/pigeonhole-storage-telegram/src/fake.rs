@@ -1,10 +1,9 @@
 //! An in-memory channel for tests: ids grow, sends deduplicate by
 //! `random_id`, `get_file` checks the window rules and file references.
 
-use crate::channel::{ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, WINDOW};
-
-/// Longest text message the fake takes (Telegram: 4096).
-pub const TEXT_MAX_CHARS: usize = 4096;
+use crate::channel::{
+    ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, TEXT_MAX_CHARS, WINDOW,
+};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;

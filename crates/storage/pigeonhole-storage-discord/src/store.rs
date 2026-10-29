@@ -5,7 +5,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lru::LruCache;
-use pigeonhole_storage_api::text::{self, DISCORD_MAX_CHARS};
+use crate::api::CONTENT_MAX_CHARS;
+use pigeonhole_storage_api::text;
 use pigeonhole_storage_api::{
     bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
     Sweepable,
@@ -145,7 +146,7 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
 
     /// Post blob `name` as text if it fits, else as an attachment; the message.
     pub(crate) async fn post_blob(&self, name: &str, data: Bytes, nonce: &str) -> Result<DcMessage> {
-        let (bytes, as_text) = (data.len(), self.inline && text::fits(name, data.len(), DISCORD_MAX_CHARS));
+        let (bytes, as_text) = (data.len(), self.inline && text::fits(name, data.len(), CONTENT_MAX_CHARS));
         let m = if as_text {
             self.api.send(&text::encode(name, &data), None, nonce).await?
         } else {

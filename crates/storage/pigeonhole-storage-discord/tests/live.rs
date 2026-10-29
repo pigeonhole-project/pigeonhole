@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceKind, InstanceRole};
+use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_meta::{
     Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogId, LogStore, SnapshotRef, SnapshotStore,
@@ -34,7 +34,7 @@ fn channel(var: &str) -> (Arc<DiscordChannel>, Arc<ChatLimiter>, DiscordClient, 
 fn store_on(ch: &Arc<DiscordChannel>, limiter: &Arc<ChatLimiter>, id: u64) -> Arc<DiscordBlobStore<DiscordChannel>> {
     let info = InstanceInfo {
         id: format!("live-{id}"),
-        kind: InstanceKind::Discord,
+        kind: pigeonhole_storage_discord::KIND,
         fingerprint: format!("dc:live:{id}"),
         location: format!("dc:channel:{id}"),
         role: InstanceRole::ReadWrite,

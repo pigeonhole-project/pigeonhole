@@ -2,7 +2,7 @@
 //! here only the type-erased stored identity.
 
 pub use pigeonhole_storage_api::{
-    BlobBackend, BlobId, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
+    BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
     Sweepable,
 };
 use anyhow::{bail, Result};

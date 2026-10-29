@@ -4,11 +4,11 @@ use anyhow::Context;
 use pigeonhole::config::Config;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole_blob::{
-    erase_sweep, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
+    erase_sweep, CheapestFirst, MetricsBackend, Replicated, SharedBackend,
 };
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole::config::{LogSettings, SnapshotSettings};
-use pigeonhole::instances::{check_fingerprints, InstanceConfig, TelegramLogin};
+use pigeonhole::instances::{check_fingerprints, InstanceConfig, InstanceKind, TelegramLogin};
 use pigeonhole_chunk_store::{BlockCache, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole::index::Index;
 use crate::channel_log;
@@ -99,7 +99,7 @@ async fn meta_channel_store(
         .with_context(|| format!("{purpose} channel"))?;
     let info = InstanceInfo {
         id: format!("meta-{purpose}"),
-        kind: InstanceKind::Telegram,
+        kind: InstanceKind::Telegram.as_str(),
         fingerprint: format!("tg:meta:{chat_id}"),
         location: format!("tg:chat:{chat_id}"),
         role: InstanceRole::ReadWrite,
@@ -125,7 +125,7 @@ async fn meta_discord<T: ?Sized>(
     dc.ensure_permissions(id, true, &limiter).await.with_context(|| format!("{purpose} channel"))?;
     let info = InstanceInfo {
         id: format!("meta-{purpose}"),
-        kind: InstanceKind::Discord,
+        kind: InstanceKind::Discord.as_str(),
         fingerprint: discord_fingerprint(&dc.app_id(), channel_id),
         location: discord_location(channel_id),
         role: InstanceRole::ReadWrite,
@@ -186,7 +186,7 @@ async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {
                 .iter()
                 .find(|i| i.info.id == *id)
                 .with_context(|| format!("blob store {id:?} not resolved"))?;
-            let limiter = cfg.chat_limiter(inst.info.kind, &inst.bot_token, &inst.scope_id);
+            let limiter = cfg.chat_limiter(inst.kind, &inst.bot_token, &inst.scope_id);
             members.push(build_member(inst, &limiter).await?);
         }
         shards.push((members, shard.write_quorum));
@@ -198,7 +198,7 @@ async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {
 /// One blob store as a placement member.
 async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyhow::Result<SharedBackend> {
     let id = &inst.info.id;
-    Ok(match inst.info.kind {
+    Ok(match inst.kind {
         InstanceKind::Memory => {
             warn!("memory instance {id}: in-process MemoryBlobStore (data does not survive the process)");
             let mem = Arc::new(

@@ -162,7 +162,7 @@ fn concat_bytes(parts: Vec<Bytes>, total: usize) -> Bytes {
 mod tests {
     use super::*;
     use crate::erase::{erase, SharedBackend};
-    use crate::typed::{CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, BlobBackend};
+    use crate::typed::{CostHint, InstanceInfo, InstanceRole, OpKind, BlobBackend};
     use crate::{bytes_stream, collect_stream, slice_range, BoxByteStream};
     use async_trait::async_trait;
     use pigeonhole_types::{BackendLimits, ByteRange};
@@ -186,7 +186,7 @@ mod tests {
             Self {
                 info: InstanceInfo {
                     id: id.into(),
-                    kind: InstanceKind::Memory,
+                    kind: "memory",
                     fingerprint: format!("memory:{id}"),
                     location: format!("memory:{id}"),
                     role: InstanceRole::ReadWrite,

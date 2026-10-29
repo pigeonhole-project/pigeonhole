@@ -44,27 +44,6 @@ impl OrderedKey for i64 {
     }
 }
 
-/// Backend kind string as stored in config / `instances` table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InstanceKind {
-    Telegram,
-    Discord,
-    Memory,
-    LocalDisk,
-}
-
-impl InstanceKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Telegram => "telegram",
-            Self::Discord => "discord",
-            Self::Memory => "memory",
-            Self::LocalDisk => "local_disk",
-        }
-    }
-}
-
 /// Runtime role of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -85,11 +64,12 @@ impl InstanceRole {
 }
 
 /// Stable identity of a configured backend instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceInfo {
     /// Stable config name, e.g. `tg-main`.
     pub id: String,
-    pub kind: InstanceKind,
+    /// What store it is (`telegram`, `local_disk`, …): its crate's `KIND`.
+    pub kind: &'static str,
     /// Opaque fingerprint string, e.g. `tg:{bot_id}:{scope}`.
     pub fingerprint: String,
     /// Location key for uniqueness of writers, e.g. `tg:chat:-100…`.

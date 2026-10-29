@@ -10,9 +10,6 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
-/// Characters a message's content takes (Discord: 2000 code points).
-pub const CONTENT_MAX_CHARS: usize = 2000;
-
 #[derive(Debug, Clone)]
 struct Stored {
     content: String,
@@ -183,7 +180,7 @@ impl DiscordApi for FakeDiscord {
         if content.is_empty() && file.is_none() {
             bail!("50006: cannot send an empty message");
         }
-        if content.chars().count() > CONTENT_MAX_CHARS {
+        if content.chars().count() > crate::api::CONTENT_MAX_CHARS {
             bail!("50035: content must be 2000 or fewer in length");
         }
         if nonce.len() > 25 {

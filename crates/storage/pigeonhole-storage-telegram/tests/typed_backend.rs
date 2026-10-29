@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use pigeonhole_storage_api::{
-    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceKind, InstanceRole, Sweepable,
+    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole, Sweepable,
 };
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_storage_telegram::fake::FakeChannel;
@@ -24,7 +24,7 @@ fn store_on(channel: Arc<FakeChannel>) -> (Arc<FakeChannel>, TelegramBlobStore<F
     }));
     let info = InstanceInfo {
         id: "tgm".into(),
-        kind: InstanceKind::Telegram,
+        kind: pigeonhole_storage_telegram::KIND,
         fingerprint: "tg:1:77".into(),
         location: "tg:chat:-10077".into(),
         role: InstanceRole::ReadWrite,

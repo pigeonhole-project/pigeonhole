@@ -791,7 +791,7 @@ mod tests {
     use pigeonhole_storage_api::{NotFound, Unavailable};
     use crate::erase::{erase, SharedBackend};
     use crate::typed::{
-        CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, BlobBackend,
+        CostHint, InstanceInfo, InstanceRole, OpKind, BlobBackend,
     };
     use crate::{collect_stream, slice_range};
     use async_trait::async_trait;
@@ -823,7 +823,7 @@ mod tests {
             Arc::new(Self {
                 info: InstanceInfo {
                     id: id.into(),
-                    kind: InstanceKind::Memory,
+                    kind: "memory",
                     fingerprint: format!("memory:{id}"),
                     location: format!("memory:{id}"),
                     role: InstanceRole::ReadWrite,

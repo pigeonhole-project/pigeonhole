@@ -2,7 +2,7 @@
 //! [`Chain`]: first successor by id order), on a fake channel.
 
 use futures::TryStreamExt;
-use pigeonhole_storage_api::{InstanceInfo, InstanceKind, InstanceRole};
+use pigeonhole_storage_api::{InstanceInfo, InstanceRole};
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_meta::log::conformance;
 use pigeonhole_meta::snapshot::conformance as snapshot_conformance;
@@ -26,7 +26,7 @@ fn channel_store(channel: &Arc<FakeChannel>) -> Arc<Store> {
     }));
     let info = InstanceInfo {
         id: "log".into(),
-        kind: InstanceKind::Telegram,
+        kind: pigeonhole_storage_telegram::KIND,
         fingerprint: "tg:1:77".into(),
         location: "tg:chat:-10077".into(),
         role: InstanceRole::ReadWrite,

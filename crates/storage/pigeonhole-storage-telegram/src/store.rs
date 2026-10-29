@@ -114,7 +114,7 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
         let _upload = self.limiter.acquire_upload().await;
         let channel = &self.reader.channel;
         let store = &self.instance.id;
-        if self.inline && pigeonhole_storage_api::text::fits(name, data.len(), pigeonhole_storage_api::text::TELEGRAM_MAX_CHARS) {
+        if self.inline && pigeonhole_storage_api::text::fits(name, data.len(), crate::channel::TEXT_MAX_CHARS) {
             let bytes = data.len();
             let sent = channel.send_text(&pigeonhole_storage_api::text::encode(name, &data), random_id).await?;
             self.reader.remember(sent.message_id, Located::Inline(data));
