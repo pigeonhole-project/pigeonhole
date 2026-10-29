@@ -208,6 +208,16 @@ successor wins") on blob stores; one `ChainLogStore` and one
 replaces `ChannelApi` / `ChannelLogStore` / `ChannelSnapshotStore`). Can run
 in parallel with 7b (different code in `pigeonhole-meta`).
 
+### Step 7d — Metrics you can look at ✅ done
+
+[metrics.md](metrics.md). Fixes (a HEAD counted its object as egress, a
+cache hit counted twice, Telegram rate limits never showed, buckets started
+at 10 ms), the S3 operation as a label, the tablet's metrics (commit,
+append, snapshots, boot), its contents as gauges, an L2 cache of stored
+blocks (configured before, never built). Every metric is declared in a
+table and listed in metrics.md by a test. `make metrics-demo`: a disk-backed
+node, Prometheus, Grafana with a dashboard, S3 traffic.
+
 ### Step 8 — Raft between nodes
 
 Design: meta-backends.md § Raft between nodes. Sub-steps:
