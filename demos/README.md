@@ -25,16 +25,17 @@ DEMO_BACKEND=chats ./demos/<demo>/run.sh      # metadata in Discord, objects in 
 DEMO_BACKEND=discord ./demos/<demo>/run.sh    # all of it in Discord
 ```
 
-With `chats` and `discord`, pigeonhole's metadata log and snapshots go to the
-Discord test channels (`DISCORD_LOG_CHANNEL_ID`, `DISCORD_SNAP_CHANNEL_ID`,
-a lease instead of a thread per write). The objects go to the Telegram
-channel `TG_BLOBS_CHAT_ID` (over MTProto) with `chats`, to
-`DISCORD_BLOBS_CHANNEL_ID` with `discord`. A Telegram channel takes about
-20 posts a minute, so a burst of objects queues there for seconds; Discord
-takes them faster (see etcd-on-telegram for when that matters). Secrets and ids come from the repo `.env`
-(see `.env.example`). The Telegram channels are marked before a run and only
-the messages between the marks are deleted after it; the Discord test
-channels are emptied whole, so they must be dedicated to tests.
+With `chats` and `discord`, pigeonhole's metadata log and snapshots go to
+the Discord test channels (`DISCORD_LOG_CHANNEL_ID`,
+`DISCORD_SNAP_CHANNEL_ID`, a lease instead of a thread per write). The
+objects go to the Telegram channel `TG_BLOBS_CHAT_ID` (over MTProto) with
+`chats`, to `DISCORD_BLOBS_CHANNEL_ID` with `discord`. A Telegram channel
+takes about 20 posts a minute, so a burst of objects queues there for
+seconds; Discord takes them faster (see etcd-on-telegram for when that
+matters). Secrets and ids come from the repo `.env` (see `.env.example`).
+The Telegram channels are marked before a run and only the messages between
+the marks are deleted after it; the Discord test channels are emptied whole,
+so they must be dedicated to tests.
 
 ## Needs
 
