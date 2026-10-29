@@ -110,6 +110,13 @@ delete_burst = 5.0
 upload_concurrency = 2
 download_concurrency = 8
 
+[discord]
+# The same knobs as [telegram], for Discord channels; defaults: ~5 messages
+# per 5 s per channel (send 1.0, burst 5; a log entry is a message and a
+# thread), reads 5/s, the bot 40/s.
+# send_rate_per_sec = 1.0
+# send_burst = 5.0
+
 [cache]
 # In-memory block caches: a read looks in L1 (decoded blocks), then L2
 # (stored, compressed blocks), then the backend. Raw chunks are not cached.

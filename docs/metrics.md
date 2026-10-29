@@ -83,7 +83,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_bytes_from_backend_total` | counter | `instance` | Bytes read from backend instances |
 | `pigeonhole_instance_rate_limited_total` | counter | `instance`, `op` | Backend calls that failed rate limited (a 429 / FLOOD_WAIT longer than the call's budget) |
 | `pigeonhole_backend_throttle_wait_seconds` | histogram | `service`, `method` | Waits a chat service asked for (429 retry-after / FLOOD_WAIT), also the ones waited out inside a call |
-| `pigeonhole_limiter_wait_seconds` | histogram | `op` | Time waiting for our own chat rate-limit buckets (waits > 0 only) |
+| `pigeonhole_limiter_wait_seconds` | histogram | `chat`, `op` | Time waiting for our own rate-limit buckets of a chat / channel (waits > 0 only) |
 | `pigeonhole_replica_selected_total` | counter | `instance` | Replicas chosen to read from |
 | `pigeonhole_parts_per_chunk` | histogram | `instance` | Backend parts written per chunk replica |
 | `pigeonhole_cache_requests_total` | counter | `level`, `outcome` | Block cache lookups: hit, miss (loaded the block), collapsed (waited for another lookup's load) |

@@ -191,6 +191,8 @@ impl BotLimiter {
 
 /// Budgets for one chat; each call also takes a token from its bot.
 pub struct ChatLimiter {
+    /// The chat / channel id, a metrics label.
+    chat: String,
     bot: Arc<BotLimiter>,
     send: TokenBucket,
     get_file: TokenBucket,
@@ -218,6 +220,28 @@ pub struct ChatLimiterConfig {
     pub download_concurrency: usize,
 }
 
+impl ChatLimiterConfig {
+    /// Discord: ~50 requests a second per bot; per channel ~5 messages per
+    /// 5 s (a log entry is a message and a thread: two sends) and route
+    /// limits the client also reads from the headers.
+    pub fn discord() -> Self {
+        Self {
+            bot_rate_per_sec: 40.0,
+            bot_burst: 50.0,
+            send_rate_per_sec: 1.0,
+            send_burst: 5.0,
+            get_file_rate_per_sec: 5.0,
+            get_file_burst: 10.0,
+            delete_rate_per_sec: 1.0,
+            delete_burst: 5.0,
+            info_rate_per_sec: 2.0,
+            info_burst: 5.0,
+            upload_concurrency: 2,
+            download_concurrency: 8,
+        }
+    }
+}
+
 impl Default for ChatLimiterConfig {
     fn default() -> Self {
         Self {
@@ -243,12 +267,13 @@ impl ChatLimiter {
     /// A chat with a bot of its own (tests, single-chat tools).
     pub fn new(cfg: ChatLimiterConfig) -> Self {
         let bot = Arc::new(BotLimiter::new(cfg.bot_rate_per_sec, cfg.bot_burst));
-        Self::for_bot(cfg, bot)
+        Self::for_bot(cfg, bot, "")
     }
 
-    /// A chat of `bot`, sharing its bot-level budget with the bot's other chats.
-    pub fn for_bot(cfg: ChatLimiterConfig, bot: Arc<BotLimiter>) -> Self {
+    /// Chat `chat` of `bot`, sharing its bot-level budget with the bot's other chats.
+    pub fn for_bot(cfg: ChatLimiterConfig, bot: Arc<BotLimiter>, chat: &str) -> Self {
         Self {
+            chat: chat.to_owned(),
             bot,
             send: TokenBucket::new(cfg.send_rate_per_sec, cfg.send_burst),
             get_file: TokenBucket::new(cfg.get_file_rate_per_sec, cfg.get_file_burst),
@@ -266,7 +291,7 @@ impl ChatLimiter {
     /// Chat bucket first, then the bot's.
     async fn take(&self, bucket: &TokenBucket, name: &'static str) {
         let waited = bucket.acquire().await + self.bot.acquire().await;
-        crate::metrics::record_limiter_wait(name, waited);
+        crate::metrics::record_limiter_wait(&self.chat, name, waited);
     }
 
     /// `sendDocument` / `sendMessage` / pin / unpin.
@@ -370,7 +395,7 @@ impl LimiterRegistry {
             .entry(bot.to_string())
             .or_insert_with(|| Arc::new(BotLimiter::new(self.cfg.bot_rate_per_sec, self.cfg.bot_burst)))
             .clone();
-        let l = Arc::new(ChatLimiter::for_bot(self.cfg.clone(), bot_limiter));
+        let l = Arc::new(ChatLimiter::for_bot(self.cfg.clone(), bot_limiter, chat));
         chats.insert((bot.to_string(), chat.to_string()), l.clone());
         l
     }

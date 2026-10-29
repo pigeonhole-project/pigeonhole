@@ -84,7 +84,7 @@ async fn meta_channel_store(
     chat_id: &str,
     purpose: &str,
 ) -> anyhow::Result<Arc<TelegramBlobStore<MtprotoChannel>>> {
-    let limiter = cfg.chat_limiter(&login.bot_token, chat_id);
+    let limiter = cfg.chat_limiter(InstanceKind::Telegram, &login.bot_token, chat_id);
     let channel = channel_log::client(login)
         .await?
         .channel(parse_chat(chat_id)?, Lane::Meta, limiter.clone())
@@ -112,7 +112,7 @@ async fn meta_discord<T: ?Sized>(
     wrap: impl FnOnce(Arc<pigeonhole_storage_discord::DiscordBlobStore<pigeonhole_storage_discord::DiscordChannel>>) -> Arc<T>,
 ) -> anyhow::Result<Arc<T>> {
     use pigeonhole_storage_discord::{discord_fingerprint, discord_location, DiscordBlobStore, DiscordClient};
-    let limiter = cfg.chat_limiter(bot_token, channel_id);
+    let limiter = cfg.chat_limiter(InstanceKind::Discord, bot_token, channel_id);
     let dc = DiscordClient::new(bot_token.to_string()).context("discord client")?;
     let id: u64 = channel_id.parse().with_context(|| format!("{purpose} channel id {channel_id:?}"))?;
     dc.ensure_permissions(id, true, &limiter).await.with_context(|| format!("{purpose} channel"))?;
@@ -178,7 +178,7 @@ async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {
                 .iter()
                 .find(|i| i.info.id == *id)
                 .with_context(|| format!("blob store {id:?} not resolved"))?;
-            let limiter = cfg.chat_limiter(&inst.bot_token, &inst.scope_id);
+            let limiter = cfg.chat_limiter(inst.info.kind, &inst.bot_token, &inst.scope_id);
             members.push(build_member(inst, &limiter).await?);
         }
         shards.push((members, shard.write_quorum));
