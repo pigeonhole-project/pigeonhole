@@ -260,6 +260,36 @@ a fresh store 1.6 s; claim on an empty channel 2.2 s; 5 appends 32 s (~6.5 s
 each: a message, a thread and its archiving under the default limiter);
 racing claims leave one writer; snapshots put / remove / newest.
 
+## Webhooks as a fence: checked live, rejected (2026-10-29)
+
+The idea: each generation posts through a webhook of its own; a claim deletes
+every other webhook of the channel, so a deposed writer's next post answers
+`404 Unknown Webhook` — revoking the right to write instead of a
+compare-and-set per append (1 request per append, no thread budget).
+
+Live, on the test guild (a bot with Manage Webhooks):
+
+- Basics hold: `POST /webhooks/{id}/{token}?wait=true` in ~480 ms returns the
+  message with its `webhook_id`; files work; 5 posts per webhook per ~2 s;
+  after a delete, the next post answers 404 (code 10015); at most 15
+  webhooks per channel (16th: 30007); creating webhooks has a hidden limit
+  (429 with a ~55-65 s wait after a few, though the headers show 999 of 1000
+  left).
+- **The boundary is not atomic.** 15 rounds of 4 writers posting while the
+  webhook is deleted, the claimant reading the channel right after the
+  delete returns (121 acknowledged posts): 3 posts were acknowledged (200)
+  after the delete had returned, one of them sent 48 ms *after* the delete
+  started; and in one round a post sent 35 ms before the delete, answered
+  200 at 0.6 s after it, was **not** in the claimant's read (it showed up 3 s
+  later). A writer would have acknowledged entries the next generation never
+  saw.
+
+So a webhook fence needs a wait after the delete before the claimant reads (a
+straggler window: a bound on Discord's internals that nothing guarantees) —
+the timing assumption the chain log exists to avoid. Not adopted; the thread
+compare-and-set stays. Cheaper Discord appends come from a Discord-specific
+rate limiter and from archiving links off the hot path (roadmap).
+
 ## Steps
 
 Each step ends with `cargo test --workspace` and
