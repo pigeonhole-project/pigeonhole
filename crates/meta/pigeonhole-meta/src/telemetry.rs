@@ -14,7 +14,7 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::counter("pigeonhole_meta_log_entries_total", &[], "Entries appended to the log"),
     MetricDoc::counter("pigeonhole_meta_log_bytes_total", &[], "Entry payload bytes appended to the log"),
     MetricDoc::histogram("pigeonhole_meta_snapshot_seconds", &[], "Time to encode and store a snapshot"),
-    MetricDoc::gauge("pigeonhole_meta_snapshot_bytes", &[], "Size of the newest snapshot"),
+    MetricDoc::gauge("pigeonhole_meta_snapshot_bytes", &[], "Size of the newest snapshot (stored, or loaded on boot)"),
     MetricDoc::counter("pigeonhole_meta_snapshots_total", &[], "Snapshots stored"),
     MetricDoc::gauge("pigeonhole_meta_applied_position", &[], "Position of the last applied entry"),
     MetricDoc::gauge("pigeonhole_meta_base_position", &[], "Position of the snapshot the log starts from (the log holds applied - base entries)"),
@@ -49,6 +49,11 @@ pub(crate) fn record_snapshot(bytes: usize, d: Duration) {
     metrics::histogram!("pigeonhole_meta_snapshot_seconds").record(d.as_secs_f64());
     metrics::gauge!("pigeonhole_meta_snapshot_bytes").set(bytes as f64);
     metrics::counter!("pigeonhole_meta_snapshots_total").increment(1);
+}
+
+/// The snapshot a boot started from.
+pub(crate) fn record_loaded_snapshot(bytes: usize) {
+    metrics::gauge!("pigeonhole_meta_snapshot_bytes").set(bytes as f64);
 }
 
 pub(crate) fn record_boot(replayed: u64, d: Duration) {

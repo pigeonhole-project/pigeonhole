@@ -10,6 +10,30 @@ Each crate declares the metrics it records in a `METRICS` table
 it, and so does the list below: `tests/metrics_doc.rs` fails when the list is
 stale and rewrites it with `UPDATE_METRICS_DOC=1`.
 
+## Watching them live
+
+```sh
+brew install prometheus grafana awscli
+make metrics-demo                     # ./scripts/metrics-demo.sh up
+open http://127.0.0.1:3000/d/pigeonhole/pigeonhole
+./scripts/metrics-demo.sh check       # every panel's query answers; every exported metric is listed here
+make metrics-demo-down                # data stays in .cache/metrics-demo; `metrics-demo.sh clean` drops it
+```
+
+`up` builds the release binary and starts, each logging to `.cache/metrics-demo/`:
+
+| What | Where |
+|---|---|
+| pigeonhole, blobs and log on local disk | S3 `127.0.0.1:8333`, `/metrics` on `127.0.0.1:9100` |
+| Prometheus, scraping every 2 s (`ops/observability/prometheus.yml`) | `127.0.0.1:9090` |
+| Grafana, anonymous admin, the dashboard provisioned | `127.0.0.1:3000` |
+| `scripts/metrics-load.sh`: PUT / multipart / GET / ranged GET / HEAD / LIST / COPY / DELETE in a loop (`NO_LOAD=1` skips it) | |
+
+The dashboard is generated: edit `ops/observability/dashboard.py`; `up`
+writes `ops/observability/grafana/dashboards/pigeonhole.json` from it (commit
+both). The JSON imports into any Grafana with a Prometheus data source of
+uid `prom`.
+
 ## Reading them
 
 - `pigeonhole_gateway_request_duration_seconds` is the time to response
@@ -84,7 +108,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_meta_log_entries_total` | counter |  | Entries appended to the log |
 | `pigeonhole_meta_log_bytes_total` | counter |  | Entry payload bytes appended to the log |
 | `pigeonhole_meta_snapshot_seconds` | histogram |  | Time to encode and store a snapshot |
-| `pigeonhole_meta_snapshot_bytes` | gauge |  | Size of the newest snapshot |
+| `pigeonhole_meta_snapshot_bytes` | gauge |  | Size of the newest snapshot (stored, or loaded on boot) |
 | `pigeonhole_meta_snapshots_total` | counter |  | Snapshots stored |
 | `pigeonhole_meta_applied_position` | gauge |  | Position of the last applied entry |
 | `pigeonhole_meta_base_position` | gauge |  | Position of the snapshot the log starts from (the log holds applied - base entries) |

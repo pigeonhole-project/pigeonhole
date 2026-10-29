@@ -497,6 +497,7 @@ impl MetaStore {
             if stored.log_id != head.log_id {
                 bail!("snapshot {:?} is of log {}, not of log {}", base.snapshot.0, stored.log_id, head.log_id);
             }
+            telemetry::record_loaded_snapshot(stored.data.len());
             let snap = raft::RaftSnapshot::decode(&stored.data)?;
             if snap.meta.last_log_id.as_ref().map_or(0, raft::position) < base.at {
                 bail!("snapshot {:?} is behind the log's base {}", base.snapshot.0, base.at);

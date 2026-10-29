@@ -20,6 +20,8 @@ use tracing::warn;
 pub async fn cmd_serve() -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     info!(path = %cfg.config_path.display(), "loaded config");
+    // Before the runtime: booting the tablet records metrics too.
+    let metrics_on_main = setup_metrics(&cfg)?;
     let rt = open_runtime(&cfg).await.context("open runtime")?;
     let index = Index::open(rt.meta.clone())
         .await
@@ -55,8 +57,6 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
             }
         });
     }
-
-    let metrics_on_main = setup_metrics(&cfg)?;
 
     let max_headers = cfg.http.max_headers;
     let s3_service = build_s3_service(s3_gateway, &cfg.access_key, &cfg.secret_key);
