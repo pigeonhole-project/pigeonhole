@@ -198,12 +198,14 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
 ## Implementation notes (2026-10-29)
 
 - **Where**: `ChainLogStore::with_lease(Lease)` (pigeonhole-meta
-  `log/chain.rs`). A store takes part through three `Chain` methods:
+  `log/chain.rs`), only for a store that implements `LeaseChain` (a
+  `Chain` subtrait in pigeonhole-storage-api), so a lease on any other store
+  does not compile:
   - `stamp_ms`: Discord's snowflake time;
   - `put_unlinked`: a member's name, no thread;
   - `list_after`: list newer blobs by label.
 
-  Stores that stamp nothing keep the link-per-batch log.
+  Other stores keep the link-per-batch log.
   `[meta] lease_secs = 0` turns the lease off for Discord too.
 - **Renewals run in the background and stay outside the log.** In the first
   live run a renewal waited for the thread pacer (~7 s with the post) in

@@ -32,7 +32,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use pigeonhole_storage_api::{collect_stream, After, BlobBackend, Chain, Linked};
+use pigeonhole_storage_api::{collect_stream, After, BlobBackend, Chain, LeaseChain, Linked};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -54,6 +54,35 @@ impl Lease {
     pub fn new(duration: Duration) -> Self {
         Self { duration, margin: Duration::from_secs(1).min(duration / 4) }
     }
+}
+
+/// What a lease log needs of its store beyond [`Chain`]: [`LeaseChain`],
+/// object-safe over the store's id, so that a [`ChainLogStore`] built
+/// [`with_lease`](ChainLogStore::with_lease) keeps it next to its lease.
+#[async_trait]
+trait LeaseStore<Id>: Send + Sync {
+    fn stamp_ms(&self, id: &Id) -> u64;
+    async fn put_unlinked(&self, prev: &Id, label: &str, data: Bytes) -> anyhow::Result<Id>;
+    async fn list_after(&self, after: Option<&Id>, prefix: &str) -> anyhow::Result<Vec<Linked<Id>>>;
+}
+
+#[async_trait]
+impl<C: LeaseChain> LeaseStore<C::Id> for C {
+    fn stamp_ms(&self, id: &C::Id) -> u64 {
+        LeaseChain::stamp_ms(self, id)
+    }
+    async fn put_unlinked(&self, prev: &C::Id, label: &str, data: Bytes) -> anyhow::Result<C::Id> {
+        LeaseChain::put_unlinked(self, prev, label, data).await
+    }
+    async fn list_after(&self, after: Option<&C::Id>, prefix: &str) -> anyhow::Result<Vec<Linked<C::Id>>> {
+        LeaseChain::list_after(self, after, prefix).await
+    }
+}
+
+/// A lease log's lease and its store.
+struct Leased<Id> {
+    lease: Lease,
+    store: Arc<dyn LeaseStore<Id>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +235,7 @@ struct Write {
 
 pub struct ChainLogStore<C: Chain> {
     chain: Arc<C>,
-    lease: Option<Lease>,
+    lease: Option<Leased<C::Id>>,
     state: Arc<Mutex<State<C::Id>>>,
     /// One write at a time.
     writing: tokio::sync::Mutex<()>,
@@ -242,22 +271,19 @@ impl<C: Chain> ChainLogStore<C> {
         }
     }
 
-    /// Hold the log by `lease` (the store must stamp its ids).
-    pub fn with_lease(mut self, lease: Lease) -> Self {
-        self.lease = Some(lease);
+    /// Hold the log by `lease`.
+    pub fn with_lease(mut self, lease: Lease) -> Self
+    where
+        C: LeaseChain,
+    {
+        self.lease = Some(Leased { lease, store: self.chain.clone() });
         self
     }
 
-    fn stamp(&self, id: &C::Id) -> LogResult<u64> {
-        self.chain
-            .stamp_ms(id)
-            .ok_or_else(|| LogError::Other(anyhow!("a lease log needs a store that stamps its blobs")))
-    }
-
     /// The store's time now: the stamp of a probe blob, deleted after.
-    async fn store_now(&self) -> LogResult<u64> {
+    async fn store_now(&self, l: &Leased<C::Id>) -> LogResult<u64> {
         let probe = self.chain.put_loose("log-probe", Bytes::from_static(&[0])).await?;
-        let now = self.stamp(&probe)?;
+        let now = l.store.stamp_ms(&probe);
         if let Err(e) = self.chain.delete(&[C::key(&probe)]).await {
             tracing::debug!(error = %format!("{e:#}"), "a lease probe stays");
         }
@@ -265,9 +291,9 @@ impl<C: Chain> ChainLogStore<C> {
     }
 
     /// Return once the store's clock is past `ms`.
-    async fn wait_past(&self, ms: u64) -> LogResult<()> {
+    async fn wait_past(&self, l: &Leased<C::Id>, ms: u64) -> LogResult<()> {
         loop {
-            let now = self.store_now().await?;
+            let now = self.store_now(l).await?;
             if now > ms {
                 return Ok(());
             }
@@ -277,16 +303,16 @@ impl<C: Chain> ChainLogStore<C> {
 
     /// When the lease of record `record` (labelled `label`) ends, in the
     /// store's ms: its stamp plus the lease, or the stamp for a release.
-    fn expiry(&self, record: &C::Id, label: &str, lease: Lease) -> LogResult<u64> {
-        let stamp = self.stamp(record)?;
-        Ok(if label.starts_with("log-release-") { stamp } else { stamp + lease.duration.as_millis() as u64 })
+    fn expiry(&self, l: &Leased<C::Id>, record: &C::Id, label: &str) -> u64 {
+        let stamp = l.store.stamp_ms(record);
+        if label.starts_with("log-release-") { stamp } else { stamp + l.lease.duration.as_millis() as u64 }
     }
 
     /// The tip as of lease record `record` of generation `gen`: its newest
     /// batch stamped inside the lease, or the record itself.
-    async fn lease_tip(&self, record: &Linked<C::Id>, lease: Lease) -> LogResult<(ChainDoc<C::Id>, Prev<C::Id>)> {
+    async fn lease_tip(&self, l: &Leased<C::Id>, record: &Linked<C::Id>) -> LogResult<(ChainDoc<C::Id>, Prev<C::Id>)> {
         let gen = label_gen(&record.label).unwrap_or(0);
-        let expiry = self.expiry(&record.id, &record.label, lease)?;
+        let expiry = self.expiry(l, &record.id, &record.label);
         let record = &record.id;
         let batch = label(Kind::Batch, gen);
         // A renewal (or release) is outside the log: it names the writer's
@@ -295,11 +321,11 @@ impl<C: Chain> ChainLogStore<C> {
         let (doc, at) = self.reader().fetch(record).await?;
         let mut newest = match (doc.claim, &doc.prev) {
             (false, Some(prev)) => prev.id.clone(),
-            _ => return self.newest_batch(record, (doc, at), &batch, expiry).await,
+            _ => return self.newest_batch(l, record, (doc, at), &batch, expiry).await,
         };
         let start = newest.clone();
-        for b in self.chain.list_after(Some(&start), &batch).await? {
-            if b.label == batch && self.stamp(&b.id)? < expiry {
+        for b in l.store.list_after(Some(&start), &batch).await? {
+            if b.label == batch && l.store.stamp_ms(&b.id) < expiry {
                 newest = b.id;
             }
         }
@@ -310,14 +336,15 @@ impl<C: Chain> ChainLogStore<C> {
     /// claim itself (`claim`, fetched).
     async fn newest_batch(
         &self,
+        l: &Leased<C::Id>,
         record: &C::Id,
         claim: (ChainDoc<C::Id>, Prev<C::Id>),
         batch: &str,
         expiry: u64,
     ) -> LogResult<(ChainDoc<C::Id>, Prev<C::Id>)> {
         let mut newest = None;
-        for b in self.chain.list_after(Some(record), batch).await? {
-            if b.label == batch && self.stamp(&b.id)? < expiry {
+        for b in l.store.list_after(Some(record), batch).await? {
+            if b.label == batch && l.store.stamp_ms(&b.id) < expiry {
                 newest = Some(b.id);
             }
         }
@@ -373,12 +400,12 @@ impl<C: Chain> ChainLogStore<C> {
     /// A lease log's claim: wait out the newest lease record `newest`, read
     /// the tip it leaves, link a claim after it. `Ok(None)`: a renewal
     /// linked first; look again.
-    async fn claim_after_lease(&self, gen: u64, lease: Lease, newest: &Linked<C::Id>) -> LogResult<Option<Head>> {
+    async fn claim_after_lease(&self, l: &Leased<C::Id>, gen: u64, newest: &Linked<C::Id>) -> LogResult<Option<Head>> {
         let t0 = Instant::now();
-        let expiry = self.expiry(&newest.id, &newest.label, lease)?;
-        self.wait_past(expiry + lease.margin.as_millis() as u64).await?;
+        let expiry = self.expiry(l, &newest.id, &newest.label);
+        self.wait_past(l, expiry + l.lease.margin.as_millis() as u64).await?;
         crate::telemetry::record_lease_wait("claim", t0.elapsed());
-        let (old, at) = self.lease_tip(newest, lease).await?;
+        let (old, at) = self.lease_tip(l, newest).await?;
         let newest = &newest.id;
         let tip = Tip::of(&old, at);
         let doc = ChainDoc {
@@ -493,8 +520,8 @@ impl<C: Chain> ChainLogStore<C> {
     /// Put `w` as generation `gen` after the owner's tip.
     async fn write(&self, gen: u64, w: Write) -> LogResult<Tip<C::Id>> {
         let _one = self.writing.lock().await;
-        if let Some(lease) = self.lease {
-            self.keep_lease(gen, lease).await?;
+        if let Some(l) = &self.lease {
+            self.keep_lease(gen, l.lease).await?;
         }
         let (log_id, tip) = self.owned(gen)?;
         let (base, older) = match w.base {
@@ -517,11 +544,11 @@ impl<C: Chain> ChainLogStore<C> {
         let bytes = doc.encode();
         let crc = crc32fast::hash(&bytes);
         let prev = tip.at.as_ref().map(|p| &p.id);
-        let put = match (self.lease, self.held(gen), prev) {
-            (Some(lease), Some((_, sent)), Some(prev)) => {
+        let put = match (&self.lease, self.held(gen), prev) {
+            (Some(l), Some((_, sent)), Some(prev)) => {
                 // Kept only if the store answered inside the lease.
-                let deadline = sent + lease.duration.saturating_sub(lease.margin);
-                match self.chain.put_unlinked(prev, &label(Kind::Batch, gen), Bytes::from(bytes)).await {
+                let deadline = sent + l.lease.duration.saturating_sub(l.lease.margin);
+                match l.store.put_unlinked(prev, &label(Kind::Batch, gen), Bytes::from(bytes)).await {
                     Ok(_) if Instant::now() >= deadline => {
                         self.fail(Failed::Broken("a batch was answered after the lease's deadline".into()));
                         return Err(LogError::Other(anyhow!("a log batch was answered after the lease's deadline")));
@@ -616,14 +643,14 @@ async fn lease_record<C: Chain>(
 #[async_trait]
 impl<C: Chain> LogStore for ChainLogStore<C> {
     async fn claim(&self, gen: u64) -> LogResult<Head> {
-        if let Some(lease) = self.lease {
+        if let Some(l) = &self.lease {
             for _ in 0..pigeonhole_storage_api::PUT_AFTER_TAIL_ATTEMPTS {
                 let Some(newest) = self.chain.tail().await? else { break };
                 let newest_gen = label_gen(&newest.label).unwrap_or(0);
                 if newest_gen >= gen {
                     return Err(LogError::Fenced { current: newest_gen });
                 }
-                if let Some(head) = self.claim_after_lease(gen, lease, &newest).await? {
+                if let Some(head) = self.claim_after_lease(l, gen, &newest).await? {
                     return Ok(head);
                 }
             }
@@ -672,7 +699,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         match (won, made.into_inner().unwrap()) {
             (None, Some(Made::Fenced(current))) => Err(LogError::Fenced { current }),
             (Some(id), Some(Made::Claim { log_id, position, doc, crc })) => {
-                let held = self.lease.map(|_| (id.clone(), sent));
+                let held = self.lease.as_ref().map(|_| (id.clone(), sent));
                 let tip = Tip::of(&doc, Prev { id, crc });
                 self.state.lock().unwrap().owner = Some(Owner { gen, log_id, tip, failed: None, held });
                 Ok(Head { log_id, position })
@@ -756,8 +783,8 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             }));
         }
         let Some(tail) = self.chain.tail().await? else { return Ok(None) };
-        let (doc, at) = match self.lease {
-            Some(lease) => self.lease_tip(&tail, lease).await?,
+        let (doc, at) = match &self.lease {
+            Some(l) => self.lease_tip(l, &tail).await?,
             None => self.reader().fetch(&tail.id).await?,
         };
         let tip = Tip::of(&doc, at);
