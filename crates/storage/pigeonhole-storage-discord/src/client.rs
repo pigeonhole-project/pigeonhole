@@ -193,7 +193,7 @@ impl DiscordClient {
                     RateBudget::Read => limiter.penalize_get_file(wait),
                     RateBudget::Download => {}
                 }
-                // TODO(metrics): pigeonhole_blob::record_throttle("discord", what, wait) once it lands.
+                pigeonhole_blob::record_throttle("discord", what, wait);
                 tokio::time::sleep(wait).await;
                 last = Some(RateLimited { method: what, retry_after: wait }.into());
                 continue;
