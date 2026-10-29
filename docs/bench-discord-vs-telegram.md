@@ -133,6 +133,36 @@ messages (no paced thread), the same run gives
 The log is still the limit (an entry is a paced thread), but it no longer
 stalls.
 
+## Update: the Discord log on a lease
+
+Since the lease (`[meta] lease_secs`, 45 s by default) a Discord log entry is
+a plain post; threads are only for the lease records. The same full run on
+Discord, against the earlier ones and the first Telegram run (not rerun:
+its code did not change for this) ([raw](bench/2026-10-29-lease/discord.json)):
+
+| | Discord first | Discord, log-collect | **Discord, lease** | Telegram first |
+|---|---|---|---|---|
+| small PUT, 1 client: p50 | 6.7 s | 6.7 s | **0.95 s** | 3.3 s |
+| small PUT, 1 client: PUTs/s | 0.15 | 0.15 | **0.93** ¹ | 0.31 |
+| log append mean | 6.1 s | 5.7 s | **0.48 s** | 2.5 s |
+| large PUT | 1.3 MiB/s | 1.4 MiB/s | **2.7 MiB/s** | 2.7 MiB/s |
+| small PUT, 8 clients: PUTs/s | 0.30 | 0.60 | **1.02** | 0.30 |
+| small PUT, 8 clients: p50 / p95 | 13 s / 119 s | 13 s / 20 s | **7.8 s / 11 s** | 23 s / 40 s |
+| proposals per entry (8 clients) | 2.67 | 3.56 | 1.15 | 1.02 |
+| cold GET | 6.6 MiB/s | 8.0 MiB/s | 6.7 MiB/s | 5.6 MiB/s |
+
+¹ The phase stopped at its cap of 60 PUTs (in 65 s).
+
+- **The log no longer limits Discord writes.** An append takes ~0.5 s
+  instead of a paced thread's 6 s; one client writes 6× faster and is now
+  faster than Telegram.
+- **Large PUTs reach upload speed**: 2.7 MiB/s, as Telegram.
+- **With 8 clients Discord is now blob-bound, like Telegram**: 190 PUTs in
+  187 s is our `[discord]` send budget of the blobs channel (1 message a
+  second); entries rarely wait, so batching drops to 1.15 proposals each.
+  More blob channels (`[[shards]]`) would lift it, as on Telegram.
+- Reads did not change (no log in them).
+
 ## Update: reading blocks in parallel does not help
 
 A chunk store that read up to n blocks of a chunk at once (an experiment,
