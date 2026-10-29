@@ -18,13 +18,24 @@ pub(crate) const NAMESPACE: &str = "s3";
 /// win, as a repeated header would.
 pub type Pairs = Vec<(String, String)>;
 
+/// What a write expects of its key's current object: an S3 conditional
+/// write (docs/conditional-writes.md), checked when the command applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Expect {
+    /// `If-None-Match: *`: no object under the key.
+    Absent,
+    /// `If-Match`: the object's ETag (hex, unquoted).
+    ETag(String),
+}
+
 /// Commands of the `s3` namespace. Changing the shape of a variant or the
 /// order of variants needs a new [`S3State::VERSION`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum S3Command {
     CreateBucket { name: String, created_at: String },
     DeleteBucket { name: String },
-    /// Insert or replace an object (user metadata and tags of the old version go).
+    /// Insert or replace an object with its tags (user metadata and tags of
+    /// the old version go).
     PutObject {
         bucket: String,
         key: String,
@@ -33,10 +44,12 @@ pub enum S3Command {
         content_type: Option<String>,
         extents: Vec<Extent>,
         user_meta: Pairs,
+        tags: Pairs,
         checksums_json: String,
         mtime: String,
+        expect: Option<Expect>,
     },
-    DeleteObject { bucket: String, key: String },
+    DeleteObject { bucket: String, key: String, expect: Option<Expect> },
     /// Replace an object's tags (empty = delete them).
     PutObjectTags { bucket: String, key: String, tags: Pairs },
     CreateUpload {
@@ -51,7 +64,14 @@ pub enum S3Command {
     },
     PutPart { upload_id: String, part_number: i64, etag: String, size: i64, extents: Vec<Extent> },
     /// Assemble the object from parts; part extents move to the object (no release).
-    CompleteUpload { upload_id: String, part_numbers: Vec<i64>, etag: String, total_size: i64, mtime: String },
+    CompleteUpload {
+        upload_id: String,
+        part_numbers: Vec<i64>,
+        etag: String,
+        total_size: i64,
+        mtime: String,
+        expect: Option<Expect>,
+    },
     AbortUpload { upload_id: String },
 }
 
@@ -64,6 +84,8 @@ pub enum S3Reject {
     NoSuchKey,
     NoSuchUpload,
     MissingPart(i64),
+    /// The key's object is not what the write's [`Expect`] said.
+    PreconditionFailed,
 }
 
 /// Reply of every committed command: chunk ids the caller must release
@@ -119,7 +141,7 @@ pub struct S3State {
 
 impl StateMachine for S3State {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     type Command = S3Command;
     type Reply = Released;
     type Reject = S3Reject;
@@ -142,11 +164,16 @@ impl StateMachine for S3State {
                 content_type,
                 extents,
                 user_meta,
+                tags,
                 checksums_json,
                 mtime,
+                expect,
             } => {
                 if !self.buckets.contains_key(&bucket) {
                     return Ok(Err(S3Reject::BucketNotFound));
+                }
+                if let Err(reject) = self.check(&bucket, &key, expect.as_ref()) {
+                    return Ok(Err(reject));
                 }
                 let rec = ObjectRec {
                     etag,
@@ -156,14 +183,19 @@ impl StateMachine for S3State {
                     checksums_json,
                     extents,
                     user_meta: user_meta.into_iter().collect(),
-                    tags: BTreeMap::new(),
+                    tags: tags.into_iter().collect(),
                 };
                 released(self.write_object(bucket, key, rec))
             }
-            S3Command::DeleteObject { bucket, key } => match self.objects.remove(&(bucket, key)) {
-                Some(o) => released(chunk_ids(&o.extents)),
-                None => Err(S3Reject::NoSuchKey),
-            },
+            S3Command::DeleteObject { bucket, key, expect } => {
+                if let Err(reject) = self.check(&bucket, &key, expect.as_ref()) {
+                    return Ok(Err(reject));
+                }
+                match self.objects.remove(&(bucket, key)) {
+                    Some(o) => released(chunk_ids(&o.extents)),
+                    None => Err(S3Reject::NoSuchKey),
+                }
+            }
             S3Command::PutObjectTags { bucket, key, tags } => match self.objects.get_mut(&(bucket, key)) {
                 Some(o) => {
                     o.tags = tags.into_iter().collect();
@@ -207,8 +239,8 @@ impl StateMachine for S3State {
                 let old = upload.parts.insert(part_number, PartRec { etag, size, extents });
                 released(old.map(|p| chunk_ids(&p.extents)).unwrap_or_default())
             }
-            S3Command::CompleteUpload { upload_id, part_numbers, etag, total_size, mtime } => {
-                self.complete_upload(&upload_id, &part_numbers, etag, total_size, mtime)
+            S3Command::CompleteUpload { upload_id, part_numbers, etag, total_size, mtime, expect } => {
+                self.complete_upload(&upload_id, &part_numbers, etag, total_size, mtime, expect.as_ref())
             }
             S3Command::AbortUpload { upload_id } => {
                 let Some(upload) = self.uploads.remove(&upload_id) else {
@@ -221,6 +253,18 @@ impl StateMachine for S3State {
 }
 
 impl S3State {
+    /// Whether the object under `(bucket, key)` is what `expect` says (none
+    /// expected: anything is).
+    pub(crate) fn check(&self, bucket: &str, key: &str, expect: Option<&Expect>) -> std::result::Result<(), S3Reject> {
+        let current = self.objects.get(&(bucket.to_string(), key.to_string()));
+        match (expect, current) {
+            (None, _) | (Some(Expect::Absent), None) => Ok(()),
+            (Some(Expect::ETag(e)), Some(o)) if o.etag == *e => Ok(()),
+            (Some(Expect::ETag(_)), None) => Err(S3Reject::NoSuchKey),
+            (Some(_), Some(_)) => Err(S3Reject::PreconditionFailed),
+        }
+    }
+
     /// Refuses a bucket with objects; its unfinished uploads go with it.
     fn delete_bucket(&mut self, name: &str) -> Applied {
         if !self.buckets.contains_key(name) {
@@ -258,10 +302,12 @@ impl S3State {
         etag: String,
         total_size: i64,
         mtime: String,
+        expect: Option<&Expect>,
     ) -> Applied {
         let Some(upload) = self.uploads.get(upload_id) else {
             return Err(S3Reject::NoSuchUpload);
         };
+        self.check(&upload.bucket, &upload.key, expect)?;
         let mut extents = Vec::new();
         for &pn in part_numbers {
             let Some(part) = upload.parts.get(&pn) else {
@@ -306,11 +352,13 @@ mod tests {
     /// the expected bytes (old logs then refuse to replay, as they should).
     #[test]
     fn command_encoding_is_pinned() {
-        let cmd = S3Command::DeleteObject { bucket: "b".into(), key: "k".into() };
-        assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k']);
+        let cmd = S3Command::DeleteObject { bucket: "b".into(), key: "k".into(), expect: None };
+        assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k', 0]);
+        let cmd = S3Command::DeleteObject { bucket: "b".into(), key: "k".into(), expect: Some(Expect::ETag("e".into())) };
+        assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k', 1, 1, 1, b'e']);
         let cmd = S3Command::CreateBucket { name: "b".into(), created_at: "t".into() };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [0, 1, b'b', 1, b't']);
-        assert_eq!(S3State::VERSION, 2);
+        assert_eq!(S3State::VERSION, 3);
     }
 
     #[test]
@@ -324,8 +372,10 @@ mod tests {
             content_type: None,
             extents: vec![Extent { chunk: 7, offset: 0, len: 1 }],
             user_meta: vec![],
+            tags: vec![],
             checksums_json: "{}".into(),
             mtime: "t".into(),
+            expect: None,
         };
         assert_eq!(s.apply(put("k")).unwrap(), Err(S3Reject::BucketNotFound));
         let create = S3Command::CreateBucket { name: "b".into(), created_at: "t".into() };
@@ -340,9 +390,47 @@ mod tests {
             etag: "e".into(),
             total_size: 1,
             mtime: "t".into(),
+            expect: None,
         };
         assert_eq!(s.apply(done).unwrap(), Err(S3Reject::NoSuchUpload));
         assert_eq!(s.apply(S3Command::DeleteBucket { name: "b".into() }).unwrap(), Err(S3Reject::BucketNotEmpty));
         assert_eq!(pigeonhole_meta::encode_state(&s), before);
+    }
+
+    /// docs/conditional-writes.md § Semantics, row by row; a refusal changes nothing.
+    #[test]
+    fn conditional_writes_follow_the_table() {
+        let mut s = S3State::default();
+        s.apply(S3Command::CreateBucket { name: "b".into(), created_at: "t".into() }).unwrap().unwrap();
+        let put = |etag: &str, expect: Option<Expect>| S3Command::PutObject {
+            bucket: "b".into(),
+            key: "k".into(),
+            etag: etag.into(),
+            size: 1,
+            content_type: None,
+            extents: vec![],
+            user_meta: vec![],
+            tags: vec![],
+            checksums_json: "{}".into(),
+            mtime: "t".into(),
+            expect,
+        };
+        let del = |expect: Option<Expect>| S3Command::DeleteObject { bucket: "b".into(), key: "k".into(), expect };
+        let etag = |e: &str| Some(Expect::ETag(e.into()));
+
+        // Absent key.
+        assert_eq!(s.apply(put("1", etag("1"))).unwrap(), Err(S3Reject::NoSuchKey));
+        assert_eq!(s.apply(del(etag("1"))).unwrap(), Err(S3Reject::NoSuchKey));
+        assert_eq!(s.apply(put("1", Some(Expect::Absent))).unwrap(), Ok(vec![]));
+
+        // Present, ETag "1".
+        let before = pigeonhole_meta::encode_state(&s);
+        assert_eq!(s.apply(put("2", Some(Expect::Absent))).unwrap(), Err(S3Reject::PreconditionFailed));
+        assert_eq!(s.apply(put("2", etag("0"))).unwrap(), Err(S3Reject::PreconditionFailed));
+        assert_eq!(s.apply(del(etag("0"))).unwrap(), Err(S3Reject::PreconditionFailed));
+        assert_eq!(pigeonhole_meta::encode_state(&s), before);
+        assert_eq!(s.apply(put("2", etag("1"))).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(del(etag("2"))).unwrap(), Ok(vec![]));
+        assert!(s.objects.is_empty());
     }
 }

@@ -9,7 +9,7 @@ use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use http::{HeaderMap, Method, Uri};
 use http::Extensions;
 use s3s::dto::*;
-use s3s::{S3, S3Request};
+use s3s::{S3ErrorCode, S3Request, S3Response, S3};
 use std::sync::Arc;
 
 fn req<T>(input: T) -> S3Request<T> {
@@ -708,6 +708,143 @@ async fn a_put_is_one_log_entry_and_a_bad_digest_commits_nothing() {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while meta.applied_position() < before + 2 {
         assert!(tokio::time::Instant::now() < deadline, "the release never came");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+fn code(err: s3s::S3Error) -> S3ErrorCode {
+    err.code().clone()
+}
+
+fn put(key: &str, body: &str, if_match: Option<&str>, if_none_match: bool) -> PutObjectInput {
+    PutObjectInput {
+        bucket: "b".into(),
+        key: key.into(),
+        body: Some(StreamingBlob::from_bytes(Bytes::from(body.to_string()))),
+        if_match: if_match.map(|e| ETagCondition::ETag(ETag::Strong(e.into()))),
+        if_none_match: if_none_match.then_some(ETagCondition::Any),
+        ..Default::default()
+    }
+}
+
+/// docs/conditional-writes.md § Semantics through the gateway.
+#[tokio::test]
+async fn conditional_writes_follow_the_table() {
+    let (s3, _meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    let etag = |r: S3Response<PutObjectOutput>| r.output.e_tag.unwrap().value().to_string();
+
+    // Absent key: If-Match is 404, If-None-Match writes.
+    let err = s3.put_object(req(put("k", "one", Some("00"), false))).await.unwrap_err();
+    assert_eq!(code(err), S3ErrorCode::NoSuchKey);
+    let one = etag(s3.put_object(req(put("k", "one", None, true))).await.unwrap());
+
+    // Present: If-None-Match and a stale If-Match are 412; the current ETag writes.
+    let err = s3.put_object(req(put("k", "two", None, true))).await.unwrap_err();
+    assert_eq!(code(err), S3ErrorCode::PreconditionFailed);
+    let err = s3.put_object(req(put("k", "two", Some("00"), false))).await.unwrap_err();
+    assert_eq!(code(err), S3ErrorCode::PreconditionFailed);
+    let two = etag(s3.put_object(req(put("k", "two", Some(&one), false))).await.unwrap());
+    let err = s3.put_object(req(put("k", "three", Some(&one), false))).await.unwrap_err();
+    assert_eq!(code(err), S3ErrorCode::PreconditionFailed, "a superseded ETag");
+
+    // Copy onto an existing key with If-None-Match.
+    let copy = CopyObjectInput::builder()
+        .bucket("b".into())
+        .key("k".into())
+        .copy_source(CopySource::Bucket { bucket: "b".into(), key: "k".into(), version_id: None })
+        .if_none_match(Some(ETagCondition::Any))
+        .build()
+        .unwrap();
+    assert_eq!(code(s3.copy_object(req(copy)).await.unwrap_err()), S3ErrorCode::PreconditionFailed);
+
+    // Multipart: checked at Complete against the object as it is then.
+    let upload = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput { bucket: "b".into(), key: "k".into(), ..Default::default() }))
+        .await
+        .unwrap()
+        .output
+        .upload_id
+        .unwrap();
+    let part = s3
+        .upload_part(req(UploadPartInput {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload_id: upload.clone(),
+            part_number: 1,
+            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"part"))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output
+        .e_tag;
+    let complete = |cond: CompleteMultipartUploadInput| CompleteMultipartUploadInput {
+        bucket: "b".into(),
+        key: "k".into(),
+        upload_id: upload.clone(),
+        multipart_upload: Some(CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart { part_number: Some(1), e_tag: part.clone(), ..Default::default() }]),
+        }),
+        ..cond
+    };
+    let err = s3
+        .complete_multipart_upload(req(complete(CompleteMultipartUploadInput {
+            if_none_match: Some(ETagCondition::Any),
+            ..Default::default()
+        })))
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), S3ErrorCode::PreconditionFailed);
+    s3.complete_multipart_upload(req(complete(CompleteMultipartUploadInput {
+        if_match: Some(ETagCondition::ETag(ETag::Strong(two.clone()))),
+        ..Default::default()
+    })))
+    .await
+    .unwrap();
+
+    // Delete with If-Match.
+    let del = |e: &str| DeleteObjectInput {
+        bucket: "b".into(),
+        key: "k".into(),
+        if_match: Some(ETagCondition::ETag(ETag::Strong(e.into()))),
+        ..Default::default()
+    };
+    assert_eq!(code(s3.delete_object(req(del(&two))).await.unwrap_err()), S3ErrorCode::PreconditionFailed);
+    let current = s3.index.get_object("b", "k").await.unwrap().unwrap().etag;
+    s3.delete_object(req(del(&current))).await.unwrap();
+    assert_eq!(code(s3.delete_object(req(del(&current))).await.unwrap_err()), S3ErrorCode::NoSuchKey);
+
+    // Only `*` in If-None-Match.
+    let mut bad = put("x", "x", None, false);
+    bad.if_none_match = Some(ETagCondition::ETag(ETag::Strong("00".into())));
+    assert_eq!(code(s3.put_object(req(bad)).await.unwrap_err()), S3ErrorCode::InvalidArgument);
+}
+
+/// Racing `If-None-Match: *` puts of one key: exactly one wins, the losers
+/// get 412, and their chunks are released (not left referenced).
+#[tokio::test]
+async fn racing_creates_one_wins_and_losers_release_their_chunks() {
+    let (s3, _meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    let s3 = Arc::new(s3);
+    let tasks: Vec<_> = (0..8)
+        .map(|i| {
+            let s3 = s3.clone();
+            tokio::spawn(async move { s3.put_object(req(put("lock", &format!("writer {i}"), None, true))).await })
+        })
+        .collect();
+    let mut won = 0;
+    for t in tasks {
+        match t.await.unwrap() {
+            Ok(_) => won += 1,
+            Err(e) => assert_eq!(code(e), S3ErrorCode::PreconditionFailed),
+        }
+    }
+    assert_eq!(won, 1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while s3.store.db().stats().live != 1 {
+        assert!(tokio::time::Instant::now() < deadline, "losers' chunks still live: {:?}", s3.store.db().stats());
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
