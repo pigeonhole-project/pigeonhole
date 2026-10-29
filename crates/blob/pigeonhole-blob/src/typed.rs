@@ -7,7 +7,7 @@ pub use pigeonhole_storage_api::{
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-/// Type-erased stored identity: order key + postcard/bincode locator bytes.
+/// Type-erased stored identity: order key + the typed id in postcard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobLocator {
     pub key: Vec<u8>,
@@ -17,13 +17,13 @@ pub struct BlobLocator {
 /// Encode a typed id into [`BlobLocator`].
 pub fn store_id<B: BlobBackend>(id: &B::Id) -> Result<BlobLocator> {
     let key = B::key(id).to_bytes();
-    let locator = serde_json::to_vec(id)?;
+    let locator = postcard::to_stdvec(id)?;
     Ok(BlobLocator { key, locator })
 }
 
 /// Decode a typed id from locator bytes.
 pub fn load_id<B: BlobBackend>(stored: &BlobLocator) -> Result<B::Id> {
-    let id: B::Id = serde_json::from_slice(&stored.locator)?;
+    let id: B::Id = postcard::from_bytes(&stored.locator)?;
     let expect = B::key(&id).to_bytes();
     if expect != stored.key {
         bail!("BlobLocator key mismatch for decoded locator");

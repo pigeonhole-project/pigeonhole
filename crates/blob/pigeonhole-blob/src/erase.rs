@@ -49,7 +49,13 @@ impl<B: BlobBackend> DynBlobBackend for Erased<B> {
     }
 
     fn cost(&self, op: OpKind, id: Option<&BlobLocator>) -> CostHint {
-        let typed = id.and_then(|s| serde_json::from_slice::<B::Id>(&s.locator).ok());
+        let typed = id.and_then(|s| match postcard::from_bytes::<B::Id>(&s.locator) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::debug!(store = %self.inner.instance().id, error = %e, "cost of a locator that does not decode");
+                None
+            }
+        });
         self.inner.cost(op, typed.as_ref())
     }
 
@@ -59,7 +65,7 @@ impl<B: BlobBackend> DynBlobBackend for Erased<B> {
     }
 
     async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream> {
-        let typed: B::Id = serde_json::from_slice(&id.locator)?;
+        let typed: B::Id = postcard::from_bytes(&id.locator)?;
         self.inner.get(&typed, range).await
     }
 

@@ -2502,8 +2502,8 @@ dependencies = [
  "metrics",
  "pigeonhole-storage-api",
  "pigeonhole-types",
+ "postcard",
  "serde",
- "serde_json",
  "tracing",
  "uuid",
 ]
