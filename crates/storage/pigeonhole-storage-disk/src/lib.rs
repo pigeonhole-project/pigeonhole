@@ -14,10 +14,11 @@ mod segments;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_blob::{
-    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceKind, InstanceRole,
-    Linked, MakeAfter, NotFound, OpKind, StoreLimiter, Sweepable,
+use pigeonhole_storage_api::{
+    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceKind,
+    InstanceRole, Linked, MakeAfter, NotFound, OpKind, Sweepable,
 };
+use pigeonhole_limits::StoreLimiter;
 use pigeonhole_types::{BackendLimits, ByteRange};
 use segments::Segments;
 use serde::{Deserialize, Serialize};

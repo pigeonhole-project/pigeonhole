@@ -1,9 +1,10 @@
 //! In-memory [`BlobBackend`] for tests and `memory = true`.
 
-use pigeonhole_blob::{
-    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo,
-    InstanceKind, InstanceRole, Linked, NotFound, OpKind, StoreLimiter, Sweepable, Unavailable,
+use pigeonhole_storage_api::{
+    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceKind,
+    InstanceRole, Linked, NotFound, OpKind, Sweepable, Unavailable,
 };
+use pigeonhole_limits::StoreLimiter;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -341,7 +342,7 @@ impl Chain for MemoryBlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pigeonhole_blob::collect_stream;
+    use pigeonhole_storage_api::collect_stream;
 
     #[tokio::test]
     async fn memory_put_get_delete() {
@@ -355,7 +356,7 @@ mod tests {
         assert_eq!(got.as_ref(), b"hello");
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
         let gone = BlobBackend::get(&store, &id, None).await;
-        assert_eq!(pigeonhole_blob::Failure::of(&gone.err().unwrap()), pigeonhole_blob::Failure::NotFound);
+        assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound);
         // Repeat delete is ok.
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
     }

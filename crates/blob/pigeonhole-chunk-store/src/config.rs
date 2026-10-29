@@ -4,7 +4,8 @@ use crate::repair::{
     RepairConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
 };
 use crate::sweep::{SweepConfig, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};
-use pigeonhole_blob::{CacheConfig, ChatLimiter, ChatLimiterConfig, InstanceKind, LimiterRegistry};
+use pigeonhole_blob::{CacheConfig, InstanceKind};
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, LimiterRegistry};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
 use anyhow::{bail, Context, Result};

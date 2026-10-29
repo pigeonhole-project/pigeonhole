@@ -78,7 +78,7 @@ the store is busy it makes no progress at all, and that is fine: nothing
 waits for it. When the store is idle it collects at its own rate. A 429 on a
 delete backs it off like any caller.
 
-What idle means (built, `rate_limit.rs`):
+What idle means (built, `pigeonhole-limits`):
 
 - **Telegram, Discord**: `ChatLimiter::wait_idle(budget)` returns once
   nobody waits for the chat's bucket or the bot's, and both are at least

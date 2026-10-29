@@ -1,10 +1,10 @@
 //! The Discord blob backend on a fake channel.
 
 use bytes::Bytes;
-use pigeonhole_blob::{
-    collect_stream, BlobBackend, BlobId, ChatLimiter, ChatLimiterConfig, InstanceInfo, InstanceKind, InstanceRole,
-    Sweepable,
+use pigeonhole_storage_api::{
+    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceKind, InstanceRole, Sweepable,
 };
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_storage_discord::fake::FakeDiscord;
 use pigeonhole_storage_discord::{DiscordBlobStore, DiscordId};
 use std::sync::Arc;
@@ -113,5 +113,5 @@ async fn sweeps_only_our_blobs() {
     assert!(store.candidates(Some(late), late + 5, 100).await.unwrap().is_empty());
     store.delete(&[ours, late]).await.unwrap();
     let gone = store.get(&DiscordId { message_id: ours }, None).await;
-    assert_eq!(pigeonhole_blob::Failure::of(&gone.err().unwrap()), pigeonhole_blob::Failure::NotFound);
+    assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound);
 }

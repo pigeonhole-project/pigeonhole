@@ -4,8 +4,9 @@ use anyhow::Context;
 use pigeonhole::config::Config;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole_blob::{
-    erase_sweep, ChatLimiter, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
+    erase_sweep, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
 };
+use pigeonhole_limits::ChatLimiter;
 use pigeonhole_chunk_store::{
     check_fingerprints, BlockCache, BlobDb, ChunkStore, IngestOptions, InstanceConfig, LogSettings,
     SnapshotSettings,

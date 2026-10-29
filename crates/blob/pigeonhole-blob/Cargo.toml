@@ -3,7 +3,7 @@ name = "pigeonhole-blob"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "BlobBackend traits, rate limits, Replicated, BootstrapPointer"
+description = "Stores behind one object-safe face: erasure, replication, part packing, store metrics"
 
 [dependencies]
 anyhow = { workspace = true }

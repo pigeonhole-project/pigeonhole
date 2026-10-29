@@ -5,7 +5,8 @@ use crate::api::{CdnStale, DcAttachment, DcMessage, DiscordApi, ThreadStart, PAG
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_blob::{ChatLimiter, RateLimited, Unavailable};
+use pigeonhole_storage_api::{RateLimited, Unavailable};
+use pigeonhole_limits::ChatLimiter;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -197,7 +198,7 @@ impl DiscordClient {
                     RateBudget::Read => limiter.penalize_get_file(wait),
                     RateBudget::Download => {}
                 }
-                pigeonhole_blob::record_throttle("discord", what, wait);
+                pigeonhole_limits::record_throttle("discord", what, wait);
                 tokio::time::sleep(wait).await;
                 last = Some(RateLimited { method: what, retry_after: wait }.into());
                 continue;

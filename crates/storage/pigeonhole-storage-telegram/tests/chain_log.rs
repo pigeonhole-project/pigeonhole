@@ -2,10 +2,13 @@
 //! [`Chain`]: first successor by id order), on a fake channel.
 
 use futures::TryStreamExt;
-use pigeonhole_blob::{ChatLimiter, ChatLimiterConfig, InstanceInfo, InstanceKind, InstanceRole};
+use pigeonhole_storage_api::{InstanceInfo, InstanceKind, InstanceRole};
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_meta::log::conformance;
 use pigeonhole_meta::snapshot::conformance as snapshot_conformance;
-use pigeonhole_meta::{Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogStore, SnapshotRef, SnapshotStore};
+use pigeonhole_meta::{
+    Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogStore, SnapshotRef, SnapshotStore,
+};
 use pigeonhole_storage_telegram::fake::FakeChannel;
 use pigeonhole_storage_telegram::{ChainOptions, TelegramBlobStore};
 use std::sync::Arc;

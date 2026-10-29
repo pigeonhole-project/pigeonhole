@@ -5,11 +5,12 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lru::LruCache;
-use pigeonhole_blob::text::{self, DISCORD_MAX_CHARS};
-use pigeonhole_blob::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget,
-    NotFound, OpKind, Sweepable,
+use pigeonhole_storage_api::text::{self, DISCORD_MAX_CHARS};
+use pigeonhole_storage_api::{
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
+    Sweepable,
 };
+use pigeonhole_limits::{ChatLimiter, LimitBudget};
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
@@ -36,7 +37,7 @@ pub fn discord_location(channel_id: &str) -> String {
 const LOCATION_CACHE: usize = 4096;
 
 /// Where a blob's bytes are: an attachment, or the bytes themselves (a text
-/// message, [`pigeonhole_blob::text`]).
+/// message, [`pigeonhole_storage_api::text`]).
 #[derive(Clone)]
 pub(crate) enum Located {
     Cdn { url: String, size: u64 },

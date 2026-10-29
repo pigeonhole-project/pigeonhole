@@ -12,6 +12,7 @@ ROLE = {
     "pigeonhole-types": "types",
     "pigeonhole-codec": "codec",
     "pigeonhole-storage-api": "storage-api",
+    "pigeonhole-limits": "limits",
     "pigeonhole-meta": "meta",
     "pigeonhole-blob": "blob",
     "pigeonhole-chunk-store": "chunk-store",
@@ -29,7 +30,7 @@ ROLE = {
 }
 
 FORBIDDEN_SOFT = {
-    "storage": {"chunk-store", "gateway", "storage", "bin"},
+    "storage": {"blob", "chunk-store", "gateway", "storage", "bin"},
     "gateway": {"storage", "gateway", "bin"},
 }
 
@@ -73,7 +74,7 @@ def main() -> int:
                 dep_names.append(dep_name)
 
         if role == "storage":
-            allowed = {"blob", "storage-api", "types"}
+            allowed = {"limits", "storage-api", "types"}
             for dep_name in dep_names:
                 dr = ROLE.get(dep_name)
                 if dr is None:
@@ -119,10 +120,11 @@ def main() -> int:
                         f"{name} (chunk-store) must not depend on {dep['name']}"
                     )
 
-        elif role in ("blob", "codec", "meta", "storage-api", "types") and strict:
+        elif role in ("blob", "codec", "limits", "meta", "storage-api", "types") and strict:
             allowed = {
                 "blob": {"storage-api", "types"},
                 "codec": {"types"},
+                "limits": {"types"},
                 "meta": {"storage-api", "types"},
                 "storage-api": {"types"},
                 "types": set(),

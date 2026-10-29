@@ -2469,6 +2469,7 @@ dependencies = [
  "pigeonhole-codec",
  "pigeonhole-gateway-bytestream",
  "pigeonhole-gateway-s3",
+ "pigeonhole-limits",
  "pigeonhole-meta",
  "pigeonhole-storage-discord",
  "pigeonhole-storage-disk",
@@ -2523,6 +2524,7 @@ dependencies = [
  "moka",
  "pigeonhole-blob",
  "pigeonhole-codec",
+ "pigeonhole-limits",
  "pigeonhole-meta",
  "pigeonhole-storage-memory",
  "pigeonhole-testkit",
@@ -2616,6 +2618,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pigeonhole-limits"
+version = "0.1.0"
+dependencies = [
+ "madsim-tokio",
+ "metrics",
+ "pigeonhole-types",
+ "tracing",
+]
+
+[[package]]
 name = "pigeonhole-meta"
 version = "0.1.0"
 dependencies = [
@@ -2686,8 +2698,9 @@ dependencies = [
  "futures",
  "lru",
  "madsim-tokio",
- "pigeonhole-blob",
+ "pigeonhole-limits",
  "pigeonhole-meta",
+ "pigeonhole-storage-api",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "reqwest",
@@ -2708,7 +2721,8 @@ dependencies = [
  "crc32fast",
  "libc",
  "madsim-tokio",
- "pigeonhole-blob",
+ "pigeonhole-limits",
+ "pigeonhole-storage-api",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "serde",
@@ -2724,7 +2738,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "madsim-tokio",
- "pigeonhole-blob",
+ "pigeonhole-limits",
+ "pigeonhole-storage-api",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "serde",
@@ -2746,8 +2761,9 @@ dependencies = [
  "hex",
  "lru",
  "madsim-tokio",
- "pigeonhole-blob",
+ "pigeonhole-limits",
  "pigeonhole-meta",
+ "pigeonhole-storage-api",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "serde",

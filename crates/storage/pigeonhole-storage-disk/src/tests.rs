@@ -1,5 +1,5 @@
 use super::*;
-use pigeonhole_blob::collect_stream;
+use pigeonhole_storage_api::collect_stream;
 use std::fs;
 
 fn small(dir: &Path, segment_bytes: u64) -> DiskBlobStore {
@@ -80,13 +80,13 @@ async fn deletes_free_space_and_drop_dead_segments() {
     assert_eq!(segment_files(dir.path()).len(), 2);
     assert!(blocks() < before, "a hole: {} -> {} blocks", before, blocks());
     let gone = store.get(&ids[2], None).await;
-    assert_eq!(pigeonhole_blob::Failure::of(&gone.err().unwrap()), pigeonhole_blob::Failure::NotFound);
+    assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound);
     assert_eq!(read(&store, &ids[3]).await, vec![3; 40 << 10]);
     store.delete(&[ids[2].key]).await.unwrap(); // again: fine
 
     let reopened = small(dir.path(), 64 << 10);
     let gone = reopened.get(&ids[2], None).await;
-    assert_eq!(pigeonhole_blob::Failure::of(&gone.err().unwrap()), pigeonhole_blob::Failure::NotFound, "dead after reopen");
+    assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound, "dead after reopen");
     assert_eq!(reopened.candidates(None, u64::MAX, 100).await.unwrap(), vec![ids[3].key, ids[4].key, ids[5].key]);
 }
 

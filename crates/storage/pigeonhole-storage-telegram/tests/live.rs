@@ -4,9 +4,8 @@
 //! Deletes only what it posted.
 
 use bytes::Bytes;
-use pigeonhole_blob::{
-    collect_stream, BlobBackend, BlobId, ChatLimiter, ChatLimiterConfig, InstanceInfo, InstanceKind, InstanceRole,
-};
+use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceKind, InstanceRole};
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_storage_telegram::{ChannelApi, Lane, TelegramBlobStore, MtprotoConfig, TelegramMtproto};
 use std::path::Path;
 use std::sync::Arc;
@@ -167,7 +166,7 @@ async fn clean() {
                 let name = match m {
                     pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => Some(name.as_str()),
                     pigeonhole_storage_telegram::ChannelMessage::Text { text } => {
-                        pigeonhole_blob::text::name_of(text)
+                        pigeonhole_storage_api::text::name_of(text)
                     }
                     _ => None,
                 };
@@ -212,7 +211,7 @@ async fn inline_blobs_against_a_live_channel() {
     let store = TelegramBlobStore::new(channel.clone(), limiter.clone(), info.clone());
     let name = BlobId::random().name();
     let mut max = 0;
-    while pigeonhole_blob::text::fits(&name, max + 1, pigeonhole_blob::text::TELEGRAM_MAX_CHARS) {
+    while pigeonhole_storage_api::text::fits(&name, max + 1, pigeonhole_storage_api::text::TELEGRAM_MAX_CHARS) {
         max += 1;
     }
     let mut posted = Vec::new();
@@ -236,7 +235,7 @@ async fn inline_blobs_against_a_live_channel() {
 #[tokio::test]
 #[ignore = "needs a Telegram bot, api id and a test channel"]
 async fn chain_names_survive_as_documents() {
-    use pigeonhole_blob::{After, Chain};
+    use pigeonhole_storage_api::{After, Chain};
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     dotenvy::from_path(root.join(".env")).ok();
     let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
@@ -275,7 +274,7 @@ async fn chain_names_survive_as_documents() {
         .zip(channel.get_messages(&ids).await.unwrap())
         .filter(|(_, m)| match m {
             pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => name.starts_with("live-doc-") || name == "chain-probe.bin",
-            pigeonhole_storage_telegram::ChannelMessage::Text { text } => pigeonhole_blob::text::name_of(text) == Some("chain-probe.bin"),
+            pigeonhole_storage_telegram::ChannelMessage::Text { text } => pigeonhole_storage_api::text::name_of(text) == Some("chain-probe.bin"),
             _ => false,
         })
         .map(|(id, _)| *id)

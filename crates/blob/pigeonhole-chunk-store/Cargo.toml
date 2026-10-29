@@ -21,6 +21,7 @@ sha2 = { workspace = true }
 metrics = { workspace = true }
 moka = { workspace = true }
 pigeonhole-blob = { workspace = true }
+pigeonhole-limits = { workspace = true }
 pigeonhole-codec = { workspace = true }
 pigeonhole-meta = { workspace = true }
 pigeonhole-types = { workspace = true }

@@ -6,9 +6,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use lru::LruCache;
-use pigeonhole_blob::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget, NotFound, OpKind, Sweepable,
+use pigeonhole_storage_api::{
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
+    Sweepable,
 };
+use pigeonhole_limits::{ChatLimiter, LimitBudget};
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,7 +30,7 @@ const LOCATION_CACHE: usize = 4096;
 const WINDOWS_IN_FLIGHT: usize = 4;
 
 /// Where a blob's bytes are: a document's file, or the bytes themselves (a
-/// text message, [`pigeonhole_blob::text`]).
+/// text message, [`pigeonhole_storage_api::text`]).
 #[derive(Clone)]
 pub(crate) enum Located {
     Doc { size: u64, file: FileLocation },
@@ -40,7 +42,7 @@ impl Located {
     pub(crate) fn of(msg: &ChannelMessage) -> Option<Self> {
         match msg {
             ChannelMessage::Document { size, file, .. } => Some(Located::Doc { size: *size, file: file.clone() }),
-            ChannelMessage::Text { text } => pigeonhole_blob::text::decode(text).map(|(_, data)| Located::Inline(data)),
+            ChannelMessage::Text { text } => pigeonhole_storage_api::text::decode(text).map(|(_, data)| Located::Inline(data)),
             _ => None,
         }
     }
@@ -50,7 +52,7 @@ impl Located {
 pub(crate) fn blob_name(msg: &ChannelMessage) -> Option<&str> {
     match msg {
         ChannelMessage::Document { name, .. } => Some(name),
-        ChannelMessage::Text { text } => pigeonhole_blob::text::name_of(text),
+        ChannelMessage::Text { text } => pigeonhole_storage_api::text::name_of(text),
         _ => None,
     }
 }
@@ -63,7 +65,7 @@ pub struct TelegramBlobStore<C> {
     pub(crate) reader: Reader<C>,
     pub(crate) limiter: Arc<ChatLimiter>,
     pub(crate) chain: crate::chain::ChainOptions,
-    /// Blobs that fit a text message go as text ([`pigeonhole_blob::text`]).
+    /// Blobs that fit a text message go as text ([`pigeonhole_storage_api::text`]).
     inline: bool,
 }
 
@@ -112,9 +114,9 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
         let _upload = self.limiter.acquire_upload().await;
         let channel = &self.reader.channel;
         let store = &self.instance.id;
-        if self.inline && pigeonhole_blob::text::fits(name, data.len(), pigeonhole_blob::text::TELEGRAM_MAX_CHARS) {
+        if self.inline && pigeonhole_storage_api::text::fits(name, data.len(), pigeonhole_storage_api::text::TELEGRAM_MAX_CHARS) {
             let bytes = data.len();
-            let sent = channel.send_text(&pigeonhole_blob::text::encode(name, &data), random_id).await?;
+            let sent = channel.send_text(&pigeonhole_storage_api::text::encode(name, &data), random_id).await?;
             self.reader.remember(sent.message_id, Located::Inline(data));
             tracing::debug!(%store, message_id = sent.message_id, name, bytes, kind = "text", "posted");
             return Ok(sent.message_id);

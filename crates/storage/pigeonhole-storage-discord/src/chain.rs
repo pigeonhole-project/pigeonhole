@@ -31,7 +31,7 @@ use crate::store::{blob_name, DiscordBlobStore, DiscordId};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_blob::{After, BlobBackend, Chain, LeaseChain, Linked};
+use pigeonhole_storage_api::{After, BlobBackend, Chain, LeaseChain, Linked};
 
 const ANCHOR: &str = "chain-anchor.bin";
 /// Thread names hold 100 characters.
@@ -267,7 +267,7 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
         let mut before = Some(below.message_id);
         loop {
             // Background work: only on spare budget, never ahead of appends.
-            self.limiter.wait_idle(pigeonhole_blob::LimitBudget::Delete).await;
+            self.limiter.wait_idle(pigeonhole_limits::LimitBudget::Delete).await;
             let page = self.api.list(before, None, PAGE).await?;
             let ours: Vec<&DcMessage> = page.iter().filter(|m| is_member(m)).collect();
             if ours.is_empty() {

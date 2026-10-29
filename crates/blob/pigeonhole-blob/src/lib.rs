@@ -6,7 +6,6 @@ pub mod erase;
 pub mod upload_pins;
 pub mod metrics;
 pub mod part_packer;
-pub mod rate_limit;
 pub mod replicated;
 pub mod typed;
 pub use backend::{bytes_stream, collect_stream, slice_range, BoxByteStream};
@@ -17,11 +16,10 @@ pub use metrics::{
     describe, inflight_dec, inflight_inc, record_429, record_bytes_from_backend,
     record_bytes_from_clients, record_background_pass, record_bytes_to_backend, record_bytes_to_clients, record_cache, record_chunk_gone, record_compression_ratio,
     record_double_release, record_gateway_request, record_ingest_budget_wait, record_instance_call,
-    record_limiter_wait, record_parts_per_chunk, record_repair, record_replica_selected,
-    record_sweep, record_throttle, set_cache_size, set_repair_queue_depth, MetricsBackend, METRICS,
+    record_parts_per_chunk, record_repair, record_replica_selected,
+    record_sweep, set_cache_size, set_repair_queue_depth, MetricsBackend, METRICS,
 };
 pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
-pub use rate_limit::{BotLimiter, ChatLimiter, ChatLimiterConfig, LimitBudget, LimiterRegistry, StoreLimiter};
 pub use replicated::{
     CheapestFirst, ChunkReplicaWriter, InstanceId, PartLayout, ReplicaLayout, ReplicaSelector,
     Replicated, SealedChunk, ShardSpec,

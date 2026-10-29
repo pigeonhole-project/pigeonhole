@@ -24,7 +24,7 @@
 //! over the data; a segment whose records are all dead is removed.
 
 use crate::io::{DirLock, Fs, FsFile};
-use pigeonhole_blob::NotFound;
+use pigeonhole_storage_api::NotFound;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

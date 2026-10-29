@@ -6,10 +6,12 @@
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use pigeonhole_blob::{
-    collect_stream, BlobBackend, BlobId, ChatLimiter, ChatLimiterConfig, InstanceInfo, InstanceKind, InstanceRole,
+use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceKind, InstanceRole};
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
+use pigeonhole_meta::{
+    Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogId, LogStore, SnapshotRef, SnapshotStore,
+    StoredSnapshot,
 };
-use pigeonhole_meta::{Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogId, LogStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 use pigeonhole_storage_discord::{DiscordApi, DiscordBlobStore, DiscordChannel, DiscordClient, PAGE};
 use std::path::Path;
 use std::sync::Arc;
@@ -50,7 +52,7 @@ async fn empty(ch: &DiscordChannel) {
         ids.extend(page.iter().map(|m| m.id));
         for m in &page {
             let name = m.attachment.as_ref().map(|a| a.filename.clone()).or_else(|| {
-                pigeonhole_blob::text::name_of(&m.content).map(str::to_string)
+                pigeonhole_storage_api::text::name_of(&m.content).map(str::to_string)
             });
             if let Some(prev) = name.and_then(|n| n.strip_suffix(".bin")?.rsplit_once('~')?.1.parse::<u64>().ok()) {
                 ids.push(prev);

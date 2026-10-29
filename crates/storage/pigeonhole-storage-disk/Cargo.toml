@@ -11,7 +11,8 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 libc = "0.2"
-pigeonhole-blob = { workspace = true }
+pigeonhole-limits = { workspace = true }
+pigeonhole-storage-api = { workspace = true }
 pigeonhole-types = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
