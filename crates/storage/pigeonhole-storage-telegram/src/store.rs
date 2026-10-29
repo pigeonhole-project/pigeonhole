@@ -111,9 +111,12 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
     pub(crate) async fn post_blob(&self, name: &str, data: Bytes, random_id: i64) -> Result<i64> {
         let _upload = self.limiter.acquire_upload().await;
         let channel = &self.reader.channel;
+        let store = &self.instance.id;
         if self.inline && pigeonhole_blob::text::fits(name, data.len(), pigeonhole_blob::text::TELEGRAM_MAX_CHARS) {
+            let bytes = data.len();
             let sent = channel.send_text(&pigeonhole_blob::text::encode(name, &data), random_id).await?;
             self.reader.remember(sent.message_id, Located::Inline(data));
+            tracing::debug!(%store, message_id = sent.message_id, name, bytes, kind = "text", "posted");
             return Ok(sent.message_id);
         }
         let size = data.len() as u64;
@@ -121,6 +124,7 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
         if let Some(file) = sent.file {
             self.reader.remember(sent.message_id, Located::Doc { size, file });
         }
+        tracing::debug!(%store, message_id = sent.message_id, name, bytes = size, kind = "document", "posted");
         Ok(sent.message_id)
     }
 
@@ -235,9 +239,13 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let message_id = id.message_id;
         let (size, file) = match self.reader.locate(message_id, false).await? {
-            Located::Inline(data) => return Ok(bytes_stream(slice_range(data, range)?)),
+            Located::Inline(data) => {
+                tracing::debug!(store = %self.instance.id, message_id = message_id, ?range, kind = "text", "read");
+                return Ok(bytes_stream(slice_range(data, range)?));
+            }
             Located::Doc { size, file } => (size, file),
         };
+        tracing::debug!(store = %self.instance.id, message_id = message_id, ?range, size, kind = "document", "read");
         let (start, end) = match range {
             Some(r) if r.start > r.end || r.end > size => {
                 bail!("byte range {}..{} outside blob of {} bytes", r.start, r.end, size)
@@ -259,6 +267,7 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
         for ids in keys.chunks(IDS_PER_CALL) {
             self.reader.channel.delete_messages(ids).await?;
+            tracing::debug!(store = %self.instance.id, messages = ?ids, "deleted");
             let mut cache = self.reader.locations.lock().unwrap();
             for id in ids {
                 cache.pop(id);

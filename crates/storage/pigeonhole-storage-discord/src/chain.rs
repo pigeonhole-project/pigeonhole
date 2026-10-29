@@ -31,7 +31,7 @@ use crate::store::{blob_name, DiscordBlobStore, DiscordId};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_blob::{After, Chain, Linked};
+use pigeonhole_blob::{After, BlobBackend, Chain, Linked};
 
 const ANCHOR: &str = "chain-anchor.bin";
 /// Thread names hold 100 characters.
@@ -107,6 +107,7 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
             Some(a) => a,
             None => {
                 let mine = self.post_blob(ANCHOR, Bytes::from_static(&[0]), &Self::nonce()).await?.id;
+                tracing::debug!(store = %self.instance().id, message_id = mine, "posted the chain's anchor");
                 // Two stores may post one at once: the oldest is the anchor.
                 let oldest = self.find_anchor().await?.context("the anchor just posted is not listed")?;
                 if oldest != mine {
@@ -138,12 +139,14 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
             if let Some(p) = prev {
                 if Some(p) != anchor && !exists(p).await? {
                     self.api.delete_thread(p).await?;
+                    tracing::debug!(store = %self.instance().id, thread = p, "retired a link");
                 }
             }
             // Outgoing: the link on `m` (gone) to a successor that is gone too.
             if let Some(next) = self.link_of(m).await? {
                 if !exists(next.id.message_id).await? {
                     self.api.delete_thread(m).await?;
+                    tracing::debug!(store = %self.instance().id, thread = m, "retired a link");
                 }
             }
         }
@@ -176,8 +179,10 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
         if name.chars().count() > THREAD_NAME_MAX {
             bail!("thread name {name:?} is over {THREAD_NAME_MAX} characters");
         }
+        let store = &self.instance().id;
         match self.api.start_thread(from, &name).await? {
             ThreadStart::Created => {
+                tracing::debug!(%store, label, from, message_id = b, "linked (thread created)");
                 if let Err(e) = self.api.archive_thread(from).await {
                     tracing::debug!(error = %format!("{e:#}"), from, "archiving a link failed");
                 }
@@ -185,6 +190,7 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
             }
             ThreadStart::Taken => {
                 let winner = self.link_of(from).await?.with_context(|| format!("message {from} has an unreadable link"))?;
+                tracing::debug!(%store, label, from, message_id = b, winner = winner.id.message_id, winner_label = %winner.label, "lost the link (thread taken)");
                 Ok(After::Lost(winner))
             }
             ThreadStart::NoMessage => bail!("message {from} to link from is gone"),
@@ -211,6 +217,7 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
                     },
                 };
                 if self.link_of(from).await?.is_some_and(|l| l.id.message_id == m.id) {
+                    tracing::debug!(store = %self.instance().id, message_id = m.id, label, "found the tail");
                     self.remember(m);
                     return Ok(Some(Linked { id: DiscordId { message_id: m.id }, label: label.to_string() }));
                 }
@@ -241,6 +248,7 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
             }
             let ids: Vec<u64> = ours.iter().map(|m| m.id).collect();
             self.api.delete_messages(&ids).await?;
+            tracing::debug!(store = %self.instance().id, below = below.message_id, deleted = ids.len(), "pruned");
             self.retire_links(&ids).await?;
             match page.first() {
                 Some(m) if page.len() == PAGE => before = Some(m.id),

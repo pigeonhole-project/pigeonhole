@@ -215,11 +215,13 @@ impl<C: Chain> ChainLogStore<C> {
             head_term: w.head_term,
             batch: Batch::new(gen, w.first, w.entries),
         };
+        let w_first = doc.batch.first;
         let bytes = doc.encode();
         let crc = crc32fast::hash(&bytes);
         let prev = tip.at.as_ref().map(|p| &p.id);
         match self.chain.put_after(prev, &label(Kind::Batch, gen), Bytes::from(bytes)).await {
             Ok(After::Won(id)) => {
+                tracing::debug!(generation = gen, first = w_first, last = doc.head_position(), blob = ?id, "log batch linked");
                 let tip = Tip::of(&doc, Prev { id, crc });
                 if let Some(o) = self.state.lock().unwrap().owner.as_mut().filter(|o| o.gen == gen) {
                     o.tip = tip.clone();

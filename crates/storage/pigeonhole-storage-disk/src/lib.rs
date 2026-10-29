@@ -140,8 +140,9 @@ impl BlobBackend for DiskBlobStore {
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
         self.check_size(&data)?;
-        let name = name.to_string();
-        let key = self.locked(move |s| s.append(None, &name, &data)).await?;
+        let (bytes, owned) = (data.len(), name.to_string());
+        let key = self.locked(move |s| s.append(None, &owned, &data)).await?;
+        tracing::debug!(store = %self.instance().id, key, segment = key >> 40, bytes, name, "stored");
         Ok(DiskId { key })
     }
 
@@ -166,12 +167,16 @@ impl BlobBackend for DiskBlobStore {
             guard.read(key, from, to - from)
         })
         .await?;
+        tracing::debug!(store = %self.instance().id, key, bytes = data.len(), "read");
         Ok(bytes_stream(Bytes::from(data)))
     }
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
+        let n = keys.len();
         let keys = keys.to_vec();
-        self.locked(move |s| s.delete(&keys)).await
+        self.locked(move |s| s.delete(&keys)).await?;
+        tracing::debug!(store = %self.instance().id, keys = n, "deleted");
+        Ok(())
     }
 }
 
@@ -196,15 +201,23 @@ impl Chain for DiskBlobStore {
     async fn put_after(&self, prev: Option<&Self::Id>, label: &str, data: Bytes) -> Result<After<Self::Id>> {
         self.check_size(&data)?;
         let prev = prev.map(|p| p.key);
-        let label = label.to_string();
-        self.locked(move |s| {
-            if let Some(&winner) = s.next.get(&prev) {
-                return Ok(After::Lost(Self::linked(s, winner)));
+        let (bytes, owned) = (data.len(), label.to_string());
+        let after = self
+            .locked(move |s| {
+                if let Some(&winner) = s.next.get(&prev) {
+                    return Ok(After::Lost(Self::linked(s, winner)));
+                }
+                let key = s.append(Some((prev, &owned)), &owned, &data)?;
+                Ok(After::Won(DiskId { key }))
+            })
+            .await?;
+        match &after {
+            After::Won(id) => tracing::debug!(store = %self.instance().id, label, ?prev, key = id.key, bytes, "linked"),
+            After::Lost(w) => {
+                tracing::debug!(store = %self.instance().id, label, ?prev, winner = w.id.key, winner_label = %w.label, "lost the link")
             }
-            let key = s.append(Some((prev, &label)), &label, &data)?;
-            Ok(After::Won(DiskId { key }))
-        })
-        .await
+        }
+        Ok(after)
     }
 
     async fn tail(&self) -> Result<Option<Linked<Self::Id>>> {
@@ -238,6 +251,7 @@ impl Chain for DiskBlobStore {
             let Some(blob) = make(tail_id.as_ref().zip(data.as_deref()))? else { return Ok(None) };
             self.check_size(&blob)?;
             let key = s.append(Some((tail, &label)), &label, &blob)?;
+            tracing::debug!(store = %self.instance().id, label, ?tail, key, bytes = blob.len(), "linked after the tail");
             Ok(Some(DiskId { key }))
         })()
     }
@@ -246,9 +260,11 @@ impl Chain for DiskBlobStore {
         let below = below.key;
         self.locked(move |s| {
             let doomed: Vec<u64> = s.records.range(..below).filter(|(_, r)| !r.dead).map(|(k, _)| *k).collect();
-            s.delete(&doomed)
+            s.delete(&doomed)?;
+            Ok(doomed.len())
         })
         .await
+        .map(|n| tracing::debug!(store = %self.instance().id, below, deleted = n, "pruned"))
     }
 }
 

@@ -176,12 +176,20 @@ impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
         if b <= lo {
             bail!("the channel gave message id {b}, not above {lo}");
         }
+        let store = &self.instance().id;
         if prev.is_some() && b == lo + 1 {
+            tracing::debug!(%store, label, ?prev, message_id = b, "linked (next id, no read)");
             return Ok(After::Won(TelegramId { message_id: b }));
         }
         match self.first_naming(&mut View::new(), lo, b, prev).await? {
-            Some(winner) => Ok(After::Lost(winner)),
-            None => Ok(After::Won(TelegramId { message_id: b })),
+            Some(winner) => {
+                tracing::debug!(%store, label, ?prev, message_id = b, winner = winner.id.message_id, winner_label = %winner.label, "lost the link");
+                Ok(After::Lost(winner))
+            }
+            None => {
+                tracing::debug!(%store, label, ?prev, message_id = b, "linked");
+                Ok(After::Won(TelegramId { message_id: b }))
+            }
         }
     }
 
@@ -194,6 +202,7 @@ impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
             if let Some(Seen::Member(label, prev)) = view.get(&id).cloned() {
                 // A member that won its link is in the chain; the newest is the tail.
                 if self.first_naming(&mut view, prev.unwrap_or(0), id, prev).await?.is_none() {
+                    tracing::debug!(store = %self.instance().id, message_id = id, %label, top, "found the tail");
                     return Ok(Some(Linked { id: TelegramId { message_id: id }, label }));
                 }
             }
@@ -227,6 +236,7 @@ impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
             }
             let keys: Vec<i64> = ours;
             self.delete(&keys).await.map_err(|e| anyhow!("prune {lo}..={hi}: {e:#}"))?;
+            tracing::debug!(store = %self.instance().id, lo, hi, deleted = keys.len(), "pruned");
             hi = lo - 1;
         }
         Ok(())

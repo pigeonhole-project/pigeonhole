@@ -197,6 +197,7 @@ impl BlobBackend for MemoryBlobStore {
             .unwrap()
             .insert(message_id, file_id.clone());
         self.names.lock().unwrap().insert(message_id, name.to_string());
+        tracing::debug!(store = %self.instance.id, message_id = message_id, name, bytes = self.files.lock().unwrap().get(&file_id).map_or(0, |d| d.len()), "stored");
         Ok(MemoryId {
             file_id,
             message_id: message_id as u64,
@@ -270,6 +271,7 @@ impl Chain for MemoryBlobStore {
         }
         chain.next.insert(prev, mine);
         chain.tail = Some(mine);
+        tracing::debug!(store = %self.instance.id, label, ?prev, message_id = mine, "linked");
         Ok(After::Won(id))
     }
 

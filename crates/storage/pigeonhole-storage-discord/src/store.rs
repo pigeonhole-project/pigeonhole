@@ -122,12 +122,15 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
 
     /// Post blob `name` as text if it fits, else as an attachment; the message.
     pub(crate) async fn post_blob(&self, name: &str, data: Bytes, nonce: &str) -> Result<DcMessage> {
-        let m = if self.inline && text::fits(name, data.len(), DISCORD_MAX_CHARS) {
+        let (bytes, as_text) = (data.len(), self.inline && text::fits(name, data.len(), DISCORD_MAX_CHARS));
+        let m = if as_text {
             self.api.send(&text::encode(name, &data), None, nonce).await?
         } else {
             self.api.send(name, Some((name, data)), nonce).await?
         };
         self.remember(&m);
+        let kind = if as_text { "text" } else { "attachment" };
+        tracing::debug!(store = %self.instance.id, message_id = m.id, name, bytes, kind, "posted");
         Ok(m)
     }
 
@@ -205,9 +208,13 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let mid = id.message_id;
         let (url, size) = match self.locate(mid, false).await? {
-            Located::Inline(data) => return Ok(bytes_stream(slice_range(data, range)?)),
+            Located::Inline(data) => {
+                tracing::debug!(store = %self.instance.id, message_id = mid, ?range, kind = "text", "read");
+                return Ok(bytes_stream(slice_range(data, range)?));
+            }
             Located::Cdn { url, size } => (url, size),
         };
+        tracing::debug!(store = %self.instance.id, message_id = mid, ?range, size, kind = "attachment", "read");
         let want = match range {
             Some(r) if r.start > r.end || r.end > size => {
                 bail!("byte range {}..{} outside blob of {size} bytes", r.start, r.end)
@@ -232,6 +239,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
         for ids in keys.chunks(PAGE) {
             self.api.delete_messages(ids).await?;
+            tracing::debug!(store = %self.instance.id, messages = ?ids, "deleted");
             let mut cache = self.locations.lock().unwrap();
             for id in ids {
                 cache.pop(id);
