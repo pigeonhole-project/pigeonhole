@@ -166,6 +166,10 @@ place([
         (ratio(f"rate(pigeonhole_meta_proposals_per_entry_sum{R})", f"rate(pigeonhole_meta_proposals_per_entry_count{R})"), "mean"),
         (q(0.99, "pigeonhole_meta_proposals_per_entry"), "p99")]),
     ts("Log written", [(f"rate(pigeonhole_meta_log_bytes_total{R})", "bytes/s")], "Bps"),
+    ts("Lease waits (Discord log)", [
+        (f"sum by (reason) (rate(pigeonhole_meta_lease_wait_seconds_sum{R}))", "{{reason}} (s/s)"),
+        (q(0.99, "pigeonhole_meta_lease_wait_seconds", "reason"), "{{reason}} p99")], "s",
+       desc="renew: the writer renewing its lease; claim: a new incarnation waiting for the old lease to expire"),
     ts("Log writer: other ops, collection", [
         (f"max by (op) (rate(pigeonhole_meta_log_write_seconds_sum{R}) / rate(pigeonhole_meta_log_write_seconds_count{R}))", "{{op}} (mean)"),
         (f"rate(pigeonhole_meta_log_collect_seconds_sum{R}) / rate(pigeonhole_meta_log_collect_seconds_count{R})", "collection (background, mean)")], "s",
