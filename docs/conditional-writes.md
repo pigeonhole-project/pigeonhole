@@ -1,6 +1,6 @@
 # Conditional writes in the S3 gateway
 
-Status: design + implementation (2026-10-29).
+Status: implemented, checked live with T4 (2026-10-29).
 
 ## Why
 
@@ -77,3 +77,29 @@ disappears under a put. `S3State::VERSION` 3.
 - Race: N concurrent `If-None-Match: *` puts of one key, exactly one wins.
 - T4 against a local pigeonhole: its conditional-write probe passes, and
   `etcdctl put/get/txn` round-trips (live, not in CI).
+
+## Live: T4 on pigeonhole (2026-10-29)
+
+T4 v1.1.16 (`t4 run --s3-endpoint http://127.0.0.1:<port> --peer-listen …`,
+multi-node mode) against a local pigeonhole, etcdctl v3.7.3 as the client.
+
+- **Local disk.** The node elects itself through `leader-lock`
+  (`If-None-Match` / `If-Match`); put, get, txn and leases work. A second
+  node follows; `kill -9` of the leader: the follower catches up from the
+  bucket and takes over (term 3) in a few seconds, and writes go on.
+- **Chats.** The same with pigeonhole's metadata log on Discord (lease), its
+  snapshots in a second Discord channel, and the objects in a Telegram
+  channel. Election in ~1 s; an etcd put is 0.4–0.6 s (each one is a
+  conditional PUT: a lone leader flushes every batch to the bucket);
+  takeover after `kill -9` in ~10 s.
+- **Limit found.** T4's lock is valid for 6 s and renewed by `If-Match`. Our
+  write latency has tails of several seconds (a Discord lease renewal waits
+  for the thread pacer), so one renewal timed out right after the takeover
+  and puts then took 0.4–5 s, once 11 s. It held, but T4's lock timings are
+  tighter than a chat-backed store's tail; either T4 gets longer lock
+  timings or our lease renews earlier.
+- **Control.** The same run against main before this change: the gateway
+  answered 200 to every conditional put (`If-None-Match: *` twice, a stale
+  `If-Match`), so two leaders could both "win". T4 v1.1.16 started anyway:
+  its probe of whether a store enforces the headers (t4db/t4#377) is not in
+  a release yet.
