@@ -23,7 +23,7 @@ Read those first.
 
 ## Where we are
 
-Done (on `main`), steps 1–7a, 6d, 8.1–8.2:
+Done (on `main`), steps 1–7d, 9, 10, 8.1–8.2:
 
 - `pigeonhole-meta` is the tablet. `MetaStore::propose::<S>(cmd)` queues a
   typed command; the batcher appends what is queued to the `LogStore` under the
@@ -40,10 +40,11 @@ Done (on `main`), steps 1–7a, 6d, 8.1–8.2:
 - `ChainLogStore` keeps the log on any store that implements `Chain`: the
   local disk (segment files, one fsync per append, decided under `flock`),
   memory, a Telegram channel over MTProto fenced by the order of message
-  ids; `BlobSnapshotStore` the snapshots (chain-log.md). No per-kind logs.
+  ids, a Discord channel fenced by threads; `BlobSnapshotStore` the
+  snapshots (chain-log.md). No per-kind logs.
 - Snapshots every `[meta] snapshot_every_entries` (10000) and
   `snapshot_every_secs` (600, when anything changed), stored in a `SnapshotStore` configured apart
-  from the log (`local_disk` | `memory` | `telegram`, pinless); the log records which one it starts
+  from the log (`local_disk` | `memory` | `telegram` | `discord`, pinless); the log records which one it starts
   from. `pigeonhole restore --lossy` starts an empty log from the newest one.
 - Removed: `durability.rs` (checkpoint, superblock pins, root journal,
   `start_or_restore`), `s3/index` / `cas/index` snapshots, chunk roots.
@@ -64,7 +65,10 @@ Known gaps:
   lives elsewhere (and restore from it is lossy); the `telegram` log avoids it.
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
-- Discord cannot hold the log or snapshots yet (step 10).
+- Logs: openraft floods startup at info, s3s logs client 4xx as ERROR, no
+  per-request log, the tablet and the stores say almost nothing above
+  debug, no traces across a request (step 7e).
+- Discord: a snapshot over 20 MiB is refused (no splitting yet).
 
 ## Steps
 
@@ -218,6 +222,17 @@ blocks (configured before, never built). Every metric is declared in a
 table and listed in metrics.md by a test. `make metrics-demo`: a disk-backed
 node, Prometheus, Grafana with a dashboard, S3 traffic.
 
+### Step 7e — Logs and traces
+
+Design: [observability.md](observability.md) (to write). A log a person can
+read at `info` (no library floods, client errors not as ERROR), the events
+that matter (tablet: claim, snapshot, rebase, stop and why; stores: long
+rate-limit waits, refreshed links, failed collection; requests: method,
+path, status, duration), configurable (`[log]` level and format, JSON for
+machines, no ANSI into files), and traces: one span per S3 request carrying
+its id down through the chunk store, the tablet's commit and the store
+calls, so a slow PUT shows where the time went.
+
 ### Step 8 — Raft between nodes
 
 Design: meta-backends.md § Raft between nodes. Sub-steps:
@@ -281,7 +296,7 @@ fencing between two primaries; restore and followers.
 
 ### Order
 
-Single node first: 6e → 7b ∥ 7c → 9 → 10 → 11 → 12 → 13. Then Raft between
+Single node first: 6e → 7b ∥ 7c → 9 → 10 → 7d → **7e** → 11 → 12 → 13. Then Raft between
 nodes (8.3–8.5), a separate axis. Later: several tablets (when
 metadata outgrows RAM — never a database inside the tablet), encryption per
 block in the codec.
