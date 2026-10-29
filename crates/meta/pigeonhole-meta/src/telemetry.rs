@@ -38,6 +38,11 @@ pub const METRICS: &[MetricDoc] = &[
         &["outcome"],
         "Dropping what lies behind a new base (in the background, after a rebase)",
     ),
+    MetricDoc::histogram(
+        "pigeonhole_meta_lease_wait_seconds",
+        &["reason"],
+        "A lease log's waits: renew (a renewal before a write), claim (a claimant waiting out the old lease)",
+    ),
     MetricDoc::counter("pigeonhole_meta_log_entries_total", &[], "Entries appended to the log"),
     MetricDoc::counter("pigeonhole_meta_log_bytes_total", &[], "Entry payload bytes appended to the log"),
     MetricDoc::histogram("pigeonhole_meta_snapshot_seconds", &[], "Time to encode and store a snapshot"),
@@ -127,6 +132,10 @@ pub(crate) fn record_positions(applied: u64, base: u64, generation: u64, stopped
 
 pub(crate) fn record_log_write(op: &'static str, ok: bool, d: Duration) {
     metrics::histogram!("pigeonhole_meta_log_write_seconds", "op" => op, "outcome" => outcome(ok)).record(d.as_secs_f64());
+}
+
+pub(crate) fn record_lease_wait(reason: &'static str, d: Duration) {
+    metrics::histogram!("pigeonhole_meta_lease_wait_seconds", "reason" => reason).record(d.as_secs_f64());
 }
 
 pub(crate) fn record_collect(ok: bool, d: Duration) {

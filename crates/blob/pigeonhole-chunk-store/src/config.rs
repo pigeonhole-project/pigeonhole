@@ -135,6 +135,10 @@ pub struct MetaSettings {
     pub snapshot_interval: Duration,
     /// The newest snapshots kept, with the log from the oldest of them (≥ 1).
     pub keep_snapshots: usize,
+    /// A Discord log's lease (docs/discord-lease.md): batches without a
+    /// thread each; a new writer waits it out after a crash. Zero = a
+    /// thread per batch.
+    pub lease: Duration,
     pub log: LogSettings,
     pub snapshot: SnapshotSettings,
 }
@@ -526,6 +530,8 @@ struct FileMeta {
     snapshot_every_entries: u64,
     snapshot_every_secs: u64,
     keep_snapshots: usize,
+    /// A Discord log's lease, in seconds; 0 = a thread per batch.
+    lease_secs: u64,
 }
 
 impl Default for FileMeta {
@@ -536,6 +542,7 @@ impl Default for FileMeta {
             snapshot_every_entries: 10_000,
             snapshot_every_secs: 600,
             keep_snapshots: 2,
+            lease_secs: 45,
         }
     }
 }
@@ -593,6 +600,7 @@ impl FileMeta {
             snapshot_every_entries: self.snapshot_every_entries,
             snapshot_interval: Duration::from_secs(self.snapshot_every_secs),
             keep_snapshots: self.keep_snapshots,
+            lease: Duration::from_secs(self.lease_secs),
             log,
             snapshot,
         })
@@ -982,6 +990,7 @@ upload_concurrency = 4
         ))
         .unwrap();
         assert_eq!(cfg.meta.keep_snapshots, 3);
+        assert_eq!(cfg.meta.lease, Duration::from_secs(45));
         assert_eq!(cfg.meta.snapshot_every_entries, 0);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(60));
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "/var/log-dir".into() });

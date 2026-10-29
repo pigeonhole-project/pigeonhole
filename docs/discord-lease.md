@@ -1,6 +1,6 @@
 # A lease for the Discord log: appends without a thread each
 
-Status: **proposal**, not implemented; the spike ran (§ Spike findings): its assumptions hold.
+Status: **implemented** for Discord logs (`[meta] lease_secs`, default 45). See § Implementation notes for where the code differs from the design.
 Read [discord-log.md](discord-log.md) (the thread fence this changes),
 [chain-log.md](chain-log.md) and
 [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md) first.
@@ -194,6 +194,51 @@ afterwards (`/tmp/dspike/lease_spike.py`).
 
 So A and B hold with margin. A lease's batch costs one POST (~0.3 s) and
 appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
+
+## Implementation notes (2026-10-29)
+
+- **Where**: `ChainLogStore::with_lease(Lease)` (pigeonhole-meta
+  `log/chain.rs`). A store takes part through three `Chain` methods:
+  - `stamp_ms`: Discord's snowflake time;
+  - `put_unlinked`: a member's name, no thread;
+  - `list_after`: list newer blobs by label.
+
+  Stores that stamp nothing keep the link-per-batch log.
+  `[meta] lease_secs = 0` turns the lease off for Discord too.
+- **Renewals run in the background and stay outside the log.** In the first
+  live run a renewal waited for the thread pacer (~7 s with the post) in
+  front of an append. The next batch then missed the deadline and the handle
+  stopped, so thread throttling would have stopped the tablet. Now:
+  - once a third of the lease is gone, a write spawns the renewal and goes
+    on;
+  - only after two thirds does a write wait for it;
+  - a renewal names the writer's tip as a hint, but batches keep naming
+    batches: a renewal in flight cannot fork the log.
+
+  A reader's tip under a renewal is the newest batch after that hint stamped
+  inside the renewal's lease. Under a claim it is the newest batch after the
+  claim.
+- **No background renewer when idle.** An idle writer's lease runs out. Its
+  next write waits for a renewal: the compare-and-set after its last record
+  either wins, and it holds again, or loses to a claim, and it is fenced.
+- **A claimant's wait** is measured by probes: a loose `log-probe` message,
+  its stamp read, deleted right after. Two posts per probe, a few per claim.
+- **Collection** never prunes below the newest lease record: it is the
+  chain's tail.
+- **Metrics**: `pigeonhole_meta_lease_wait_seconds{reason}`, where `renew`
+  is a write waiting for a renewal and `claim` is a claimant waiting out the
+  old lease.
+- **Live** (`tests/live.rs` `lease_log_against_a_live_channel`, 10 s lease,
+  the `[discord]` limiter):
+  - claim on an empty channel: 3.1 s;
+  - 10 appends: 10.9 s (the limiter's 1 send/s; the link-per-batch log
+    took ~6 s per append);
+  - a second claim waited out the lease (10.6 s) and fenced the first
+    writer;
+  - a reader saw all 11 entries.
+- **Not done**: the `flock` shortcut, and a release on clean shutdown. Every
+  restart waits up to `lease_secs`. Also no simulation tests for the lease
+  yet.
 
 ## Steps
 

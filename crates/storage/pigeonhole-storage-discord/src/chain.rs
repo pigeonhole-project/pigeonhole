@@ -261,6 +261,40 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
         }
     }
 
+    /// A snowflake's millisecond timestamp.
+    fn stamp_ms(&self, id: &DiscordId) -> Option<u64> {
+        Some(crate::client::snowflake_timestamp_ms(id.message_id))
+    }
+
+    /// Named like a member (`<label>~<prev>.bin`), so pruned like one, but
+    /// with no thread: one POST.
+    async fn put_unlinked(&self, prev: &DiscordId, label: &str, data: Bytes) -> Result<DiscordId> {
+        if label.contains(['~', ' ']) {
+            bail!("a chain label may not contain '~' or spaces: {label:?}");
+        }
+        let m = self.post_blob(&chain_name(label, Some(prev.message_id)), data, &Self::nonce()).await?;
+        tracing::debug!(store = %self.instance().id, label, prev = prev.message_id, message_id = m.id, "put unlinked");
+        Ok(DiscordId { message_id: m.id })
+    }
+
+    async fn list_after(&self, after: Option<&DiscordId>, prefix: &str) -> Result<Vec<Linked<DiscordId>>> {
+        let mut after = after.map_or(0, |a| a.message_id);
+        let mut out = Vec::new();
+        loop {
+            let page = self.api.list(None, Some(after), PAGE).await?;
+            for m in &page {
+                let Some(name) = blob_name(m).filter(|n| n.starts_with(prefix)) else { continue };
+                let label = label_of(name).unwrap_or(name).to_string();
+                self.remember(m);
+                out.push(Linked { id: DiscordId { message_id: m.id }, label });
+            }
+            match page.last() {
+                Some(m) if page.len() == PAGE => after = m.id,
+                _ => return Ok(out),
+            }
+        }
+    }
+
     /// Our messages below `below` (not the anchor), walking down until a page
     /// holds none of ours, and their links but the one into `below`.
     async fn prune(&self, below: &DiscordId) -> Result<()> {

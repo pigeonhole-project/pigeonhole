@@ -11,7 +11,7 @@ pub mod chain;
 #[cfg(any(test, feature = "testsuite"))]
 pub mod conformance;
 
-pub use chain::ChainLogStore;
+pub use chain::{ChainLogStore, Lease};
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.

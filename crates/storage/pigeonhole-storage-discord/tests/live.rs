@@ -25,7 +25,7 @@ fn channel(var: &str) -> (Arc<DiscordChannel>, Arc<ChatLimiter>, DiscordClient, 
     let _ = tracing_subscriber::fmt().with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())).try_init();
     let id: u64 = env(var).parse().unwrap();
     let client = DiscordClient::new(env("DISCORD_BOT_TOKEN")).unwrap();
-    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::discord()));
     (Arc::new(client.channel(id, limiter.clone())), limiter, client, id)
 }
 
@@ -144,6 +144,47 @@ async fn chain_log_against_a_live_channel() {
         .collect();
     println!("discover + read in {:?}", t.elapsed());
     assert_eq!((d.gen, d.head.position, got), (2, 7, vec![5, 6, 7]));
+    empty(&ch).await;
+}
+
+/// docs/discord-lease.md: batches are plain posts; a claimant waits out
+/// the lease.
+#[tokio::test]
+#[ignore = "needs a Discord bot and a test channel"]
+async fn lease_log_against_a_live_channel() {
+    let (ch, limiter, client, id) = channel("DISCORD_LOG_CHANNEL_ID");
+    client.ensure_permissions(id, true, &limiter).await.unwrap();
+    let lease = pigeonhole_meta::Lease::new(std::time::Duration::from_secs(10));
+    let open = || Arc::new(ChainLogStore::new(store_on(&ch, &limiter, id)).with_lease(lease));
+
+    let a = open();
+    let t = Instant::now();
+    a.claim(1).await.unwrap();
+    println!("claim on an empty channel in {:?}", t.elapsed());
+    let t = Instant::now();
+    for i in 1..=10 {
+        a.append(1, &[entry(i)]).await.unwrap();
+    }
+    println!("10 appends in {:?} (a renewal included if a third of the lease went by)", t.elapsed());
+
+    let b = open();
+    let t = Instant::now();
+    assert_eq!(b.claim(2).await.unwrap().position, 10);
+    println!("a second claim waited out the lease: {:?}", t.elapsed());
+    assert!(matches!(a.append(1, &[entry(99)]).await, Err(LogError::Fenced { current: 2 })));
+    b.append(2, &[entry(11)]).await.unwrap();
+
+    let reader = open();
+    let d = reader.discover().await.unwrap().unwrap();
+    let got: Vec<u64> = reader
+        .read(0, d.head)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| u64::from_le_bytes(e.payload.try_into().unwrap()))
+        .collect();
+    assert_eq!((d.gen, got), (2, (1..=11).collect::<Vec<_>>()));
     empty(&ch).await;
 }
 

@@ -113,6 +113,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_meta_log_append_seconds` | histogram | `outcome` | LogStore append of a batch of entries (fsync / chat message) |
 | `pigeonhole_meta_log_write_seconds` | histogram | `op`, `outcome` | The log writer's other operations (rebase, truncate, vote): appends queue behind them |
 | `pigeonhole_meta_log_collect_seconds` | histogram | `outcome` | Dropping what lies behind a new base (in the background, after a rebase) |
+| `pigeonhole_meta_lease_wait_seconds` | histogram | `reason` | A lease log's waits: renew (a renewal before a write), claim (a claimant waiting out the old lease) |
 | `pigeonhole_meta_log_entries_total` | counter |  | Entries appended to the log |
 | `pigeonhole_meta_log_bytes_total` | counter |  | Entry payload bytes appended to the log |
 | `pigeonhole_meta_snapshot_seconds` | histogram |  | Time to encode and store a snapshot |

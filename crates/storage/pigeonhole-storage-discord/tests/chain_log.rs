@@ -246,3 +246,114 @@ async fn snapshots_are_plain_messages_found_by_listing() {
     fresh.remove(&second).await.unwrap();
     assert_eq!(fresh.newest().await.unwrap(), Some(snap(1, 10)));
 }
+
+// A lease log (docs/discord-lease.md): only lease records take a thread.
+
+const LEASE: std::time::Duration = std::time::Duration::from_millis(300);
+
+fn leased(channel: &Arc<FakeDiscord>) -> Arc<ChainLogStore<Store>> {
+    let lease = pigeonhole_meta::Lease { duration: LEASE, margin: std::time::Duration::from_millis(50) };
+    Arc::new(ChainLogStore::new(channel_store(channel)).with_lease(lease))
+}
+
+#[tokio::test]
+async fn a_lease_log_passes_the_logstore_conformance_suite() {
+    conformance::run_all(|| {
+        let channel = Arc::new(FakeDiscord::new(81));
+        move || {
+            let channel = channel.clone();
+            async move { leased(&channel) as Arc<dyn LogStore> }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_lease_log_appends_without_threads() {
+    let channel = Arc::new(FakeDiscord::new(82));
+    let a = leased(&channel);
+    a.claim(1).await.unwrap();
+    let threads = channel.calls().start_thread;
+    for i in 1..=20 {
+        a.append(1, &[entry(i)]).await.unwrap();
+    }
+    assert_eq!(channel.calls().start_thread, threads, "batches are unlinked");
+    assert_eq!(history(leased(&channel).as_ref()).await, (1..=20).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn a_lease_writer_renews_once_a_third_is_gone() {
+    let channel = Arc::new(FakeDiscord::new(83));
+    let a = leased(&channel);
+    a.claim(1).await.unwrap();
+    a.append(1, &[entry(1)]).await.unwrap();
+    let threads = channel.calls().start_thread;
+    tokio::time::sleep(LEASE / 2).await;
+    a.append(1, &[entry(2)]).await.unwrap();
+    // The renewal runs off the append's path.
+    for _ in 0..100 {
+        if channel.calls().start_thread > threads {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(channel.calls().start_thread, threads + 1, "one renewal");
+    // Long idle: the lease ran out, but nobody claimed; the renewal holds again.
+    tokio::time::sleep(LEASE * 2).await;
+    a.append(1, &[entry(3)]).await.unwrap();
+    a.confirm(1).await.unwrap();
+    assert_eq!(history(leased(&channel).as_ref()).await, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn a_claimant_waits_out_the_lease_and_fences_the_holder() {
+    let channel = Arc::new(FakeDiscord::new(84));
+    let a = leased(&channel);
+    a.claim(1).await.unwrap();
+    a.append(1, &[entry(1)]).await.unwrap();
+    let t0 = std::time::Instant::now();
+    let b = leased(&channel);
+    assert_eq!(b.claim(2).await.unwrap().position, 1);
+    assert!(t0.elapsed() >= LEASE / 2, "waited out a's lease: {:?}", t0.elapsed());
+    assert!(matches!(a.append(1, &[entry(99)]).await, Err(LogError::Fenced { current: 2 })));
+    b.append(2, &[entry(2)]).await.unwrap();
+    assert_eq!(history(leased(&channel).as_ref()).await, vec![1, 2]);
+}
+
+/// The store answered after the lease's deadline: the writer does not keep
+/// the batch and stops; the next writer goes on from what it finds.
+#[tokio::test]
+async fn a_batch_answered_after_the_deadline_is_not_acknowledged() {
+    let channel = Arc::new(FakeDiscord::new(85));
+    let a = leased(&channel);
+    a.claim(1).await.unwrap();
+    a.append(1, &[entry(1)]).await.unwrap();
+    channel.delay_next_answer(LEASE);
+    assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Other(_))));
+    assert!(a.append(1, &[entry(3)]).await.is_err(), "the handle stopped");
+    let b = leased(&channel);
+    let head = b.claim(2).await.unwrap();
+    // Landed inside the lease, so it is in the log (as an unacknowledged
+    // write may be); nothing after it.
+    assert_eq!(head.position, 2);
+    b.append(2, &[entry(4)]).await.unwrap();
+    assert_eq!(history(leased(&channel).as_ref()).await, vec![1, 2, 4]);
+}
+
+#[tokio::test]
+async fn a_lease_log_rebase_keeps_the_newest_lease_record() {
+    let channel = Arc::new(FakeDiscord::new(86));
+    let a = leased(&channel);
+    a.claim(1).await.unwrap();
+    for i in 1..=10 {
+        a.append(1, &[entry(i)]).await.unwrap();
+    }
+    a.rebase(1, Base { at: 8, term: 1, leader: 0, snapshot: SnapshotRef("s8".into()) }, 1).await.unwrap();
+    a.settle().await;
+    a.append(1, &[entry(11)]).await.unwrap();
+    let b = leased(&channel);
+    assert_eq!(b.claim(2).await.unwrap().position, 11);
+    let head = b.discover().await.unwrap().unwrap().head;
+    let got: Vec<_> = b.read(8, head).try_collect().await.unwrap();
+    assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![9, 10, 11]);
+}
