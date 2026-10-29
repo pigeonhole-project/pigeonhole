@@ -283,3 +283,67 @@ async fn chain_names_survive_as_documents() {
     channel.delete_messages(&ours).await.unwrap();
     assert_eq!(tail.map(|t| t.id), Some(id), "the chain finds its document member");
 }
+
+/// Around a live run in the test channels (`scripts/bench.sh`):
+/// `TG_BENCH=mark` posts a marker in each of TG_{BLOBS,LOG,SNAP}_CHAT_ID and
+/// records its id; `TG_BENCH=clean` posts a second marker and deletes every
+/// message between the two, both included (never message 208 of the log
+/// channel, which may be the user's).
+/// `TG_BENCH=mark cargo test -p pigeonhole-storage-telegram --test live bench_window -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "posts and deletes messages in the real test channels"]
+async fn bench_window() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let marks = root.join(".cache/bench/tg-marks.txt");
+    let cfg = MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env("TG_BOT_TOKEN"),
+        session: root.join(".cache/tgm-live.session"),
+    };
+    let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+    let vars = ["TG_BLOBS_CHAT_ID", "TG_LOG_CHAT_ID", "TG_SNAP_CHAT_ID"];
+    let mode = env("TG_BENCH");
+    let mut lines = Vec::new();
+    let recorded = std::fs::read_to_string(&marks).unwrap_or_default();
+    for var in vars {
+        let chat_id: i64 = env(var).parse().unwrap();
+        let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(ChatLimiterConfig::default()))).await.unwrap();
+        let marker = channel.send_text(&format!("pigeonhole bench marker ({mode})"), uuid_like()).await.unwrap().message_id;
+        match mode.as_str() {
+            "mark" => {
+                println!("{var}: from {marker}");
+                lines.push(format!("{chat_id} {marker}"));
+            }
+            "clean" => {
+                let from: i64 = recorded
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{chat_id} "))?.trim().parse().ok())
+                    .unwrap_or_else(|| panic!("no mark for {var} in {}", marks.display()));
+                let mut deleted = 0;
+                let mut lo = from;
+                while lo <= marker {
+                    let ids: Vec<i64> = (lo..=marker.min(lo + 99)).collect();
+                    let present: Vec<i64> = ids
+                        .iter()
+                        .zip(channel.get_messages(&ids).await.unwrap())
+                        .filter(|(id, m)| !matches!(m, pigeonhole_storage_telegram::ChannelMessage::Empty) && **id != 208)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if !present.is_empty() {
+                        channel.delete_messages(&present).await.unwrap();
+                        deleted += present.len();
+                    }
+                    lo += 100;
+                }
+                println!("{var}: deleted {deleted} messages in {from}..={marker}");
+            }
+            other => panic!("TG_BENCH={other}: mark | clean"),
+        }
+    }
+    if mode == "mark" {
+        std::fs::create_dir_all(marks.parent().unwrap()).unwrap();
+        std::fs::write(&marks, lines.join("\n") + "\n").unwrap();
+    }
+}
