@@ -2469,6 +2469,7 @@ dependencies = [
  "pigeonhole-codec",
  "pigeonhole-gateway-bytestream",
  "pigeonhole-gateway-s3",
+ "pigeonhole-limits",
  "pigeonhole-meta",
  "pigeonhole-storage-discord",
  "pigeonhole-storage-disk",
@@ -2478,8 +2479,10 @@ dependencies = [
  "pigeonhole-types",
  "pin-project-lite",
  "s3s",
+ "serde",
  "serde_json",
  "tempfile",
+ "toml 0.8.23",
  "tower 0.5.3",
  "tower-http",
  "tracing",
@@ -2499,8 +2502,8 @@ dependencies = [
  "metrics",
  "pigeonhole-storage-api",
  "pigeonhole-types",
+ "postcard",
  "serde",
- "serde_json",
  "tracing",
  "uuid",
 ]
@@ -2514,7 +2517,6 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
- "dotenvy",
  "futures",
  "hex",
  "madsim-tokio",
@@ -2529,10 +2531,7 @@ dependencies = [
  "pigeonhole-types",
  "postcard",
  "serde",
- "serde_json",
- "sha2 0.10.9",
  "tempfile",
- "toml 0.8.23",
  "tracing",
 ]
 
@@ -2616,6 +2615,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pigeonhole-limits"
+version = "0.1.0"
+dependencies = [
+ "madsim-tokio",
+ "metrics",
+ "pigeonhole-types",
+ "tracing",
+]
+
+[[package]]
 name = "pigeonhole-meta"
 version = "0.1.0"
 dependencies = [
@@ -2686,8 +2695,9 @@ dependencies = [
  "futures",
  "lru",
  "madsim-tokio",
- "pigeonhole-blob",
+ "pigeonhole-limits",
  "pigeonhole-meta",
+ "pigeonhole-storage-api",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "reqwest",
@@ -2708,7 +2718,8 @@ dependencies = [
  "crc32fast",
  "libc",
  "madsim-tokio",
- "pigeonhole-blob",
+ "pigeonhole-limits",
+ "pigeonhole-storage-api",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "serde",
@@ -2724,7 +2735,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "madsim-tokio",
- "pigeonhole-blob",
+ "pigeonhole-limits",
+ "pigeonhole-storage-api",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "serde",
@@ -2746,8 +2758,9 @@ dependencies = [
  "hex",
  "lru",
  "madsim-tokio",
- "pigeonhole-blob",
+ "pigeonhole-limits",
  "pigeonhole-meta",
+ "pigeonhole-storage-api",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "serde",

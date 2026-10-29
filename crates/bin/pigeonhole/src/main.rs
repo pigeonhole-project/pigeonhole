@@ -13,7 +13,7 @@ use tracing::warn;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    pigeonhole::logging::init(&pigeonhole_chunk_store::LoggingSettings::from_config_file());
+    pigeonhole::logging::init(&pigeonhole::config::LoggingSettings::from_config_file());
 
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {

@@ -114,9 +114,9 @@ chat_id = -1001234567890
 
 ### Shared rate-limit error
 
-Move `RateLimited` (now in the Bot API client) and the `retrying` helper (now
-in `telegram_log.rs`) somewhere both transports and the log adapters use, e.g.
-`pigeonhole-blob`. 429 and `FLOOD_WAIT_X` map to the same type.
+`RateLimited` lives in `pigeonhole-storage-api` with the other failures a
+store reports by type (`NotFound`, `Unavailable`; `Failure::of` reads them).
+429 and `FLOOD_WAIT_X` map to the same type.
 
 ### The log: a fence by order in the channel
 

@@ -190,10 +190,12 @@ on disk.
 ## Layering
 
 `pigeonhole-meta` depends on crates.io only. The storage traits move to a new
-crate `core/pigeonhole-storage-api` (crates.io only): `BlobBackend`,
-`Sweepable`, `Chain`, `OrderedKey`, `BlobId`, `BackendLimits` and the types
+crate `core/pigeonhole-storage-api` (crates.io only): `BlobBackend` (its
+listing for the sweeper included; `Sweepable` folded into it), `Chain`, `OrderedKey`, `BlobId`, `BackendLimits` and the types
 they need. `pigeonhole-blob`, `pigeonhole-meta` and every storage crate depend
-on it; `scripts/check_deps.py` learns the new layer. A log or snapshot store
+on it; `scripts/check_deps.py` learns the new layer. A storage crate depends
+on it, `core/pigeonhole-limits` (rate limiters) and `pigeonhole-types` only,
+never on the blob layer above it. A log or snapshot store
 is configured as any `[[store]]`; one store serves one purpose (blobs, a log,
 or snapshots), as today.
 

@@ -7,7 +7,8 @@ use crate::index::{
 };
 use pigeonhole_meta::{Outcome, Prepared, Proposal};
 use pigeonhole_chunk_store::Extent;
-use pigeonhole_chunk_store::{config::Config, ChunkStore, IngestOptions};
+use pigeonhole_chunk_store::{ChunkStore, IngestOptions};
+use pigeonhole_codec::{self as chunker, ByteBudget, ChunkCodec};
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
@@ -24,29 +25,48 @@ use tracing::info;
 /// GET re-reads the object this many times if its chunks are reclaimed underneath it.
 const GET_ATTEMPTS: u32 = 5;
 
+/// What the S3 gateway takes from the configuration.
+#[derive(Clone, Debug)]
+pub struct S3Options {
+    /// Answered to GetBucketLocation.
+    pub region: String,
+    /// Max on-wire chunk size in bytes.
+    pub chunk_size: usize,
+    pub chunk_codec: ChunkCodec,
+    pub block_size: usize,
+    /// Process-wide ingest buffer budget (shared across PUTs).
+    pub ingest_budget: Option<ByteBudget>,
+}
+
+impl S3Options {
+    /// The defaults, for in-process tests.
+    pub fn for_test() -> Self {
+        Self {
+            region: "us-east-1".into(),
+            chunk_size: chunker::DEFAULT_CHUNK_SIZE,
+            chunk_codec: ChunkCodec::Zstd,
+            block_size: chunker::DEFAULT_BLOCK_SIZE,
+            ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct S3Gateway {
-    pub cfg: Config,
+    pub opts: S3Options,
     pub index: Index,
     pub store: Arc<ChunkStore>,
 }
 
 impl S3Gateway {
-    pub fn new(cfg: Config, index: Index, store: Arc<ChunkStore>) -> Self {
-        Self { cfg, index, store }
-    }
-
-    fn scope_id(&self) -> &str {
-        // Gateways use the placement primary scope.
-        self.cfg
-            .primary_scope_id()
-            .expect("config placement primary scope_id")
+    pub fn new(opts: S3Options, index: Index, store: Arc<ChunkStore>) -> Self {
+        Self { opts, index, store }
     }
 
     fn ingest_options(&self) -> IngestOptions {
-        let mut opts = IngestOptions::new(self.cfg.chunk_size, self.cfg.chunk_codec);
-        opts.block_size = self.cfg.block_size;
-        opts.memory_budget = self.cfg.ingest_budget.clone();
+        let mut opts = IngestOptions::new(self.opts.chunk_size, self.opts.chunk_codec);
+        opts.block_size = self.opts.block_size;
+        opts.memory_budget = self.opts.ingest_budget.clone();
         opts
     }
 
@@ -326,7 +346,7 @@ impl S3 for S3Gateway {
         let name = req.input.bucket;
         let created = self
             .index
-            .create_bucket(&name, self.scope_id())
+            .create_bucket(&name)
             .await
             .map_err(Self::map_err)?;
         if !created && self.index.bucket_exists(&name).await.map_err(Self::map_err)? {
@@ -380,10 +400,10 @@ impl S3 for S3Gateway {
             return Err(s3_error!(NoSuchBucket));
         }
         // us-east-1 → null LocationConstraint (S3 convention).
-        let location_constraint = if self.cfg.region == "us-east-1" {
+        let location_constraint = if self.opts.region == "us-east-1" {
             None
         } else {
-            Some(BucketLocationConstraint::from(self.cfg.region.clone()))
+            Some(BucketLocationConstraint::from(self.opts.region.clone()))
         };
         Ok(S3Response::new(GetBucketLocationOutput {
             location_constraint,

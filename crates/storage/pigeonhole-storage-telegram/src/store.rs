@@ -1,4 +1,4 @@
-//! [`BlobBackend`] + [`Sweepable`] over one channel.
+//! [`BlobBackend`] over one channel.
 
 use crate::channel::{windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, IDS_PER_CALL, WINDOW};
 use anyhow::{bail, Context, Result};
@@ -6,9 +6,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use lru::LruCache;
-use pigeonhole_blob::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget, OpKind, Sweepable,
+use pigeonhole_storage_api::{
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
 };
+use pigeonhole_limits::{ChatLimiter, LimitBudget};
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,7 +29,7 @@ const LOCATION_CACHE: usize = 4096;
 const WINDOWS_IN_FLIGHT: usize = 4;
 
 /// Where a blob's bytes are: a document's file, or the bytes themselves (a
-/// text message, [`pigeonhole_blob::text`]).
+/// text message, [`pigeonhole_storage_api::text`]).
 #[derive(Clone)]
 pub(crate) enum Located {
     Doc { size: u64, file: FileLocation },
@@ -40,7 +41,7 @@ impl Located {
     pub(crate) fn of(msg: &ChannelMessage) -> Option<Self> {
         match msg {
             ChannelMessage::Document { size, file, .. } => Some(Located::Doc { size: *size, file: file.clone() }),
-            ChannelMessage::Text { text } => pigeonhole_blob::text::decode(text).map(|(_, data)| Located::Inline(data)),
+            ChannelMessage::Text { text } => pigeonhole_storage_api::text::decode(text).map(|(_, data)| Located::Inline(data)),
             _ => None,
         }
     }
@@ -50,7 +51,7 @@ impl Located {
 pub(crate) fn blob_name(msg: &ChannelMessage) -> Option<&str> {
     match msg {
         ChannelMessage::Document { name, .. } => Some(name),
-        ChannelMessage::Text { text } => pigeonhole_blob::text::name_of(text),
+        ChannelMessage::Text { text } => pigeonhole_storage_api::text::name_of(text),
         _ => None,
     }
 }
@@ -63,7 +64,7 @@ pub struct TelegramBlobStore<C> {
     pub(crate) reader: Reader<C>,
     pub(crate) limiter: Arc<ChatLimiter>,
     pub(crate) chain: crate::chain::ChainOptions,
-    /// Blobs that fit a text message go as text ([`pigeonhole_blob::text`]).
+    /// Blobs that fit a text message go as text ([`pigeonhole_storage_api::text`]).
     inline: bool,
 }
 
@@ -112,9 +113,9 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
         let _upload = self.limiter.acquire_upload().await;
         let channel = &self.reader.channel;
         let store = &self.instance.id;
-        if self.inline && pigeonhole_blob::text::fits(name, data.len(), pigeonhole_blob::text::TELEGRAM_MAX_CHARS) {
+        if self.inline && pigeonhole_storage_api::text::fits(name, data.len(), crate::channel::TEXT_MAX_CHARS) {
             let bytes = data.len();
-            let sent = channel.send_text(&pigeonhole_blob::text::encode(name, &data), random_id).await?;
+            let sent = channel.send_text(&pigeonhole_storage_api::text::encode(name, &data), random_id).await?;
             self.reader.remember(sent.message_id, Located::Inline(data));
             tracing::debug!(%store, message_id = sent.message_id, name, bytes, kind = "text", "posted");
             return Ok(sent.message_id);
@@ -169,7 +170,7 @@ impl<C: ChannelApi> Reader<C> {
         let ids: Vec<i64> = (lo..=message_id).collect();
         let msg = self.read(&ids).await?.pop();
         match msg {
-            Some(ChannelMessage::Empty) | None => bail!("blob message {message_id} is gone"),
+            Some(ChannelMessage::Empty) | None => Err(NotFound(format!("blob message {message_id}")).into()),
             Some(m) => Located::of(&m).with_context(|| format!("message {message_id} is not a blob")),
         }
     }
@@ -275,10 +276,7 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl<C: ChannelApi> Sweepable for TelegramBlobStore<C> {
     /// Our blobs (documents or texts named by a [`BlobId`]) with ids in `(after,
     /// upto]`, read from the channel 100 ids at a time; nothing else in the
     /// channel is ever a candidate.
@@ -302,3 +300,4 @@ impl<C: ChannelApi> Sweepable for TelegramBlobStore<C> {
         Ok(out)
     }
 }
+

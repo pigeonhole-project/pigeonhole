@@ -48,7 +48,7 @@ async fn setup_with_mem() -> (
     let store = Arc::new(
         ChunkStore::open(db, store_mem, opts).await.unwrap(),
     );
-    let s3 = build_s3_gateway(cfg, index, store);
+    let s3 = build_s3_gateway(cfg.s3_options(), index, store);
     (s3, mem, dir)
 }
 
@@ -670,7 +670,7 @@ async fn setup_one_tablet(chunk_size: usize) -> (pigeonhole::service::S3Gateway,
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
     let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
-    (build_s3_gateway(cfg, index, store), meta, dir)
+    (build_s3_gateway(cfg.s3_options(), index, store), meta, dir)
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
-//! Telegram rate limits on two levels, plus explicit cool-downs from 429s.
+//! Rate limits a store paces its calls with. A chat service (Telegram,
+//! Discord) limits on two levels, plus explicit cool-downs from 429s:
 //!
 //! - **Bot** ([`BotLimiter`]): every call of one bot token, across all its
 //!   chats (Telegram: about 30 per second).
@@ -20,12 +21,49 @@
 //! without remote limits (disk, memory) have a [`StoreLimiter`]: there idle
 //! means no other operation in flight.
 
+use pigeonhole_types::MetricDoc;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use tracing::debug;
+
+/// The metrics this crate records.
+pub const METRICS: &[MetricDoc] = &[
+    MetricDoc::histogram(
+        "pigeonhole_backend_throttle_wait_seconds",
+        &["service", "method"],
+        "Waits a chat service asked for (429 retry-after / FLOOD_WAIT), also the ones waited out inside a call",
+    ),
+    MetricDoc::histogram(
+        "pigeonhole_limiter_wait_seconds",
+        &["chat", "op"],
+        "Time waiting for our own rate-limit buckets of a chat / channel (waits > 0 only)",
+    ),
+];
+
+/// A chat service told us to wait `d` before calling `method` again.
+pub fn record_throttle(service: &str, method: &str, d: Duration) {
+    metrics::histogram!(
+        "pigeonhole_backend_throttle_wait_seconds",
+        "service" => service.to_owned(),
+        "method" => method.to_owned()
+    )
+    .record(d.as_secs_f64());
+}
+
+pub fn record_limiter_wait(chat: &str, op: &str, d: Duration) {
+    if d.is_zero() {
+        return;
+    }
+    metrics::histogram!(
+        "pigeonhole_limiter_wait_seconds",
+        "chat" => chat.to_owned(),
+        "op" => op.to_owned()
+    )
+    .record(d.as_secs_f64());
+}
 
 #[derive(Debug)]
 struct BucketState {
@@ -339,7 +377,7 @@ impl ChatLimiter {
     /// Chat bucket first, then the bot's.
     async fn take(&self, bucket: &TokenBucket, name: &'static str) {
         let waited = bucket.acquire().await + self.bot.acquire().await;
-        crate::metrics::record_limiter_wait(&self.chat, name, waited);
+        record_limiter_wait(&self.chat, name, waited);
     }
 
     /// `sendDocument` / `sendMessage` / pin / unpin.
@@ -416,7 +454,7 @@ impl ChatLimiter {
         while !(self.bucket(budget).idle() && self.bot.idle()) {
             tokio::time::sleep(IDLE_POLL).await;
         }
-        crate::metrics::record_limiter_wait(&self.chat, "idle", started.elapsed());
+        record_limiter_wait(&self.chat, "idle", started.elapsed());
     }
 
     /// Estimated wait before the next token for `budget` (does not capture a token).
@@ -464,7 +502,7 @@ impl StoreLimiter {
     pub async fn op(&self) -> Op<'_> {
         if let Some(rate) = &self.rate {
             let waited = rate.acquire().await;
-            crate::metrics::record_limiter_wait(&self.store, "op", waited);
+            record_limiter_wait(&self.store, "op", waited);
         }
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         Op(self)
@@ -489,7 +527,7 @@ impl StoreLimiter {
                 _ = tokio::time::sleep(IDLE_POLL) => {}
             }
         }
-        crate::metrics::record_limiter_wait(&self.store, "idle", started.elapsed());
+        record_limiter_wait(&self.store, "idle", started.elapsed());
     }
 }
 

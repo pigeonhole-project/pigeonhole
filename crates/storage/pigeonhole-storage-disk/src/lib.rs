@@ -14,10 +14,11 @@ mod segments;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_blob::{
-    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceKind, InstanceRole,
-    Linked, MakeAfter, OpKind, StoreLimiter, Sweepable,
+use pigeonhole_storage_api::{
+    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked,
+    MakeAfter, NotFound, OpKind,
 };
+use pigeonhole_limits::StoreLimiter;
 use pigeonhole_types::{BackendLimits, ByteRange};
 use segments::Segments;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,9 @@ use std::sync::{Arc, Mutex};
 
 pub use io::{Fs, SimFs, StdFs};
 pub use segments::DEFAULT_SEGMENT_BYTES;
+
+/// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
+pub const KIND: &str = "local_disk";
 
 /// Identity of a blob on disk: its key, the record's position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +70,7 @@ impl DiskBlobStore {
         let dir = dir.into();
         let info = InstanceInfo {
             id: "local_disk".into(),
-            kind: InstanceKind::LocalDisk,
+            kind: crate::KIND,
             fingerprint: disk_location(&dir),
             location: disk_location(&dir),
             role: InstanceRole::ReadWrite,
@@ -85,7 +89,7 @@ impl DiskBlobStore {
         let dir = dir.into();
         let info = InstanceInfo {
             id: "local_disk".into(),
-            kind: InstanceKind::LocalDisk,
+            kind: crate::KIND,
             fingerprint: disk_location(&dir),
             location: disk_location(&dir),
             role: InstanceRole::ReadWrite,
@@ -210,7 +214,7 @@ impl BlobBackend for DiskBlobStore {
                 guard.locked()?.catch_up()?;
             }
             let len = guard.records.get(&key).filter(|r| !r.dead).map(|r| r.data_len);
-            let Some(len) = len else { bail!("no blob {key}") };
+            let Some(len) = len else { return Err(NotFound(format!("blob {key}")).into()) };
             let (from, to) = match range {
                 Some(r) => (r.start, r.end),
                 None => (0, len),
@@ -232,10 +236,7 @@ impl BlobBackend for DiskBlobStore {
         tracing::debug!(store = %self.instance().id, keys = n, "deleted");
         Ok(())
     }
-}
 
-#[async_trait]
-impl Sweepable for DiskBlobStore {
     async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
         self.locked(move |s| {
             let from = after.map_or(0, |a| a.saturating_add(1));

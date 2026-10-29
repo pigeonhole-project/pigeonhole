@@ -17,7 +17,8 @@ for arg in "$@"; do
       cat <<'EOF'
 Usage: scripts/check-deps.sh [--strict]
 
-Soft (default): storage must not depend on index/engine/gateways/other storage;
+Soft (default): storage must not depend on the blob layer, chunk store, gateways
+or other storage;
 gateways must not depend on storage or each other.
 
 Strict: also require blob-store purity and gateway → {blob-store, codec, types} only.

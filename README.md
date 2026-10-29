@@ -47,9 +47,11 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 |---|---|
 | `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
 | `core/pigeonhole-codec` | Codecs + `BlockWriter` |
+| `core/pigeonhole-storage-api` | What a store implements: `BlobBackend`, `Chain`, `LeaseChain`, and the failures it reports by type (`NotFound`, `Unavailable`, `RateLimited`) |
+| `core/pigeonhole-limits` | Rate limiters a store paces its calls with (`ChatLimiter`, `StoreLimiter`) |
 | `meta/pigeonhole-meta` | Metadata tablet: layer commands in a fencing `LogStore`, applied to in-memory `StateMachine`s (`MetaStore`) |
-| `blob/pigeonhole-blob` | `BlobBackend`, `Replicated`, rate limits, `BootstrapPointer`, cache knobs |
-| `blob/pigeonhole-chunk-store` | `ChunkStore`, the `chunk` namespace, ingest, sweeper, repair, config (no protocol crates) |
+| `blob/pigeonhole-blob` | Stores behind one object-safe face (`DynBlobBackend`), `Replicated`, part packing, store metrics, cache knobs |
+| `blob/pigeonhole-chunk-store` | `ChunkStore`, the `chunk` namespace, ingest, sweeper, repair (no protocol or store-specific crates) |
 | `storage/pigeonhole-storage-telegram` | Telegram storage over MTProto (grammers), logged in as a bot |
 | `storage/pigeonhole-storage-discord` | Discord storage: blobs, and a chain over threads for the log and snapshots |
 | `storage/pigeonhole-storage-memory` | In-memory blob storage for tests / `kind = "memory"` stores |
@@ -58,7 +60,7 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 | `gateway/pigeonhole-gateway-bytestream` | REAPI v2 remote cache |
 | `testing/pigeonhole-testkit` | Storage conformance suites |
 | `testing/pigeonhole-sim` | Fault injection (`Faulty<B>`) and deterministic simulation scenarios (madsim) |
-| `bin/pigeonhole` | The `pigeonhole` binary (features select storage/gateways) |
+| `bin/pigeonhole` | The `pigeonhole` binary: config (`pigeonhole.toml`, `[[store]]`), wiring of stores, tablet and gateways (features select storage/gateways) |
 
 Dependency layering is enforced by `./scripts/check-deps.sh --strict` in CI.
 

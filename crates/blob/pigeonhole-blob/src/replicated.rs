@@ -8,6 +8,7 @@ use crate::typed::{BlobId, BlobLocator, CostHint, OpKind};
 use anyhow::{bail, Result};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, StreamExt};
+use pigeonhole_storage_api::Failure;
 use pigeonhole_types::{ByteRange, RangeSupport};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -60,8 +61,8 @@ pub trait ReplicaSelector: Send + Sync {
     /// Observe a successful op on `instance`.
     fn record_success(&self, instance: &str);
 
-    /// Observe a failure; `http_status` when known (429/5xx).
-    fn record_failure(&self, instance: &str, http_status: Option<u16>, timed_out: bool);
+    /// Observe a failure.
+    fn record_failure(&self, instance: &str, failure: Failure);
 }
 
 /// Circuit-breaking cheapest-first selector.
@@ -170,11 +171,8 @@ impl ReplicaSelector for CheapestFirst {
         g.unhealthy.remove(instance);
     }
 
-    fn record_failure(&self, instance: &str, http_status: Option<u16>, timed_out: bool) {
-        let trip = timed_out
-            || http_status == Some(429)
-            || http_status.is_some_and(|s| (500..600).contains(&s));
-        if !trip {
+    fn record_failure(&self, instance: &str, failure: Failure) {
+        if !matches!(failure, Failure::Timeout | Failure::RateLimited | Failure::Unavailable) {
             return;
         }
         let mut g = self.inner.lock().unwrap();
@@ -586,6 +584,17 @@ struct ActivePart {
 }
 
 impl ReadState {
+    /// A replica failed: a missing part is repaired, the rest goes to the
+    /// selector.
+    fn failed(&self, instance: &str, failure: Failure) {
+        if failure == Failure::NotFound {
+            if let Some(hook) = &self.on_not_found {
+                hook(instance);
+            }
+        }
+        self.selector.record_failure(instance, failure);
+    }
+
     async fn pull(&mut self) -> Result<Option<Bytes>> {
         loop {
             if self.next_block >= self.end_block {
@@ -618,14 +627,7 @@ impl ReadState {
                         }
                     }
                     Ok(Some(Err(e))) => {
-                        if is_not_found_err(&e) {
-                            if let Some(hook) = &self.on_not_found {
-                                hook(&active.instance);
-                            }
-                        }
-                        let (status, timed_out) = classify_err(&e);
-                        self.selector
-                            .record_failure(&active.instance, status, timed_out);
+                        self.failed(&active.instance, Failure::of(&e));
                         debug!(
                             instance = %active.instance,
                             next_block = self.next_block,
@@ -637,8 +639,7 @@ impl ReadState {
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        self.selector
-                            .record_failure(&active.instance, None, true);
+                        self.failed(&active.instance, Failure::Timeout);
                         failed = true;
                         break;
                     }
@@ -651,8 +652,8 @@ impl ReadState {
             }
 
             if active.expected_len != u64::MAX && (buf.len() as u64) < active.expected_len {
-                self.selector
-                    .record_failure(&active.instance, Some(500), false);
+                // A replica that ends early serves badly: route around it.
+                self.failed(&active.instance, Failure::Unavailable);
                 continue;
             }
 
@@ -723,14 +724,7 @@ impl ReadState {
                     return Ok(true);
                 }
                 Ok(Err(e)) => {
-                    if is_not_found_err(&e) {
-                        if let Some(hook) = &self.on_not_found {
-                            hook(&layout.instance);
-                        }
-                    }
-                    let (status, timed_out) = classify_err(&e);
-                    self.selector
-                        .record_failure(&layout.instance, status, timed_out);
+                    self.failed(&layout.instance, Failure::of(&e));
                     debug!(
                         instance = %layout.instance,
                         error = %e,
@@ -738,8 +732,7 @@ impl ReadState {
                     );
                 }
                 Err(_) => {
-                    self.selector
-                        .record_failure(&layout.instance, None, true);
+                    self.failed(&layout.instance, Failure::Timeout);
                     debug!(instance = %layout.instance, "replica get timed out");
                 }
             }
@@ -792,43 +785,13 @@ fn plan_part_read(
     None
 }
 
-fn classify_err(e: &anyhow::Error) -> (Option<u16>, bool) {
-    let msg = format!("{e:#}").to_ascii_lowercase();
-    if msg.contains("timed out") || msg.contains("timeout") {
-        return (None, true);
-    }
-    if msg.contains("429") {
-        return (Some(429), false);
-    }
-    if is_not_found_msg(&msg) {
-        return (Some(404), false);
-    }
-    for code in [500u16, 502, 503, 504] {
-        if msg.contains(&code.to_string()) {
-            return (Some(code), false);
-        }
-    }
-    (None, false)
-}
-
-fn is_not_found_err(e: &anyhow::Error) -> bool {
-    is_not_found_msg(&format!("{e:#}").to_ascii_lowercase())
-}
-
-fn is_not_found_msg(msg: &str) -> bool {
-    msg.contains("404")
-        || msg.contains("not found")
-        || msg.contains("unknown file")
-        || msg.contains("missing")
-        || msg.contains("no such")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pigeonhole_storage_api::{NotFound, Unavailable};
     use crate::erase::{erase, SharedBackend};
     use crate::typed::{
-        CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, BlobBackend,
+        CostHint, InstanceInfo, InstanceRole, OpKind, BlobBackend,
     };
     use crate::{collect_stream, slice_range};
     use async_trait::async_trait;
@@ -860,7 +823,7 @@ mod tests {
             Arc::new(Self {
                 info: InstanceInfo {
                     id: id.into(),
-                    kind: InstanceKind::Memory,
+                    kind: "memory",
                     fingerprint: format!("memory:{id}"),
                     location: format!("memory:{id}"),
                     role: InstanceRole::ReadWrite,
@@ -913,12 +876,12 @@ mod tests {
         }
         async fn put(&self, data: Bytes, _name: &str) -> Result<Self::Id> {
             if self.unavailable.load(Ordering::Relaxed) {
-                bail!("503 service unavailable");
+                return Err(Unavailable("get".into()).into());
             }
             let n = self.put_count.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(after) = *self.put_fail_after.lock().unwrap() {
                 if n > after {
-                    bail!("503 put failed");
+                    return Err(Unavailable("put".into()).into());
                 }
             }
             if data.len() > self.limits.max_blob_size {
@@ -930,7 +893,7 @@ mod tests {
         }
         async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
             if self.unavailable.load(Ordering::Relaxed) {
-                bail!("503 service unavailable");
+                return Err(Unavailable("get".into()).into());
             }
             let data = self
                 .data
@@ -938,7 +901,7 @@ mod tests {
                 .unwrap()
                 .get(&id.key)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing"))?;
+                .ok_or_else(|| NotFound(format!("blob {}", id.key)))?;
             let sliced = slice_range(data, range)?;
             let n = self.get_count.fetch_add(1, Ordering::Relaxed) + 1;
             let fail = *self.fail_get_after.lock().unwrap();
@@ -948,7 +911,7 @@ mod tests {
                     let head = sliced.slice(0..n);
                     return Ok(Box::pin(stream::iter([
                         Ok(head),
-                        Err(anyhow::anyhow!("503 mid-stream break")),
+                        Err(Unavailable("mid-stream break".into()).into()),
                     ])));
                 }
             }
@@ -960,6 +923,13 @@ mod tests {
                 g.remove(k);
             }
             Ok(())
+        }
+        async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
+            let mut keys: Vec<u64> =
+                self.data.lock().unwrap().keys().copied().filter(|&k| k <= upto && after.is_none_or(|a| k > a)).collect();
+            keys.sort_unstable();
+            keys.truncate(limit);
+            Ok(keys)
         }
     }
 

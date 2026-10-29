@@ -1,9 +1,10 @@
 //! In-memory [`BlobBackend`] for tests and `memory = true`.
 
-use pigeonhole_blob::{
-    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo,
-    InstanceKind, InstanceRole, Linked, OpKind, StoreLimiter, Sweepable,
+use pigeonhole_storage_api::{
+    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole,
+    Linked, NotFound, OpKind, Unavailable,
 };
+use pigeonhole_limits::StoreLimiter;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -12,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
+pub const KIND: &str = "memory";
 
 /// Typed identity for the memory backend (stage 1.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,7 +68,7 @@ impl MemoryBlobStore {
             limits,
             instance: InstanceInfo {
                 id: "memory".into(),
-                kind: InstanceKind::Memory,
+                kind: crate::KIND,
                 fingerprint: "memory:local".into(),
                 location: "memory:local".into(),
                 role: InstanceRole::ReadWrite,
@@ -131,7 +135,7 @@ impl MemoryBlobStore {
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed))
         {
-            bail!("503 service unavailable");
+            return Err(Unavailable(self.instance.id.clone()).into());
         }
         Ok(())
     }
@@ -241,7 +245,7 @@ impl BlobBackend for MemoryBlobStore {
             .unwrap()
             .get(&id.file_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown file_id {}", id.file_id))?;
+            .ok_or_else(|| NotFound(format!("blob {}", id.file_id)))?;
         let sliced = slice_range(data, range)?;
         Ok(bytes_stream(sliced))
     }
@@ -262,10 +266,7 @@ impl BlobBackend for MemoryBlobStore {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl Sweepable for MemoryBlobStore {
     async fn candidates(
         &self,
         after: Option<Self::Key>,
@@ -341,7 +342,7 @@ impl Chain for MemoryBlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pigeonhole_blob::collect_stream;
+    use pigeonhole_storage_api::collect_stream;
 
     #[tokio::test]
     async fn memory_put_get_delete() {
@@ -354,7 +355,8 @@ mod tests {
             .unwrap();
         assert_eq!(got.as_ref(), b"hello");
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
-        assert!(BlobBackend::get(&store, &id, None).await.is_err());
+        let gone = BlobBackend::get(&store, &id, None).await;
+        assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound);
         // Repeat delete is ok.
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
     }
@@ -432,7 +434,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.as_ref(), b"typed");
-        let keys = Sweepable::candidates(&store, None, u64::MAX, 10)
+        let keys = BlobBackend::candidates(&store, None, u64::MAX, 10)
             .await
             .unwrap();
         assert!(keys.contains(&id.message_id));

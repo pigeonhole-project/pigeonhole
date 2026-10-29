@@ -1,10 +1,10 @@
 //! The Discord blob backend on a fake channel.
 
 use bytes::Bytes;
-use pigeonhole_blob::{
-    collect_stream, BlobBackend, BlobId, ChatLimiter, ChatLimiterConfig, InstanceInfo, InstanceKind, InstanceRole,
-    Sweepable,
+use pigeonhole_storage_api::{
+    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole,
 };
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_storage_discord::fake::FakeDiscord;
 use pigeonhole_storage_discord::{DiscordBlobStore, DiscordId};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ fn limiter() -> Arc<ChatLimiter> {
 fn store_on(channel: &Arc<FakeDiscord>) -> Store {
     let info = InstanceInfo {
         id: "dc".into(),
-        kind: InstanceKind::Discord,
+        kind: pigeonhole_storage_discord::KIND,
         fingerprint: "dc:1:77".into(),
         location: "dc:channel:77".into(),
         role: InstanceRole::ReadWrite,
@@ -112,5 +112,6 @@ async fn sweeps_only_our_blobs() {
     assert_eq!(store.candidates(Some(ours), late, 1).await.unwrap(), vec![late]);
     assert!(store.candidates(Some(late), late + 5, 100).await.unwrap().is_empty());
     store.delete(&[ours, late]).await.unwrap();
-    assert!(store.get(&DiscordId { message_id: ours }, None).await.is_err());
+    let gone = store.get(&DiscordId { message_id: ours }, None).await;
+    assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound);
 }

@@ -1,17 +1,15 @@
 //! Object-safe erasure of [`BlobBackend`] (stage 1.2).
 
-use crate::typed::{
-    store_id, CostHint, InstanceInfo, OpKind, OrderedKey, BlobLocator, Sweepable, BlobBackend,
-};
+use crate::typed::{store_id, BlobBackend, BlobLocator, CostHint, InstanceInfo, OpKind, OrderedKey};
 use crate::BoxByteStream;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_types::{BackendLimits, ByteRange};
-use std::marker::PhantomData;
 use std::sync::Arc;
 
-/// Object-safe backend used by blob-store / replication.
+/// Object-safe backend used by blob-store / replication: ids as
+/// [`BlobLocator`]s, keys as their order-preserving bytes.
 #[async_trait]
 pub trait DynBlobBackend: Send + Sync + 'static {
     fn instance(&self) -> &InstanceInfo;
@@ -21,22 +19,11 @@ pub trait DynBlobBackend: Send + Sync + 'static {
     async fn put(&self, data: Bytes, name: &str) -> Result<BlobLocator>;
     async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream>;
     async fn delete(&self, keys: &[Vec<u8>]) -> Result<()>;
-    /// Optional sweeper registration.
-    fn sweeper(&self) -> Option<&dyn DynSweep>;
+    /// [`BlobBackend::candidates`] over key bytes.
+    async fn candidates(&self, after: Option<&[u8]>, upto: &[u8], limit: usize) -> Result<Vec<Vec<u8>>>;
 }
 
-/// Object-safe sweep API.
-#[async_trait]
-pub trait DynSweep: Send + Sync {
-    async fn candidates(
-        &self,
-        after: Option<&[u8]>,
-        upto: &[u8],
-        limit: usize,
-    ) -> Result<Vec<Vec<u8>>>;
-}
-
-/// Wrap a concrete [`BlobBackend`] as [`DynBlobBackend`].
+/// A concrete [`BlobBackend`] as a [`DynBlobBackend`].
 pub struct Erased<B> {
     inner: B,
 }
@@ -52,10 +39,7 @@ impl<B> Erased<B> {
 }
 
 #[async_trait]
-impl<B> DynBlobBackend for Erased<B>
-where
-    B: BlobBackend,
-{
+impl<B: BlobBackend> DynBlobBackend for Erased<B> {
     fn instance(&self) -> &InstanceInfo {
         self.inner.instance()
     }
@@ -65,7 +49,13 @@ where
     }
 
     fn cost(&self, op: OpKind, id: Option<&BlobLocator>) -> CostHint {
-        let typed = id.and_then(|s| serde_json::from_slice::<B::Id>(&s.locator).ok());
+        let typed = id.and_then(|s| match postcard::from_bytes::<B::Id>(&s.locator) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::debug!(store = %self.inner.instance().id, error = %e, "cost of a locator that does not decode");
+                None
+            }
+        });
         self.inner.cost(op, typed.as_ref())
     }
 
@@ -75,96 +65,18 @@ where
     }
 
     async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream> {
-        let typed: B::Id = serde_json::from_slice(&id.locator)?;
+        let typed: B::Id = postcard::from_bytes(&id.locator)?;
         self.inner.get(&typed, range).await
     }
 
     async fn delete(&self, keys: &[Vec<u8>]) -> Result<()> {
-        let mut typed = Vec::with_capacity(keys.len());
-        for k in keys {
-            typed.push(B::Key::from_bytes(k)?);
-        }
+        let typed = keys.iter().map(|k| B::Key::from_bytes(k)).collect::<Result<Vec<_>>>()?;
         self.inner.delete(&typed).await
     }
 
-    fn sweeper(&self) -> Option<&dyn DynSweep> {
-        None
-    }
-}
-
-/// Erased backend that also exposes [`Sweepable`].
-pub struct ErasedSweep<B> {
-    inner: B,
-}
-
-impl<B> ErasedSweep<B> {
-    pub fn new(inner: B) -> Self {
-        Self { inner }
-    }
-
-    pub fn inner(&self) -> &B {
-        &self.inner
-    }
-}
-
-#[async_trait]
-impl<B> DynBlobBackend for ErasedSweep<B>
-where
-    B: Sweepable,
-{
-    fn instance(&self) -> &InstanceInfo {
-        self.inner.instance()
-    }
-
-    fn limits(&self) -> &BackendLimits {
-        self.inner.limits()
-    }
-
-    fn cost(&self, op: OpKind, id: Option<&BlobLocator>) -> CostHint {
-        let typed = id.and_then(|s| serde_json::from_slice::<B::Id>(&s.locator).ok());
-        self.inner.cost(op, typed.as_ref())
-    }
-
-    async fn put(&self, data: Bytes, name: &str) -> Result<BlobLocator> {
-        let id = BlobBackend::put(&self.inner, data, name).await?;
-        store_id::<B>(&id)
-    }
-
-    async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream> {
-        let typed: B::Id = serde_json::from_slice(&id.locator)?;
-        BlobBackend::get(&self.inner, &typed, range).await
-    }
-
-    async fn delete(&self, keys: &[Vec<u8>]) -> Result<()> {
-        let mut typed = Vec::with_capacity(keys.len());
-        for k in keys {
-            typed.push(B::Key::from_bytes(k)?);
-        }
-        BlobBackend::delete(&self.inner, &typed).await
-    }
-
-    fn sweeper(&self) -> Option<&dyn DynSweep> {
-        Some(self)
-    }
-}
-
-#[async_trait]
-impl<B> DynSweep for ErasedSweep<B>
-where
-    B: Sweepable,
-{
-    async fn candidates(
-        &self,
-        after: Option<&[u8]>,
-        upto: &[u8],
-        limit: usize,
-    ) -> Result<Vec<Vec<u8>>> {
-        let after = match after {
-            Some(b) => Some(B::Key::from_bytes(b)?),
-            None => None,
-        };
-        let upto = B::Key::from_bytes(upto)?;
-        let keys = self.inner.candidates(after, upto, limit).await?;
+    async fn candidates(&self, after: Option<&[u8]>, upto: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        let after = after.map(B::Key::from_bytes).transpose()?;
+        let keys = self.inner.candidates(after, B::Key::from_bytes(upto)?, limit).await?;
         Ok(keys.into_iter().map(|k| k.to_bytes()).collect())
     }
 }
@@ -172,14 +84,8 @@ where
 /// Arc helper.
 pub type SharedBackend = Arc<dyn DynBlobBackend>;
 
-/// Adapt a non-sweep backend; `PhantomData` keeps unused type params quiet in macros.
 pub fn erase<B: BlobBackend>(backend: B) -> Erased<B> {
-    let _ = PhantomData::<B>;
     Erased::new(backend)
-}
-
-pub fn erase_sweep<B: Sweepable>(backend: B) -> ErasedSweep<B> {
-    ErasedSweep::new(backend)
 }
 
 #[cfg(test)]
@@ -206,7 +112,7 @@ mod tests {
             Self {
                 info: InstanceInfo {
                     id: "tiny".into(),
-                    kind: crate::typed::InstanceKind::Memory,
+                    kind: "memory",
                     fingerprint: "tiny".into(),
                     location: "tiny".into(),
                     role: crate::typed::InstanceRole::ReadWrite,
@@ -259,10 +165,7 @@ mod tests {
             }
             Ok(())
         }
-    }
 
-    #[async_trait]
-    impl Sweepable for TinyMem {
         async fn candidates(
             &self,
             after: Option<Self::Key>,
@@ -279,19 +182,19 @@ mod tests {
             keys.truncate(limit);
             Ok(keys)
         }
+    
     }
 
     #[tokio::test]
-    async fn erased_sweep_roundtrip() {
-        let backend: SharedBackend = Arc::new(erase_sweep(TinyMem::new()));
+    async fn erased_roundtrip() {
+        let backend: SharedBackend = Arc::new(erase(TinyMem::new()));
         let id = backend.put(Bytes::from_static(b"hi"), "hi.bin").await.unwrap();
         let got = collect_stream(backend.get(&id, None).await.unwrap())
             .await
             .unwrap();
         assert_eq!(got.as_ref(), b"hi");
-        let sweep = backend.sweeper().expect("sweeper");
         let upto = u64::MAX.to_bytes();
-        let keys = sweep.candidates(None, &upto, 10).await.unwrap();
+        let keys = backend.candidates(None, &upto, 10).await.unwrap();
         assert_eq!(keys.len(), 1);
         backend.delete(&keys).await.unwrap();
         assert!(backend.get(&id, None).await.is_err());

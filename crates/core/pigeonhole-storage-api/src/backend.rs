@@ -44,27 +44,6 @@ impl OrderedKey for i64 {
     }
 }
 
-/// Backend kind string as stored in config / `instances` table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InstanceKind {
-    Telegram,
-    Discord,
-    Memory,
-    LocalDisk,
-}
-
-impl InstanceKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Telegram => "telegram",
-            Self::Discord => "discord",
-            Self::Memory => "memory",
-            Self::LocalDisk => "local_disk",
-        }
-    }
-}
-
 /// Runtime role of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -85,11 +64,12 @@ impl InstanceRole {
 }
 
 /// Stable identity of a configured backend instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceInfo {
     /// Stable config name, e.g. `tg-main`.
     pub id: String,
-    pub kind: InstanceKind,
+    /// What store it is (`telegram`, `local_disk`, …): its crate's `KIND`.
+    pub kind: &'static str,
     /// Opaque fingerprint string, e.g. `tg:{bot_id}:{scope}`.
     pub fingerprint: String,
     /// Location key for uniqueness of writers, e.g. `tg:chat:-100…`.
@@ -175,17 +155,10 @@ pub trait BlobBackend: Send + Sync + 'static {
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream>;
     /// Batch delete; not-found is ok.
     async fn delete(&self, keys: &[Self::Key]) -> Result<()>;
-}
 
-/// Backends that can list keys in order for the sweeper.
-#[async_trait]
-pub trait Sweepable: BlobBackend {
-    async fn candidates(
-        &self,
-        after: Option<Self::Key>,
-        upto: Self::Key,
-        limit: usize,
-    ) -> Result<Vec<Self::Key>>;
+    /// Up to `limit` keys of our blobs in `(after, upto]`, in order: what
+    /// the sweeper checks against the metadata.
+    async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>>;
 }
 
 /// Share one backend instance between several owners.
@@ -215,10 +188,6 @@ impl<B: BlobBackend> BlobBackend for std::sync::Arc<B> {
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
         (**self).delete(keys).await
     }
-}
-
-#[async_trait]
-impl<B: Sweepable> Sweepable for std::sync::Arc<B> {
     async fn candidates(
         &self,
         after: Option<Self::Key>,

@@ -17,7 +17,7 @@ use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_blob::{
-    erase_sweep, BlobBackend, CheapestFirst, OrderedKey, Replicated, SharedBackend,
+    erase, BlobBackend, CheapestFirst, OrderedKey, Replicated, SharedBackend,
 };
 use pigeonhole_chunk_store::{SweepConfig, Sweeper};
 use s3s::dto::*;
@@ -125,12 +125,12 @@ async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
     let info = mem.instance().clone();
     // Same wiring as the binary: uploads are pinned until committed, the
     // sweeper stops at the pins' horizon.
-    let backend: SharedBackend = Arc::new(erase_sweep(mem));
+    let backend: SharedBackend = Arc::new(erase(mem));
     let rep = Arc::new(
         Replicated::new(vec![backend.clone()], 1, Arc::new(CheapestFirst::new())).unwrap(),
     );
     let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
-    let s3 = build_s3_gateway(cfg, index, store.clone());
+    let s3 = build_s3_gateway(cfg.s3_options(), index, store.clone());
     Node {
         s3,
         store,

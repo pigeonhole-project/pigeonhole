@@ -28,7 +28,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         .await
         .context("open s3 index")?;
 
-    let s3_gateway = build_s3_gateway(cfg.clone(), index.clone(), rt.store.clone());
+    let s3_gateway = build_s3_gateway(cfg.s3_options(), index.clone(), rt.store.clone());
     spawn_background_tasks(&cfg, &rt);
     if cfg.metrics.enabled {
         pigeonhole::state_metrics::spawn(rt.meta.clone(), index.clone(), rt.store.db().clone());
@@ -95,7 +95,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     let instances: Vec<String> = cfg
         .instances
         .iter()
-        .map(|i| format!("{}:{}", i.info.id, i.info.kind.as_str()))
+        .map(|i| format!("{}:{}", i.info.id, i.info.kind))
         .collect();
     info!(
         ?instances,

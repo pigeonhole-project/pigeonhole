@@ -7,9 +7,10 @@ use crate::instances::{
     memory_fingerprint, memory_location, telegram_location, telegram_fingerprint,
     InstanceConfig, TelegramLogin,
 };
-use crate::{PlacementConfig, ShardPlacement};
+use crate::config::{PlacementConfig, ShardPlacement};
 use anyhow::{bail, Context, Result};
-use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole};
+use crate::instances::InstanceKind;
+use pigeonhole_blob::{InstanceInfo, InstanceRole};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -356,7 +357,8 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
         ),
     };
     Ok(InstanceConfig {
-        info: InstanceInfo { id: id.to_string(), kind, fingerprint, location, role: InstanceRole::ReadWrite },
+        kind,
+        info: InstanceInfo { id: id.to_string(), kind: kind.as_str(), fingerprint, location, role: InstanceRole::ReadWrite },
         bot_token_env,
         bot_token,
         scope_id,

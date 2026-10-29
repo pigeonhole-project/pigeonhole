@@ -3,7 +3,7 @@
 //! Libraries only call these helpers. The binary optionally installs a
 //! Prometheus recorder behind feature `metrics-prometheus`.
 
-use crate::erase::{DynBlobBackend, DynSweep, SharedBackend};
+use crate::erase::{DynBlobBackend, SharedBackend};
 use crate::typed::{CostHint, InstanceInfo, OpKind, BlobLocator};
 use crate::BoxByteStream;
 use anyhow::Result;
@@ -32,16 +32,6 @@ pub const METRICS: &[MetricDoc] = &[
         "pigeonhole_instance_rate_limited_total",
         &["instance", "op"],
         "Backend calls that failed rate limited (a 429 / FLOOD_WAIT longer than the call's budget)",
-    ),
-    MetricDoc::histogram(
-        "pigeonhole_backend_throttle_wait_seconds",
-        &["service", "method"],
-        "Waits a chat service asked for (429 retry-after / FLOOD_WAIT), also the ones waited out inside a call",
-    ),
-    MetricDoc::histogram(
-        "pigeonhole_limiter_wait_seconds",
-        &["chat", "op"],
-        "Time waiting for our own rate-limit buckets of a chat / channel (waits > 0 only)",
     ),
     MetricDoc::counter("pigeonhole_replica_selected_total", &["instance"], "Replicas chosen to read from"),
     MetricDoc::histogram("pigeonhole_parts_per_chunk", &["instance"], "Backend parts written per chunk replica"),
@@ -109,28 +99,6 @@ pub fn record_429(instance: &str, op: &str) {
         "op" => op.to_owned()
     )
     .increment(1);
-}
-
-/// A chat service told us to wait `d` before calling `method` again.
-pub fn record_throttle(service: &str, method: &str, d: Duration) {
-    metrics::histogram!(
-        "pigeonhole_backend_throttle_wait_seconds",
-        "service" => service.to_owned(),
-        "method" => method.to_owned()
-    )
-    .record(d.as_secs_f64());
-}
-
-pub fn record_limiter_wait(chat: &str, op: &str, d: Duration) {
-    if d.is_zero() {
-        return;
-    }
-    metrics::histogram!(
-        "pigeonhole_limiter_wait_seconds",
-        "chat" => chat.to_owned(),
-        "op" => op.to_owned()
-    )
-    .record(d.as_secs_f64());
 }
 
 pub fn inflight_inc(instance: &str, op: &str) {
@@ -293,7 +261,7 @@ impl Drop for Inflight {
 }
 
 fn outcome_from_err(err: &anyhow::Error) -> (&'static str, bool) {
-    if err.chain().any(|e| e.is::<crate::RateLimited>()) || format!("{err:#}").contains("429") {
+    if crate::Failure::of(err) == crate::Failure::RateLimited {
         ("rate_limited", true)
     } else {
         ("error", false)
@@ -422,7 +390,7 @@ impl DynBlobBackend for MetricsBackend {
         result
     }
 
-    fn sweeper(&self) -> Option<&dyn DynSweep> {
-        self.inner.sweeper()
+    async fn candidates(&self, after: Option<&[u8]>, upto: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        self.inner.candidates(after, upto, limit).await
     }
 }

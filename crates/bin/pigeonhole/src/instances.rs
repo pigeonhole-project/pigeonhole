@@ -1,13 +1,36 @@
 //! Blob stores as the chunk store sees them (resolved from `[[store]]`).
 
 use anyhow::{bail, Context, Result};
-use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole};
+use pigeonhole_blob::{InstanceInfo, InstanceRole};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+/// The kinds of store this binary builds (`[[store]] kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceKind {
+    Telegram,
+    Discord,
+    Memory,
+    LocalDisk,
+}
+
+impl InstanceKind {
+    /// The store crate's `KIND`, recorded in [`InstanceInfo::kind`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Telegram => pigeonhole_storage_telegram::KIND,
+            // The crate is optional; a test pins the two together.
+            Self::Discord => "discord",
+            Self::Memory => pigeonhole_storage_memory::KIND,
+            Self::LocalDisk => pigeonhole_storage_disk::KIND,
+        }
+    }
+}
 
 /// One configured backend instance after secret resolution.
 #[derive(Debug, Clone)]
 pub struct InstanceConfig {
+    pub kind: InstanceKind,
     pub info: InstanceInfo,
     /// Env var name holding the bot/app token (never the secret itself).
     pub bot_token_env: String,
@@ -88,9 +111,10 @@ pub fn discord_app_id_from_token(token: &str) -> String {
 /// In-process memory instance (tests, local runs).
 pub fn memory_instance(id: &str) -> InstanceConfig {
     InstanceConfig {
+        kind: InstanceKind::Memory,
         info: InstanceInfo {
             id: id.into(),
-            kind: InstanceKind::Memory,
+            kind: InstanceKind::Memory.as_str(),
             fingerprint: memory_fingerprint(id),
             location: memory_location(id),
             role: InstanceRole::ReadWrite,
@@ -154,12 +178,19 @@ pub fn check_fingerprints(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "discord")]
+    #[test]
+    fn discord_kind_is_the_crates() {
+        assert_eq!(InstanceKind::Discord.as_str(), pigeonhole_storage_discord::KIND);
+    }
+
     #[test]
     fn rejects_two_writers_same_location() {
         let a = InstanceConfig {
+            kind: InstanceKind::Telegram,
             info: InstanceInfo {
                 id: "a".into(),
-                kind: InstanceKind::Telegram,
+                kind: "telegram",
                 fingerprint: "tg:1:-100".into(),
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,
@@ -178,9 +209,10 @@ mod tests {
     #[test]
     fn allows_writer_plus_readonly_same_location() {
         let a = InstanceConfig {
+            kind: InstanceKind::Telegram,
             info: InstanceInfo {
                 id: "rw".into(),
-                kind: InstanceKind::Telegram,
+                kind: "telegram",
                 fingerprint: "tg:1:-100".into(),
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,
@@ -201,9 +233,10 @@ mod tests {
     #[test]
     fn fingerprint_mismatch_refuses() {
         let cfg = InstanceConfig {
+            kind: InstanceKind::Telegram,
             info: InstanceInfo {
                 id: "tg-main".into(),
-                kind: InstanceKind::Telegram,
+                kind: "telegram",
                 fingerprint: "tg:1:-100".into(),
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,

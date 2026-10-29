@@ -2,7 +2,7 @@
 //! its blob stores, the log and the snapshots.
 
 use anyhow::{bail, Context};
-use pigeonhole_chunk_store::TelegramLogin;
+use pigeonhole::instances::TelegramLogin;
 use pigeonhole_storage_telegram::{MtprotoConfig, TelegramMtproto};
 use std::collections::HashMap;
 use std::path::PathBuf;

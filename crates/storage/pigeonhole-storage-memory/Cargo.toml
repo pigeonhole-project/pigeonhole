@@ -9,7 +9,8 @@ description = "In-memory storage backend for pigeonhole tests"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-pigeonhole-blob = { workspace = true }
+pigeonhole-limits = { workspace = true }
+pigeonhole-storage-api = { workspace = true }
 pigeonhole-types = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }

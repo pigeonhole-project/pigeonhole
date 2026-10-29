@@ -203,7 +203,7 @@ impl BlobDb {
             .iter()
             .map(|i| {
                 let rec = InstanceRec {
-                    kind: i.kind.as_str().into(),
+                    kind: i.kind.into(),
                     fingerprint: i.fingerprint.clone(),
                     location: i.location.clone(),
                     state: i.role.as_str().into(),
@@ -546,7 +546,7 @@ impl BlobDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pigeonhole_blob::{BlobId, BlobLocator, InstanceKind, InstanceRole, PartLayout};
+    use pigeonhole_blob::{BlobId, BlobLocator, InstanceRole, PartLayout};
 
     #[tokio::test]
     async fn instances_and_refs_roundtrip() {
@@ -555,7 +555,7 @@ mod tests {
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let info = InstanceInfo {
             id: "tg-main".into(),
-            kind: InstanceKind::Telegram,
+            kind: "telegram",
             fingerprint: "tg:1:-100".into(),
             location: "tg:chat:-100".into(),
             role: InstanceRole::ReadWrite,
@@ -601,7 +601,7 @@ mod tests {
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let a = InstanceInfo {
             id: "a".into(),
-            kind: InstanceKind::Memory,
+            kind: "memory",
             fingerprint: "memory:local".into(),
             location: "memory:local".into(),
             role: InstanceRole::ReadWrite,
@@ -618,7 +618,7 @@ mod tests {
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let info = InstanceInfo {
             id: "mem".into(),
-            kind: InstanceKind::Memory,
+            kind: "memory",
             fingerprint: "memory:mem".into(),
             location: "memory:mem".into(),
             role: InstanceRole::ReadWrite,
@@ -684,7 +684,7 @@ mod tests {
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         db.sync_instances(&[InstanceInfo {
             id: "mem".into(),
-            kind: InstanceKind::Memory,
+            kind: "memory",
             fingerprint: "memory:mem".into(),
             location: "memory:mem".into(),
             role: InstanceRole::ReadWrite,
@@ -740,7 +740,7 @@ mod tests {
         let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
         db.sync_instances(&[InstanceInfo {
             id: "mem".into(),
-            kind: InstanceKind::Memory,
+            kind: "memory",
             fingerprint: "memory:mem".into(),
             location: "memory:mem".into(),
             role: InstanceRole::ReadWrite,
@@ -771,7 +771,7 @@ mod tests {
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
         let info = InstanceInfo {
             id: "mem".into(),
-            kind: InstanceKind::Memory,
+            kind: "memory",
             fingerprint: "memory:mem".into(),
             location: "memory:mem".into(),
             role: InstanceRole::ReadWrite,

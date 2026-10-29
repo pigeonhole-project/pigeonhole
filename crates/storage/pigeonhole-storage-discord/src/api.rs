@@ -9,6 +9,9 @@ use bytes::Bytes;
 /// Most message ids one bulk delete takes, and messages one listing returns.
 pub const PAGE: usize = 100;
 
+/// Characters a message's content takes (code points).
+pub const CONTENT_MAX_CHARS: usize = 2000;
+
 /// A message as far as we care.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DcMessage {

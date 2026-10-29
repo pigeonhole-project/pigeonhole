@@ -222,7 +222,7 @@ above, and why:
 
 - **Shape as Telegram's**: the HTTP client sits behind a `DiscordApi` trait
   (`DiscordChannel` over HTTP, `fake::FakeDiscord` in memory);
-  `DiscordBlobStore<A>` implements `BlobBackend`, `Sweepable` and `Chain`. The
+  `DiscordBlobStore<A>` implements `BlobBackend`, `Chain` and `LeaseChain`. The
   log and snapshots are the generic `ChainLogStore` / `BlobSnapshotStore`
   (chain-log.md); none of the protocol above is Discord code any more, only
   "first successor wins" by a thread.

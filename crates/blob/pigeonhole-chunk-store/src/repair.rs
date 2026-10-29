@@ -355,17 +355,7 @@ async fn read_encoded_blocks(
     Ok(out)
 }
 
-/// Whether an error message looks like a missing backend blob (enqueue repair).
-pub fn is_part_not_found(err: &anyhow::Error) -> bool {
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("404")
-        || msg.contains("not found")
-        || msg.contains("unknown file")
-        || msg.contains("missing")
-        || msg.contains("no such")
-}
-
-/// Spawn a best-effort enqueue (read path must not block on SQLite).
+/// Spawn a best-effort enqueue (the read path must not wait for the metadata log).
 pub fn spawn_enqueue_repair(db: BlobDb, chunk_id: ChunkId, instance_id: String) {
     tokio::spawn(async move {
         if let Err(e) = db.enqueue_repair(chunk_id, &instance_id).await {

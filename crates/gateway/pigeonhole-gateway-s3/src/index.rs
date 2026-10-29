@@ -22,7 +22,6 @@ pub struct Index {
 pub struct Bucket {
     pub name: String,
     pub created_at: String,
-    pub scope_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,10 +132,9 @@ impl Index {
     }
 
     /// Returns false when the bucket already exists.
-    pub async fn create_bucket(&self, name: &str, scope_id: &str) -> Result<bool> {
+    pub async fn create_bucket(&self, name: &str) -> Result<bool> {
         let cmd = S3Command::CreateBucket {
             name: name.into(),
-            scope_id: scope_id.into(),
             created_at: Utc::now().to_rfc3339(),
         };
         match self.propose(cmd).await? {
@@ -144,10 +142,6 @@ impl Index {
             Err(S3Reject::BucketExists) => Ok(false),
             Err(other) => anyhow::bail!("unexpected create_bucket rejection {other:?}"),
         }
-    }
-
-    pub async fn bucket_scope_id(&self, name: &str) -> Result<Option<String>> {
-        Ok(self.read(|s| s.buckets.get(name).map(|b| b.scope_id.clone())))
     }
 
     pub async fn delete_bucket(&self, name: &str) -> Result<DeleteBucketResult> {
@@ -166,7 +160,6 @@ impl Index {
                 .map(|(name, b)| Bucket {
                     name: name.clone(),
                     created_at: b.created_at.clone(),
-                    scope_id: b.scope_id.clone(),
                 })
                 .collect()
         }))
@@ -1017,7 +1010,7 @@ mod list_tests {
         for case in 0..400 {
             let ix = index().await;
             let bucket = format!("bucket{case}");
-            ix.create_bucket(&bucket, "scope").await.unwrap();
+            ix.create_bucket(&bucket).await.unwrap();
             let mut keys: Vec<String> = (0..25).map(|_| rng.word(&alphabet, 6)).collect();
             keys.sort();
             keys.dedup();
@@ -1058,7 +1051,7 @@ mod list_tests {
     #[tokio::test]
     async fn a_start_after_inside_a_big_common_prefix_still_lists_what_follows() {
         let ix = index().await;
-        ix.create_bucket("b", "scope").await.unwrap();
+        ix.create_bucket("b").await.unwrap();
         for i in 0..100 {
             ix.put_object("b", &format!("a/k{i:03}"), "etag", 0, None, &[], &[], "{}")
                 .await

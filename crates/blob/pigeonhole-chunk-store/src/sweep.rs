@@ -41,7 +41,7 @@ pub struct SweepStats {
     pub keys_skipped_live: u64,
 }
 
-/// One sweeper per process; iterates every Sweepable member of the placement group.
+/// One sweeper per process; iterates every member of the placement group.
 pub struct Sweeper {
     db: BlobDb,
     members: Vec<SharedBackend>,
@@ -171,9 +171,6 @@ impl Sweeper {
     }
 
     async fn sweep_instance(&self, backend: &SharedBackend) -> Result<(u64, u64)> {
-        let Some(sweep) = backend.sweeper() else {
-            return Ok((0, 0));
-        };
         let instance_id = backend.instance().id.as_str();
         let Some(upto) = self.pins.horizon(instance_id) else {
             return Ok((0, 0));
@@ -185,7 +182,7 @@ impl Sweeper {
         let batch = self.config.batch_size.max(1);
 
         loop {
-            let keys = sweep
+            let keys = backend
                 .candidates(after.as_deref(), &upto, batch)
                 .await
                 .with_context(|| format!("candidates for {instance_id}"))?;
@@ -245,12 +242,9 @@ impl Sweeper {
 mod tests {
     use super::*;
     use crate::ingest::IngestOptions;
-    use crate::instances::{validate_instances, InstanceConfig};
     use crate::layer::ChunkStore;
     use bytes::Bytes;
-    use pigeonhole_blob::{
-        erase_sweep, BlobLocator, InstanceInfo, InstanceKind, InstanceRole, OrderedKey, Replicated,
-    };
+    use pigeonhole_blob::{erase, BlobLocator, OrderedKey, Replicated};
     use pigeonhole_codec::ChunkCodec;
     use pigeonhole_storage_memory::MemoryBlobStore;
 
@@ -278,7 +272,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
         let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
-        let backend: SharedBackend = Arc::new(erase_sweep(mem.clone()));
+        let backend: SharedBackend = Arc::new(erase(mem.clone()));
         let (layer, pins) = open_layer(db.clone(), backend.clone()).await;
         Fixture { _dir: dir, db, mem, backend, layer, pins }
     }
@@ -445,7 +439,7 @@ mod tests {
             .unwrap();
         let db = BlobDb::open(meta.clone()).await.unwrap();
         let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
-        let backend: SharedBackend = Arc::new(erase_sweep(mem.clone()));
+        let backend: SharedBackend = Arc::new(erase(mem.clone()));
         let (layer, pins) = open_layer(db.clone(), backend.clone()).await;
         let f = Fixture { _dir: dir, db, mem, backend, layer, pins };
 
@@ -483,27 +477,5 @@ mod tests {
         assert_eq!(stats.keys_deleted, 1);
         assert!(!on_backend(&f, &dead));
         assert!(f.db.chunk_meta(id).await.unwrap().is_some());
-    }
-
-    #[test]
-    fn two_writers_same_location_refused() {
-        let a = InstanceConfig {
-            info: InstanceInfo {
-                id: "a".into(),
-                kind: InstanceKind::Memory,
-                fingerprint: "memory:a".into(),
-                location: "memory:same".into(),
-                role: InstanceRole::ReadWrite,
-            },
-            bot_token_env: String::new(),
-            bot_token: String::new(),
-            scope_id: "a".into(),
-            max_blob_size: None,
-            telegram: None,
-        };
-        let mut b = a.clone();
-        b.info.id = "b".into();
-        b.info.fingerprint = "memory:b".into();
-        assert!(validate_instances(&[a, b]).is_err());
     }
 }

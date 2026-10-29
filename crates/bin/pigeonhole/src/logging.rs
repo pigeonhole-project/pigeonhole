@@ -1,6 +1,6 @@
 //! The process's log: `[log]` (level, format) to stderr (docs/observability.md).
 
-use pigeonhole_chunk_store::{LogFormat, LoggingSettings};
+use crate::config::{LogFormat, LoggingSettings};
 use std::io::IsTerminal;
 use tracing_subscriber::EnvFilter;
 

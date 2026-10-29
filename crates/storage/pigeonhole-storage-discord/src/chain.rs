@@ -31,7 +31,7 @@ use crate::store::{blob_name, DiscordBlobStore, DiscordId};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_blob::{After, BlobBackend, Chain, Linked};
+use pigeonhole_storage_api::{After, BlobBackend, Chain, LeaseChain, Linked};
 
 const ANCHOR: &str = "chain-anchor.bin";
 /// Thread names hold 100 characters.
@@ -261,9 +261,38 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
         }
     }
 
+    /// Our messages below `below` (not the anchor), walking down until a page
+    /// holds none of ours, and their links but the one into `below`.
+    async fn prune(&self, below: &DiscordId) -> Result<()> {
+        let mut before = Some(below.message_id);
+        loop {
+            // Background work: only on spare budget, never ahead of appends.
+            self.limiter.wait_idle(pigeonhole_limits::LimitBudget::Delete).await;
+            let page = self.api.list(before, None, PAGE).await?;
+            let ours: Vec<&DcMessage> = page.iter().filter(|m| is_member(m)).collect();
+            if ours.is_empty() {
+                return Ok(());
+            }
+            for m in &ours {
+                self.remember(m);
+            }
+            let ids: Vec<u64> = ours.iter().map(|m| m.id).collect();
+            self.api.delete_messages(&ids).await?;
+            tracing::debug!(store = %self.instance().id, below = below.message_id, deleted = ids.len(), "pruned");
+            self.retire_links(&ids).await?;
+            match page.first() {
+                Some(m) if page.len() == PAGE => before = Some(m.id),
+                _ => return Ok(()),
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl<A: DiscordApi> LeaseChain for DiscordBlobStore<A> {
     /// A snowflake's millisecond timestamp.
-    fn stamp_ms(&self, id: &DiscordId) -> Option<u64> {
-        Some(crate::client::snowflake_timestamp_ms(id.message_id))
+    fn stamp_ms(&self, id: &DiscordId) -> u64 {
+        crate::client::snowflake_timestamp_ms(id.message_id)
     }
 
     /// Named like a member (`<label>~<prev>.bin`), so pruned like one, but
@@ -291,32 +320,6 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
             match page.last() {
                 Some(m) if page.len() == PAGE => after = m.id,
                 _ => return Ok(out),
-            }
-        }
-    }
-
-    /// Our messages below `below` (not the anchor), walking down until a page
-    /// holds none of ours, and their links but the one into `below`.
-    async fn prune(&self, below: &DiscordId) -> Result<()> {
-        let mut before = Some(below.message_id);
-        loop {
-            // Background work: only on spare budget, never ahead of appends.
-            self.limiter.wait_idle(pigeonhole_blob::LimitBudget::Delete).await;
-            let page = self.api.list(before, None, PAGE).await?;
-            let ours: Vec<&DcMessage> = page.iter().filter(|m| is_member(m)).collect();
-            if ours.is_empty() {
-                return Ok(());
-            }
-            for m in &ours {
-                self.remember(m);
-            }
-            let ids: Vec<u64> = ours.iter().map(|m| m.id).collect();
-            self.api.delete_messages(&ids).await?;
-            tracing::debug!(store = %self.instance().id, below = below.message_id, deleted = ids.len(), "pruned");
-            self.retire_links(&ids).await?;
-            match page.first() {
-                Some(m) if page.len() == PAGE => before = Some(m.id),
-                _ => return Ok(()),
             }
         }
     }

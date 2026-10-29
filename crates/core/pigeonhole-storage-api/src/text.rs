@@ -11,11 +11,6 @@
 
 use bytes::Bytes;
 
-/// Characters in a Telegram text message.
-pub const TELEGRAM_MAX_CHARS: usize = 4096;
-/// Characters in a Discord message's content.
-pub const DISCORD_MAX_CHARS: usize = 2000;
-
 const BASE: u32 = 0x20000;
 const BITS: u32 = 15;
 
@@ -108,7 +103,7 @@ mod tests {
     #[test]
     fn the_limit_is_counted_in_characters() {
         let name = "ph-0123456789abcdef0123456789abcdef.bin";
-        for (limit, at_least) in [(TELEGRAM_MAX_CHARS, 7500), (DISCORD_MAX_CHARS, 3600)] {
+        for (limit, at_least) in [(4096, 7500), (2000, 3600)] {
             let mut max = 0;
             while fits(name, max + 1, limit) {
                 max += 1;
@@ -116,8 +111,8 @@ mod tests {
             assert!(max > at_least, "{limit}: {max}");
             assert!(encode(name, &vec![0xa5; max]).chars().count() <= limit);
         }
-        assert!(!fits(name, 0, TELEGRAM_MAX_CHARS), "empty blobs are refused anyway");
-        assert!(!fits("a name", 10, TELEGRAM_MAX_CHARS), "a name with a space");
+        assert!(!fits(name, 0, 4096), "empty blobs are refused anyway");
+        assert!(!fits("a name", 10, 4096), "a name with a space");
     }
 
     #[test]

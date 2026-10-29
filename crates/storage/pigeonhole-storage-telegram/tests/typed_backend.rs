@@ -1,10 +1,10 @@
 //! The MTProto blob backend on a fake channel.
 
 use bytes::Bytes;
-use pigeonhole_blob::{
-    collect_stream, BlobBackend, BlobId, ChatLimiter, ChatLimiterConfig, InstanceInfo, InstanceKind, InstanceRole,
-    Sweepable,
+use pigeonhole_storage_api::{
+    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole,
 };
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_storage_telegram::fake::FakeChannel;
 use pigeonhole_storage_telegram::{TelegramBlobStore, TelegramId, WINDOW};
 use std::sync::Arc;
@@ -24,7 +24,7 @@ fn store_on(channel: Arc<FakeChannel>) -> (Arc<FakeChannel>, TelegramBlobStore<F
     }));
     let info = InstanceInfo {
         id: "tgm".into(),
-        kind: InstanceKind::Telegram,
+        kind: pigeonhole_storage_telegram::KIND,
         fingerprint: "tg:1:77".into(),
         location: "tg:chat:-10077".into(),
         role: InstanceRole::ReadWrite,
@@ -112,7 +112,8 @@ async fn deletes_in_batches_of_100() {
     store.delete(&keys).await.unwrap();
     assert!(channel.message_ids().is_empty());
     assert_eq!(channel.calls().delete_messages, 2);
-    assert!(store.get(&TelegramId { message_id: keys[0] }, None).await.is_err());
+    let gone = store.get(&TelegramId { message_id: keys[0] }, None).await;
+    assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound);
 }
 
 /// Blobs that fit a text message go as text: no upload, and a reader of

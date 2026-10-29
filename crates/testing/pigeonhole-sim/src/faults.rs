@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
     After, BackendLimits, BlobBackend, BoxByteStream, ByteRange, Chain, CostHint, InstanceInfo, Linked, MakeAfter,
-    OpKind, RateLimited, Sweepable,
+    OpKind, RateLimited,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -289,10 +289,7 @@ impl<B: BlobBackend> BlobBackend for Faulty<B> {
             _ => self.inner.delete(keys).await,
         }
     }
-}
 
-#[async_trait]
-impl<B: Sweepable> Sweepable for Faulty<B> {
     async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
         self.before(LIST, "candidates", READ_FAULTS).await?;
         self.inner.candidates(after, upto, limit).await

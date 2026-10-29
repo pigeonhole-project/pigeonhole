@@ -17,8 +17,11 @@ bytes = { workspace = true }
 dotenvy = { workspace = true }
 http = { workspace = true }
 s3s = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 pigeonhole-blob = { workspace = true }
+pigeonhole-limits = { workspace = true }
 pigeonhole-types = { workspace = true }
 pigeonhole-codec = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
@@ -56,6 +59,7 @@ futures = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 pigeonhole-blob = { workspace = true }
+pigeonhole-limits = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
 pigeonhole-codec = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }

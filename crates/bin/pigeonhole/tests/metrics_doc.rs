@@ -13,7 +13,7 @@ const END: &str = "<!-- metrics:end -->";
 const BUCKETED: &[&str] = &["_seconds", "_ratio", "_per_chunk", "_per_entry"];
 
 fn table() -> String {
-    let crates = ["pigeonhole-blob", "pigeonhole-meta", "pigeonhole (binary)"];
+    let crates = ["pigeonhole-blob", "pigeonhole-limits", "pigeonhole-meta", "pigeonhole (binary)"];
     let mut out = String::new();
     for (name, docs) in crates.iter().zip(pigeonhole::metric_docs()) {
         out.push_str(&format!("\n### {name}\n\n| Metric | Kind | Labels | Meaning |\n|---|---|---|---|\n"));

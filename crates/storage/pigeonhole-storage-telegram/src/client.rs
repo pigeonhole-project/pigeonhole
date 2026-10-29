@@ -15,7 +15,8 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use grammers_mtsender::{ConnectionParams, InvocationError, NoRetries, SenderPool, SenderPoolHandle};
 use grammers_tl_types::{self as tl, enums, functions, types};
-use pigeonhole_blob::{ChatLimiter, RateLimited};
+use pigeonhole_storage_api::{RateLimited, Unavailable};
+use pigeonhole_limits::ChatLimiter;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -314,7 +315,7 @@ where
         };
         let wait = match classify(&err) {
             Failure::Flood(wait) => {
-                pigeonhole_blob::record_throttle("telegram", what, wait);
+                pigeonhole_limits::record_throttle("telegram", what, wait);
                 if let Some(penalize) = penalize {
                     penalize(wait);
                 }
@@ -327,7 +328,8 @@ where
                 let wait = backoff;
                 backoff = (backoff * 2).min(Duration::from_secs(16));
                 if tokio::time::Instant::now() + wait >= deadline {
-                    return Err(anyhow!("{what}: {err} (still failing after {budget:?})"));
+                    return Err(anyhow::Error::new(Unavailable(what.to_string()))
+                        .context(format!("{what}: {err} (still failing after {budget:?})")));
                 }
                 wait
             }
@@ -744,7 +746,7 @@ mod abandoned_send_live {
             session: root.join(".cache/tgm-live.session"),
         };
         let tg = TelegramMtproto::connect(&cfg).await.unwrap();
-        let limiter = Arc::new(ChatLimiter::new(pigeonhole_blob::ChatLimiterConfig::default()));
+        let limiter = Arc::new(ChatLimiter::new(pigeonhole_limits::ChatLimiterConfig::default()));
         let ch = tg.channel(env("TG_BLOBS_CHAT_ID").parse().unwrap(), Lane::Blobs, limiter).await.unwrap();
 
         let probe_name = format!("abandoned-{}.bin", random_i64().unsigned_abs());

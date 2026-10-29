@@ -1,15 +1,16 @@
-//! [`BlobBackend`] + [`Sweepable`] over one channel.
+//! [`BlobBackend`] over one channel.
 
 use crate::api::{CdnStale, DcMessage, DiscordApi, PAGE};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lru::LruCache;
-use pigeonhole_blob::text::{self, DISCORD_MAX_CHARS};
-use pigeonhole_blob::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget,
-    OpKind, Sweepable,
+use crate::api::CONTENT_MAX_CHARS;
+use pigeonhole_storage_api::text;
+use pigeonhole_storage_api::{
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
 };
+use pigeonhole_limits::{ChatLimiter, LimitBudget};
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
@@ -36,7 +37,7 @@ pub fn discord_location(channel_id: &str) -> String {
 const LOCATION_CACHE: usize = 4096;
 
 /// Where a blob's bytes are: an attachment, or the bytes themselves (a text
-/// message, [`pigeonhole_blob::text`]).
+/// message, [`pigeonhole_storage_api::text`]).
 #[derive(Clone)]
 pub(crate) enum Located {
     Cdn { url: String, size: u64 },
@@ -144,7 +145,7 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
 
     /// Post blob `name` as text if it fits, else as an attachment; the message.
     pub(crate) async fn post_blob(&self, name: &str, data: Bytes, nonce: &str) -> Result<DcMessage> {
-        let (bytes, as_text) = (data.len(), self.inline && text::fits(name, data.len(), DISCORD_MAX_CHARS));
+        let (bytes, as_text) = (data.len(), self.inline && text::fits(name, data.len(), CONTENT_MAX_CHARS));
         let m = if as_text {
             self.api.send(&text::encode(name, &data), None, nonce).await?
         } else {
@@ -179,7 +180,7 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
                 return Ok(l.clone());
             }
         }
-        let m = self.api.get_message(id).await?.with_context(|| format!("blob message {id} is gone"))?;
+        let Some(m) = self.api.get_message(id).await? else { return Err(NotFound(format!("blob message {id}")).into()) };
         let l = Located::of(&m).with_context(|| format!("message {id} is not a blob"))?;
         self.locations.lock().unwrap().put(id, l.clone());
         Ok(l)
@@ -270,10 +271,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
         // Chain members (a removed snapshot): their links go too.
         self.retire_links(keys).await
     }
-}
 
-#[async_trait]
-impl<A: DiscordApi> Sweepable for DiscordBlobStore<A> {
     /// Our blobs (attachments or texts named by a [`BlobId`]) with ids in
     /// `(after, upto]`, listed 100 at a time; nothing else is a candidate.
     async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
@@ -300,3 +298,4 @@ impl<A: DiscordApi> Sweepable for DiscordBlobStore<A> {
         Ok(out)
     }
 }
+

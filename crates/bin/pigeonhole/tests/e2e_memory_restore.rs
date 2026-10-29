@@ -11,7 +11,7 @@ use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_blob::{
-    erase_sweep, CheapestFirst, Replicated, SharedBackend,
+    erase, CheapestFirst, Replicated, SharedBackend,
 };
 use pigeonhole_meta::{MetaOptions, MetaStore, Namespaces};
 use s3s::dto::*;
@@ -56,10 +56,10 @@ async fn open_with_shared_mem(
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
 
-    let backend: SharedBackend = Arc::new(erase_sweep(mem));
+    let backend: SharedBackend = Arc::new(erase(mem));
     let rep = Arc::new(Replicated::new(vec![backend], 1, Arc::new(CheapestFirst::new())).unwrap());
     let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
-    build_s3_gateway(cfg, index, store)
+    build_s3_gateway(cfg.s3_options(), index, store)
 }
 
 #[tokio::test]
@@ -127,10 +127,10 @@ async fn open_snapshotting(dir: &Path, mem: Arc<MemoryBlobStore>) -> (pigeonhole
     let db = BlobDb::open(meta.clone()).await.unwrap();
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
-    let backend: SharedBackend = Arc::new(erase_sweep(mem));
+    let backend: SharedBackend = Arc::new(erase(mem));
     let rep = Arc::new(Replicated::new(vec![backend], 1, Arc::new(CheapestFirst::new())).unwrap());
     let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
-    (build_s3_gateway(cfg, index, store), meta)
+    (build_s3_gateway(cfg.s3_options(), index, store), meta)
 }
 
 #[tokio::test]
