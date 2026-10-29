@@ -75,8 +75,8 @@ disappears under a put. `S3State::VERSION` 3.
 - Gateway (`tests/s3_api.rs`): each row of the table through s3s; a rejected
   put leaves no chunk referenced.
 - Race: N concurrent `If-None-Match: *` puts of one key, exactly one wins.
-- T4 against a local pigeonhole: its conditional-write probe passes, and
-  `etcdctl put/get/txn` round-trips (live, not in CI).
+- T4 against a local pigeonhole: leader election, `etcdctl put/get/txn`,
+  takeover after a leader is killed (live, not in CI; below).
 
 ## Live: T4 on pigeonhole (2026-10-29)
 
