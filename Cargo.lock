@@ -2649,12 +2649,16 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "http",
  "madsim",
  "madsim-tokio",
  "pigeonhole-blob",
+ "pigeonhole-chunk-store",
+ "pigeonhole-gateway-s3",
  "pigeonhole-meta",
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
+ "s3s",
  "serde",
 ]
 
