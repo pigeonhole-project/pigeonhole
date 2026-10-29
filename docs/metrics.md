@@ -74,7 +74,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 
 | Metric | Kind | Labels | Meaning |
 |---|---|---|---|
-| `pigeonhole_gateway_request_duration_seconds` | histogram | `gateway`, `op`, `outcome` | Gateway request time to response headers; op is the S3 operation (unknown: routing or auth failed first) |
+| `pigeonhole_gateway_request_duration_seconds` | histogram | `gateway`, `op`, `outcome` | Gateway request time to response headers; op is the S3 operation (unknown: routing or auth failed first), outcome ok / client_error / server_error / cancelled (the client went away first) |
 | `pigeonhole_bytes_from_clients_total` | counter | `gateway`, `op` | Request body bytes received from gateway clients |
 | `pigeonhole_bytes_to_clients_total` | counter | `gateway`, `op` | Response body bytes sent to gateway clients |
 | `pigeonhole_instance_call_duration_seconds` | histogram | `instance`, `op`, `outcome` | Backend call duration (get: until the stream starts) |

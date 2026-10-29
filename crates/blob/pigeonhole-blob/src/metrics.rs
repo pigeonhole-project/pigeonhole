@@ -19,7 +19,7 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::histogram(
         "pigeonhole_gateway_request_duration_seconds",
         &["gateway", "op", "outcome"],
-        "Gateway request time to response headers; op is the S3 operation (unknown: routing or auth failed first)",
+        "Gateway request time to response headers; op is the S3 operation (unknown: routing or auth failed first), outcome ok / client_error / server_error / cancelled (the client went away first)",
     ),
     MetricDoc::counter("pigeonhole_bytes_from_clients_total", &["gateway", "op"], "Request body bytes received from gateway clients"),
     MetricDoc::counter("pigeonhole_bytes_to_clients_total", &["gateway", "op"], "Response body bytes sent to gateway clients"),

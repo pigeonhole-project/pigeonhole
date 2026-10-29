@@ -62,3 +62,38 @@ fn head_sends_no_bytes_and_ops_are_labelled() {
         .collect();
     assert!(ops.contains(&"HeadObject".to_string()) && ops.contains(&"GetObject".to_string()), "{ops:?}");
 }
+
+/// A request the client gives up on still counts, as `cancelled`.
+#[test]
+fn abandoned_requests_count_as_cancelled() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let app = Router::new()
+                .route(
+                    "/{*key}",
+                    any(|req: Request| async move {
+                        let _ = req.extensions().get::<S3OpSlot>().unwrap().0.set("CreateBucket".into());
+                        std::future::pending::<Response>().await
+                    }),
+                )
+                .layer(axum::middleware::from_fn(|req, next| track_gateway("s3", req, next)));
+            let req = Request::builder().method(Method::PUT).uri("/b").body(Body::empty()).unwrap();
+            let gave_up = tokio::time::timeout(std::time::Duration::from_millis(20), app.oneshot(req)).await;
+            assert!(gave_up.is_err());
+        });
+    });
+    let outcomes: Vec<(String, String)> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| k.key().name() == "pigeonhole_gateway_request_duration_seconds")
+        .map(|(k, ..)| {
+            let label = |n: &str| k.key().labels().find(|l| l.key() == n).map(|l| l.value().to_owned()).unwrap_or_default();
+            (label("op"), label("outcome"))
+        })
+        .collect();
+    assert_eq!(outcomes, vec![("CreateBucket".to_string(), "cancelled".to_string())]);
+}

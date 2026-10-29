@@ -4,12 +4,14 @@
 # DELETE. Ctrl-C to stop.
 #
 #   ENDPOINT=http://127.0.0.1:8333 ./scripts/metrics-load.sh
+#   LOAD_PAUSE=10 …    # seconds between iterations (a chat store's rate limits)
 
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENDPOINT="${ENDPOINT:-http://127.0.0.1:8333}"
 BUCKET="${BUCKET:-demo}"
+PAUSE="${LOAD_PAUSE:-0}"
 if [[ -f "$ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -22,8 +24,10 @@ export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 export AWS_EC2_METADATA_DISABLED=true
 command -v aws >/dev/null || { echo "missing dependency: aws (brew install awscli)" >&2; exit 1; }
 
-s3() { aws --endpoint-url "$ENDPOINT" --no-cli-pager s3 "$@" >/dev/null 2>&1; }
-api() { aws --endpoint-url "$ENDPOINT" --no-cli-pager s3api "$@" >/dev/null 2>&1; }
+# A chat store's log commits in seconds, more when rate limited: wait long.
+AWS=(aws --endpoint-url "$ENDPOINT" --no-cli-pager --cli-read-timeout 300)
+s3() { "${AWS[@]}" s3 "$@" >/dev/null 2>&1; }
+api() { "${AWS[@]}" s3api "$@" >/dev/null 2>&1; }
 
 D="$(mktemp -d)"
 trap 'rm -rf "$D"' EXIT
@@ -32,7 +36,10 @@ dd if=/dev/urandom of="$D/mid" bs=1m count=2 status=none
 dd if=/dev/urandom of="$D/big" bs=1m count=24 status=none     # multipart, several chunks
 yes "pigeonhole compressible line" | head -c 8388608 >"$D/text"   # zstd-friendly
 
-api create-bucket --bucket "$BUCKET"
+until api head-bucket --bucket "$BUCKET" || api create-bucket --bucket "$BUCKET"; do
+  echo "creating bucket $BUCKET failed; retrying" >&2
+  sleep 5
+done
 i=0
 while true; do
   i=$((i + 1))
@@ -49,4 +56,5 @@ while true; do
   api head-object --bucket "$BUCKET" --key "missing-$i"
   (( i % 7 == 0 )) && s3 rm "s3://$BUCKET/small-$((RANDOM % 20))"
   echo "iteration $i"
+  sleep "$PAUSE"
 done

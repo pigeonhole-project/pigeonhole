@@ -16,23 +16,38 @@ use std::time::Instant;
 /// the body bytes that actually crossed the wire each way (a HEAD sends none,
 /// whatever its `Content-Length` says; an aborted download counts what left).
 pub async fn track_gateway(gateway: &'static str, req: Request, next: Next) -> Response {
-    let t0 = Instant::now();
     let slot = S3OpSlot::default();
     let (mut parts, body) = req.into_parts();
     parts.extensions.insert(slot.clone());
     let body = Body::new(CountingBody::new(body, gateway, slot.clone(), Direction::FromClient));
+    // Dropped unanswered (the client went away): recorded as `cancelled`.
+    let mut pending = Pending { gateway, slot: slot.clone(), t0: Instant::now(), outcome: "cancelled" };
     let resp = next.run(Request::from_parts(parts, body)).await;
     let status = resp.status().as_u16();
-    let outcome = if status < 400 {
+    pending.outcome = if status < 400 {
         "ok"
     } else if status < 500 {
         "client_error"
     } else {
         "server_error"
     };
-    record_gateway_request(gateway, op_of(&slot), outcome, t0.elapsed());
+    drop(pending);
     let (parts, body) = resp.into_parts();
     Response::from_parts(parts, Body::new(CountingBody::new(body, gateway, slot, Direction::ToClient)))
+}
+
+/// Records a request's duration and outcome when dropped.
+struct Pending {
+    gateway: &'static str,
+    slot: S3OpSlot,
+    t0: Instant,
+    outcome: &'static str,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        record_gateway_request(self.gateway, op_of(&self.slot), self.outcome, self.t0.elapsed());
+    }
 }
 
 /// The operation s3s routed the request to, or `unknown` (bad route or auth).
