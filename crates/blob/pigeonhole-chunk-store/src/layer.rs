@@ -586,98 +586,25 @@ impl ChunkStore {
     where
         S: futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
     {
-        let chunk_logical = opts
-            .chunk_size
-            .clamp(1024, pigeonhole_codec::MAX_LOGICAL_CHUNK);
-        let block_size = opts.block_size.max(1024).min(chunk_logical);
-        let calls = opts
-            .compress_calls
-            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-        let budget = opts.memory_budget;
-
         let mut md5 = Md5::new();
         let mut crc = crc32fast::Hasher::new();
-        let mut extents = Vec::new();
-        let mut pending = PendingChunks::default();
         let mut total = 0i64;
-
-        let mut block_buf = Vec::with_capacity(block_size);
-        let mut block_permit: Option<pigeonhole_codec::BudgetPermit> = None;
-        let mut open = OpenChunk::new(self.replicated.chunk_writer());
-
+        let mut feeder = BlockFeeder::new(self, opts);
         while let Some(item) = stream.next().await {
-            let chunk = item?;
-            if chunk.is_empty() {
-                continue;
-            }
-            md5.update(&chunk);
-            crc.update(&chunk);
-            total += chunk.len() as i64;
-            let mut rest = chunk.as_ref();
-            while !rest.is_empty() {
-                if block_buf.is_empty() {
-                    if let Some(b) = &budget {
-                        // Seal chunk under pressure so open-part + block budget can free.
-                        if b.available_permits() < block_size && open.logical > 0 {
-                            extents.push(
-                                self.seal_open_chunk(&mut open, &budget, &mut pending)
-                                    .await?,
-                            );
-                        }
-                        block_permit = Some(b.acquire(block_size).await?);
-                    }
-                }
-                let need = block_size - block_buf.len();
-                let take = need.min(rest.len());
-                block_buf.extend_from_slice(&rest[..take]);
-                rest = &rest[take..];
-                if block_buf.len() >= block_size {
-                    self.encode_push_block(
-                        &mut open,
-                        &mut block_buf,
-                        &mut block_permit,
-                        opts.codec,
-                        &calls,
-                        &budget,
-                    )
-                    .await?;
-                    if open.logical >= chunk_logical as i64 {
-                        extents.push(self.seal_open_chunk(&mut open, &budget, &mut pending).await?);
-                    }
-                }
-            }
+            let bytes = item?;
+            md5.update(&bytes);
+            crc.update(&bytes);
+            total += bytes.len() as i64;
+            feeder.feed(&bytes).await?;
         }
+        let (extents, pending) = feeder.finish().await?;
 
-        if !block_buf.is_empty() {
-            self.encode_push_block(
-                &mut open,
-                &mut block_buf,
-                &mut block_permit,
-                opts.codec,
-                &calls,
-                &budget,
-            )
-            .await?;
-        }
-        if open.logical > 0 || !open.blocks.is_empty() {
-            extents.push(self.seal_open_chunk(&mut open, &budget, &mut pending).await?);
-        }
-
-        let digest = md5.finalize();
-        let mut md5_bytes = [0u8; 16];
-        md5_bytes.copy_from_slice(&digest);
+        let md5: [u8; 16] = md5.finalize().into();
         let crc32 = crc.finalize();
         let mut checksums = BTreeMap::new();
-        checksums.insert("md5".into(), hex::encode(md5_bytes));
+        checksums.insert("md5".into(), hex::encode(md5));
         checksums.insert("crc32".into(), format!("{crc32:08x}"));
-        Ok(Ingested {
-            extents,
-            size: total,
-            md5: md5_bytes,
-            crc32,
-            checksums,
-            chunks: pending,
-        })
+        Ok(Ingested { extents, size: total, md5, crc32, checksums, chunks: pending })
     }
 
     async fn encode_push_block(
@@ -687,7 +614,6 @@ impl ChunkStore {
         block_permit: &mut Option<pigeonhole_codec::BudgetPermit>,
         codec: ChunkCodec,
         calls: &Arc<AtomicU64>,
-        budget: &Option<ByteBudget>,
     ) -> Result<()> {
         let logical = std::mem::take(block_buf);
         let logical_len = logical.len();
@@ -703,16 +629,6 @@ impl ChunkStore {
         .await
         .context("spawn_blocking encode")??;
         pigeonhole_blob::record_compression_ratio(stored.len(), logical_len);
-
-        // Memory budget: hold open parts of all members + this block until pushed.
-        if let Some(b) = budget {
-            let open_parts = open.writer.open_part_bytes();
-            let need = open_parts.saturating_add(stored.len());
-            if need > 0 && b.available_permits() < need {
-                // Best-effort: acquire what we can for accounting; parts already uploaded
-                // free their buffers inside PartPacker.
-            }
-        }
 
         let block_no = open.blocks.len() as i64;
         let logical_off = open.logical;
@@ -745,7 +661,6 @@ impl ChunkStore {
     async fn seal_open_chunk(
         &self,
         open: &mut OpenChunk,
-        _budget: &Option<ByteBudget>,
         pending: &mut PendingChunks,
     ) -> Result<Extent> {
         let blocks = std::mem::take(&mut open.blocks);
@@ -778,6 +693,96 @@ impl ChunkStore {
             offset: 0,
             len: logical,
         })
+    }
+}
+
+/// Cuts a stream into blocks and the blocks into chunks as the bytes come,
+/// within the memory budget.
+struct BlockFeeder<'a> {
+    store: &'a ChunkStore,
+    chunk_logical: i64,
+    block_size: usize,
+    codec: ChunkCodec,
+    calls: Arc<AtomicU64>,
+    budget: Option<ByteBudget>,
+    /// The block being filled, and the memory it holds.
+    block: Vec<u8>,
+    permit: Option<pigeonhole_codec::BudgetPermit>,
+    open: OpenChunk,
+    extents: Vec<Extent>,
+    pending: PendingChunks,
+}
+
+impl<'a> BlockFeeder<'a> {
+    fn new(store: &'a ChunkStore, opts: IngestOptions) -> Self {
+        let chunk_logical = opts.chunk_size.clamp(1024, pigeonhole_codec::MAX_LOGICAL_CHUNK);
+        let block_size = opts.block_size.max(1024).min(chunk_logical);
+        Self {
+            store,
+            chunk_logical: chunk_logical as i64,
+            block_size,
+            codec: opts.codec,
+            calls: opts.compress_calls.unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
+            budget: opts.memory_budget,
+            block: Vec::with_capacity(block_size),
+            permit: None,
+            open: OpenChunk::new(store.replicated.chunk_writer()),
+            extents: Vec::new(),
+            pending: PendingChunks::default(),
+        }
+    }
+
+    async fn feed(&mut self, mut rest: &[u8]) -> Result<()> {
+        while !rest.is_empty() {
+            if self.block.is_empty() {
+                self.reserve_block().await?;
+            }
+            let take = (self.block_size - self.block.len()).min(rest.len());
+            self.block.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.block.len() >= self.block_size {
+                self.push_block().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Memory for the next block. Under pressure the open chunk is sealed
+    /// first, so its parts can upload and free theirs.
+    async fn reserve_block(&mut self) -> Result<()> {
+        let Some(budget) = self.budget.clone() else { return Ok(()) };
+        if budget.available_permits() < self.block_size && self.open.logical > 0 {
+            self.seal().await?;
+        }
+        self.permit = Some(budget.acquire(self.block_size).await?);
+        Ok(())
+    }
+
+    async fn push_block(&mut self) -> Result<()> {
+        self.store
+            .encode_push_block(&mut self.open, &mut self.block, &mut self.permit, self.codec, &self.calls)
+            .await?;
+        if self.open.logical >= self.chunk_logical {
+            self.seal().await?;
+        }
+        Ok(())
+    }
+
+    async fn seal(&mut self) -> Result<()> {
+        let extent = self.store.seal_open_chunk(&mut self.open, &mut self.pending).await?;
+        self.extents.push(extent);
+        Ok(())
+    }
+
+    /// The last block and chunk: every extent, and the chunks to commit.
+    async fn finish(mut self) -> Result<(Vec<Extent>, PendingChunks)> {
+        if !self.block.is_empty() {
+            self.push_block().await?;
+        }
+        if self.open.logical > 0 || !self.open.blocks.is_empty() {
+            self.seal().await?;
+        }
+        Ok((self.extents, self.pending))
     }
 }
 
