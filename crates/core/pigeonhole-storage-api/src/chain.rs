@@ -75,6 +75,28 @@ pub trait Chain: BlobBackend {
         }
         anyhow::bail!("{label}: lost the link {PUT_AFTER_TAIL_ATTEMPTS} times in a row; the chain does not settle")
     }
+
+    /// Put a blob that needs no order but "the newest of its kind"
+    /// ([`Self::newest_loose`]): snapshots. The default links it into the
+    /// chain (a store that cannot list finds the newest blob only by
+    /// following links); a store that can list should put it plainly, since
+    /// a link may cost a rate-limited call (a Discord thread).
+    async fn put_loose(&self, label: &str, data: Bytes) -> Result<Self::Id> {
+        for _ in 0..PUT_AFTER_TAIL_ATTEMPTS {
+            let tail = self.tail().await?;
+            match self.put_after(tail.as_ref().map(|t| &t.id), label, data.clone()).await? {
+                After::Won(id) => return Ok(id),
+                After::Lost(_) => continue,
+            }
+        }
+        anyhow::bail!("{label}: lost the link {PUT_AFTER_TAIL_ATTEMPTS} times in a row; the chain does not settle")
+    }
+
+    /// The newest blob [`Self::put_loose`] put with a label starting with
+    /// `prefix`. The default: the chain's tail, if its label matches.
+    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
+        Ok(self.tail().await?.filter(|t| t.label.starts_with(prefix)))
+    }
 }
 
 /// Tries of the default [`Chain::put_after_tail`] before it gives up.
@@ -96,6 +118,12 @@ impl<C: Chain> Chain for std::sync::Arc<C> {
     }
     async fn prune(&self, below: &Self::Id) -> Result<()> {
         (**self).prune(below).await
+    }
+    async fn put_loose(&self, label: &str, data: Bytes) -> Result<Self::Id> {
+        (**self).put_loose(label, data).await
+    }
+    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
+        (**self).newest_loose(prefix).await
     }
     async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
         (**self).put_after_tail(label, make).await

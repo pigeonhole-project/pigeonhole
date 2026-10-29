@@ -226,3 +226,23 @@ async fn links_are_archived_off_the_appends_path() {
     }
     panic!("archived {} of {links} links", channel.calls().archive_thread);
 }
+
+/// A snapshot is a plain message: no thread (the pacer would hold it), and
+/// the newest is found by listing the channel.
+#[tokio::test]
+async fn snapshots_are_plain_messages_found_by_listing() {
+    let channel = Arc::new(FakeDiscord::new(79));
+    let snaps = BlobSnapshotStore::new(channel_store(&channel));
+    let snap = |log: u128, at| pigeonhole_meta::StoredSnapshot {
+        log_id: pigeonhole_meta::LogId(log),
+        at,
+        data: vec![at as u8; 10],
+    };
+    snaps.put(&snap(1, 10)).await.unwrap();
+    let second = snaps.put(&snap(1, 20)).await.unwrap();
+    assert!(channel.thread_ids().is_empty(), "snapshots start no threads: {:?}", channel.thread_ids());
+    let fresh = BlobSnapshotStore::new(channel_store(&channel));
+    assert_eq!(fresh.newest().await.unwrap(), Some(snap(1, 20)));
+    fresh.remove(&second).await.unwrap();
+    assert_eq!(fresh.newest().await.unwrap(), Some(snap(1, 10)));
+}

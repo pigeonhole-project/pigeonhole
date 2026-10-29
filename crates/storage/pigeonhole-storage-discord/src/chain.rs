@@ -233,6 +233,34 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
         self.link_of(id.message_id).await
     }
 
+    /// A plain message: a channel lists, so the newest is found without a
+    /// link (whose thread the pacer would hold for seconds).
+    async fn put_loose(&self, label: &str, data: Bytes) -> Result<DiscordId> {
+        if label.contains(['~', ' ']) {
+            bail!("a loose label may not contain '~' or spaces: {label:?}");
+        }
+        let m = self.post_blob(label, data, &Self::nonce()).await?;
+        Ok(DiscordId { message_id: m.id })
+    }
+
+    /// The newest message whose name starts with `prefix`, loose or linked.
+    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<DiscordId>>> {
+        let mut before = None;
+        loop {
+            let page = self.api.list(before, None, PAGE).await?;
+            for m in page.iter().rev() {
+                let Some(name) = blob_name(m).filter(|n| n.starts_with(prefix)) else { continue };
+                let label = label_of(name).unwrap_or(name).to_string();
+                self.remember(m);
+                return Ok(Some(Linked { id: DiscordId { message_id: m.id }, label }));
+            }
+            match page.first() {
+                Some(m) if page.len() == PAGE => before = Some(m.id),
+                _ => return Ok(None),
+            }
+        }
+    }
+
     /// Our messages below `below` (not the anchor), walking down until a page
     /// holds none of ours, and their links but the one into `below`.
     async fn prune(&self, below: &DiscordId) -> Result<()> {

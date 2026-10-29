@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use bytes::Bytes;
-use pigeonhole_storage_api::{collect_stream, After, BlobBackend, Chain};
+use pigeonhole_storage_api::{collect_stream, BlobBackend, Chain};
 
 /// Version of the stored envelope ([`StoredSnapshot`] on disk / in a chat).
 pub const SNAPSHOT_STORE_FORMAT: u32 = 1;
@@ -73,12 +73,13 @@ pub trait SnapshotStore: Send + Sync + 'static {
     async fn remove(&self, r: &SnapshotRef) -> Result<()>;
 }
 
-/// Tries of a put that keeps losing its link to another writer.
-const PUT_ATTEMPTS: usize = 16;
+/// Labels of snapshot blobs: `snapshot-<log id>-<at>.snap`.
+const SNAPSHOT_PREFIX: &str = "snapshot-";
 
-/// Snapshots as blobs of any store that can chain them ([`Chain`]): no
-/// order or fence is needed (a snapshot counts only while the log's base
-/// names it), the chain only tells which one is newest. The ref is the blob
+/// Snapshots as blobs of a [`Chain`] store: no order or fence is needed (a
+/// snapshot counts only while the log's base names it); only a lossy
+/// restore asks which one is newest ([`Chain::newest_loose`]: by listing
+/// where the store can, else by the chain). The ref is the blob
 /// id (postcard, hex) and its crc, so a replaced blob is detected.
 pub struct BlobSnapshotStore<C> {
     chain: Arc<C>,
@@ -120,17 +121,9 @@ impl<C: Chain> SnapshotStore for BlobSnapshotStore<C> {
     async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
         let data = Bytes::from(snapshot.encode());
         let crc = crc32fast::hash(&data);
-        let label = format!("snapshot-{}-{}.snap", snapshot.log_id, snapshot.at);
-        // Another writer may link first: put after the new tail then (a
-        // bounded number of times: a chain that never settles is a bug).
-        for _ in 0..PUT_ATTEMPTS {
-            let tail = self.chain.tail().await?;
-            match self.chain.put_after(tail.as_ref().map(|t| &t.id), &label, data.clone()).await? {
-                After::Won(id) => return Ok(Self::reference(&id, crc)),
-                After::Lost(_) => continue,
-            }
-        }
-        bail!("snapshot put lost its link {PUT_ATTEMPTS} times in a row: the store's chain does not settle")
+        let label = format!("{SNAPSHOT_PREFIX}{}-{}.snap", snapshot.log_id, snapshot.at);
+        let id = self.chain.put_loose(&label, data).await?;
+        Ok(Self::reference(&id, crc))
     }
 
     async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
@@ -142,9 +135,9 @@ impl<C: Chain> SnapshotStore for BlobSnapshotStore<C> {
         StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {:?}", r.0))
     }
 
-    /// The tail of the chain: the most recently stored snapshot.
+    /// The most recently stored snapshot.
     async fn newest(&self) -> Result<Option<StoredSnapshot>> {
-        let Some(tail) = self.chain.tail().await? else { return Ok(None) };
+        let Some(tail) = self.chain.newest_loose(SNAPSHOT_PREFIX).await? else { return Ok(None) };
         let data = self.download(&tail.id).await.with_context(|| format!("download snapshot {:?}", tail.label))?;
         Ok(Some(StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {:?}", tail.label))?))
     }
