@@ -158,6 +158,7 @@ async fn a_rebase_prunes_messages_and_their_links() {
     }
     let messages = channel.message_ids().len();
     a.rebase(1, Base { at: 3, term: 1, leader: 0, snapshot: SnapshotRef("s3".into()) }).await.unwrap();
+    a.settle().await; // the collection runs in the background
     assert!(channel.message_ids().contains(&foreign));
     assert!(channel.message_ids().len() < messages, "pruned");
     let alive = channel.message_ids();

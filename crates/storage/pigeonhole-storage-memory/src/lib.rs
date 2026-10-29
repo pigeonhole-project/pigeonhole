@@ -34,6 +34,9 @@ pub struct MemoryBlobStore {
     unavailable: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The chain ([`Chain`]): successor of each message (`None`: the start).
     chain: Mutex<ChainLinks>,
+    /// Deletes wait while [`Self::hold_deletes`]' guard lives (tests of
+    /// what must not wait for a delete).
+    delete_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Default)]
@@ -68,6 +71,7 @@ impl MemoryBlobStore {
             names: Mutex::new(HashMap::new()),
             unavailable: None,
             chain: Mutex::default(),
+            delete_gate: Arc::default(),
         }
     }
 
@@ -90,6 +94,11 @@ impl MemoryBlobStore {
     pub fn with_unavailable_flag(mut self) -> Self {
         self.unavailable = Some(Arc::new(AtomicBool::new(false)));
         self
+    }
+
+    /// Until the guard drops, every delete waits.
+    pub fn hold_deletes(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.delete_gate.clone().try_write_owned().expect("deletes held twice")
     }
 
     pub fn unavailable_flag(&self) -> Arc<AtomicBool> {
@@ -218,6 +227,7 @@ impl BlobBackend for MemoryBlobStore {
     }
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
+        let _gate = self.delete_gate.read().await;
         for &k in keys {
             let mut messages = self.messages.lock().unwrap();
             let Some(file_id) = messages.remove(&(k as i64)) else {

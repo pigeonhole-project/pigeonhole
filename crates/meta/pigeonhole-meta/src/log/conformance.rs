@@ -125,6 +125,7 @@ where
     log.append(1, &[entry(5)]).await.unwrap();
     log.append(1, &[entry(6)]).await.unwrap();
 
+    log.settle().await; // the collection may run in the background
     let again = open().await;
     let d = again.discover().await.unwrap().unwrap();
     assert_eq!(d.base, Some(base(4)));

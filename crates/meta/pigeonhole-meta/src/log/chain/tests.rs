@@ -99,12 +99,33 @@ async fn a_rebase_prunes_below_the_oldest_needed_blob() {
     let before = mem.message_keys().len();
     let base = Base { at: 3, term: 1, leader: 0, snapshot: crate::snapshot::SnapshotRef("s3".into()) };
     a.rebase(1, base).await.unwrap();
+    a.settle().await; // the collection runs in the background
     assert!(mem.message_keys().len() < before, "{:?}", mem.message_keys());
     a.append(1, &[entry(5)]).await.unwrap();
     let again = store(&mem);
     let d = again.discover().await.unwrap().unwrap();
     let got = again.read(3, d.head).try_collect::<Vec<_>>().await.unwrap();
     assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![4, 5]);
+}
+
+/// A rebase returns once the base is written; the collection behind it
+/// does not hold the writer (on a chat it deletes for minutes).
+#[tokio::test]
+async fn a_rebase_does_not_wait_for_its_collection() {
+    let mem = Arc::new(MemoryBlobStore::new());
+    let a = store(&mem);
+    a.claim(1).await.unwrap();
+    for i in 1..=4 {
+        a.append(1, &[entry(i)]).await.unwrap();
+    }
+    let gate = mem.hold_deletes();
+    let base = Base { at: 3, term: 1, leader: 0, snapshot: crate::snapshot::SnapshotRef("s3".into()) };
+    tokio::time::timeout(std::time::Duration::from_secs(5), a.rebase(1, base)).await.expect("rebase waited for its prune").unwrap();
+    a.append(1, &[entry(5)]).await.unwrap();
+    drop(gate);
+    a.settle().await;
+    let d = store(&mem).discover().await.unwrap().unwrap();
+    assert_eq!(d.head.position, 5);
 }
 
 /// The registers travel with every blob: the tail alone answers discover.

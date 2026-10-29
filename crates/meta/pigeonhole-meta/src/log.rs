@@ -207,4 +207,8 @@ pub trait LogStore: Send + Sync + 'static {
     /// entries ≤ `base.at` (collect). `base.at` may be past the head (a
     /// snapshot installed from elsewhere): the log is then empty up to it.
     async fn rebase(&self, gen: u64, base: Base) -> LogResult<()>;
+
+    /// Wait for background work (the collection after a rebase); tests use
+    /// it before looking at what a rebase dropped.
+    async fn settle(&self) {}
 }
