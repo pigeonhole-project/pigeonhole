@@ -1,8 +1,10 @@
 //! [`Faulty<B>`]: any store with faults injected (docs/fault-injection.md).
 //!
-//! Only faults the store contracts allow: a delay, a failure before the
+//! Faults the store contracts allow: a delay, a failure before the
 //! operation did anything, a failure after it did everything (an ambiguous
 //! put), a put that lands late after its caller got an error, a rate limit.
+//! One contract violation, off unless a plan asks for it: a damaged copy
+//! (`FaultPlan::corrupt`), which reads must detect.
 //! A run's faults come from its seed (the simulator's, under madsim), each
 //! one drawn from `(seed, operation, the operation's counter)`, so the n-th
 //! put of a store meets the same fault whatever the interleaving.

@@ -1,6 +1,7 @@
 # Deterministic simulation (madsim)
 
-Status: **proposal**; spike done (see Spike findings). Read [fault-injection.md](fault-injection.md) first: this
+Status: **implemented** (steps 0–5; scenarios 4 and 5 left); spike findings
+below. Read [fault-injection.md](fault-injection.md) first: this
 design takes its fault model and decorator and makes the rest of the run —
 task order, time, randomness, crashes — reproducible from one seed too.
 
@@ -153,6 +154,35 @@ replayed with `MADSIM_TEST_SEED`.
   seed. Separate `target` directory (`CARGO_TARGET_DIR=target/madsim`): the
   cfg flag rebuilds everything.
 
+## Running and replaying
+
+```bash
+make sim                                   # pigeonhole-sim under --cfg madsim
+MADSIM_TEST_NUM=50 MADSIM_TEST_CHECK_DETERMINISM=1 make sim
+MADSIM_TEST_SEED=1234 make sim             # replay the seed a failure printed
+make sim-all                               # every library's tests in the simulator
+```
+
+A failing run prints its seed; the same seed replays the same run, faults,
+timers and task order included. CI runs `make sim` with 50 seeds and the
+determinism check, and `make sim-all` with 3 seeds, on macOS (where madsim
+intercepts entropy).
+
+## Implementation
+
+- The disk store reaches files through `Fs` / `FsFile` (`io.rs`): `StdFs` in
+  production, `SimFs` in the simulation, an in-memory disk that keeps synced
+  and unsynced bytes apart. `SimFs::crash` drops what was not synced and may
+  keep a torn prefix of the last write; every sync costs virtual time, and
+  under `cfg(madsim)` every disk operation at least 1 ms, so a busy writer
+  lets the clock move.
+- openraft runs on `MadsimRuntime` (`pigeonhole-meta/src/sim_runtime.rs`).
+- Gated out under `cfg(madsim)`: the REAPI ephemeral server and its tests,
+  the binary, one test that builds its own runtime.
+- Scenarios 1–3 are in `crates/testing/pigeonhole-sim/tests` (`log_model`,
+  `takeover`, `disk`, `s3_stress`); processes are tasks on one node so far,
+  crashes are dropped handles plus `SimFs::crash`.
+
 ## Spike findings (2026-10-29, madsim 0.2.34, madsim-tokio 0.2.30, macOS arm64)
 
 Branch `madsim-spike` (throwaway): the workspace's `tokio` as
@@ -206,14 +236,14 @@ where entropy is intercepted, and add Linux with the patched `getrandom`.
    `MadsimRuntime` for openraft; one tablet test under `#[madsim::test]` with
    `MADSIM_TEST_CHECK_DETERMINISM`. Record what breaks (crates on plain tokio,
    `select!`, clocks, entropy, `spawn_blocking`, macOS) and decide.
-1. **madsim-tokio** for the workspace, the cfg gates, the CI job compiling
+1. ✅ **madsim-tokio** for the workspace, the cfg gates, the CI job compiling
    and running one scenario.
-2. **`SegmentIo`**: the disk store over `StdIo` (no behaviour change), then
+2. ✅ **`SegmentIo`** (built as `Fs`): the disk store over `StdIo` (no behaviour change), then
    `SimIo` with crashes and torn writes.
-3. **Determinism**: the clock facade, maps whose order matters, until the
+3. ✅ **Determinism**: the clock facade, maps whose order matters, until the
    determinism check passes on every scenario.
-4. **Scenarios 1–4**, with the faults of step 11 drawing from the simulator.
-5. **Docs**: how to run and replay a seed (README § Tests), what each
+4. ✅ **Scenarios 1–3** (4 left), with the faults of step 11 drawing from the simulator.
+5. ✅ **Docs**: how to run and replay a seed (README § Tests), what each
    scenario checks.
 
 ## Open questions

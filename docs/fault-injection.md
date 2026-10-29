@@ -1,6 +1,8 @@
 # Fault injection
 
-Status: **proposal** (roadmap step 11). Read [chain-log.md](chain-log.md)
+Status: **implemented** (roadmap step 11), together with
+[simulation.md](simulation.md); see Implementation for what was built and
+what is left. Read [chain-log.md](chain-log.md)
 (the `Chain` contract), [meta-backends.md](meta-backends.md) (the `LogStore`
 contract) and [sweep-invariants.md](sweep-invariants.md) first.
 
@@ -45,7 +47,7 @@ must never break an invariant, the second must be reported (an error, a
 | Fault | Expected outcome |
 |---|---|
 | **Lost blob**: a committed part or log blob is gone | read fails over to another replica; repair restores the copy; a lost log blob is `LogError::Lost`, never a shorter history |
-| **Corrupted blob**: bytes flipped | the log's crc links catch it (`Lost`); for data, see Open questions: chunk reads have no per-block checksum today, so this case is expected to **fail** until one is added |
+| **Corrupted blob**: bytes flipped | the log's crc links catch it (`Lost`); for data, every `StoredBlock` carries the crc32 of its stored bytes: a read that finds a mismatch reads each replica alone, and fails only when every copy is bad; repair never copies a damaged block |
 | **Torn disk record** (crash mid-append) | the record is dropped on open; nothing acknowledged is lost |
 | **Duplicate put** | the same data twice under two keys: the second is an orphan the sweeper deletes |
 
@@ -147,7 +149,36 @@ commits of their own, each with the seed that found it as a regression case.
 5. **Docs**: what each store is tested against (meta-backends.md,
    sweep-invariants.md), how to reproduce a seed.
 
+## Implementation
+
+What was built differs from the plan above in a few places:
+
+- The decorator lives in `testing/pigeonhole-sim` (`pigeonhole_sim::faults`),
+  next to the scenarios, not in a crate of its own. `FaultPlan` is a set of
+  probabilities (`none`, `mild`, `harsh`) rather than per-operation rules;
+  draws come from `(seed, operation, its counter)`; `Faulty::faults()` is the
+  fault log.
+- Implemented faults: delay, fail before, fail after, land late, rate limit,
+  and one violation, `corrupt` (a share of blobs, chosen by key, always reads
+  back with a byte flipped).
+- Determinism of the whole run comes from the simulator
+  ([simulation.md](simulation.md)); the same tests also run on plain tokio in
+  `cargo test --workspace`.
+- Scenarios (`crates/testing/pigeonhole-sim/tests`): the log model check
+  (memory and simulated disk, mild and harsh plans), a takeover under load, a
+  power failure with a torn write, `sweep_stress` over S3 under faults with a
+  restart, and the same with two replicas, one of them damaged.
+
+Left for later: outages, slow visibility, cancellation, lost blobs; the
+tablet over faulty log and snapshot stores; snapshots and restore under
+crashes; a repair scenario (a lossy member restored to equal the healthy
+one).
+
 ## Open questions
+
+Settled: interleavings are fixed by the simulator; data blocks carry a crc;
+faults stay test-only (no config knob in the binary); counts, not seconds
+(virtual time makes delays reproducible anyway).
 
 - **Determinism of interleavings.** Seeds fix the faults, not the schedule of
   a multi-threaded runtime. A current-thread runtime with paused time

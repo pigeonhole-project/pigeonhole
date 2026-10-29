@@ -272,11 +272,15 @@ attachments; `impl Chain` on threads (an anchor, the tail checked through
 the predecessor's link, links cleaned up after their messages); Discord can
 hold the log and snapshots; live tests.
 
-### Step 11 — Fault injection
+### Step 11 — Fault injection ✅ done (tablet, snapshot and repair scenarios left)
 
-Design: [fault-injection.md](fault-injection.md) (proposal). A decorator over `BlobBackend + Chain`: delays, errors, 429s
-/ flood waits, lost and corrupted blobs, late visibility, all from a seed; the
-`LogStore` conformance suite, the tablet and `sweep_stress` run through it.
+[fault-injection.md](fault-injection.md), [simulation.md](simulation.md).
+`Faulty<B>` over `BlobBackend + Chain` (delays, ambiguous and late puts, rate
+limits, damaged copies) in `pigeonhole-sim`; the workspace on madsim-tokio,
+openraft on a `MadsimRuntime`, the disk store over `Fs` with a simulated
+disk; scenarios: log model check, takeover, power failure, `sweep_stress`
+over S3, a damaged replica. A crc per stored block (chunk `VERSION` 3).
+`make sim` in CI with 50 seeds.
 
 ### Step 12 — OpenDAL
 
