@@ -17,6 +17,10 @@ DEMO_BACKEND="${DEMO_BACKEND:-disk}"
 BIN="$ROOT/.cache/demos/bin"
 S3_ADDR="${DEMO_S3_ADDR:-127.0.0.1:9333}"
 S3_URL="http://$S3_ADDR"
+METRICS_ADDR="${DEMO_METRICS_ADDR:-127.0.0.1:9334}"
+# pigeonhole's [log] level, e.g. "info,pigeonhole::request_log=debug" for
+# every request with its time.
+LOG_LEVEL="${DEMO_LOG_LEVEL:-info}"
 # The demo's own S3 keys (the gateway takes whatever it is started with).
 export AWS_ACCESS_KEY_ID=demo AWS_SECRET_ACCESS_KEY=demosecret AWS_REGION=us-east-1
 mkdir -p "$BIN"
@@ -117,6 +121,15 @@ pigeonhole_up() {
     discord) write_chats_config discord ;;
     *) echo "DEMO_BACKEND: disk | chats | discord" >&2; exit 2 ;;
   esac
+  cat >>"$STATE/pigeonhole.toml" <<EOF
+
+[metrics]
+enabled = true
+listen_addr = "$METRICS_ADDR"
+
+[log]
+level = "$LOG_LEVEL"
+EOF
   PIGEONHOLE_CONFIG="$STATE/pigeonhole.toml" "$ROOT/target/release/pigeonhole" >"$STATE/pigeonhole.log" 2>&1 &
   echo $! >"$STATE/pigeonhole.pid"; disown
   for _ in $(seq 1 120); do
@@ -124,7 +137,7 @@ pigeonhole_up() {
     sleep 0.5
   done
   grep -q 'listening' "$STATE/pigeonhole.log" || { tail -20 "$STATE/pigeonhole.log"; echo "pigeonhole did not start" >&2; exit 1; }
-  echo "pigeonhole on $S3_URL ($DEMO_BACKEND), log: $STATE/pigeonhole.log"
+  echo "pigeonhole on $S3_URL ($DEMO_BACKEND), metrics on http://$METRICS_ADDR/metrics, log: $STATE/pigeonhole.log"
 }
 
 pigeonhole_down() {

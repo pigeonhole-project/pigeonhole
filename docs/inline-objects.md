@@ -152,11 +152,26 @@ Gauges `pigeonhole_inline_bytes`, `pigeonhole_inline_objects`; counters
 `pigeonhole_background_pass_seconds{task="cool"}`. A request log line says
 `inline=true` for an inline write or read.
 
+## Measured (step 0, 2026-10-30)
+
+The T4 demo with objects in Telegram (`DEMO_BACKEND=chats`,
+`DEMO_LOG_LEVEL=…,pigeonhole::request_log=debug,pigeonhole_blob::metrics=debug`):
+
+- The objects channel took 11 PUTs in the run, 24.1 s of store time, of
+  which 21.8 s was waiting for our own send limiter
+  (`pigeonhole_limiter_wait_seconds{op="send"}`); the rest is the post.
+- After the takeover a lock renewal spent 4.8 s in the store, was abandoned
+  by T4 at 5 s, and still committed; the next renewal (3.2 s in the store)
+  carried the old ETag and got 412: the step-down.
+- A lone T4 leader is in fast mode: it renews every 2 s and flushes a WAL
+  segment per write, more than the channel's 0.3 posts/s on its own. So a
+  priority lane in the limiter would not do: the lock alone outruns the
+  channel. Inline, neither the lock (223 B) nor the WAL segments (~150 B)
+  post at all.
+
 ## Steps
 
-0. **Measure first.** Run the T4 demo with objects in Telegram and read
-   `pigeonhole_limiter_wait_seconds` for the lock's PUTs: confirm the
-   renewal's seconds go to the channel's send queue, as assumed above.
+0. ~~Measure first.~~ Done, above.
 1. `Body`, `PutObject` with an inline body, `Cool`, `inline_bytes`;
    `[inline]` config; the inline write and read paths; copy.
 2. The cooler, with its metrics.
