@@ -240,6 +240,16 @@ comments. Sections:
 Unknown keys are rejected, so a stale config fails at startup instead of being
 half-applied.
 
+## Logs and traces
+
+Logs go to stderr: `[log] level` (tracing directives, default
+`info,openraft=warn,s3s=off`; `RUST_LOG` overrides), `format = "text" |
+"json"`, `slow_request_ms`. Every S3 request runs in a span with an id, sent
+back as `x-pigeonhole-request-id`; store calls and the tablet's commit run
+below it, so `RUST_LOG=debug` follows one request from the gateway to the
+blob it stored and the log position its commit landed at. Levels, spans and
+an example: [docs/observability.md](docs/observability.md).
+
 ## Durability and restore
 
 Every metadata change is a layer command. `pigeonhole-meta` appends it to the

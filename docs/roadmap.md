@@ -65,9 +65,7 @@ Known gaps:
   lives elsewhere (and restore from it is lossy); the `telegram` log avoids it.
 - fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
   without; plain `fsync` (what SQLite does on macOS) is an option.
-- Logs: openraft floods startup at info, s3s logs client 4xx as ERROR, no
-  per-request log, the tablet and the stores say almost nothing above
-  debug, no traces across a request (step 7e).
+- Traces stay in the log: no export to Jaeger / Tempo yet (step 7e).
 - Discord: a snapshot over 20 MiB is refused (no splitting yet).
 
 ## Steps
@@ -222,9 +220,10 @@ blocks (configured before, never built). Every metric is declared in a
 table and listed in metrics.md by a test. `make metrics-demo`: a disk-backed
 node, Prometheus, Grafana with a dashboard, S3 traffic.
 
-### Step 7e — Logs and traces
+### Step 7e — Logs and traces ✅ done (export of traces left)
 
-Design: [observability.md](observability.md) (to write). A log a person can
+[observability.md](observability.md). Done as below, except the export of
+spans as distributed traces (OpenTelemetry), left as an option. A log a person can
 read at `info` (no library floods, client errors not as ERROR), the events
 that matter (tablet: claim, snapshot, rebase, stop and why; stores: long
 rate-limit waits, refreshed links, failed collection; requests: method,
