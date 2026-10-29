@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
     bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceKind, InstanceRole,
-    Linked, MakeAfter, OpKind, Sweepable,
+    Linked, MakeAfter, OpKind, StoreLimiter, Sweepable,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use segments::Segments;
@@ -43,7 +43,12 @@ pub struct DiskBlobStore {
     limits: BackendLimits,
     segments: Arc<Mutex<Segments>>,
     fs: Arc<dyn Fs>,
+    /// Every operation in flight; [`Chain::prune`] runs only when idle.
+    limiter: Arc<StoreLimiter>,
 }
+
+/// Records [`Chain::prune`] deletes per idle moment.
+const PRUNE_BATCH: usize = 100;
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f).await.context("disk task")?
@@ -96,11 +101,22 @@ impl DiskBlobStore {
         let segments = Segments::open(fs.clone(), &dir, segment_bytes)?;
         Ok(Self {
             dir,
-            instance: info,
             limits: BackendLimits::local_disk(),
             segments: Arc::new(Mutex::new(segments)),
             fs,
+            limiter: Arc::new(StoreLimiter::new(&info.id)),
+            instance: info,
         })
+    }
+
+    /// At most `rate_per_sec` operations a second (`burst` at once).
+    pub fn with_rate(mut self, rate_per_sec: f64, burst: f64) -> Self {
+        self.limiter = Arc::new(StoreLimiter::new(&self.instance.id).with_rate(rate_per_sec, burst));
+        self
+    }
+
+    pub fn limiter(&self) -> &Arc<StoreLimiter> {
+        &self.limiter
     }
 
     pub fn dir(&self) -> &Path {
@@ -113,6 +129,7 @@ impl DiskBlobStore {
         &self,
         f: impl FnOnce(&mut segments::Locked<'_>) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        let _op = self.limiter.op().await;
         let segments = self.segments.clone();
         let out = blocking(move || {
             let mut guard = segments.lock().unwrap();
@@ -183,6 +200,7 @@ impl BlobBackend for DiskBlobStore {
     }
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
+        let _op = self.limiter.op().await;
         let segments = self.segments.clone();
         let key = id.key;
         let data = blocking(move || {
@@ -267,6 +285,7 @@ impl Chain for DiskBlobStore {
 
     /// Atomic: the tail is read and the blob appended under one `flock`.
     async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
+        let _op = self.limiter.op().await;
         let segments = self.segments.clone();
         let label = label.to_string();
         // `make` is borrowed, so this runs on the caller's thread: one
@@ -294,15 +313,18 @@ impl Chain for DiskBlobStore {
         out
     }
 
+    /// Background work: a batch at a time, each when no other operation runs.
     async fn prune(&self, below: &Self::Id) -> Result<()> {
         let below = below.key;
-        self.locked(move |s| {
-            let doomed: Vec<u64> = s.records.range(..below).filter(|(_, r)| !r.dead).map(|(k, _)| *k).collect();
-            s.delete(&doomed)?;
-            Ok(doomed.len())
-        })
-        .await
-        .map(|n| tracing::debug!(store = %self.instance().id, below, deleted = n, "pruned"))
+        let doomed: Vec<u64> =
+            self.locked(move |s| Ok(s.records.range(..below).filter(|(_, r)| !r.dead).map(|(k, _)| *k).collect())).await?;
+        for batch in doomed.chunks(PRUNE_BATCH) {
+            self.limiter.wait_idle().await;
+            let batch = batch.to_vec();
+            self.locked(move |s| s.delete(&batch)).await?;
+        }
+        tracing::debug!(store = %self.instance().id, below, deleted = doomed.len(), "pruned");
+        Ok(())
     }
 }
 

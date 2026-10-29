@@ -2,7 +2,7 @@
 
 use pigeonhole_blob::{
     bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo,
-    InstanceKind, InstanceRole, Linked, OpKind, Sweepable,
+    InstanceKind, InstanceRole, Linked, OpKind, StoreLimiter, Sweepable,
 };
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -37,7 +37,12 @@ pub struct MemoryBlobStore {
     /// Deletes wait while [`Self::hold_deletes`]' guard lives (tests of
     /// what must not wait for a delete).
     delete_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Every operation in flight; [`Chain::prune`] runs only when idle.
+    limiter: Arc<StoreLimiter>,
 }
+
+/// Keys [`Chain::prune`] deletes per idle moment.
+const PRUNE_BATCH: usize = 100;
 
 #[derive(Default)]
 struct ChainLinks {
@@ -72,7 +77,18 @@ impl MemoryBlobStore {
             unavailable: None,
             chain: Mutex::default(),
             delete_gate: Arc::default(),
+            limiter: Arc::new(StoreLimiter::new("memory")),
         }
+    }
+
+    /// At most `rate_per_sec` operations a second (`burst` at once).
+    pub fn with_rate(mut self, rate_per_sec: f64, burst: f64) -> Self {
+        self.limiter = Arc::new(StoreLimiter::new(&self.instance.id).with_rate(rate_per_sec, burst));
+        self
+    }
+
+    pub fn limiter(&self) -> &Arc<StoreLimiter> {
+        &self.limiter
     }
 
     /// Override stable instance id (for multi-member Replicated tests).
@@ -81,11 +97,13 @@ impl MemoryBlobStore {
         self.instance.id = id.clone();
         self.instance.fingerprint = format!("memory:{id}");
         self.instance.location = format!("memory:{id}");
+        self.limiter = Arc::new(StoreLimiter::new(&id));
         self
     }
 
     /// Use a pre-resolved [`InstanceInfo`] (from `[[store]]`).
     pub fn with_instance_info(mut self, info: InstanceInfo) -> Self {
+        self.limiter = Arc::new(StoreLimiter::new(&info.id));
         self.instance = info;
         self
     }
@@ -187,6 +205,7 @@ impl BlobBackend for MemoryBlobStore {
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
+        let _op = self.limiter.op().await;
         self.check_available()?;
         if data.is_empty() {
             bail!("refusing empty blob upload (Telegram rejects empty documents)");
@@ -214,6 +233,7 @@ impl BlobBackend for MemoryBlobStore {
     }
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
+        let _op = self.limiter.op().await;
         self.check_available()?;
         let data = self
             .files
@@ -228,6 +248,7 @@ impl BlobBackend for MemoryBlobStore {
 
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
         let _gate = self.delete_gate.read().await;
+        let _op = self.limiter.op().await;
         for &k in keys {
             let mut messages = self.messages.lock().unwrap();
             let Some(file_id) = messages.remove(&(k as i64)) else {
@@ -251,6 +272,7 @@ impl Sweepable for MemoryBlobStore {
         upto: Self::Key,
         limit: usize,
     ) -> Result<Vec<Self::Key>> {
+        let _op = self.limiter.op().await;
         let messages = self.messages.lock().unwrap();
         let mut keys: Vec<u64> = messages
             .keys()
@@ -268,6 +290,7 @@ impl Sweepable for MemoryBlobStore {
 #[async_trait]
 impl Chain for MemoryBlobStore {
     async fn put_after(&self, prev: Option<&Self::Id>, label: &str, data: Bytes) -> Result<After<Self::Id>> {
+        let _op = self.limiter.op().await;
         let prev = prev.map(|p| p.message_id as i64);
         if let Some(&winner) = self.chain.lock().unwrap().next.get(&prev) {
             return Ok(After::Lost(self.linked(winner)));
@@ -286,24 +309,30 @@ impl Chain for MemoryBlobStore {
     }
 
     async fn tail(&self) -> Result<Option<Linked<Self::Id>>> {
+        let _op = self.limiter.op().await;
         self.check_available()?;
         let tail = self.chain.lock().unwrap().tail;
         Ok(tail.map(|t| self.linked(t)))
     }
 
     async fn successor(&self, id: &Self::Id) -> Result<Option<Linked<Self::Id>>> {
+        let _op = self.limiter.op().await;
         self.check_available()?;
         let next = self.chain.lock().unwrap().next.get(&Some(id.message_id as i64)).copied();
         Ok(next.map(|n| self.linked(n)))
     }
 
+    /// Background work: a batch at a time, each when no other operation runs.
     async fn prune(&self, below: &Self::Id) -> Result<()> {
         let below = below.message_id;
         let doomed: Vec<u64> = self.message_keys().into_iter().filter(|&k| k < below).collect();
-        BlobBackend::delete(self, &doomed).await?;
-        let mut names = self.names.lock().unwrap();
-        for k in &doomed {
-            names.remove(&(*k as i64));
+        for batch in doomed.chunks(PRUNE_BATCH) {
+            self.limiter.wait_idle().await;
+            BlobBackend::delete(self, batch).await?;
+            let mut names = self.names.lock().unwrap();
+            for k in batch {
+                names.remove(&(*k as i64));
+            }
         }
         Ok(())
     }
@@ -353,6 +382,26 @@ mod tests {
         assert!(BlobBackend::get(&store, &a, None).await.is_err(), "below the prune point");
         assert!(BlobBackend::get(&store, &b, None).await.is_ok());
         assert_eq!(store.tail().await.unwrap().map(|t| t.label), Some("b".into()));
+    }
+
+    #[tokio::test]
+    async fn prune_waits_while_another_operation_runs() {
+        let store = Arc::new(MemoryBlobStore::new());
+        let mut last = None;
+        for i in 0..3 {
+            last = Some(BlobBackend::put(store.as_ref(), Bytes::from(vec![i + 1]), "b").await.unwrap());
+        }
+        let below = last.unwrap();
+        let op = store.limiter().op().await;
+        let prune = {
+            let (store, below) = (store.clone(), below.clone());
+            tokio::spawn(async move { Chain::prune(store.as_ref(), &below).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(store.message_keys().len(), 3, "pruned while an operation was in flight");
+        drop(op);
+        prune.await.unwrap().unwrap();
+        assert_eq!(store.message_keys(), vec![below.message_id]);
     }
 
     #[tokio::test]

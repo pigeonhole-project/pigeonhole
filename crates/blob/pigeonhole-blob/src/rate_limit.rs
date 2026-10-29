@@ -13,8 +13,15 @@
 //! File CDN byte streams are not API-metered, only capped by a download
 //! connection semaphore. [`LimiterRegistry`] hands out one limiter per
 //! (bot, chat), all sharing their bot's.
+//!
+//! **Background work** (collecting the log) spends only spare budget:
+//! [`ChatLimiter::wait_idle`] returns once nobody waits for the bucket and it
+//! is at least half full; the caller then takes tokens as usual. Stores
+//! without remote limits (disk, memory) have a [`StoreLimiter`]: there idle
+//! means no other operation in flight.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
@@ -49,6 +56,15 @@ impl BucketState {
             self.tokens = (self.tokens + add).min(self.capacity);
             self.last_refill = now;
         }
+    }
+
+    /// Spare for background work: not cooling down, at least half full.
+    fn spare(&mut self, now: Instant) -> bool {
+        if self.cool_down_until.is_some_and(|until| now < until) {
+            return false;
+        }
+        self.refill(now);
+        self.tokens >= (self.capacity / 2.0).max(1.0)
     }
 
     fn time_until_token(&self) -> Duration {
@@ -99,18 +115,46 @@ pub enum LimitBudget {
 struct TokenBucket {
     state: Mutex<BucketState>,
     notify: Notify,
+    /// Callers inside [`Self::acquire`].
+    waiting: AtomicUsize,
 }
+
+/// Counts a caller in [`TokenBucket::acquire`] (also when its future is dropped).
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(n: &'a AtomicUsize) -> Self {
+        n.fetch_add(1, Ordering::SeqCst);
+        Self(n)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How often background work looks again at a busy budget.
+const IDLE_POLL: Duration = Duration::from_millis(100);
 
 impl TokenBucket {
     fn new(rate_per_sec: f64, burst: f64) -> Self {
         Self {
             state: Mutex::new(BucketState::new(rate_per_sec, burst)),
             notify: Notify::new(),
+            waiting: AtomicUsize::new(0),
         }
+    }
+
+    /// Nobody waits and there is spare budget (see [`BucketState::spare`]).
+    fn idle(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst) == 0 && self.state.lock().unwrap().spare(Instant::now())
     }
 
     async fn acquire(&self) -> Duration {
         let started = Instant::now();
+        let _waiting = Waiting::new(&self.waiting);
         loop {
             let action = {
                 let mut st = self.state.lock().unwrap();
@@ -180,6 +224,10 @@ impl BotLimiter {
 
     async fn acquire(&self) -> Duration {
         self.calls.acquire().await
+    }
+
+    fn idle(&self) -> bool {
+        self.calls.idle()
     }
 
     /// A 429 not tied to one chat: every chat of the bot waits.
@@ -351,15 +399,103 @@ impl ChatLimiter {
             .expect("download semaphore closed")
     }
 
+    fn bucket(&self, budget: LimitBudget) -> &TokenBucket {
+        match budget {
+            LimitBudget::Send => &self.send,
+            LimitBudget::GetFile => &self.get_file,
+            LimitBudget::Delete => &self.delete,
+            LimitBudget::Info => &self.info,
+        }
+    }
+
+    /// Background work: wait until `budget` and the bot's have spare tokens
+    /// and nobody waits for them. Takes no token; under steady foreground
+    /// load it waits as long as the load lasts.
+    pub async fn wait_idle(&self, budget: LimitBudget) {
+        let started = Instant::now();
+        while !(self.bucket(budget).idle() && self.bot.idle()) {
+            tokio::time::sleep(IDLE_POLL).await;
+        }
+        crate::metrics::record_limiter_wait(&self.chat, "idle", started.elapsed());
+    }
+
     /// Estimated wait before the next token for `budget` (does not capture a token).
     pub fn peek_wait(&self, budget: LimitBudget) -> Duration {
-        match budget {
-            LimitBudget::Send => self.send.peek_wait(),
-            LimitBudget::GetFile => self.get_file.peek_wait(),
-            LimitBudget::Delete => self.delete.peek_wait(),
-            LimitBudget::Info => self.info.peek_wait(),
+        self.bucket(budget).peek_wait().max(self.bot.calls.peek_wait())
+    }
+}
+
+/// The budget of a store without remote limits (disk, memory): every
+/// operation holds an [`Op`] while it runs and, with a rate set, takes a
+/// token first. Background work waits for [`Self::wait_idle`]: no operation
+/// in flight (and spare tokens).
+pub struct StoreLimiter {
+    store: String,
+    in_flight: AtomicUsize,
+    quiet: Notify,
+    rate: Option<TokenBucket>,
+}
+
+/// One store operation in flight; see [`StoreLimiter::op`].
+pub struct Op<'a>(&'a StoreLimiter);
+
+impl Drop for Op<'_> {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.quiet.notify_waiters();
         }
-        .max(self.bot.calls.peek_wait())
+    }
+}
+
+impl StoreLimiter {
+    /// No rate: operations never wait, background work waits for quiet.
+    pub fn new(store: &str) -> Self {
+        Self { store: store.to_owned(), in_flight: AtomicUsize::new(0), quiet: Notify::new(), rate: None }
+    }
+
+    /// At most `rate_per_sec` operations a second, `burst` at once.
+    pub fn with_rate(mut self, rate_per_sec: f64, burst: f64) -> Self {
+        self.rate = Some(TokenBucket::new(rate_per_sec, burst));
+        self
+    }
+
+    /// Start an operation: a token if a rate is set, then counted in flight
+    /// until the [`Op`] drops.
+    pub async fn op(&self) -> Op<'_> {
+        if let Some(rate) = &self.rate {
+            let waited = rate.acquire().await;
+            crate::metrics::record_limiter_wait(&self.store, "op", waited);
+        }
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        Op(self)
+    }
+
+    fn idle(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) == 0 && self.rate.as_ref().is_none_or(|r| r.idle())
+    }
+
+    /// Background work: wait until no operation is in flight and the rate
+    /// (if any) has spare tokens. Takes nothing; the caller's own operations
+    /// then go through [`Self::op`] as usual.
+    pub async fn wait_idle(&self) {
+        let started = Instant::now();
+        loop {
+            let quiet = self.quiet.notified();
+            if self.idle() {
+                break;
+            }
+            tokio::select! {
+                _ = quiet => {}
+                _ = tokio::time::sleep(IDLE_POLL) => {}
+            }
+        }
+        crate::metrics::record_limiter_wait(&self.store, "idle", started.elapsed());
+    }
+}
+
+impl std::fmt::Debug for StoreLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreLimiter").field("store", &self.store).finish()
     }
 }
 
@@ -524,5 +660,47 @@ mod tests {
         let peeked2 = lim.peek_wait(LimitBudget::Send);
         assert!((peeked2.as_secs_f64() - peeked.as_secs_f64()).abs() < 0.05);
         assert_eq!(lim.peek_wait(LimitBudget::GetFile), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn background_waits_for_a_foreground_caller_and_spare_tokens() {
+        let l = Arc::new(ChatLimiter::new(ChatLimiterConfig {
+            delete_rate_per_sec: 20.0,
+            delete_burst: 2.0,
+            ..ChatLimiterConfig::default()
+        }));
+        l.wait_idle(LimitBudget::Delete).await; // a fresh budget is idle
+        l.acquire_delete().await;
+        l.acquire_delete().await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let fg = {
+            let (l, order) = (l.clone(), order.clone());
+            tokio::spawn(async move {
+                l.acquire_delete().await; // waits ~50 ms for a token
+                order.lock().unwrap().push("foreground");
+            })
+        };
+        tokio::task::yield_now().await;
+        l.wait_idle(LimitBudget::Delete).await;
+        order.lock().unwrap().push("background");
+        fg.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["foreground", "background"]);
+    }
+
+    #[tokio::test]
+    async fn store_background_waits_until_no_operation_is_in_flight() {
+        let l = Arc::new(StoreLimiter::new("disk"));
+        l.wait_idle().await;
+        let op = l.op().await;
+        let bg = {
+            let l = l.clone();
+            tokio::spawn(async move { l.wait_idle().await })
+        };
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!bg.is_finished(), "background ran while an operation was in flight");
+        let t0 = Instant::now();
+        drop(op);
+        bg.await.unwrap();
+        assert!(t0.elapsed() < IDLE_POLL, "the end of the last operation wakes background work");
     }
 }

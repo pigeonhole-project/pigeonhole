@@ -266,6 +266,8 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
     async fn prune(&self, below: &DiscordId) -> Result<()> {
         let mut before = Some(below.message_id);
         loop {
+            // Background work: only on spare budget, never ahead of appends.
+            self.limiter.wait_idle(pigeonhole_blob::LimitBudget::Delete).await;
             let page = self.api.list(before, None, PAGE).await?;
             let ours: Vec<&DcMessage> = page.iter().filter(|m| is_member(m)).collect();
             if ours.is_empty() {

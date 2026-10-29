@@ -76,7 +76,7 @@ pub struct DiscordBlobStore<A> {
     limits: BackendLimits,
     instance: InstanceInfo,
     pub(crate) api: Arc<A>,
-    limiter: Arc<ChatLimiter>,
+    pub(crate) limiter: Arc<ChatLimiter>,
     locations: Mutex<LruCache<u64, Located>>,
     /// Names of recently seen blob messages (a chain member's name tells
     /// what it follows, which deleting it needs).
