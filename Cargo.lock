@@ -2646,8 +2646,12 @@ name = "pigeonhole-sim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "bytes",
+ "futures",
  "madsim",
  "madsim-tokio",
+ "pigeonhole-blob",
  "pigeonhole-meta",
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",

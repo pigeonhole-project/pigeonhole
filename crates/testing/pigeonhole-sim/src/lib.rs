@@ -4,6 +4,8 @@
 //! `MADSIM_TEST_SEED` replays one, `MADSIM_TEST_NUM` runs many,
 //! `MADSIM_TEST_CHECK_DETERMINISM=1` runs each twice and compares.
 
+pub mod faults;
+
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
