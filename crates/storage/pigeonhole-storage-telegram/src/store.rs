@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use lru::LruCache;
 use pigeonhole_blob::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget, OpKind, Sweepable,
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget, NotFound, OpKind, Sweepable,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -169,7 +169,7 @@ impl<C: ChannelApi> Reader<C> {
         let ids: Vec<i64> = (lo..=message_id).collect();
         let msg = self.read(&ids).await?.pop();
         match msg {
-            Some(ChannelMessage::Empty) | None => bail!("blob message {message_id} is gone"),
+            Some(ChannelMessage::Empty) | None => Err(NotFound(format!("blob message {message_id}")).into()),
             Some(m) => Located::of(&m).with_context(|| format!("message {message_id} is not a blob")),
         }
     }

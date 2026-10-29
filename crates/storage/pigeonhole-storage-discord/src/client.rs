@@ -5,7 +5,7 @@ use crate::api::{CdnStale, DcAttachment, DcMessage, DiscordApi, ThreadStart, PAG
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_blob::{ChatLimiter, RateLimited};
+use pigeonhole_blob::{ChatLimiter, RateLimited, Unavailable};
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -156,7 +156,8 @@ impl DiscordClient {
         format!("{}/{}", self.api_base.trim_end_matches('/'), path.trim_start_matches('/'))
     }
 
-    /// Send `build()` until it is not a 429 or a network error.
+    /// Send `build()` until it is not a 429, a 5xx or a network error; if
+    /// every attempt was one of the latter two, the store is [`Unavailable`].
     async fn request(
         &self,
         limiter: &ChatLimiter,
@@ -177,7 +178,7 @@ impl DiscordClient {
                 Err(e) => {
                     let wait = Duration::from_millis(200 * 2u64.pow(attempt));
                     debug!(what, attempt, ?wait, error = %e, "discord http retry");
-                    last = Some(anyhow::Error::from(e));
+                    last = Some(anyhow::Error::from(e).context(Unavailable(what.to_string())));
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -199,6 +200,13 @@ impl DiscordClient {
                 pigeonhole_blob::record_throttle("discord", what, wait);
                 tokio::time::sleep(wait).await;
                 last = Some(RateLimited { method: what, retry_after: wait }.into());
+                continue;
+            }
+            if status >= 500 {
+                let wait = Duration::from_millis(200 * 2u64.pow(attempt));
+                debug!(what, attempt, status, ?wait, "discord server error; retry");
+                last = Some(anyhow!("{what}: {status} {text}").context(Unavailable(what.to_string())));
+                tokio::time::sleep(wait).await;
                 continue;
             }
             let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -476,8 +484,11 @@ impl DiscordApi for DiscordChannel {
         if let Some((start, end)) = range {
             req = req.header("Range", format!("bytes={start}-{}", end - 1));
         }
-        let resp = req.send().await.context("download attachment")?;
+        let resp = req.send().await.context("download attachment").context(Unavailable("download".into()))?;
         let status = resp.status().as_u16();
+        if status >= 500 {
+            return Err(anyhow!("download answered {status}").context(Unavailable("download".into())));
+        }
         if matches!(status, 403 | 404) {
             return Err(CdnStale.into());
         }

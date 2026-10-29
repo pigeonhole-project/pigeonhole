@@ -112,5 +112,6 @@ async fn sweeps_only_our_blobs() {
     assert_eq!(store.candidates(Some(ours), late, 1).await.unwrap(), vec![late]);
     assert!(store.candidates(Some(late), late + 5, 100).await.unwrap().is_empty());
     store.delete(&[ours, late]).await.unwrap();
-    assert!(store.get(&DiscordId { message_id: ours }, None).await.is_err());
+    let gone = store.get(&DiscordId { message_id: ours }, None).await;
+    assert_eq!(pigeonhole_blob::Failure::of(&gone.err().unwrap()), pigeonhole_blob::Failure::NotFound);
 }

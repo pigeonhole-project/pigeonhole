@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use grammers_mtsender::{ConnectionParams, InvocationError, NoRetries, SenderPool, SenderPoolHandle};
 use grammers_tl_types::{self as tl, enums, functions, types};
-use pigeonhole_blob::{ChatLimiter, RateLimited};
+use pigeonhole_blob::{ChatLimiter, RateLimited, Unavailable};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -327,7 +327,8 @@ where
                 let wait = backoff;
                 backoff = (backoff * 2).min(Duration::from_secs(16));
                 if tokio::time::Instant::now() + wait >= deadline {
-                    return Err(anyhow!("{what}: {err} (still failing after {budget:?})"));
+                    return Err(anyhow::Error::new(Unavailable(what.to_string()))
+                        .context(format!("{what}: {err} (still failing after {budget:?})")));
                 }
                 wait
             }

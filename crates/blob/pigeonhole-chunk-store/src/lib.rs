@@ -29,7 +29,7 @@ pub use block_cache::BlockCache;
 pub use pigeonhole_blob::CacheConfig;
 pub use ingest::{codec_from_sql, codec_to_sql, IngestHasher, IngestOptions};
 pub use repair::{
-    is_part_not_found, spawn_enqueue_repair, RepairConfig, RepairStats, Repairer,
+    spawn_enqueue_repair, RepairConfig, RepairStats, Repairer,
     DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
 };
 pub use sweep::{

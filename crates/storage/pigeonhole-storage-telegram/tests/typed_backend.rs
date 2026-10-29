@@ -112,7 +112,8 @@ async fn deletes_in_batches_of_100() {
     store.delete(&keys).await.unwrap();
     assert!(channel.message_ids().is_empty());
     assert_eq!(channel.calls().delete_messages, 2);
-    assert!(store.get(&TelegramId { message_id: keys[0] }, None).await.is_err());
+    let gone = store.get(&TelegramId { message_id: keys[0] }, None).await;
+    assert_eq!(pigeonhole_blob::Failure::of(&gone.err().unwrap()), pigeonhole_blob::Failure::NotFound);
 }
 
 /// Blobs that fit a text message go as text: no upload, and a reader of

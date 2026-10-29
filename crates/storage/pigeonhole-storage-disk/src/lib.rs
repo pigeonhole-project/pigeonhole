@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
     bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceKind, InstanceRole,
-    Linked, MakeAfter, OpKind, StoreLimiter, Sweepable,
+    Linked, MakeAfter, NotFound, OpKind, StoreLimiter, Sweepable,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use segments::Segments;
@@ -210,7 +210,7 @@ impl BlobBackend for DiskBlobStore {
                 guard.locked()?.catch_up()?;
             }
             let len = guard.records.get(&key).filter(|r| !r.dead).map(|r| r.data_len);
-            let Some(len) = len else { bail!("no blob {key}") };
+            let Some(len) = len else { return Err(NotFound(format!("blob {key}")).into()) };
             let (from, to) = match range {
                 Some(r) => (r.start, r.end),
                 None => (0, len),

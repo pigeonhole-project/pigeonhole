@@ -8,7 +8,6 @@ pub mod metrics;
 pub mod part_packer;
 pub mod rate_limit;
 pub mod replicated;
-pub mod retry;
 pub mod typed;
 pub use backend::{bytes_stream, collect_stream, slice_range, BoxByteStream};
 pub use cache::CacheConfig;
@@ -23,7 +22,6 @@ pub use metrics::{
 };
 pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
 pub use rate_limit::{BotLimiter, ChatLimiter, ChatLimiterConfig, LimitBudget, LimiterRegistry, StoreLimiter};
-pub use retry::{retrying, RateLimited, Retry};
 pub use replicated::{
     CheapestFirst, ChunkReplicaWriter, InstanceId, PartLayout, ReplicaLayout, ReplicaSelector,
     Replicated, SealedChunk, ShardSpec,
@@ -32,7 +30,7 @@ pub use typed::{
     load_id, store_id, CostHint, InstanceInfo, InstanceKind, InstanceRole, OpKind, OrderedKey,
     BlobId, BlobLocator, Sweepable, BlobBackend,
 };
-pub use pigeonhole_storage_api::{text, After, Chain, Linked, MakeAfter};
+pub use pigeonhole_storage_api::{text, After, Chain, Failure, Linked, MakeAfter, NotFound, RateLimited, Unavailable};
 pub use pigeonhole_types::{
     BackendId, BackendLimits, BlobKey, ByteRange, DeleteOutcome, RangeSupport,
 };

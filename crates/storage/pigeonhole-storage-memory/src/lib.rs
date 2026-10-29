@@ -2,7 +2,7 @@
 
 use pigeonhole_blob::{
     bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo,
-    InstanceKind, InstanceRole, Linked, OpKind, StoreLimiter, Sweepable,
+    InstanceKind, InstanceRole, Linked, NotFound, OpKind, StoreLimiter, Sweepable, Unavailable,
 };
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -131,7 +131,7 @@ impl MemoryBlobStore {
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed))
         {
-            bail!("503 service unavailable");
+            return Err(Unavailable(self.instance.id.clone()).into());
         }
         Ok(())
     }
@@ -241,7 +241,7 @@ impl BlobBackend for MemoryBlobStore {
             .unwrap()
             .get(&id.file_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown file_id {}", id.file_id))?;
+            .ok_or_else(|| NotFound(format!("blob {}", id.file_id)))?;
         let sliced = slice_range(data, range)?;
         Ok(bytes_stream(sliced))
     }
@@ -354,7 +354,8 @@ mod tests {
             .unwrap();
         assert_eq!(got.as_ref(), b"hello");
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
-        assert!(BlobBackend::get(&store, &id, None).await.is_err());
+        let gone = BlobBackend::get(&store, &id, None).await;
+        assert_eq!(pigeonhole_blob::Failure::of(&gone.err().unwrap()), pigeonhole_blob::Failure::NotFound);
         // Repeat delete is ok.
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
     }

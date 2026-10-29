@@ -24,6 +24,7 @@
 //! over the data; a segment whose records are all dead is removed.
 
 use crate::io::{DirLock, Fs, FsFile};
+use pigeonhole_blob::NotFound;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -148,7 +149,7 @@ impl Segments {
 
     /// Read `len` bytes of record `key`'s data at `from`.
     pub fn read(&self, key: u64, from: u64, len: u64) -> Result<Vec<u8>> {
-        let rec = self.records.get(&key).filter(|r| !r.dead).ok_or_else(|| anyhow!("no blob {key}"))?;
+        let rec = self.records.get(&key).filter(|r| !r.dead).ok_or_else(|| NotFound(format!("blob {key}")))?;
         if from + len > rec.data_len {
             bail!("byte range {from}..{} outside blob of {} bytes", from + len, rec.data_len);
         }

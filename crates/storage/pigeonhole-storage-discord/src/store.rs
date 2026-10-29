@@ -8,7 +8,7 @@ use lru::LruCache;
 use pigeonhole_blob::text::{self, DISCORD_MAX_CHARS};
 use pigeonhole_blob::{
     bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, ChatLimiter, CostHint, InstanceInfo, LimitBudget,
-    OpKind, Sweepable,
+    NotFound, OpKind, Sweepable,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -179,7 +179,7 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
                 return Ok(l.clone());
             }
         }
-        let m = self.api.get_message(id).await?.with_context(|| format!("blob message {id} is gone"))?;
+        let Some(m) = self.api.get_message(id).await? else { return Err(NotFound(format!("blob message {id}")).into()) };
         let l = Located::of(&m).with_context(|| format!("message {id} is not a blob"))?;
         self.locations.lock().unwrap().put(id, l.clone());
         Ok(l)
