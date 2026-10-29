@@ -48,7 +48,15 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
         #[cfg(feature = "discord")]
         LogSettings::Discord { channel_id, bot_token, max_blob_size } => {
             info!(channel_id = %channel_id, "metadata log in a Discord channel");
-            meta_discord(cfg, channel_id, bot_token, *max_blob_size, "log", |s| Arc::new(ChainLogStore::new(s))).await?
+            let lease = (!cfg.meta.lease.is_zero()).then(|| pigeonhole_meta::Lease::new(cfg.meta.lease));
+            meta_discord(cfg, channel_id, bot_token, *max_blob_size, "log", |s| {
+                let log = ChainLogStore::new(s);
+                Arc::new(match lease {
+                    Some(lease) => log.with_lease(lease),
+                    None => log,
+                })
+            })
+            .await?
         }
     })
 }

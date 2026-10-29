@@ -11,7 +11,7 @@ pub mod chain;
 #[cfg(any(test, feature = "testsuite"))]
 pub mod conformance;
 
-pub use chain::ChainLogStore;
+pub use chain::{ChainLogStore, Lease};
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.
@@ -220,4 +220,10 @@ pub trait LogStore: Send + Sync + 'static {
     /// Wait for background work (the collection after a rebase); tests use
     /// it before looking at what a rebase dropped.
     async fn settle(&self) {}
+
+    /// A clean shutdown: generation `gen` writes no more, and a log held by
+    /// a lease lets the next claimant in at once. Nothing to do elsewhere.
+    async fn release(&self, _gen: u64) -> LogResult<()> {
+        Ok(())
+    }
 }

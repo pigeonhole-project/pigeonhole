@@ -272,6 +272,14 @@ attachments; `impl Chain` on threads (an anchor, the tail checked through
 the predecessor's link, links cleaned up after their messages); Discord can
 hold the log and snapshots; live tests.
 
+### Step 10a — A lease for the Discord log ✅ done (flock after a crash left)
+
+[discord-lease.md](discord-lease.md): only lease records take a thread.
+Batches are plain posts, kept if answered inside the lease; renewals run in
+the background; a claimant waits out the old lease, timed by snowflakes; a
+clean shutdown releases it. Live: ~1 append/s against ~6 s per append with
+a thread each.
+
 ### Step 11 — Fault injection ✅ done (tablet, snapshot and repair scenarios left)
 
 [fault-injection.md](fault-injection.md), [simulation.md](simulation.md).

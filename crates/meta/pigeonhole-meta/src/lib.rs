@@ -52,7 +52,7 @@ mod telemetry;
 
 pub use log::{
     Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult,
-    LogStore, Position, LOG_FORMAT, ChainLogStore,
+    LogStore, Position, LOG_FORMAT, ChainLogStore, Lease,
 };
 pub use telemetry::METRICS;
 pub use snapshot::{BlobSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
@@ -680,6 +680,18 @@ impl MetaStore {
     /// Whether the tablet has stopped (fenced or failed).
     pub fn is_stopped(&self) -> bool {
         self.stop.borrow().is_some()
+    }
+
+    /// A clean shutdown: stop Raft, so nothing more is written, then
+    /// release the log (a lease log lets the next claimant in at once).
+    pub async fn close(&self) -> Result<()> {
+        if let Some(t) = self.ticker.lock().unwrap().take() {
+            t.abort();
+        }
+        self.raft.shutdown().await.map_err(|e| anyhow::anyhow!("shut raft down: {e}"))?;
+        self.shared.stop.send_replace(Some(Stop::Failed("closed".into())));
+        self.log.release(self.gen).await.context("release the log")?;
+        Ok(())
     }
 
     /// Resolves once the tablet stops accepting proposals.

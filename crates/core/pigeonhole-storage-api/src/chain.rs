@@ -97,6 +97,28 @@ pub trait Chain: BlobBackend {
     async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
         Ok(self.tail().await?.filter(|t| t.label.starts_with(prefix)))
     }
+
+    /// When the store stamped blob `id`, in ms of the store's own clock, if
+    /// its ids carry that (a Discord snowflake). A store that answers holds
+    /// a log by a lease (docs/discord-lease.md): the stamps of its blobs,
+    /// not a reader's clock, tell whether a batch fell inside it.
+    fn stamp_ms(&self, _id: &Self::Id) -> Option<u64> {
+        None
+    }
+
+    /// Put a blob that names `prev` as a chain member does, without linking
+    /// it: nothing decides a winner, and [`Self::tail`] does not see it. It
+    /// is listed ([`Self::list_after`]) and pruned like a member. For a lease
+    /// log's batches.
+    async fn put_unlinked(&self, _prev: &Self::Id, label: &str, _data: Bytes) -> Result<Self::Id> {
+        anyhow::bail!("{label}: this store cannot put a blob outside its chain")
+    }
+
+    /// Blobs newer than `after` (all for `None`) whose label starts with
+    /// `prefix`, oldest first: members, unlinked and loose blobs alike.
+    async fn list_after(&self, _after: Option<&Self::Id>, prefix: &str) -> Result<Vec<Linked<Self::Id>>> {
+        anyhow::bail!("{prefix}: this store cannot list its blobs")
+    }
 }
 
 /// Tries of the default [`Chain::put_after_tail`] before it gives up.
@@ -127,5 +149,14 @@ impl<C: Chain> Chain for std::sync::Arc<C> {
     }
     async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
         (**self).put_after_tail(label, make).await
+    }
+    fn stamp_ms(&self, id: &Self::Id) -> Option<u64> {
+        (**self).stamp_ms(id)
+    }
+    async fn put_unlinked(&self, prev: &Self::Id, label: &str, data: Bytes) -> Result<Self::Id> {
+        (**self).put_unlinked(prev, label, data).await
+    }
+    async fn list_after(&self, after: Option<&Self::Id>, prefix: &str) -> Result<Vec<Linked<Self::Id>>> {
+        (**self).list_after(after, prefix).await
     }
 }

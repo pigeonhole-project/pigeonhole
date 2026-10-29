@@ -41,7 +41,18 @@ struct Inner {
     /// Bumped by [`FakeDiscord::expire_urls`].
     url_epoch: u32,
     lose_next_answer: bool,
+    /// The next send's answer comes this much later (it lands at once).
+    delay_next_answer: Option<std::time::Duration>,
     calls: Calls,
+}
+
+impl Inner {
+    /// A snowflake: the time now, above every id so far.
+    fn next_id(&mut self) -> u64 {
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        self.top = (self.top + 1).max((ms - crate::client::DISCORD_EPOCH_MS) << 22);
+        self.top
+    }
 }
 
 pub struct FakeDiscord {
@@ -51,14 +62,13 @@ pub struct FakeDiscord {
 
 impl FakeDiscord {
     pub fn new(channel_id: u64) -> Self {
-        Self { id: channel_id, inner: Mutex::new(Inner { top: 1_000, ..Inner::default() }) }
+        Self { id: channel_id, inner: Mutex::new(Inner::default()) }
     }
 
     /// Someone else posts a text; its id.
     pub fn post_text(&self, text: &str) -> u64 {
         let mut g = self.inner.lock().unwrap();
-        g.top += 1;
-        let id = g.top;
+        let id = g.next_id();
         g.messages.insert(id, Stored { content: text.into(), file: None });
         id
     }
@@ -71,6 +81,12 @@ impl FakeDiscord {
     /// The next send posts, but the sender learns nothing.
     pub fn lose_next_answer(&self) {
         self.inner.lock().unwrap().lose_next_answer = true;
+    }
+
+    /// The next send lands at once, but its answer comes `after` later (a
+    /// slow connection).
+    pub fn delay_next_answer(&self, after: std::time::Duration) {
+        self.inner.lock().unwrap().delay_next_answer = Some(after);
     }
 
     /// Delete message `id` behind everyone's back.
@@ -114,6 +130,34 @@ impl FakeDiscord {
         ids
     }
 
+    /// A send, under the lock: the answer, and how late it comes.
+    fn post(
+        &self,
+        content: &str,
+        file: Option<(&str, Bytes)>,
+        nonce: &str,
+    ) -> Result<(DcMessage, Option<std::time::Duration>)> {
+        let mut g = self.inner.lock().unwrap();
+        g.calls.send += 1;
+        if let Some(&id) = g.by_nonce.get(nonce) {
+            let m = g.messages.get(&id).cloned();
+            return match m {
+                Some(m) => Ok((self.view(&g, id, &m), None)),
+                None => bail!("404 10008: Unknown Message"),
+            };
+        }
+        let id = g.next_id();
+        // Discord keeps only some characters of a file name (it drops `~`).
+        let clean = |n: &str| n.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).collect::<String>();
+        let stored = Stored { content: content.into(), file: file.map(|(n, d)| (clean(n), d)) };
+        g.messages.insert(id, stored.clone());
+        g.by_nonce.insert(nonce.into(), id);
+        if std::mem::take(&mut g.lose_next_answer) {
+            bail!("connection reset before the answer");
+        }
+        Ok((self.view(&g, id, &stored), g.delay_next_answer.take()))
+    }
+
     fn view(&self, g: &Inner, id: u64, m: &Stored) -> DcMessage {
         DcMessage {
             id,
@@ -145,26 +189,11 @@ impl DiscordApi for FakeDiscord {
         if nonce.len() > 25 {
             bail!("50035: nonce must be 25 or fewer characters long");
         }
-        let mut g = self.inner.lock().unwrap();
-        g.calls.send += 1;
-        if let Some(&id) = g.by_nonce.get(nonce) {
-            let m = g.messages.get(&id).cloned();
-            return match m {
-                Some(m) => Ok(self.view(&g, id, &m)),
-                None => bail!("404 10008: Unknown Message"),
-            };
+        let (answer, delay) = self.post(content, file, nonce)?;
+        if let Some(after) = delay {
+            tokio::time::sleep(after).await;
         }
-        g.top += 1;
-        let id = g.top;
-        // Discord keeps only some characters of a file name (it drops `~`).
-        let clean = |n: &str| n.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).collect::<String>();
-        let stored = Stored { content: content.into(), file: file.map(|(n, d)| (clean(n), d)) };
-        g.messages.insert(id, stored.clone());
-        g.by_nonce.insert(nonce.into(), id);
-        if std::mem::take(&mut g.lose_next_answer) {
-            bail!("connection reset before the answer");
-        }
-        Ok(self.view(&g, id, &stored))
+        Ok(answer)
     }
 
     async fn get_message(&self, id: u64) -> Result<Option<DcMessage>> {
