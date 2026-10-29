@@ -1,6 +1,6 @@
 # Deterministic simulation (madsim)
 
-Status: **proposal**. Read [fault-injection.md](fault-injection.md) first: this
+Status: **proposal**; spike done (see Spike findings). Read [fault-injection.md](fault-injection.md) first: this
 design takes its fault model and decorator and makes the rest of the run —
 task order, time, randomness, crashes — reproducible from one seed too.
 
@@ -153,9 +153,55 @@ replayed with `MADSIM_TEST_SEED`.
   seed. Separate `target` directory (`CARGO_TARGET_DIR=target/madsim`): the
   cfg flag rebuilds everything.
 
+## Spike findings (2026-10-29, madsim 0.2.34, madsim-tokio 0.2.30, macOS arm64)
+
+Branch `madsim-spike` (throwaway): the workspace's `tokio` as
+`madsim-tokio`, a `MadsimRuntime` for openraft, the existing tests built
+with `--cfg madsim`.
+
+- **The normal build is unchanged** with `madsim-tokio` in place of tokio:
+  every test green, nothing else to touch.
+- **Under `--cfg madsim` everything but the servers builds**: meta, blob,
+  chunk store, gateway-s3, the memory / disk / Telegram / Discord stores.
+  The REAPI server (`TcpListenerStream` from tokio-stream wants a real
+  `TcpListener`) and the binary's serving code need `cfg(not(madsim))`
+  gates. grammers and reqwest compile (they keep their own tokio types); a
+  simulation must not call them, it uses the fakes.
+- **openraft runs on madsim** through its `AsyncRuntime` parameter: a
+  60-line `MadsimRuntime` (madsim's spawn, sleep, a small `Timeout` future;
+  tokio's oneshot and `Instant` as they are — madsim answers the clock).
+  With openraft's default `TokioRuntime` every tablet test panicked (no
+  tokio reactor).
+- **Results under `--cfg madsim`**: chunk store 50/50, Telegram store (on
+  its fake) 5/5, memory store 5/5, meta 28 of 31 (below).
+- **Deterministic where no real I/O is involved**: the tablet over memory
+  stores and the chain-log tests pass `MADSIM_TEST_CHECK_DETERMINISM=1`
+  over 20 seeds — openraft, `select!`, `uuid` and `Utc::now()` included.
+  madsim overrides `clock_gettime` / `gettimeofday` and, on macOS,
+  `getentropy` / `CCRandomGenerateBytes` at the symbol level, so std time
+  and entropy are the simulator's without code changes. Its own note: on
+  Linux the `getrandom` syscall path is not intercepted (deterministic
+  randomness there needs the patched `getrandom` crate, or the CI job runs
+  on macOS).
+- **Tests over the real disk are not deterministic** (the scheduler sees a
+  different set of ready tasks early on): real file I/O inside the
+  simulation. `spawn_blocking` is madsim's deprecated shim that runs the
+  closure inline as a task, so disk work takes no virtual time.
+- **Three tests hang**, for reasons the design already covers:
+  `snapshot_count` calls `futures::executor::block_on` inside the single
+  simulation thread (deadlock; test helper only);
+  `second_incarnation_fences_the_first…` busy-writes on disk that takes no
+  virtual time, so the clock never advances to B's start — a simulated disk
+  must cost virtual time per fsync, as `SimIo` would.
+
+Decision proposed: go ahead. The blockers are the ones the design expected
+(`SimIo` for the disk, cfg gates for servers, a `MadsimRuntime`); none came
+from openraft's internals or third-party crates. CI can start on macOS,
+where entropy is intercepted, and add Linux with the patched `getrandom`.
+
 ## Steps
 
-0. **Spike** (throwaway, a day): build `pigeonhole-meta`, `-blob`,
+0. ✅ **Spike** (throwaway, a day; findings above): build `pigeonhole-meta`, `-blob`,
    `-chunk-store`, `-gateway-s3` with `--cfg madsim` and madsim-tokio; a
    `MadsimRuntime` for openraft; one tablet test under `#[madsim::test]` with
    `MADSIM_TEST_CHECK_DETERMINISM`. Record what breaks (crates on plain tokio,
