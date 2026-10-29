@@ -41,8 +41,9 @@ uid `prom`.
   for how much went out.
 - Bytes are counted as body frames pass, not from `Content-Length`: a HEAD
   sends nothing, an aborted download counts what left.
-- `pigeonhole_instance_call_duration_seconds{op="get"}` stops when the stream
-  starts; the time to read it is in the caller's.
+- `pigeonhole_instance_call_duration_seconds{op="get"}` is the time to the
+  first byte (a store may hand out a stream before any request); the get
+  stays in `pigeonhole_instance_inflight` until its stream is read.
 - Buckets: `*_seconds` from 100 µs to 5 min, `*_ratio` 0.01…1.05,
   `*_per_chunk` / `*_per_entry` 1…1024 (`crates/bin/pigeonhole/src/prometheus.rs`).
 - The tablet gauges (`pigeonhole_s3_*`, `pigeonhole_chunk*`,
@@ -77,8 +78,8 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_gateway_request_duration_seconds` | histogram | `gateway`, `op`, `outcome` | Gateway request time to response headers; op is the S3 operation (unknown: routing or auth failed first), outcome ok / client_error / server_error / cancelled (the client went away first) |
 | `pigeonhole_bytes_from_clients_total` | counter | `gateway`, `op` | Request body bytes received from gateway clients |
 | `pigeonhole_bytes_to_clients_total` | counter | `gateway`, `op` | Response body bytes sent to gateway clients |
-| `pigeonhole_instance_call_duration_seconds` | histogram | `instance`, `op`, `outcome` | Backend call duration (get: until the stream starts) |
-| `pigeonhole_instance_inflight` | gauge | `instance`, `op` | Backend calls in flight |
+| `pigeonhole_instance_call_duration_seconds` | histogram | `instance`, `op`, `outcome` | Backend call duration (get: until the first byte) |
+| `pigeonhole_instance_inflight` | gauge | `instance`, `op` | Backend calls in flight (a get until its stream is read or dropped) |
 | `pigeonhole_bytes_to_backend_total` | counter | `instance` | Bytes written to backend instances |
 | `pigeonhole_bytes_from_backend_total` | counter | `instance` | Bytes read from backend instances |
 | `pigeonhole_instance_rate_limited_total` | counter | `instance`, `op` | Backend calls that failed rate limited (a 429 / FLOOD_WAIT longer than the call's budget) |
