@@ -250,13 +250,16 @@ impl LogAdapter {
                     let (at, new_ref) = (base.at, base.snapshot.clone());
                     let r = self.log.rebase(gen, base).await.map_err(|e| self.shared.log_error(e));
                     if r.is_ok() {
+                        tracing::info!(at, snapshot = %new_ref.0, "log rebased on a snapshot");
                         self.durable.fetch_max(at, Ordering::SeqCst);
                         self.tail.lock().unwrap().retain(|p, _| *p > at);
                         self.shared.based.store(at, Ordering::SeqCst);
                         let old = self.shared.base_ref.lock().unwrap().replace(new_ref.clone());
                         if let Some(old) = old.filter(|o| *o != new_ref) {
                             // Nothing starts from it any more (best effort).
-                            let _ = snapshots.remove(&old).await;
+                            if let Err(e) = snapshots.remove(&old).await {
+                                tracing::warn!(snapshot = %old.0, error = %format!("{e:#}"), "removing the old base failed");
+                            }
                         }
                     }
                     let _ = done.send(r);
@@ -438,13 +441,16 @@ impl StateMachine {
             .await
             .map_err(|e| StorageError::from(StorageIOError::write_snapshot(None, AnyError::error(format!("{e:#}")))))?;
         crate::telemetry::record_snapshot(data.len(), t0.elapsed());
+        tracing::info!(at, bytes = data.len(), ms = t0.elapsed().as_millis() as u64, "snapshot stored");
         let current = CurrentSnapshot { meta: snap.meta.clone(), data, snapshot };
         let old = shared.current.lock().unwrap().replace(current.clone());
         // A newer one replaced it before the log moved onto it: unused (the
         // one the log starts from stays until a purge moves the base).
         let base_ref = shared.base_ref.lock().unwrap().clone();
         if let Some(old) = old.filter(|o| o.snapshot != current.snapshot && Some(&o.snapshot) != base_ref.as_ref()) {
-            let _ = snapshots.remove(&old.snapshot).await;
+            if let Err(e) = snapshots.remove(&old.snapshot).await {
+                tracing::warn!(snapshot = %old.snapshot.0, error = %format!("{e:#}"), "removing an unused snapshot failed");
+            }
         }
         Ok(current)
     }

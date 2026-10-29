@@ -13,6 +13,7 @@ use futures::StreamExt;
 use pigeonhole_types::{BackendLimits, ByteRange, MetricDoc, MetricKind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 /// The metrics this crate's helpers record.
 pub const METRICS: &[MetricDoc] = &[
@@ -286,6 +287,16 @@ impl MetricsBackend {
     }
 }
 
+/// One store call in the log: `debug` when it worked, `warn` when it failed
+/// (a replica's failure inside a write that met its quorum shows only here).
+fn log_call<T>(span: &tracing::Span, result: &Result<T>, elapsed: std::time::Duration) {
+    let ms = elapsed.as_millis() as u64;
+    span.in_scope(|| match result {
+        Ok(_) => tracing::debug!(ms, "store call"),
+        Err(e) => tracing::warn!(ms, error = %format!("{e:#}"), "store call failed"),
+    });
+}
+
 #[async_trait]
 impl DynBlobBackend for MetricsBackend {
     fn instance(&self) -> &InstanceInfo {
@@ -306,7 +317,9 @@ impl DynBlobBackend for MetricsBackend {
         let len = data.len() as u64;
         inflight_inc(&instance, op);
         let t0 = Instant::now();
-        let result = self.inner.put(data, name).await;
+        let span = tracing::debug_span!("store", instance = %instance, op, bytes = len);
+        let result = self.inner.put(data, name).instrument(span.clone()).await;
+        log_call(&span, &result, t0.elapsed());
         if result.is_ok() {
             record_bytes_to_backend(&instance, len);
         }
@@ -330,7 +343,9 @@ impl DynBlobBackend for MetricsBackend {
         let op = "get";
         inflight_inc(&instance, op);
         let t0 = Instant::now();
-        let result = self.inner.get(id, range).await;
+        let span = tracing::debug_span!("store", instance = %instance, op);
+        let result = self.inner.get(id, range).instrument(span.clone()).await;
+        log_call(&span, &result, t0.elapsed());
         match result {
             Ok(stream) => {
                 record_instance_call(&instance, op, "ok", t0.elapsed());
@@ -360,7 +375,9 @@ impl DynBlobBackend for MetricsBackend {
         let op = "delete";
         inflight_inc(&instance, op);
         let t0 = Instant::now();
-        let result = self.inner.delete(keys).await;
+        let span = tracing::debug_span!("store", instance = %instance, op, keys = keys.len());
+        let result = self.inner.delete(keys).instrument(span.clone()).await;
+        log_call(&span, &result, t0.elapsed());
         let elapsed = t0.elapsed();
         inflight_dec(&instance, op);
         match &result {

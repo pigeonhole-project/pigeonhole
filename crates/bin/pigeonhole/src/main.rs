@@ -10,15 +10,10 @@ use admin::{cmd_purge, cmd_restore};
 use anyhow::{bail, Context};
 use serve::cmd_serve;
 use tracing::warn;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    pigeonhole::logging::init(&pigeonhole_chunk_store::LoggingSettings::from_config_file());
 
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {

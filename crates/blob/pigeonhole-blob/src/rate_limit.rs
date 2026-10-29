@@ -184,7 +184,7 @@ impl BotLimiter {
 
     /// A 429 not tied to one chat: every chat of the bot waits.
     pub fn penalize(&self, retry_after: Duration) {
-        debug!(?retry_after, "telegram bot cool-down from 429");
+        cool_down("bot", retry_after);
         self.calls.penalize(retry_after);
     }
 }
@@ -280,12 +280,12 @@ impl ChatLimiter {
     }
 
     pub fn penalize_info(&self, retry_after: Duration) {
-        debug!(?retry_after, "telegram info cool-down from 429");
+        cool_down("info", retry_after);
         self.info.penalize(retry_after);
     }
 
     pub fn penalize_send(&self, retry_after: Duration) {
-        debug!(?retry_after, "telegram send cool-down from 429");
+        cool_down("send", retry_after);
         self.send.penalize(retry_after);
     }
 
@@ -296,7 +296,7 @@ impl ChatLimiter {
 
     /// `getFile` is not tied to a chat: its 429 holds the whole bot.
     pub fn penalize_get_file(&self, retry_after: Duration) {
-        debug!(?retry_after, "telegram getFile cool-down from 429");
+        cool_down("getFile", retry_after);
         self.get_file.penalize(retry_after);
         self.bot.penalize(retry_after);
     }
@@ -307,7 +307,7 @@ impl ChatLimiter {
     }
 
     pub fn penalize_delete(&self, retry_after: Duration) {
-        debug!(?retry_after, "telegram delete cool-down from 429");
+        cool_down("delete", retry_after);
         self.delete.penalize(retry_after);
     }
 
@@ -373,6 +373,16 @@ impl LimiterRegistry {
         let l = Arc::new(ChatLimiter::for_bot(self.cfg.clone(), bot_limiter));
         chats.insert((bot.to_string(), chat.to_string()), l.clone());
         l
+    }
+}
+
+/// A rate limit the server asked for: `info` when it is long enough for a
+/// person to notice (a stalled upload, a slow boot), `debug` otherwise.
+fn cool_down(budget: &'static str, retry_after: Duration) {
+    if retry_after >= Duration::from_secs(5) {
+        tracing::info!(budget, wait_secs = retry_after.as_secs_f64(), "rate limited: waiting");
+    } else {
+        debug!(budget, ?retry_after, "rate limited");
     }
 }
 

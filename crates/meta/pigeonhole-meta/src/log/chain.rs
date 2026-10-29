@@ -436,7 +436,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         }
         if let Some(keep) = keep {
             if let Err(e) = self.chain.prune(&keep.id).await {
-                tracing::debug!(error = %format!("{e:#}"), "log collection failed; retried at the next rebase");
+                tracing::warn!(error = %format!("{e:#}"), "log collection failed; retried at the next rebase");
             }
         }
         Ok(())

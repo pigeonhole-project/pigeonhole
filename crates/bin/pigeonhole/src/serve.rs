@@ -9,6 +9,7 @@ use axum::Router;
 use pigeonhole::config::Config;
 use pigeonhole::gateway_metrics::track_gateway;
 use pigeonhole::http_timeout::with_http_timeouts;
+use pigeonhole::request_log::trace_request;
 use pigeonhole::index::Index;
 use pigeonhole::{build_s3_gateway, build_s3_service};
 use s3s::{Body, HttpError};
@@ -64,6 +65,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     let body_idle = Duration::from_secs(cfg.http.request_timeout_secs);
     let headers_timeout = Duration::from_secs(cfg.http.headers_timeout_secs);
     let concurrency = cfg.http.max_concurrent_requests;
+    let slow_request = cfg.log.slow_request;
     let mut app = Router::new();
     #[cfg(feature = "metrics-prometheus")]
     if metrics_on_main {
@@ -79,6 +81,10 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         }))
         .layer(axum::middleware::from_fn(|req, next| {
             track_gateway("s3", req, next)
+        }))
+        // Outermost: the request's span covers everything below.
+        .layer(axum::middleware::from_fn(move |req, next| {
+            trace_request("s3", slow_request, req, next)
         }));
     let app = with_http_timeouts(app, headers_timeout, body_idle, concurrency);
 

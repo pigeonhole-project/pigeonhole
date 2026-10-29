@@ -14,7 +14,7 @@ pub mod sweep;
 pub use blob_db::{is_chunk_gone, BlobDb, ChunkGone, ChunkStats, ReadPin, StoredBlock};
 pub use commands::{ChunkCommand, ChunkReject, ChunkState, InstanceRec, PartRec, Replica};
 pub use config::{
-    BytestreamSettings, Config, HttpSettings, LogSettings, MetaSettings, MetricsSettings, SnapshotSettings,
+    BytestreamSettings, Config, HttpSettings, LogFormat, LogSettings, LoggingSettings, MetaSettings, MetricsSettings, SnapshotSettings, DEFAULT_LOG_LEVEL,
     PlacementConfig, ShardPlacement,
 };
 pub use layer::{

@@ -68,7 +68,57 @@ pub struct Config {
     pub repair: RepairConfig,
     /// Prometheus scrape endpoint (`[metrics]`); off by default.
     pub metrics: MetricsSettings,
+    /// What the process logs (`[log]`).
+    pub log: LoggingSettings,
     pub config_path: PathBuf,
+}
+
+/// Default `[log] level`: our crates at `info`; openraft's per-step chatter
+/// and s3s's own error lines (a refused signature logged as ERROR) are off —
+/// the request log says what each request did.
+pub const DEFAULT_LOG_LEVEL: &str = "info,openraft=warn,s3s=off";
+
+/// `[log]`: what the process prints, to stderr (docs/observability.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoggingSettings {
+    /// `tracing` filter directives (`info`, `info,pigeonhole_meta=debug`, …);
+    /// `RUST_LOG`, when set, wins.
+    pub level: String,
+    pub format: LogFormat,
+    /// A request slower than this to its response headers is logged at `info`.
+    pub slow_request: Duration,
+}
+
+/// `[log] format`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// For people; colours only on a terminal.
+    Text,
+    /// One JSON object per line, with the spans an event happened in.
+    Json,
+}
+
+impl Default for LoggingSettings {
+    fn default() -> Self {
+        FileLog::default().into_settings()
+    }
+}
+
+impl LoggingSettings {
+    /// `[log]` of the config file (`PIGEONHOLE_CONFIG`, else
+    /// `pigeonhole.toml`), read before anything else so that loading the rest
+    /// of the config is logged too. A missing or broken file gives the
+    /// defaults: `Config::load` reports the error.
+    pub fn from_config_file() -> Self {
+        let _ = dotenvy::dotenv();
+        let log = fs::read_to_string(config_path_from_env())
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|mut t| t.remove("log"))
+            .and_then(|v| v.try_into::<FileLog>().ok());
+        log.unwrap_or_default().into_settings()
+    }
 }
 
 /// Metadata tablet: group commit knobs, the command log and the snapshot
@@ -293,6 +343,7 @@ impl Config {
             sweep: file.sweep.into_sweep_config(),
             repair: file.repair.into_repair_config(),
             metrics: file.metrics.into_settings(),
+            log: file.log.into_settings(),
             config_path,
         })
     }
@@ -339,6 +390,7 @@ impl Config {
             sweep: SweepConfig::default(),
             repair: RepairConfig::default(),
             metrics: MetricsSettings::default(),
+            log: LoggingSettings::default(),
             config_path: PathBuf::from("(test)"),
         }
     }
@@ -405,6 +457,28 @@ struct FileConfig {
     repair: FileRepair,
     #[serde(default)]
     metrics: FileMetrics,
+    #[serde(default)]
+    log: FileLog,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileLog {
+    level: String,
+    format: LogFormat,
+    slow_request_ms: u64,
+}
+
+impl Default for FileLog {
+    fn default() -> Self {
+        Self { level: DEFAULT_LOG_LEVEL.into(), format: LogFormat::Text, slow_request_ms: 5_000 }
+    }
+}
+
+impl FileLog {
+    fn into_settings(self) -> LoggingSettings {
+        LoggingSettings { level: self.level, format: self.format, slow_request: Duration::from_millis(self.slow_request_ms) }
+    }
 }
 
 impl Default for FileConfig {
@@ -425,6 +499,7 @@ impl Default for FileConfig {
             sweep: FileSweep::default(),
             repair: FileRepair::default(),
             metrics: FileMetrics::default(),
+            log: FileLog::default(),
         }
     }
 }
@@ -1106,6 +1181,20 @@ upload_concurrency = 4
         for stale in ["[[instances]]\nid = \"x\"\nkind = \"memory\"\n", "[placement]\ngroup = [\"mem\"]\n"] {
             assert!(load_mem(stale).is_err(), "{stale:?} accepted");
         }
+    }
+
+    #[test]
+    fn log_settings_default_and_parse() {
+        let cfg = load_mem("").unwrap();
+        assert_eq!(cfg.log, LoggingSettings::default());
+        assert_eq!(cfg.log.level, DEFAULT_LOG_LEVEL);
+        let cfg = load_mem("[log]\nlevel = \"debug\"\nformat = \"json\"\nslow_request_ms = 250\n").unwrap();
+        assert_eq!(
+            cfg.log,
+            LoggingSettings { level: "debug".into(), format: LogFormat::Json, slow_request: Duration::from_millis(250) }
+        );
+        assert!(load_mem("[log]\nformat = \"xml\"\n").is_err());
+        assert!(load_mem("[log]\nlevels = \"debug\"\n").is_err(), "unknown keys are refused");
     }
 
     #[test]

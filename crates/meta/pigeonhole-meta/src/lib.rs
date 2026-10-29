@@ -483,8 +483,29 @@ impl MetaStore {
         }
         let (gen, head) = claim_next(log.as_ref(), known.map_or(0, |d| d.gen)).await?;
         let d = log.discover().await.context("discover log")?.context("a claimed log is discovered")?;
+        tracing::info!(
+            generation = gen,
+            log = %head.log_id,
+            head = d.head.position,
+            base = d.base.as_ref().map_or(0, |b| b.at),
+            "claimed the metadata log"
+        );
 
         let (stop_tx, stop) = watch::channel(None);
+        // Whatever stops the tablet (a newer generation, a failed append, a
+        // failed commit), say so once, with the reason.
+        let mut watch_stop = stop.clone();
+        tokio::spawn(async move {
+            if let Ok(stop) = watch_stop.wait_for(Option::is_some).await {
+                let stop = stop.clone().expect("waited for a stop");
+                match stop {
+                    Stop::Fenced { current } => {
+                        tracing::warn!(generation = gen, current, "tablet stopped: a newer generation claimed the log")
+                    }
+                    Stop::Failed(why) => tracing::error!(generation = gen, reason = %why, "tablet stopped"),
+                }
+            }
+        });
         let shared = Arc::new(raft::Shared {
             stop: stop_tx,
             applied: AtomicU64::new(0),
@@ -597,6 +618,13 @@ impl MetaStore {
         });
         *store.ticker.lock().unwrap() = ticker;
         telemetry::record_boot(store.applied_position().saturating_sub(store.base_position()), t0.elapsed());
+        tracing::info!(
+            generation = gen,
+            position = store.applied_position(),
+            replayed = store.applied_position().saturating_sub(store.base_position()),
+            ms = t0.elapsed().as_millis() as u64,
+            "metadata tablet ready"
+        );
         store.record_gauges();
         Ok(Arc::new(store))
     }

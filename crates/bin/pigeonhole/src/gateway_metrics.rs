@@ -16,8 +16,9 @@ use std::time::Instant;
 /// the body bytes that actually crossed the wire each way (a HEAD sends none,
 /// whatever its `Content-Length` says; an aborted download counts what left).
 pub async fn track_gateway(gateway: &'static str, req: Request, next: Next) -> Response {
-    let slot = S3OpSlot::default();
     let (mut parts, body) = req.into_parts();
+    // The request log may have put one in already: one slot per request.
+    let slot = parts.extensions.get::<S3OpSlot>().cloned().unwrap_or_default();
     parts.extensions.insert(slot.clone());
     let body = Body::new(CountingBody::new(body, gateway, slot.clone(), Direction::FromClient));
     // Dropped unanswered (the client went away): recorded as `cancelled`.

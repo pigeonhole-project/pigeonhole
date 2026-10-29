@@ -145,7 +145,6 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     let meta = MetaStore::open(log, snapshots, namespaces, opts)
         .await
         .context("boot metadata tablet")?;
-    info!(generation = meta.generation(), "metadata tablet active");
     let blob_db = BlobDb::open(meta.clone())
         .await
         .context("open chunk metadata")?;

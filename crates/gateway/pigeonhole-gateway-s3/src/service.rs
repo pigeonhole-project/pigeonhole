@@ -66,11 +66,12 @@ impl S3Gateway {
             return;
         }
         let store = self.store.clone();
-        tokio::spawn(async move {
+        // After the answer, under the request's span still.
+        tokio::spawn(tracing::Instrument::in_current_span(async move {
             if let Err(e) = store.release(&ids).await {
                 tracing::warn!(error = %e, "chunk release failed");
             }
-        });
+        }));
     }
 
     /// Commit an ingest's chunks and `command` (and `then`, if any) as one

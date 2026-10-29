@@ -2,6 +2,8 @@
 
 pub mod gateway_metrics;
 pub mod http_timeout;
+pub mod logging;
+pub mod request_log;
 pub mod state_metrics;
 #[cfg(feature = "metrics-prometheus")]
 pub mod prometheus;
