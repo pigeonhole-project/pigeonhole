@@ -1,0 +1,153 @@
+# Discord vs Telegram: one node, measured
+
+One run on 2026-10-29 (code at 26b9e37), the same S3 workload against a
+pigeonhole whose blobs, log and snapshots all live in one service's test
+channels, and against a local disk for scale. Raw results:
+[bench/2026-10-29/](bench/2026-10-29/) (`tables.md` has every number below,
+the JSON files every counter).
+
+## Summary
+
+| | disk | Discord | Telegram |
+|---|---|---|---|
+| Small PUT, one client: latency p50 | 9 ms | 6.7 s | 3.3 s |
+| Small PUT, one client: PUTs/s | 104 | 0.15 | 0.31 |
+| Small PUT, 8 clients: PUTs/s | 133 | 0.30 | 0.30 |
+| Large PUT (1–32 MiB, one at a time) | 101 MiB/s | 1.3 MiB/s | 2.7 MiB/s |
+| Cold GET, whole objects | 371 MiB/s | 6.6 MiB/s | 5.6 MiB/s |
+| 1 MiB ranged GET p50 | 2 ms | 111 ms | 115 ms |
+| HEAD / LIST p50 | 1 ms | 1 ms | 1 ms |
+
+- **Writes are bound by the metadata log, not by bandwidth.** Every PUT is
+  one log entry, and a log entry is a chat message: Discord takes ≥ 6.7 s
+  per entry, Telegram 3.3 s. With one client Telegram writes twice as fast.
+- **Uploading bytes costs the same on both**, about 2.7–2.9 MiB/s per
+  upload (16 MiB chunks, one stream).
+- **Reads are comparable** (5.6–6.6 MiB/s whole, ~110 ms per 1 MiB range)
+  and never touch the log.
+- **With 8 clients both stop at 0.30 PUTs/s**, for different reasons:
+  Discord on the log (entries are paced; proposals share them), Telegram on
+  the blobs channel (every PUT is a message there too).
+- Metadata reads (HEAD, LIST) answer from the tablet's memory: ~1 ms
+  whatever the backend.
+
+## Setup
+
+- `scripts/bench.sh disk discord telegram` → per backend a fresh server from
+  `scripts/metrics-demo.sh` with **no block cache** (`METRICS_DEMO_CACHE=off`)
+  and no demo traffic; `scripts/bench-backends.py` drives it over S3 (boto3)
+  and reads `/metrics` before and after each phase.
+- Each service: blobs, log and snapshots in three channels of its own
+  (`[meta] log` / `snapshot` in the service, as `.env`'s test channels);
+  chunks of 16 MiB, codec zstd, payloads random (incompressible).
+- Limits as shipped: Telegram `[telegram]` defaults (send 0.3/s per chat,
+  burst 3); Discord `[discord]` defaults (send 1/s burst 5) and the thread
+  pacer (burst 5, then one thread per ~6.7 s, ≤ 50 per 300 s).
+- Phases are time-boxed (each until its operation count or time runs out),
+  in this order, on one tablet: sequential 4 KiB PUTs (≤ 60, 180 s); PUT
+  4×1, 3×8, 2×32 MiB (270 s); GET them back whole (150 s); six 1 MiB ranged
+  GETs in a 32 MiB object (60 s); 4 KiB PUTs from 8 clients (180 s); 50
+  HEAD + 50 LIST (30 s).
+- Client and server on one macOS machine; the services over its internet
+  connection (where their servers are was not measured).
+
+## What each phase shows
+
+### Small PUTs, one client
+
+A 4 KiB PUT is one blob message and one log entry.
+
+- **Discord, 6.7 s**: blob upload 0.56 s, then the log entry: append 6.1 s.
+  An append is a message plus a thread (the link of the chain); the pacer
+  allows one thread per ~6.7 s once its burst of 5 is spent, so the log
+  runs at ~0.15 entries/s. Discord itself never answered 429.
+- **Telegram, 3.3 s**: blob upload 0.75 s, log append 2.5 s, and 171 s of
+  waits in our own limiter over the 180 s phase: each channel may send 0.3 per
+  second (`send_rate_per_sec`, under Telegram's ~20 messages a minute per
+  channel), and the log channel's bucket sets the pace. One FLOOD_WAIT (3 s).
+
+### Large PUTs
+
+The same 92 MiB in 11 chunks on both. Uploads take ~3 s per chunk on both
+services (2.9 s Telegram, 3.1 s Discord): the bandwidth is the same. The
+difference is the log entry after each object: 92 ms on Telegram (its bucket
+refilled during the upload) against 3.8 s on Discord (the pacer). Hence
+2.7 vs 1.3 MiB/s.
+
+### Cold reads
+
+With no cache every 1 MiB block is its own backend read, one after the
+other: 92 reads for 92 MiB.
+
+- Whole objects: Discord 6.6 MiB/s (149 ms to the first byte of each block),
+  Telegram 5.6 MiB/s with 4 FLOOD_WAITs (6 s in all; without them it would
+  be about as fast as Discord).
+- 1 MiB ranges: ~110 ms on both, one request each.
+
+`pigeonhole_instance_call_duration_seconds{op="get"}` reads 0 ms for
+Telegram: its stream starts lazily, so the call returns before any request.
+For Telegram reads look at the client's time or `limiter_wait` / throttles.
+
+### Eight clients
+
+| | Discord | Telegram |
+|---|---|---|
+| PUTs/s | 0.30 | 0.30 |
+| p50 / p95 / max | 13 s / 119 s / 125 s | 23 s / 40 s / 47 s |
+| log entries, proposals per entry | 21, 2.67 | 60, 1.02 |
+| proposal: queue wait / whole | 15.4 s / 23.9 s | 1 ms / 94 ms |
+| blob upload (mean) | 2.5 s | 25 s |
+
+- **Discord** is log-bound and the batcher shows it: proposals queue behind
+  the entry being written (15 s on average) and share entries (2.67 each).
+  Entries came every ~9 s, slower than the pacer's 6.7 s, and p95 was 119 s:
+  the 50-threads-per-300 s window was already mostly spent by the phases
+  before, so the pacer held entries until the window moved.
+- **Telegram** is blob-bound: eight clients share one blobs channel at 0.3
+  sends/s, so an upload waits 25 s in our limiter (398 s of waits in the
+  phase) and proposals reach the log one at a time (1.02 per entry). Three
+  FLOOD_WAITs (13 s).
+- Both land on ~0.3 PUTs/s: Telegram's blobs channel rate, and Discord's
+  log rate (0.11 entries/s) times 2.67 proposals per entry.
+
+## What would move the numbers
+
+- **Telegram: more blob channels.** One chat's send budget is the ceiling
+  for writes under load; `[[shards]]` over several blob chats multiplies it
+  (step 7). The log channel then becomes the limit at 0.3 entries/s, where
+  group commit starts to pay as it does on Discord.
+- **Discord: fewer threads.** A log entry costs a paced thread; more blob
+  channels would not help. Batching already helps under load; an entry
+  that links less often than once per message would lift the ceiling
+  (a design question for the chain, docs/discord-log.md).
+- **Both: reads in parallel.** Cold reads fetch blocks one at a time;
+  reading ahead a few blocks (the old, never used `readahead_blocks`)
+  would multiply read throughput on both. With the cache on (the default),
+  reads after a write are free (L2 write-through).
+- **Small objects and Telegram's text path**: blobs that fit a text
+  message already go as text; they still cost a send each.
+
+## Caveats
+
+- One run, from one place; small samples for the large PUT and GET phases
+  (9 objects). The services' latency varies by hour and by route.
+- Phases share one tablet and one rate-limit state: Discord's thread window
+  spent in early phases slowed the 8-client phase; Telegram's buckets carry
+  over the same way. Running a phase alone would give it a fresh budget.
+- Telegram ran on `[telegram]` defaults (0.3 sends/s per chat), which sit
+  just under the service's ~20 messages a minute per channel; Discord on
+  its new defaults and the pacer of 30e19f2.
+
+## Running it again
+
+```sh
+brew install uv prometheus grafana
+./scripts/bench.sh disk discord telegram   # ~35 min; BENCH_MINUTES scales the phases
+cat .cache/bench/report.md
+```
+
+It needs the test channels and tokens in `.env`. The run leaves those
+channels as it found them: Discord's are emptied whole, Telegram's between
+two marker messages it posts (`bench_window` in
+`crates/storage/pigeonhole-storage-telegram/tests/live.rs`). While it runs,
+the dashboard is up at http://127.0.0.1:3000/d/pigeonhole/pigeonhole.
