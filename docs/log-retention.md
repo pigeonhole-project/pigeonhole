@@ -95,7 +95,7 @@ What idle means (built, `rate_limit.rs`):
   (`with_rate`) adds a token bucket with the same rule; none by default.
 
 `Chain::prune` is background work by contract: memory, disk and Telegram
-prune a batch per idle moment already (Discord once log-collect is in).
+prune a batch per idle moment already; so does Discord.
 
 **Safety across incarnations.** A newer generation sees every rebase record
 an older one saw, plus its own, so its watermark is at or above the older
