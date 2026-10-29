@@ -6,6 +6,7 @@
 #   METRICS_DEMO_BACKEND=discord ./scripts/metrics-demo.sh up
 #                                      # blobs, log and snapshots in the Discord channels
 #                                      # DISCORD_{BLOBS,LOG,SNAP}_CHANNEL_ID of .env, gentler traffic
+#   LOAD_CLIENTS=8 LOAD_PAUSE=0 …      # traffic shape (scripts/metrics-load.sh)
 #   ./scripts/metrics-demo.sh check    # every dashboard query answers; every metric is documented
 #   ./scripts/metrics-demo.sh status
 #   ./scripts/metrics-demo.sh down     # stop (data stays in $STATE; `clean` removes it)
@@ -202,9 +203,12 @@ up() {
   wait_http grafana "http://127.0.0.1:$GRAFANA_PORT/api/health"
 
   if [[ -z "${NO_LOAD:-}" ]]; then
-    local pause=0
-    [[ "$BACKEND" == discord ]] && pause=10
-    ENDPOINT="http://$S3_ADDR" LOAD_PAUSE="${LOAD_PAUSE:-$pause}" start load "$ROOT/scripts/metrics-load.sh"
+    # A chat store: few clients, long pauses (its rate limits, and every
+    # write lands in the channels).
+    local pause=0 clients=4
+    [[ "$BACKEND" == discord ]] && pause=20 clients=3
+    ENDPOINT="http://$S3_ADDR" LOAD_PAUSE="${LOAD_PAUSE:-$pause}" LOAD_CLIENTS="${LOAD_CLIENTS:-$clients}" \
+      start load "$ROOT/scripts/metrics-load.sh"
   fi
   status
   echo
@@ -255,10 +259,20 @@ status() {
   done
 }
 
+# kill_tree PID: the process and everything it started (the load's clients
+# and their aws calls).
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1"); do
+    kill_tree "$child"
+  done
+  kill "$1" 2>/dev/null || true
+}
+
 down() {
   for name in load grafana prometheus pigeonhole; do
     if running "$name"; then
-      kill "$(cat "$STATE/$name.pid")"
+      kill_tree "$(cat "$STATE/$name.pid")"
       echo "stopped $name"
     fi
     rm -f "$STATE/$name.pid"

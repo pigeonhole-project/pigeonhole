@@ -164,3 +164,14 @@ async fn snapshots_against_a_live_channel() {
     assert_eq!(fresh.newest().await.unwrap().map(|s| s.at), Some(3));
     empty(&ch).await;
 }
+
+/// Empty the three test channels (after a live run of anything, e.g.
+/// `METRICS_DEMO_BACKEND=discord scripts/metrics-demo.sh`).
+#[tokio::test]
+#[ignore = "needs a Discord bot and the test channels"]
+async fn empty_test_channels() {
+    for var in ["DISCORD_BLOBS_CHANNEL_ID", "DISCORD_LOG_CHANNEL_ID", "DISCORD_SNAP_CHANNEL_ID"] {
+        let (ch, ..) = channel(var);
+        empty(&ch).await;
+    }
+}

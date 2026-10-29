@@ -184,13 +184,15 @@ impl BotLimiter {
 
     /// A 429 not tied to one chat: every chat of the bot waits.
     pub fn penalize(&self, retry_after: Duration) {
-        cool_down("bot", retry_after);
+        cool_down("", "bot", retry_after);
         self.calls.penalize(retry_after);
     }
 }
 
 /// Budgets for one chat; each call also takes a token from its bot.
 pub struct ChatLimiter {
+    /// The chat / channel id, a metrics label.
+    chat: String,
     bot: Arc<BotLimiter>,
     send: TokenBucket,
     get_file: TokenBucket,
@@ -218,6 +220,28 @@ pub struct ChatLimiterConfig {
     pub download_concurrency: usize,
 }
 
+impl ChatLimiterConfig {
+    /// Discord: ~50 requests a second per bot; per channel ~5 messages per
+    /// 5 s (a log entry is a message and a thread: two sends) and route
+    /// limits the client also reads from the headers.
+    pub fn discord() -> Self {
+        Self {
+            bot_rate_per_sec: 40.0,
+            bot_burst: 50.0,
+            send_rate_per_sec: 1.0,
+            send_burst: 5.0,
+            get_file_rate_per_sec: 5.0,
+            get_file_burst: 10.0,
+            delete_rate_per_sec: 1.0,
+            delete_burst: 5.0,
+            info_rate_per_sec: 2.0,
+            info_burst: 5.0,
+            upload_concurrency: 2,
+            download_concurrency: 8,
+        }
+    }
+}
+
 impl Default for ChatLimiterConfig {
     fn default() -> Self {
         Self {
@@ -243,12 +267,13 @@ impl ChatLimiter {
     /// A chat with a bot of its own (tests, single-chat tools).
     pub fn new(cfg: ChatLimiterConfig) -> Self {
         let bot = Arc::new(BotLimiter::new(cfg.bot_rate_per_sec, cfg.bot_burst));
-        Self::for_bot(cfg, bot)
+        Self::for_bot(cfg, bot, "")
     }
 
-    /// A chat of `bot`, sharing its bot-level budget with the bot's other chats.
-    pub fn for_bot(cfg: ChatLimiterConfig, bot: Arc<BotLimiter>) -> Self {
+    /// Chat `chat` of `bot`, sharing its bot-level budget with the bot's other chats.
+    pub fn for_bot(cfg: ChatLimiterConfig, bot: Arc<BotLimiter>, chat: &str) -> Self {
         Self {
+            chat: chat.to_owned(),
             bot,
             send: TokenBucket::new(cfg.send_rate_per_sec, cfg.send_burst),
             get_file: TokenBucket::new(cfg.get_file_rate_per_sec, cfg.get_file_burst),
@@ -266,7 +291,7 @@ impl ChatLimiter {
     /// Chat bucket first, then the bot's.
     async fn take(&self, bucket: &TokenBucket, name: &'static str) {
         let waited = bucket.acquire().await + self.bot.acquire().await;
-        crate::metrics::record_limiter_wait(name, waited);
+        crate::metrics::record_limiter_wait(&self.chat, name, waited);
     }
 
     /// `sendDocument` / `sendMessage` / pin / unpin.
@@ -280,12 +305,12 @@ impl ChatLimiter {
     }
 
     pub fn penalize_info(&self, retry_after: Duration) {
-        cool_down("info", retry_after);
+        cool_down(&self.chat, "info", retry_after);
         self.info.penalize(retry_after);
     }
 
     pub fn penalize_send(&self, retry_after: Duration) {
-        cool_down("send", retry_after);
+        cool_down(&self.chat, "send", retry_after);
         self.send.penalize(retry_after);
     }
 
@@ -296,7 +321,7 @@ impl ChatLimiter {
 
     /// `getFile` is not tied to a chat: its 429 holds the whole bot.
     pub fn penalize_get_file(&self, retry_after: Duration) {
-        cool_down("getFile", retry_after);
+        cool_down(&self.chat, "getFile", retry_after);
         self.get_file.penalize(retry_after);
         self.bot.penalize(retry_after);
     }
@@ -307,7 +332,7 @@ impl ChatLimiter {
     }
 
     pub fn penalize_delete(&self, retry_after: Duration) {
-        cool_down("delete", retry_after);
+        cool_down(&self.chat, "delete", retry_after);
         self.delete.penalize(retry_after);
     }
 
@@ -370,7 +395,7 @@ impl LimiterRegistry {
             .entry(bot.to_string())
             .or_insert_with(|| Arc::new(BotLimiter::new(self.cfg.bot_rate_per_sec, self.cfg.bot_burst)))
             .clone();
-        let l = Arc::new(ChatLimiter::for_bot(self.cfg.clone(), bot_limiter));
+        let l = Arc::new(ChatLimiter::for_bot(self.cfg.clone(), bot_limiter, chat));
         chats.insert((bot.to_string(), chat.to_string()), l.clone());
         l
     }
@@ -378,11 +403,11 @@ impl LimiterRegistry {
 
 /// A rate limit the server asked for: `info` when it is long enough for a
 /// person to notice (a stalled upload, a slow boot), `debug` otherwise.
-fn cool_down(budget: &'static str, retry_after: Duration) {
+fn cool_down(chat: &str, budget: &'static str, retry_after: Duration) {
     if retry_after >= Duration::from_secs(5) {
-        tracing::info!(budget, wait_secs = retry_after.as_secs_f64(), "rate limited: waiting");
+        tracing::info!(chat, budget, wait_secs = retry_after.as_secs_f64(), "rate limited: waiting");
     } else {
-        debug!(budget, ?retry_after, "rate limited");
+        debug!(chat, budget, ?retry_after, "rate limited");
     }
 }
 
