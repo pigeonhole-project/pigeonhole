@@ -1457,7 +1457,7 @@
   },
   {
    "type": "timeseries",
-   "title": "Commits/s and commands/s",
+   "title": "Entries, proposals, commands /s",
    "id": 33,
    "datasource": {
     "type": "prometheus",
@@ -1476,6 +1476,15 @@
     },
     {
      "refId": "B",
+     "expr": "sum(rate(pigeonhole_meta_proposals_per_entry_sum[$__rate_interval]))",
+     "legendFormat": "proposals",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    },
+    {
+     "refId": "C",
      "expr": "sum(rate(pigeonhole_meta_commands_per_entry_sum[$__rate_interval]))",
      "legendFormat": "commands",
      "datasource": {
@@ -1517,16 +1526,34 @@
   },
   {
    "type": "timeseries",
-   "title": "Commit / append p99",
+   "title": "Propose p99, split",
    "id": 34,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
    },
-   "description": "",
+   "description": "propose \u2248 queue wait + commit; commit includes the log append and applying",
    "targets": [
     {
      "refId": "A",
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(pigeonhole_meta_propose_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "propose (caller)",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(pigeonhole_meta_queue_wait_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "queue wait",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    },
+    {
+     "refId": "C",
      "expr": "histogram_quantile(0.99, sum by (le) (rate(pigeonhole_meta_commit_seconds_bucket[$__rate_interval])))",
      "legendFormat": "commit (batcher)",
      "datasource": {
@@ -1535,7 +1562,7 @@
      }
     },
     {
-     "refId": "B",
+     "refId": "D",
      "expr": "histogram_quantile(0.99, sum by (le) (rate(pigeonhole_meta_log_append_seconds_bucket[$__rate_interval])))",
      "legendFormat": "log append",
      "datasource": {
@@ -1577,8 +1604,128 @@
   },
   {
    "type": "timeseries",
-   "title": "Log written",
+   "title": "Batcher queue",
    "id": 35,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "pigeonhole_meta_queue_depth",
+     "legendFormat": "waiting",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "rate(pigeonhole_meta_batch_full_total[$__rate_interval])",
+     "legendFormat": "full entries/s",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 58
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Proposals per entry",
+   "id": 36,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "(rate(pigeonhole_meta_proposals_per_entry_sum[$__rate_interval])) / (rate(pigeonhole_meta_proposals_per_entry_count[$__rate_interval]))",
+     "legendFormat": "mean",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(pigeonhole_meta_proposals_per_entry_bucket[$__rate_interval])))",
+     "legendFormat": "p99",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 66
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Log written",
+   "id": 37,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -1621,15 +1768,15 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 8,
-    "x": 16,
-    "y": 58
+    "w": 12,
+    "x": 12,
+    "y": 66
    }
   },
   {
    "type": "timeseries",
    "title": "Entries since snapshot",
-   "id": 36,
+   "id": 38,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -1674,13 +1821,13 @@
     "h": 8,
     "w": 4,
     "x": 0,
-    "y": 66
+    "y": 74
    }
   },
   {
    "type": "timeseries",
    "title": "Snapshot size",
-   "id": 37,
+   "id": 39,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -1725,13 +1872,13 @@
     "h": 8,
     "w": 4,
     "x": 4,
-    "y": 66
+    "y": 74
    }
   },
   {
    "type": "stat",
    "title": "Last boot",
-   "id": 38,
+   "id": 40,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -1775,13 +1922,13 @@
     "h": 8,
     "w": 4,
     "x": 8,
-    "y": 66
+    "y": 74
    }
   },
   {
    "type": "stat",
    "title": "Replayed on boot",
-   "id": 39,
+   "id": 41,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -1825,13 +1972,13 @@
     "h": 8,
     "w": 4,
     "x": 12,
-    "y": 66
+    "y": 74
    }
   },
   {
    "type": "stat",
    "title": "Generation",
-   "id": 40,
+   "id": 42,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -1875,13 +2022,13 @@
     "h": 8,
     "w": 4,
     "x": 16,
-    "y": 66
+    "y": 74
    }
   },
   {
    "type": "stat",
    "title": "Stopped",
-   "id": 41,
+   "id": 43,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -1933,25 +2080,25 @@
     "h": 8,
     "w": 4,
     "x": 20,
-    "y": 66
+    "y": 74
    }
   },
   {
    "type": "row",
    "title": "Contents",
-   "id": 42,
+   "id": 44,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 74
+    "y": 82
    }
   },
   {
    "type": "timeseries",
    "title": "Objects / uploads",
-   "id": 43,
+   "id": 45,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2014,13 +2161,13 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 75
+    "y": 83
    }
   },
   {
    "type": "timeseries",
    "title": "Chunks by state",
-   "id": 44,
+   "id": 46,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2065,13 +2212,13 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 75
+    "y": 83
    }
   },
   {
    "type": "timeseries",
    "title": "Logical vs stored",
-   "id": 45,
+   "id": 47,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2134,25 +2281,25 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 75
+    "y": 83
    }
   },
   {
    "type": "row",
    "title": "Background",
-   "id": 46,
+   "id": 48,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 83
+    "y": 91
    }
   },
   {
    "type": "timeseries",
    "title": "Sweeper",
-   "id": 47,
+   "id": 49,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2197,13 +2344,13 @@
     "h": 8,
     "w": 6,
     "x": 0,
-    "y": 84
+    "y": 92
    }
   },
   {
    "type": "timeseries",
    "title": "Repair",
-   "id": 48,
+   "id": 50,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2248,13 +2395,13 @@
     "h": 8,
     "w": 6,
     "x": 6,
-    "y": 84
+    "y": 92
    }
   },
   {
    "type": "timeseries",
    "title": "Pass duration p99",
-   "id": 49,
+   "id": 51,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2299,13 +2446,13 @@
     "h": 8,
     "w": 6,
     "x": 12,
-    "y": 84
+    "y": 92
    }
   },
   {
    "type": "timeseries",
    "title": "Repair queue",
-   "id": 50,
+   "id": 52,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2350,25 +2497,25 @@
     "h": 8,
     "w": 6,
     "x": 18,
-    "y": 84
+    "y": 92
    }
   },
   {
    "type": "row",
    "title": "Chat rate limits",
-   "id": 51,
+   "id": 53,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 92
+    "y": 100
    }
   },
   {
    "type": "timeseries",
    "title": "Throttle waits asked (s/s)",
-   "id": 52,
+   "id": 54,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2413,13 +2560,13 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 93
+    "y": 101
    }
   },
   {
    "type": "timeseries",
    "title": "Calls failed rate limited",
-   "id": 53,
+   "id": 55,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2464,13 +2611,13 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 93
+    "y": 101
    }
   },
   {
    "type": "timeseries",
    "title": "Own limiter wait p99",
-   "id": 54,
+   "id": 56,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2515,7 +2662,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 93
+    "y": 101
    }
   }
  ]

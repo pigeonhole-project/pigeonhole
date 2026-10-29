@@ -9,7 +9,24 @@ pub const METRICS: &[MetricDoc] = &[
         &["outcome"],
         "Time to commit and apply one log entry (a batch of proposals), from the batcher",
     ),
+    MetricDoc::histogram(
+        "pigeonhole_meta_propose_seconds",
+        &["outcome"],
+        "A proposal's whole wait, as its caller sees it: queued, then committed and applied",
+    ),
+    MetricDoc::histogram(
+        "pigeonhole_meta_queue_wait_seconds",
+        &[],
+        "Time a proposal waits in the batcher's queue (behind the entry being written)",
+    ),
+    MetricDoc::gauge("pigeonhole_meta_queue_depth", &[], "Proposals waiting in the batcher's queue"),
     MetricDoc::histogram("pigeonhole_meta_commands_per_entry", &[], "Commands group-committed in one log entry"),
+    MetricDoc::histogram("pigeonhole_meta_proposals_per_entry", &[], "Proposals group-committed in one log entry"),
+    MetricDoc::counter(
+        "pigeonhole_meta_batch_full_total",
+        &[],
+        "Entries that reached MAX_BATCH commands (a proposal that did not fit waits for the next)",
+    ),
     MetricDoc::histogram("pigeonhole_meta_log_append_seconds", &["outcome"], "LogStore append of a batch of entries (fsync / chat message)"),
     MetricDoc::counter("pigeonhole_meta_log_entries_total", &[], "Entries appended to the log"),
     MetricDoc::counter("pigeonhole_meta_log_bytes_total", &[], "Entry payload bytes appended to the log"),
@@ -32,9 +49,30 @@ fn outcome(ok: bool) -> &'static str {
     }
 }
 
-pub(crate) fn record_commit(ok: bool, commands: usize, d: Duration) {
+pub(crate) fn record_commit(ok: bool, commands: usize, proposals: usize, d: Duration) {
     metrics::histogram!("pigeonhole_meta_commit_seconds", "outcome" => outcome(ok)).record(d.as_secs_f64());
     metrics::histogram!("pigeonhole_meta_commands_per_entry").record(commands as f64);
+    metrics::histogram!("pigeonhole_meta_proposals_per_entry").record(proposals as f64);
+}
+
+pub(crate) fn record_propose(ok: bool, d: Duration) {
+    metrics::histogram!("pigeonhole_meta_propose_seconds", "outcome" => outcome(ok)).record(d.as_secs_f64());
+}
+
+pub(crate) fn record_queue_wait(d: Duration) {
+    metrics::histogram!("pigeonhole_meta_queue_wait_seconds").record(d.as_secs_f64());
+}
+
+pub(crate) fn record_enqueued() {
+    metrics::gauge!("pigeonhole_meta_queue_depth").increment(1.0);
+}
+
+pub(crate) fn record_dequeued(n: usize) {
+    metrics::gauge!("pigeonhole_meta_queue_depth").decrement(n as f64);
+}
+
+pub(crate) fn record_batch_full() {
+    metrics::counter!("pigeonhole_meta_batch_full_total").increment(1);
 }
 
 pub(crate) fn record_append(ok: bool, entries: usize, bytes: usize, d: Duration) {

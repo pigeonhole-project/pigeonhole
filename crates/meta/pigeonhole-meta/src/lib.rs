@@ -353,6 +353,8 @@ pub(crate) type States = HashMap<&'static str, Arc<dyn AnyState>>;
 struct Pending {
     commands: Vec<Command>,
     reply: tokio::sync::oneshot::Sender<Result<(Position, Vec<Vec<u8>>)>>,
+    /// When it was queued (the batcher's queue wait).
+    enqueued: std::time::Instant,
 }
 
 /// Commands per Raft entry at most, unless one proposal alone has more (a
@@ -364,21 +366,27 @@ const MAX_BATCH: usize = 1024;
 /// the next entry (one fsync, one chat message).
 async fn batcher(raft: raft::Raft, shared: Arc<raft::Shared>, mut rx: tokio::sync::mpsc::UnboundedReceiver<Pending>) {
     while let Some(first) = rx.recv().await {
+        telemetry::record_dequeued(1);
         let mut size = first.commands.len();
         let mut batch = vec![first];
         let mut next = None;
         while size < MAX_BATCH {
             match rx.try_recv() {
                 Ok(p) if size + p.commands.len() > MAX_BATCH => {
+                    telemetry::record_dequeued(1);
                     next = Some(p);
                     break;
                 }
                 Ok(p) => {
+                    telemetry::record_dequeued(1);
                     size += p.commands.len();
                     batch.push(p);
                 }
                 Err(_) => break,
             }
+        }
+        if next.is_some() || size >= MAX_BATCH {
+            telemetry::record_batch_full();
         }
         write_batch(&raft, &shared, batch).await;
         if let Some(p) = next {
@@ -390,8 +398,11 @@ async fn batcher(raft: raft::Raft, shared: Arc<raft::Shared>, mut rx: tokio::syn
 async fn write_batch(raft: &raft::Raft, shared: &raft::Shared, batch: Vec<Pending>) {
     let commands: Vec<Command> = batch.iter().flat_map(|p| p.commands.iter().cloned()).collect();
     let (n, t0) = (commands.len(), std::time::Instant::now());
+    for p in &batch {
+        telemetry::record_queue_wait(t0.saturating_duration_since(p.enqueued));
+    }
     let written = raft.client_write(commands).await;
-    telemetry::record_commit(written.is_ok(), n, t0.elapsed());
+    telemetry::record_commit(written.is_ok(), n, batch.len(), t0.elapsed());
     match written {
         Ok(resp) => {
             let position = raft::position(&resp.log_id);
@@ -666,10 +677,16 @@ impl MetaStore {
             return Ok((self.applied_position(), Outcomes { outcomes: Vec::new() }));
         }
         let (reply, rx) = tokio::sync::oneshot::channel();
-        if self.queue.send(Pending { commands: proposal.commands, reply }).is_err() {
+        let enqueued = std::time::Instant::now();
+        // Counted before the send: the batcher may take it at once.
+        telemetry::record_enqueued();
+        if self.queue.send(Pending { commands: proposal.commands, reply, enqueued }).is_err() {
+            telemetry::record_dequeued(1);
             bail!("the tablet's batcher is gone");
         }
-        let (position, outcomes) = rx.await.context("the tablet's batcher dropped the proposal")??;
+        let answer = rx.await.context("the tablet's batcher dropped the proposal").and_then(|r| r);
+        telemetry::record_propose(answer.is_ok(), enqueued.elapsed());
+        let (position, outcomes) = answer?;
         Ok((position, Outcomes { outcomes: outcomes.into_iter().map(Some).collect() }))
     }
 

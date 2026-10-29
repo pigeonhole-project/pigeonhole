@@ -572,3 +572,41 @@ async fn timing_probe() {
         println!("{kind}: 200 sequential {seq:?} ({:?}/op), 200 concurrent {par:?}, 50 confirm_active {conf:?}", seq / 200);
     }
 }
+
+/// Proposals queued together share entries; every one is counted in and out
+/// of the queue and its wait recorded.
+#[test]
+fn batcher_metrics_add_up() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    const N: usize = 50;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        // One thread: the batcher and Raft run where the recorder is set.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store = open_on(dir.path()).await;
+            let all = (0..N as u64).map(|i| store.propose::<Counter>(op(i, 1)));
+            for r in futures::future::join_all(all).await {
+                assert!(r.unwrap().is_ok());
+            }
+        });
+    });
+    let snapshot = snapshotter.snapshot().into_vec();
+    let value = |name: &str| snapshot.iter().find(|(k, ..)| k.key().name() == name).map(|(.., v)| v);
+    // A histogram's (count, sum).
+    let hist = |name: &str| match value(name) {
+        Some(DebugValue::Histogram(h)) => (h.len(), h.iter().map(|x| x.into_inner()).sum::<f64>()),
+        other => panic!("{name}: {other:?}"),
+    };
+    match value("pigeonhole_meta_queue_depth") {
+        Some(DebugValue::Gauge(g)) => assert_eq!(g.into_inner(), 0.0, "every proposal left the queue"),
+        other => panic!("queue depth: {other:?}"),
+    }
+    assert_eq!(hist("pigeonhole_meta_queue_wait_seconds").0, N);
+    assert_eq!(hist("pigeonhole_meta_propose_seconds").0, N);
+    let (entries, proposals) = hist("pigeonhole_meta_proposals_per_entry");
+    assert_eq!(proposals as usize, N);
+    assert!(entries < N, "{N} proposals queued at once share entries, got {entries}");
+}
