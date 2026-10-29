@@ -1,3 +1,4 @@
+#![cfg(not(madsim))] // talks gRPC over a real TCP listener
 //! In-process REAPI tests (localhost only, no external network).
 
 use bytes::Bytes;

@@ -1,4 +1,4 @@
-.PHONY: run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report
+.PHONY: sim run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report
 
 run:
 	cargo run --release
@@ -63,3 +63,8 @@ report:
 	./scripts/code_report.py --out target/code-report.md
 
 test-all: check-deps test smoke
+
+# Deterministic simulation (docs/simulation.md). MADSIM_TEST_SEED=<seed>
+# replays one run; MADSIM_TEST_NUM=<n> runs n seeds.
+sim:
+	RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test -p pigeonhole-sim

@@ -67,3 +67,6 @@ tower = { workspace = true }
 [lib]
 name = "pigeonhole"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

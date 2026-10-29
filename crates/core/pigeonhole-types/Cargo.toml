@@ -8,3 +8,6 @@ description = "Shared types for pigeonhole (no I/O)"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true
