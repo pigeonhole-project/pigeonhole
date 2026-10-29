@@ -184,7 +184,7 @@ impl BotLimiter {
 
     /// A 429 not tied to one chat: every chat of the bot waits.
     pub fn penalize(&self, retry_after: Duration) {
-        cool_down("bot", retry_after);
+        cool_down("", "bot", retry_after);
         self.calls.penalize(retry_after);
     }
 }
@@ -305,12 +305,12 @@ impl ChatLimiter {
     }
 
     pub fn penalize_info(&self, retry_after: Duration) {
-        cool_down("info", retry_after);
+        cool_down(&self.chat, "info", retry_after);
         self.info.penalize(retry_after);
     }
 
     pub fn penalize_send(&self, retry_after: Duration) {
-        cool_down("send", retry_after);
+        cool_down(&self.chat, "send", retry_after);
         self.send.penalize(retry_after);
     }
 
@@ -321,7 +321,7 @@ impl ChatLimiter {
 
     /// `getFile` is not tied to a chat: its 429 holds the whole bot.
     pub fn penalize_get_file(&self, retry_after: Duration) {
-        cool_down("getFile", retry_after);
+        cool_down(&self.chat, "getFile", retry_after);
         self.get_file.penalize(retry_after);
         self.bot.penalize(retry_after);
     }
@@ -332,7 +332,7 @@ impl ChatLimiter {
     }
 
     pub fn penalize_delete(&self, retry_after: Duration) {
-        cool_down("delete", retry_after);
+        cool_down(&self.chat, "delete", retry_after);
         self.delete.penalize(retry_after);
     }
 
@@ -403,11 +403,11 @@ impl LimiterRegistry {
 
 /// A rate limit the server asked for: `info` when it is long enough for a
 /// person to notice (a stalled upload, a slow boot), `debug` otherwise.
-fn cool_down(budget: &'static str, retry_after: Duration) {
+fn cool_down(chat: &str, budget: &'static str, retry_after: Duration) {
     if retry_after >= Duration::from_secs(5) {
-        tracing::info!(budget, wait_secs = retry_after.as_secs_f64(), "rate limited: waiting");
+        tracing::info!(chat, budget, wait_secs = retry_after.as_secs_f64(), "rate limited: waiting");
     } else {
-        debug!(budget, ?retry_after, "rate limited");
+        debug!(chat, budget, ?retry_after, "rate limited");
     }
 }
 
