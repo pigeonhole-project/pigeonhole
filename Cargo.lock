@@ -2462,6 +2462,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "metrics",
+ "metrics-util",
  "openraft",
  "pigeonhole-storage-api",
  "pigeonhole-storage-disk",

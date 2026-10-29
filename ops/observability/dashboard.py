@@ -146,13 +146,25 @@ place([
 
 row("Metadata tablet")
 place([
-    ts("Commits/s and commands/s", [
+    ts("Entries, proposals, commands /s", [
         (f"sum(rate(pigeonhole_meta_commit_seconds_count{R}))", "entries"),
+        (f"sum(rate(pigeonhole_meta_proposals_per_entry_sum{R}))", "proposals"),
         (f"sum(rate(pigeonhole_meta_commands_per_entry_sum{R}))", "commands")], "ops",
        desc="Group commit: proposals queued while one entry is written share the next"),
-    ts("Commit / append p99", [
+    ts("Propose p99, split", [
+        (q(0.99, "pigeonhole_meta_propose_seconds"), "propose (caller)"),
+        (q(0.99, "pigeonhole_meta_queue_wait_seconds"), "queue wait"),
         (q(0.99, "pigeonhole_meta_commit_seconds"), "commit (batcher)"),
-        (q(0.99, "pigeonhole_meta_log_append_seconds"), "log append")], "s"),
+        (q(0.99, "pigeonhole_meta_log_append_seconds"), "log append")], "s",
+       desc="propose ≈ queue wait + commit; commit includes the log append and applying"),
+    ts("Batcher queue", [
+        ("pigeonhole_meta_queue_depth", "waiting"),
+        (f"rate(pigeonhole_meta_batch_full_total{R})", "full entries/s")]),
+], 8)
+place([
+    ts("Proposals per entry", [
+        (ratio(f"rate(pigeonhole_meta_proposals_per_entry_sum{R})", f"rate(pigeonhole_meta_proposals_per_entry_count{R})"), "mean"),
+        (q(0.99, "pigeonhole_meta_proposals_per_entry"), "p99")]),
     ts("Log written", [(f"rate(pigeonhole_meta_log_bytes_total{R})", "bytes/s")], "Bps"),
 ], 8)
 place([

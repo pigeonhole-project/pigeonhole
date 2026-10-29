@@ -103,7 +103,12 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | Metric | Kind | Labels | Meaning |
 |---|---|---|---|
 | `pigeonhole_meta_commit_seconds` | histogram | `outcome` | Time to commit and apply one log entry (a batch of proposals), from the batcher |
+| `pigeonhole_meta_propose_seconds` | histogram | `outcome` | A proposal's whole wait, as its caller sees it: queued, then committed and applied |
+| `pigeonhole_meta_queue_wait_seconds` | histogram |  | Time a proposal waits in the batcher's queue (behind the entry being written) |
+| `pigeonhole_meta_queue_depth` | gauge |  | Proposals waiting in the batcher's queue |
 | `pigeonhole_meta_commands_per_entry` | histogram |  | Commands group-committed in one log entry |
+| `pigeonhole_meta_proposals_per_entry` | histogram |  | Proposals group-committed in one log entry |
+| `pigeonhole_meta_batch_full_total` | counter |  | Entries that reached MAX_BATCH commands (a proposal that did not fit waits for the next) |
 | `pigeonhole_meta_log_append_seconds` | histogram | `outcome` | LogStore append of a batch of entries (fsync / chat message) |
 | `pigeonhole_meta_log_entries_total` | counter |  | Entries appended to the log |
 | `pigeonhole_meta_log_bytes_total` | counter |  | Entry payload bytes appended to the log |
