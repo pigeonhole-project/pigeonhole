@@ -8,9 +8,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::{Extensions, HeaderMap, Method, Uri};
 use pigeonhole_blob::{erase_sweep, CheapestFirst, OrderedKey, Replicated, SharedBackend};
-use pigeonhole_chunk_store::config::Config;
 use pigeonhole_chunk_store::{BlobDb, ChunkStore, IngestOptions, SweepConfig, Sweeper};
-use pigeonhole_gateway_s3::{build_s3_gateway, Index, S3Gateway};
+use pigeonhole_gateway_s3::{build_s3_gateway, Index, S3Gateway, S3Options};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_sim::faults::{Fault, FaultPlan, Faulty};
 use pigeonhole_sim::{random_ms, random_u64};
@@ -83,17 +82,14 @@ async fn open_node(log: &Arc<MemoryBlobStore>, snaps: &Arc<MemoryBlobStore>, mem
     )
     .await
     .unwrap();
-    let dir = std::env::temp_dir();
-    let mut cfg = Config::for_test(&dir);
-    cfg.chunk_size = 16 * 1024;
-    cfg.block_size = 4 * 1024;
-    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    opts.block_size = cfg.block_size;
+    let s3_opts = S3Options { chunk_size: 16 * 1024, block_size: 4 * 1024, ..S3Options::for_test() };
+    let mut opts = IngestOptions::new(s3_opts.chunk_size, s3_opts.chunk_codec);
+    opts.block_size = s3_opts.block_size;
     let backends: Vec<SharedBackend> = members.iter().map(|m| Arc::new(erase_sweep(m.clone())) as SharedBackend).collect();
     let rep = Arc::new(Replicated::new(backends.clone(), 1, Arc::new(CheapestFirst::new())).unwrap());
     let store =
         Arc::new(ChunkStore::open_replicated(BlobDb::open(meta.clone()).await.unwrap(), rep, opts).await.unwrap());
-    let s3 = build_s3_gateway(cfg, Index::open(meta).await.unwrap(), store.clone());
+    let s3 = build_s3_gateway(s3_opts, Index::open(meta).await.unwrap(), store.clone());
     Node { s3, store, backends }
 }
 

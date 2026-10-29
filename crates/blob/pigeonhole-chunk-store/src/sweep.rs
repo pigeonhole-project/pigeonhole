@@ -245,12 +245,9 @@ impl Sweeper {
 mod tests {
     use super::*;
     use crate::ingest::IngestOptions;
-    use crate::instances::{validate_instances, InstanceConfig};
     use crate::layer::ChunkStore;
     use bytes::Bytes;
-    use pigeonhole_blob::{
-        erase_sweep, BlobLocator, InstanceInfo, InstanceKind, InstanceRole, OrderedKey, Replicated,
-    };
+    use pigeonhole_blob::{erase_sweep, BlobLocator, OrderedKey, Replicated};
     use pigeonhole_codec::ChunkCodec;
     use pigeonhole_storage_memory::MemoryBlobStore;
 
@@ -483,27 +480,5 @@ mod tests {
         assert_eq!(stats.keys_deleted, 1);
         assert!(!on_backend(&f, &dead));
         assert!(f.db.chunk_meta(id).await.unwrap().is_some());
-    }
-
-    #[test]
-    fn two_writers_same_location_refused() {
-        let a = InstanceConfig {
-            info: InstanceInfo {
-                id: "a".into(),
-                kind: InstanceKind::Memory,
-                fingerprint: "memory:a".into(),
-                location: "memory:same".into(),
-                role: InstanceRole::ReadWrite,
-            },
-            bot_token_env: String::new(),
-            bot_token: String::new(),
-            scope_id: "a".into(),
-            max_blob_size: None,
-            telegram: None,
-        };
-        let mut b = a.clone();
-        b.info.id = "b".into();
-        b.info.fingerprint = "memory:b".into();
-        assert!(validate_instances(&[a, b]).is_err());
     }
 }

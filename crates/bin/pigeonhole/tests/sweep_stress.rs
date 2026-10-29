@@ -130,7 +130,7 @@ async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
         Replicated::new(vec![backend.clone()], 1, Arc::new(CheapestFirst::new())).unwrap(),
     );
     let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
-    let s3 = build_s3_gateway(cfg, index, store.clone());
+    let s3 = build_s3_gateway(cfg.s3_options(), index, store.clone());
     Node {
         s3,
         store,

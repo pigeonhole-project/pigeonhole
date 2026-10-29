@@ -7,7 +7,7 @@ use crate::instances::{
     memory_fingerprint, memory_location, telegram_location, telegram_fingerprint,
     InstanceConfig, TelegramLogin,
 };
-use crate::{PlacementConfig, ShardPlacement};
+use crate::config::{PlacementConfig, ShardPlacement};
 use anyhow::{bail, Context, Result};
 use pigeonhole_blob::{InstanceInfo, InstanceKind, InstanceRole};
 use serde::Deserialize;

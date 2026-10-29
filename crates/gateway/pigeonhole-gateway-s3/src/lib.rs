@@ -8,9 +8,9 @@ mod service;
 pub use index::{
     parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ObjectMeta,
 };
-pub use pigeonhole_chunk_store::{ChunkStore, Config, Extent};
+pub use pigeonhole_chunk_store::{ChunkStore, Extent};
 pub use commands::{Pairs, Released, S3Command, S3Reject, S3State};
-pub use service::S3Gateway;
+pub use service::{S3Gateway, S3Options};
 
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::SimpleAuth;
@@ -19,8 +19,8 @@ use s3s::{s3_error, S3Result};
 use std::sync::{Arc, OnceLock};
 
 /// Build an [`S3Gateway`] backend from an existing index + chunk store.
-pub fn build_s3_gateway(cfg: Config, index: Index, store: Arc<ChunkStore>) -> S3Gateway {
-    S3Gateway::new(cfg, index, store)
+pub fn build_s3_gateway(opts: S3Options, index: Index, store: Arc<ChunkStore>) -> S3Gateway {
+    S3Gateway::new(opts, index, store)
 }
 
 /// Wrap [`S3Gateway`] in an authenticated s3s HTTP service.

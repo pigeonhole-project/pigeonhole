@@ -163,12 +163,8 @@ LEXEME_ALLOW_DIR_PREFIXES = (
     "compat/",
     "tests/",
 )
-# Store config names backend scope fields (chat_id / channel_id) explicitly.
-LEXEME_ALLOW_FILES = {
-    "crates/blob/pigeonhole-chunk-store/src/config.rs",
-    "crates/blob/pigeonhole-chunk-store/src/instances.rs",
-    "crates/blob/pigeonhole-chunk-store/src/stores.rs",
-}
+# Files outside storage-*/bin allowed to name backend scope fields.
+LEXEME_ALLOW_FILES: set[str] = set()
 
 
 def scan_forbidden_lexemes() -> list[str]:

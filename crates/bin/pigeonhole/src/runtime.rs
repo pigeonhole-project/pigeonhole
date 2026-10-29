@@ -7,15 +7,13 @@ use pigeonhole_blob::{
     erase_sweep, CheapestFirst, InstanceKind, MetricsBackend, Replicated, SharedBackend,
 };
 use pigeonhole_limits::ChatLimiter;
-use pigeonhole_chunk_store::{
-    check_fingerprints, BlockCache, BlobDb, ChunkStore, IngestOptions, InstanceConfig, LogSettings,
-    SnapshotSettings,
-};
+use pigeonhole::config::{LogSettings, SnapshotSettings};
+use pigeonhole::instances::{check_fingerprints, InstanceConfig, TelegramLogin};
+use pigeonhole_chunk_store::{BlockCache, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole::index::Index;
 use crate::channel_log;
 use pigeonhole::telegram::{Lane, MtprotoChannel, TelegramBlobStore};
 use pigeonhole_blob::{InstanceInfo, InstanceRole};
-use pigeonhole_chunk_store::TelegramLogin;
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, SnapshotStore};
 use pigeonhole_meta::{LogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_storage_disk::DiskBlobStore;

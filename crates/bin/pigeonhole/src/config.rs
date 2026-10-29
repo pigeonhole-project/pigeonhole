@@ -1,13 +1,14 @@
 use crate::instances::{memory_instance, InstanceConfig, TelegramLogin};
 use crate::stores::{FileReplicas, FileShards, FileStore, Store, Topology};
-use crate::repair::{
-    RepairConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, REPAIR_BATCH_SIZE,
+use pigeonhole_chunk_store::{
+    RepairConfig, SweepConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, DEFAULT_SWEEP_INTERVAL,
+    REPAIR_BATCH_SIZE, SWEEP_BATCH_SIZE,
 };
-use crate::sweep::{SweepConfig, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};
 use pigeonhole_blob::{CacheConfig, InstanceKind};
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, LimiterRegistry};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
+use pigeonhole_gateway_s3::S3Options;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::env;
@@ -402,6 +403,17 @@ impl Config {
             metrics: MetricsSettings::default(),
             log: LoggingSettings::default(),
             config_path: PathBuf::from("(test)"),
+        }
+    }
+
+    /// What the S3 gateway takes from this config.
+    pub fn s3_options(&self) -> S3Options {
+        S3Options {
+            region: self.region.clone(),
+            chunk_size: self.chunk_size,
+            chunk_codec: self.chunk_codec,
+            block_size: self.block_size,
+            ingest_budget: self.ingest_budget.clone(),
         }
     }
 
@@ -915,9 +927,19 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// The tests set and read the environment from many threads, which is
+    /// not safe at the same time: one at a time.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn set_env(key: &str, value: &str) {
+        let _one = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(key, value);
+    }
+
     fn load(toml: &str) -> Result<Config> {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(toml.as_bytes()).unwrap();
+        let _one = ENV.lock().unwrap_or_else(|e| e.into_inner());
         Config::load_from_path(f.path())
     }
 
@@ -932,9 +954,9 @@ mod tests {
     }
 
     fn tg_store(id: &str, chat: i64) -> String {
-        std::env::set_var("PH_TEST_TGM_TOKEN", "42:secret");
-        std::env::set_var("PH_TEST_TGM_API_ID", "12345");
-        std::env::set_var("PH_TEST_TGM_API_HASH", "hash");
+        set_env("PH_TEST_TGM_TOKEN", "42:secret");
+        set_env("PH_TEST_TGM_API_ID", "12345");
+        set_env("PH_TEST_TGM_API_HASH", "hash");
         tgm_store(id, chat)
     }
 
@@ -1052,9 +1074,9 @@ upload_concurrency = 4
 
     #[test]
     fn telegram_stores_log_in_one_session_per_bot() {
-        std::env::set_var("PH_TEST_TGM_TOKEN", "42:secret");
-        std::env::set_var("PH_TEST_TGM_API_ID", "12345");
-        std::env::set_var("PH_TEST_TGM_API_HASH", "hash");
+        set_env("PH_TEST_TGM_TOKEN", "42:secret");
+        set_env("PH_TEST_TGM_API_ID", "12345");
+        set_env("PH_TEST_TGM_API_HASH", "hash");
         let stores = format!("{}{}{}", tgm_store("log", -1001), tgm_store("snap", -1002), tgm_store("blobs", -1003));
         let cfg = load(&format!("[meta]\nlog = \"log\"\nsnapshot = \"snap\"\n[chunk]\nstore = \"blobs\"\n{stores}")).unwrap();
         let login = TelegramLogin {
@@ -1110,7 +1132,7 @@ upload_concurrency = 4
         assert!(format!("{:#}", load(twice).unwrap_err()).contains("same place"));
 
         // A discord log needs its snapshots in a channel too.
-        std::env::set_var("DISCORD_BOT_TOKEN", "discord-test-token");
+        set_env("DISCORD_BOT_TOKEN", "discord-test-token");
         let dc = "[meta]\nlog = \"dc\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\n";
         let err = load_mem(dc).unwrap_err();
         assert!(format!("{err:#}").contains("snapshot is required"), "{err:#}");
@@ -1123,7 +1145,7 @@ upload_concurrency = 4
 
     #[test]
     fn a_local_log_with_snapshots_in_a_chat() {
-        std::env::set_var("PH_TEST_TG_TOKEN", "1:test");
+        set_env("PH_TEST_TG_TOKEN", "1:test");
         let cfg = load_mem(&format!("[meta]\nsnapshot = \"tg-snap\"\n{}", tg_store("tg-snap", -200))).unwrap();
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "pigeonhole-meta".into() });
         assert!(cfg.meta.snapshots_outlive_log());
@@ -1181,10 +1203,13 @@ upload_concurrency = 4
     #[test]
     fn example_config_loads() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../pigeonhole.toml.example");
-        std::env::set_var("BOT_TOKEN", "123:example");
-        std::env::set_var("TG_API_ID", "1");
-        std::env::set_var("TG_API_HASH", "example");
-        let cfg = Config::load_from_path(&path).unwrap();
+        set_env("BOT_TOKEN", "123:example");
+        set_env("TG_API_ID", "1");
+        set_env("TG_API_HASH", "example");
+        let cfg = {
+            let _one = ENV.lock().unwrap_or_else(|e| e.into_inner());
+            Config::load_from_path(&path).unwrap()
+        };
         assert_eq!(cfg.primary_instance().unwrap().info.id, "tg-main");
     }
 
@@ -1221,7 +1246,7 @@ upload_concurrency = 4
 
     #[test]
     fn parses_discord_store() {
-        std::env::set_var("DISCORD_BOT_TOKEN", "discord-test-token");
+        set_env("DISCORD_BOT_TOKEN", "discord-test-token");
         let cfg = load(
             r#"
 [chunk]

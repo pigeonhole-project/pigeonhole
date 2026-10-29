@@ -66,7 +66,7 @@ async fn rebuild(snapshot_every: u64) {
     let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     opts.block_size = cfg.block_size;
     let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
-    let s3 = build_s3_gateway(cfg, Index::open(meta.clone()).await.unwrap(), store);
+    let s3 = build_s3_gateway(cfg.s3_options(), Index::open(meta.clone()).await.unwrap(), store);
 
     s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() }))
         .await

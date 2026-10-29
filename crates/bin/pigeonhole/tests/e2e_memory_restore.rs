@@ -59,7 +59,7 @@ async fn open_with_shared_mem(
     let backend: SharedBackend = Arc::new(erase_sweep(mem));
     let rep = Arc::new(Replicated::new(vec![backend], 1, Arc::new(CheapestFirst::new())).unwrap());
     let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
-    build_s3_gateway(cfg, index, store)
+    build_s3_gateway(cfg.s3_options(), index, store)
 }
 
 #[tokio::test]
@@ -130,7 +130,7 @@ async fn open_snapshotting(dir: &Path, mem: Arc<MemoryBlobStore>) -> (pigeonhole
     let backend: SharedBackend = Arc::new(erase_sweep(mem));
     let rep = Arc::new(Replicated::new(vec![backend], 1, Arc::new(CheapestFirst::new())).unwrap());
     let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
-    (build_s3_gateway(cfg, index, store), meta)
+    (build_s3_gateway(cfg.s3_options(), index, store), meta)
 }
 
 #[tokio::test]

@@ -22,7 +22,7 @@ pub type Pairs = Vec<(String, String)>;
 /// order of variants needs a new [`S3State::VERSION`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum S3Command {
-    CreateBucket { name: String, scope_id: String, created_at: String },
+    CreateBucket { name: String, created_at: String },
     DeleteBucket { name: String },
     /// Insert or replace an object (user metadata and tags of the old version go).
     PutObject {
@@ -75,7 +75,6 @@ type Applied = std::result::Result<Released, S3Reject>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BucketRec {
     pub created_at: String,
-    pub scope_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,18 +119,18 @@ pub struct S3State {
 
 impl StateMachine for S3State {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     type Command = S3Command;
     type Reply = Released;
     type Reject = S3Reject;
 
     fn apply(&mut self, command: S3Command) -> Result<Outcome<Self>> {
         Ok(match command {
-            S3Command::CreateBucket { name, scope_id, created_at } => {
+            S3Command::CreateBucket { name, created_at } => {
                 if self.buckets.contains_key(&name) {
                     return Ok(Err(S3Reject::BucketExists));
                 }
-                self.buckets.insert(name, BucketRec { created_at, scope_id });
+                self.buckets.insert(name, BucketRec { created_at });
                 ok()
             }
             S3Command::DeleteBucket { name } => self.delete_bucket(&name),
@@ -309,7 +308,9 @@ mod tests {
     fn command_encoding_is_pinned() {
         let cmd = S3Command::DeleteObject { bucket: "b".into(), key: "k".into() };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k']);
-        assert_eq!(S3State::VERSION, 1);
+        let cmd = S3Command::CreateBucket { name: "b".into(), created_at: "t".into() };
+        assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [0, 1, b'b', 1, b't']);
+        assert_eq!(S3State::VERSION, 2);
     }
 
     #[test]
@@ -327,7 +328,7 @@ mod tests {
             mtime: "t".into(),
         };
         assert_eq!(s.apply(put("k")).unwrap(), Err(S3Reject::BucketNotFound));
-        let create = S3Command::CreateBucket { name: "b".into(), scope_id: "".into(), created_at: "t".into() };
+        let create = S3Command::CreateBucket { name: "b".into(), created_at: "t".into() };
         assert_eq!(s.apply(create.clone()).unwrap(), Ok(vec![]));
         assert_eq!(s.apply(create).unwrap(), Err(S3Reject::BucketExists));
         assert_eq!(s.apply(put("k")).unwrap(), Ok(vec![]));
