@@ -5,6 +5,8 @@
 #   DEMO_BACKEND=chats  metadata log + snapshots in the Discord test channels
 #                       (DISCORD_{LOG,SNAP}_CHANNEL_ID), objects in the Telegram
 #                       one (TG_BLOBS_CHAT_ID); secrets from the repo .env
+#   DEMO_BACKEND=discord  the same, objects in DISCORD_BLOBS_CHANNEL_ID too
+#                       (Discord takes posts faster than a Telegram channel)
 #
 # State lives in .cache/demos/<demo>; binaries in .cache/demos/bin.
 
@@ -111,8 +113,9 @@ pigeonhole_up() {
   (cd "$ROOT" && cargo build -q --release -p pigeonhole)
   case "$DEMO_BACKEND" in
     disk) write_disk_config ;;
-    chats) chats_before; write_chats_config ;;
-    *) echo "DEMO_BACKEND: disk | chats" >&2; exit 2 ;;
+    chats) chats_before; write_chats_config telegram ;;
+    discord) write_chats_config discord ;;
+    *) echo "DEMO_BACKEND: disk | chats | discord" >&2; exit 2 ;;
   esac
   PIGEONHOLE_CONFIG="$STATE/pigeonhole.toml" "$ROOT/target/release/pigeonhole" >"$STATE/pigeonhole.log" 2>&1 &
   echo $! >"$STATE/pigeonhole.pid"; disown
@@ -152,8 +155,24 @@ store = "blobs"
 EOF
 }
 
+# Metadata in the Discord log and snapshot channels; objects in `$1`
+# (telegram | discord).
 write_chats_config() {
-  : "${DISCORD_LOG_CHANNEL_ID:?set in .env}" "${DISCORD_SNAP_CHANNEL_ID:?set in .env}" "${TG_BLOBS_CHAT_ID:?set in .env}"
+  : "${DISCORD_LOG_CHANNEL_ID:?set in .env}" "${DISCORD_SNAP_CHANNEL_ID:?set in .env}"
+  local blobs
+  if [[ "$1" == telegram ]]; then
+    : "${TG_BLOBS_CHAT_ID:?set in .env}"
+    blobs="id = \"blobs\"
+kind = \"telegram\"
+chat_id = $TG_BLOBS_CHAT_ID
+bot_token_env = \"TG_BOT_TOKEN\"
+session = \"$ROOT/.cache/demos/tg.session\""
+  else
+    : "${DISCORD_BLOBS_CHANNEL_ID:?set in .env}"
+    blobs="id = \"blobs\"
+kind = \"discord\"
+channel_id = $DISCORD_BLOBS_CHANNEL_ID"
+  fi
   cat >"$STATE/pigeonhole.toml" <<EOF
 listen_addr = "$S3_ADDR"
 
@@ -168,18 +187,14 @@ kind = "discord"
 channel_id = $DISCORD_SNAP_CHANNEL_ID
 
 [[store]]
-id = "tg-blobs"
-kind = "telegram"
-chat_id = $TG_BLOBS_CHAT_ID
-bot_token_env = "TG_BOT_TOKEN"
-session = "$ROOT/.cache/demos/tg.session"
+$blobs
 
 [meta]
 log = "dc-log"
 snapshot = "dc-snap"
 
 [chunk]
-store = "tg-blobs"
+store = "blobs"
 EOF
 }
 
@@ -193,9 +208,9 @@ chats_before() {
 }
 
 chats_after() {
-  [[ "$DEMO_BACKEND" == chats ]] || return 0
+  [[ "$DEMO_BACKEND" == disk ]] && return 0
   say "cleaning up the chat channels"
-  (cd "$ROOT" && TG_BENCH=clean cargo test -q -p pigeonhole-storage-telegram --test live bench_window -- --ignored --nocapture) \
+  [[ "$DEMO_BACKEND" == chats ]] && (cd "$ROOT" && TG_BENCH=clean cargo test -q -p pigeonhole-storage-telegram --test live bench_window -- --ignored --nocapture) \
     | grep -E 'deleted' || true
   (cd "$ROOT" && cargo test -q -p pigeonhole-storage-discord --test live empty_test_channels -- --ignored --nocapture --test-threads 1) \
     | grep -E 'emptied' || true

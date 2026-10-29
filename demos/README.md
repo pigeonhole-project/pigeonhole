@@ -14,20 +14,24 @@ everything on exit.
 | Demo | What you see |
 |---|---|
 | [conditional-writes](conditional-writes/) | `If-None-Match` / `If-Match` by curl; ten writers race for one key, one wins |
-| [etcd-on-telegram](etcd-on-telegram/) | an etcd cluster (T4) whose state lives in pigeonhole: election, txn, leases, `kill -9` of the leader and a takeover |
+| [etcd-on-telegram](etcd-on-telegram/) (best with `discord`) | an etcd cluster (T4) whose state lives in pigeonhole: election, txn, leases, `kill -9` of the leader and a takeover |
 | [sqlite-on-telegram](sqlite-on-telegram/) | a SQLite database streamed into pigeonhole by Litestream, deleted, restored, and restored as of a past moment |
 
 ## Where the bytes go
 
 ```
-./demos/<demo>/run.sh                       # local disk, no secrets
-DEMO_BACKEND=chats ./demos/<demo>/run.sh    # Discord + Telegram
+./demos/<demo>/run.sh                         # local disk, no secrets
+DEMO_BACKEND=chats ./demos/<demo>/run.sh      # metadata in Discord, objects in Telegram
+DEMO_BACKEND=discord ./demos/<demo>/run.sh    # all of it in Discord
 ```
 
-With `chats`, pigeonhole's metadata log and snapshots go to the Discord test
-channels (`DISCORD_LOG_CHANNEL_ID`, `DISCORD_SNAP_CHANNEL_ID`, a lease
-instead of a thread per write) and the objects to the Telegram one
-(`TG_BLOBS_CHAT_ID`, over MTProto). Secrets and ids come from the repo `.env`
+With `chats` and `discord`, pigeonhole's metadata log and snapshots go to the
+Discord test channels (`DISCORD_LOG_CHANNEL_ID`, `DISCORD_SNAP_CHANNEL_ID`,
+a lease instead of a thread per write). The objects go to the Telegram
+channel `TG_BLOBS_CHAT_ID` (over MTProto) with `chats`, to
+`DISCORD_BLOBS_CHANNEL_ID` with `discord`. A Telegram channel takes about
+20 posts a minute, so a burst of objects queues there for seconds; Discord
+takes them faster (see etcd-on-telegram for when that matters). Secrets and ids come from the repo `.env`
 (see `.env.example`). The Telegram channels are marked before a run and only
 the messages between the marks are deleted after it; the Discord test
 channels are emptied whole, so they must be dedicated to tests.

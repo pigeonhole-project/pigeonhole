@@ -1,8 +1,9 @@
 # etcd on Telegram
 
 ```
-./demos/etcd-on-telegram/run.sh
-DEMO_BACKEND=chats ./demos/etcd-on-telegram/run.sh
+./demos/etcd-on-telegram/run.sh                         # local disk
+DEMO_BACKEND=discord ./demos/etcd-on-telegram/run.sh    # metadata and objects in Discord
+DEMO_BACKEND=chats ./demos/etcd-on-telegram/run.sh      # objects in Telegram: see below
 ```
 
 [T4](https://github.com/t4db/t4) is a key-value store that speaks the etcd v3
@@ -26,16 +27,20 @@ The demo:
 
 ## What to expect
 
-| | disk | chats |
-|---|---|---|
-| election | < 1 s | ~1 s |
-| etcd put (a lone leader flushes every batch to S3) | ms | 0.4–0.6 s, tails to several s |
-| takeover after `kill -9` | a few s | ~10 s |
+| | disk | discord | chats (objects in Telegram) |
+|---|---|---|---|
+| election | < 1 s | ~1 s | ~1 s |
+| etcd put (a lone leader flushes every batch to S3) | ms | ~0.5 s | 0.4–0.6 s, tails to several s |
+| takeover after `kill -9` | ~10 s | ~11 s | ~12 s, then the new leader may step down |
 
-T4's leader lock is valid for 6 s. With the metadata log on Discord, a write
-now and then waits several seconds for a lease renewal, so a lock renewal
-can time out right after a takeover; it has held in our runs, but the
-margins are thin (docs/conditional-writes.md § Live).
+T4's lock is valid for 6 s and each renewal gets 5 s (both fixed in T4).
+Right after a takeover T4 uploads a checkpoint, a burst of objects. In a
+Telegram channel (~20 posts a minute) the lock renewal queues behind them,
+times out, may still land, and the next renewal, carrying the old ETag, is
+refused: T4 reads that as "lock taken" and steps down. Safe (never two
+leaders), but etcd answers `no leader` until a node elects itself again.
+Discord takes posts fast enough that this does not happen.
+(docs/conditional-writes.md § Live.)
 
 ## Toward Kubernetes
 
