@@ -401,8 +401,13 @@ async fn write_batch(raft: &raft::Raft, shared: &raft::Shared, batch: Vec<Pendin
     for p in &batch {
         telemetry::record_queue_wait(t0.saturating_duration_since(p.enqueued));
     }
-    let written = raft.client_write(commands).await;
+    let span = tracing::debug_span!("commit", entries = n, proposals = batch.len(), position = tracing::field::Empty);
+    let written = tracing::Instrument::instrument(raft.client_write(commands), span.clone()).await;
     telemetry::record_commit(written.is_ok(), n, batch.len(), t0.elapsed());
+    if let Ok(resp) = &written {
+        span.record("position", raft::position(&resp.log_id));
+    }
+    span.in_scope(|| tracing::debug!(ok = written.is_ok(), ms = t0.elapsed().as_millis() as u64, "commit"));
     match written {
         Ok(resp) => {
             let position = raft::position(&resp.log_id);
@@ -714,6 +719,13 @@ impl MetaStore {
         }
         let answer = rx.await.context("the tablet's batcher dropped the proposal").and_then(|r| r);
         telemetry::record_propose(answer.is_ok(), enqueued.elapsed());
+        // In the caller's span (a request): which entry holds its commands.
+        match &answer {
+            Ok((position, _)) => {
+                tracing::debug!(position, waited_ms = enqueued.elapsed().as_millis() as u64, "committed")
+            }
+            Err(e) => tracing::debug!(error = %format!("{e:#}"), "proposal failed"),
+        }
         let (position, outcomes) = answer?;
         Ok((position, Outcomes { outcomes: outcomes.into_iter().map(Some).collect() }))
     }
