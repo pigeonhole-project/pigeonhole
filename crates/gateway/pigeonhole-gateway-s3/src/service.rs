@@ -2,7 +2,7 @@
 
 use crate::commands::{S3Reject, S3State};
 use crate::index::{
-    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, SourceSnapshot,
+    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ListPage, SourceSnapshot,
 };
 use pigeonhole_meta::{Outcome, Prepared, Proposal};
 use pigeonhole_chunk_store::Extent;
@@ -670,7 +670,7 @@ impl S3 for S3Gateway {
 
         let prefix = input.prefix.as_deref().unwrap_or("");
         let (max_keys, max_keys_out) = clamp_max_keys(input.max_keys);
-        let (objects, common, truncated, next) = self
+        let ListPage { objects, prefixes: common, truncated, next } = self
             .index
             .list_objects(
                 &input.bucket,
@@ -735,7 +735,7 @@ impl S3 for S3Gateway {
             .as_deref()
             .or(input.start_after.as_deref());
 
-        let (objects, common, truncated, next) = self
+        let ListPage { objects, prefixes: common, truncated, next } = self
             .index
             .list_objects(
                 &input.bucket,
@@ -800,7 +800,7 @@ impl S3 for S3Gateway {
 
         let prefix = input.prefix.as_deref().unwrap_or("");
         let (max_keys, max_keys_out) = clamp_max_keys(input.max_keys);
-        let (objects, common, truncated, next) = self
+        let ListPage { objects, prefixes: common, truncated, next } = self
             .index
             .list_objects(
                 &input.bucket,

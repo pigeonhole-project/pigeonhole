@@ -442,6 +442,8 @@ impl Index {
         })
     }
 
+    /// One page of `bucket`'s keys under `prefix`, after `start_after`, keys
+    /// that go on past a `delimiter` rolled up into common prefixes.
     pub async fn list_objects(
         &self,
         bucket: &str,
@@ -449,100 +451,79 @@ impl Index {
         delimiter: Option<&str>,
         max_keys: i64,
         start_after: Option<&str>,
-    ) -> Result<(Vec<ObjectMeta>, Vec<String>, bool, Option<String>)> {
+    ) -> Result<ListPage> {
         let max_keys = max_keys.clamp(1, 1000) as usize;
-        let range_end = exclusive_prefix_end(prefix);
         // An empty delimiter is no delimiter.
-        let delimiter = delimiter.filter(|d| !d.is_empty());
+        Ok(match delimiter.filter(|d| !d.is_empty()) {
+            Some(delim) => self.list_delimited(bucket, prefix, delim, max_keys, start_after),
+            None => self.list_flat(bucket, prefix, max_keys, start_after),
+        })
+    }
 
-        if let Some(delim) = delimiter {
-            let batch = (max_keys * 32).clamp(64, 10_000);
-            let mut cursor: Option<(bool, String)> = match start_after {
-                Some(after) if is_common_prefix(after, prefix, delim) => {
-                    exclusive_prefix_end(after).map(|e| (true, e))
-                }
-                Some(after) => Some((false, after.to_string())),
-                None => None,
-            };
-            let mut collected: Vec<(String, DelimEntry)> = Vec::new();
-            let mut exhausted = false;
-
-            loop {
-                let lower = match &cursor {
-                    Some((true, c)) if c.as_str() >= prefix => Bound::Included(c.as_str()),
-                    Some((false, c)) if c.as_str() >= prefix => Bound::Excluded(c.as_str()),
-                    _ => Bound::Included(prefix),
-                };
-                let objs = self.scan_objects(bucket, lower, range_end.as_deref(), batch);
-                if objs.len() < batch {
-                    exhausted = true;
-                }
-
-                let batch_entries = group_delimiter_entries(prefix, delim, objs);
-                let mut advanced = false;
-                for e in batch_entries {
-                    if let Some(after) = start_after {
-                        if e.0.as_str() <= after {
-                            continue;
-                        }
-                    }
-                    if collected.last().map(|(k, _)| k) == Some(&e.0) {
-                        continue;
-                    }
-                    let is_prefix = matches!(e.1, DelimEntry::Prefix(_));
-                    let sort_key = e.0.clone();
-                    collected.push(e);
-                    advanced = true;
-                    if is_prefix {
-                        if let Some(end) = exclusive_prefix_end(&sort_key) {
-                            cursor = Some((true, end));
-                        } else {
-                            cursor = Some((false, sort_key));
-                        }
-                    } else {
-                        cursor = Some((false, sort_key));
-                    }
-                    if collected.len() > max_keys {
-                        break;
-                    }
-                }
-
-                if collected.len() > max_keys || exhausted || !advanced {
-                    break;
-                }
-            }
-
-            let truncated = collected.len() > max_keys;
-            collected.truncate(max_keys);
-            let next = if truncated {
-                collected.last().map(|(k, _)| k.clone())
-            } else {
-                None
-            };
-            let mut objects = Vec::new();
-            let mut common = Vec::new();
-            for (_, e) in collected {
-                match e {
-                    DelimEntry::Object(o) => objects.push(o),
-                    DelimEntry::Prefix(p) => common.push(p),
-                }
-            }
-            return Ok((objects, common, truncated, next));
+    fn list_flat(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        max_keys: usize,
+        start_after: Option<&str>,
+    ) -> ListPage {
+        let cursor =
+            start_after.map_or_else(|| Cursor::From(prefix.into()), |a| Cursor::After(a.into()));
+        let end = exclusive_prefix_end(prefix);
+        let mut objects = self.scan_objects(
+            bucket,
+            cursor.lower_bound(prefix),
+            end.as_deref(),
+            max_keys + 1,
+        );
+        let truncated = objects.len() > max_keys;
+        objects.truncate(max_keys);
+        let next = truncated
+            .then(|| objects.last().map(|o| o.key.clone()))
+            .flatten();
+        ListPage {
+            objects,
+            prefixes: Vec::new(),
+            truncated,
+            next,
         }
+    }
 
-        let lower = match start_after {
-            Some(after) if after >= prefix => Bound::Excluded(after),
-            _ => Bound::Included(prefix),
+    /// Scans in batches: a common prefix may stand for any number of keys,
+    /// and the scan skips past each one it rolls up.
+    fn list_delimited(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delim: &str,
+        max_keys: usize,
+        start_after: Option<&str>,
+    ) -> ListPage {
+        let batch = (max_keys * 32).clamp(64, 10_000);
+        let end = exclusive_prefix_end(prefix);
+        let mut cursor = match start_after {
+            Some(after) if is_common_prefix(after, prefix, delim) => Cursor::past(after),
+            Some(after) => Some(Cursor::After(after.into())),
+            None => Some(Cursor::From(prefix.into())),
         };
-        let mut objs = self.scan_objects(bucket, lower, range_end.as_deref(), max_keys + 1);
-        let truncated = objs.len() > max_keys;
-        objs.truncate(max_keys);
-        let next = if truncated {
-            objs.last().map(|o| o.key.clone())
-        } else {
-            None
-        };
-        Ok((objs, Vec::new(), truncated, next))
+        let mut page = DelimitedPage::new(max_keys, start_after);
+        while let Some(c) = cursor.take() {
+            let objects = self.scan_objects(bucket, c.lower_bound(prefix), end.as_deref(), batch);
+            let exhausted = objects.len() < batch;
+            for (key, entry) in group_delimiter_entries(prefix, delim, objects) {
+                cursor = match entry {
+                    DelimEntry::Prefix(_) => Cursor::past(&key),
+                    DelimEntry::Object(_) => Some(Cursor::After(key.clone())),
+                };
+                if page.push(key, entry) == Fill::Full {
+                    return page.finish();
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+        page.finish()
     }
 
     pub async fn count_objects(&self) -> Result<i64> {
@@ -813,9 +794,102 @@ pub fn slice_extents(extents: &[Extent], start: u64, length: u64) -> Vec<Extent>
     out
 }
 
+/// One page of a listing.
+pub struct ListPage {
+    pub objects: Vec<ObjectMeta>,
+    pub prefixes: Vec<String>,
+    pub truncated: bool,
+    /// The last key or common prefix of a truncated page: where the next
+    /// page goes on from.
+    pub next: Option<String>,
+}
+
+/// Where a scan starts.
+enum Cursor {
+    /// At this key.
+    From(String),
+    /// Past this key.
+    After(String),
+}
+
+impl Cursor {
+    /// Past every key that starts with `cp` (`None`: there is nothing past).
+    fn past(cp: &str) -> Option<Cursor> {
+        exclusive_prefix_end(cp).map(Cursor::From)
+    }
+
+    /// The scan's lower bound, at `prefix` at the lowest.
+    fn lower_bound<'a>(&'a self, prefix: &'a str) -> Bound<&'a str> {
+        match self {
+            Cursor::From(k) if k.as_str() >= prefix => Bound::Included(k),
+            Cursor::After(k) if k.as_str() >= prefix => Bound::Excluded(k),
+            _ => Bound::Included(prefix),
+        }
+    }
+}
+
 enum DelimEntry {
     Object(ObjectMeta),
     Prefix(String),
+}
+
+#[derive(PartialEq)]
+enum Fill {
+    More,
+    /// One entry over `max_keys`: the page is known to be truncated.
+    Full,
+}
+
+/// Collects a delimited page: entries after `start_after`, once each, up to
+/// one over `max_keys`.
+struct DelimitedPage<'a> {
+    max_keys: usize,
+    start_after: Option<&'a str>,
+    entries: Vec<(String, DelimEntry)>,
+}
+
+impl<'a> DelimitedPage<'a> {
+    fn new(max_keys: usize, start_after: Option<&'a str>) -> Self {
+        Self {
+            max_keys,
+            start_after,
+            entries: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, key: String, entry: DelimEntry) -> Fill {
+        let seen = self.start_after.is_some_and(|after| key.as_str() <= after)
+            || self.entries.last().is_some_and(|(last, _)| *last == key);
+        if !seen {
+            self.entries.push((key, entry));
+        }
+        if self.entries.len() > self.max_keys {
+            Fill::Full
+        } else {
+            Fill::More
+        }
+    }
+
+    fn finish(mut self) -> ListPage {
+        let truncated = self.entries.len() > self.max_keys;
+        self.entries.truncate(self.max_keys);
+        let next = truncated
+            .then(|| self.entries.last().map(|(k, _)| k.clone()))
+            .flatten();
+        let (mut objects, mut prefixes) = (Vec::new(), Vec::new());
+        for (_, e) in self.entries {
+            match e {
+                DelimEntry::Object(o) => objects.push(o),
+                DelimEntry::Prefix(p) => prefixes.push(p),
+            }
+        }
+        ListPage {
+            objects,
+            prefixes,
+            truncated,
+            next,
+        }
+    }
 }
 
 /// The least string above every string that starts with `prefix` (`None`:
@@ -842,30 +916,27 @@ fn is_common_prefix(s: &str, prefix: &str, delim: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Each object under `prefix` as itself, or as the common prefix it rolls up
+/// into (repeated for each object under it: they are adjacent in key order).
 fn group_delimiter_entries(
     prefix: &str,
     delim: &str,
     objs: Vec<ObjectMeta>,
 ) -> Vec<(String, DelimEntry)> {
-    let mut entries: Vec<(String, DelimEntry)> = Vec::new();
-    let mut seen_cp = std::collections::BTreeSet::new();
-
-    for obj in objs {
-        let Some(rest) = obj.key.strip_prefix(prefix) else {
-            continue;
-        };
-        if let Some(idx) = rest.find(delim) {
-            // Up to and including the whole delimiter (it may be longer
-            // than one byte).
-            let cp = format!("{prefix}{}", &rest[..idx + delim.len()]);
-            if seen_cp.insert(cp.clone()) {
-                entries.push((cp.clone(), DelimEntry::Prefix(cp)));
-            }
-        } else {
-            entries.push((obj.key.clone(), DelimEntry::Object(obj)));
-        }
-    }
-    entries
+    objs.into_iter()
+        .filter_map(|obj| {
+            let rest = obj.key.strip_prefix(prefix)?;
+            Some(match rest.find(delim) {
+                // Up to and including the whole delimiter (it may be longer
+                // than one byte).
+                Some(idx) => {
+                    let cp = format!("{prefix}{}", &rest[..idx + delim.len()]);
+                    (cp.clone(), DelimEntry::Prefix(cp))
+                }
+                None => (obj.key.clone(), DelimEntry::Object(obj)),
+            })
+        })
+        .collect()
 }
 
 pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
@@ -962,7 +1033,7 @@ mod list_tests {
                 let mut got: Vec<(String, bool)> = Vec::new();
                 let mut after: Option<String> = None;
                 for _ in 0..200 {
-                    let (objs, prefixes, truncated, next) =
+                    let ListPage { objects: objs, prefixes, truncated, next } =
                         ix.list_objects(&bucket, &prefix, delim, max_keys, after.as_deref()).await.unwrap();
                     let mut page: Vec<(String, bool)> = objs.into_iter().map(|o| (o.key, false)).collect();
                     page.extend(prefixes.into_iter().map(|p| (p, true)));
@@ -980,6 +1051,31 @@ mod list_tests {
                 );
             }
         }
+    }
+
+    /// A `start_after` inside a common prefix that spans more than a scan
+    /// batch: the scan goes on past the prefix instead of ending the listing.
+    #[tokio::test]
+    async fn a_start_after_inside_a_big_common_prefix_still_lists_what_follows() {
+        let ix = index().await;
+        ix.create_bucket("b", "scope").await.unwrap();
+        for i in 0..100 {
+            ix.put_object("b", &format!("a/k{i:03}"), "etag", 0, None, &[], &[], "{}")
+                .await
+                .unwrap();
+        }
+        ix.put_object("b", "c", "etag", 0, None, &[], &[], "{}")
+            .await
+            .unwrap();
+        let page = ix
+            .list_objects("b", "", Some("/"), 1, Some("a/b"))
+            .await
+            .unwrap();
+        let keys: Vec<_> = page.objects.into_iter().map(|o| o.key).collect();
+        assert_eq!(
+            (keys, page.prefixes, page.truncated),
+            (vec!["c".to_string()], vec![], false)
+        );
     }
 
     #[test]
