@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 anyhow = { workspace = true }
 pigeonhole-meta = { workspace = true }
+pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }

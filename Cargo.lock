@@ -2649,6 +2649,7 @@ dependencies = [
  "madsim",
  "madsim-tokio",
  "pigeonhole-meta",
+ "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
  "serde",
 ]

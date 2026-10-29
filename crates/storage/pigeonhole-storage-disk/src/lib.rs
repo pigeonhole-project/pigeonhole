@@ -8,6 +8,7 @@
 //! so the store holds a metadata log ([`Chain`]) as well as blobs; one
 //! store serves one purpose.
 
+pub mod io;
 mod segments;
 
 use anyhow::{bail, Context, Result};
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub use io::{Fs, SimFs, StdFs};
 pub use segments::DEFAULT_SEGMENT_BYTES;
 
 /// Identity of a blob on disk: its key, the record's position.
@@ -40,6 +42,7 @@ pub struct DiskBlobStore {
     instance: InstanceInfo,
     limits: BackendLimits,
     segments: Arc<Mutex<Segments>>,
+    fs: Arc<dyn Fs>,
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
@@ -71,13 +74,32 @@ impl DiskBlobStore {
         Self::open_as(dir.into(), info, DEFAULT_SEGMENT_BYTES)
     }
 
+    /// Open `dir` on another file system (a [`SimFs`] in tests and the
+    /// simulation).
+    pub fn open_on(fs: Arc<dyn Fs>, dir: impl Into<PathBuf>, segment_bytes: u64) -> Result<Self> {
+        let dir = dir.into();
+        let info = InstanceInfo {
+            id: "local_disk".into(),
+            kind: InstanceKind::LocalDisk,
+            fingerprint: disk_location(&dir),
+            location: disk_location(&dir),
+            role: InstanceRole::ReadWrite,
+        };
+        Self::open_with(fs, dir, info, segment_bytes)
+    }
+
     fn open_as(dir: PathBuf, info: InstanceInfo, segment_bytes: u64) -> Result<Self> {
-        let segments = Segments::open(&dir, segment_bytes)?;
+        Self::open_with(Arc::new(StdFs), dir, info, segment_bytes)
+    }
+
+    fn open_with(fs: Arc<dyn Fs>, dir: PathBuf, info: InstanceInfo, segment_bytes: u64) -> Result<Self> {
+        let segments = Segments::open(fs.clone(), &dir, segment_bytes)?;
         Ok(Self {
             dir,
             instance: info,
             limits: BackendLimits::local_disk(),
             segments: Arc::new(Mutex::new(segments)),
+            fs,
         })
     }
 
@@ -92,13 +114,23 @@ impl DiskBlobStore {
         f: impl FnOnce(&mut segments::Locked<'_>) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let segments = self.segments.clone();
-        blocking(move || {
+        let out = blocking(move || {
             let mut guard = segments.lock().unwrap();
             let mut locked = guard.locked()?;
             locked.catch_up()?;
             f(&mut locked)
         })
-        .await
+        .await;
+        self.charge().await;
+        out
+    }
+
+    /// Spend the virtual time a simulated disk says the I/O took.
+    async fn charge(&self) {
+        let cost = self.fs.take_cost();
+        if !cost.is_zero() {
+            tokio::time::sleep(cost).await;
+        }
     }
 
     fn check_size(&self, data: &Bytes) -> Result<()> {
@@ -235,7 +267,7 @@ impl Chain for DiskBlobStore {
         let label = label.to_string();
         // `make` is borrowed, so this runs on the caller's thread: one
         // append and its fsync, the price of every claim.
-        (move || {
+        let out = (move || {
             let mut guard = segments.lock().unwrap();
             let mut s = guard.locked()?;
             s.catch_up()?;
@@ -253,7 +285,9 @@ impl Chain for DiskBlobStore {
             let key = s.append(Some((tail, &label)), &label, &blob)?;
             tracing::debug!(store = %self.instance().id, label, ?tail, key, bytes = blob.len(), "linked after the tail");
             Ok(Some(DiskId { key }))
-        })()
+        })();
+        self.charge().await;
+        out
     }
 
     async fn prune(&self, below: &Self::Id) -> Result<()> {
