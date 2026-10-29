@@ -61,7 +61,6 @@ dependency of the binary):
 pub struct Faulty<B> { inner: B, plan: Arc<FaultPlan>, log: Arc<FaultLog> }
 
 impl<B: BlobBackend> BlobBackend for Faulty<B> { /* draw, then delegate */ }
-impl<B: Sweepable>   Sweepable   for Faulty<B> { /* delays, errors */ }
 impl<B: Chain>       Chain       for Faulty<B> { /* incl. put_after_tail */ }
 
 pub struct FaultPlan {

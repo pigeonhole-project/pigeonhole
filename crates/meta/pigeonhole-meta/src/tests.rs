@@ -56,7 +56,7 @@ fn snaps_of(meta_dir: &Path) -> Arc<crate::BlobSnapshotStore<DiskBlobStore>> {
 /// Live snapshot blobs in `<meta_dir>/snapshots`.
 async fn snapshot_count(meta_dir: &Path) -> usize {
     let store = DiskBlobStore::open(meta_dir.join("snapshots")).unwrap();
-    pigeonhole_storage_api::Sweepable::candidates(&store, None, u64::MAX, 1000).await.unwrap().len()
+    pigeonhole_storage_api::BlobBackend::candidates(&store, None, u64::MAX, 1000).await.unwrap().len()
 }
 
 /// Wait until there are at most `n` snapshots in `meta_dir`.

@@ -1,4 +1,4 @@
-//! [`BlobBackend`] + [`Sweepable`] over one channel.
+//! [`BlobBackend`] over one channel.
 
 use crate::channel::{windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, IDS_PER_CALL, WINDOW};
 use anyhow::{bail, Context, Result};
@@ -8,7 +8,6 @@ use futures::StreamExt;
 use lru::LruCache;
 use pigeonhole_storage_api::{
     bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
-    Sweepable,
 };
 use pigeonhole_limits::{ChatLimiter, LimitBudget};
 use pigeonhole_types::{BackendLimits, ByteRange};
@@ -277,10 +276,7 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl<C: ChannelApi> Sweepable for TelegramBlobStore<C> {
     /// Our blobs (documents or texts named by a [`BlobId`]) with ids in `(after,
     /// upto]`, read from the channel 100 ids at a time; nothing else in the
     /// channel is ever a candidate.
@@ -304,3 +300,4 @@ impl<C: ChannelApi> Sweepable for TelegramBlobStore<C> {
         Ok(out)
     }
 }
+

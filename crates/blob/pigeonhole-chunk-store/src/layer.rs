@@ -12,8 +12,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use md5::{Digest, Md5};
 use pigeonhole_blob::{
-    collect_stream, erase_sweep, CheapestFirst, EncodedBlock, ReplicaLayout, Replicated,
-    SharedBackend, Sweepable,
+    collect_stream, erase, BlobBackend, CheapestFirst, EncodedBlock, ReplicaLayout, Replicated,
+    SharedBackend,
 };
 use crate::repair::spawn_enqueue_repair;
 use pigeonhole_codec::{
@@ -127,12 +127,12 @@ pub struct ChunkStore {
 
 impl ChunkStore {
     /// Open with a single backend (write quorum 1).
-    pub async fn open<B: Sweepable>(
+    pub async fn open<B: BlobBackend>(
         db: BlobDb,
         backend: B,
         opts: IngestOptions,
     ) -> Result<Self> {
-        let backend: SharedBackend = Arc::new(erase_sweep(backend));
+        let backend: SharedBackend = Arc::new(erase(backend));
         let info = backend.instance().clone();
         db.sync_instances(&[info]).await?;
         let replicated = Replicated::new(

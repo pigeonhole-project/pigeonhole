@@ -3,17 +3,16 @@
 use anyhow::Result;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    collect_stream, BlobBackend, BlobId, Sweepable,
+    collect_stream, BlobBackend, BlobId,
 };
 
-/// Shared suite for [`BlobBackend`] + [`Sweepable`].
+/// Shared suite for [`BlobBackend`].
 ///
 /// Covers: put/get/range/delete, repeat delete, empty rejected, near-`max_blob_size`
 /// blob, monotonic keys, candidates covering written keys.
 pub async fn run_typed_conformance<B>(backend: &B) -> Result<()>
 where
-    B: BlobBackend + Sweepable,
-{
+    B: BlobBackend + {
     // empty rejected
     assert!(
         backend.put(Bytes::new(), &BlobId::random().name()).await.is_err(),

@@ -4,7 +4,7 @@ use anyhow::Context;
 use pigeonhole::config::Config;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole_blob::{
-    erase_sweep, CheapestFirst, MetricsBackend, Replicated, SharedBackend,
+    erase, CheapestFirst, MetricsBackend, Replicated, SharedBackend,
 };
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole::config::{LogSettings, SnapshotSettings};
@@ -204,12 +204,12 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
             let mem = Arc::new(
                 MemoryBlobStore::new().with_instance_info(inst.info.clone()),
             );
-            MetricsBackend::wrap(Arc::new(erase_sweep(mem)))
+            MetricsBackend::wrap(Arc::new(erase(mem)))
         }
         InstanceKind::LocalDisk => {
             let store = DiskBlobStore::with_instance(&inst.scope_id, inst.info.clone())
                 .with_context(|| format!("open local_disk store {}", inst.scope_id))?;
-            MetricsBackend::wrap(Arc::new(erase_sweep(Arc::new(store))))
+            MetricsBackend::wrap(Arc::new(erase(Arc::new(store))))
         }
         InstanceKind::Telegram => {
             let login = inst.telegram.as_ref().with_context(|| format!("store {id:?}: no MTProto login"))?;
@@ -219,7 +219,7 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
                 .await
                 .with_context(|| format!("store {id:?}"))?;
             let store = TelegramBlobStore::new(Arc::new(channel), limiter.clone(), inst.info.clone());
-            MetricsBackend::wrap(Arc::new(erase_sweep(Arc::new(store))))
+            MetricsBackend::wrap(Arc::new(erase(Arc::new(store))))
         }
         InstanceKind::Discord => {
             #[cfg(feature = "discord")]
@@ -232,7 +232,7 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
                     .with_context(|| format!("store {id:?}: permission check"))?;
                 let channel = Arc::new(dc.channel(channel_id, limiter.clone()));
                 let store = DiscordBlobStore::new(channel, limiter.clone(), inst.max_blob_size, inst.info.clone());
-                MetricsBackend::wrap(Arc::new(erase_sweep(Arc::new(store))))
+                MetricsBackend::wrap(Arc::new(erase(Arc::new(store))))
             }
             #[cfg(not(feature = "discord"))]
             {

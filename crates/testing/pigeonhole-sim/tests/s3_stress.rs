@@ -7,7 +7,7 @@
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{Extensions, HeaderMap, Method, Uri};
-use pigeonhole_blob::{erase_sweep, CheapestFirst, OrderedKey, Replicated, SharedBackend};
+use pigeonhole_blob::{erase, CheapestFirst, OrderedKey, Replicated, SharedBackend};
 use pigeonhole_chunk_store::{BlobDb, ChunkStore, IngestOptions, SweepConfig, Sweeper};
 use pigeonhole_gateway_s3::{build_s3_gateway, Index, S3Gateway, S3Options};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, MetaOptions, MetaStore, Namespaces};
@@ -85,7 +85,7 @@ async fn open_node(log: &Arc<MemoryBlobStore>, snaps: &Arc<MemoryBlobStore>, mem
     let s3_opts = S3Options { chunk_size: 16 * 1024, block_size: 4 * 1024, ..S3Options::for_test() };
     let mut opts = IngestOptions::new(s3_opts.chunk_size, s3_opts.chunk_codec);
     opts.block_size = s3_opts.block_size;
-    let backends: Vec<SharedBackend> = members.iter().map(|m| Arc::new(erase_sweep(m.clone())) as SharedBackend).collect();
+    let backends: Vec<SharedBackend> = members.iter().map(|m| Arc::new(erase(m.clone())) as SharedBackend).collect();
     let rep = Arc::new(Replicated::new(backends.clone(), 1, Arc::new(CheapestFirst::new())).unwrap());
     let store =
         Arc::new(ChunkStore::open_replicated(BlobDb::open(meta.clone()).await.unwrap(), rep, opts).await.unwrap());

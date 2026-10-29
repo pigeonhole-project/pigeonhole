@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_storage_api::{
     bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked,
-    MakeAfter, NotFound, OpKind, Sweepable,
+    MakeAfter, NotFound, OpKind,
 };
 use pigeonhole_limits::StoreLimiter;
 use pigeonhole_types::{BackendLimits, ByteRange};
@@ -236,10 +236,7 @@ impl BlobBackend for DiskBlobStore {
         tracing::debug!(store = %self.instance().id, keys = n, "deleted");
         Ok(())
     }
-}
 
-#[async_trait]
-impl Sweepable for DiskBlobStore {
     async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
         self.locked(move |s| {
             let from = after.map_or(0, |a| a.saturating_add(1));

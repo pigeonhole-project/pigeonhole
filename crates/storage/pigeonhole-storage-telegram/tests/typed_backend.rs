@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use pigeonhole_storage_api::{
-    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole, Sweepable,
+    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole,
 };
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
 use pigeonhole_storage_telegram::fake::FakeChannel;

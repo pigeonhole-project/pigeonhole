@@ -47,7 +47,7 @@ Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
 |---|---|
 | `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
 | `core/pigeonhole-codec` | Codecs + `BlockWriter` |
-| `core/pigeonhole-storage-api` | What a store implements: `BlobBackend`, `Sweepable`, `Chain`, `LeaseChain`, and the failures it reports by type (`NotFound`, `Unavailable`, `RateLimited`) |
+| `core/pigeonhole-storage-api` | What a store implements: `BlobBackend`, `Chain`, `LeaseChain`, and the failures it reports by type (`NotFound`, `Unavailable`, `RateLimited`) |
 | `core/pigeonhole-limits` | Rate limiters a store paces its calls with (`ChatLimiter`, `StoreLimiter`) |
 | `meta/pigeonhole-meta` | Metadata tablet: layer commands in a fencing `LogStore`, applied to in-memory `StateMachine`s (`MetaStore`) |
 | `blob/pigeonhole-blob` | Stores behind one object-safe face (`DynBlobBackend`), `Replicated`, part packing, store metrics, cache knobs |

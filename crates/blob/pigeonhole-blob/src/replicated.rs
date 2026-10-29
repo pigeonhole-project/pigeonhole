@@ -924,6 +924,13 @@ mod tests {
             }
             Ok(())
         }
+        async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
+            let mut keys: Vec<u64> =
+                self.data.lock().unwrap().keys().copied().filter(|&k| k <= upto && after.is_none_or(|a| k > a)).collect();
+            keys.sort_unstable();
+            keys.truncate(limit);
+            Ok(keys)
+        }
     }
 
     fn block(fill: u8, n: usize) -> EncodedBlock {

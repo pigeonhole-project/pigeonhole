@@ -10,7 +10,7 @@ pub mod replicated;
 pub mod typed;
 pub use backend::{bytes_stream, collect_stream, slice_range, BoxByteStream};
 pub use cache::CacheConfig;
-pub use erase::{erase, erase_sweep, DynBlobBackend, DynSweep, Erased, ErasedSweep, SharedBackend};
+pub use erase::{erase, DynBlobBackend, Erased, SharedBackend};
 pub use upload_pins::{UploadPin, UploadPins};
 pub use metrics::{
     describe, inflight_dec, inflight_inc, record_429, record_bytes_from_backend,
@@ -26,7 +26,7 @@ pub use replicated::{
 };
 pub use typed::{
     load_id, store_id, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
-    BlobId, BlobLocator, Sweepable, BlobBackend,
+    BlobId, BlobLocator, BlobBackend,
 };
 pub use pigeonhole_storage_api::{text, After, Chain, Failure, LeaseChain, Linked, MakeAfter, NotFound, RateLimited, Unavailable};
 pub use pigeonhole_types::{

@@ -2,7 +2,7 @@
 
 use pigeonhole_storage_api::{
     bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole,
-    Linked, NotFound, OpKind, Sweepable, Unavailable,
+    Linked, NotFound, OpKind, Unavailable,
 };
 use pigeonhole_limits::StoreLimiter;
 use anyhow::{bail, Result};
@@ -266,10 +266,7 @@ impl BlobBackend for MemoryBlobStore {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl Sweepable for MemoryBlobStore {
     async fn candidates(
         &self,
         after: Option<Self::Key>,
@@ -437,7 +434,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.as_ref(), b"typed");
-        let keys = Sweepable::candidates(&store, None, u64::MAX, 10)
+        let keys = BlobBackend::candidates(&store, None, u64::MAX, 10)
             .await
             .unwrap();
         assert!(keys.contains(&id.message_id));

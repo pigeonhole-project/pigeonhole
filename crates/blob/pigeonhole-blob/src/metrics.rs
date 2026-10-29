@@ -3,7 +3,7 @@
 //! Libraries only call these helpers. The binary optionally installs a
 //! Prometheus recorder behind feature `metrics-prometheus`.
 
-use crate::erase::{DynBlobBackend, DynSweep, SharedBackend};
+use crate::erase::{DynBlobBackend, SharedBackend};
 use crate::typed::{CostHint, InstanceInfo, OpKind, BlobLocator};
 use crate::BoxByteStream;
 use anyhow::Result;
@@ -261,7 +261,7 @@ impl Drop for Inflight {
 }
 
 fn outcome_from_err(err: &anyhow::Error) -> (&'static str, bool) {
-    if err.chain().any(|e| e.is::<crate::RateLimited>()) || format!("{err:#}").contains("429") {
+    if crate::Failure::of(err) == crate::Failure::RateLimited {
         ("rate_limited", true)
     } else {
         ("error", false)
@@ -390,7 +390,7 @@ impl DynBlobBackend for MetricsBackend {
         result
     }
 
-    fn sweeper(&self) -> Option<&dyn DynSweep> {
-        self.inner.sweeper()
+    async fn candidates(&self, after: Option<&[u8]>, upto: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        self.inner.candidates(after, upto, limit).await
     }
 }

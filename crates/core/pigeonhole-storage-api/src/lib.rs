@@ -1,5 +1,5 @@
 //! What a pigeonhole store implements: [`BlobBackend`] (immutable blobs under
-//! keys the store chooses), [`Sweepable`] (listing for the sweeper), [`Chain`]
+//! keys the store chooses, listed in order for the sweeper), [`Chain`]
 //! (blobs linked first-successor-wins: what a log needs), [`LeaseChain`] (a
 //! chain that holds a log by a lease), and the failures a
 //! store reports by type ([`Failure`]).
@@ -14,7 +14,6 @@ pub mod text;
 
 pub use backend::{
     BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
-    Sweepable,
 };
 pub use error::{Failure, NotFound, RateLimited, Unavailable};
 pub use chain::{After, Chain, LeaseChain, Linked, MakeAfter, PUT_AFTER_TAIL_ATTEMPTS};

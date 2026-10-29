@@ -1,4 +1,4 @@
-//! [`BlobBackend`] + [`Sweepable`] over one channel.
+//! [`BlobBackend`] over one channel.
 
 use crate::api::{CdnStale, DcMessage, DiscordApi, PAGE};
 use anyhow::{bail, Context, Result};
@@ -9,7 +9,6 @@ use crate::api::CONTENT_MAX_CHARS;
 use pigeonhole_storage_api::text;
 use pigeonhole_storage_api::{
     bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
-    Sweepable,
 };
 use pigeonhole_limits::{ChatLimiter, LimitBudget};
 use pigeonhole_types::{BackendLimits, ByteRange};
@@ -272,10 +271,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
         // Chain members (a removed snapshot): their links go too.
         self.retire_links(keys).await
     }
-}
 
-#[async_trait]
-impl<A: DiscordApi> Sweepable for DiscordBlobStore<A> {
     /// Our blobs (attachments or texts named by a [`BlobId`]) with ids in
     /// `(after, upto]`, listed 100 at a time; nothing else is a candidate.
     async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
@@ -302,3 +298,4 @@ impl<A: DiscordApi> Sweepable for DiscordBlobStore<A> {
         Ok(out)
     }
 }
+

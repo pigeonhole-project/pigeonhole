@@ -3,7 +3,6 @@
 
 pub use pigeonhole_storage_api::{
     BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
-    Sweepable,
 };
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
