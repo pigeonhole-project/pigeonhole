@@ -314,6 +314,7 @@ where
         };
         let wait = match classify(&err) {
             Failure::Flood(wait) => {
+                pigeonhole_blob::record_throttle("telegram", what, wait);
                 if let Some(penalize) = penalize {
                     penalize(wait);
                 }

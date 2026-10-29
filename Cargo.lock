@@ -1829,7 +1829,9 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.16.1",
+ "indexmap 2.14.2",
  "metrics",
+ "ordered-float",
  "quanta",
  "rand 0.9.5",
  "rand_xoshiro",
@@ -2179,6 +2181,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ordered-float"
+version = "5.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f59006ce1e204c30956638535b74d317bca99477b9356dfaec54c37f6f600ab"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "os_info"
 version = "3.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2288,6 +2299,7 @@ dependencies = [
  "lru",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "pigeonhole-blob",
  "pigeonhole-chunk-store",
  "pigeonhole-codec",
@@ -2449,10 +2461,12 @@ dependencies = [
  "bytes",
  "crc32fast",
  "futures",
+ "metrics",
  "openraft",
  "pigeonhole-storage-api",
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
+ "pigeonhole-types",
  "postcard",
  "serde",
  "tempfile",
@@ -2493,6 +2507,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

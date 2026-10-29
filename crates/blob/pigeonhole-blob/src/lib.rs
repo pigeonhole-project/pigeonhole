@@ -15,11 +15,11 @@ pub use cache::CacheConfig;
 pub use erase::{erase, erase_sweep, DynBlobBackend, DynSweep, Erased, ErasedSweep, SharedBackend};
 pub use upload_pins::{UploadPin, UploadPins};
 pub use metrics::{
-    describe_metrics, inflight_dec, inflight_inc, record_429, record_bytes_from_backend,
-    record_bytes_to_clients, record_cache, record_chunk_gone, record_compression_ratio,
+    describe, inflight_dec, inflight_inc, record_429, record_bytes_from_backend,
+    record_bytes_from_clients, record_background_pass, record_bytes_to_backend, record_bytes_to_clients, record_cache, record_chunk_gone, record_compression_ratio,
     record_double_release, record_gateway_request, record_ingest_budget_wait, record_instance_call,
     record_limiter_wait, record_parts_per_chunk, record_repair, record_replica_selected,
-    record_sweep, set_repair_queue_depth, MetricsBackend,
+    record_sweep, record_throttle, set_cache_size, set_repair_queue_depth, MetricsBackend, METRICS,
 };
 pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
 pub use rate_limit::{BotLimiter, ChatLimiter, ChatLimiterConfig, LimitBudget, LimiterRegistry};

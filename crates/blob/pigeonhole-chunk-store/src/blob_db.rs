@@ -56,6 +56,18 @@ pub struct StoredBlock {
     pub codec: String,
 }
 
+/// What [`BlobDb::stats`] counts.
+#[derive(Debug, Default, Clone)]
+pub struct ChunkStats {
+    pub live: u64,
+    /// No refs, not yet reclaimed (the sweeper's next work).
+    pub unreferenced: u64,
+    pub reclaiming: u64,
+    pub logical_bytes: u64,
+    /// Instance → stored bytes of the replicas it holds.
+    pub stored_bytes: BTreeMap<String, u64>,
+}
+
 /// Progress of this process; lost on restart by design.
 #[derive(Default)]
 struct NodeLocal {
@@ -129,6 +141,30 @@ impl BlobDb {
 
     fn read<R>(&self, f: impl FnOnce(&ChunkState) -> R) -> R {
         self.meta.read::<ChunkState, _>(f)
+    }
+
+    /// Chunk counts and sizes, for gauges (a pass over every chunk).
+    pub fn stats(&self) -> ChunkStats {
+        self.read(|s| {
+            let mut st = ChunkStats::default();
+            for c in s.chunks.values() {
+                match (c.reclaiming, c.refs > 0) {
+                    (true, _) => st.reclaiming += 1,
+                    (false, true) => st.live += 1,
+                    (false, false) => st.unreferenced += 1,
+                }
+                st.logical_bytes += c.logical_size.max(0) as u64;
+                let stored = if c.blocks.is_empty() {
+                    c.logical_size.max(0) as u64
+                } else {
+                    c.blocks.iter().map(|b| b.stored_len.max(0) as u64).sum()
+                };
+                for instance in c.replicas.keys() {
+                    *st.stored_bytes.entry(instance.clone()).or_default() += stored;
+                }
+            }
+            st
+        })
     }
 
     fn chunk<R>(&self, chunk_id: ChunkId, f: impl FnOnce(&ChunkRec) -> R) -> Option<R> {

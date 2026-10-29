@@ -1,134 +1,95 @@
-//! L1 cache of unpacked frames keyed by ([`BlobKey`], block_no).
+//! In-memory block cache keyed by (chunk, block_no): L1 holds decoded
+//! blocks, L2 the stored (compressed) ones. Chunk ids are never reused, so
+//! entries never go stale; dropped chunks age out.
 
 use bytes::Bytes;
 use moka::future::Cache;
-use pigeonhole_blob::record_cache;
-use pigeonhole_types::BlobKey;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::sync::Semaphore;
-
-#[derive(Clone, Hash, Eq, PartialEq)]
-struct BlockKey {
-    blob: BlobKey,
-    block_no: u32,
-}
+use pigeonhole_blob::{record_cache, set_cache_size};
+use crate::ChunkId;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub struct BlockCache {
-    cache: Cache<BlockKey, Bytes>,
-    /// Secondary index for GC invalidation by blob key.
-    by_blob: Mutex<HashMap<BlobKey, Vec<u32>>>,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    collapsed: AtomicU64,
-    /// Caps concurrent readahead getFile / decode work.
-    readahead_sem: Arc<Semaphore>,
-    readahead_blocks: usize,
+    /// Metrics label: `l1` / `l2`.
+    level: &'static str,
+    cache: Cache<(ChunkId, u32), Bytes>,
 }
 
 impl BlockCache {
-    pub fn new(capacity_bytes: usize, readahead_blocks: usize) -> Self {
+    pub fn new(level: &'static str, capacity_bytes: usize) -> Self {
         Self {
+            level,
             cache: Cache::builder()
                 .max_capacity(capacity_bytes as u64)
-                .weigher(|_k: &BlockKey, v: &Bytes| v.len().min(u32::MAX as usize) as u32)
+                .weigher(|_k, v: &Bytes| v.len().min(u32::MAX as usize) as u32)
                 .build(),
-            by_blob: Mutex::new(HashMap::new()),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            collapsed: AtomicU64::new(0),
-            readahead_sem: Arc::new(Semaphore::new(2)),
-            readahead_blocks,
         }
     }
 
-    pub fn readahead_blocks(&self) -> usize {
-        self.readahead_blocks
-    }
-
-    pub fn readahead_sem(&self) -> Arc<Semaphore> {
-        self.readahead_sem.clone()
-    }
-
-    pub fn metrics(&self) -> (u64, u64, u64) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-            self.collapsed.load(Ordering::Relaxed),
-        )
-    }
-
-    pub async fn get_or_load<F, Fut>(
-        &self,
-        blob: BlobKey,
-        block_no: u32,
-        loader: F,
-    ) -> anyhow::Result<Bytes>
+    /// The cached block, or `loader`'s; concurrent lookups of one missing
+    /// block share one load (`collapsed`: waited for another lookup's).
+    pub async fn get_or_load<F, Fut>(&self, chunk: ChunkId, block_no: u32, loader: F) -> anyhow::Result<Bytes>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<Bytes>>,
     {
-        let key = BlockKey {
-            blob: blob.clone(),
-            block_no,
-        };
-        if self.cache.contains_key(&key) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            record_cache("l1", "hit");
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            record_cache("l1", "miss");
+        let key = (chunk, block_no);
+        if let Some(hit) = self.cache.get(&key).await {
+            record_cache(self.level, "hit");
+            return Ok(hit);
         }
-        let collapsed = Arc::new(AtomicU64::new(0));
-        let c = collapsed.clone();
-        let by_blob = &self.by_blob;
+        let loaded = Arc::new(AtomicBool::new(false));
+        let mine = loaded.clone();
         let out = self
             .cache
-            .try_get_with(key.clone(), async move {
-                c.fetch_add(1, Ordering::Relaxed);
+            .try_get_with(key, async move {
+                mine.store(true, Ordering::Relaxed);
                 loader().await
             })
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if collapsed.load(Ordering::Relaxed) == 0 {
-            self.collapsed.fetch_add(1, Ordering::Relaxed);
-            record_cache("l1", "collapsed");
+        if loaded.load(Ordering::Relaxed) {
+            record_cache(self.level, "miss");
+            self.record_size();
         } else {
-            let mut map = by_blob.lock().unwrap();
-            map.entry(blob).or_default().push(block_no);
+            record_cache(self.level, "collapsed");
         }
         Ok(out)
     }
 
-    pub async fn insert(&self, blob: BlobKey, block_no: u32, data: Bytes) {
-        {
-            let mut map = self.by_blob.lock().unwrap();
-            map.entry(blob.clone()).or_default().push(block_no);
-        }
-        self.cache
-            .insert(BlockKey { blob, block_no }, data)
-            .await;
+    pub async fn insert(&self, chunk: ChunkId, block_no: u32, data: Bytes) {
+        self.cache.insert((chunk, block_no), data).await;
+        self.record_size();
     }
 
-    pub async fn invalidate_blob(&self, blob: &BlobKey) {
-        let frames = {
-            let mut map = self.by_blob.lock().unwrap();
-            map.remove(blob).unwrap_or_default()
+    fn record_size(&self) {
+        set_cache_size(self.level, self.cache.weighted_size(), self.cache.entry_count());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn hit_miss_and_collapsed_are_counted_once_each() {
+        let cache = Arc::new(BlockCache::new("l1", 1 << 20));
+        let loads = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let load = |loads: Arc<std::sync::atomic::AtomicU32>| async move {
+            loads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(Bytes::from_static(b"block"))
         };
-        for block_no in frames {
-            self.cache
-                .invalidate(&BlockKey {
-                    blob: blob.clone(),
-                    block_no,
-                })
-                .await;
-        }
-    }
-
-    pub async fn clear(&self) {
-        self.cache.invalidate_all();
-        self.cache.run_pending_tasks().await;
-        self.by_blob.lock().unwrap().clear();
+        let (a, b) = tokio::join!(
+            cache.get_or_load(1, 0, || load(loads.clone())),
+            cache.get_or_load(1, 0, || load(loads.clone())),
+        );
+        assert_eq!((a.unwrap(), b.unwrap()), (Bytes::from_static(b"block"), Bytes::from_static(b"block")));
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "one load for two concurrent lookups");
+        cache.get_or_load(1, 0, || load(loads.clone())).await.unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "then a hit");
+        cache.insert(2, 0, Bytes::from_static(b"written")).await;
+        let got = cache.get_or_load(2, 0, || load(loads.clone())).await.unwrap();
+        assert_eq!((got, loads.load(Ordering::SeqCst)), (Bytes::from_static(b"written"), 1));
     }
 }

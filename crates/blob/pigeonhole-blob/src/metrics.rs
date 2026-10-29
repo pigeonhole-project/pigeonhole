@@ -10,80 +10,78 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use pigeonhole_types::{BackendLimits, ByteRange};
+use pigeonhole_types::{BackendLimits, ByteRange, MetricDoc, MetricKind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Describe metric metadata once at process start (safe to call multiple times).
-pub fn describe_metrics() {
-    metrics::describe_histogram!(
+/// The metrics this crate's helpers record.
+pub const METRICS: &[MetricDoc] = &[
+    MetricDoc::histogram(
         "pigeonhole_gateway_request_duration_seconds",
-        "Gateway HTTP request duration"
-    );
-    metrics::describe_histogram!(
-        "pigeonhole_instance_call_duration_seconds",
-        "Backend instance call duration"
-    );
-    metrics::describe_counter!(
+        &["gateway", "op", "outcome"],
+        "Gateway request time to response headers; op is the S3 operation (unknown: routing or auth failed first)",
+    ),
+    MetricDoc::counter("pigeonhole_bytes_from_clients_total", &["gateway", "op"], "Request body bytes received from gateway clients"),
+    MetricDoc::counter("pigeonhole_bytes_to_clients_total", &["gateway", "op"], "Response body bytes sent to gateway clients"),
+    MetricDoc::histogram("pigeonhole_instance_call_duration_seconds", &["instance", "op", "outcome"], "Backend call duration (get: until the stream starts)"),
+    MetricDoc::gauge("pigeonhole_instance_inflight", &["instance", "op"], "Backend calls in flight"),
+    MetricDoc::counter("pigeonhole_bytes_to_backend_total", &["instance"], "Bytes written to backend instances"),
+    MetricDoc::counter("pigeonhole_bytes_from_backend_total", &["instance"], "Bytes read from backend instances"),
+    MetricDoc::counter(
         "pigeonhole_instance_rate_limited_total",
-        "HTTP 429 responses from backend instances"
-    );
-    metrics::describe_histogram!(
-        "pigeonhole_limiter_wait_seconds",
-        "Time spent waiting on ChatLimiter token buckets"
-    );
-    metrics::describe_gauge!(
-        "pigeonhole_instance_inflight",
-        "In-flight backend ops per instance"
-    );
-    metrics::describe_counter!(
+        &["instance", "op"],
+        "Backend calls that failed rate limited (a 429 / FLOOD_WAIT longer than the call's budget)",
+    ),
+    MetricDoc::histogram(
+        "pigeonhole_backend_throttle_wait_seconds",
+        &["service", "method"],
+        "Waits a chat service asked for (429 retry-after / FLOOD_WAIT), also the ones waited out inside a call",
+    ),
+    MetricDoc::histogram("pigeonhole_limiter_wait_seconds", &["op"], "Time waiting for our own chat rate-limit buckets (waits > 0 only)"),
+    MetricDoc::counter("pigeonhole_replica_selected_total", &["instance"], "Replicas chosen to read from"),
+    MetricDoc::histogram("pigeonhole_parts_per_chunk", &["instance"], "Backend parts written per chunk replica"),
+    MetricDoc::counter(
         "pigeonhole_cache_requests_total",
-        "Block cache lookups (hit / miss / collapsed)"
-    );
-    metrics::describe_counter!(
-        "pigeonhole_bytes_from_backend_total",
-        "Bytes read from backend instances"
-    );
-    metrics::describe_counter!(
-        "pigeonhole_bytes_to_clients_total",
-        "Bytes written to gateway clients"
-    );
-    metrics::describe_histogram!(
-        "pigeonhole_compression_ratio",
-        "Stored/logical size ratio for encoded blocks (lower is better)"
-    );
-    metrics::describe_histogram!(
-        "pigeonhole_ingest_budget_wait_seconds",
-        "Time waiting for ingest memory budget permits"
-    );
-    metrics::describe_histogram!(
-        "pigeonhole_parts_per_chunk",
-        "Number of backend parts produced per chunk replica"
-    );
-    metrics::describe_counter!("pigeonhole_sweep_keys_total", "Sweeper key outcomes");
-    metrics::describe_counter!("pigeonhole_repair_jobs_total", "Repair job outcomes");
-    metrics::describe_gauge!(
-        "pigeonhole_repair_queue_depth",
-        "Pending repair queue depth"
-    );
-    metrics::describe_counter!(
-        "pigeonhole_replica_selected_total",
-        "Replica instances chosen for reads"
-    );
-    metrics::describe_counter!(
-        "pigeonhole_chunk_gone_total",
-        "retain failed because chunk was reclaiming or missing"
-    );
-    metrics::describe_counter!(
-        "pigeonhole_double_release_total",
-        "release called on a chunk with refs already 0"
-    );
+        &["level", "outcome"],
+        "Block cache lookups: hit, miss (loaded the block), collapsed (waited for another lookup's load)",
+    ),
+    MetricDoc::gauge("pigeonhole_cache_bytes", &["level"], "Bytes held by a block cache level"),
+    MetricDoc::gauge("pigeonhole_cache_entries", &["level"], "Blocks held by a block cache level"),
+    MetricDoc::histogram("pigeonhole_compression_ratio", &[], "Stored / logical size of each block written (lower is better)"),
+    MetricDoc::histogram("pigeonhole_ingest_budget_wait_seconds", &[], "Time PUTs wait for the ingest memory budget (waits > 0 only)"),
+    MetricDoc::histogram("pigeonhole_background_pass_seconds", &["task", "outcome"], "Duration of a sweep / repair pass"),
+    MetricDoc::counter("pigeonhole_sweep_keys_total", &["outcome"], "Sweeper outcomes: deleted keys, live keys skipped, zero-ref chunks reclaimed"),
+    MetricDoc::counter("pigeonhole_repair_jobs_total", &["outcome"], "Repair job outcomes"),
+    MetricDoc::gauge("pigeonhole_repair_queue_depth", &[], "Pending repair jobs"),
+    MetricDoc::counter("pigeonhole_chunk_gone_total", &[], "Retains that failed: the chunk was reclaiming or missing"),
+    MetricDoc::counter("pigeonhole_double_release_total", &[], "Releases of a chunk whose refs were already 0"),
+];
+
+/// Describe `docs` to the installed recorder (help text in the scrape).
+pub fn describe(docs: &[MetricDoc]) {
+    for d in docs {
+        match d.kind {
+            MetricKind::Counter => metrics::describe_counter!(d.name, d.help),
+            MetricKind::Gauge => metrics::describe_gauge!(d.name, d.help),
+            MetricKind::Histogram => metrics::describe_histogram!(d.name, d.help),
+        }
+    }
 }
 
-pub fn record_gateway_request(gateway: &str, outcome: &str, d: Duration) {
+pub fn record_background_pass(task: &str, ok: bool, d: Duration) {
+    metrics::histogram!(
+        "pigeonhole_background_pass_seconds",
+        "task" => task.to_owned(),
+        "outcome" => if ok { "ok" } else { "error" }
+    )
+    .record(d.as_secs_f64());
+}
+
+pub fn record_gateway_request(gateway: &str, op: &str, outcome: &str, d: Duration) {
     metrics::histogram!(
         "pigeonhole_gateway_request_duration_seconds",
         "gateway" => gateway.to_owned(),
+        "op" => op.to_owned(),
         "outcome" => outcome.to_owned()
     )
     .record(d.as_secs_f64());
@@ -106,6 +104,16 @@ pub fn record_429(instance: &str, op: &str) {
         "op" => op.to_owned()
     )
     .increment(1);
+}
+
+/// A chat service told us to wait `d` before calling `method` again.
+pub fn record_throttle(service: &str, method: &str, d: Duration) {
+    metrics::histogram!(
+        "pigeonhole_backend_throttle_wait_seconds",
+        "service" => service.to_owned(),
+        "method" => method.to_owned()
+    )
+    .record(d.as_secs_f64());
 }
 
 pub fn record_limiter_wait(op: &str, d: Duration) {
@@ -157,15 +165,41 @@ pub fn record_bytes_from_backend(instance: &str, n: u64) {
     .increment(n);
 }
 
-pub fn record_bytes_to_clients(gateway: &str, n: u64) {
+pub fn record_bytes_to_backend(instance: &str, n: u64) {
+    metrics::counter!(
+        "pigeonhole_bytes_to_backend_total",
+        "instance" => instance.to_owned()
+    )
+    .increment(n);
+}
+
+pub fn record_bytes_to_clients(gateway: &str, op: &str, n: u64) {
     if n == 0 {
         return;
     }
     metrics::counter!(
         "pigeonhole_bytes_to_clients_total",
-        "gateway" => gateway.to_owned()
+        "gateway" => gateway.to_owned(),
+        "op" => op.to_owned()
     )
     .increment(n);
+}
+
+pub fn record_bytes_from_clients(gateway: &str, op: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    metrics::counter!(
+        "pigeonhole_bytes_from_clients_total",
+        "gateway" => gateway.to_owned(),
+        "op" => op.to_owned()
+    )
+    .increment(n);
+}
+
+pub fn set_cache_size(level: &str, bytes: u64, entries: u64) {
+    metrics::gauge!("pigeonhole_cache_bytes", "level" => level.to_owned()).set(bytes as f64);
+    metrics::gauge!("pigeonhole_cache_entries", "level" => level.to_owned()).set(entries as f64);
 }
 
 pub fn record_compression_ratio(stored: usize, logical: usize) {
@@ -234,8 +268,7 @@ pub fn record_replica_selected(instance: &str) {
 }
 
 fn outcome_from_err(err: &anyhow::Error) -> (&'static str, bool) {
-    let msg = format!("{err:#}");
-    if msg.contains("429") {
+    if err.chain().any(|e| e.is::<crate::RateLimited>()) || format!("{err:#}").contains("429") {
         ("rate_limited", true)
     } else {
         ("error", false)
@@ -270,9 +303,13 @@ impl DynBlobBackend for MetricsBackend {
     async fn put(&self, data: Bytes, name: &str) -> Result<BlobLocator> {
         let instance = self.inner.instance().id.clone();
         let op = "put";
+        let len = data.len() as u64;
         inflight_inc(&instance, op);
         let t0 = Instant::now();
         let result = self.inner.put(data, name).await;
+        if result.is_ok() {
+            record_bytes_to_backend(&instance, len);
+        }
         let elapsed = t0.elapsed();
         inflight_dec(&instance, op);
         match &result {

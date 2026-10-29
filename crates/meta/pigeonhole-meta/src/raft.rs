@@ -217,7 +217,10 @@ impl LogAdapter {
                             payload: postcard::to_stdvec(e).expect("an entry always encodes"),
                         })
                         .collect();
-                    let result = match self.log.append(gen, &ours).await {
+                    let (bytes, t0) = (ours.iter().map(|e| e.payload.len()).sum(), std::time::Instant::now());
+                    let appended = self.log.append(gen, &ours).await;
+                    crate::telemetry::record_append(appended.is_ok(), ours.len(), bytes, t0.elapsed());
+                    let result = match appended {
                         Ok(last) => {
                             self.durable.store(last, Ordering::SeqCst);
                             let mut tail = self.tail.lock().unwrap();
@@ -426,6 +429,7 @@ impl StateMachine {
         shared: &Shared,
         snap: &RaftSnapshot,
     ) -> Result<CurrentSnapshot, SErr> {
+        let t0 = std::time::Instant::now();
         let data = snap.encode();
         let at = snap.meta.last_log_id.as_ref().map_or(0, position);
         let stored = StoredSnapshot { log_id: history, at, data: data.clone() };
@@ -433,6 +437,7 @@ impl StateMachine {
             .put(&stored)
             .await
             .map_err(|e| StorageError::from(StorageIOError::write_snapshot(None, AnyError::error(format!("{e:#}")))))?;
+        crate::telemetry::record_snapshot(data.len(), t0.elapsed());
         let current = CurrentSnapshot { meta: snap.meta.clone(), data, snapshot };
         let old = shared.current.lock().unwrap().replace(current.clone());
         // A newer one replaced it before the log moved onto it: unused (the

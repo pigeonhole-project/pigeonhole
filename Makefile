@@ -1,4 +1,4 @@
-.PHONY: run smoke compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report
+.PHONY: run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report
 
 run:
 	cargo run --release
@@ -43,6 +43,13 @@ compat-telegram:
 # Manual Discord Bot API suite (not in CI). Needs DISCORD_BOT_TOKEN + channel_id.
 compat-discord:
 	./scripts/compat-discord.sh $(ARGS)
+
+# Local pigeonhole on disk + Prometheus + Grafana + S3 traffic (docs/metrics.md).
+metrics-demo:
+	./scripts/metrics-demo.sh up
+
+metrics-demo-down:
+	./scripts/metrics-demo.sh down
 
 test:
 	cargo test --workspace

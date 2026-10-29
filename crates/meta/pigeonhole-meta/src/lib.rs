@@ -46,11 +46,13 @@ use tokio::sync::watch;
 pub mod log;
 pub mod raft;
 pub mod snapshot;
+mod telemetry;
 
 pub use log::{
     Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult,
     LogStore, Position, LOG_FORMAT, ChainLogStore,
 };
+pub use telemetry::METRICS;
 pub use snapshot::{BlobSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 
 /// A rejection that cannot happen (a namespace whose commands never fail).
@@ -386,8 +388,11 @@ async fn batcher(raft: raft::Raft, shared: Arc<raft::Shared>, mut rx: tokio::syn
 }
 
 async fn write_batch(raft: &raft::Raft, shared: &raft::Shared, batch: Vec<Pending>) {
-    let commands = batch.iter().flat_map(|p| p.commands.iter().cloned()).collect();
-    match raft.client_write(commands).await {
+    let commands: Vec<Command> = batch.iter().flat_map(|p| p.commands.iter().cloned()).collect();
+    let (n, t0) = (commands.len(), std::time::Instant::now());
+    let written = raft.client_write(commands).await;
+    telemetry::record_commit(written.is_ok(), n, t0.elapsed());
+    match written {
         Ok(resp) => {
             let position = raft::position(&resp.log_id);
             let mut outcomes = resp.data.into_iter();
@@ -443,6 +448,7 @@ impl MetaStore {
         namespaces: Namespaces,
         opts: MetaOptions,
     ) -> Result<Arc<Self>> {
+        let t0 = std::time::Instant::now();
         let mut states = States::new();
         for (name, state) in namespaces.states {
             if states.insert(name, state).is_some() {
@@ -491,6 +497,7 @@ impl MetaStore {
             if stored.log_id != head.log_id {
                 bail!("snapshot {:?} is of log {}, not of log {}", base.snapshot.0, stored.log_id, head.log_id);
             }
+            telemetry::record_loaded_snapshot(stored.data.len());
             let snap = raft::RaftSnapshot::decode(&stored.data)?;
             if snap.meta.last_log_id.as_ref().map_or(0, raft::position) < base.at {
                 bail!("snapshot {:?} is behind the log's base {}", base.snapshot.0, base.at);
@@ -578,6 +585,8 @@ impl MetaStore {
             })
         });
         *store.ticker.lock().unwrap() = ticker;
+        telemetry::record_boot(store.applied_position().saturating_sub(store.base_position()), t0.elapsed());
+        store.record_gauges();
         Ok(Arc::new(store))
     }
 
@@ -716,6 +725,11 @@ impl MetaStore {
     /// Position of the last applied entry (0 before the first).
     pub fn applied_position(&self) -> Position {
         self.shared.applied.load(Ordering::SeqCst)
+    }
+
+    /// Set the position / generation / stopped gauges (call it periodically).
+    pub fn record_gauges(&self) {
+        telemetry::record_positions(self.applied_position(), self.base_position(), self.gen, self.is_stopped());
     }
 }
 

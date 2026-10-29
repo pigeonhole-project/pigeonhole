@@ -1,0 +1,7 @@
+# Scrape a local pigeonhole (scripts/metrics-demo.sh: [metrics] listen_addr).
+global:
+  scrape_interval: 2s
+scrape_configs:
+  - job_name: pigeonhole
+    static_configs:
+      - targets: ["127.0.0.1:9100"]

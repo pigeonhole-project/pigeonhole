@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::Range;
 
+pub mod metric_doc;
+pub use metric_doc::{MetricDoc, MetricKind};
+
 /// Result of deleting a backend message/attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOutcome {

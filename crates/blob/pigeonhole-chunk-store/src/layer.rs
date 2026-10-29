@@ -121,6 +121,8 @@ pub struct ChunkStore {
     block_cache: Option<Arc<BlockCache>>,
     /// L2: compressed block payloads keyed by (ChunkId, block_no).
     compressed_cache: Option<Arc<BlockCache>>,
+    /// Put the blocks of every chunk written into L2.
+    write_through: bool,
 }
 
 impl ChunkStore {
@@ -170,16 +172,20 @@ impl ChunkStore {
             memory_budget: opts.memory_budget,
             block_cache: None,
             compressed_cache: None,
+            write_through: false,
         })
     }
 
+    /// `write_through`: chunks written put their stored blocks into `l2`.
     pub fn with_caches(
         mut self,
         l1: Option<Arc<BlockCache>>,
         l2: Option<Arc<BlockCache>>,
+        write_through: bool,
     ) -> Self {
         self.block_cache = l1;
         self.compressed_cache = l2;
+        self.write_through = write_through;
         self
     }
 
@@ -462,9 +468,8 @@ impl ChunkStore {
     ) -> Result<Bytes> {
         let block_no = block.block_no as u32;
         if let Some(l1) = &self.block_cache {
-            let key = chunk_cache_key(chunk_id);
             return l1
-                .get_or_load(key, block_no, || async {
+                .get_or_load(chunk_id, block_no, || async {
                     let stored = self
                         .load_compressed_block(chunk_id, block, replicas, fetch_range.clone())
                         .await?;
@@ -517,8 +522,7 @@ impl ChunkStore {
             Ok(raw)
         };
         if let Some(l2) = &self.compressed_cache {
-            let key = chunk_cache_key(chunk_id);
-            return l2.get_or_load(key, block_no, loader).await;
+            return l2.get_or_load(chunk_id, block_no, loader).await;
         }
         loader().await
     }
@@ -693,6 +697,9 @@ impl ChunkStore {
             .await
             .context("replicated push block")?;
 
+        if self.write_through && self.compressed_cache.is_some() {
+            open.stored.push(stored.clone());
+        }
         open.blocks.push(StoredBlock {
             block_no,
             logical_off,
@@ -713,6 +720,7 @@ impl ChunkStore {
         pending: &mut PendingChunks,
     ) -> Result<Extent> {
         let blocks = std::mem::take(&mut open.blocks);
+        let stored = std::mem::take(&mut open.stored);
         let logical = open.logical;
         open.logical = 0;
         let writer = std::mem::replace(&mut open.writer, self.replicated.chunk_writer());
@@ -728,6 +736,13 @@ impl ChunkStore {
         // Committed by the caller, with whatever points at it; the uploads
         // stay pinned until then.
         let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts);
+        // Ids are never reused: an entry of a chunk that fails to commit is
+        // never asked for.
+        if let Some(l2) = &self.compressed_cache {
+            for (block_no, data) in stored.into_iter().enumerate() {
+                l2.insert(chunk_id, block_no as u32, data).await;
+            }
+        }
         pending.chunks.push(PendingChunk { chunk_id, commit, layouts: sealed.layouts, pins: sealed.pins });
         Ok(Extent {
             chunk: chunk_id,
@@ -740,6 +755,8 @@ impl ChunkStore {
 struct OpenChunk {
     writer: pigeonhole_blob::ChunkReplicaWriter,
     blocks: Vec<StoredBlock>,
+    /// The blocks' stored bytes, kept for L2 when it is written through.
+    stored: Vec<Bytes>,
     logical: i64,
 }
 
@@ -748,18 +765,12 @@ impl OpenChunk {
         Self {
             writer,
             blocks: Vec::new(),
+            stored: Vec::new(),
             logical: 0,
         }
     }
 }
 
-fn chunk_cache_key(chunk_id: ChunkId) -> pigeonhole_types::BlobKey {
-    use pigeonhole_types::BackendId;
-    pigeonhole_types::BlobKey::new(
-        BackendId::new("chunk", &chunk_id.to_string()),
-        format!("chunk-{chunk_id}"),
-    )
-}
 
 /// E.4: block_size (+ margin for incompressible / header) must fit every member.
 pub fn check_block_fits_members(block_size: usize, replicated: &Replicated) -> Result<()> {
@@ -1026,6 +1037,35 @@ mod tests {
         flag.store(true, Ordering::Relaxed);
         let got = layer.read(&ingested.extents, None).await.unwrap();
         assert_eq!(got, data);
+    }
+
+    /// Written through, L2 holds every block: reads need no backend. Without
+    /// it, the same read goes to the (now unavailable) backend.
+    #[tokio::test]
+    async fn written_through_blocks_read_from_l2() {
+        const MIB: usize = 1024 * 1024;
+        for write_through in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = BlobDb::open(pigeonhole_testkit::tablet(&dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
+            let store = MemoryBlobStore::with_limits(BackendLimits::memory()).with_unavailable_flag();
+            let down = store.unavailable_flag();
+            let mut opts = IngestOptions::new(8 * MIB, ChunkCodec::Zstd);
+            opts.block_size = MIB;
+            let l2 = Arc::new(BlockCache::new("l2", 64 * MIB));
+            let layer = ChunkStore::open(db, store, opts).await.unwrap().with_caches(None, Some(l2), write_through);
+            let data: Bytes = (0..3 * MIB + 5).map(|i| (i / 1000) as u8).collect::<Vec<_>>().into();
+            let ingested = layer
+                .ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None)
+                .await
+                .unwrap();
+            down.store(true, Ordering::Relaxed);
+            let got = layer.read(&ingested.extents, None).await;
+            if write_through {
+                assert_eq!(got.unwrap(), data);
+            } else {
+                assert!(got.is_err(), "nothing cached, the backend is down");
+            }
+        }
     }
 
     /// Object larger than the ingest budget must still complete (budget covers

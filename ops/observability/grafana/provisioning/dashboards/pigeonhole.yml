@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: pigeonhole
+    type: file
+    options:
+      # Set by scripts/metrics-demo.sh.
+      path: ${PIGEONHOLE_DASHBOARDS}

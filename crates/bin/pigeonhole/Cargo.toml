@@ -48,6 +48,8 @@ bytestream = ["dep:pigeonhole-gateway-bytestream"]
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
 
 [dev-dependencies]
+metrics = { workspace = true }
+metrics-util = { workspace = true }
 pigeonhole-testkit = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
