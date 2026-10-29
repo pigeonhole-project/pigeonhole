@@ -26,6 +26,19 @@ measured with eight clients.
 A message send is 5 per ~5 s per channel (spike, 2026-10-28): about 6× more,
 at the latency of one POST instead of a place in the thread pacer's queue.
 
+Measured after log-collect (2026-10-29, [bench/](bench/)):
+
+- A Discord append takes 5.8 s on average with eight clients and 6.1 s one
+  at a time. A message POST alone (a 4 KiB blob put) takes ~0.56 s, so ~90%
+  of an append is waiting for the pacer's next thread (one per ~6.7 s).
+- No 429 on message create at our ~1 message/s per channel. Every 429 seen
+  was on thread creation.
+- Snapshots take no threads any more (`put_loose`). The budget goes to one
+  thread per log entry, plus one per snapshot (the rebase batch).
+- With eight clients the log is still the limit: 0.6 PUTs/s, 3.56 proposals
+  per entry, p50 13 s. The batcher only divides it. One POST per entry
+  instead of a paced thread should lift writes about 10×.
+
 ## Why not a plain lease
 
 "I hold the log until T; before T I append" breaks on a pause. The writer
@@ -165,7 +178,13 @@ On a test channel, with two bots or two tokens where noted:
 ## Open questions
 
 - `D`: shorter speeds up failover, longer spends fewer threads. 45 s is a
-  guess.
+  guess. Restart-heavy tests and the simulation must not pay `D` for every
+  restart. Options: `D` set by config (seconds in tests), the fake's and
+  madsim's virtual clock, and the `flock` shortcut on one host.
+- Commit latency now rests on assumption A and the deadline check, not on a
+  compare-and-set. A violation of A loses an acknowledged batch silently.
+  The simulation should inject a late-visible message and show the deadline
+  holds.
 - Whether the lease belongs in `ChainLogStore`, for every store (the memory
   and disk stores do not need it), or only behind the Discord `Chain`.
 - An in-flight delete after the expiry (above).
