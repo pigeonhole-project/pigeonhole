@@ -183,9 +183,9 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
         match self.api.start_thread(from, &name).await? {
             ThreadStart::Created => {
                 tracing::debug!(%store, label, from, message_id = b, "linked (thread created)");
-                if let Err(e) = self.api.archive_thread(from).await {
-                    tracing::debug!(error = %format!("{e:#}"), from, "archiving a link failed");
-                }
+                // Off the append's path: an archived link still answers
+                // 160004; archiving only keeps the guild's active threads low.
+                self.archive_later(from);
                 Ok(After::Won(DiscordId { message_id: b }))
             }
             ThreadStart::Taken => {

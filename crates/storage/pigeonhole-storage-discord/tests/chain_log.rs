@@ -206,3 +206,22 @@ async fn removed_snapshots_leave_no_links_behind() {
     let dangling: Vec<u64> = channel.thread_ids().into_iter().filter(|t| !alive.contains(t)).collect();
     assert!(dangling.len() <= 1, "{dangling:?}");
 }
+
+/// An append is a message and a thread; archiving the link runs after it.
+#[tokio::test]
+async fn links_are_archived_off_the_appends_path() {
+    let channel = Arc::new(FakeDiscord::new(80));
+    let a = store(&channel);
+    a.claim(1).await.unwrap();
+    for i in 1..=5 {
+        a.append(1, &[entry(i)]).await.unwrap();
+    }
+    let links = channel.calls().start_thread;
+    for _ in 0..100 {
+        if channel.calls().archive_thread >= links {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("archived {} of {links} links", channel.calls().archive_thread);
+}

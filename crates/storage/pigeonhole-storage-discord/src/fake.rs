@@ -27,6 +27,7 @@ pub struct Calls {
     pub list: usize,
     pub delete: usize,
     pub start_thread: usize,
+    pub archive_thread: usize,
     pub download: usize,
 }
 
@@ -221,6 +222,7 @@ impl DiscordApi for FakeDiscord {
     }
 
     async fn archive_thread(&self, message_id: u64) -> Result<()> {
+        self.inner.lock().unwrap().calls.archive_thread += 1;
         if !self.inner.lock().unwrap().threads.contains_key(&message_id) {
             bail!("404: no thread {message_id}");
         }

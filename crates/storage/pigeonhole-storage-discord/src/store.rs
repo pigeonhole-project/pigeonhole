@@ -85,6 +85,8 @@ pub struct DiscordBlobStore<A> {
     inline: bool,
     /// The chain's anchor message, once found ([`crate::chain`]).
     pub(crate) anchor: tokio::sync::Mutex<Option<u64>>,
+    /// Links to archive in the background ([`Self::archive_later`]).
+    archiver: Mutex<Option<tokio::sync::mpsc::UnboundedSender<u64>>>,
 }
 
 impl<A: DiscordApi> DiscordBlobStore<A> {
@@ -98,7 +100,27 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
             names: Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())),
             inline: true,
             anchor: tokio::sync::Mutex::new(None),
+            archiver: Mutex::new(None),
         }
+    }
+
+    /// Archive the thread of message `id` in the background, one at a time
+    /// (started on first use; ends with the store).
+    pub(crate) fn archive_later(&self, id: u64) {
+        let mut tx = self.archiver.lock().unwrap();
+        if tx.as_ref().is_none_or(|t| t.is_closed()) {
+            let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+            let api = self.api.clone();
+            tokio::spawn(async move {
+                while let Some(id) = rx.recv().await {
+                    if let Err(e) = api.archive_thread(id).await {
+                        tracing::debug!(thread = id, error = %format!("{e:#}"), "archiving a link failed");
+                    }
+                }
+            });
+            *tx = Some(sender);
+        }
+        let _ = tx.as_ref().expect("just set").send(id);
     }
 
     /// Whether small blobs go as text messages (default) or always as attachments.
