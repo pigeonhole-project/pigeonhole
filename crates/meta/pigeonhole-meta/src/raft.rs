@@ -245,7 +245,9 @@ impl LogAdapter {
                     }
                 }
                 Op::Truncate(from, done) => {
+                    let t0 = std::time::Instant::now();
                     let r = self.log.truncate(gen, from).await.map_err(|e| self.shared.log_error(e));
+                    crate::telemetry::record_log_write("truncate", r.is_ok(), t0.elapsed());
                     if r.is_ok() {
                         self.durable.store(from - 1, Ordering::SeqCst);
                         self.tail.lock().unwrap().retain(|p, _| *p < from);
@@ -254,7 +256,9 @@ impl LogAdapter {
                 }
                 Op::Rebase(base, done) => {
                     let (at, new_ref) = (base.at, base.snapshot.clone());
+                    let t0 = std::time::Instant::now();
                     let r = self.log.rebase(gen, base).await.map_err(|e| self.shared.log_error(e));
+                    crate::telemetry::record_log_write("rebase", r.is_ok(), t0.elapsed());
                     if r.is_ok() {
                         tracing::info!(at, snapshot = %new_ref.0, "log rebased on a snapshot");
                         self.durable.fetch_max(at, Ordering::SeqCst);
@@ -271,7 +275,10 @@ impl LogAdapter {
                     let _ = done.send(r);
                 }
                 Op::Vote(vote, done) => {
-                    let _ = done.send(self.log.save_vote(gen, &vote).await.map_err(|e| self.shared.log_error(e)));
+                    let t0 = std::time::Instant::now();
+                    let r = self.log.save_vote(gen, &vote).await.map_err(|e| self.shared.log_error(e));
+                    crate::telemetry::record_log_write("vote", r.is_ok(), t0.elapsed());
+                    let _ = done.send(r);
                 }
             }
         }

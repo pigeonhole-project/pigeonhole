@@ -110,6 +110,29 @@ For Telegram reads look at the client's time or `limiter_wait` / throttles.
 - Both land on ~0.3 PUTs/s: Telegram's blobs channel rate, and Discord's
   log rate (0.11 entries/s) times 2.67 proposals per entry.
 
+## Update: the collection off the log's path
+
+The 8-client Discord phase above spent ~5 s of every commit outside the
+log append: the snapshot ticker fired in that phase, and the rebase after
+it ran its collection inline in the log writer (on Discord: ~150 reads
+and ~50 thread deletes at 1/s) for 112 s, every entry queued behind it.
+Since `ChainLogStore::rebase` returns once the base is written (the
+collection runs in the background) and snapshots on Discord are plain
+messages (no paced thread), the same run gives
+([raw](bench/2026-10-29-log-collect/discord.json)):
+
+| Discord, 8 clients | before | after |
+|---|---|---|
+| PUTs in the phase | 56 | 114 |
+| client p50 / p95 | 13 s / 119 s | 13 s / 20 s |
+| commit / log append mean | 8.9 s / 3.8 s | 6.0 s / 5.8 s |
+| proposals per entry | 2.67 | 3.56 |
+| snapshot put | 13.4 s | 0.8 s |
+| snapshot stored → log rebased | 112 s | 12 s |
+
+The log is still the limit (an entry is a paced thread), but it no longer
+stalls.
+
 ## What would move the numbers
 
 - **Telegram: more blob channels.** One chat's send budget is the ceiling

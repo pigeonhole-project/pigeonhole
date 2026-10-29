@@ -110,6 +110,8 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_meta_proposals_per_entry` | histogram |  | Proposals group-committed in one log entry |
 | `pigeonhole_meta_batch_full_total` | counter |  | Entries that reached MAX_BATCH commands (a proposal that did not fit waits for the next) |
 | `pigeonhole_meta_log_append_seconds` | histogram | `outcome` | LogStore append of a batch of entries (fsync / chat message) |
+| `pigeonhole_meta_log_write_seconds` | histogram | `op`, `outcome` | The log writer's other operations (rebase, truncate, vote): appends queue behind them |
+| `pigeonhole_meta_log_collect_seconds` | histogram | `outcome` | Dropping what lies behind a new base (in the background, after a rebase) |
 | `pigeonhole_meta_log_entries_total` | counter |  | Entries appended to the log |
 | `pigeonhole_meta_log_bytes_total` | counter |  | Entry payload bytes appended to the log |
 | `pigeonhole_meta_snapshot_seconds` | histogram |  | Time to encode and store a snapshot |

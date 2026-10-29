@@ -28,6 +28,16 @@ pub const METRICS: &[MetricDoc] = &[
         "Entries that reached MAX_BATCH commands (a proposal that did not fit waits for the next)",
     ),
     MetricDoc::histogram("pigeonhole_meta_log_append_seconds", &["outcome"], "LogStore append of a batch of entries (fsync / chat message)"),
+    MetricDoc::histogram(
+        "pigeonhole_meta_log_write_seconds",
+        &["op", "outcome"],
+        "The log writer's other operations (rebase, truncate, vote): appends queue behind them",
+    ),
+    MetricDoc::histogram(
+        "pigeonhole_meta_log_collect_seconds",
+        &["outcome"],
+        "Dropping what lies behind a new base (in the background, after a rebase)",
+    ),
     MetricDoc::counter("pigeonhole_meta_log_entries_total", &[], "Entries appended to the log"),
     MetricDoc::counter("pigeonhole_meta_log_bytes_total", &[], "Entry payload bytes appended to the log"),
     MetricDoc::histogram("pigeonhole_meta_snapshot_seconds", &[], "Time to encode and store a snapshot"),
@@ -104,4 +114,12 @@ pub(crate) fn record_positions(applied: u64, base: u64, generation: u64, stopped
     metrics::gauge!("pigeonhole_meta_base_position").set(base as f64);
     metrics::gauge!("pigeonhole_meta_generation").set(generation as f64);
     metrics::gauge!("pigeonhole_meta_stopped").set(if stopped { 1.0 } else { 0.0 });
+}
+
+pub(crate) fn record_log_write(op: &'static str, ok: bool, d: Duration) {
+    metrics::histogram!("pigeonhole_meta_log_write_seconds", "op" => op, "outcome" => outcome(ok)).record(d.as_secs_f64());
+}
+
+pub(crate) fn record_collect(ok: bool, d: Duration) {
+    metrics::histogram!("pigeonhole_meta_log_collect_seconds", "outcome" => outcome(ok)).record(d.as_secs_f64());
 }

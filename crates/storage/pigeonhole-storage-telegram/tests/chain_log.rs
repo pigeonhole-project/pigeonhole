@@ -207,6 +207,7 @@ async fn a_rebase_prunes_our_messages_and_nothing_else() {
         a.append(1, &[entry(i)]).await.unwrap();
     }
     a.rebase(1, base(3)).await.unwrap();
+    a.settle().await; // the collection runs in the background
     let names = channel.names();
     assert!(names.iter().any(|(id, _)| *id == foreign), "{names:?}");
     // Batches 4 and 5 and the rebase batch stay, and the batch holding 3's

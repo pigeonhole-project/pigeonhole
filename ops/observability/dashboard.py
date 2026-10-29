@@ -166,6 +166,10 @@ place([
         (ratio(f"rate(pigeonhole_meta_proposals_per_entry_sum{R})", f"rate(pigeonhole_meta_proposals_per_entry_count{R})"), "mean"),
         (q(0.99, "pigeonhole_meta_proposals_per_entry"), "p99")]),
     ts("Log written", [(f"rate(pigeonhole_meta_log_bytes_total{R})", "bytes/s")], "Bps"),
+    ts("Log writer: other ops, collection", [
+        (f"max by (op) (rate(pigeonhole_meta_log_write_seconds_sum{R}) / rate(pigeonhole_meta_log_write_seconds_count{R}))", "{{op}} (mean)"),
+        (f"rate(pigeonhole_meta_log_collect_seconds_sum{R}) / rate(pigeonhole_meta_log_collect_seconds_count{R})", "collection (background, mean)")], "s",
+       desc="Appends queue behind a rebase / truncate / vote; the collection after a rebase runs beside them"),
 ], 8)
 place([
     ts("Entries since snapshot", [("pigeonhole_meta_applied_position - pigeonhole_meta_base_position", "log length")]),

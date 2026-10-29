@@ -161,11 +161,59 @@ struct Write {
 pub struct ChainLogStore<C: Chain> {
     chain: Arc<C>,
     state: Mutex<State<C::Id>>,
+    /// The collection after the last rebase, in the background: on a chat
+    /// it deletes one message (and thread) at a time, and the log's writer
+    /// must not wait for it. Ends with the store.
+    collecting: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl<C: Chain> Drop for ChainLogStore<C> {
+    fn drop(&mut self) {
+        // A dropped (or crashed) incarnation stops touching the store.
+        if let Some(task) = self.collecting.lock().unwrap().take() {
+            task.abort();
+        }
+    }
 }
 
 impl<C: Chain> ChainLogStore<C> {
     pub fn new(chain: Arc<C>) -> Self {
-        Self { chain, state: Mutex::default() }
+        Self { chain, state: Mutex::default(), collecting: Mutex::default() }
+    }
+
+    /// Collect below the base of `tip` in the background: walk back as a
+    /// reader from the base would, to the oldest blob it needs, and prune
+    /// below it. Safe after a fence too: the base is in the chain before
+    /// this starts, so a newer incarnation replays from it or later and
+    /// never needs what lies below. One collection at a time; while one
+    /// runs, a rebase skips its own (the next one collects).
+    fn collect_behind(&self, tip: &Tip<C::Id>) {
+        let mut collecting = self.collecting.lock().unwrap();
+        if collecting.as_ref().is_some_and(|t| !t.is_finished()) {
+            return;
+        }
+        let (reader, chain, at) = (self.reader(), self.chain.clone(), tip.base_at());
+        let mut next = tip.at.clone();
+        *collecting = Some(tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            let mut keep = next.clone();
+            let mut limit = Position::MAX;
+            while let Some(link) = next {
+                let Ok(doc) = reader.follow(&link).await else { return };
+                limit = limit.min(doc.batch.first);
+                keep = Some(link);
+                if limit <= at + 1 {
+                    break;
+                }
+                next = doc.prev;
+            }
+            let Some(keep) = keep else { return };
+            let pruned = chain.prune(&keep.id).await;
+            if let Err(e) = &pruned {
+                tracing::warn!(error = %format!("{e:#}"), "log collection failed; retried at the next rebase");
+            }
+            crate::telemetry::record_collect(pruned.is_ok(), t0.elapsed());
+        }));
     }
 
     /// This handle's tip, if it holds generation `gen`.
@@ -420,28 +468,16 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         };
         let w = Write { first, entries: Vec::new(), head_term, base: Some(base), vote: None };
         let tip = self.write(gen, w).await?;
-
-        // Collect (best effort): walk back as a reader from `at` would, to
-        // the oldest blob it needs, and prune below it.
-        let reader = self.reader();
-        let mut keep = tip.at.clone();
-        let mut limit = Position::MAX;
-        let mut next = tip.at;
-        while let Some(link) = next {
-            let Ok(doc) = reader.follow(&link).await else { return Ok(()) };
-            limit = limit.min(doc.batch.first);
-            keep = Some(link);
-            if limit <= at + 1 {
-                break;
-            }
-            next = doc.prev;
-        }
-        if let Some(keep) = keep {
-            if let Err(e) = self.chain.prune(&keep.id).await {
-                tracing::warn!(error = %format!("{e:#}"), "log collection failed; retried at the next rebase");
-            }
-        }
+        // The base is durable; dropping what lies behind it is best effort.
+        self.collect_behind(&tip);
         Ok(())
+    }
+
+    async fn settle(&self) {
+        let task = self.collecting.lock().unwrap().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 }
 
