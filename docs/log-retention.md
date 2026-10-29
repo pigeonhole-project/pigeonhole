@@ -127,7 +127,7 @@ position would be referenced by the restored state. Reclaim already waits for
 only once the base passes the chunk's `BeginReclaim`. With retention the gate
 becomes the **watermark**: a part is deleted only when no retained base or
 retained log can bring its chunk back. The cost is that released data stays
-for the retention window too. Blobs uploaded after the position are orphans
+while its chunk is retained too. Blobs uploaded after the position are orphans
 of the restored state; the sweeper's horizon (seeded from the highest
 committed key) collects them after the first new upload.
 
