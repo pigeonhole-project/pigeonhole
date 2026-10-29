@@ -49,6 +49,11 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::gauge("pigeonhole_meta_stopped", &[], "1 once the tablet stopped (fenced or failed)"),
     MetricDoc::gauge("pigeonhole_meta_boot_seconds", &[], "Time the last boot took: claim, load the snapshot, replay the log"),
     MetricDoc::gauge("pigeonhole_meta_boot_replayed_entries", &[], "Entries the last boot replayed on top of its snapshot"),
+    MetricDoc::counter(
+        "pigeonhole_meta_snapshot_fallbacks_total",
+        &[],
+        "Boots that could not load the newest base's snapshot and started from an older one the log keeps",
+    ),
 ];
 
 fn outcome(ok: bool) -> &'static str {
@@ -102,6 +107,10 @@ pub(crate) fn record_snapshot(bytes: usize, d: Duration) {
 /// The snapshot a boot started from.
 pub(crate) fn record_loaded_snapshot(bytes: usize) {
     metrics::gauge!("pigeonhole_meta_snapshot_bytes").set(bytes as f64);
+}
+
+pub(crate) fn record_snapshot_fallback() {
+    metrics::counter!("pigeonhole_meta_snapshot_fallbacks_total").increment(1);
 }
 
 pub(crate) fn record_boot(replayed: u64, d: Duration) {

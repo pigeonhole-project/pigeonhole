@@ -99,8 +99,10 @@ pub(crate) struct Shared {
     /// Position the log starts from.
     pub(crate) based: AtomicU64,
     pub(crate) current: Mutex<Option<CurrentSnapshot>>,
-    /// The snapshot the log starts from (kept until the log moves on).
-    pub(crate) base_ref: Mutex<Option<SnapshotRef>>,
+    /// The base this node started from or last rebased on: the log's own,
+    /// or an older one it keeps when the newest snapshot could not be
+    /// loaded. Raft sees the log as purged up to it.
+    pub(crate) base: Mutex<Option<Base>>,
 }
 
 impl Shared {
@@ -165,6 +167,10 @@ pub(crate) struct LogAdapter {
     tx: mpsc::UnboundedSender<Op>,
 }
 
+/// Bases (and their snapshots) the log keeps: the newest `keep`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Keep(pub(crate) usize);
+
 impl LogAdapter {
     /// Start the writer task for `log`, claimed as `gen`, whose head is `head`.
     pub(crate) fn new(
@@ -174,6 +180,7 @@ impl LogAdapter {
         head: Position,
         shared: Arc<Shared>,
         snapshots: Arc<dyn SnapshotStore>,
+        keep: Keep,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let this = Self {
@@ -185,11 +192,11 @@ impl LogAdapter {
             shared,
             tx,
         };
-        tokio::spawn(this.clone().write_loop(gen, snapshots, rx));
+        tokio::spawn(this.clone().write_loop(gen, snapshots, keep, rx));
         this
     }
 
-    async fn write_loop(self, gen: u64, snapshots: Arc<dyn SnapshotStore>, mut rx: mpsc::UnboundedReceiver<Op>) {
+    async fn write_loop(self, gen: u64, snapshots: Arc<dyn SnapshotStore>, keep: Keep, mut rx: mpsc::UnboundedReceiver<Op>) {
         let mut next = None;
         loop {
             let op = match next.take() {
@@ -257,22 +264,24 @@ impl LogAdapter {
                 Op::Rebase(base, done) => {
                     let (at, new_ref) = (base.at, base.snapshot.clone());
                     let t0 = std::time::Instant::now();
-                    let r = self.log.rebase(gen, base).await.map_err(|e| self.shared.log_error(e));
+                    let r = self.log.rebase(gen, base.clone(), keep.0).await.map_err(|e| self.shared.log_error(e));
                     crate::telemetry::record_log_write("rebase", r.is_ok(), t0.elapsed());
-                    if r.is_ok() {
+                    let r = r.map(|dropped| {
                         tracing::info!(at, snapshot = %new_ref.0, "log rebased on a snapshot");
                         self.durable.fetch_max(at, Ordering::SeqCst);
                         self.tail.lock().unwrap().retain(|p, _| *p > at);
                         self.shared.based.store(at, Ordering::SeqCst);
-                        let old = self.shared.base_ref.lock().unwrap().replace(new_ref.clone());
-                        if let Some(old) = old.filter(|o| *o != new_ref) {
-                            // Nothing starts from it any more (best effort).
-                            if let Err(e) = snapshots.remove(&old).await {
-                                tracing::warn!(snapshot = %old.0, error = %format!("{e:#}"), "removing the old base failed");
-                            }
+                        *self.shared.base.lock().unwrap() = Some(base);
+                        dropped
+                    });
+                    let dropped = r.as_ref().map(|d| d.clone()).unwrap_or_default();
+                    let _ = done.send(r.map(|_| ()));
+                    // Nothing starts from them any more (best effort).
+                    for old in dropped.into_iter().filter(|o| o.snapshot != new_ref) {
+                        if let Err(e) = snapshots.remove(&old.snapshot).await {
+                            tracing::warn!(snapshot = %old.snapshot.0, error = %format!("{e:#}"), "removing an old base failed");
                         }
                     }
-                    let _ = done.send(r);
                 }
                 Op::Vote(vote, done) => {
                     let t0 = std::time::Instant::now();
@@ -345,9 +354,10 @@ impl RaftLogStorage<TypeConfig> for LogAdapter {
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, SErr> {
         let d = self.log.discover().await.map_err(read_err)?.ok_or_else(|| read_err("the log was never claimed"))?;
-        let purged = d.base.as_ref().map(|b| log_id(b.term, b.leader, b.at - 1)).filter(|_| d.base.as_ref().is_some_and(|b| b.at > 0));
+        let base = self.shared.base.lock().unwrap().clone();
+        let purged = base.as_ref().filter(|b| b.at > 0).map(|b| log_id(b.term, b.leader, b.at - 1));
         let head = d.head.position;
-        let base_at = d.base.as_ref().map_or(0, |b| b.at);
+        let base_at = base.as_ref().map_or(0, |b| b.at);
         let last = if head > base_at {
             self.read_positions(head - 1, head).await?.pop().map(|e| e.log_id)
         } else {
@@ -458,8 +468,8 @@ impl StateMachine {
         let current = CurrentSnapshot { meta: snap.meta.clone(), data, snapshot };
         let old = shared.current.lock().unwrap().replace(current.clone());
         // A newer one replaced it before the log moved onto it: unused (the
-        // one the log starts from stays until a purge moves the base).
-        let base_ref = shared.base_ref.lock().unwrap().clone();
+        // one the node starts from stays until the log drops it).
+        let base_ref = shared.base.lock().unwrap().as_ref().map(|b| b.snapshot.clone());
         if let Some(old) = old.filter(|o| o.snapshot != current.snapshot && Some(&o.snapshot) != base_ref.as_ref()) {
             if let Err(e) = snapshots.remove(&old.snapshot).await {
                 tracing::warn!(snapshot = %old.snapshot.0, error = %format!("{e:#}"), "removing an unused snapshot failed");

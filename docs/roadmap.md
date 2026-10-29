@@ -282,14 +282,14 @@ disk; scenarios: log model check, takeover, power failure, `sweep_stress`
 over S3, a damaged replica. A crc per stored block (chunk `VERSION` 3).
 `make sim` in CI with 50 seeds.
 
-### Step 11a — Log retention
+### Step 11a — Log retention ✅ done (point-in-time restore left)
 
-[log-retention.md](log-retention.md) (proposal): keep the newest snapshots
-and the log from the oldest of them by a policy (`[meta.retain]`); one
-collector deletes below a watermark that only rises, batched, at its own
-rate and only with spare budget; a
-boot falls back to an older snapshot when the newest is damaged; later a
-point-in-time restore with reclaim gated on the watermark.
+[log-retention.md](log-retention.md): `[meta] keep_snapshots` newest bases
+and the log from the oldest are kept (in the log's registers); the rest is
+collected in the background on spare budget only (`wait_idle` in every
+store's limiter); a boot falls back to an older snapshot when the newest
+cannot be read. Later: point-in-time restore with reclaim gated on the
+watermark.
 
 ### Step 12 — OpenDAL
 

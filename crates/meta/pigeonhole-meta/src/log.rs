@@ -15,7 +15,7 @@ pub use chain::ChainLogStore;
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.
-pub const LOG_FORMAT: u32 = 3;
+pub const LOG_FORMAT: u32 = 4;
 
 /// One log entry: the Raft term it was written in and an opaque payload (a
 /// tablet command; later an openraft entry).
@@ -114,6 +114,10 @@ pub struct Base {
 pub struct Discovered {
     /// `None`: the log starts at position 0 from empty states.
     pub base: Option<Base>,
+    /// Older bases the log still keeps, newest first: the log is readable
+    /// from the oldest of them, so a boot that cannot load `base` can start
+    /// from one of these and replay (docs/log-retention.md).
+    pub older: Vec<Base>,
     pub head: Head,
     /// Term of the entry at the head (the base's if the head is the base).
     pub head_term: u64,
@@ -200,13 +204,18 @@ pub trait LogStore: Send + Sync + 'static {
     /// log was never claimed.
     async fn discover(&self) -> LogResult<Option<Discovered>>;
 
-    /// Entries after `from` up to `head`, in order (replay).
+    /// Entries after `from` up to `head`, in order (replay). `from` may lie
+    /// behind the base, down to the oldest base kept ([`Discovered::older`]);
+    /// further back is `Lost`.
     fn read(&self, from: Position, head: Head) -> EntryStream;
 
-    /// Start the log from `base` (a snapshot already stored) and drop
-    /// entries ≤ `base.at` (collect). `base.at` may be past the head (a
-    /// snapshot installed from elsewhere): the log is then empty up to it.
-    async fn rebase(&self, gen: u64, base: Base) -> LogResult<()>;
+    /// Start the log from `base` (a snapshot already stored), keeping the
+    /// `keep` newest bases (≥ 1, `base` included) and the entries after the
+    /// oldest of them; entries before it are collected in the background.
+    /// Returns the bases no longer kept: nothing starts from their
+    /// snapshots any more. `base.at` may be past the head (a snapshot
+    /// installed from elsewhere): the log is then empty up to it.
+    async fn rebase(&self, gen: u64, base: Base, keep: usize) -> LogResult<Vec<Base>>;
 
     /// Wait for background work (the collection after a rebase); tests use
     /// it before looking at what a rebase dropped.

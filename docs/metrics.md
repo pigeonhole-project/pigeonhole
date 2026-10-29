@@ -123,6 +123,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_meta_stopped` | gauge |  | 1 once the tablet stopped (fenced or failed) |
 | `pigeonhole_meta_boot_seconds` | gauge |  | Time the last boot took: claim, load the snapshot, replay the log |
 | `pigeonhole_meta_boot_replayed_entries` | gauge |  | Entries the last boot replayed on top of its snapshot |
+| `pigeonhole_meta_snapshot_fallbacks_total` | counter |  | Boots that could not load the newest base's snapshot and started from an older one the log keeps |
 
 ### pigeonhole (binary)
 

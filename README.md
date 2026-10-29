@@ -227,7 +227,7 @@ comments. Sections:
 | `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
 | `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never) |
+| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every_secs` (`0` = never), `keep_snapshots` (the newest snapshots kept with the log between them; default 2) |
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Rate limits on two levels: per bot (`bot_rate_per_sec`) and per channel (send / getFile / delete / info budgets); a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency |
@@ -261,7 +261,9 @@ truth and every boot rebuilds the state by replaying it (see
 
 Every `[meta] snapshot_every_entries` entries (and every `snapshot_every_secs`
 when anything changed) the tablet snapshots all states into the snapshot store and
-drops the log behind it, so boot = that snapshot + the log after it. Log and
+drops the log behind the oldest of the `keep_snapshots` newest snapshots, so
+boot = the newest snapshot + the log after it, or, if that snapshot cannot be
+read, an older one + a longer replay ([docs/log-retention.md](docs/log-retention.md)). Log and
 snapshots are configured separately:
 
 | `[meta] log` | `[meta] snapshot` | losing this host's disk |

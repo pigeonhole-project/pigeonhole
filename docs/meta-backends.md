@@ -111,12 +111,15 @@ trait LogStore {
     /// Base + log head + newest generation (bootstrap without local state).
     async fn discover(&self) -> Result<Option<Discovered>>;
 
-    /// Entries after `from` up to `head`, in order (replay).
+    /// Entries after `from` up to `head`, in order (replay); `from` may be
+    /// behind the base, down to the oldest base kept.
     fn read(&self, from: Position, head: Head) -> EntryStream;
 
     /// Start the log from `base` = { at, snapshot: SnapshotRef } (a snapshot
-    /// already stored) and drop entries ≤ `at` (collect). Fenced like append.
-    async fn rebase(&self, gen: u64, base: Base) -> Result<()>;
+    /// already stored), keeping the `keep` newest bases and the log from the
+    /// oldest; collect the rest in the background. Returns the bases that
+    /// fell out. Fenced like append (log-retention.md).
+    async fn rebase(&self, gen: u64, base: Base, keep: usize) -> Result<Vec<Base>>;
 }
 ```
 
@@ -181,7 +184,10 @@ one chain.
    `snapshot_every_secs` when anything changed (an idle tablet wakes up for it), between
    batches: one `TabletSnapshot` of all states, stored with `put` in the
    background (one at a time); when it is stored, the batcher `rebase`s the log
-   on it (dropping the log behind it) and removes the previous base snapshot.
+   on it, keeping `[meta] keep_snapshots` bases (and the log from the oldest),
+   and removes the snapshots of the bases that fell out
+   ([log-retention.md](log-retention.md)). A boot that cannot load the newest
+   base's snapshot starts from an older kept one.
    `MetaStore::base_position` is where the log starts now. A failed put or
    rebase keeps the old base; the next snapshot tries again.
 
@@ -289,11 +295,13 @@ cheap compared to Telegram; needs an S3-compatible store with conditional writes
 
 ### Garbage of the log itself
 
-The tablet decides what is garbage in its own log (entries ≤ the base), like
+The tablet decides what is garbage in its own log (entries ≤ the oldest
+base kept), like
 YDB's `CollectGarbage` barrier on `generation:step`; ids of log objects are
 chosen by the writer, so collection needs no listing. Old Telegram log
-messages (ours only) below the oldest batch a reader needs are deleted by
-`rebase`, the previous base snapshot by the tablet.
+messages (ours only) below the oldest batch a reader needs are deleted in
+the background after `rebase`, on spare budget only; the snapshots of bases
+no longer kept by the tablet.
 
 ## Config
 

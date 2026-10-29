@@ -111,6 +111,11 @@ impl<C: Chain> BlobSnapshotStore<C> {
         Ok((id, u32::from_str_radix(crc, 16).map_err(|_| bad())?))
     }
 
+    /// The blob a snapshot ref names (tests that damage it underneath).
+    pub fn blob_id(r: &SnapshotRef) -> Result<C::Id> {
+        Ok(Self::parse(r)?.0)
+    }
+
     async fn download(&self, id: &C::Id) -> Result<Vec<u8>> {
         Ok(collect_stream(self.chain.get(id, None).await?).await?.to_vec())
     }

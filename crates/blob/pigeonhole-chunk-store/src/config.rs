@@ -133,6 +133,8 @@ pub struct MetaSettings {
     pub snapshot_every_entries: u64,
     /// Also snapshot this often when there are new entries; zero = never.
     pub snapshot_interval: Duration,
+    /// The newest snapshots kept, with the log from the oldest of them (≥ 1).
+    pub keep_snapshots: usize,
     pub log: LogSettings,
     pub snapshot: SnapshotSettings,
 }
@@ -523,6 +525,7 @@ struct FileMeta {
     snapshot: Option<String>,
     snapshot_every_entries: u64,
     snapshot_every_secs: u64,
+    keep_snapshots: usize,
 }
 
 impl Default for FileMeta {
@@ -532,6 +535,7 @@ impl Default for FileMeta {
             snapshot: None,
             snapshot_every_entries: 10_000,
             snapshot_every_secs: 600,
+            keep_snapshots: 2,
         }
     }
 }
@@ -582,9 +586,13 @@ impl FileMeta {
             ),
             _ => {}
         }
+        if self.keep_snapshots == 0 {
+            bail!("[meta] keep_snapshots: at least 1 (the snapshot the log starts from)");
+        }
         Ok(MetaSettings {
             snapshot_every_entries: self.snapshot_every_entries,
             snapshot_interval: Duration::from_secs(self.snapshot_every_secs),
+            keep_snapshots: self.keep_snapshots,
             log,
             snapshot,
         })
@@ -958,6 +966,7 @@ upload_concurrency = 4
         assert_eq!(cfg.placement, PlacementConfig::single("mem"));
         assert_eq!(cfg.meta.snapshot_every_entries, 10_000);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(600));
+        assert_eq!(cfg.meta.keep_snapshots, 2);
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "pigeonhole-meta".into() });
         assert_eq!(cfg.meta.snapshot, SnapshotSettings::LocalDisk { path: "pigeonhole-meta".into() });
         assert!(!cfg.meta.snapshots_outlive_log(), "same directory, same disk");
@@ -969,9 +978,10 @@ upload_concurrency = 4
                     [[store]]\nid = \"backup\"\nkind = \"local_disk\"\npath = \"/backup\"\n";
         let cfg = load_mem(&format!(
             "[meta]\nlog = \"disk\"\nsnapshot = \"backup\"\n\
-             snapshot_every_entries = 0\nsnapshot_every_secs = 60\n{dirs}"
+             snapshot_every_entries = 0\nsnapshot_every_secs = 60\nkeep_snapshots = 3\n{dirs}"
         ))
         .unwrap();
+        assert_eq!(cfg.meta.keep_snapshots, 3);
         assert_eq!(cfg.meta.snapshot_every_entries, 0);
         assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(60));
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "/var/log-dir".into() });

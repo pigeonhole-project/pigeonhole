@@ -340,11 +340,15 @@ pub struct MetaOptions {
     /// The snapshot store can survive the log (another disk, a chat), so a
     /// lossy restore from it is possible: see [`MetaStore::restorable_position`].
     pub snapshots_outlive_log: bool,
+    /// Bases kept (≥ 1): the newest snapshots and the log from the oldest of
+    /// them, so a boot that cannot load the newest starts from an older one
+    /// (docs/log-retention.md).
+    pub keep_snapshots: usize,
 }
 
 impl Default for MetaOptions {
     fn default() -> Self {
-        Self { snapshot_every: 10_000, snapshot_interval: Duration::ZERO, snapshots_outlive_log: false }
+        Self { snapshot_every: 10_000, snapshot_interval: Duration::ZERO, snapshots_outlive_log: false, keep_snapshots: 2 }
     }
 }
 
@@ -475,9 +479,9 @@ impl MetaStore {
         let shared = Arc::new(raft::Shared {
             stop: stop_tx,
             applied: AtomicU64::new(0),
-            based: AtomicU64::new(d.base.as_ref().map_or(0, |b| b.at)),
+            based: AtomicU64::new(0),
             current: Mutex::new(None),
-            base_ref: Mutex::new(d.base.as_ref().map(|b| b.snapshot.clone())),
+            base: Mutex::new(None),
         });
         let mut sm = raft::StateMachine {
             states: states.clone(),
@@ -487,13 +491,28 @@ impl MetaStore {
             membership: Default::default(),
             shared: shared.clone(),
         };
-        if let Some(base) = &d.base {
-            load_base(&mut sm, snapshots.as_ref(), base, head.log_id).await?;
-        }
+        let fell_back = match &d.base {
+            Some(newest) => {
+                let base = load_some_base(&mut sm, snapshots.as_ref(), newest, &d.older, head.log_id).await?;
+                shared.based.store(base.at, Ordering::SeqCst);
+                let fell_back = base != *newest;
+                *shared.base.lock().unwrap() = Some(base);
+                fell_back
+            }
+            None => false,
+        };
         let fresh = d.head.position == 0 && d.base.is_none() && d.vote.is_none();
 
-        let adapter =
-            raft::LogAdapter::new(log.clone(), gen, head.log_id, d.head.position, shared.clone(), snapshots.clone());
+        let keep = raft::Keep(opts.keep_snapshots.max(1));
+        let adapter = raft::LogAdapter::new(
+            log.clone(),
+            gen,
+            head.log_id,
+            d.head.position,
+            shared.clone(),
+            snapshots.clone(),
+            keep,
+        );
         let raft = raft::Raft::new(raft::SOLO, Arc::new(raft_config(&opts)?), raft::NoNetwork, adapter, sm)
             .await
             .context("start raft")?;
@@ -522,6 +541,10 @@ impl MetaStore {
             .map_err(|e| store.stopped_by(e))
             .context("boot the tablet")?;
         store.confirm_active().await.context("boot the tablet")?;
+        if fell_back {
+            // So that the snapshot that failed stops being the base.
+            let _ = raft.trigger().snapshot().await;
+        }
         *store.ticker.lock().unwrap() =
             (!opts.snapshot_interval.is_zero()).then(|| spawn_snapshot_ticker(raft, shared, opts.snapshot_interval));
         telemetry::record_boot(store.applied_position().saturating_sub(store.base_position()), t0.elapsed());
@@ -758,7 +781,40 @@ fn report_stop(mut stop: watch::Receiver<Option<Stop>>, gen: u64) {
     });
 }
 
-/// Restore the states from the snapshot the log starts from.
+/// Restore the states from the newest base, or else from the newest older
+/// base the log keeps (the log is readable from there): the base loaded.
+async fn load_some_base(
+    sm: &mut raft::StateMachine,
+    snapshots: &dyn SnapshotStore,
+    newest: &Base,
+    older: &[Base],
+    log_id: LogId,
+) -> Result<Base> {
+    let first = match load_base(sm, snapshots, newest, log_id).await {
+        Ok(()) => return Ok(newest.clone()),
+        Err(e) => e,
+    };
+    for base in older {
+        tracing::warn!(
+            snapshot = %newest.snapshot.0,
+            at = newest.at,
+            error = %format!("{first:#}"),
+            older = %base.snapshot.0,
+            older_at = base.at,
+            "cannot load the newest base; trying an older one the log keeps"
+        );
+        match load_base(sm, snapshots, base, log_id).await {
+            Ok(()) => {
+                telemetry::record_snapshot_fallback();
+                return Ok(base.clone());
+            }
+            Err(e) => tracing::warn!(snapshot = %base.snapshot.0, error = %format!("{e:#}"), "older base unusable too"),
+        }
+    }
+    Err(first)
+}
+
+/// Restore the states from the snapshot of `base`.
 async fn load_base(sm: &mut raft::StateMachine, snapshots: &dyn SnapshotStore, base: &Base, log_id: LogId) -> Result<()> {
     let stored = snapshots
         .get(&base.snapshot)
@@ -847,7 +903,7 @@ pub async fn restore_lossy(log: &dyn LogStore, snapshots: &dyn SnapshotStore) ->
     let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
     let stored = StoredSnapshot { log_id: head.log_id, at: 1, data };
     let snapshot = snapshots.put(&stored).await.context("store the restored snapshot")?;
-    log.rebase(gen, raft::base_of(&meta, snapshot)).await.context("start the new log from it")?;
+    log.rebase(gen, raft::base_of(&meta, snapshot), 1).await.context("start the new log from it")?;
     Ok(old_position)
 }
 
