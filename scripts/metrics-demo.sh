@@ -239,6 +239,13 @@ up() {
 
   PIGEONHOLE_CONFIG="$STATE/pigeonhole.toml" start pigeonhole "$ROOT/target/release/pigeonhole"
   wait_http pigeonhole "http://$METRICS_ADDR/metrics"
+  # /metrics answers before the tablet boots; S3 once it has (a chat log
+  # takes seconds). Any HTTP answer will do: unsigned requests are refused.
+  for _ in $(seq 1 600); do
+    [[ "$(curl -s -o /dev/null -w '%{http_code}' "http://$S3_ADDR/" || true)" != 000 ]] && break
+    running pigeonhole || { echo "pigeonhole exited; see $STATE/pigeonhole.log" >&2; exit 1; }
+    sleep 0.5
+  done
 
   start prometheus prometheus --config.file="$OBS/prometheus.yml" \
     --storage.tsdb.path="$STATE/prometheus" --web.listen-address="$PROM_ADDR"
