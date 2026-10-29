@@ -78,22 +78,24 @@ collection in `rebase` and the removals in the write loop:
    days), paced as below.
 
 **Pacing.** The collector has a rate of its own (a cap, e.g. one batch a
-second) and the lowest priority in the store's shared budget: it takes a
-token only when nobody
-else is waiting and the bucket has spare tokens, otherwise it sleeps and
-looks again. While the store is busy it makes no progress at all, and that
-is fine: nothing waits for it. When the store is idle it collects at its own
-rate. A 429 on a delete backs it off like any caller. The limiter needs one
-call for this, a non-blocking `try_acquire_idle(class)` that fails instead of
-queueing.
+second) and the lowest priority in the store's shared budget: before each
+batch it waits until the store is idle, then spends tokens as usual. While
+the store is busy it makes no progress at all, and that is fine: nothing
+waits for it. When the store is idle it collects at its own rate. A 429 on a
+delete backs it off like any caller.
 
-Every store gets such a budget, not only the chats (the bot's and the
-chat's buckets in `rate_limit.rs`). On `local_disk` the budget is I/O: the
-collector's deletes and hole punching compete with appends and part writes
-for the disk and its syncs. In memory it is the store's lock. Either way the
-collector stays out of the way of foreground work, so a disk and a memory
-store get a limiter too (operations per second, generous by default), with
-the same idle-only class.
+What idle means (built, `rate_limit.rs`):
+
+- **Telegram, Discord**: `ChatLimiter::wait_idle(budget)` returns once
+  nobody waits for the chat's bucket or the bot's, and both are at least
+  half full.
+- **`local_disk`, memory**: a `StoreLimiter` counts operations in flight;
+  `wait_idle` returns when none is (the disk's budget is its I/O: deletes and
+  hole punching compete with appends and their syncs). An optional rate
+  (`with_rate`) adds a token bucket with the same rule; none by default.
+
+`Chain::prune` is background work by contract: memory, disk and Telegram
+prune a batch per idle moment already (Discord once log-collect is in).
 
 **Safety across incarnations.** A newer generation sees every rebase record
 an older one saw, plus its own, so its watermark is at or above the older
@@ -180,8 +182,9 @@ In `pigeonhole-sim`, under the simulator with many seeds:
    case `rebase_covers_and_collects` becomes "readable down to the watermark,
    `Lost` below".
 2. The collector and `[meta.retain]`: the watermark, snapshot removal moved
-   out of the write loop, collection out of `rebase`, batching; idle-only
-   tokens in the limiter, and a limiter for `local_disk` and memory.
+   out of the write loop, collection out of `rebase`, batching. (Idle
+   waiting in the limiters, and `StoreLimiter` for `local_disk` and memory:
+   done.)
    Scenario 3.
 3. Fallback boot, its metric; scenarios 1 and 2.
 4. Docs: meta-backends.md (what a boot does, retention), README § Durability.

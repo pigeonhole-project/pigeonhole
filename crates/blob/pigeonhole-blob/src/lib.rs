@@ -22,7 +22,7 @@ pub use metrics::{
     record_sweep, record_throttle, set_cache_size, set_repair_queue_depth, MetricsBackend, METRICS,
 };
 pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
-pub use rate_limit::{BotLimiter, ChatLimiter, ChatLimiterConfig, LimitBudget, LimiterRegistry};
+pub use rate_limit::{BotLimiter, ChatLimiter, ChatLimiterConfig, LimitBudget, LimiterRegistry, StoreLimiter};
 pub use retry::{retrying, RateLimited, Retry};
 pub use replicated::{
     CheapestFirst, ChunkReplicaWriter, InstanceId, PartLayout, ReplicaLayout, ReplicaSelector,

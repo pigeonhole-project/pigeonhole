@@ -109,6 +109,16 @@ pub struct Faulty<B> {
     counters: [AtomicU64; 8],
     quiet: AtomicBool,
     log: Mutex<Vec<(&'static str, Fault)>>,
+    /// Keys damaged on purpose ([`Faulty::damage`]), on top of the plan's.
+    damaged: Mutex<std::collections::HashSet<Vec<u8>>>,
+}
+
+impl<B: BlobBackend> Faulty<B> {
+    /// From now on `id` reads back damaged, every time (and after
+    /// [`Self::quiesce`]): a bad copy chosen by the test.
+    pub fn damage(&self, id: &B::Id) {
+        self.damaged.lock().unwrap().insert(pigeonhole_blob::OrderedKey::to_bytes(&B::key(id)));
+    }
 }
 
 /// splitmix64: a counter-based draw.
@@ -126,7 +136,7 @@ impl<B> Faulty<B> {
     }
 
     pub fn with_seed(inner: Arc<B>, plan: FaultPlan, seed: u64) -> Self {
-        Self { inner, plan, seed, counters: Default::default(), quiet: AtomicBool::new(false), log: Mutex::default() }
+        Self { inner, plan, seed, counters: Default::default(), quiet: AtomicBool::new(false), log: Mutex::default(), damaged: Mutex::default() }
     }
 
     pub fn inner(&self) -> &Arc<B> {
@@ -141,6 +151,11 @@ impl<B> Faulty<B> {
     /// Every fault injected so far.
     pub fn faults(&self) -> Vec<(&'static str, Fault)> {
         self.log.lock().unwrap().clone()
+    }
+
+    fn is_damaged(&self, key: &[u8], h: u64) -> bool {
+        self.damaged.lock().unwrap().contains(key)
+            || (self.plan.corrupt > 0.0 && ((h >> 11) as f64 / (1u64 << 53) as f64) < self.plan.corrupt)
     }
 
     fn uniform(&self, op: usize, salt: u64) -> f64 {
@@ -253,7 +268,7 @@ impl<B: BlobBackend> BlobBackend for Faulty<B> {
         // The same blob is damaged on every read (a bad copy, not a flake).
         let key = pigeonhole_blob::OrderedKey::to_bytes(&B::key(id));
         let h = key.iter().fold(self.seed, |h, b| mix(h ^ *b as u64));
-        if self.plan.corrupt > 0.0 && ((h >> 11) as f64 / (1u64 << 53) as f64) < self.plan.corrupt {
+        if self.is_damaged(&key, h) {
             let mut data = pigeonhole_blob::collect_stream(stream).await?.to_vec();
             let at = (h as usize) % data.len().max(1);
             if let Some(b) = data.get_mut(at) {
@@ -330,5 +345,28 @@ impl<B: Chain> Chain for Faulty<B> {
             }
             _ => self.inner.put_after_tail(label, make).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pigeonhole_storage_memory::MemoryBlobStore;
+
+    #[tokio::test]
+    async fn a_damaged_blob_reads_back_damaged_every_time() {
+        let store = Faulty::new(Arc::new(MemoryBlobStore::new()), FaultPlan::none());
+        let a = store.put(Bytes::from_static(b"alpha"), "a").await.unwrap();
+        let b = store.put(Bytes::from_static(b"beta"), "b").await.unwrap();
+        store.damage(&a);
+        store.quiesce();
+        for _ in 0..2 {
+            let got = pigeonhole_blob::collect_stream(store.get(&a, None).await.unwrap()).await.unwrap();
+            assert_ne!(&got[..], b"alpha");
+            assert_eq!(got.len(), 5);
+        }
+        let got = pigeonhole_blob::collect_stream(store.get(&b, None).await.unwrap()).await.unwrap();
+        assert_eq!(&got[..], b"beta");
+        assert_eq!(store.faults().len(), 2);
     }
 }
