@@ -286,7 +286,8 @@ over S3, a damaged replica. A crc per stored block (chunk `VERSION` 3).
 
 [log-retention.md](log-retention.md) (proposal): keep the newest snapshots
 and the log from the oldest of them by a policy (`[meta.retain]`); one
-collector deletes below a watermark that only rises, paced and batched; a
+collector deletes below a watermark that only rises, batched, at its own
+rate and only with spare budget; a
 boot falls back to an older snapshot when the newest is damaged; later a
 point-in-time restore with reclaim gated on the watermark.
 

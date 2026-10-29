@@ -37,11 +37,11 @@ what is kept: a fallback boot now, a point-in-time restore later.
 ```toml
 [meta.retain]
 snapshots = 2     # the newest N bases the log was rebased on (≥ 1)
-for = "24h"       # and every base younger than this
 ```
 
-A **retained base** is one of the `snapshots` newest bases, or one younger
-than `for`. The **watermark** is the oldest retained base. Kept:
+A **retained base** is one of the `snapshots` newest bases; there is no
+time-based policy (no clock in the decision, no time in the log). The
+**watermark** is the oldest retained base. Kept:
 
 - every retained base's snapshot;
 - the log from the watermark up to the head.
@@ -52,12 +52,12 @@ newer one replaced it before the log moved onto it) is garbage at once, as
 today.
 
 The chain is its own catalog: every rebase record names its snapshot, so
-walking back from the tail lists the bases (`at`, snapshot ref, the time the
-record was written) without a separate index.
+walking back from the tail lists the bases (`at`, snapshot ref) without a
+separate index.
 
-Proposed defaults: memory and `local_disk` `snapshots = 2, for = "0s"`;
-chats `snapshots = 3, for = "24h"`. With `snapshots = 1, for = "0s"` the
-behaviour is today's, minus the immediate delete.
+Proposed defaults: memory and `local_disk` `snapshots = 2`; chats
+`snapshots = 3`. With `snapshots = 1` the behaviour is today's, minus the
+immediate delete.
 
 ## The collector
 
@@ -75,16 +75,22 @@ collection in `rebase` and the removals in the write loop:
    without its snapshot.
 4. It deletes in batches where the store has them (Telegram deletes up to 100
    messages per call; Discord bulk-deletes up to 100 messages younger than 14
-   days) and paces itself well under the store's limit, so appends never wait
-   for it.
+   days), paced as below.
+
+**Pacing.** The collector has a rate of its own (a cap, e.g. one batch a
+second) and the lowest priority in the store's shared budget (the bot's and
+the chat's buckets in `rate_limit.rs`): it takes a token only when nobody
+else is waiting and the bucket has spare tokens, otherwise it sleeps and
+looks again. While the store is busy it makes no progress at all, and that
+is fine: nothing waits for it. When the store is idle it collects at its own
+rate. A 429 on a delete backs it off like any caller. The limiter needs one
+call for this, a non-blocking `try_acquire_idle(class)` that fails instead of
+queueing.
 
 **Safety across incarnations.** A newer generation sees every rebase record
 an older one saw, plus its own, so its watermark is at or above the older
-one's under a count policy. An old incarnation still collecting therefore
-never deletes what the newer one keeps. The `for` part is computed from the
-times written in the rebase records, and the watermark never passes the
-`snapshots`-th newest base, so a skewed clock can only make it keep more.
-Shrinking `snapshots` in the config of a newer incarnation is the one way to
+one's. An old incarnation still collecting therefore never deletes what the
+newer one keeps. Shrinking `snapshots` in the config of a newer incarnation is the one way to
 lose retained history, and that is the point of the change.
 
 ## Fallback boot
@@ -109,8 +115,7 @@ stores a fresh snapshot soon after, so the damaged one stops being the base.
 
 ## Point-in-time restore (later)
 
-`pigeonhole restore --to <position>` (or a time, mapped through the rebase
-records' times): the state at any position at or above the watermark, from
+`pigeonhole restore --to <position>`: the state at any position at or above the watermark, from
 the base below it plus the log up to the position. The restored tablet starts
 a new log (a new `log_id`, as a lossy restore does); the old log's tail after
 the position is abandoned.
@@ -133,7 +138,7 @@ those chunks are reclaiming or gone already.
 
 | Store | Retained log | Retained snapshots | Collector |
 |---|---|---|---|
-| memory | RAM: write rate × window | N copies of the state | free |
+| memory | RAM: the log since the oldest retained base | N copies of the state | free |
 | `local_disk` | segments below the watermark punched later | files | free; bounds disk use |
 | Telegram | messages | documents | batched deletes, paced |
 | Discord | messages and threads | attachments | bulk deletes while younger than 14 days, single deletes after |
@@ -167,7 +172,8 @@ In `pigeonhole-sim`, under the simulator with many seeds:
    case `rebase_covers_and_collects` becomes "readable down to the watermark,
    `Lost` below".
 2. The collector and `[meta.retain]`: the watermark, snapshot removal moved
-   out of the write loop, collection out of `rebase`, batching and pacing.
+   out of the write loop, collection out of `rebase`, batching; idle-only
+   tokens in the limiter.
    Scenario 3.
 3. Fallback boot, its metric; scenarios 1 and 2.
 4. Docs: meta-backends.md (what a boot does, retention), README § Durability.
@@ -175,14 +181,13 @@ In `pigeonhole-sim`, under the simulator with many seeds:
 
 ## Open questions
 
-- **Defaults for chats.** 24 hours of log and three snapshots is cheap for a
-  small tablet. Is a size cap (`max_bytes`) needed as well, collecting early
-  when the retained log grows past it?
+- **Defaults for chats.** Three snapshots and the log between them is cheap
+  for a small tablet. Is a size cap (`max_bytes`) needed as well, collecting
+  early when the retained log grows past it?
 - **One watermark or two.** Log and snapshots retained together keep the
   model simple. Old snapshots without their log (`restore --lossy` targets)
   would be cheaper than log, but only useful for a lossy restore.
-- **Pacing.** A share of the store's limiter (a low-priority class) or a
-  fixed rate of its own?
-- **Time.** Rebase records do not carry a time today; adding one is a log
-  format bump. Positions alone would do for the count policy and for
-  `restore --to <position>`.
+- **A store that is never idle.** Under a steady full load the collector
+  never gets a token and garbage grows. Accept it (load ends; disk space is
+  the only real limit, and the disk store has no rate limit), or let it take
+  a token after waiting long enough?
