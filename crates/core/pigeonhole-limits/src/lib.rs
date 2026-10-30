@@ -24,7 +24,7 @@
 use pigeonhole_types::MetricDoc;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use tracing::debug;
@@ -105,6 +105,19 @@ impl BucketState {
         self.tokens >= (self.capacity / 2.0).max(1.0)
     }
 
+    /// Wait before a token is available now: none during a cool-down, else
+    /// what the refill needs. Ends a cool-down that is over.
+    fn wait(&mut self, now: Instant) -> Duration {
+        if let Some(until) = self.cool_down_until {
+            if now < until {
+                return until.saturating_duration_since(now);
+            }
+            self.cool_down_until = None;
+        }
+        self.refill(now);
+        self.time_until_token()
+    }
+
     fn time_until_token(&self) -> Duration {
         if self.tokens >= 1.0 {
             return Duration::ZERO;
@@ -152,12 +165,11 @@ pub enum LimitBudget {
 
 struct TokenBucket {
     state: Mutex<BucketState>,
-    notify: Notify,
-    /// Callers inside [`Self::acquire`].
+    /// Callers inside [`take_all`] with this bucket in their plan.
     waiting: AtomicUsize,
 }
 
-/// Counts a caller in [`TokenBucket::acquire`] (also when its future is dropped).
+/// Counts a caller in [`take_all`] (also when its future is dropped).
 struct Waiting<'a>(&'a AtomicUsize);
 
 impl<'a> Waiting<'a> {
@@ -180,7 +192,6 @@ impl TokenBucket {
     fn new(rate_per_sec: f64, burst: f64) -> Self {
         Self {
             state: Mutex::new(BucketState::new(rate_per_sec, burst)),
-            notify: Notify::new(),
             waiting: AtomicUsize::new(0),
         }
     }
@@ -188,48 +199,6 @@ impl TokenBucket {
     /// Nobody waits and there is spare budget (see [`BucketState::spare`]).
     fn idle(&self) -> bool {
         self.waiting.load(Ordering::SeqCst) == 0 && self.state.lock().unwrap().spare(Instant::now())
-    }
-
-    async fn acquire(&self) -> Duration {
-        let started = Instant::now();
-        let _waiting = Waiting::new(&self.waiting);
-        loop {
-            let action = {
-                let mut st = self.state.lock().unwrap();
-                let now = Instant::now();
-                if let Some(until) = st.cool_down_until {
-                    if now < until {
-                        Err(until.saturating_duration_since(now))
-                    } else {
-                        st.cool_down_until = None;
-                        st.refill(now);
-                        if st.tokens >= 1.0 {
-                            st.tokens -= 1.0;
-                            Ok(())
-                        } else {
-                            Err(st.time_until_token())
-                        }
-                    }
-                } else {
-                    st.refill(now);
-                    if st.tokens >= 1.0 {
-                        st.tokens -= 1.0;
-                        Ok(())
-                    } else {
-                        Err(st.time_until_token())
-                    }
-                }
-            };
-            match action {
-                Ok(()) => return started.elapsed(),
-                Err(d) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(d) => {}
-                        _ = self.notify.notified() => {}
-                    }
-                }
-            }
-        }
     }
 
     fn peek_wait(&self) -> Duration {
@@ -245,9 +214,45 @@ impl TokenBucket {
             None => until,
         });
         st.tokens = 0.0;
-        drop(st);
-        self.notify.notify_waiters();
     }
+}
+
+/// Take a token from every bucket of `plan` at once: all of them, or none.
+/// A caller that waits holds no token meanwhile, so waiting for one bucket
+/// (the bot's) never keeps another (the chat's) from the rest. Returns the
+/// time waited.
+///
+/// Not a reservation: waiters retry when the latest bucket should have a
+/// token, and are not served in the order they came (see
+/// docs/shared-limiter.md, § Taking a plan at once).
+async fn take_all(plan: &[&TokenBucket]) -> Duration {
+    let started = Instant::now();
+    let _waiting: Vec<Waiting<'_>> = plan.iter().map(|b| Waiting::new(&b.waiting)).collect();
+    loop {
+        match try_take_all(plan) {
+            None => return started.elapsed(),
+            Some(wait) => tokio::time::sleep(wait).await,
+        }
+    }
+}
+
+/// One attempt of [`take_all`]: `None` when the tokens were taken, else how
+/// long until the latest bucket has one.
+fn try_take_all(plan: &[&TokenBucket]) -> Option<Duration> {
+    // Locked in one order (by address) so that two plans never deadlock.
+    let mut buckets = plan.to_vec();
+    buckets.sort_by_key(|b| *b as *const TokenBucket as usize);
+    buckets.dedup_by_key(|b| *b as *const TokenBucket as usize);
+    let mut states: Vec<MutexGuard<'_, BucketState>> = buckets.iter().map(|b| b.state.lock().unwrap()).collect();
+    let now = Instant::now();
+    let wait = states.iter_mut().map(|st| st.wait(now)).max().unwrap_or(Duration::ZERO);
+    if !wait.is_zero() {
+        return Some(wait);
+    }
+    for st in &mut states {
+        st.tokens -= 1.0;
+    }
+    None
 }
 
 /// Every call of one bot, across its chats.
@@ -258,10 +263,6 @@ pub struct BotLimiter {
 impl BotLimiter {
     pub fn new(rate_per_sec: f64, burst: f64) -> Self {
         Self { calls: TokenBucket::new(rate_per_sec, burst) }
-    }
-
-    async fn acquire(&self) -> Duration {
-        self.calls.acquire().await
     }
 
     fn idle(&self) -> bool {
@@ -374,9 +375,9 @@ impl ChatLimiter {
         &self.bot
     }
 
-    /// Chat bucket first, then the bot's.
+    /// A token of `bucket` and one of the bot's, at once.
     async fn take(&self, bucket: &TokenBucket, name: &'static str) {
-        let waited = bucket.acquire().await + self.bot.acquire().await;
+        let waited = take_all(&[bucket, &self.bot.calls]).await;
         record_limiter_wait(&self.chat, name, waited);
     }
 
@@ -501,7 +502,7 @@ impl StoreLimiter {
     /// until the [`Op`] drops.
     pub async fn op(&self) -> Op<'_> {
         if let Some(rate) = &self.rate {
-            let waited = rate.acquire().await;
+            let waited = take_all(&[rate]).await;
             record_limiter_wait(&self.store, "op", waited);
         }
         self.in_flight.fetch_add(1, Ordering::SeqCst);
@@ -636,6 +637,50 @@ mod tests {
         assert_eq!(b.peek_wait(LimitBudget::Send), Duration::ZERO);
         a.penalize_get_file(Duration::from_secs(20));
         assert!(b.peek_wait(LimitBudget::Delete) > Duration::from_secs(10), "getFile is not chat-scoped");
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_bot_holds_no_chat_token() {
+        let lim = Arc::new(ChatLimiter::new(ChatLimiterConfig {
+            bot_rate_per_sec: 10.0,
+            bot_burst: 1.0,
+            send_rate_per_sec: 0.01,
+            send_burst: 1.0,
+            ..ChatLimiterConfig::default()
+        }));
+        lim.acquire_info().await; // the bot's only token
+        let send = {
+            let lim = lim.clone();
+            tokio::spawn(async move { lim.acquire_send().await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!send.is_finished(), "the send waits for the bot");
+        assert_eq!(lim.send.peek_wait(), Duration::ZERO, "and has not taken the chat's send token");
+        send.await.unwrap();
+        assert!(lim.peek_wait(LimitBudget::Send) > Duration::from_secs(1), "now it has");
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_chat_holds_no_bot_token() {
+        let reg = LimiterRegistry::new(ChatLimiterConfig {
+            bot_rate_per_sec: 0.01,
+            bot_burst: 2.0,
+            send_rate_per_sec: 10.0,
+            send_burst: 1.0,
+            ..ChatLimiterConfig::default()
+        });
+        let (a, b) = (reg.chat("bot", "-1"), reg.chat("bot", "-2"));
+        a.acquire_send().await; // a's send token, and one of the bot's two
+        let again = {
+            let a = a.clone();
+            tokio::spawn(async move { a.acquire_send().await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!again.is_finished(), "a's second send waits for its chat");
+        let t0 = Instant::now();
+        b.acquire_send().await;
+        assert!(t0.elapsed() < Duration::from_millis(50), "the bot's last token went to chat b");
+        again.abort();
     }
 
     #[tokio::test]

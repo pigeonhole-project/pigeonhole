@@ -78,25 +78,28 @@ the service's **rules** (`TelegramRules`, `DiscordRules`): which levels a
 class touches, and the rates per level and class. The limiter itself knows
 no service.
 
-### Taking a plan at once: reservations
+### Taking a plan at once
 
-A plan is taken **atomically**: all of its buckets, or none.
+A plan is taken **atomically**: a token from every bucket of it, or none.
 
-Buckets keep a balance that may go below zero (a reservation, like Go's
-`rate.Reserve`):
+Under the buckets' locks, taken in one order (by address, so two plans never
+deadlock), the limiter computes the wait of every bucket (cool-downs
+included). If all have a token, it takes one from each. Otherwise it takes
+nothing and sleeps until the latest bucket should have one, then tries
+again. No call holds one bucket while it waits for another: today's
+`ChatLimiter::take` took the chat's token and then waited for the bot's,
+keeping that chat token from everyone meanwhile.
 
-1. Under one lock (contention is low: tens of calls a second), compute
-   `ready_at` = the latest of every bucket's earliest slot for `cost`
-   (cool-downs included).
-2. Debit every bucket of the plan as of `ready_at` and record the
-   reservation.
-3. Sleep until `ready_at`, then call.
-
-Callers run in the order they asked, and no call holds one bucket while it
-waits for another. A call needing four buckets cannot starve behind
-one-bucket calls. If the future is dropped before `ready_at`, the
-reservation is refunded. A penalty that lands while calls are reserved
-pushes their `ready_at` (they wake, re-plan, re-reserve).
+This is not a reservation, and waiters are not served in the order they
+came. Reserving ahead (debiting every bucket as of the time the slowest is
+ready, as Go's `rate.Reserve` does for one bucket) was the first design. It
+does not fit buckets with a burst: in GCRA terms the debit moves a wide
+bucket's theoretical arrival time to the slow bucket's slot. A send waiting
+3 s for its chat would then hold every other chat of the bot ~2 s behind
+it, with the bot's 30 tokens unused. Done exactly, a reservation needs a
+list of future debits per bucket. That is worth it only if a call that needs
+several buckets is seen to starve. The metric `limiter_wait_seconds` shows
+it: today every call takes exactly two buckets (its chat's and its bot's).
 
 ### Choosing the account: a pool
 
@@ -117,12 +120,13 @@ is the same for every account behind one address, so it does not tell them
 apart. It still bounds the sum: ten bots behind one IP never go past the
 IP's budget.
 
-`begin` returns a **ticket**: the chosen account and its reservation.
+`begin` waits for the chosen account's plan and returns a **ticket**: that
+account, with the tokens of its first attempt taken.
 
 ### Sticky retries
 
 A ticket stands for **one logical operation**, from the first attempt to the
-last. Every retry of it reserves the same account's plan again
+last. Every retry of it takes the same account's plan again
 (`ticket.retry()`), never another account's:
 
 - **Deduplication is per author.** A Telegram send carries a `random_id`,
@@ -154,8 +158,8 @@ for, from the method and the answer:
 | Discord 429, `X-RateLimit-Scope: shared` | the shared scope bucket (every bot) |
 | Discord 429 without a JSON body (Cloudflare), 1015 | egress |
 
-A penalty freezes the bucket until the wait is over and pushes every
-reservation on it, as `penalize` does today. The ticket's own retry waits
+A penalty freezes the bucket until the wait is over, as `penalize` does
+today; every call whose plan has that bucket waits it out. The ticket's own retry waits
 for it: retries are sticky (§ Sticky retries), even when another bot is free.
 
 ### Learning from answers
@@ -172,9 +176,8 @@ One interface, three kinds:
 
 ```rust
 trait Bucket {
-    fn ready_at(&self, now: Instant, cost: u32) -> Instant;
-    fn reserve(&mut self, at: Instant, cost: u32);
-    fn refund(&mut self, at: Instant, cost: u32);
+    fn wait(&mut self, now: Instant, cost: u32) -> Duration;   // zero: can take now
+    fn take(&mut self, now: Instant, cost: u32);
     fn penalize(&mut self, until: Instant);
     fn observe(&mut self, remaining: u32, reset_after: Duration) {}
 }
@@ -191,7 +194,7 @@ trait Bucket {
 ### Background work
 
 `wait_idle` stays: background work (log collection, the sweeper) reserves
-nothing until every bucket of its plan has no reservation waiting and is at
+nothing until every bucket of its plan has no caller waiting and is at
 least half full, then takes a ticket as usual. With a pool it asks for
 **any** idle account.
 
@@ -229,7 +232,7 @@ limiter, wired or not; a function without `Budgeted` does not compile.
 
 ## Crates
 
-- **`pigeonhole-limits`**: buckets, plans, reservations, pools, tickets,
+- **`pigeonhole-limits`**: buckets, plans taken at once, pools, tickets,
   the retry driver, metrics. It knows no service and depends on tokio
   only. It should build outside this workspace (no `madsim-tokio` alias
   required; the simulation keeps working through the alias, as today).
@@ -306,8 +309,8 @@ until the round trip (~0.3–0.5 s per send) is what is left.
 ## Plan
 
 1. ✅ **Spike**: per bot on both services (§ Spike findings).
-2. Reservations and plans in `pigeonhole-limits`, behind today's
-   `ChatLimiter` API (no behaviour change; one bot per store).
+2. ✅ Plans taken at once in `pigeonhole-limits` (`take_all`), behind
+   today's `ChatLimiter` API (one bot per store).
 3. `Limiter::run` and `classify` for Telegram and Discord; `Budgeted` for
    the MTProto requests; the hand-wired `acquire_*` / `penalize_*` go.
 4. Pools and `bot_token_envs`; sticky tickets.
