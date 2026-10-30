@@ -331,9 +331,8 @@ until the round trip (~0.3–0.5 s per send) is what is left.
    Discord endpoint; config tables per rate.
 4. ✅ Pools (`pigeonhole_limits::Pool`, `PooledChannel`, `PooledDiscord`)
    and `bot_token_envs`; a rate limit moves to a free bot (a member gives
-   way: `Retry::give_way`), an unknown outcome pins the call; Telegram reads
-   stay on the primary (a bot's file locations are its own:
-   `FILE_REFERENCE_EXPIRED` for another, measured). Metrics: pool calls by
+   way: `Retry::give_way`), an unknown outcome pins the call. A bot's file
+   locations are its own (`FILE_REFERENCE_EXPIRED` for another, measured). Metrics: pool calls by
    member, moves, retry waits. Live, two bots, default limits, sends one
    after another: Telegram 30 in 40 s (44.8/min, one bot's budget 18/min),
    Discord 40 in 16 s (147/min, one bot's 60/min), no rate limit hit.
