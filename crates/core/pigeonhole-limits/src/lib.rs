@@ -215,11 +215,12 @@ impl TokenBucket {
         let retry_after = retry_after.max(Duration::from_secs(1));
         let mut st = self.state.lock().unwrap();
         let until = Instant::now() + retry_after;
-        st.cool_down_until = Some(match st.cool_down_until {
-            Some(prev) => prev.max(until),
-            None => until,
-        });
+        let until = st.cool_down_until.map_or(until, |prev| prev.max(until));
+        st.cool_down_until = Some(until);
+        // Empty, and filling only from the end of the cool-down: a full
+        // burst right after a long flood wait is what earns the next one.
         st.tokens = 0.0;
+        st.last_refill = until;
     }
 }
 
@@ -668,6 +669,23 @@ mod tests {
         b.acquire(LimitBudget::Send).await;
         assert!(t0.elapsed() < Duration::from_millis(50), "the bot's last token went to chat b");
         again.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cooled_bucket_starts_empty_when_the_cool_down_ends() {
+        let lim = ChatLimiter::new(ChatLimiterConfig {
+            send_rate_per_sec: 1.0,
+            send_burst: 3.0,
+            ..ChatLimiterConfig::default()
+        });
+        lim.penalize_budget(LimitBudget::Send, Duration::from_secs(35));
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        // Not a burst of three at once: one token a second from here.
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            lim.acquire(LimitBudget::Send).await;
+        }
+        assert!(t0.elapsed() >= Duration::from_millis(2900), "{:?}", t0.elapsed());
     }
 
     #[tokio::test]
