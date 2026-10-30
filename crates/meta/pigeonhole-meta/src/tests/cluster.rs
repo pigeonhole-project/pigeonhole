@@ -1,6 +1,7 @@
 //! Three tablets as one Raft cluster over openraft-chat on a fake chat
 //! (docs/raft-over-chat.md): election, commits applied everywhere, writes
-//! to a follower, a killed leader, a partitioned leader that heals.
+//! to a follower, a killed leader, a partitioned leader that heals, and the
+//! Raft gauges.
 
 use super::*;
 use crate::raft::TypeConfig;
@@ -119,4 +120,60 @@ async fn a_partitioned_leader_steps_down_and_catches_up_when_healed() {
     chat.isolate(old, false);
     eventually("the old leader follows the new one", || nodes[&old].leader() == Some(new)).await;
     eventually("and applied what it missed", || value(&nodes[&old]) == 4).await;
+}
+
+/// `node`'s gauges as `record_gauges` sets them, by `name` or `name{value}`
+/// (the value of its one label).
+fn gauges(node: &MetaStore) -> HashMap<String, f64> {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || node.record_gauges());
+    let mut out = HashMap::new();
+    for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+        let DebugValue::Gauge(g) = value else { continue };
+        let name = match key.key().labels().next() {
+            Some(l) => format!("{}{{{}}}", key.key().name(), l.value()),
+            None => key.key().name().to_string(),
+        };
+        out.insert(name, g.into_inner());
+    }
+    out
+}
+
+#[tokio::test]
+async fn raft_gauges_show_roles_and_a_lagging_peer() {
+    let chat = FakeChat::new();
+    let nodes = three(&chat).await;
+    let leader = agreed_leader(&nodes).await;
+    let mut followers = MEMBERS.into_iter().filter(|&m| m != leader);
+    let (behind, other) = (followers.next().unwrap(), followers.next().unwrap());
+    nodes[&leader].propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
+    eventually("every node applied the commit", || nodes.values().all(|n| value(n) == 1)).await;
+
+    let g = gauges(&nodes[&behind]);
+    assert_eq!(g["pigeonhole_meta_raft_state{follower}"], 1.0);
+    assert_eq!(g["pigeonhole_meta_raft_state{leader}"], 0.0);
+    assert_eq!(g["pigeonhole_meta_raft_leader"], leader as f64);
+    assert!(g["pigeonhole_meta_raft_quorum_ack_age_seconds"].is_nan(), "a follower has no quorum acks");
+    assert!(g[&format!("pigeonhole_meta_raft_replication_lag{{{leader}}}")].is_nan());
+
+    chat.isolate(behind, true);
+    for i in 2..=4 {
+        nodes[&leader].propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    let lag = |p: u64| format!("pigeonhole_meta_raft_replication_lag{{{p}}}");
+    eventually("the leader sees the isolated peer 3 entries behind and the other caught up", || {
+        let g = gauges(&nodes[&leader]);
+        g[&lag(behind)] >= 3.0 && g[&lag(other)] == 0.0
+    })
+    .await;
+    let g = gauges(&nodes[&leader]);
+    assert_eq!(g["pigeonhole_meta_raft_state{leader}"], 1.0);
+    assert_eq!(g["pigeonhole_meta_raft_node"], leader as f64);
+    assert!(g["pigeonhole_meta_raft_term"] >= 1.0);
+    assert!(g["pigeonhole_meta_raft_quorum_ack_age_seconds"] < 1.0, "the other follower acks");
+
+    chat.isolate(behind, false);
+    eventually("the healed peer catches up", || gauges(&nodes[&leader])[&lag(behind)] == 0.0).await;
 }

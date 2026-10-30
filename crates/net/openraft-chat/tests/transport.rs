@@ -166,3 +166,44 @@ async fn a_node_with_another_key_is_not_heard() {
     assert!(matches!(err, RPCError::Timeout(_)), "{err:?}");
     assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn calls_frames_and_posts_are_counted() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    // A current-thread runtime: every task records where the guard is set.
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let chat = FakeChat::new();
+    chat.set_duplication(Some(1));
+    let (mut one, _two) = pair(&chat, KEY, Arc::new(Yes::default())).await;
+    for term in 1..=3 {
+        vote(&mut one, 2, term, Duration::from_secs(10)).await.unwrap();
+    }
+    chat.isolate(2, true);
+    vote(&mut one, 2, 4, Duration::from_secs(3)).await.unwrap_err();
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    // The value of `name` whose labels include all of `labels`.
+    let find = |name: &str, labels: &[(&str, &str)]| {
+        snapshot
+            .iter()
+            .find(|(k, ..)| {
+                k.key().name() == name
+                    && labels.iter().all(|(l, v)| k.key().labels().any(|x| x.key() == *l && x.value() == *v))
+            })
+            .map_or_else(|| panic!("{name} {labels:?}"), |(.., v)| v)
+    };
+    let calls = |outcome| match find("openraft_chat_call_seconds", &[("peer", "2"), ("rpc", "vote"), ("outcome", outcome)]) {
+        DebugValue::Histogram(h) => h.len(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((calls("ok"), calls("timeout")), (3, 1));
+    let frames = |peer, outcome| match find("openraft_chat_frames_received_total", &[("peer", peer), ("outcome", outcome)]) {
+        DebugValue::Counter(c) => *c,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(frames("1", "ok"), 3, "node 2 got the 3 requests once");
+    assert_eq!(frames("1", "duplicate"), 3, "and each a second time");
+    assert!(matches!(find("openraft_chat_posts_total", &[("outcome", "ok")]), DebugValue::Counter(n) if *n >= 6));
+}

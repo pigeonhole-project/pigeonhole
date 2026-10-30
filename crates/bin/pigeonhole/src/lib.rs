@@ -31,6 +31,24 @@ pub use pigeonhole_storage_discord as discord;
 pub use pigeonhole_gateway_s3::{Index, S3Gateway};
 
 /// Every metric the binary records, crate by crate (docs/metrics.md).
-pub fn metric_docs() -> [&'static [pigeonhole_types::MetricDoc]; 4] {
-    [pigeonhole_blob::METRICS, pigeonhole_limits::METRICS, pigeonhole_meta::METRICS, state_metrics::METRICS]
+pub fn metric_docs() -> [&'static [pigeonhole_types::MetricDoc]; 5] {
+    [pigeonhole_blob::METRICS, pigeonhole_limits::METRICS, pigeonhole_meta::METRICS, &CHAT_METRICS, state_metrics::METRICS]
 }
+
+/// openraft-chat's metrics (a standalone crate with its own list), as docs.
+const CHAT_METRICS: [pigeonhole_types::MetricDoc; openraft_chat::telemetry::METRICS.len()] = {
+    use openraft_chat::telemetry::{MetricKind as K, METRICS};
+    use pigeonhole_types::MetricDoc;
+    let mut out = [MetricDoc::gauge("", &[], ""); METRICS.len()];
+    let mut i = 0;
+    while i < METRICS.len() {
+        let m = METRICS[i];
+        out[i] = match m.kind {
+            K::Counter => MetricDoc::counter(m.name, m.labels, m.help),
+            K::Gauge => MetricDoc::gauge(m.name, m.labels, m.help),
+            K::Histogram => MetricDoc::histogram(m.name, m.labels, m.help),
+        };
+        i += 1;
+    }
+    out
+};

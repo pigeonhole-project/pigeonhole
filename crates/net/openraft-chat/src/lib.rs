@@ -14,6 +14,7 @@
 pub mod frame;
 mod mailbox;
 mod network;
+pub mod telemetry;
 
 pub use frame::Key;
 pub use mailbox::{FakeChat, Mailbox};

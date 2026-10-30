@@ -305,7 +305,7 @@ print(f"{bad} failing, {empty} without data (a chat-only or idle metric is fine)
 sys.exit(1 if bad else 0)
 EOF
   local undocumented
-  undocumented="$(curl -fs "http://$METRICS_ADDR/metrics" | grep -o '^pigeonhole_[a-z0-9_]*' \
+  undocumented="$(curl -fs "http://$METRICS_ADDR/metrics" | grep -Eo '^(pigeonhole|openraft_chat)_[a-z0-9_]*' \
     | sed -E 's/_(bucket|sum|count)$//' | sort -u \
     | while read -r m; do grep -q "\`$m\`" "$ROOT/docs/metrics.md" || echo "$m"; done)"
   if [[ -n "$undocumented" ]]; then

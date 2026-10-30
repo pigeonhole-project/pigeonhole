@@ -10,10 +10,10 @@ const END: &str = "<!-- metrics:end -->";
 
 /// Histogram name suffixes `prometheus.rs` sets buckets for; any other
 /// histogram would be exported as a summary.
-const BUCKETED: &[&str] = &["_seconds", "_ratio", "_per_chunk", "_per_entry"];
+const BUCKETED: &[&str] = &["_seconds", "_ratio", "_per_chunk", "_per_entry", "_per_frame"];
 
 fn table() -> String {
-    let crates = ["pigeonhole-blob", "pigeonhole-limits", "pigeonhole-meta", "pigeonhole (binary)"];
+    let crates = ["pigeonhole-blob", "pigeonhole-limits", "pigeonhole-meta", "openraft-chat", "pigeonhole (binary)"];
     let mut out = String::new();
     for (name, docs) in crates.iter().zip(pigeonhole::metric_docs()) {
         out.push_str(&format!("\n### {name}\n\n| Metric | Kind | Labels | Meaning |\n|---|---|---|---|\n"));
@@ -29,7 +29,7 @@ fn table() -> String {
 fn names_are_unique_and_histograms_have_buckets() {
     let mut seen = HashSet::new();
     for d in pigeonhole::metric_docs().into_iter().flatten() {
-        assert!(d.name.starts_with("pigeonhole_"), "{}", d.name);
+        assert!(d.name.starts_with("pigeonhole_") || d.name.starts_with("openraft_chat_"), "{}", d.name);
         assert!(seen.insert(d.name), "{} declared twice", d.name);
         if d.kind == MetricKind::Histogram {
             assert!(BUCKETED.iter().any(|s| d.name.ends_with(s)), "{}: no buckets for it in prometheus.rs", d.name);

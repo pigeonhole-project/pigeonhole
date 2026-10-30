@@ -2205,7 +2205,7 @@
   },
   {
    "type": "row",
-   "title": "Contents",
+   "title": "Cluster (Raft)",
    "id": 46,
    "collapsed": false,
    "gridPos": {
@@ -2216,9 +2216,777 @@
    }
   },
   {
+   "type": "stat",
+   "title": "Leader",
+   "id": 47,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(pigeonhole_meta_raft_leader)",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 0,
+    "y": 83
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Term",
+   "id": 48,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(pigeonhole_meta_raft_term)",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 6,
+    "y": 83
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Leaders",
+   "id": 49,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(pigeonhole_meta_raft_state{state=\"leader\"})",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 2
+       },
+       {
+        "color": "red",
+        "value": 2
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 12,
+    "y": 83
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Quorum ack age",
+   "id": 50,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(pigeonhole_meta_raft_quorum_ack_age_seconds)",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       },
+       {
+        "color": "red",
+        "value": 5
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 18,
+    "y": 83
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Role per node",
+   "id": 51,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "A node's Raft role; an election shows as a candidate blip, a split brain as two leaders",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "pigeonhole_meta_raft_state == 1",
+     "legendFormat": "{{instance}}: {{state}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 0,
+    "y": 87
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Term",
+   "id": 52,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "Every step up is an election; steady terms mean a stable leader",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "pigeonhole_meta_raft_term",
+     "legendFormat": "{{instance}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 4,
+    "y": 87
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Replication lag (on the leader)",
+   "id": 53,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "Entries a follower is behind the leader's log; it grows while a follower is cut off",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "pigeonhole_meta_raft_replication_lag",
+     "legendFormat": "to {{peer}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 8,
+    "y": 87
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Quorum ack age (on the leader)",
+   "id": 54,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "Time since a quorum last acknowledged the leader; near the heartbeat when healthy",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "pigeonhole_meta_raft_quorum_ack_age_seconds",
+     "legendFormat": "{{instance}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 12,
+    "y": 87
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Unapplied entries",
+   "id": 55,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "Entries in a node's log it has not applied yet",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "pigeonhole_meta_raft_last_log_index - pigeonhole_meta_raft_last_applied_index",
+     "legendFormat": "{{instance}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 16,
+    "y": 87
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Raft calls /s",
+   "id": 56,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "Requests this node sent over the chat, by their fate; timeouts are lost or late frames",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (rpc, outcome) (rate(openraft_chat_call_seconds_count[$__rate_interval]))",
+     "legendFormat": "{{rpc}} {{outcome}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 0,
+    "y": 95
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Raft call p50 / p99",
+   "id": 57,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "Round trip over the chat: a tick to post, the peer's read (push or poll), its tick to answer",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "histogram_quantile(0.5, sum by (le, rpc) (rate(openraft_chat_call_seconds_bucket{outcome=\"ok\"}[$__rate_interval])))",
+     "legendFormat": "{{rpc}} p50",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "histogram_quantile(0.99, sum by (le, rpc) (rate(openraft_chat_call_seconds_bucket{outcome=\"ok\"}[$__rate_interval])))",
+     "legendFormat": "{{rpc}} p99",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 4,
+    "y": 95
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Posts /s",
+   "id": 58,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "One frame per tick at most; envelopes per frame show the coalescing",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (outcome) (rate(openraft_chat_posts_total[$__rate_interval]))",
+     "legendFormat": "{{outcome}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "(rate(openraft_chat_envelopes_per_frame_sum[$__rate_interval])) / (rate(openraft_chat_envelopes_per_frame_count[$__rate_interval]))",
+     "legendFormat": "envelopes per frame",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 8,
+    "y": 95
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Frames received /s",
+   "id": 59,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "duplicate: a frame seen twice; bad_frame / foreign: another key or cluster",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (peer, outcome) (rate(openraft_chat_frames_received_total[$__rate_interval]))",
+     "legendFormat": "from {{peer}}: {{outcome}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    },
+    {
+     "refId": "B",
+     "expr": "sum by (peer) (rate(openraft_chat_read_errors_total[$__rate_interval]))",
+     "legendFormat": "from {{peer}}: read error",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 12,
+    "y": 95
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Post p99",
+   "id": 60,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(openraft_chat_post_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "p99",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "fillOpacity": 15,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 4,
+    "x": 16,
+    "y": 95
+   }
+  },
+  {
+   "type": "row",
+   "title": "Contents",
+   "id": 61,
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 103
+   }
+  },
+  {
    "type": "timeseries",
    "title": "Objects / uploads",
-   "id": 47,
+   "id": 62,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2281,13 +3049,13 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 83
+    "y": 104
    }
   },
   {
    "type": "timeseries",
    "title": "Chunks by state",
-   "id": 48,
+   "id": 63,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2332,13 +3100,13 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 83
+    "y": 104
    }
   },
   {
    "type": "timeseries",
    "title": "Logical vs stored",
-   "id": 49,
+   "id": 64,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2401,25 +3169,25 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 83
+    "y": 104
    }
   },
   {
    "type": "row",
    "title": "Background",
-   "id": 50,
+   "id": 65,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 91
+    "y": 112
    }
   },
   {
    "type": "timeseries",
    "title": "Sweeper",
-   "id": 51,
+   "id": 66,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2464,13 +3232,13 @@
     "h": 8,
     "w": 6,
     "x": 0,
-    "y": 92
+    "y": 113
    }
   },
   {
    "type": "timeseries",
    "title": "Repair",
-   "id": 52,
+   "id": 67,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2515,13 +3283,13 @@
     "h": 8,
     "w": 6,
     "x": 6,
-    "y": 92
+    "y": 113
    }
   },
   {
    "type": "timeseries",
    "title": "Pass duration p99",
-   "id": 53,
+   "id": 68,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2566,13 +3334,13 @@
     "h": 8,
     "w": 6,
     "x": 12,
-    "y": 92
+    "y": 113
    }
   },
   {
    "type": "timeseries",
    "title": "Repair queue",
-   "id": 54,
+   "id": 69,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2617,25 +3385,25 @@
     "h": 8,
     "w": 6,
     "x": 18,
-    "y": 92
+    "y": 113
    }
   },
   {
    "type": "row",
    "title": "Chat rate limits",
-   "id": 55,
+   "id": 70,
    "collapsed": false,
    "gridPos": {
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 100
+    "y": 121
    }
   },
   {
    "type": "timeseries",
    "title": "Throttle waits asked (s/s)",
-   "id": 56,
+   "id": 71,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2680,13 +3448,13 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 101
+    "y": 122
    }
   },
   {
    "type": "timeseries",
    "title": "Calls failed rate limited",
-   "id": 57,
+   "id": 72,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2731,13 +3499,13 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 101
+    "y": 122
    }
   },
   {
    "type": "timeseries",
    "title": "Own limiter wait p99",
-   "id": 58,
+   "id": 73,
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -2782,7 +3550,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 101
+    "y": 122
    }
   }
  ]

@@ -28,6 +28,7 @@ pigeonhole-types = { workspace = true }
 pigeonhole-codec = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
 pigeonhole-meta = { workspace = true }
+openraft-chat = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true }
 uuid = { workspace = true }

@@ -4,6 +4,7 @@
 
 use crate::frame::{open, seal, Body, Envelope, Frame, Key, FRAME_VERSION};
 use crate::mailbox::Mailbox;
+use crate::telemetry;
 use async_trait::async_trait;
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Timeout};
 use openraft::network::{RPCOption, RPCTypes, RaftNetwork, RaftNetworkFactory};
@@ -15,7 +16,7 @@ use openraft::{AnyError, Raft, RaftTypeConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -160,15 +161,18 @@ impl<C: RaftTypeConfig> ChatNetwork<C> {
     /// Send `body` to `target` and wait up to `ttl` for its response.
     pub async fn call(&self, target: C::NodeId, body: Body<C>, ttl: Duration) -> Result<Body<C>, CallError> {
         let rpc = self.inner.next_rpc.fetch_add(1, Ordering::Relaxed);
+        let (kind, peer, t0) = (body.rpc(), target.to_string(), Instant::now());
         let (tx, rx) = oneshot::channel();
         self.inner.waiting.lock().unwrap().insert(rpc, tx);
         self.inner.enqueue(Envelope { to: target, rpc, body });
         let got = tokio::time::timeout(ttl, rx).await;
         self.inner.waiting.lock().unwrap().remove(&rpc);
-        match got {
+        let got = match got {
             Ok(Ok(body)) => Ok(body),
             _ => Err(CallError::Timeout),
-        }
+        };
+        telemetry::record_call(peer, kind, if got.is_ok() { "ok" } else { "timeout" }, t0.elapsed());
+        got
     }
 
     fn client(&self, target: C::NodeId) -> ChatClient<C> {
@@ -204,7 +208,10 @@ async fn send_loop<C: RaftTypeConfig>(inner: std::sync::Weak<Inner<C>>) {
             envelopes,
         };
         let n = frame.envelopes.len();
-        match this.outbox.post(seal(&frame, &this.settings.key)).await {
+        let t0 = Instant::now();
+        let posted = this.outbox.post(seal(&frame, &this.settings.key)).await;
+        telemetry::record_post(posted.is_ok(), n, t0.elapsed());
+        match posted {
             Ok(pos) => debug!(node = %this.me, pos, envelopes = n, "posted a frame"),
             // The calls time out; openraft retries as on a broken connection.
             Err(e) => warn!(node = %this.me, envelopes = n, error = %format!("{e:#}"), "post failed"),
@@ -253,6 +260,7 @@ async fn read_loop<C: RaftTypeConfig>(
                 mailbox.wait(pos, poll).await;
             }
             Err(e) => {
+                telemetry::record_read_error(peer.to_string());
                 debug!(node = %this.me, %peer, error = %format!("{e:#}"), "read failed");
                 drop(this);
                 tokio::time::sleep(poll).await;
@@ -266,11 +274,13 @@ impl<C: RaftTypeConfig> Inner<C> {
         let frame = match open::<C>(bytes, &self.settings.key) {
             Ok(f) => f,
             Err(e) => {
+                telemetry::record_frame(peer.to_string(), "bad_frame");
                 warn!(node = %self.me, %peer, error = %format!("{e:#}"), "frame dropped");
                 return;
             }
         };
         if frame.cluster != self.settings.cluster || frame.from != peer {
+            telemetry::record_frame(peer.to_string(), "foreign");
             warn!(node = %self.me, %peer, from = %frame.from, "frame of another cluster or sender dropped");
             return;
         }
@@ -278,16 +288,19 @@ impl<C: RaftTypeConfig> Inner<C> {
             let mut seen = self.seen.lock().unwrap();
             let last = seen.entry(peer.clone()).or_insert(0);
             if frame.seq <= *last {
+                telemetry::record_frame(peer.to_string(), "duplicate");
                 return;
             }
             *last = frame.seq;
         }
+        telemetry::record_frame(peer.to_string(), "ok");
         for env in frame.envelopes {
             if env.to != self.me {
                 continue;
             }
             if env.body.is_request() {
                 let Some(handler) = self.handler.get().cloned() else { continue };
+                telemetry::record_served(peer.to_string(), env.body.rpc());
                 let this = Arc::downgrade(self);
                 let peer = peer.clone();
                 tokio::spawn(async move {
