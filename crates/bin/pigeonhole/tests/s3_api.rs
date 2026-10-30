@@ -815,10 +815,21 @@ async fn conditional_writes_follow_the_table() {
     s3.delete_object(req(del(&current))).await.unwrap();
     assert_eq!(code(s3.delete_object(req(del(&current))).await.unwrap_err()), S3ErrorCode::NoSuchKey);
 
-    // Only `*` in If-None-Match.
-    let mut bad = put("x", "x", None, false);
-    bad.if_none_match = Some(ETagCondition::ETag(ETag::Strong("00".into())));
-    assert_eq!(code(s3.put_object(req(bad)).await.unwrap_err()), S3ErrorCode::InvalidArgument);
+    // If-Match: * (any object) and If-None-Match: <etag> (not that one), as
+    // s3-tests' test_put_object_if_match has them.
+    let star = |key: &str, body: &str| PutObjectInput { if_match: Some(ETagCondition::Any), ..put(key, body, None, false) };
+    let not = |key: &str, body: &str, e: &str| PutObjectInput {
+        if_none_match: Some(ETagCondition::ETag(ETag::Strong(e.into()))),
+        ..put(key, body, None, false)
+    };
+    assert_eq!(code(s3.put_object(req(star("x", "1"))).await.unwrap_err()), S3ErrorCode::NoSuchKey);
+    let x1 = etag(s3.put_object(req(not("x", "1", "00"))).await.unwrap());
+    assert_eq!(code(s3.put_object(req(not("x", "2", &x1))).await.unwrap_err()), S3ErrorCode::PreconditionFailed);
+    s3.put_object(req(not("x", "2", "00"))).await.unwrap();
+    s3.put_object(req(star("x", "3"))).await.unwrap();
+    let mut both = star("x", "4");
+    both.if_none_match = Some(ETagCondition::Any);
+    assert_eq!(code(s3.put_object(req(both)).await.unwrap_err()), S3ErrorCode::InvalidArgument);
 }
 
 /// Racing `If-None-Match: *` puts of one key: exactly one wins, the losers

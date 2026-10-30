@@ -24,8 +24,12 @@ pub type Pairs = Vec<(String, String)>;
 pub enum Expect {
     /// `If-None-Match: *`: no object under the key.
     Absent,
-    /// `If-Match`: the object's ETag (hex, unquoted).
+    /// `If-Match: <etag>`: the object, with this ETag (hex, unquoted).
     ETag(String),
+    /// `If-Match: *`: any object under the key.
+    Present,
+    /// `If-None-Match: <etag>`: no object with this ETag (none at all is fine).
+    NotETag(String),
 }
 
 /// Where an object's bytes are (docs/inline-objects.md).
@@ -175,7 +179,7 @@ pub struct S3State {
 
 impl StateMachine for S3State {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 4;
+    const VERSION: u32 = 5;
     type Command = S3Command;
     type Reply = Released;
     type Reject = S3Reject;
@@ -308,9 +312,11 @@ impl S3State {
     pub(crate) fn check(&self, bucket: &str, key: &str, expect: Option<&Expect>) -> std::result::Result<(), S3Reject> {
         let current = self.objects.get(&(bucket.to_string(), key.to_string()));
         match (expect, current) {
-            (None, _) | (Some(Expect::Absent), None) => Ok(()),
+            (None, _) | (Some(Expect::Absent), None) | (Some(Expect::NotETag(_)), None) => Ok(()),
             (Some(Expect::ETag(e)), Some(o)) if o.etag == *e => Ok(()),
-            (Some(Expect::ETag(_)), None) => Err(S3Reject::NoSuchKey),
+            (Some(Expect::NotETag(e)), Some(o)) if o.etag != *e => Ok(()),
+            (Some(Expect::Present), Some(_)) => Ok(()),
+            (Some(Expect::ETag(_) | Expect::Present), None) => Err(S3Reject::NoSuchKey),
             (Some(_), Some(_)) => Err(S3Reject::PreconditionFailed),
         }
     }
@@ -416,7 +422,7 @@ mod tests {
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k', 1, 1, 1, b'e']);
         let cmd = S3Command::CreateBucket { name: "b".into(), created_at: "t".into() };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [0, 1, b'b', 1, b't']);
-        assert_eq!(S3State::VERSION, 4);
+        assert_eq!(S3State::VERSION, 5);
     }
 
     #[test]

@@ -23,16 +23,20 @@ We are unusually well placed for this: every S3 write is already one entry
 in a linearizable log, so the condition is checked where the write is
 decided, not before it.
 
-## Semantics (as AWS)
+## Semantics (as AWS and s3-tests)
 
 | Request | Object absent | Object present, ETag equal | ETag different |
 |---|---|---|---|
 | `PutObject` / `CompleteMultipartUpload` / `CopyObject` + `If-None-Match: *` | write | 412 `PreconditionFailed` | 412 |
+| same + `If-None-Match: <etag>` | write | 412 | write |
 | same + `If-Match: <etag>` | 404 `NoSuchKey` | write | 412 |
-| `DeleteObject` + `If-Match: <etag>` | 404 `NoSuchKey` | delete | 412 |
+| same + `If-Match: *` | 404 `NoSuchKey` | write | write |
+| `DeleteObject` + `If-Match: <etag>` / `*` | 404 `NoSuchKey` | delete | 412 / delete |
 
-- `If-None-Match` takes only `*`; anything else is 400 `InvalidArgument`
-  (AWS: `NotImplemented`).
+- AWS documents `If-None-Match: *` and `If-Match: <etag>`; the other two
+  are HTTP's (RFC 9110) and ceph's s3-tests check them
+  (`test_put_object_if_match`, `test_put_object_ifnonmatch_good`, …). Both
+  headers at once is 400 `InvalidArgument`.
 - ETags compare by value (quotes and `W/` ignored; ours are strong).
 - Of two conditional writes racing for one key, the first to commit wins
   and the other gets 412. AWS may also answer 409
