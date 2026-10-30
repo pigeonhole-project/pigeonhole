@@ -227,33 +227,32 @@ impl BlockWriter {
             if self.block.is_empty() {
                 // Seal the open chunk before waiting for another whole frame so
                 // the caller can free permits under a tight shared budget.
-                if let Some(budget) = &self.budget {
-                    if budget.available_permits() < self.block_size && !self.chunk_stored.is_empty()
-                    {
-                        if let Some(c) = self.seal_chunk() {
-                            out.push(c);
-                            return Ok((out, total - data.len()));
-                        }
-                    }
+                if let Some(c) = self.budget_is_tight().then(|| self.seal_chunk()).flatten() {
+                    out.push(c);
+                    return Ok((out, total - data.len()));
                 }
                 self.acquire_block_budget().await?;
             }
-            let need = self.block_size - self.block.len();
-            let take = need.min(data.len());
+            let take = (self.block_size - self.block.len()).min(data.len());
             self.block.extend_from_slice(&data[..take]);
             data = &data[take..];
-            if self.block.len() >= self.block_size {
-                let sealed = self.emit_block().await?;
-                if !sealed.is_empty() {
-                    out.extend(sealed);
-                    // With a budget, stop so the caller can free permits via put/drop.
-                    if self.budget.is_some() {
-                        return Ok((out, total - data.len()));
-                    }
-                }
+            if self.block.len() < self.block_size {
+                continue;
+            }
+            let sealed = self.emit_block().await?;
+            // With a budget, stop so the caller can free permits via put/drop.
+            let stop = !sealed.is_empty() && self.budget.is_some();
+            out.extend(sealed);
+            if stop {
+                return Ok((out, total - data.len()));
             }
         }
         Ok((out, total))
+    }
+
+    /// Less than a block of the shared budget is left and a chunk is open.
+    fn budget_is_tight(&self) -> bool {
+        self.budget.as_ref().is_some_and(|b| b.available_permits() < self.block_size) && !self.chunk_stored.is_empty()
     }
 
     /// Finish the stream: flush partial block and seal the last chunk.
