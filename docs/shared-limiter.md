@@ -28,8 +28,9 @@ works for one bot per store. It does not take us further:
 - **Nothing above the bot.** Several bots in one process share one IP, and
   some limits are per IP: Cloudflare in front of Discord bans an address
   after 10 000 invalid requests in 10 minutes, whatever the token; Telegram
-  limits connections and logins per address. Today there is no place to
-  put such a budget.
+  limits connections and logins per address. Neither is a rate of calls,
+  and neither has been seen yet, so the model leaves them out until a live
+  run shows one (§ Levels and buckets).
 - **Bound to this program.** The classes are ours (send / info / get_file /
   delete for a channel used as storage). A bot that talks to people needs
   others (private chats, edits, callback answers) and could not reuse it.
@@ -42,41 +43,46 @@ soonest, and a retry stays on the bot that made the first attempt.
 
 ### Levels and buckets
 
-A **bucket** is one budget: a token bucket, a fixed window, or a cap on
-calls in flight (see § Bucket kinds). Buckets sit on levels, from the
-widest down:
+A **bucket** is one budget, a token bucket (a rate and a burst). Buckets
+sit on two levels:
 
 | Level | Key | Examples |
 |---|---|---|
-| **Egress** | the outbound address (one by default; one per proxy) | Cloudflare's invalid-request ban, connections per IP |
-| **Account** | a bot token | Telegram ~30 calls/s per bot; Discord 50 requests/s (`global`) |
-| **Account × class** | bot, class | Telegram `upload.getFile` floods per bot; Discord threads 50 per 300 s |
-| **Scope × account × class** | chat, bot, class | Telegram ~20 sends a minute per chat; Discord 5 per 5 s per channel |
-| **Scope × class** (shared) | chat, class | a per-channel limit that holds for every bot together, if any (Discord `X-RateLimit-Scope: shared`) |
+| **Bot** | a bot token | Telegram ~30 calls/s per bot; Discord 50 requests/s (`global`) |
+| **Class** | chat, bot, class | Telegram ~20 sends a minute per chat; Discord 5 per 5 s per channel |
 
-A level that a service does not have is simply not configured. The spike
+A **class** is a kind of call with a bucket of its own in each chat: `send`,
+`read`, `delete` on both services. The service names its classes and their
+default rates (`pigeonhole_storage_telegram::limits()`,
+`pigeonhole_storage_discord::limits()`); `pigeonhole-limits` knows no
+service.
+
+**Not in the model** until a live run shows them: a level above the bot (the
+outbound address) and a class shared by every bot of a channel. The spike
 found channel send limits per bot on both services (§ Spike findings), so
-the shared scope level is off by default; it stays in the model for limits
-that are per channel (a Discord answer with `X-RateLimit-Scope: shared`).
+nothing measured needs the shared level. What is known about per-address
+limits does not fit a rate: Cloudflare in front of Discord bans an address
+for 10 000 *invalid* answers (401, 403, 429) in 10 minutes, which is an
+error budget (a counter over a sliding window that stops calls near the
+limit), and Telegram's are about connections and logins, not calls.
 
 ### A call and its plan
 
 A call is described by what it spends, not by how it is wired:
 
 ```rust
-struct Call {
-    class: Class,           // Send, Read, File, Delete, Info, Thread, … (per service)
-    scope: Option<Scope>,   // the chat / channel, if the call has one
-    cost: u32,              // tokens, usually 1
+pub struct Call {
+    pub service: &'static str,   // a metrics label
+    pub what: &'static str,      // the method
+    pub spend: Spend,            // Nothing (a CDN read) | Bot | Class(class)
+    pub cools: Option<Level>,    // what its rate limit cools by default
 }
 ```
 
-The **plan** of a call on one account is the list of buckets it takes from:
-for a Telegram send to chat `c` by bot `b`, that is egress, `b`,
-`(c, b, Send)`, and `(c, Send)` if the shared level is on. Plans come from
-the service's **rules** (`TelegramRules`, `DiscordRules`): which levels a
-class touches, and the rates per level and class. The limiter itself knows
-no service.
+A call of a class takes a token of the class's bucket in its chat and one of
+its bot's: that is its **plan**. `Spend::Bot` takes the bot's only (Telegram
+`getFile`, upload parts); every API call takes at least that.
+`Spend::Nothing` is for CDN downloads, which are not API calls.
 
 ### Taking a plan at once
 
@@ -113,12 +119,11 @@ chat_id = -1001234567890
 bot_token_envs = ["BOT_A", "BOT_B", "BOT_C"]   # all admins of the channel
 ```
 
-`pool.begin(call)` computes `ready_at` of the call's plan for every account
-of the pool and takes the earliest. Ties go to the account used least
-recently, so load spreads even when every bucket is full. The egress level
-is the same for every account behind one address, so it does not tell them
-apart. It still bounds the sum: ten bots behind one IP never go past the
-IP's budget.
+`pool.begin(call)` computes when the call's plan would be ready for every
+account of the pool and takes the earliest. Ties go to the account used
+least recently, so load spreads even when every bucket is full. The choice
+is made once: if another account frees up while the call waits for the
+chosen one, the call does not switch.
 
 `begin` waits for the chosen account's plan and returns a **ticket**: that
 account, with the tokens of its first attempt taken.
@@ -145,22 +150,31 @@ may land on another account: this is where the pool spreads load.
 
 ### Penalties
 
-The service tells us to wait; its rules say **which level** the wait is
-for, from the method and the answer:
+The service says what a failure means (`classify` → `Verdict`). A rate limit
+(`Verdict::Wait { after, level }`) cools the call's default level
+(`Call::cools`), or the level the service names:
 
-| Answer | Penalized |
+| Answer | Cooled |
 |---|---|
-| Telegram `FLOOD_WAIT_X` on a send | `(chat, bot, Send)` |
-| Telegram `FLOOD_WAIT_X` on `upload.getFile` | `(bot, File)` and `bot` |
-| Telegram `FLOOD_WAIT_X` on auth / connect | egress |
-| Discord 429, `X-RateLimit-Scope: user` | the route's bucket of that bot |
+| Telegram `FLOOD_WAIT_X` on a send, a read, a delete | the class in that chat |
+| Telegram `FLOOD_WAIT_X` on `upload.getFile`, an upload part | the bot |
+| Discord 429 | the route's class in that channel |
 | Discord 429, `global: true` | the bot |
-| Discord 429, `X-RateLimit-Scope: shared` | the shared scope bucket (every bot) |
-| Discord 429 without a JSON body (Cloudflare), 1015 | egress |
 
-A penalty freezes the bucket until the wait is over, as `penalize` does
-today; every call whose plan has that bucket waits it out. The ticket's own retry waits
-for it: retries are sticky (§ Sticky retries), even when another bot is free.
+A penalty freezes the bucket until the wait is over, and the bucket starts
+empty then: a full burst right after a 35 s `FLOOD_WAIT` is what earns the
+next one. Every call whose plan has that bucket waits it out, the ticket's
+own retry too: retries are sticky (§ Sticky retries), even when another bot
+is free.
+
+### Fairness
+
+Waiters are not served in the order they came, and a retry after a penalty
+has no priority over a fresh call: after waiting out a 35 s flood it may
+lose the bucket's first token to a call that just arrived, and wait again.
+Whether that happens is measured first, by the wait of retries after a
+penalty, apart from other waits (§ Metrics). Priority for those retries
+comes only if that wait shows it.
 
 ### Learning from answers
 
@@ -172,24 +186,11 @@ nothing until a flood wait, so its rates stay configured.
 
 ### Bucket kinds
 
-One interface, three kinds:
-
-```rust
-trait Bucket {
-    fn wait(&mut self, now: Instant, cost: u32) -> Duration;   // zero: can take now
-    fn take(&mut self, now: Instant, cost: u32);
-    fn penalize(&mut self, until: Instant);
-    fn observe(&mut self, remaining: u32, reset_after: Duration) {}
-}
-```
-
-- **Token bucket** (rate, burst): most API limits.
-- **Window / GCRA** (n per period, a burst): Discord threads, 50 per 300 s;
-  today's `Pacer` becomes one.
-- **In flight** (a count): uploads and downloads at once. Not time-based:
-  the permit is held while the call runs and returned at the end. Per
-  account or per egress: whether bandwidth is capped per bot or per address
-  is open (§ Open questions).
+Token buckets for rates, and semaphores for transfers at once (uploads,
+CDN downloads per chat). Discord's thread budget (50 per 300 s in a fixed
+window) has its own pacer (`Pacer`, GCRA) fed from the answers' headers. It
+becomes a kind of bucket, and the headers feed the limiter
+(`observe(remaining, reset_after)`), only if the bench shows a need (§ Plan).
 
 ### Background work
 
@@ -200,76 +201,72 @@ least half full, then takes a ticket as usual. With a pool it asks for
 
 ## The API
 
-```rust
-let limiter = Limiter::new(rules);                 // one per process
-let pool = limiter.pool(scope, accounts);          // a store's bots for its chat
+What exists (step 3): a service describes each request once, and every
+request goes through one loop.
 
-let mut ticket = pool.begin(Call::send(scope)).await;   // picks the bot, waits
-loop {
-    match ticket.account().send(…, random_id).await {
-        Ok(v) => break ticket.done(v),
-        Err(e) => match rules.classify(&e) {
-            Verdict::Wait { level, after } => { ticket.penalize(level, after); ticket.retry().await }
-            Verdict::Transient => ticket.backoff().await,        // same account
-            Verdict::Fatal => break Err(e),
-        },
-    }
+```rust
+// Telegram: a request without a budget does not compile.
+budgeted! {
+    functions::messages::SendMedia => "messages.sendMedia", Spend::Class(SEND), Level::Class;
+    functions::upload::GetFile => "upload.getFile", Spend::Bot, Level::Bot;
+    …
 }
+// Discord: one Call per endpoint.
+const SEND_MESSAGE: Call = api("send message", SEND);
+
+pigeonhole_limits::run(Some(&limiter), &call, &RETRY, classify, || attempt()).await
 ```
 
-`retry_call` (today in the Telegram client) becomes the generic driver of
-this loop, with the deadline (`CALL_BUDGET`), so a service only writes
-`classify` and the call itself:
+`run` takes the call's tokens before each attempt, asks `classify`, cools
+on a rate limit and retries within `Retry` (a deadline, attempts, a
+backoff). Step 4 puts a pool in front of it:
 
 ```rust
-limiter.run(&pool, Call::send(scope), |account| account.send(…, random_id)).await
+let mut ticket = pool.begin(&call).await;          // picks the bot, takes its plan
+let result = ticket.run(&RETRY, classify, |bot| bot.send(…, random_id)).await;
 ```
-
-Over MTProto the call is `invoke(&request)` on the account's sender pool,
-with `impl Budgeted for` the TL functions we use (`messages.SendMedia` →
-`Send`, `upload.GetFile` → `File`, …). Every call then goes through the
-limiter, wired or not; a function without `Budgeted` does not compile.
 
 ## Crates
 
-- **`pigeonhole-limits`**: buckets, plans taken at once, pools, tickets,
-  the retry driver, metrics. It knows no service and depends on tokio
-  only. It should build outside this workspace (no `madsim-tokio` alias
-  required; the simulation keeps working through the alias, as today).
-- **The service crates** bring their rules: classes, levels per class,
-  default rates, `classify`, `observe`. They implement `Budgeted` for their
-  requests.
-- **The binary** builds one `Limiter` per service and the pools from
-  `[[store]]`.
-
-A bot that has nothing to do with pigeonhole uses the first crate and its
-own rules, for example private chats at ~1 message per second per chat.
+- **`pigeonhole-limits`**: buckets, plans taken at once, the retry loop,
+  then pools and tickets. It knows no service and depends on tokio (the
+  workspace's `madsim-tokio` alias, so the simulation sees its clock) and
+  metrics.
+- **The service crates** bring their classes and default rates
+  (`limits()`), `classify`, and a `Call` per request (`Budgeted` on
+  Telegram, constants on Discord).
+- **The binary** builds one registry of limiters per service, and the pools
+  from `[[store]]`.
 
 ## Config
 
 ```toml
-[telegram.egress]
-rate_per_sec = 50.0              # every call of every bot from this address
-[telegram.account]
-rate_per_sec = 25.0              # was bot_rate_per_sec
+[telegram]
+upload_concurrency = 2
+download_concurrency = 8
+[telegram.bot]                   # every call of a bot
+rate_per_sec = 25.0
 burst = 30.0
-[telegram.scope.send]            # per chat and bot; was send_rate_per_sec
+[telegram.send]                  # a class: per chat and bot
 rate_per_sec = 0.3
 burst = 3.0
-# [telegram.shared.send]         # per chat for all bots together; off by default
+# [telegram.read], [telegram.delete]; [discord] takes the same tables
 ```
 
-Each `[[store]]` takes `bot_token_envs` (a list; one entry is today's
-`bot_token_env`) and with it the pool. Two stores on one chat stay refused:
-one store, many bots.
+Unset values keep the service's defaults; a class the service does not have
+is refused. Step 4 adds `bot_token_envs` to a `[[store]]` (a list; one
+entry is today's `bot_token_env`) and with it the pool. Two stores on one
+chat stay refused: one store, many bots.
 
 ## Metrics
 
-- `pigeonhole_limiter_wait_seconds{level, class}`: the wait, by the level
-  that set `ready_at` (which budget is the bottleneck).
-- `pigeonhole_limiter_penalties_total{service, level}`.
+- `pigeonhole_limiter_wait_seconds{chat, op}`: waits for our own buckets
+  (exists).
+- `pigeonhole_backend_throttle_wait_seconds{service, method}`: waits the
+  service asked for (exists).
+- `pigeonhole_limiter_retry_wait_seconds{service, method}`: the wait of a
+  retry after a penalty, until its next attempt (§ Fairness).
 - `pigeonhole_pool_calls_total{store, account}`: how the pool spreads load.
-- `pigeonhole_limiter_waiting{level}`: calls waiting on a level.
 
 ## Spike findings (2026-10-30)
 
@@ -309,19 +306,22 @@ until the round trip (~0.3–0.5 s per send) is what is left.
 ## Plan
 
 1. ✅ **Spike**: per bot on both services (§ Spike findings).
-2. ✅ Plans taken at once in `pigeonhole-limits` (`take_all`), behind
-   today's `ChatLimiter` API (one bot per store).
+2. ✅ Plans taken at once in `pigeonhole-limits` (`take_all`).
 3. ✅ `pigeonhole_limits::run` (a `Call`, a `Retry`, the service's
    `classify` → `Verdict`) for Telegram and Discord; `Budgeted` for the
    MTProto requests, so `TelegramMtproto::invoke` is the only way out
    besides the login; the hand-wired `acquire_*` / `penalize_*` are gone.
-   A Discord 429 with `global: true` now cools the whole bot. The buckets
-   run on the runtime's clock (`tokio::time::Instant`), so the simulation
-   and paused tests see them too.
-4. Pools and `bot_token_envs`; sticky tickets.
-5. Egress, the Discord `Pacer` as a window bucket, `observe` from headers.
-6. Bench: log entries per second with 1, 2, 4 bots against
+   The buckets run on the runtime's clock (`tokio::time::Instant`), so the
+   simulation and paused tests see them too.
+   After review (pigeonhole-ce): classes belong to the services; every API
+   call takes its bot's token; a cooled bucket starts empty; a Discord
+   429 cools its route's class, the bot only when `global`; one `Call` per
+   Discord endpoint; config tables per rate.
+4. Pools and `bot_token_envs`; tickets; the retry-wait metric.
+5. Bench: log entries per second with 1, 2, 4 bots against
    [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md).
+6. Only as far as the bench shows a need: the Discord `Pacer` as a kind of
+   bucket, `observe` from headers, priority for retries after a penalty.
 
 ## Open questions
 
@@ -330,15 +330,13 @@ until the round trip (~0.3–0.5 s per send) is what is left.
   posted, through its own `getMessages`. Whether A's `FileLocation` works
   for B directly was not tried: reads stay sticky.
 - **More bots.** Two bots doubled the rate. Does it keep scaling at 4–8
-  bots from one IP, or does an egress limit appear?
-- **Rerouting a flood wait.** A Telegram `FLOOD_WAIT` guarantees the call
+  bots from one IP, or does a per-address limit appear (§ Levels and
+  buckets: not in the model until seen)?
+- **Rerouting a flood wait.** A `FLOOD_WAIT` or a 429 guarantees the call
   was not applied, so moving that operation to another bot with a new
-  `random_id` would be safe, unlike a retry after a lost answer. Worth it
-  when the wait is long and another bot is free? Not in the first version:
-  retries are sticky.
+  `random_id` / nonce would be safe, unlike a retry after a lost answer.
+  Telegram gives a bot a 35–40 s wait every ~18 sends, and the log is
+  written one entry after another: without moving, an entry waits that out
+  while another bot is free. Not decided yet: retries are sticky.
 - **Bandwidth.** Is the ~2.7 MiB/s upload per stream capped per bot,
-  per connection or per address? That decides whether the in-flight cap for
-  uploads is per account or per egress.
-- **Several egresses.** Bots behind different proxies get their own egress
-  buckets. Is that worth supporting, given that the services may treat it
-  as evasion?
+  per connection or per address?
