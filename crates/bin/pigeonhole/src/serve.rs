@@ -11,7 +11,7 @@ use pigeonhole::gateway_metrics::track_gateway;
 use pigeonhole::http_timeout::with_http_timeouts;
 use pigeonhole::request_log::trace_request;
 use pigeonhole::index::Index;
-use pigeonhole::{build_s3_gateway, build_s3_service};
+use pigeonhole::{build_s3_gateway, build_s3_service, S3Gateway};
 use s3s::{Body, HttpError};
 use tracing::info;
 #[cfg(any(feature = "bytestream", not(feature = "metrics-prometheus")))]
@@ -35,58 +35,9 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "bytestream")]
-    if cfg.bytestream.enabled {
-        use pigeonhole_gateway_bytestream::cas_index::CasIndex;
-        use pigeonhole_gateway_bytestream::config::BytestreamConfig;
-        let bs_cfg = BytestreamConfig {
-            enabled: true,
-            listen_addr: cfg.bytestream.listen_addr.clone(),
-            instance_name: cfg.bytestream.instance_name.clone(),
-            max_batch_total_size_bytes: cfg.bytestream.max_batch_total_size as i64,
-            gc_ttl: cfg.bytestream.gc_ttl,
-            ..Default::default()
-        };
-        let cas = CasIndex::open(rt.meta.clone())
-            .await
-            .context("open cas index")?;
-        let bs_store = rt.store.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                pigeonhole_gateway_bytestream::server::serve(bs_cfg, cas, bs_store).await
-            {
-                warn!(error = %e, "bytestream server exited");
-            }
-        });
-    }
+    spawn_bytestream(&cfg, &rt).await?;
 
-    let max_headers = cfg.http.max_headers;
-    let s3_service = build_s3_service(s3_gateway, &cfg.access_key, &cfg.secret_key);
-    let s3_service = HandleError::new(s3_service, handle_s3_error);
-    let body_idle = cfg.http.request_timeout;
-    let headers_timeout = cfg.http.headers_timeout;
-    let concurrency = cfg.http.max_concurrent_requests;
-    let slow_request = cfg.log.slow_request;
-    let mut app = Router::new();
-    #[cfg(feature = "metrics-prometheus")]
-    if metrics_on_main {
-        app = pigeonhole::prometheus::layer_metrics_route(app);
-    }
-    #[cfg(not(feature = "metrics-prometheus"))]
-    let _ = metrics_on_main;
-    let app = app
-        .fallback_service(s3_service)
-        .layer(axum::middleware::from_fn(move |req, next| {
-            let max = max_headers;
-            async move { limit_request_headers(max, req, next).await }
-        }))
-        .layer(axum::middleware::from_fn(|req, next| {
-            track_gateway("s3", req, next)
-        }))
-        // Outermost: the request's span covers everything below.
-        .layer(axum::middleware::from_fn(move |req, next| {
-            trace_request("s3", slow_request, req, next)
-        }));
-    let app = with_http_timeouts(app, headers_timeout, body_idle, concurrency);
+    let app = s3_app(&cfg, s3_gateway, metrics_on_main);
 
     let addr = cfg.listen_addr.clone();
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -120,6 +71,62 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The REAPI / ByteStream server on its own port, if enabled.
+#[cfg(feature = "bytestream")]
+async fn spawn_bytestream(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow::Result<()> {
+    use pigeonhole_gateway_bytestream::cas_index::CasIndex;
+    use pigeonhole_gateway_bytestream::config::BytestreamConfig;
+    if !cfg.bytestream.enabled {
+        return Ok(());
+    }
+    let bs_cfg = BytestreamConfig {
+        enabled: true,
+        listen_addr: cfg.bytestream.listen_addr.clone(),
+        instance_name: cfg.bytestream.instance_name.clone(),
+        max_batch_total_size_bytes: cfg.bytestream.max_batch_total_size as i64,
+        gc_ttl: cfg.bytestream.gc_ttl,
+        ..Default::default()
+    };
+    let cas = CasIndex::open(rt.meta.clone()).await.context("open cas index")?;
+    let bs_store = rt.store.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pigeonhole_gateway_bytestream::server::serve(bs_cfg, cas, bs_store).await {
+            warn!(error = %e, "bytestream server exited");
+        }
+    });
+    Ok(())
+}
+
+/// The S3 gateway as an HTTP app: header limits, metrics, request spans
+/// and timeouts around it (and `/metrics` when served here).
+fn s3_app(cfg: &Config, s3_gateway: S3Gateway, metrics_on_main: bool) -> Router {
+    let max_headers = cfg.http.max_headers;
+    let slow_request = cfg.log.slow_request;
+    let s3_service = build_s3_service(s3_gateway, &cfg.access_key, &cfg.secret_key);
+    let s3_service = HandleError::new(s3_service, handle_s3_error);
+    let mut app = Router::new();
+    #[cfg(feature = "metrics-prometheus")]
+    if metrics_on_main {
+        app = pigeonhole::prometheus::layer_metrics_route(app);
+    }
+    #[cfg(not(feature = "metrics-prometheus"))]
+    let _ = metrics_on_main;
+    let app = app
+        .fallback_service(s3_service)
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let max = max_headers;
+            async move { limit_request_headers(max, req, next).await }
+        }))
+        .layer(axum::middleware::from_fn(|req, next| {
+            track_gateway("s3", req, next)
+        }))
+        // Outermost: the request's span covers everything below.
+        .layer(axum::middleware::from_fn(move |req, next| {
+            trace_request("s3", slow_request, req, next)
+        }));
+    with_http_timeouts(app, cfg.http.headers_timeout, cfg.http.request_timeout, cfg.http.max_concurrent_requests)
 }
 
 /// SIGINT or SIGTERM: which one came.
