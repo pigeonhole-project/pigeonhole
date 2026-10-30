@@ -228,17 +228,16 @@ fn ts(rfc3339: &str) -> Timestamp {
 }
 
 /// The [`Expect`] of a write's `If-Match` / `If-None-Match`
-/// (docs/conditional-writes.md): `If-None-Match` takes only `*`, `If-Match`
-/// only an ETag, and not both at once.
+/// (docs/conditional-writes.md): an ETag or `*` in either, not both at once.
 fn expect_of(if_match: Option<IfMatch>, if_none_match: Option<IfNoneMatch>) -> S3Result<Option<Expect>> {
-    match (if_match, if_none_match) {
-        (None, None) => Ok(None),
-        (None, Some(ETagCondition::Any)) => Ok(Some(Expect::Absent)),
-        (Some(ETagCondition::ETag(e)), None) => Ok(Some(Expect::ETag(e.value().to_string()))),
-        (None, Some(_)) => Err(s3_error!(InvalidArgument, "If-None-Match takes only *")),
-        (Some(_), None) => Err(s3_error!(InvalidArgument, "If-Match takes an ETag")),
-        (Some(_), Some(_)) => Err(s3_error!(InvalidArgument, "If-Match and If-None-Match together")),
-    }
+    Ok(match (if_match, if_none_match) {
+        (None, None) => None,
+        (Some(ETagCondition::ETag(e)), None) => Some(Expect::ETag(e.value().to_string())),
+        (Some(ETagCondition::Any), None) => Some(Expect::Present),
+        (None, Some(ETagCondition::Any)) => Some(Expect::Absent),
+        (None, Some(ETagCondition::ETag(e))) => Some(Expect::NotETag(e.value().to_string())),
+        (Some(_), Some(_)) => return Err(s3_error!(InvalidArgument, "If-Match and If-None-Match together")),
+    })
 }
 
 fn etag_hex(hex: &str) -> ETag {
