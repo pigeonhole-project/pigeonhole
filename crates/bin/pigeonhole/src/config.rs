@@ -305,8 +305,10 @@ impl Config {
         Self::load_from_path(&path)
     }
 
+    /// The config at `path`, secrets from the environment as it is (no
+    /// `.env`: [`Self::load`] reads that first). Tests call this, so they
+    /// never pick up a developer's real `.env`.
     pub fn load_from_path(path: &Path) -> Result<Self> {
-        let _ = dotenvy::dotenv();
         let text = fs::read_to_string(path)
             .with_context(|| format!("read config {}", path.display()))?;
         let file: FileConfig = toml::from_str(&text)
@@ -1377,7 +1379,8 @@ max_blob_size = "8 MiB"
 "#,
         )
         .unwrap();
-        std::env::remove_var("DISCORD_BOT_TOKEN");
+        // The variable stays: other tests set the same value, and removing
+        // it under them (without the lock) raced their loads in CI.
         let inst = cfg.primary_instance().unwrap();
         assert_eq!(inst.kind, InstanceKind::Discord);
         assert_eq!(inst.scope_id, "123456789");
