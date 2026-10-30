@@ -93,31 +93,62 @@ pub struct TelegramMtproto {
     inner: Arc<Inner>,
 }
 
-fn pool(session: &Arc<FileSession>, api_id: i32) -> Pool {
+/// A pool of connections, and its updates if `updates` (else the pool
+/// drops them: with the receiver gone it stops forwarding).
+fn pool(session: &Arc<FileSession>, api_id: i32, updates: bool) -> (Pool, Option<UpdatesRx>) {
     let params = ConnectionParams { retry_policy: Box::new(NoRetries), ..Default::default() };
     let pool = SenderPool::with_configuration(session.clone(), api_id, params);
-    // Updates are ignored: with the receiver gone the pool drops them.
-    drop(pool.updates);
-    Pool {
+    let rx = updates.then_some(pool.updates);
+    let pool = Pool {
         handle: pool.handle.thin.clone(),
         runner: tokio::spawn(pool.runner.run()),
         authorized_dcs: tokio::sync::Mutex::new(HashSet::new()),
-    }
+    };
+    (pool, rx)
 }
+
+/// Raw MTProto updates as the connections receive them.
+pub type UpdatesRx = tokio::sync::mpsc::Receiver<grammers_session::updates::UpdatesLike>;
 
 impl TelegramMtproto {
     /// Log in as the bot of `cfg.bot_token`, reusing the session's auth key
     /// when it belongs to that bot.
     pub async fn connect(cfg: &MtprotoConfig) -> Result<Self> {
+        Ok(Self::open(cfg, false).await?.0)
+    }
+
+    /// [`Self::connect`], keeping the updates Telegram pushes to this
+    /// session (both connection pools merged into one receiver), and asking
+    /// for them (`updates.getState`). For docs/raft-over-chat.md: a channel's
+    /// new posts arrive as `updateNewChannelMessage`.
+    pub async fn connect_with_updates(cfg: &MtprotoConfig) -> Result<(Self, UpdatesRx)> {
+        let (this, rxs) = Self::open(cfg, true).await?;
+        let (tx, merged) = tokio::sync::mpsc::channel(1024);
+        for mut rx in rxs {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(u) = rx.recv().await {
+                    if tx.send(u).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        let request = functions::updates::GetState {};
+        retry_call("updates.getState", CALL_BUDGET, None, || this.home(Lane::Meta, &request)).await?;
+        Ok((this, merged))
+    }
+
+    async fn open(cfg: &MtprotoConfig, updates: bool) -> Result<(Self, Vec<UpdatesRx>)> {
         let bot_id = bot_id_of(&cfg.bot_token)?;
         let session = Arc::new(FileSession::open(&cfg.session)?);
-        let blobs = pool(&session, cfg.api_id);
-        let meta = pool(&session, cfg.api_id);
+        let (blobs, blobs_rx) = pool(&session, cfg.api_id, updates);
+        let (meta, meta_rx) = pool(&session, cfg.api_id, updates);
         let this = Self { inner: Arc::new(Inner { session, bot_id, blobs, meta }) };
         if !this.logged_in().await? {
             this.sign_in(cfg).await?;
         }
-        Ok(this)
+        Ok((this, blobs_rx.into_iter().chain(meta_rx).collect()))
     }
 
     pub fn bot_id(&self) -> i64 {
