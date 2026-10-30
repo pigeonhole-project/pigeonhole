@@ -60,6 +60,9 @@ jobs:
         with:
           name: code-report
           path: code-report.md
+      # A ratchet: lower these as the hotspots are split, never raise them.
+      - name: No function past the complexity and length limits
+        run: ./scripts/code_report.py --no-traits --max-cognitive 25 --max-lines 150 --out /dev/null
 
   compat-memory:
     name: compat-memory (ceph known-good)
