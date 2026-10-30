@@ -237,7 +237,9 @@ impl TelegramMtproto {
     /// Setup, not storage (tests/live.rs `grant_admin`): make the bot
     /// `@username` an admin of `chat_id` with what a store needs (post, edit
     /// and delete messages). This bot must be an admin there with the right
-    /// to add admins.
+    /// to add admins, and `@username` must already be in the channel: a bot
+    /// cannot bring anyone in (Telegram answers `CHAT_ADMIN_INVITE_REQUIRED`
+    /// even with every admin right), so a person adds it first.
     pub async fn promote_bot(&self, chat_id: i64, username: &str) -> Result<()> {
         let resolve = functions::contacts::ResolveUsername { username: username.trim_start_matches('@').into(), referer: None };
         let enums::contacts::ResolvedPeer::Peer(resolved) =
@@ -265,6 +267,14 @@ impl TelegramMtproto {
                 _ => None,
             })
             .with_context(|| format!("chat {chat_id} is not a channel this bot can see"))?;
+        let mine = match &channel.admin_rights {
+            Some(enums::ChatAdminRights::Rights(r)) => r.clone(),
+            None => bail!("chat {chat_id}: this bot is not an admin (creator: {})", channel.creator),
+        };
+        debug!(chat_id, add_admins = mine.add_admins, creator = channel.creator, "own rights before editAdmin");
+        if !mine.add_admins && !channel.creator {
+            bail!("chat {chat_id}: this bot lacks the right to add admins ({mine:?})");
+        }
         let rights = types::ChatAdminRights {
             change_info: false,
             post_messages: true,
@@ -294,7 +304,7 @@ impl TelegramMtproto {
         };
         retry_call("channels.editAdmin", CALL_BUDGET, None, || self.home(Lane::Meta, &edit))
             .await
-            .with_context(|| format!("make @{username} an admin of {chat_id} (does this bot have the right to add admins?)"))?;
+            .with_context(|| format!("make @{username} an admin of {chat_id} as a bot with {mine:?}"))?;
         Ok(())
     }
 

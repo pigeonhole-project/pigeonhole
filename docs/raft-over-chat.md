@@ -312,11 +312,17 @@ transport.
    polling only fills gaps. Also check whether several processes logged in
    as one bot all get the updates (one bot per node avoids the question).
 
-Setting up the second bot is a script, not clicks: after creating the bot
-in BotFather (bots cannot create bots) and putting its token in `.env` as
-`TG_BOT_TOKEN_2`, the live test `grant_admin` makes it an admin of the test
-channels as the first bot (`channels.editAdmin`), which needs the right to
-add admins there:
+Setting up the second bot takes a person:
+- create it in BotFather (bots cannot create bots) and put its token in
+  `.env` as `TG_BOT_TOKEN_2`;
+- add it as an admin (post, edit, delete) of each test channel. A bot cannot
+  do this for it: `channels.editAdmin` on a bot that is not in the channel
+  is an invitation, and Telegram refuses it to a bot with
+  `CHAT_ADMIN_INVITE_REQUIRED` even when the bot holds every admin right
+  (tried 2026-10-30).
+
+The live test `grant_admin` then checks each channel, and grants the rights
+as the first bot where the second is in the channel without them:
 
 ```
 cargo test -p pigeonhole-storage-telegram --test live grant_admin -- --ignored --nocapture
