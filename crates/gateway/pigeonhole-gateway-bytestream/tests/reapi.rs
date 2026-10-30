@@ -144,6 +144,31 @@ async fn bytestream_wrong_hash_rejected() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
+/// Write `messages` (offset, finish, data) of one upload of `payload`; the error.
+async fn write_err(messages: Vec<(i64, bool, Vec<u8>)>, payload: &[u8]) -> tonic::Status {
+    let (_cas, mut bs, inst, _dir) = test_harness().await;
+    let d = digest_for(payload);
+    let resource = format!("{inst}/uploads/{}/blobs/{}/{}", uuid::Uuid::new_v4(), d.hash, d.size_bytes);
+    let requests = messages.into_iter().map(|(write_offset, finish_write, data)| WriteRequest {
+        resource_name: resource.clone(),
+        write_offset,
+        finish_write,
+        data,
+    });
+    bs.write(tokio_stream::iter(requests.collect::<Vec<_>>())).await.unwrap_err()
+}
+
+#[tokio::test]
+async fn bytestream_write_refuses_a_gap_an_unfinished_stream_and_nothing() {
+    let payload = b"hello cas".to_vec();
+    let gap = write_err(vec![(0, false, payload[..4].to_vec()), (5, true, payload[5..].to_vec())], &payload).await;
+    assert!(gap.message().contains("write_offset 5 != committed 4"), "{gap:?}");
+    let unfinished = write_err(vec![(0, false, payload.clone())], &payload).await;
+    assert!(unfinished.message().contains("finish_write not set"), "{unfinished:?}");
+    let nothing = write_err(vec![], &payload).await;
+    assert!(nothing.message().contains("empty write stream"), "{nothing:?}");
+}
+
 #[tokio::test]
 async fn find_missing_and_batch() {
     let (mut cas, mut bs, inst, _dir) = test_harness().await;

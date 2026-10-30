@@ -184,6 +184,106 @@ fn grpc_status(code: tonic::Code, msg: impl Into<String>) -> Status {
     Status::new(code, msg.into())
 }
 
+/// One ByteStream Write in progress: its bytes go on to the CAS as they come
+/// and are hashed on the way.
+struct Upload {
+    resource_name: String,
+    /// The upload id, the key of [`ReapiState::uploads`].
+    key: String,
+    hash: String,
+    size: i64,
+    hasher: Sha256,
+    committed: i64,
+    body: mpsc::Sender<Result<Bytes>>,
+    ingest: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl Upload {
+    /// Take the next message of the stream: same resource, the offset where
+    /// the last one ended.
+    async fn append(&mut self, req: WriteRequest) -> Result<(), Status> {
+        if req.resource_name != self.resource_name {
+            return Err(grpc_status(tonic::Code::InvalidArgument, "resource_name changed mid-stream"));
+        }
+        if req.write_offset != self.committed {
+            return Err(grpc_status(
+                tonic::Code::InvalidArgument,
+                format!("write_offset {} != committed {}", req.write_offset, self.committed),
+            ));
+        }
+        if req.data.is_empty() {
+            return Ok(());
+        }
+        self.hasher.update(&req.data);
+        self.committed += req.data.len() as i64;
+        self.body
+            .send(Ok(Bytes::from(req.data)))
+            .await
+            .map_err(|_| grpc_status(tonic::Code::Internal, "ingest channel closed"))
+    }
+}
+
+impl ReapiState {
+    /// Start the upload `resource_name` names: its bytes stream into the CAS
+    /// from now on, and its progress is visible to QueryWriteStatus.
+    async fn start_upload(&self, resource_name: &str) -> Result<Upload, Status> {
+        let parsed = parse_upload_resource(&self.instance, resource_name)
+            .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
+        let (body, rx) = mpsc::channel::<Result<Bytes>>(8);
+        let (cas, hash, size) = (self.cas.clone(), parsed.hash_hex.clone(), parsed.size);
+        let ingest = tokio::spawn(async move { cas.put_stream(&hash, size, ReceiverStream::new(rx)).await });
+        let pending = PendingUpload {
+            hash_hex: parsed.hash_hex.clone(),
+            size: parsed.size,
+            committed_size: 0,
+            complete: false,
+            last_activity: Instant::now(),
+        };
+        self.uploads.lock().await.insert(parsed.upload_id.clone(), pending);
+        Ok(Upload {
+            resource_name: resource_name.to_string(),
+            key: parsed.upload_id,
+            hash: parsed.hash_hex,
+            size: parsed.size,
+            hasher: Sha256::new(),
+            committed: 0,
+            body,
+            ingest,
+        })
+    }
+
+    async fn note_progress(&self, key: &str, committed: i64, finished: bool) {
+        if let Some(u) = self.uploads.lock().await.get_mut(key) {
+            u.committed_size = committed;
+            u.last_activity = Instant::now();
+            u.complete |= finished;
+        }
+    }
+
+    /// End an upload: wait for the ingest, check the bytes against the
+    /// digest they were sent under; the committed size.
+    async fn finish_upload(&self, upload: Upload, finished: bool) -> Result<i64, Status> {
+        let Upload { key, hash, size, hasher, committed, body, ingest, .. } = upload;
+        drop(body); // the end of the body: put_stream can finish
+        let ingested = ingest.await;
+        self.uploads.lock().await.remove(&key);
+        if !finished {
+            return Err(grpc_status(tonic::Code::InvalidArgument, "finish_write not set"));
+        }
+        if hex::encode(hasher.finalize()) != hash || committed != size {
+            // Remove any CAS row written under the claimed digest.
+            if let Ok(ids) = self.cas.cas.release(&hash, size).await {
+                let _ = self.cas.store.release(&ids).await;
+            }
+            return Err(grpc_status(tonic::Code::InvalidArgument, "digest mismatch"));
+        }
+        ingested
+            .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?
+            .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
+        Ok(committed)
+    }
+}
+
 #[tonic::async_trait]
 impl Capabilities for ReapiState {
     async fn get_capabilities(
@@ -511,141 +611,24 @@ impl ByteStream for ReapiState {
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let mut stream = request.into_inner();
-        let mut resource_name = String::new();
-        let mut upload_key = String::new();
-        let mut expected_hash = String::new();
-        let mut expected_size = 0i64;
-        let mut hasher = Sha256::new();
-        let mut committed_size = 0i64;
+        let mut upload: Option<Upload> = None;
         let mut finished = false;
-
-        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(8);
-        let mut body_tx = Some(body_tx);
-        let mut body_rx = Some(body_rx);
-        let mut ingest_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
-
         while let Some(msg) = stream.next().await {
             let req = msg.map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
-            if resource_name.is_empty() {
-                resource_name = req.resource_name.clone();
-                let parsed = parse_upload_resource(&self.instance, &resource_name)
-                    .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
-                upload_key = parsed.upload_id;
-                expected_hash = parsed.hash_hex;
-                expected_size = parsed.size;
-
-                let cas = self.cas.clone();
-                let hash = expected_hash.clone();
-                let size = expected_size;
-                let rx = body_rx
-                    .take()
-                    .ok_or_else(|| grpc_status(tonic::Code::Internal, "duplicate upload init"))?;
-                ingest_handle = Some(tokio::spawn(async move {
-                    cas.put_stream(&hash, size, ReceiverStream::new(rx)).await
-                }));
-
-                let mut uploads = self.uploads.lock().await;
-                uploads.insert(
-                    upload_key.clone(),
-                    PendingUpload {
-                        hash_hex: expected_hash.clone(),
-                        size: expected_size,
-                        committed_size: 0,
-                        complete: false,
-                        last_activity: Instant::now(),
-                    },
-                );
-            } else if req.resource_name != resource_name {
-                return Err(grpc_status(
-                    tonic::Code::InvalidArgument,
-                    "resource_name changed mid-stream",
-                ));
+            if upload.is_none() {
+                upload = Some(self.start_upload(&req.resource_name).await?);
             }
-
-            if req.write_offset != committed_size {
-                return Err(grpc_status(
-                    tonic::Code::InvalidArgument,
-                    format!(
-                        "write_offset {} != committed {committed_size}",
-                        req.write_offset
-                    ),
-                ));
-            }
-
-            if !req.data.is_empty() {
-                hasher.update(&req.data);
-                committed_size += req.data.len() as i64;
-                let tx = body_tx.as_ref().ok_or_else(|| {
-                    grpc_status(tonic::Code::Internal, "ingest channel missing")
-                })?;
-                if tx.send(Ok(Bytes::from(req.data))).await.is_err() {
-                    return Err(grpc_status(
-                        tonic::Code::Internal,
-                        "ingest channel closed",
-                    ));
-                }
-            }
-
-            {
-                let mut uploads = self.uploads.lock().await;
-                if let Some(u) = uploads.get_mut(&upload_key) {
-                    u.committed_size = committed_size;
-                    u.last_activity = Instant::now();
-                    if req.finish_write {
-                        u.complete = true;
-                    }
-                }
-            }
-
-            if req.finish_write {
+            let u = upload.as_mut().expect("started above");
+            let finish = req.finish_write;
+            u.append(req).await?;
+            self.note_progress(&u.key, u.committed, finish).await;
+            if finish {
                 finished = true;
                 break;
             }
         }
-
-        // Close ingest body so put_stream can finish.
-        drop(body_tx.take());
-
-        let Some(handle) = ingest_handle else {
-            return Err(grpc_status(
-                tonic::Code::InvalidArgument,
-                "empty write stream",
-            ));
-        };
-
-        if !finished {
-            let _ = handle.await;
-            let mut uploads = self.uploads.lock().await;
-            uploads.remove(&upload_key);
-            return Err(grpc_status(
-                tonic::Code::InvalidArgument,
-                "finish_write not set",
-            ));
-        }
-
-        let digest = hex::encode(hasher.finalize());
-        if digest != expected_hash || committed_size != expected_size {
-            // Finish/cancel ingest; remove any CAS row written under the claimed digest.
-            let _ = handle.await;
-            if let Ok(ids) = self.cas.cas.release(&expected_hash, expected_size).await {
-                let _ = self.cas.store.release(&ids).await;
-            }
-            let mut uploads = self.uploads.lock().await;
-            uploads.remove(&upload_key);
-            return Err(grpc_status(
-                tonic::Code::InvalidArgument,
-                "digest mismatch",
-            ));
-        }
-
-        handle
-            .await
-            .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?
-            .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
-
-        let mut uploads = self.uploads.lock().await;
-        uploads.remove(&upload_key);
-
+        let upload = upload.ok_or_else(|| grpc_status(tonic::Code::InvalidArgument, "empty write stream"))?;
+        let committed_size = self.finish_upload(upload, finished).await?;
         Ok(Response::new(WriteResponse { committed_size }))
     }
 
