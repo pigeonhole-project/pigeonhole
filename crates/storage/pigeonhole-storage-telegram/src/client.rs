@@ -20,9 +20,9 @@ use grammers_mtsender::{ConnectionParams, InvocationError, NoRetries, SenderPool
 use grammers_tl_types::{self as tl, enums, functions, types};
 use pigeonhole_limits::{Call, ChatLimiter, Failed, Level, Retry, Spend, Verdict};
 use pigeonhole_storage_api::{RateLimited, Unavailable};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
@@ -39,6 +39,8 @@ const RETRY: Retry = Retry {
 /// A member of a [`PooledChannel`](crate::PooledChannel): a flood wait ends
 /// the call at once, so that the pool may move it to another bot.
 const RETRY_IN_POOL: Retry = Retry { give_way: true, ..RETRY };
+/// How long a file uploaded for a send is kept for a repeat of that send.
+const UPLOAD_KEPT: Duration = Duration::from_secs(300);
 /// Upload parts of one file in flight.
 const PARTS_IN_FLIGHT: usize = 4;
 /// Upload part size (the most Telegram takes).
@@ -311,7 +313,15 @@ impl TelegramMtproto {
         }
         let access_hash = channel.access_hash.context("channel without an access hash")?;
         debug!(chat_id, title = %channel.title, "resolved channel");
-        Ok(MtprotoChannel { client: self.clone(), lane, channel_id, access_hash, limiter, retry: RETRY })
+        Ok(MtprotoChannel {
+            client: self.clone(),
+            lane,
+            channel_id,
+            access_hash,
+            limiter,
+            retry: RETRY,
+            uploads: Arc::default(),
+        })
     }
 }
 
@@ -406,6 +416,42 @@ pub struct MtprotoChannel {
     access_hash: i64,
     limiter: Arc<ChatLimiter>,
     retry: Retry,
+    uploads: Arc<Uploads>,
+}
+
+/// Files uploaded for sends not done yet, by the send's `random_id`: a send
+/// that gave way to a flood wait and runs again on this bot posts what it
+/// uploaded instead of uploading it again (on another bot it must: an
+/// upload is its session's).
+#[derive(Default)]
+struct Uploads(Mutex<HashMap<i64, (enums::InputFile, tokio::time::Instant)>>);
+
+impl Uploads {
+    fn get(&self, random_id: i64) -> Option<enums::InputFile> {
+        let mut kept = self.0.lock().unwrap();
+        kept.retain(|_, (_, at)| at.elapsed() < UPLOAD_KEPT);
+        kept.get(&random_id).map(|(file, _)| file.clone())
+    }
+
+    fn keep(&self, random_id: i64, file: enums::InputFile) {
+        self.0.lock().unwrap().insert(random_id, (file, tokio::time::Instant::now()));
+    }
+
+    fn done(&self, random_id: i64) {
+        self.0.lock().unwrap().remove(&random_id);
+    }
+}
+
+/// The retries of `call` on a channel whose own are `channel`: a call of the
+/// bot (an upload part, a download) waits a flood wait out where it is,
+/// even in a pool. Moving it would mean uploading again, or holds a
+/// location only this bot can use.
+fn retry_for<'a>(call: &Call, channel: &'a Retry) -> &'a Retry {
+    if call.spend == Spend::Bot {
+        &RETRY
+    } else {
+        channel
+    }
 }
 
 impl MtprotoChannel {
@@ -435,7 +481,7 @@ impl MtprotoChannel {
 
     /// `request` on this channel's lane, metered by its limiter.
     async fn invoke<R: Budgeted>(&self, dc: Option<i32>, request: &R) -> Result<R::Return> {
-        self.client.invoke(self.lane, dc, Some(&self.limiter), &self.retry, request).await
+        self.client.invoke(self.lane, dc, Some(&self.limiter), retry_for(&R::CALL, &self.retry), request).await
     }
 
     /// Upload `data` as one file; returns what `sendMedia` takes.
@@ -576,7 +622,14 @@ impl ChannelApi for MtprotoChannel {
         if data.is_empty() {
             bail!("Telegram does not take empty documents");
         }
-        let file = self.upload(name, &data).await.with_context(|| format!("upload {name}"))?;
+        let file = match self.uploads.get(random_id) {
+            Some(file) => file,
+            None => {
+                let file = self.upload(name, &data).await.with_context(|| format!("upload {name}"))?;
+                self.uploads.keep(random_id, file.clone());
+                file
+            }
+        };
         let media: enums::InputMedia = types::InputMediaUploadedDocument {
             nosound_video: false,
             force_file: true,
@@ -616,8 +669,12 @@ impl ChannelApi for MtprotoChannel {
         };
         // Repeats carry the same random_id: Telegram returns the message a
         // lost answer was about instead of posting another.
-        let updates = self.invoke(None, &request).await?;
-        sent_message(updates, random_id)
+        let updates = self.invoke(None, &request).await;
+        // Given way to a flood wait: the pool may run the send here again.
+        if !updates.as_ref().is_err_and(|e| e.is::<RateLimited>()) {
+            self.uploads.done(random_id);
+        }
+        sent_message(updates?, random_id)
     }
 
     async fn send_text(&self, text: &str, random_id: i64) -> Result<Sent> {
@@ -733,6 +790,32 @@ mod tests {
         assert!(e.is::<FileReferenceExpired>());
         let e = map_fatal("upload.getFile", rpc(303, "FILE_MIGRATE_4"));
         assert_eq!(migrate_dc(&e), Some(4));
+    }
+
+    #[test]
+    fn calls_of_the_bot_never_give_way() {
+        let part = <functions::upload::SaveFilePart as Budgeted>::CALL;
+        let file = <functions::upload::GetFile as Budgeted>::CALL;
+        let send = <functions::messages::SendMedia as Budgeted>::CALL;
+        assert!(!retry_for(&part, &RETRY_IN_POOL).give_way, "an upload part waits: moving would upload again");
+        assert!(!retry_for(&file, &RETRY_IN_POOL).give_way, "a download holds this bot's location");
+        assert!(retry_for(&send, &RETRY_IN_POOL).give_way, "a send may move");
+        assert!(!retry_for(&send, &RETRY).give_way, "not outside a pool");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upload_is_kept_for_a_repeat_of_its_send_for_a_while() {
+        let uploads = Uploads::default();
+        let file: enums::InputFile =
+            types::InputFile { id: 1, parts: 2, name: "b".into(), md5_checksum: String::new() }.into();
+        uploads.keep(7, file.clone());
+        assert_eq!(uploads.get(7), Some(file.clone()));
+        assert_eq!(uploads.get(8), None);
+        uploads.done(7);
+        assert_eq!(uploads.get(7), None, "a send done keeps nothing");
+        uploads.keep(7, file);
+        tokio::time::sleep(UPLOAD_KEPT).await;
+        assert_eq!(uploads.get(7), None, "not past UPLOAD_KEPT");
     }
 
     #[tokio::test(start_paused = true)]
