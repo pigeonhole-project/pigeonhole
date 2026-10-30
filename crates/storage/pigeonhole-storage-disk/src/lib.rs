@@ -269,7 +269,7 @@ impl Chain for DiskBlobStore {
         match &after {
             After::Won(id) => tracing::debug!(store = %self.instance().id, label, ?prev, key = id.key, bytes, "linked"),
             After::Lost(w) => {
-                tracing::debug!(store = %self.instance().id, label, ?prev, winner = w.id.key, winner_label = %w.label, "lost the link")
+                tracing::debug!(store = %self.instance().id, label, ?prev, winner = w.id.key, winner_label = %w.label, "lost the link");
             }
         }
         Ok(after)

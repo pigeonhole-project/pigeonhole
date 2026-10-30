@@ -4,7 +4,7 @@ use crate::checksums::{self, copy_checksums, IncomingChecksums};
 use crate::commands::{Body, Expect, S3Reject, S3State};
 use crate::cool::{CoolPolicy, CoolReason};
 use crate::index::{
-    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ListPage, ObjectMeta, ObjectView, Rejected,
+    parse_rfc3339, slice_extents, CopyDest, unique_chunk_ids, DeleteBucketResult, Index, ListPage, ObjectMeta, ObjectView, Rejected,
     SourceSnapshot,
 };
 use pigeonhole_meta::{Outcome, Prepared, Proposal};
@@ -720,7 +720,6 @@ impl S3 for S3Gateway {
             .into_iter()
             .map(|p| CommonPrefix {
                 prefix: Some(p),
-                ..Default::default()
             })
             .collect::<Vec<_>>();
 
@@ -779,7 +778,6 @@ impl S3 for S3Gateway {
             .into_iter()
             .map(|p| CommonPrefix {
                 prefix: Some(p),
-                ..Default::default()
             })
             .collect::<Vec<_>>();
 
@@ -846,7 +844,6 @@ impl S3 for S3Gateway {
             .into_iter()
             .map(|p| CommonPrefix {
                 prefix: Some(p),
-                ..Default::default()
             })
             .collect::<Vec<_>>();
 
@@ -1077,10 +1074,14 @@ impl S3 for S3Gateway {
 
         let copy_source_meta =
             input.metadata_directive.as_ref().map(|d| d.as_str()) != Some(MetadataDirective::REPLACE);
-        let (content_type, user_meta): (_, Vec<(String, String)>) = if copy_source_meta {
-            (None, vec![])
-        } else {
-            (input.content_type.as_deref(), input.metadata.unwrap_or_default().into_iter().collect())
+        let user_meta: Vec<(String, String)> = input.metadata.unwrap_or_default().into_iter().collect();
+        let dest = CopyDest {
+            bucket: &input.bucket,
+            key: &input.key,
+            content_type: input.content_type.as_deref().filter(|_| !copy_source_meta),
+            user_meta: &user_meta,
+            copy_source_meta,
+            expect,
         };
 
         let (src, extents) =
@@ -1095,24 +1096,12 @@ impl S3 for S3Gateway {
         };
         if let Some(data) = rechunk {
             let ingested = self.ingest_bytes(data).await?;
-            let (put, dst) = self.index.prepare_copy_object(
-                &src,
-                Body::Chunks(ingested.extents.clone()),
-                &input.bucket,
-                &input.key,
-                content_type,
-                &user_meta,
-                copy_source_meta,
-                expect,
-            );
+            let (put, dst) = self.index.prepare_copy_object(&src, Body::Chunks(ingested.extents.clone()), dest);
             self.commit_new(Some(ingested.chunks), &ingested.extents, put, Self::refused).await?;
             return Ok(S3Response::new(copy_object_output(&dst)));
         }
 
-        let copied = self
-            .index
-            .copy_object(&src, &input.bucket, &input.key, content_type, &user_meta, copy_source_meta, expect)
-            .await;
+        let copied = self.index.copy_object(&src, dest).await;
         let dst = match copied {
             Ok((dst, old)) => {
                 self.release_later(old);

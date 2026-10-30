@@ -103,8 +103,7 @@ impl Sweeper {
 
     /// Single pass: reclaim `refs = 0` chunks, then range-sweep each instance.
     pub async fn sweep_once(&self) -> Result<SweepStats> {
-        let mut stats = SweepStats::default();
-        stats.zero_ref_chunks = self.reclaim_zero_refs().await?;
+        let mut stats = SweepStats { zero_ref_chunks: self.reclaim_zero_refs().await?, ..Default::default() };
         for member in &self.members {
             let (deleted, skipped) = self.sweep_instance(member).await?;
             stats.keys_deleted += deleted;
@@ -249,7 +248,7 @@ mod tests {
     use pigeonhole_storage_memory::MemoryBlobStore;
 
     struct Fixture {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         db: BlobDb,
         mem: Arc<MemoryBlobStore>,
         backend: SharedBackend,
@@ -274,7 +273,7 @@ mod tests {
         let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
         let backend: SharedBackend = Arc::new(erase(mem.clone()));
         let (layer, pins) = open_layer(db.clone(), backend.clone()).await;
-        Fixture { _dir: dir, db, mem, backend, layer, pins }
+        Fixture { dir, db, mem, backend, layer, pins }
     }
 
     fn sweeper(f: &Fixture) -> Sweeper {
@@ -307,7 +306,7 @@ mod tests {
         let f = setup().await;
         let loc = orphan(&f, b"orphan").await;
         // A newer incarnation claims the same log; this one has not written since.
-        let _newer = BlobDb::open(pigeonhole_testkit::tablet(f._dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
+        let _newer = BlobDb::open(pigeonhole_testkit::tablet(f.dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
 
         let err = sweeper(&f).sweep_once().await.unwrap_err();
         assert!(format!("{err:#}").contains("fenced"), "{err:#}");
@@ -441,7 +440,7 @@ mod tests {
         let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
         let backend: SharedBackend = Arc::new(erase(mem.clone()));
         let (layer, pins) = open_layer(db.clone(), backend.clone()).await;
-        let f = Fixture { _dir: dir, db, mem, backend, layer, pins };
+        let f = Fixture { dir, db, mem, backend, layer, pins };
 
         let id = f.layer.put_small(Bytes::from_static(b"released")).await.unwrap();
         let keys = f.mem.message_keys();

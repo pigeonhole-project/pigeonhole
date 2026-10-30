@@ -149,13 +149,13 @@ async fn write_err(messages: Vec<(i64, bool, Vec<u8>)>, payload: &[u8]) -> tonic
     let (_cas, mut bs, inst, _dir) = test_harness().await;
     let d = digest_for(payload);
     let resource = format!("{inst}/uploads/{}/blobs/{}/{}", uuid::Uuid::new_v4(), d.hash, d.size_bytes);
-    let requests = messages.into_iter().map(|(write_offset, finish_write, data)| WriteRequest {
+    let requests = messages.into_iter().map(move |(write_offset, finish_write, data)| WriteRequest {
         resource_name: resource.clone(),
         write_offset,
         finish_write,
         data,
     });
-    bs.write(tokio_stream::iter(requests.collect::<Vec<_>>())).await.unwrap_err()
+    bs.write(tokio_stream::iter(requests)).await.unwrap_err()
 }
 
 #[tokio::test]

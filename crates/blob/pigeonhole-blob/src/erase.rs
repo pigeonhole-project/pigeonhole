@@ -176,7 +176,7 @@ mod tests {
             let mut keys: Vec<u64> = g
                 .keys()
                 .copied()
-                .filter(|&k| k <= upto && after.map(|a| k > a).unwrap_or(true))
+                .filter(|&k| k <= upto && after.is_none_or(|a| k > a))
                 .collect();
             keys.sort_unstable();
             keys.truncate(limit);

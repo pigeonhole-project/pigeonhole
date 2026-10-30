@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::debug;
 
+/// Called with an instance that answered "not found" for a part.
+pub type NotFoundHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Stable instance id (config name), e.g. `tg-main`.
 pub type InstanceId = String;
 
@@ -107,8 +110,7 @@ impl CheapestFirst {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_millis() as u64)
     }
 
     fn next_rand(&self) -> u64 {
@@ -125,10 +127,7 @@ impl CheapestFirst {
 
     fn is_unhealthy(&self, instance: &str) -> bool {
         let g = self.inner.lock().unwrap();
-        match g.unhealthy.get(instance) {
-            Some(u) if u.open_until > Self::tick() => true,
-            _ => false,
-        }
+        matches!(g.unhealthy.get(instance), Some(u) if u.open_until > Self::tick())
     }
 }
 
@@ -362,7 +361,7 @@ impl Replicated {
         &self,
         replicas: &[ReplicaLayout],
         blocks: Range<u32>,
-        on_not_found: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+        on_not_found: Option<NotFoundHook>,
     ) -> Result<BoxByteStream> {
         if blocks.start >= blocks.end {
             return Ok(bytes_stream(Bytes::new()));
@@ -375,9 +374,7 @@ impl Replicated {
             .iter()
             .map(|r| {
                 self.by_id
-                    .get(&r.instance)
-                    .map(|b| b.cost(OpKind::Get, None))
-                    .unwrap_or_else(CostHint::free)
+                    .get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None))
             })
             .collect();
         let order = self.selector.rank(replicas, &costs);
@@ -571,7 +568,7 @@ struct ReadState {
     next_block: u32,
     end_block: u32,
     active: Option<ActivePart>,
-    on_not_found: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    on_not_found: Option<NotFoundHook>,
 }
 
 struct ActivePart {
@@ -682,9 +679,7 @@ impl ReadState {
                 .iter()
                 .map(|r| {
                     self.backends
-                        .get(&r.instance)
-                        .map(|b| b.cost(OpKind::Get, None))
-                        .unwrap_or_else(CostHint::free)
+                        .get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None))
                 })
                 .collect();
             self.order = self.selector.rank(&self.replicas, &costs);

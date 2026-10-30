@@ -59,7 +59,8 @@ async fn a_power_failure_loses_nothing_acknowledged() {
     let writer = {
         let (a, acked) = (a.clone(), acked.clone());
         tokio::spawn(async move {
-            for id in 0.. {
+            // Until the test drops the runtime.
+            for id in 0..u64::MAX {
                 tokio::time::sleep(random_ms(3)).await;
                 if a.propose::<Journal>(Record { id, writer: "a".into() }).await.is_ok() {
                     acked.lock().unwrap().push(id);

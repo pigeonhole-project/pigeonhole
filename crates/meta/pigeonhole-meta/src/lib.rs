@@ -746,7 +746,7 @@ impl MetaStore {
         // In the caller's span (a request): which entry holds its commands.
         match &answer {
             Ok((position, _)) => {
-                tracing::debug!(position, waited_ms = enqueued.elapsed().as_millis() as u64, "committed")
+                tracing::debug!(position, waited_ms = enqueued.elapsed().as_millis() as u64, "committed");
             }
             Err(e) => tracing::debug!(error = %format!("{e:#}"), "proposal failed"),
         }
@@ -893,7 +893,7 @@ fn report_stop(mut stop: watch::Receiver<Option<Stop>>, gen: u64) {
         if let Ok(stop) = stop.wait_for(Option::is_some).await {
             match stop.clone().expect("waited for a stop") {
                 Stop::Fenced { current } => {
-                    tracing::warn!(generation = gen, current, "tablet stopped: a newer generation claimed the log")
+                    tracing::warn!(generation = gen, current, "tablet stopped: a newer generation claimed the log");
                 }
                 Stop::Failed(why) => tracing::error!(generation = gen, reason = %why, "tablet stopped"),
             }

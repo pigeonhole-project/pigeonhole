@@ -191,7 +191,7 @@ impl<Id: Clone> Tip<Id> {
 
     /// The oldest base kept: the log is readable after it.
     fn kept_from(&self) -> Position {
-        self.older.last().map_or(self.base_at(), |b| b.at)
+        self.older.last().map_or_else(|| self.base_at(), |b| b.at)
     }
 }
 
@@ -634,7 +634,7 @@ async fn lease_record<C: Chain>(
             o.failed.get_or_insert(failed);
         }
         Err(e) => {
-            o.failed.get_or_insert(Failed::Broken(format!("link a lease record: {e:#}")));
+            o.failed.get_or_insert_with(|| Failed::Broken(format!("link a lease record: {e:#}")));
         }
     }
     false
@@ -661,7 +661,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         // What `make` decided, for the last call (it may run more than once).
         enum Made<Id> {
             Fenced(u64),
-            Claim { log_id: LogId, position: Position, doc: ChainDoc<Id>, crc: u32 },
+            Claim { log_id: LogId, position: Position, doc: Box<ChainDoc<Id>>, crc: u32 },
         }
         let made: Mutex<Option<Made<C::Id>>> = Mutex::new(None);
         let make = |tail: Option<(&C::Id, &[u8])>| -> anyhow::Result<Option<Bytes>> {
@@ -691,7 +691,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             };
             let bytes = doc.encode();
             let crc = crc32fast::hash(&bytes);
-            *made.lock().unwrap() = Some(Made::Claim { log_id, position: tip.position, doc, crc });
+            *made.lock().unwrap() = Some(Made::Claim { log_id, position: tip.position, doc: Box::new(doc), crc });
             Ok(Some(Bytes::from(bytes)))
         };
         let sent = Instant::now();
@@ -751,7 +751,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
     async fn confirm(&self, gen: u64) -> LogResult<()> {
         let (_, tip) = self.owned(gen)?;
         // A lease log links only lease records: look from the newest.
-        let Some(mut at) = self.held(gen).map(|(id, _)| id).or(tip.at.map(|a| a.id)) else {
+        let Some(mut at) = self.held(gen).map(|(id, _)| id).or_else(|| tip.at.map(|a| a.id)) else {
             return Err(LogError::Other(anyhow!("generation {gen} holds no blob of the chain")));
         };
         // A successor of our own generation is our own append, linked but
@@ -817,8 +817,8 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         Box::pin(
             futures::stream::once(fut)
                 .map(|r| match r {
-                    Ok(items) => futures::stream::iter(items.into_iter().map(Ok).collect::<Vec<_>>()),
-                    Err(e) => futures::stream::iter(vec![Err(e)]),
+                    Ok(items) => futures::stream::iter(items).map(Ok).left_stream(),
+                    Err(e) => futures::stream::iter([Err(e)]).right_stream(),
                 })
                 .flatten(),
         )

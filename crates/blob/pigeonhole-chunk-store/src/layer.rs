@@ -558,7 +558,7 @@ impl ChunkStore {
     fn not_found_hook(
         &self,
         chunk_id: ChunkId,
-    ) -> Option<Arc<dyn Fn(&str) + Send + Sync>> {
+    ) -> Option<pigeonhole_blob::NotFoundHook> {
         let db = self.db.clone();
         Some(Arc::new(move |instance_id: &str| {
             spawn_enqueue_repair(db.clone(), chunk_id, instance_id.to_string());

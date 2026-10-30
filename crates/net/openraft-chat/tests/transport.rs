@@ -66,6 +66,7 @@ async fn pair(chat: &FakeChat, key2: [u8; 32], handler: Arc<Yes>) -> (ChatNetwor
     (one, two)
 }
 
+#[allow(clippy::result_large_err)] // openraft's RPCError, as its API returns it
 async fn vote(net: &mut ChatNetwork<Config>, target: u64, term: u64, ttl: Duration) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
     let mut client = net.new_client(target, &BasicNode::default()).await;
     client.vote(VoteRequest::new(Vote::new(term, 1), None), RPCOption::new(ttl)).await

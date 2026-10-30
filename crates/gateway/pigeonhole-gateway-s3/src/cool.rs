@@ -77,7 +77,7 @@ pub(crate) fn candidates(s: &S3State, now: DateTime<Utc>, p: &CoolPolicy) -> Vec
             Body::Chunks(_) => None,
         })
         .collect();
-    inline.sort_by(|a, b| b.0.cmp(&a.0));
+    inline.sort_by_key(|c| std::cmp::Reverse(c.0));
 
     let over_budget = s.inline_bytes > p.budget_bytes;
     let target = (p.budget_bytes as f64 * p.low_watermark) as u64;

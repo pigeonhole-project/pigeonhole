@@ -388,7 +388,7 @@ async fn snapshots_collect_the_log_and_boot_from_them() {
     assert_eq!(raft::RaftSnapshot::decode(&stored.data).unwrap().tablet.position, base.at);
     snapshots_down_to(&log_dir, 2, "older snapshots removed").await;
     let segs = segments(&log_dir);
-    assert!(segs[0] > "seg-0000000001".to_string(), "log behind the base collected: {segs:?}");
+    assert!(segs[0].as_str() > "seg-0000000001", "log behind the base collected: {segs:?}");
 
     let b = open_snapshotting(&log_dir).await;
     assert!(b.applied_position() >= applied, "everything the log holds is applied");
@@ -458,7 +458,7 @@ async fn a_lost_log_boots_only_through_a_lossy_restore() {
     assert!(restored <= kept && restored >= 20, "state as of the snapshot: {restored} of {kept}");
     b.propose::<Counter>(op(1000, 1)).await.unwrap().unwrap();
     drop(b);
-    assert_eq!(value(&*open(snapshots).await.unwrap()), restored + 1);
+    assert_eq!(value(&open(snapshots).await.unwrap()), restored + 1);
 }
 
 #[tokio::test]

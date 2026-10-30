@@ -231,21 +231,12 @@ impl MetaSettings {
 }
 
 /// Optional Prometheus metrics exporter (`[metrics]`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MetricsSettings {
     /// When false (default), no recorder / `/metrics` route is installed.
     pub enabled: bool,
     /// Optional dedicated listen address. Empty = `GET /metrics` on the main HTTP server.
     pub listen_addr: Option<String>,
-}
-
-impl Default for MetricsSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            listen_addr: None,
-        }
-    }
 }
 
 /// Axum/tower HTTP server knobs.
@@ -479,9 +470,7 @@ impl Config {
 }
 
 fn config_path_from_env() -> PathBuf {
-    env::var("PIGEONHOLE_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("pigeonhole.toml"))
+    env::var("PIGEONHOLE_CONFIG").map_or_else(|_| PathBuf::from("pigeonhole.toml"), PathBuf::from)
 }
 
 #[derive(Debug, Deserialize)]
@@ -619,7 +608,7 @@ impl FileMeta {
         };
         let snapshot_store = match &self.snapshot {
             Some(id) => topology.meta_store(id, "[meta] snapshot")?,
-            None if matches!(log_store, Store::LocalDisk { .. } | Store::Memory) => log_store.clone(),
+            None if matches!(log_store, Store::LocalDisk { .. } | Store::Memory) => log_store,
             None => bail!("[meta] snapshot is required with a telegram or discord log"),
         };
         let snapshot = match snapshot_store {
@@ -656,21 +645,12 @@ impl FileMeta {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileMetrics {
     enabled: bool,
     /// Empty / omitted → scrape on the main listen address at `GET /metrics`.
     listen_addr: Option<String>,
-}
-
-impl Default for FileMetrics {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            listen_addr: None,
-        }
-    }
 }
 
 impl FileMetrics {
@@ -834,7 +814,6 @@ pub fn check_block_size_against_instances(
     Ok(())
 }
 
-
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileHttp {
@@ -963,8 +942,7 @@ impl Default for FileChunk {
 impl FileChunk {
     fn resolve_block_size(&self) -> usize {
         self.block_size
-            .map(|b| b.max(1024))
-            .unwrap_or(chunker::DEFAULT_BLOCK_SIZE)
+            .map_or(chunker::DEFAULT_BLOCK_SIZE, |b| b.max(1024))
     }
 }
 
@@ -1238,9 +1216,9 @@ upload_concurrency = 4
         let dc = "[meta]\nlog = \"dc\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\n";
         let err = load_mem(dc).unwrap_err();
         assert!(format!("{err:#}").contains("snapshot is required"), "{err:#}");
-        let both = format!("[meta]\nlog = \"dc\"\nsnapshot = \"dc-snap\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\n\
-                            [[store]]\nid = \"dc-snap\"\nkind = \"discord\"\nchannel_id = 2\n");
-        let cfg = load_mem(&both).unwrap();
+        let both = "[meta]\nlog = \"dc\"\nsnapshot = \"dc-snap\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\n\
+                    [[store]]\nid = \"dc-snap\"\nkind = \"discord\"\nchannel_id = 2\n";
+        let cfg = load_mem(both).unwrap();
         assert!(matches!(cfg.meta.log, LogSettings::Discord { ref channel_id, .. } if channel_id == "1"));
         assert!(matches!(cfg.meta.snapshot, SnapshotSettings::Discord { ref channel_id, .. } if channel_id == "2"));
     }

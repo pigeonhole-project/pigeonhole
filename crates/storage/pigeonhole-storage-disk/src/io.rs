@@ -30,6 +30,7 @@ pub trait Fs: Send + Sync + 'static {
     }
 }
 
+#[allow(clippy::len_without_is_empty)] // a file's length, not a collection
 pub trait FsFile: Send + Sync {
     fn len(&self) -> io::Result<u64>;
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
@@ -123,6 +124,7 @@ impl DirLock for StdLock {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn punch(file: &File, off: u64, len: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let arg = libc::fpunchhole_t { fp_flags: 0, reserved: 0, fp_offset: off as libc::off_t, fp_length: len as libc::off_t };
@@ -132,6 +134,7 @@ fn punch(file: &File, off: u64, len: u64) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn punch(file: &File, off: u64, len: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: a valid descriptor.

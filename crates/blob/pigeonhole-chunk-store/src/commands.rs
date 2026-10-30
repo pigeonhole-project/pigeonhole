@@ -157,7 +157,7 @@ impl ChunkState {
     fn sync_instances(&mut self, configured: Vec<(String, InstanceRec)>) -> Result<Applied> {
         let mut instances = self.instances.clone();
         let ids: HashSet<&str> = configured.iter().map(|(id, _)| id.as_str()).collect();
-        for (id, rec) in instances.iter_mut() {
+        for (id, rec) in &mut instances {
             if !ids.contains(id.as_str()) {
                 rec.state = "retired".into();
             }

@@ -21,7 +21,7 @@ pub use metrics::{
 };
 pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
 pub use replicated::{
-    CheapestFirst, ChunkReplicaWriter, InstanceId, PartLayout, ReplicaLayout, ReplicaSelector,
+    CheapestFirst, ChunkReplicaWriter, InstanceId, NotFoundHook, PartLayout, ReplicaLayout, ReplicaSelector,
     Replicated, SealedChunk, ShardSpec,
 };
 pub use typed::{

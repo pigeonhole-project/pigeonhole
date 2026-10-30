@@ -86,10 +86,10 @@ async fn list() {
                 pigeonhole_storage_telegram::ChannelMessage::Empty => {}
                 pigeonhole_storage_telegram::ChannelMessage::Other => println!("{id} (not a document)"),
                 pigeonhole_storage_telegram::ChannelMessage::Text { text } => {
-                    println!("{id} text {:?}", text.chars().take(40).collect::<String>())
+                    println!("{id} text {:?}", text.chars().take(40).collect::<String>());
                 }
                 pigeonhole_storage_telegram::ChannelMessage::Document { name, size, .. } => {
-                    println!("{id} {name} {size}")
+                    println!("{id} {name} {size}");
                 }
             }
         }

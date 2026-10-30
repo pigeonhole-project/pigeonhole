@@ -106,13 +106,16 @@ fn s3_app(cfg: &Config, s3_gateway: S3Gateway, metrics_on_main: bool) -> Router 
     let slow_request = cfg.log.slow_request;
     let s3_service = build_s3_service(s3_gateway, &cfg.access_key, &cfg.secret_key);
     let s3_service = HandleError::new(s3_service, handle_s3_error);
-    let mut app = Router::new();
     #[cfg(feature = "metrics-prometheus")]
-    if metrics_on_main {
-        app = pigeonhole::prometheus::layer_metrics_route(app);
-    }
+    let app = match metrics_on_main {
+        true => pigeonhole::prometheus::layer_metrics_route(Router::new()),
+        false => Router::new(),
+    };
     #[cfg(not(feature = "metrics-prometheus"))]
-    let _ = metrics_on_main;
+    let app = {
+        let _ = metrics_on_main;
+        Router::new()
+    };
     let app = app
         .fallback_service(s3_service)
         .layer(axum::middleware::from_fn(move |req, next| {
