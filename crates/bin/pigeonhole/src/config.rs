@@ -689,12 +689,14 @@ impl FileMetrics {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileInline {
-    #[serde(deserialize_with = "units::size")]
+    /// `"off"` = never inline.
+    #[serde(deserialize_with = "units::size_or_off")]
     max_object_size: usize,
     #[serde(deserialize_with = "units::size")]
     budget: usize,
     low_watermark: f64,
-    #[serde(with = "humantime_serde")]
+    /// `"off"` = only by budget.
+    #[serde(deserialize_with = "units::duration_or_off")]
     cool_after: Duration,
     #[serde(with = "humantime_serde")]
     min_inline: Duration,
@@ -1304,14 +1306,17 @@ upload_concurrency = 4
         let cfg = load_mem("").unwrap();
         assert_eq!(cfg.inline.max_object_bytes, 1024);
         assert_eq!(cfg.inline.cool.cool_after, Some(Duration::from_secs(600)));
-        let cfg = load_mem("[inline]\nmax_object_size = \"4 KiB\"\nbudget = \"1 MiB\"\ncool_after = \"0s\"\nmin_inline = \"5s\"\ncool_every = \"2m\"\n").unwrap();
+        let cfg = load_mem("[inline]\nmax_object_size = \"4 KiB\"\nbudget = \"1 MiB\"\ncool_after = \"off\"\nmin_inline = \"5s\"\ncool_every = \"2m\"\n").unwrap();
         assert_eq!(cfg.inline.max_object_bytes, 4096);
         assert_eq!(cfg.inline.cool.budget_bytes, 1 << 20);
-        assert_eq!(cfg.inline.cool.cool_after, None, "0s: only by budget");
+        assert_eq!(cfg.inline.cool.cool_after, None, "off: only by budget");
         assert_eq!(cfg.inline.cool.min_inline, Duration::from_secs(5));
         assert_eq!(cfg.inline.cool_every, Duration::from_secs(120));
         assert!(load_mem("[inline]\nmax_object_size = \"1 KB\"\n").is_err(), "decimal units refused");
         assert!(load_mem("[inline]\nlow_watermark = 1.5\n").is_err());
+        assert!(load_mem("[inline]\ncool_after = \"0s\"\n").is_err(), "zero is ambiguous: write off");
+        let cfg = load_mem("[inline]\nmax_object_size = \"off\"\n").unwrap();
+        assert_eq!(cfg.inline.max_object_bytes, 0);
     }
 
     #[test]

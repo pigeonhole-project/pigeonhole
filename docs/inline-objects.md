@@ -36,7 +36,7 @@ Status: implemented (2026-10-30), on by default (`max_object_size = "1 KiB"`).
   out.
 - Clients see no difference: same ETags, same ranges, same conditional
   writes, whether an object is inline or not, and while it moves.
-- Every knob is in `[inline]`. `max_object_size = 0` stops inlining, and
+- Every knob is in `[inline]`. `max_object_size = "off"` stops inlining, and
   the cooler then moves out whatever is still inline.
 
 ## Why
@@ -83,10 +83,10 @@ one log append and nothing else.
 
 ```toml
 [inline]
-max_object_size = "1 KiB"     # 0 = never inline (and drain what is inline)
+max_object_size = "1 KiB"     # "off" = never inline (and drain what is inline)
 budget = "64 MiB"             # all inline bytes; above it the oldest go out
 low_watermark = 0.9           # ... until under this share of the budget
-cool_after = "10m"            # out once not rewritten this long ("0s" = only by budget)
+cool_after = "10m"            # out once not rewritten this long ("off" = only by budget)
 min_inline = "30s"            # never out while written less than this long ago
 cool_every = "1m"             # pause between cooler passes
 cool_batch = 64               # most objects one pass moves out
@@ -94,13 +94,15 @@ cool_batch = 64               # most objects one pass moves out
 
 Sizes are bytes or strings with a binary unit (`"1 KiB"`, `"64 MiB"`);
 decimal units are refused. Durations are strings (`"30s"`, `"10m"`).
+`"off"` switches off the two knobs that can be off; `0` / `"0s"` there is
+refused as ambiguous, as everywhere in the config.
 
 ### `max_object_size`
 
 Objects up to this many bytes are stored inline on `PutObject` and
 `CopyObject`. Multipart uploads are never inline.
 
-- `0` turns inlining off for new writes. The cooler keeps running and moves
+- `"off"` turns inlining off for new writes. The cooler keeps running and moves
   out every object that is still inline, `cool_batch` per `cool_every`
   (see [Turning it off](#turning-it-off)).
 - Lowering it does not touch objects already inline above the new size.
@@ -128,7 +130,7 @@ moving one object per pass at the edge.
 
 An inline object not rewritten for this long is moved out on the next pass.
 
-- `"0s"`: never by age, only by budget. Inline objects then stay until the
+- `"off"`: never by age, only by budget. Inline objects then stay until the
   budget pushes them out.
 - Coordination objects are rewritten every few seconds and never reach
   `cool_after`. Objects written once (a WAL segment, a backup index) leave
@@ -307,12 +309,12 @@ Log lines:
   the node can hold in RAM, consider `max_object_size = "4 KiB"`, and keep
   `cool_after` long enough for the hot set.
 - **Disk-only deployments:** inlining still saves a file per small object
-  and an fsync. The cost is RAM. Set `max_object_size = 0` if memory is
+  and an fsync. The cost is RAM. Set `max_object_size = "off"` if memory is
   tight.
 
 ### Turning it off
 
-Set `max_object_size = 0` and restart. New writes are chunked. The cooler
+Set `max_object_size = "off"` and restart. New writes are chunked. The cooler
 keeps running and moves every inline object out, `cool_batch` per
 `cool_every`, ignoring `cool_after` and `min_inline`. Draining N objects
 takes `N / cool_batch × cool_every` (100 000 objects at 64 per minute take
@@ -440,8 +442,8 @@ and metadata in Discord (`DEMO_BACKEND=chats`), 2026-10-30.
   - an inline rewrite releases the chunks it replaces;
   - a cooler pass moves objects out with reads unchanged;
   - the cooler racing rewrites and deletes: no lost write, no leaked chunk.
-- **Config** (`bin/src/config.rs`): units, defaults, `"0s"`, decimal units
-  refused; with inlining off the cooler drains everything
+- **Config** (`bin/src/config.rs`): units, defaults, `"off"`; `"0s"` and
+  decimal units refused; with inlining off the cooler drains everything
   (`bin/src/background.rs`).
 - **Live:** the T4 demo with objects in Telegram keeps its leader after a
   takeover (above).
