@@ -63,6 +63,23 @@ async fn a_torn_record_at_the_end_is_dropped_on_open() {
 }
 
 #[tokio::test]
+async fn a_last_record_failing_its_checksum_is_dropped_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = small(dir.path(), 1 << 20);
+    let kept = a.put(Bytes::from_static(b"kept"), "x").await.unwrap();
+    let torn = a.put(Bytes::from(vec![5u8; 1000]), "x").await.unwrap();
+    drop(a);
+    let seg = dir.path().join(&segment_files(dir.path())[0]);
+    let mut bytes = fs::read(&seg).unwrap();
+    *bytes.last_mut().unwrap() ^= 1; // the length is whole, the data is not
+    fs::write(&seg, bytes).unwrap();
+
+    let b = small(dir.path(), 1 << 20);
+    assert_eq!(read(&b, &kept).await, b"kept");
+    assert!(b.get(&torn, None).await.is_err(), "never acknowledged");
+}
+
+#[tokio::test]
 async fn deletes_free_space_and_drop_dead_segments() {
     let dir = tempfile::tempdir().unwrap();
     let store = small(dir.path(), 64 << 10);
