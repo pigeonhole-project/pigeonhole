@@ -111,13 +111,14 @@ fn retry_after(headers: &HeaderMap, body: &serde_json::Value) -> f64 {
 }
 
 /// What a request spends: sends, deletes and reads have a bucket per
-/// channel; a read's 429 holds the whole bot, as `getFile`'s does on
-/// Telegram. CDN downloads are not API calls.
+/// channel. A 429 belongs to its route: it cools the request's bucket, and
+/// the whole bot only when Discord says `global`. CDN downloads are not API
+/// calls.
 fn call_of(budget: RateBudget, what: &'static str) -> Call {
     let (budget, penalty) = match budget {
         RateBudget::Send => (Some(LimitBudget::Send), Penalty::Class(LimitBudget::Send)),
         RateBudget::Delete => (Some(LimitBudget::Delete), Penalty::Class(LimitBudget::Delete)),
-        RateBudget::Read => (Some(LimitBudget::GetFile), Penalty::ClassAndBot(LimitBudget::GetFile)),
+        RateBudget::Read => (Some(LimitBudget::GetFile), Penalty::Class(LimitBudget::GetFile)),
         RateBudget::Download => (None, Penalty::None),
     };
     Call { service: "discord", what, budget, penalty }
@@ -534,6 +535,24 @@ impl DiscordApi for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_429_cools_its_channel_and_the_bot_only_when_global() {
+        let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_limits::ChatLimiterConfig::discord());
+        let call = call_of(RateBudget::Read, "get message");
+        let once = Retry { attempts: 1, ..RETRY };
+        for global in [false, true] {
+            let (a, b) = (reg.chat(&format!("bot-{global}"), "1"), reg.chat(&format!("bot-{global}"), "2"));
+            let failed = pigeonhole_limits::run(Some(&a), &call, &once, classify, || async move {
+                Err::<(), _>(AttemptFailed::RateLimited { wait: Duration::from_secs(5), global })
+            })
+            .await;
+            assert!(matches!(failed, Err(Failed::RateLimited { .. })));
+            assert!(a.peek_wait(LimitBudget::GetFile) > Duration::from_secs(3), "the read's own bucket");
+            let other = b.peek_wait(LimitBudget::Send);
+            assert_eq!(other > Duration::from_secs(3), global, "another channel's sends (global: {global})");
+        }
+    }
 
     #[test]
     fn app_id_from_token_prefix() {
