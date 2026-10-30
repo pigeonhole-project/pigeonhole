@@ -1,6 +1,7 @@
 # A shared limiter: budgets in levels, a pool of bots, sticky retries
 
-Status: **design**. Nothing here is implemented yet. Read
+Status: **design**; the spike is done (§ Spike findings: send limits are
+per bot on both services). Nothing else is implemented yet. Read
 [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md) (what limits
 us today) and [telegram-mtproto.md](telegram-mtproto.md) (the order fence,
 which does not care which bot posts) first.
@@ -53,11 +54,10 @@ widest down:
 | **Scope × account × class** | chat, bot, class | Telegram ~20 sends a minute per chat; Discord 5 per 5 s per channel |
 | **Scope × class** (shared) | chat, class | a per-channel limit that holds for every bot together, if any (Discord `X-RateLimit-Scope: shared`) |
 
-A level that a service does not have is simply not configured. The shared
-scope level exists so that we can answer, with numbers, whether a channel's
-limit is per bot or per channel (§ Open questions). If it turns out to be
-per channel, a pool of bots in one channel gains nothing, and the limiter
-shows that instead of hitting floods.
+A level that a service does not have is simply not configured. The spike
+found channel send limits per bot on both services (§ Spike findings), so
+the shared scope level is off by default; it stays in the model for limits
+that are per channel (a Discord answer with `X-RateLimit-Scope: shared`).
 
 ### A call and its plan
 
@@ -130,9 +130,9 @@ last. Every retry of it reserves the same account's plan again
   message only for the same sender. A retry that moved to another bot after
   a lost answer could post the batch twice.
 - **Handles are per account.** An MTProto `access_hash` (of a channel, a
-  document) is issued to one user or bot, and a file location read by one
-  bot is what that bot may download. Reads that resolved a message on one
-  bot finish on it.
+  document) is issued to one user or bot. Another bot can read the same
+  message (§ Spike findings), but through its own `getMessages`, with its
+  own handles. So a read that resolved a message on one bot finishes on it.
 - **One lane.** The retry also stays on the account's connection pool (the
   `Lane`), so a resend follows the same session.
 
@@ -268,12 +268,44 @@ one store, many bots.
 - `pigeonhole_pool_calls_total{store, account}`: how the pool spreads load.
 - `pigeonhole_limiter_reserved{level}`: calls waiting on a level.
 
+## Spike findings (2026-10-30)
+
+Two bots per service, admins of the blobs test channel, the same host and
+IP. Each bot posted text messages one after another, as fast as the server
+let it: first one bot alone, then both at once. Our own limits were set far
+above the server's. Everything was deleted afterwards
+(`crates/storage/pigeonhole-storage-telegram/tests/spike_bots.rs`,
+`scripts/spike-discord-bots.py`).
+
+| | one bot | two bots at once | channel total |
+|---|---|---|---|
+| Telegram (MTProto, 3 min a phase) | 19.7 sends/min | 20.3 + 20.3 | **40.7/min** |
+| Discord (REST v10, 1 min a phase) | 57/min | 59 + 58 | **117/min** |
+
+- **Send limits are per bot, not per channel**, on both services: a second
+  bot in the same channel doubled the channel's rate, and neither bot slowed
+  down the other.
+- **Telegram** paces a bot to ~20 messages a minute in a channel: a burst of
+  about five, then `FLOOD_WAIT` of 3–5 s (50 of 59 waits), and every ~18
+  messages one of 35–40 s. Each bot got its own waits with the same pattern;
+  no wait looked shared.
+- **Discord** reports one bucket hash (`X-RateLimit-Limit: 5`) for the route
+  to both bots, but counts it per bot. Following the headers, neither bot
+  got a 429.
+- **Across bots, on both services**, bot B sees bot A's messages (text and a
+  document / an attachment, with content), downloads A's document over
+  MTProto (the bytes match) and deletes A's messages. On Discord B saw
+  content with the Message Content intent as configured for the test bots.
+  A bot without it may get empty `content` / `attachments` for other bots'
+  messages, so a pool should check that at startup.
+
+So a pool of N bots in one channel multiplies its send budget by N. On
+Telegram the log's ~3.3 s per entry is one bot's budget: two bots halve it,
+until the round trip (~0.3–0.5 s per send) is what is left.
+
 ## Plan
 
-1. **Spike** (before any code): two and three bots posting into one test
-   channel at their own pace for minutes, on Telegram and Discord. Count
-   messages per minute and flood waits per bot. This decides whether the
-   shared scope level is real.
+1. ✅ **Spike**: per bot on both services (§ Spike findings).
 2. Reservations and plans in `pigeonhole-limits`, behind today's
    `ChatLimiter` API (no behaviour change; one bot per store).
 3. `Limiter::run` and `classify` for Telegram and Discord; `Budgeted` for
@@ -285,12 +317,12 @@ one store, many bots.
 
 ## Open questions
 
-- **Per bot or per channel?** Is Telegram's ~20 sends a minute in a channel
-  per bot or for the channel as a whole? The same for Discord's 5 per 5 s.
-  The spike answers both.
-- **Handles across bots.** Is a document's `access_hash` / file reference
-  per bot (assumed, hence sticky reads), or can bot B download what bot A
-  located?
+- **Per bot or per channel?** Answered: per bot on both (§ Spike findings).
+- **Handles across bots.** Answered in part: bot B can download what bot A
+  posted, through its own `getMessages`. Whether A's `FileLocation` works
+  for B directly was not tried: reads stay sticky.
+- **More bots.** Two bots doubled the rate. Does it keep scaling at 4–8
+  bots from one IP, or does an egress limit appear?
 - **Rerouting a flood wait.** A Telegram `FLOOD_WAIT` guarantees the call
   was not applied, so moving that operation to another bot with a new
   `random_id` would be safe, unlike a retry after a lost answer. Worth it
