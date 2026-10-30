@@ -33,10 +33,13 @@ path = "pigeonhole-meta"
 id = "tg-main"
 kind = "telegram"
 chat_id = -1001234567890
-# bot_token_env = "BOT_TOKEN"
+# Several bots (each an admin of the channel) multiply its sends a minute;
+# the first is the primary: it reads, and names the store
+# (docs/shared-limiter.md).
+# bot_token_envs = ["BOT_TOKEN", "BOT_TOKEN_2"]   # default ["BOT_TOKEN"]
 # api_id_env = "TG_API_ID"
 # api_hash_env = "TG_API_HASH"
-# session = "pigeonhole-tg-<bot id>.session"
+# session = "pigeonhole-tg-<bot id>.session"   # with one bot only
 
 # [[store]]
 # id = "dc-backup"

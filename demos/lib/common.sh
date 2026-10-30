@@ -178,7 +178,7 @@ write_chats_config() {
     blobs="id = \"blobs\"
 kind = \"telegram\"
 chat_id = $TG_BLOBS_CHAT_ID
-bot_token_env = \"TG_BOT_TOKEN\"
+bot_token_envs = [\"TG_BOT_TOKEN\"]
 session = \"$ROOT/.cache/demos/tg.session\""
   else
     : "${DISCORD_BLOBS_CHANNEL_ID:?set in .env}"

@@ -176,10 +176,11 @@ pub enum SnapshotSettings {
     LocalDisk { path: PathBuf },
     /// Process memory, with a memory log (tests).
     Memory,
-    /// A dedicated Telegram channel read over MTProto.
-    Telegram { chat_id: String, login: TelegramLogin },
+    /// A dedicated Telegram channel read over MTProto, through its bots
+    /// (the primary first).
+    Telegram { chat_id: String, logins: Vec<TelegramLogin> },
     /// A dedicated Discord channel (a chain over threads; docs/discord-log.md).
-    Discord { channel_id: String, bot_token: String, max_blob_size: Option<usize> },
+    Discord { channel_id: String, bot_tokens: Vec<String>, max_blob_size: Option<usize> },
 }
 
 /// Where the command log lives (`[meta] log`).
@@ -190,10 +191,10 @@ pub enum LogSettings {
     /// Process memory: gone with the process (tests, throwaway runs).
     Memory,
     /// A dedicated Telegram channel read over MTProto (fenced by the order
-    /// of its messages; docs/telegram-mtproto.md).
-    Telegram { chat_id: String, login: TelegramLogin },
+    /// of its messages, whichever bot posted them; docs/telegram-mtproto.md).
+    Telegram { chat_id: String, logins: Vec<TelegramLogin> },
     /// A dedicated Discord channel, fenced by threads (docs/discord-log.md).
-    Discord { channel_id: String, bot_token: String, max_blob_size: Option<usize> },
+    Discord { channel_id: String, bot_tokens: Vec<String>, max_blob_size: Option<usize> },
 }
 
 impl LogSettings {
@@ -583,12 +584,12 @@ impl FileMeta {
         let log = match &log_store {
             Store::LocalDisk { path } => LogSettings::LocalDisk { path: path.clone() },
             Store::Memory => LogSettings::Memory,
-            Store::Telegram { chat_id, login, .. } => {
-                LogSettings::Telegram { chat_id: chat_id.clone(), login: login.clone() }
+            Store::Telegram { chat_id, logins, .. } => {
+                LogSettings::Telegram { chat_id: chat_id.clone(), logins: logins.clone() }
             }
-            Store::Discord { channel_id, bot_token, max_blob_size, .. } => LogSettings::Discord {
+            Store::Discord { channel_id, bot_tokens, max_blob_size, .. } => LogSettings::Discord {
                 channel_id: channel_id.clone(),
-                bot_token: bot_token.clone(),
+                bot_tokens: bot_tokens.clone(),
                 max_blob_size: *max_blob_size,
             },
         };
@@ -600,9 +601,9 @@ impl FileMeta {
         let snapshot = match snapshot_store {
             Store::LocalDisk { path } => SnapshotSettings::LocalDisk { path },
             Store::Memory => SnapshotSettings::Memory,
-            Store::Telegram { chat_id, login, .. } => SnapshotSettings::Telegram { chat_id, login },
-            Store::Discord { channel_id, bot_token, max_blob_size, .. } => {
-                SnapshotSettings::Discord { channel_id, bot_token, max_blob_size }
+            Store::Telegram { chat_id, logins, .. } => SnapshotSettings::Telegram { chat_id, logins },
+            Store::Discord { channel_id, bot_tokens, max_blob_size, .. } => {
+                SnapshotSettings::Discord { channel_id, bot_tokens, max_blob_size }
             }
         };
         match (&log, &snapshot) {
@@ -1170,7 +1171,7 @@ rate_per_sec = 20.0
 
     fn tgm_store(id: &str, chat: i64) -> String {
         format!(
-            "[[store]]\nid = \"{id}\"\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_env = \"PH_TEST_TGM_TOKEN\"\n\
+            "[[store]]\nid = \"{id}\"\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_envs = [\"PH_TEST_TGM_TOKEN\"]\n\
              api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n"
         )
     }
@@ -1188,18 +1189,49 @@ rate_per_sec = 20.0
             api_hash: "hash".into(),
             session: "pigeonhole-tg-42.session".into(),
         };
-        assert_eq!(cfg.meta.log, LogSettings::Telegram { chat_id: "-1001".into(), login: login.clone() });
-        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Telegram { chat_id: "-1002".into(), login: login.clone() });
+        assert_eq!(cfg.meta.log, LogSettings::Telegram { chat_id: "-1001".into(), logins: vec![login.clone()] });
+        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Telegram { chat_id: "-1002".into(), logins: vec![login.clone()] });
         let inst = cfg.primary_instance().unwrap();
         assert_eq!((inst.kind, inst.info.fingerprint.as_str()), (InstanceKind::Telegram, "tg:42:-1003"));
         assert_eq!(inst.info.location, "tg:chat:-1003", "the same place as a Bot API store of that chat");
-        assert_eq!(inst.telegram, Some(login));
+        assert_eq!(inst.telegram, vec![login]);
         assert!(!format!("{:?}", inst.telegram).contains("secret"));
 
         let err = load_mem(&format!("[meta]\nlog = \"log\"\nsnapshot = \"log\"\n{}", tgm_store("log", -1001))).unwrap_err();
         assert!(format!("{err:#}").contains("one purpose"), "{err:#}");
         let err = load_mem("[[store]]\nid = \"x\"\nkind = \"memory\"\nsession = \"s\"\n").unwrap_err();
         assert!(format!("{err:#}").contains("unknown field `session`"), "{err:#}");
+    }
+
+    #[test]
+    fn a_store_takes_several_bots_the_first_names_it() {
+        set_env("PH_TEST_TGM_TOKEN", "42:secret");
+        set_env("PH_TEST_TGM_TOKEN_2", "43:other");
+        set_env("PH_TEST_TGM_API_ID", "12345");
+        set_env("PH_TEST_TGM_API_HASH", "hash");
+        let store = |envs: &str, extra: &str| {
+            format!(
+                "[chunk]\nstore = \"tg\"\n[[store]]\nid = \"tg\"\nkind = \"telegram\"\nchat_id = -1003\nbot_token_envs = {envs}\n\
+                 api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n{extra}"
+            )
+        };
+        let cfg = load(&store("[\"PH_TEST_TGM_TOKEN\", \"PH_TEST_TGM_TOKEN_2\"]", "")).unwrap();
+        let inst = cfg.primary_instance().unwrap();
+        assert_eq!(inst.bot_tokens, vec!["42:secret".to_string(), "43:other".to_string()]);
+        let sessions: Vec<_> = inst.telegram.iter().map(|l| l.session.display().to_string()).collect();
+        assert_eq!(sessions, vec!["pigeonhole-tg-42.session", "pigeonhole-tg-43.session"], "a session per bot");
+        assert_eq!(inst.info.fingerprint, "tg:42:-1003", "named by the primary");
+
+        for (envs, extra, want) in [
+            ("[\"PH_TEST_TGM_TOKEN\", \"PH_TEST_TGM_TOKEN\"]", "", "listed twice"),
+            ("[]", "", "bot_token_envs is empty"),
+            ("[\"PH_TEST_TGM_TOKEN\", \"PH_TEST_TGM_TOKEN_2\"]", "session = \"s\"\n", "`session` names one bot's"),
+        ] {
+            let err = format!("{:#}", load(&store(envs, extra)).unwrap_err());
+            assert!(err.contains(want), "{envs} {extra}: want {want:?} in {err}");
+        }
+        let old = "[chunk]\nstore = \"tg\"\n[[store]]\nid = \"tg\"\nkind = \"telegram\"\nchat_id = -1003\nbot_token_env = \"X\"\n";
+        assert!(format!("{:#}", load(old).unwrap_err()).contains("unknown field `bot_token_env`"));
     }
 
     #[test]

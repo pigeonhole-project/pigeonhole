@@ -161,3 +161,41 @@ async fn handles_across_bots() {
     }
     a.delete_messages(&[sent.message_id]).await.unwrap();
 }
+
+/// A pool of the two bots with the default limits: `SPIKE_SENDS` (default
+/// 30) text sends one after another, as the log writes. One bot's budget is
+/// 18 a minute; two should give about twice that.
+#[tokio::test]
+#[ignore = "needs two Telegram bots, admins of a test channel"]
+async fn a_pool_of_two_bots_sends_twice_as_fast() {
+    use pigeonhole_storage_telegram::PooledChannel;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let _ = tracing_subscriber::fmt().with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into())).try_init();
+    let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
+    let sends: usize = std::env::var("SPIKE_SENDS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_storage_telegram::limits());
+    let mut members = Vec::new();
+    for (n, var) in [(1, "TG_BOT_TOKEN"), (2, "TG_BOT_TOKEN_2")] {
+        let cfg = MtprotoConfig {
+            api_id: env("TG_API_ID").parse().unwrap(),
+            api_hash: env("TG_API_HASH"),
+            bot_token: env(var),
+            session: root.join(format!(".cache/spike-tg-{n}.session")),
+        };
+        let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+        let limiter = reg.chat(&tg.bot_id().to_string(), &chat_id.to_string());
+        members.push(tg.channel(chat_id, Lane::Meta, limiter).await.unwrap());
+    }
+    let pooled = PooledChannel::of(members);
+    let t0 = Instant::now();
+    let mut ids = Vec::new();
+    for i in 0..sends {
+        ids.push(pooled.send_text(&format!("pooled {i}"), random_id()).await.unwrap().message_id);
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    println!("pool of 2: {sends} sends in {secs:.1} s = {:.1}/min", sends as f64 * 60.0 / secs);
+    for part in ids.chunks(100) {
+        pooled.delete_messages(part).await.unwrap();
+    }
+}

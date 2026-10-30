@@ -198,7 +198,7 @@ EOF
 id = "$1"
 kind = "telegram"
 chat_id = $2
-bot_token_env = "TG_BOT_TOKEN"
+bot_token_envs = ["TG_BOT_TOKEN"]
 api_id_env = "TG_API_ID"
 api_hash_env = "TG_API_HASH"
 session = "$STATE/tg.session"

@@ -40,7 +40,7 @@ case "$INSTANCE" in
 id = \"tgm\"
 kind = \"telegram\"
 chat_id = ${CONFIG_SCOPE_ID}
-bot_token_env = \"${CONFIG_BOT_TOKEN_ENV:-BOT_TOKEN}\""
+bot_token_envs = [\"${CONFIG_BOT_TOKEN_ENV:-BOT_TOKEN}\"]"
     if [[ -n "${CONFIG_SESSION:-}" ]]; then
       INSTANCE_BLOCK+=$'\n'"session = \"${CONFIG_SESSION}\""
     fi

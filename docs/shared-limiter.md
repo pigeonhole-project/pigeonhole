@@ -125,8 +125,8 @@ least recently, so load spreads even when every bucket is full. The choice
 is made once: if another account frees up while the call waits for the
 chosen one, the call does not switch.
 
-`begin` waits for the chosen account's plan and returns a **ticket**: that
-account, with the tokens of its first attempt taken.
+There is no ticket object: the pool's operation (`Pool::run`) holds the
+chosen member, and the member's own call loop holds the retries.
 
 ### Sticky retries
 
@@ -329,8 +329,14 @@ until the round trip (~0.3–0.5 s per send) is what is left.
    call takes its bot's token; a cooled bucket starts empty; a Discord
    429 cools its route's class, the bot only when `global`; one `Call` per
    Discord endpoint; config tables per rate.
-4. Pools and `bot_token_envs`; tickets; a rate limit moves to a free
-   account; the retry-wait metric.
+4. ✅ Pools (`pigeonhole_limits::Pool`, `PooledChannel`, `PooledDiscord`)
+   and `bot_token_envs`; a rate limit moves to a free bot (a member gives
+   way: `Retry::give_way`), an unknown outcome pins the call; Telegram reads
+   stay on the primary (a bot's file locations are its own:
+   `FILE_REFERENCE_EXPIRED` for another, measured). Metrics: pool calls by
+   member, moves, retry waits. Live, two bots, default limits, sends one
+   after another: Telegram 30 in 40 s (44.8/min, one bot's budget 18/min),
+   Discord 40 in 16 s (147/min, one bot's 60/min), no rate limit hit.
 5. Bench: log entries per second with 1, 2, 4 bots against
    [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md).
 6. Only as far as the bench shows a need: the Discord `Pacer` as a kind of
