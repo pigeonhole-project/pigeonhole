@@ -95,9 +95,8 @@ every other node's outbox.
 - **Reading**: push first, polling as the safety net.
   - Push: a bot that is a channel's member gets every new post as an update
     (MTProto `updateNewChannelMessage`; Discord gateway `MESSAGE_CREATE`), no
-    poll interval and no read budget spent. pigeonhole's MTProto client drops
-    updates today ("Updates are ignored", `client.rs`), so this needs the
-    update stream wired in.
+    poll interval and no read budget spent. pigeonhole's MTProto client gives
+    the update stream on request (`connect_with_updates`).
   - Polling: one call per peer per poll, "messages after the last id I saw".
     Telegram message ids in a channel are dense and increasing, Discord ids
     are increasing snowflakes; both read in order. It fills the gaps updates
@@ -364,14 +363,31 @@ a switch in the developer portal.
 
 ## Steps
 
-1. The checks above (1, 2), with a throwaway program: two bots, two
-   channels, post and read.
-2. `openraft-chat` with `Mailbox::fake`, `Transport`, `Inbox`, `Frame`; the
-   simulation scenarios.
-3. Telegram and Discord mailboxes; live runs.
-4. In pigeonhole: `[cluster] transport`, `[[node]] outbox`, `Forward`, with
-   the step-8 work (node storage, leader-only side effects) that every
-   transport needs.
+1. ✅ The checks above: two bots, two channels, post and read; push
+   delivers another bot's posts (checks 1 and 4).
+2. ✅ `openraft-chat`: `Mailbox` with `FakeChat` (loss, duplication,
+   isolation), `Frame` / `Envelope`, `ChatNetwork` and `Handler`, with
+   transport tests (`tests/transport.rs`).
+3. ✅ Tablets in a cluster: `MetaStore::open_in` with a `Cluster` (node id,
+   members, network, a `serve` hook), `NotLeader` from a follower; 3-node
+   tests over `FakeChat` (election, commits everywhere, a write to a
+   follower, a killed leader, a partitioned leader that heals).
+4. ✅ Metrics (§ Observability) and the Grafana Cluster row.
+5. Telegram and Discord mailboxes (`post`, `read_after`, `head`, `wait` on
+   push: `connect_with_updates` / the gateway), then live runs of 3 nodes,
+   each with its own bot: election time, commit latency, failover against
+   § Timing, watched on the dashboard.
+6. A lagging follower catches up by snapshot (`InstallSnapshot` over the
+   chat): a cluster test, then live.
+7. In pigeonhole: `[cluster] transport`, `[[node]] outbox`, `Forward` to the
+   leader, with the step-8 work every transport needs (leader-only side
+   effects: sweeper, repair, cooler).
+8. Maybe, after the live runs: a status message per node in its outbox
+   (role, term, leader, lag), edited in place, so the channel shows the
+   cluster's state without Grafana.
+
+Not done from § Tests: madsim runs with latency and reordering (the
+`FakeChat` tests run on tokio).
 
 ## Risks
 

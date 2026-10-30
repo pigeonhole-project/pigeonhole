@@ -245,8 +245,12 @@ Design: meta-backends.md § Raft between nodes. Sub-steps:
    flushes one entry per `client_write`, see its PR #2163); the log tail stays
    in memory, since openraft reads every entry it applies back from the log
    (sweep_stress 37 s, as before Raft).
-3. gRPC network, in-process multi-node tests (failover, partitions, a node on
-   a fake chat), leader-only side effects, forwarding.
+3. A network and in-process multi-node tests. Partly done: the network over
+   chat channels (crate `openraft-chat`, [raft-over-chat.md](raft-over-chat.md)
+   § Steps) and `MetaStore::open_in`, with 3-node tests over a fake chat
+   (election, failover, partitions) and Raft metrics. Left: chat mailboxes
+   and live runs, snapshot catch-up, leader-only side effects, forwarding;
+   a gRPC network later.
 4. `[[node]]` config, `init-cluster`, live runs with a node on Telegram.
 5. Later: follower reads, auth between nodes.
 
