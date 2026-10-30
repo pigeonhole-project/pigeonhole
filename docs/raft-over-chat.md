@@ -90,9 +90,17 @@ every other node's outbox.
   follower, responses, votes) goes out as **one post**: a frame holds several
   envelopes, each addressed to a node. A 3-node leader sends one post per
   tick, not one per follower.
-- **Reading** is one call per peer per poll: "messages after the last id I
-  saw". Telegram message ids in a channel are dense and increasing, Discord
-  ids are increasing snowflakes; both read in order.
+- **Reading**: push first, polling as the safety net.
+  - Push: a bot that is a channel's member gets every new post as an update
+    (MTProto `updateNewChannelMessage`; Discord gateway `MESSAGE_CREATE`), no
+    poll interval and no read budget spent. pigeonhole's MTProto client drops
+    updates today ("Updates are ignored", `client.rs`), so this needs the
+    update stream wired in.
+  - Polling: one call per peer per poll, "messages after the last id I saw".
+    Telegram message ids in a channel are dense and increasing, Discord ids
+    are increasing snowflakes; both read in order. It fills the gaps updates
+    leave after a reconnect, and is the whole path if push turns out not to
+    deliver other bots' posts.
 - **Authorship.** A node's bot is the only member with post rights in its
   outbox, so the channel itself says who wrote a frame. The HMAC below says
   so cryptographically.
@@ -187,15 +195,17 @@ frame in the node's own outbox.
 
 ## Timing
 
-A round trip costs at most a tick on each side plus a poll on each side plus
-two posts:
+A round trip costs at most a tick on each side, plus a poll on each side
+when reading by polling, plus two posts:
 
 ```
-rtt ≲ 2·tick + 2·poll + 2·post_latency
+rtt ≲ 2·tick + 2·poll + 2·post_latency      (polling)
+rtt ≲ 2·tick + 2·post_latency                (push updates)
 ```
 
-On Telegram with tick 4 s, poll 3 s and post ~0.5 s: up to ~15 s, ~7 s on
-average. On Discord with tick 1 s, poll 1 s: ~3–5 s.
+On Telegram with tick 4 s, poll 3 s and post ~0.5 s: up to ~15 s polling,
+~9 s with push. On Discord with tick 1 s, poll 1 s: ~3–5 s polling, ~2–3 s
+with push.
 
 openraft's defaults (heartbeat 50 ms, election 150–300 ms) assume a LAN.
 Raft needs `heartbeat < election_timeout_min`, and the election timeout must
@@ -295,8 +305,28 @@ transport.
    and bytes are not gated.
 3. **Polling cost** stays within the read budgets above for 3 nodes at the
    suggested poll intervals. Measure it with `pigeonhole_limiter_wait_seconds`.
-4. **MTProto updates** (push) as a later optimization over polling: a bot gets
-   `updateNewChannelMessage` for channels it is in. Check it with two bots.
+4. **MTProto updates** (push) for posts of another bot: a bot gets
+   `updateNewChannelMessage` for channels it is in, and posts in a channel
+   are the channel's, so the "bots do not see bots" rule of groups should not
+   apply. Check it with two bots. If it holds, push is the main path and
+   polling only fills gaps. Also check whether several processes logged in
+   as one bot all get the updates (one bot per node avoids the question).
+
+Setting up the second bot is a script, not clicks: after creating the bot
+in BotFather (bots cannot create bots) and putting its token in `.env` as
+`TG_BOT_TOKEN_2`, the live test `grant_admin` makes it an admin of the test
+channels as the first bot (`channels.editAdmin`), which needs the right to
+add admins there:
+
+```
+cargo test -p pigeonhole-storage-telegram --test live grant_admin -- --ignored --nocapture
+```
+
+Both bots log in with the same `TG_API_ID` / `TG_API_HASH`: those identify
+the client application, not the account, and each bot has its own session
+file. Discord has no such shortcut: a second application is created and
+invited through its OAuth URL by a person, and the Message Content intent is
+a switch in the developer portal.
 
 ## Tests
 

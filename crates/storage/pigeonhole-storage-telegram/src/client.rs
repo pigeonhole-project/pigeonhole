@@ -221,6 +221,83 @@ impl TelegramMtproto {
         }
     }
 
+    /// The bot's @username (without the @).
+    pub async fn username(&self) -> Result<String> {
+        let request = functions::users::GetUsers { id: vec![enums::InputUser::UserSelf] };
+        let users = retry_call("users.getUsers", CALL_BUDGET, None, || self.home(Lane::Meta, &request)).await?;
+        users
+            .into_iter()
+            .find_map(|u| match u {
+                enums::User::User(u) => u.username,
+                enums::User::Empty(_) => None,
+            })
+            .context("the bot has no username")
+    }
+
+    /// Setup, not storage (tests/live.rs `grant_admin`): make the bot
+    /// `@username` an admin of `chat_id` with what a store needs (post, edit
+    /// and delete messages). This bot must be an admin there with the right
+    /// to add admins.
+    pub async fn promote_bot(&self, chat_id: i64, username: &str) -> Result<()> {
+        let resolve = functions::contacts::ResolveUsername { username: username.trim_start_matches('@').into(), referer: None };
+        let enums::contacts::ResolvedPeer::Peer(resolved) =
+            retry_call("contacts.resolveUsername", CALL_BUDGET, None, || self.home(Lane::Meta, &resolve))
+                .await
+                .with_context(|| format!("resolve @{username}"))?;
+        let user = resolved
+            .users
+            .into_iter()
+            .find_map(|u| match u {
+                enums::User::User(u) if u.bot => Some(u),
+                _ => None,
+            })
+            .with_context(|| format!("@{username} is not a bot"))?;
+        let channel_id = channel_id_of(chat_id)?;
+        let get = functions::channels::GetChannels {
+            id: vec![types::InputChannel { channel_id, access_hash: 0 }.into()],
+        };
+        let chats = retry_call("channels.getChannels", CALL_BUDGET, None, || self.home(Lane::Meta, &get)).await?;
+        let channel = chats
+            .chats()
+            .into_iter()
+            .find_map(|c| match c {
+                enums::Chat::Channel(c) if c.id == channel_id => Some(c),
+                _ => None,
+            })
+            .with_context(|| format!("chat {chat_id} is not a channel this bot can see"))?;
+        let rights = types::ChatAdminRights {
+            change_info: false,
+            post_messages: true,
+            edit_messages: true,
+            delete_messages: true,
+            ban_users: false,
+            invite_users: false,
+            pin_messages: false,
+            add_admins: false,
+            anonymous: false,
+            manage_call: false,
+            other: false,
+            manage_topics: false,
+            post_stories: false,
+            edit_stories: false,
+            delete_stories: false,
+            manage_direct_messages: false,
+            manage_ranks: false,
+            manage_linked_peers: false,
+            manage_welcome_messages: false,
+        };
+        let edit = functions::channels::EditAdmin {
+            channel: types::InputChannel { channel_id, access_hash: channel.access_hash.context("channel without an access hash")? }.into(),
+            user_id: types::InputUser { user_id: user.id, access_hash: user.access_hash.context("bot without an access hash")? }.into(),
+            admin_rights: rights.into(),
+            rank: None,
+        };
+        retry_call("channels.editAdmin", CALL_BUDGET, None, || self.home(Lane::Meta, &edit))
+            .await
+            .with_context(|| format!("make @{username} an admin of {chat_id} (does this bot have the right to add admins?)"))?;
+        Ok(())
+    }
+
     /// Resolve `chat_id` (Bot API form, `-100…`) to a channel this bot
     /// administers with post and delete rights; calls go through `lane` and
     /// are metered by `limiter`.

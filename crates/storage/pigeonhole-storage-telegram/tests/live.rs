@@ -346,3 +346,33 @@ async fn bench_window() {
         std::fs::write(&marks, lines.join("\n") + "\n").unwrap();
     }
 }
+
+/// Setup for a second bot (docs/raft-over-chat.md): make the bot of
+/// `TG_BOT_TOKEN_2` an admin (post, edit, delete) of the three test channels
+/// TG_{BLOBS,LOG,SNAP}_CHAT_ID, as the bot of `TG_BOT_TOKEN`, which must hold
+/// the right to add admins there; then check it as the second bot. Both log
+/// in with the same TG_API_ID / TG_API_HASH, each with its own session.
+/// `cargo test -p pigeonhole-storage-telegram --test live grant_admin -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "changes the admins of the real test channels"]
+async fn grant_admin() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let login = |token: &str, session: &str| MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env(token),
+        session: root.join(format!(".cache/{session}")),
+    };
+    let second = TelegramMtproto::connect(&login("TG_BOT_TOKEN_2", "tgm-live-2.session")).await.unwrap();
+    let username = second.username().await.unwrap();
+    let first = TelegramMtproto::connect(&login("TG_BOT_TOKEN", "tgm-live.session")).await.unwrap();
+    println!("granting @{username} (bot {}) admin as bot {}", second.bot_id(), first.bot_id());
+    for var in ["TG_BLOBS_CHAT_ID", "TG_LOG_CHAT_ID", "TG_SNAP_CHAT_ID"] {
+        let chat_id: i64 = env(var).parse().unwrap();
+        first.promote_bot(chat_id, &username).await.unwrap();
+        let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+        second.channel(chat_id, Lane::Meta, limiter).await.unwrap();
+        println!("{var}: @{username} is an admin with post and delete rights");
+    }
+}
