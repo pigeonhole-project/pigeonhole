@@ -149,6 +149,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
         snapshot_interval: cfg.meta.snapshot_interval,
         snapshots_outlive_log: cfg.meta.snapshots_outlive_log(),
         keep_snapshots: cfg.meta.keep_snapshots,
+        ..MetaOptions::default()
     };
     let meta = MetaStore::open(log, snapshots, namespaces, opts)
         .await

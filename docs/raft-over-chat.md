@@ -84,8 +84,10 @@ Every node owns one channel, its **outbox**. It posts all it sends there:
 requests to any peer and responses to requests it received. Every node reads
 every other node's outbox.
 
-- **Per-node rate.** A channel's posting limit is per channel, so each node
-  has its own budget, and adding nodes does not share it.
+- **Per-node rate.** The posting limit is per bot, not per channel
+  (measured 2026-10-30 with a live spike: two bots in one channel
+  post twice as much as one). So each node needs **its own bot**; its own
+  channel is for authorship and tidy reads, not for budget.
 - **Coalescing.** All a node has to send in one tick (heartbeats to every
   follower, responses, votes) goes out as **one post**: a frame holds several
   envelopes, each addressed to a node. A 3-node leader sends one post per
@@ -111,20 +113,21 @@ channels and reads that grow quadratically.
 
 ### Budgets
 
-| | Telegram channel | Discord channel |
+| per bot | Telegram | Discord |
 |---|---|---|
-| posts | ~20 / min (`send_rate_per_sec = 0.3`, burst 3) | ~5 / 5 s |
-| reads (ours) | `info` budget 2 / s per bot | ~5 / s |
+| posts | ~20 / min (measured 19.7) | ~57 / min (measured, no 429) |
+| reads (ours) | `info` budget 2 / s | ~5 / s |
 
 A node posts at most once per **tick** and reads each peer once per
 **poll**. For n nodes:
 
-- posts per node: `1 / tick` (Telegram: tick ≥ 3.5 s to stay under 0.3/s
-  with room for the burst; Discord: tick ≥ 1 s);
-- reads per node: `(n − 1) / poll` against the bot's read budget (Telegram,
-  3 nodes on one bot: 6 reads per poll across the processes; poll ≥ 3 s).
+- posts per node: `1 / tick` against its bot's budget (Telegram: tick
+  ≥ 3.5 s to stay under ~0.33/s with room for the burst; Discord: tick
+  ≥ 1.1 s);
+- reads per node: `(n − 1) / poll` against the same bot's read budget, or
+  none with push updates.
 
-Each node uses its own bot, so read budgets do not stack on one token.
+Bots shared between nodes share these budgets: one bot per node.
 
 ## Wire format
 
