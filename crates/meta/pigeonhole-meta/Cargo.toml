@@ -26,6 +26,7 @@ uuid = { workspace = true }
 testsuite = []
 
 [dev-dependencies]
+openraft-chat = { workspace = true }
 metrics-util = { workspace = true }
 pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }

@@ -344,13 +344,62 @@ pub struct MetaOptions {
     /// them, so a boot that cannot load the newest starts from an older one
     /// (docs/log-retention.md).
     pub keep_snapshots: usize,
+    /// How often a Raft leader heartbeats its followers.
+    pub heartbeat: Duration,
+    /// A follower that hears no leader for a random time in this range
+    /// campaigns. Over a chat transport both are seconds
+    /// (docs/raft-over-chat.md § Timing).
+    pub election_timeout: (Duration, Duration),
 }
 
 impl Default for MetaOptions {
     fn default() -> Self {
-        Self { snapshot_every: Some(10_000), snapshot_interval: None, snapshots_outlive_log: false, keep_snapshots: 2 }
+        Self {
+            snapshot_every: Some(10_000),
+            snapshot_interval: None,
+            snapshots_outlive_log: false,
+            keep_snapshots: 2,
+            heartbeat: Duration::from_millis(50),
+            election_timeout: (Duration::from_millis(100), Duration::from_millis(150)),
+        }
     }
 }
+
+/// This process's place in a Raft cluster (docs/meta-backends.md § Raft
+/// between nodes). [`MetaStore::open`] is a cluster of one.
+pub struct Cluster<N> {
+    pub node: raft::NodeId,
+    /// Every voter, this node included. A fresh cluster is initialized by
+    /// the member with the lowest id; the others wait for its leader.
+    pub members: std::collections::BTreeSet<raft::NodeId>,
+    /// openraft's network to the other members.
+    pub network: N,
+    /// Hands the node's `Raft` to the network's receiving side once it
+    /// exists, before the tablet waits for a leader (electing one needs the
+    /// others to answer).
+    pub serve: Option<Serve>,
+}
+
+/// See [`Cluster::serve`].
+pub type Serve = Box<dyn FnOnce(raft::Raft) -> futures::future::BoxFuture<'static, ()> + Send>;
+
+/// A write or a linearizable read on a node that is not the leader: ask the
+/// leader (`None`: none known yet). The tablet keeps running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotLeader {
+    pub leader: Option<raft::NodeId>,
+}
+
+impl fmt::Display for NotLeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.leader {
+            Some(id) => write!(f, "not the leader; node {id} is"),
+            None => write!(f, "not the leader; no leader known"),
+        }
+    }
+}
+
+impl std::error::Error for NotLeader {}
 
 pub(crate) type States = HashMap<&'static str, Arc<dyn AnyState>>;
 
@@ -423,6 +472,15 @@ async fn write_batch(raft: &raft::Raft, shared: &raft::Shared, batch: Vec<Pendin
                 let _ = p.reply.send(Ok((position, mine)));
             }
         }
+        // Not the leader (a cluster of more than one): the caller asks the
+        // leader; this node goes on.
+        Err(openraft::error::RaftError::APIError(openraft::error::ClientWriteError::ForwardToLeader(f)))
+            if shared.stop.borrow().is_none() =>
+        {
+            for p in batch {
+                let _ = p.reply.send(Err(NotLeader { leader: f.leader_id }.into()));
+            }
+        }
         Err(e) => {
             let stop = shared.stop.borrow().clone().unwrap_or_else(|| Stop::Failed(e.to_string()));
             shared.stop.send_replace(Some(stop.clone()));
@@ -470,6 +528,19 @@ impl MetaStore {
         namespaces: Namespaces,
         opts: MetaOptions,
     ) -> Result<Arc<Self>> {
+        let solo = Cluster { node: raft::SOLO, members: [raft::SOLO].into(), network: raft::NoNetwork, serve: None };
+        Self::open_in(log, snapshots, namespaces, opts, solo).await
+    }
+
+    /// [`Self::open`] as one node of `cluster`. A cluster of one waits until
+    /// it leads; a node of a larger one until some leader is known.
+    pub async fn open_in<N: openraft::RaftNetworkFactory<raft::TypeConfig>>(
+        log: Arc<dyn LogStore>,
+        snapshots: Arc<dyn SnapshotStore>,
+        namespaces: Namespaces,
+        opts: MetaOptions,
+        cluster: Cluster<N>,
+    ) -> Result<Arc<Self>> {
         let t0 = std::time::Instant::now();
         let states = Arc::new(collect_states(namespaces)?);
         let (gen, head, d) = claim_log(log.as_ref(), snapshots.as_ref()).await?;
@@ -513,13 +584,16 @@ impl MetaStore {
             snapshots.clone(),
             keep,
         );
-        let raft = raft::Raft::new(raft::SOLO, Arc::new(raft_config(&opts)?), raft::NoNetwork, adapter, sm)
+        let raft = raft::Raft::new(cluster.node, Arc::new(raft_config(&opts)?), cluster.network, adapter, sm)
             .await
             .context("start raft")?;
-        if fresh {
-            let mut nodes = std::collections::BTreeMap::new();
-            nodes.insert(raft::SOLO, openraft::BasicNode::default());
-            raft.initialize(nodes).await.context("initialize a cluster of one")?;
+        if let Some(serve) = cluster.serve {
+            serve(raft.clone()).await;
+        }
+        if fresh && cluster.members.first() == Some(&cluster.node) {
+            let nodes: std::collections::BTreeMap<_, _> =
+                cluster.members.iter().map(|&id| (id, openraft::BasicNode::default())).collect();
+            raft.initialize(nodes).await.context("initialize the cluster")?;
         }
         let (queue, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(batcher(raft.clone(), shared.clone(), rx));
@@ -534,13 +608,7 @@ impl MetaStore {
             stop,
             ticker: Mutex::new(None),
         };
-        // Leader, and everything the log holds applied.
-        raft.wait(Some(Duration::from_secs(30)))
-            .state(openraft::ServerState::Leader, "become the leader of a cluster of one")
-            .await
-            .map_err(|e| store.stopped_by(e))
-            .context("boot the tablet")?;
-        store.confirm_active().await.context("boot the tablet")?;
+        store.wait_ready(cluster.members.len(), &opts).await?;
         if fell_back {
             // So that the snapshot that failed stops being the base.
             let _ = raft.trigger().snapshot().await;
@@ -557,6 +625,27 @@ impl MetaStore {
         );
         store.record_gauges();
         Ok(Arc::new(store))
+    }
+
+    /// Boot's last wait: a cluster of one until it leads with everything
+    /// the log holds applied; a node of a larger one until a leader is known.
+    async fn wait_ready(&self, members: usize, opts: &MetaOptions) -> Result<()> {
+        if members == 1 {
+            self.raft
+                .wait(Some(Duration::from_secs(30)))
+                .state(openraft::ServerState::Leader, "become the leader of a cluster of one")
+                .await
+                .map_err(|e| self.stopped_by(e))
+                .context("boot the tablet")?;
+            return self.confirm_active().await.context("boot the tablet");
+        }
+        self.raft
+            .wait(Some(opts.election_timeout.1 * 20))
+            .metrics(|m| m.current_leader.is_some(), "a leader")
+            .await
+            .map_err(|e| self.stopped_by(e))
+            .context("boot the tablet: no leader")?;
+        Ok(())
     }
 
     pub fn has_namespace(&self, name: &str) -> bool {
@@ -582,6 +671,16 @@ impl MetaStore {
     /// Generation this tablet claimed on boot.
     pub fn generation(&self) -> u64 {
         self.gen
+    }
+
+    /// The node's Raft: what a network's receiving side hands requests to.
+    pub fn raft(&self) -> &raft::Raft {
+        &self.raft
+    }
+
+    /// The leader as this node knows it.
+    pub fn leader(&self) -> Option<raft::NodeId> {
+        self.raft.metrics().borrow().current_leader
     }
 
     /// The stop reason, or `err` turned into one (the tablet is stopped).
@@ -663,8 +762,17 @@ impl MetaStore {
         if let Some(stop) = self.stop.borrow().clone() {
             return Err(stop.into());
         }
-        if let Err(e) = self.raft.ensure_linearizable().await {
-            return Err(self.stopped_by(e));
+        match self.raft.ensure_linearizable().await {
+            Ok(_) => {}
+            // Not (or no longer) the leader: nothing to stop for.
+            Err(openraft::error::RaftError::APIError(e)) => {
+                let leader = match e {
+                    openraft::error::CheckIsLeaderError::ForwardToLeader(f) => f.leader_id,
+                    openraft::error::CheckIsLeaderError::QuorumNotEnough(_) => None,
+                };
+                return Err(NotLeader { leader }.into());
+            }
+            Err(e) => return Err(self.stopped_by(e)),
         }
         match self.log.confirm(self.gen).await {
             Ok(()) => Ok(()),
@@ -852,9 +960,9 @@ async fn load_base(sm: &mut raft::StateMachine, snapshots: &dyn SnapshotStore, b
 fn raft_config(opts: &MetaOptions) -> Result<openraft::Config> {
     openraft::Config {
         cluster_name: "pigeonhole".into(),
-        heartbeat_interval: 50,
-        election_timeout_min: 100,
-        election_timeout_max: 150,
+        heartbeat_interval: opts.heartbeat.as_millis() as u64,
+        election_timeout_min: opts.election_timeout.0.as_millis() as u64,
+        election_timeout_max: opts.election_timeout.1.as_millis() as u64,
         snapshot_policy: match opts.snapshot_every {
             None => openraft::SnapshotPolicy::Never,
             Some(n) => openraft::SnapshotPolicy::LogsSinceLast(n),

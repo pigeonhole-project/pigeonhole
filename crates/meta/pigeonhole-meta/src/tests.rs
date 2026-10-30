@@ -685,3 +685,5 @@ fn batcher_metrics_add_up() {
     assert_eq!(proposals as usize, N);
     assert!(entries < N, "{N} proposals queued at once share entries, got {entries}");
 }
+
+mod cluster;

@@ -2688,6 +2688,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "openraft",
+ "openraft-chat",
  "pigeonhole-storage-api",
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
