@@ -1075,3 +1075,25 @@ async fn the_cooler_never_loses_a_rewrite_or_leaks_a_chunk() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
+
+/// With inlining off (or the threshold lowered), a copy of a still-inline
+/// object is stored as chunks, as any new write then is.
+#[tokio::test]
+async fn a_copy_follows_the_current_threshold() {
+    let (s3, _meta, _dir) = setup_inline().await;
+    s3.put_object(req(put_len("src", b"0123456789", true))).await.unwrap();
+    let mut off = s3.clone();
+    off.opts.inline_max_bytes = 0;
+    let copy = CopyObjectInput::builder()
+        .bucket("b".into())
+        .key("dst".into())
+        .copy_source(CopySource::Bucket { bucket: "b".into(), key: "src".into(), version_id: None })
+        .build()
+        .unwrap();
+    off.copy_object(req(copy)).await.unwrap();
+    assert!(s3.index.get_extents("b", "src").await.unwrap().unwrap().is_empty(), "the source stays inline");
+    assert!(!s3.index.get_extents("b", "dst").await.unwrap().unwrap().is_empty(), "the copy is chunked");
+    assert_eq!(get_all(&s3, "dst", None).await, b"0123456789");
+    let (src, dst) = (s3.index.get_object("b", "src").await.unwrap().unwrap(), s3.index.get_object("b", "dst").await.unwrap().unwrap());
+    assert_eq!(src.etag, dst.etag);
+}

@@ -467,6 +467,48 @@ impl Index {
         Ok((dst, old))
     }
 
+    /// [`Self::copy_object`] of `src` with `body` instead of its own (an
+    /// inline source stored as fresh chunks), to commit with those chunks
+    /// in one entry. The destination's meta as it will be written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_copy_object(
+        &self,
+        src: &SourceSnapshot,
+        body: Body,
+        dst_bucket: &str,
+        dst_key: &str,
+        content_type: Option<&str>,
+        user_meta: &[(String, String)],
+        copy_source_meta: bool,
+        expect: Option<Expect>,
+    ) -> (Prepared<S3State>, ObjectMeta) {
+        let ct = content_type.or(src.content_type.as_deref());
+        let meta = if copy_source_meta { &src.user_meta[..] } else { user_meta };
+        let mtime = Utc::now().to_rfc3339();
+        let put = Prepared::new(&S3Command::PutObject {
+            bucket: dst_bucket.into(),
+            key: dst_key.into(),
+            etag: src.etag.clone(),
+            size: src.size,
+            content_type: ct.map(Into::into),
+            body,
+            user_meta: meta.to_vec(),
+            tags: Vec::new(),
+            checksums_json: src.checksums_json.clone(),
+            mtime: mtime.clone(),
+            expect,
+        });
+        let dst = ObjectMeta {
+            bucket: dst_bucket.into(),
+            key: dst_key.into(),
+            etag: src.etag.clone(),
+            size: src.size,
+            content_type: ct.map(Into::into),
+            mtime,
+        };
+        (put, dst)
+    }
+
     /// Up to `limit` objects of `bucket` with keys in `(lower, upper)` bounds,
     /// in byte order.
     fn scan_objects(

@@ -138,8 +138,9 @@ An inline object not rewritten for this long is moved out on the next pass.
 
 ### `min_inline`
 
-Protects young objects from the budget rule. A lock that was just written
-is not moved out just because the tablet is over budget. Keep it above the
+No object written less than this long ago is moved out, by either rule:
+a lock that was just written is not moved out because the tablet is over
+budget (nor by `cool_after`, if that is set shorter). Keep it above the
 renewal interval of whatever writes locks (T4: 2 s; the default 30 s leaves
 room).
 
@@ -147,7 +148,7 @@ room).
 
 A pass every `cool_every` moves at most `cool_batch` objects, one after the
 other. Each move is an upload to the blob store, so in a rate-limited
-channel `cool_batch × cool_every` is the upload rate the cooler adds (64 per
+channel the cooler adds up to `cool_batch` uploads per `cool_every` (64 per
 minute is about 1/s; Telegram takes about 0.3/s). Keep `cool_batch` small on
 Telegram (e.g. 8), or let the age rule do the work slowly.
 
@@ -185,8 +186,9 @@ PUT > max_object_size ──► chunked ──── DELETE (either state) ─�
 store call, no chunk pin, no block cache.
 
 **CopyObject**
-- An inline source is copied as bytes: the destination is inline too, being
-  the same size.
+- An inline source is copied as bytes. The copy is inline if its size is
+  within the current `max_object_size`, else it is stored as new chunks
+  (after inlining was turned off or the threshold lowered).
 - A chunked source shares its extents as before, whatever its size.
 
 **UploadPartCopy** from an inline source: the requested range of its bytes
@@ -308,8 +310,8 @@ Log lines:
 - **Many small files** (backup indexes, thumbnails): raise `budget` to what
   the node can hold in RAM, consider `max_object_size = "4 KiB"`, and keep
   `cool_after` long enough for the hot set.
-- **Disk-only deployments:** inlining still saves a file per small object
-  and an fsync. The cost is RAM. Set `max_object_size = "off"` if memory is
+- **Disk-only deployments:** inlining still saves a record in a segment
+  and its fsync per small object. The cost is RAM. Set `max_object_size = "off"` if memory is
   tight.
 
 ### Turning it off
@@ -370,11 +372,12 @@ Everything `apply` decides comes from the command and the state:
 
 ### Tags in the put
 
-Before this change, a PUT with tags committed `PutObject` and then
-`PutObjectTags` in one entry, as two commands. Each command applies
-independently. With conditional writes, a refused `PutObject` would have let
-`PutObjectTags` tag the object that was already there. The tags now travel
-inside `PutObject`, so the whole put is decided once.
+Since conditional writes (docs/conditional-writes.md), the tags of a PUT
+travel inside `PutObject`. Before, they were a second command,
+`PutObjectTags`, in the same entry. Commands apply independently, so a
+refused conditional `PutObject` would have let `PutObjectTags` tag the object
+that was already there. One command decides the whole put. Inline bodies
+keep it that way.
 
 ### One entry per write
 
@@ -438,7 +441,8 @@ and metadata in Discord (`DEMO_BACKEND=chats`), 2026-10-30.
   - sizes at and around the threshold, with and without Content-Length;
   - ranges, ETag, empty object;
   - Content-MD5 on an inline body (a mismatch commits nothing);
-  - copy and UploadPartCopy from an inline source;
+  - copy and UploadPartCopy from an inline source; a copy follows the
+    current threshold (inline source, inlining off: chunked copy);
   - an inline rewrite releases the chunks it replaces;
   - a cooler pass moves objects out with reads unchanged;
   - the cooler racing rewrites and deletes: no lost write, no leaked chunk.

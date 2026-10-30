@@ -1076,6 +1076,45 @@ impl S3 for S3Gateway {
         let (src, extents) = self
             .pin_copy_source(&src_bucket, &src_key, |src| Ok(src.body.extents().to_vec()))
             .await?;
+        // An inline source too large for inlining now (it is off, or the
+        // threshold was lowered) is stored at the destination as new chunks.
+        if let Body::Inline(bytes) = &src.body {
+            if bytes.len() > self.opts.inline_max_bytes {
+                let data = Bytes::copy_from_slice(bytes);
+                let ingested = self
+                    .store
+                    .ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options()))
+                    .await
+                    .map_err(Self::map_err)?;
+                let (put, dst) = self.index.prepare_copy_object(
+                    &src,
+                    Body::Chunks(ingested.extents.clone()),
+                    &input.bucket,
+                    &input.key,
+                    content_type,
+                    &user_meta,
+                    copy_source_meta,
+                    expect,
+                );
+                let old = match self.commit_with(ingested.chunks, put).await? {
+                    Ok(old) => old,
+                    Err(reject) => {
+                        self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                        return Err(Self::refused(reject));
+                    }
+                };
+                self.release_later(old);
+                return Ok(S3Response::new(CopyObjectOutput {
+                    copy_object_result: Some(CopyObjectResult {
+                        e_tag: Some(etag_hex(&dst.etag)),
+                        last_modified: Some(ts(&dst.mtime)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+            }
+        }
+
         let held = unique_chunk_ids(&extents);
         let (dst, old) = match self
             .index
