@@ -14,7 +14,7 @@ use std::time::Duration;
 type Snaps = Faulty<MemoryBlobStore>;
 
 async fn tablet(log: &Arc<MemoryBlobStore>, snaps: &Arc<Snaps>, keep: usize) -> anyhow::Result<Arc<MetaStore>> {
-    let opts = MetaOptions { snapshot_every: 5, keep_snapshots: keep, ..MetaOptions::default() };
+    let opts = MetaOptions { snapshot_every: Some(5), keep_snapshots: keep, ..MetaOptions::default() };
     MetaStore::open(
         Arc::new(ChainLogStore::new(log.clone())),
         Arc::new(BlobSnapshotStore::new(snaps.clone())),

@@ -7,8 +7,8 @@ pub struct CacheConfig {
     pub enabled: bool,
     /// L1 capacity (decoded bytes).
     pub l1_bytes: usize,
-    /// L2 capacity (stored bytes); 0 = no L2.
-    pub l2_bytes: usize,
+    /// L2 capacity (stored bytes); `None` = no L2.
+    pub l2_bytes: Option<usize>,
     /// Chunks written put their stored blocks into L2.
     pub write_through: bool,
 }
@@ -18,7 +18,7 @@ impl Default for CacheConfig {
         Self {
             enabled: true,
             l1_bytes: 128 * 1024 * 1024,
-            l2_bytes: 256 * 1024 * 1024,
+            l2_bytes: Some(256 * 1024 * 1024),
             write_through: true,
         }
     }

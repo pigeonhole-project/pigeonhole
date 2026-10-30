@@ -78,7 +78,7 @@ async fn open_node(log: &Arc<MemoryBlobStore>, snaps: &Arc<MemoryBlobStore>, mem
         Arc::new(ChainLogStore::new(log.clone())),
         Arc::new(BlobSnapshotStore::new(snaps.clone())),
         Index::register(BlobDb::register(Namespaces::new())),
-        MetaOptions { snapshot_every: 50, ..MetaOptions::default() },
+        MetaOptions { snapshot_every: Some(50), ..MetaOptions::default() },
     )
     .await
     .unwrap();

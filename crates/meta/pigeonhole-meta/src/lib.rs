@@ -331,12 +331,12 @@ impl std::error::Error for Stop {}
 #[derive(Clone, Debug)]
 pub struct MetaOptions {
     /// Take a snapshot (and collect the log behind it) after this many
-    /// entries since the last one; 0 = never.
-    pub snapshot_every: u64,
+    /// entries since the last one; `None` = never.
+    pub snapshot_every: Option<u64>,
     /// Also take one when this long has passed and there are new entries,
-    /// even with no traffic; zero = never. Bounds how stale the newest
+    /// even with no traffic; `None` = never. Bounds how stale the newest
     /// snapshot can get.
-    pub snapshot_interval: Duration,
+    pub snapshot_interval: Option<Duration>,
     /// The snapshot store can survive the log (another disk, a chat), so a
     /// lossy restore from it is possible: see [`MetaStore::restorable_position`].
     pub snapshots_outlive_log: bool,
@@ -348,7 +348,7 @@ pub struct MetaOptions {
 
 impl Default for MetaOptions {
     fn default() -> Self {
-        Self { snapshot_every: 10_000, snapshot_interval: Duration::ZERO, snapshots_outlive_log: false, keep_snapshots: 2 }
+        Self { snapshot_every: Some(10_000), snapshot_interval: None, snapshots_outlive_log: false, keep_snapshots: 2 }
     }
 }
 
@@ -546,7 +546,7 @@ impl MetaStore {
             let _ = raft.trigger().snapshot().await;
         }
         *store.ticker.lock().unwrap() =
-            (!opts.snapshot_interval.is_zero()).then(|| spawn_snapshot_ticker(raft, shared, opts.snapshot_interval));
+            opts.snapshot_interval.map(|every| spawn_snapshot_ticker(raft, shared, every));
         telemetry::record_boot(store.applied_position().saturating_sub(store.base_position()), t0.elapsed());
         tracing::info!(
             generation = gen,
@@ -856,8 +856,8 @@ fn raft_config(opts: &MetaOptions) -> Result<openraft::Config> {
         election_timeout_min: 100,
         election_timeout_max: 150,
         snapshot_policy: match opts.snapshot_every {
-            0 => openraft::SnapshotPolicy::Never,
-            n => openraft::SnapshotPolicy::LogsSinceLast(n),
+            None => openraft::SnapshotPolicy::Never,
+            Some(n) => openraft::SnapshotPolicy::LogsSinceLast(n),
         },
         max_in_snapshot_log_to_keep: 0,
         purge_batch_size: 1,

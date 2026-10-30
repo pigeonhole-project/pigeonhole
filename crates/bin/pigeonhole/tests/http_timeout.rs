@@ -55,7 +55,7 @@ fn test_app(headers: Duration, idle: Duration) -> Router {
                 }
             }),
         );
-    with_http_timeouts(router, headers, idle, 32)
+    with_http_timeouts(router, Some(headers), idle, 32)
 }
 
 #[tokio::test]

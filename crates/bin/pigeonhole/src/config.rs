@@ -134,16 +134,16 @@ impl LoggingSettings {
 /// store (`[meta]`, `log` / `snapshot` naming a `[[store]]`).
 #[derive(Clone, Debug)]
 pub struct MetaSettings {
-    /// Snapshot (and collect the log behind it) every this many entries; 0 = never.
-    pub snapshot_every_entries: u64,
-    /// Also snapshot this often when there are new entries; zero = never.
-    pub snapshot_interval: Duration,
+    /// Snapshot (and collect the log behind it) every this many entries; `None` = never.
+    pub snapshot_every_entries: Option<u64>,
+    /// Also snapshot this often when there are new entries; `None` = never.
+    pub snapshot_interval: Option<Duration>,
     /// The newest snapshots kept, with the log from the oldest of them (≥ 1).
     pub keep_snapshots: usize,
     /// A Discord log's lease (docs/discord-lease.md): batches without a
-    /// thread each; a new writer waits it out after a crash. Zero = a
+    /// thread each; a new writer waits it out after a crash. `None` = a
     /// thread per batch.
-    pub lease: Duration,
+    pub lease: Option<Duration>,
     pub log: LogSettings,
     pub snapshot: SnapshotSettings,
 }
@@ -236,8 +236,8 @@ pub struct HttpSettings {
     /// flowing.
     pub request_timeout: Duration,
     /// Max time to produce response headers after the request body reaches EOF.
-    /// Zero disables. Default matches [`Self::request_timeout`].
-    pub headers_timeout: Duration,
+    /// `None` disables. Default matches [`Self::request_timeout`].
+    pub headers_timeout: Option<Duration>,
     /// Max concurrent in-flight HTTP requests.
     pub max_concurrent_requests: usize,
     /// Max HTTP/1 headers per request (hyper).
@@ -248,7 +248,7 @@ impl Default for HttpSettings {
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(300),
-            headers_timeout: Duration::from_secs(300),
+            headers_timeout: Some(Duration::from_secs(300)),
             max_concurrent_requests: 256,
             max_headers: 100,
         }
@@ -262,8 +262,8 @@ pub struct BytestreamSettings {
     pub listen_addr: String,
     pub instance_name: String,
     pub max_batch_total_size: usize,
-    /// Zero = no TTL GC of CAS entries.
-    pub gc_ttl: Duration,
+    /// `None` = no TTL GC of CAS entries.
+    pub gc_ttl: Option<Duration>,
 }
 
 impl Default for BytestreamSettings {
@@ -273,7 +273,7 @@ impl Default for BytestreamSettings {
             listen_addr: "127.0.0.1:8980".into(),
             instance_name: "pigeonhole".into(),
             max_batch_total_size: 4 * 1024 * 1024,
-            gc_ttl: Duration::from_secs(7 * 24 * 3600),
+            gc_ttl: Some(Duration::from_secs(7 * 24 * 3600)),
         }
     }
 }
@@ -546,13 +546,13 @@ struct FileMeta {
     /// `[[store]]` id of the snapshots; unset = the log's store if it is a `dir`.
     snapshot: Option<String>,
     #[serde(deserialize_with = "units::count_or_off")]
-    snapshot_every_entries: u64,
+    snapshot_every_entries: Option<u64>,
     #[serde(deserialize_with = "units::duration_or_off")]
-    snapshot_every: Duration,
+    snapshot_every: Option<Duration>,
     keep_snapshots: usize,
     /// A Discord log's lease; `"off"` = a thread per batch.
     #[serde(deserialize_with = "units::duration_or_off")]
-    lease: Duration,
+    lease: Option<Duration>,
 }
 
 impl Default for FileMeta {
@@ -560,10 +560,10 @@ impl Default for FileMeta {
         Self {
             log: None,
             snapshot: None,
-            snapshot_every_entries: 10_000,
-            snapshot_every: Duration::from_secs(600),
+            snapshot_every_entries: Some(10_000),
+            snapshot_every: Some(Duration::from_secs(600)),
             keep_snapshots: 2,
-            lease: Duration::from_secs(45),
+            lease: Some(Duration::from_secs(45)),
         }
     }
 }
@@ -759,7 +759,7 @@ struct FileHttp {
     #[serde(with = "humantime_serde")]
     request_timeout: Duration,
     #[serde(deserialize_with = "units::opt_duration_or_off")]
-    headers_timeout: Option<Duration>,
+    headers_timeout: Option<Option<Duration>>,
     max_concurrent_requests: usize,
     max_headers: usize,
 }
@@ -782,7 +782,7 @@ impl FileHttp {
         HttpSettings {
             request_timeout: idle,
             // Absent key → same as idle; "off" disables headers timeout.
-            headers_timeout: self.headers_timeout.unwrap_or(idle),
+            headers_timeout: self.headers_timeout.unwrap_or(Some(idle)),
             max_concurrent_requests: self.max_concurrent_requests.max(1),
             max_headers: self.max_headers.max(16),
         }
@@ -798,7 +798,7 @@ struct FileBytestream {
     #[serde(deserialize_with = "units::size")]
     max_batch_total_size: usize,
     #[serde(deserialize_with = "units::duration_or_off")]
-    gc_ttl: Duration,
+    gc_ttl: Option<Duration>,
 }
 
 impl Default for FileBytestream {
@@ -833,7 +833,7 @@ struct FileCache {
     #[serde(deserialize_with = "units::size")]
     l1_size: usize,
     #[serde(deserialize_with = "units::size_or_off")]
-    l2_size: usize,
+    l2_size: Option<usize>,
     write_through: bool,
 }
 
@@ -1015,8 +1015,8 @@ upload_concurrency = 4
         assert_eq!(cfg.tg.upload_concurrency, 4);
         assert_eq!(cfg.discord.send_rate_per_sec, ChatLimiterConfig::discord().send_rate_per_sec, "[discord] keeps its own defaults");
         assert_eq!(cfg.placement, PlacementConfig::single("mem"));
-        assert_eq!(cfg.meta.snapshot_every_entries, 10_000);
-        assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(600));
+        assert_eq!(cfg.meta.snapshot_every_entries, Some(10_000));
+        assert_eq!(cfg.meta.snapshot_interval, Some(Duration::from_secs(600)));
         assert_eq!(cfg.meta.keep_snapshots, 2);
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "pigeonhole-meta".into() });
         assert_eq!(cfg.meta.snapshot, SnapshotSettings::LocalDisk { path: "pigeonhole-meta".into() });
@@ -1033,9 +1033,9 @@ upload_concurrency = 4
         ))
         .unwrap();
         assert_eq!(cfg.meta.keep_snapshots, 3);
-        assert_eq!(cfg.meta.lease, Duration::ZERO);
-        assert_eq!(cfg.meta.snapshot_every_entries, 0);
-        assert_eq!(cfg.meta.snapshot_interval, Duration::from_secs(60));
+        assert_eq!(cfg.meta.lease, None);
+        assert_eq!(cfg.meta.snapshot_every_entries, None);
+        assert_eq!(cfg.meta.snapshot_interval, Some(Duration::from_secs(60)));
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "/var/log-dir".into() });
         assert_eq!(cfg.meta.snapshot, SnapshotSettings::LocalDisk { path: "/backup".into() });
         assert!(cfg.meta.snapshots_outlive_log());
@@ -1312,11 +1312,11 @@ max_batch_total_size = "8 MiB"
         )
         .unwrap();
         assert_eq!((cfg.chunk_size, cfg.block_size), (16 << 20, 512 << 10));
-        assert_eq!((cfg.cache.l1_bytes, cfg.cache.l2_bytes), (32 << 20, 0));
+        assert_eq!((cfg.cache.l1_bytes, cfg.cache.l2_bytes), (32 << 20, None));
         assert_eq!(cfg.sweep.interval, Duration::from_secs(90));
         assert_eq!(cfg.repair.max_cost_wait_secs, 0.5);
-        assert_eq!((cfg.http.request_timeout, cfg.http.headers_timeout), (Duration::from_secs(120), Duration::ZERO));
-        assert_eq!((cfg.bytestream.gc_ttl, cfg.bytestream.max_batch_total_size), (Duration::from_secs(7 * 86400), 8 << 20));
+        assert_eq!((cfg.http.request_timeout, cfg.http.headers_timeout), (Duration::from_secs(120), None));
+        assert_eq!((cfg.bytestream.gc_ttl, cfg.bytestream.max_batch_total_size), (Some(Duration::from_secs(7 * 86400)), 8 << 20));
 
         // Decimal units are not what anyone means by them here.
         for bad in ["[chunk]\nsize = \"10MB\"\n", "[cache]\nl1_size = \"128 KB\"\n", "[ingest]\nmemory_budget = \"1g\"\n"] {
@@ -1333,7 +1333,7 @@ max_batch_total_size = "8 MiB"
 
         // What can be off says so; zero is refused there.
         let cfg = load_mem("[meta]\nsnapshot_every = \"off\"\n[bytestream]\ngc_ttl = \"off\"\n").unwrap();
-        assert_eq!((cfg.meta.snapshot_interval, cfg.bytestream.gc_ttl), (Duration::ZERO, Duration::ZERO));
+        assert_eq!((cfg.meta.snapshot_interval, cfg.bytestream.gc_ttl), (None, None));
         for bad in [
             "[meta]\nsnapshot_every_entries = 0\n",
             "[meta]\nsnapshot_every = \"0s\"\n",

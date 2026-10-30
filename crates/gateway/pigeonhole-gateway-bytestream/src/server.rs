@@ -70,7 +70,7 @@ fn make_state(cfg: &BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>) -> 
         upload_ttl: Duration::from_secs(cfg.upload_ttl_secs.max(60)),
         uploads: Arc::new(Mutex::new(HashMap::new())),
     };
-    spawn_cas_gc(state.clone(), cfg.gc_ttl_secs);
+    spawn_cas_gc(state.clone(), cfg.gc_ttl);
     spawn_upload_gc(state.clone());
     state
 }
@@ -143,12 +143,10 @@ fn spawn_upload_gc(state: ReapiState) {
     });
 }
 
-fn spawn_cas_gc(state: ReapiState, ttl_secs: u64) {
-    if ttl_secs == 0 {
-        return;
-    }
+fn spawn_cas_gc(state: ReapiState, ttl: Option<Duration>) {
+    let Some(ttl) = ttl else { return };
     tokio::spawn(async move {
-        let ttl = ChronoDuration::seconds(ttl_secs as i64);
+        let ttl = ChronoDuration::seconds(ttl.as_secs() as i64);
         let cas = state.cas.cas.clone();
         let store = state.cas.store.clone();
         loop {

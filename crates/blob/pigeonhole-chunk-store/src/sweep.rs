@@ -427,8 +427,8 @@ mod tests {
     async fn reclaim_waits_for_a_snapshot_that_shows_it() {
         let dir = tempfile::tempdir().unwrap();
         let opts = pigeonhole_meta::MetaOptions {
-            snapshot_every: 0,
-            snapshot_interval: Duration::from_millis(50),
+            snapshot_every: None,
+            snapshot_interval: Some(Duration::from_millis(50)),
             snapshots_outlive_log: true,
             ..Default::default()
         };

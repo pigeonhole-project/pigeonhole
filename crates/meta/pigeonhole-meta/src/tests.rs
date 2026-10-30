@@ -231,7 +231,7 @@ async fn a_proposal_larger_than_a_batch_stays_one_entry() {
 async fn concurrent_proposals_get_distinct_positions() {
     let dir = tempfile::tempdir().unwrap();
     let (log, snapshots) = local(dir.path());
-    let opts = MetaOptions { snapshot_every: 5, ..MetaOptions::default() };
+    let opts = MetaOptions { snapshot_every: Some(5), ..MetaOptions::default() };
     let store = MetaStore::open(log, snapshots, counter(), opts).await.unwrap();
     let booted = store.applied_position();
     let tasks: Vec<_> = (0..32)
@@ -366,7 +366,7 @@ fn segments(dir: &Path) -> Vec<String> {
 
 async fn open_snapshotting(dir: &Path) -> Arc<MetaStore> {
     let log = crate::ChainLogStore::new(Arc::new(DiskBlobStore::with_segment_bytes(dir.join("log"), 64).unwrap()));
-    let opts = MetaOptions { snapshot_every: 10, ..MetaOptions::default() };
+    let opts = MetaOptions { snapshot_every: Some(10), ..MetaOptions::default() };
     MetaStore::open(Arc::new(log), snaps_of(dir), counter(), opts).await.unwrap()
 }
 
@@ -430,7 +430,7 @@ async fn a_lost_log_boots_only_through_a_lossy_restore() {
     let snapshots: Arc<dyn SnapshotStore> = snaps_of(&snap_dir);
     let open = |snapshots: Arc<dyn SnapshotStore>| {
         let log = log_of(&log_dir);
-        let opts = MetaOptions { snapshot_every: 10, snapshots_outlive_log: true, ..MetaOptions::default() };
+        let opts = MetaOptions { snapshot_every: Some(10), snapshots_outlive_log: true, ..MetaOptions::default() };
         MetaStore::open(log, snapshots, counter(), opts)
     };
     let a = open(snapshots.clone()).await.unwrap();
@@ -483,7 +483,7 @@ async fn the_tablet_runs_over_a_chain_log_with_snapshots_in_another_store() {
     let open = || {
         let log = Arc::new(ChainLogStore::new(log_chat.clone()));
         let snapshots = Arc::new(BlobSnapshotStore::new(snap_chat.clone()));
-        MetaStore::open(log, snapshots, counter(), MetaOptions { snapshot_every: 7, ..MetaOptions::default() })
+        MetaStore::open(log, snapshots, counter(), MetaOptions { snapshot_every: Some(7), ..MetaOptions::default() })
     };
     let a = open().await.unwrap();
     for i in 0..20u64 {
@@ -542,7 +542,7 @@ async fn a_boot_falls_back_to_an_older_base_when_the_newest_snapshot_is_unreadab
         let (log_chat, snap_chat) = (Arc::new(MemoryBlobStore::new()), Arc::new(MemoryBlobStore::new()));
         let snapshots =
             Arc::new(Unreadable { inner: Arc::new(BlobSnapshotStore::new(snap_chat)), bad: Mutex::default() });
-        let opts = MetaOptions { snapshot_every: 5, keep_snapshots: keep, ..MetaOptions::default() };
+        let opts = MetaOptions { snapshot_every: Some(5), keep_snapshots: keep, ..MetaOptions::default() };
         let open = || MetaStore::open(Arc::new(ChainLogStore::new(log_chat.clone())), snapshots.clone(), counter(), opts.clone());
         let a = open().await.unwrap();
         for i in 0..23u64 {
@@ -572,7 +572,7 @@ async fn a_local_log_restores_from_snapshots_in_a_blob_store() {
     let dir = tempfile::tempdir().unwrap();
     let chat = Arc::new(MemoryBlobStore::new());
     let snapshots: Arc<dyn SnapshotStore> = Arc::new(crate::BlobSnapshotStore::new(chat.clone()));
-    let opts = MetaOptions { snapshot_every: 10, snapshots_outlive_log: true, ..MetaOptions::default() };
+    let opts = MetaOptions { snapshot_every: Some(10), snapshots_outlive_log: true, ..MetaOptions::default() };
     let a = MetaStore::open(log_of(dir.path()), snapshots.clone(), counter(), opts)
         .await
         .unwrap();
@@ -593,8 +593,8 @@ async fn a_local_log_restores_from_snapshots_in_a_blob_store() {
 async fn an_idle_tablet_snapshots_by_time() {
     let dir = tempfile::tempdir().unwrap();
     let opts = MetaOptions {
-        snapshot_every: 0,
-        snapshot_interval: Duration::from_millis(50),
+        snapshot_every: None,
+        snapshot_interval: Some(Duration::from_millis(50)),
         keep_snapshots: 1,
         ..MetaOptions::default()
     };

@@ -4,8 +4,8 @@
 //! bytes, under Telegram's 20 MiB by 5%, and nobody means that by it.
 //! Durations are humantime strings (`"45s"`, `"10m"`, `"7d"`).
 //!
-//! A knob that can be switched off takes `"off"`, and refuses zero: a zero
-//! timeout or interval reads as "at once" as much as "never".
+//! A knob that can be switched off takes `"off"` (`None`), and refuses zero:
+//! a zero timeout or interval reads as "at once" as much as "never".
 
 use bytesize::{ByteSize, Unit};
 use humantime_serde::re::humantime;
@@ -21,30 +21,31 @@ pub(crate) fn size<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
     d.deserialize_any(SizeVisitor { off: false })
 }
 
-/// A size or `"off"` (0).
-pub(crate) fn size_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
-    d.deserialize_any(SizeVisitor { off: true })
+/// A size, or `"off"`: `None`.
+pub(crate) fn size_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    d.deserialize_any(SizeVisitor { off: true }).map(|n| (n > 0).then_some(n))
 }
 
-/// A count or `"off"` (0).
-pub(crate) fn count_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+/// A count, or `"off"`: `None`.
+pub(crate) fn count_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     d.deserialize_any(CountVisitor)
 }
 
-/// A duration or `"off"` (zero).
-pub(crate) fn duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+/// A duration, or `"off"`: `None`.
+pub(crate) fn duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
     let text = String::deserialize(d)?;
     if text.trim() == OFF {
-        return Ok(Duration::ZERO);
+        return Ok(None);
     }
     match humantime::parse_duration(&text).map_err(|e| de::Error::custom(format!("{text:?}: {e}")))? {
         Duration::ZERO => Err(de::Error::custom(format!("{text:?}: zero is ambiguous here, write \"{OFF}\""))),
-        d => Ok(d),
+        d => Ok(Some(d)),
     }
 }
 
-/// [`duration_or_off`] of an optional field (with `#[serde(default)]`).
-pub(crate) fn opt_duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+/// [`duration_or_off`] of an optional field (with `#[serde(default)]`):
+/// `None` when absent, `Some(None)` when off.
+pub(crate) fn opt_duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<Duration>>, D::Error> {
     duration_or_off(d).map(Some)
 }
 
@@ -80,7 +81,7 @@ fn zero_is_off<E: de::Error>() -> E {
 }
 
 struct SizeVisitor {
-    /// Takes `"off"` and refuses 0.
+    /// Takes `"off"`, as 0, and refuses a 0 written out.
     off: bool,
 }
 
@@ -117,26 +118,26 @@ impl<'de> Visitor<'de> for SizeVisitor {
 struct CountVisitor;
 
 impl<'de> Visitor<'de> for CountVisitor {
-    type Value = u64;
+    type Value = Option<u64>;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "a positive number, or \"{OFF}\"")
     }
 
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Option<u64>, E> {
         match v {
             0 => Err(zero_is_off()),
-            v => Ok(v),
+            v => Ok(Some(v)),
         }
     }
 
-    fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Option<u64>, E> {
         self.visit_u64(u64::try_from(v).map_err(|_| E::custom(format!("{v} is negative")))?)
     }
 
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Option<u64>, E> {
         match v.trim() {
-            OFF => Ok(0),
+            OFF => Ok(None),
             _ => Err(E::invalid_value(de::Unexpected::Str(v), &self)),
         }
     }

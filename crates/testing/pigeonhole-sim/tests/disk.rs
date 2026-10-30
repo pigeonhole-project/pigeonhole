@@ -13,7 +13,7 @@ async fn tablet(fs: &SimFs) -> anyhow::Result<Arc<MetaStore>> {
         Arc::new(ChainLogStore::new(open("/meta/log")?)),
         Arc::new(BlobSnapshotStore::new(open("/meta/snapshots")?)),
         Namespaces::new().with::<Journal>(),
-        MetaOptions { snapshot_every: 11, ..MetaOptions::default() },
+        MetaOptions { snapshot_every: Some(11), ..MetaOptions::default() },
     )
     .await
 }
