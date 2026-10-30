@@ -4,11 +4,12 @@ use crate::checksums::{self, copy_checksums, IncomingChecksums};
 use crate::commands::{Body, Expect, S3Reject, S3State};
 use crate::cool::{CoolPolicy, CoolReason};
 use crate::index::{
-    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ListPage, Rejected, SourceSnapshot,
+    parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ListPage, ObjectMeta, ObjectView, Rejected,
+    SourceSnapshot,
 };
 use pigeonhole_meta::{Outcome, Prepared, Proposal};
 use pigeonhole_chunk_store::Extent;
-use pigeonhole_chunk_store::{ChunkStore, IngestOptions};
+use pigeonhole_chunk_store::{ChunkStore, IngestOptions, Ingested, PendingChunks};
 use pigeonhole_codec::{self as chunker, ByteBudget, ChunkCodec};
 use async_trait::async_trait;
 use base64::Engine;
@@ -220,6 +221,218 @@ impl S3Gateway {
 
     fn etag_of(md5: &[u8; 16]) -> String {
         hex::encode(md5)
+    }
+
+    /// `NoSuchBucket` unless `bucket` exists.
+    async fn require_bucket(&self, bucket: &str) -> S3Result<()> {
+        if self.index.bucket_exists(bucket).await.map_err(Self::map_err)? {
+            Ok(())
+        } else {
+            Err(s3_error!(NoSuchBucket))
+        }
+    }
+
+    /// Store `data` as new chunks (not committed yet).
+    async fn ingest_bytes(&self, data: Bytes) -> S3Result<Ingested> {
+        self.store.ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options())).await.map_err(Self::map_err)
+    }
+
+    /// Commit `command` with the chunks of `extents` (`chunks`: those not
+    /// committed yet). The chunks the command replaced are released after
+    /// the answer; if it is refused, nothing points at `extents`: they are
+    /// released now and the refusal is answered as `refuse` says.
+    async fn commit_new(
+        &self,
+        chunks: Option<PendingChunks>,
+        extents: &[Extent],
+        command: Prepared<S3State>,
+        refuse: fn(S3Reject) -> s3s::S3Error,
+    ) -> S3Result<()> {
+        let outcome = match chunks {
+            Some(chunks) => self.commit_with(chunks, command).await?,
+            None => self.commit(command).await?,
+        };
+        match outcome {
+            Ok(old) => {
+                self.release_later(old);
+                Ok(())
+            }
+            Err(reject) => {
+                self.release_ids(&unique_chunk_ids(extents)).await;
+                Err(refuse(reject))
+            }
+        }
+    }
+
+    /// A part's write refused: its upload is gone, or something unexpected.
+    fn part_refused(reject: S3Reject) -> s3s::S3Error {
+        match reject {
+            S3Reject::NoSuchUpload => s3_error!(NoSuchUpload),
+            other => Self::map_err(format!("part rejected: {other:?}")),
+        }
+    }
+
+    /// Read a PUT's body: up to `inline_max` (and the declared length fits)
+    /// it stays in memory to be inlined (docs/inline-objects.md), else it is
+    /// ingested as chunks.
+    async fn take_body<S>(&self, mut stream: S, content_length: Option<i64>) -> S3Result<TakenBody>
+    where
+        S: futures::Stream<Item = anyhow::Result<Bytes>> + Unpin,
+    {
+        let max = self.opts.inline_max.map(|m| m as u64).filter(|&max| content_length.is_none_or(|n| (n as u64) <= max));
+        let mut head = Vec::new();
+        if let Some(max) = max {
+            if let Some(data) = read_at_most(&mut stream, max, &mut head).await.map_err(Self::map_err)? {
+                let md5: [u8; 16] = md5::Md5::digest(&data).into();
+                let size = data.len() as i64;
+                return Ok(TakenBody { body: Body::Inline(data), size, md5, chunks: None });
+            }
+        }
+        let stream = futures::stream::iter(head.into_iter().map(Ok)).chain(stream);
+        let ingested = self.store.ingest(stream, Some(self.ingest_options())).await.map_err(Self::map_err)?;
+        Ok(TakenBody {
+            body: Body::Chunks(ingested.extents),
+            size: ingested.size,
+            md5: ingested.md5,
+            chunks: Some(ingested.chunks),
+        })
+    }
+
+    /// One version of an object and the bytes of `range` of it. If its
+    /// chunks went away meanwhile (overwritten or deleted, then reclaimed),
+    /// that version is gone: look the key up again.
+    async fn read_object(&self, bucket: &str, key: &str, range: Option<&Range>) -> S3Result<ObjectRead> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let view = self
+                .index
+                .get_object_view(bucket, key)
+                .await
+                .map_err(Self::map_err)?
+                .ok_or_else(|| s3_error!(NoSuchKey))?;
+            let (start, length) = resolve_range(range, view.meta.size as u64)?;
+            let span = start..start + length;
+            let data = match &view.body {
+                _ if length == 0 => Bytes::new(),
+                Body::Inline(bytes) => Bytes::copy_from_slice(&bytes[span.start as usize..span.end as usize]),
+                Body::Chunks(extents) => match self.store.read(extents, Some(span)).await {
+                    Ok(data) => data,
+                    Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) && attempt < GET_ATTEMPTS => continue,
+                    Err(e) => return Err(Self::map_err(e)),
+                },
+            };
+            return Ok(ObjectRead { view, start, length, data });
+        }
+    }
+
+    /// The etag of a copied part: the source's if the part is all of a
+    /// single-part source, else the MD5 of its bytes.
+    async fn part_etag(&self, src: &SourceSnapshot, extents: &[Extent]) -> S3Result<String> {
+        let length = extents.iter().map(|e| e.len).sum::<i64>();
+        if length == src.size && !src.etag.contains('-') {
+            return Ok(src.etag.clone());
+        }
+        let data = self.store.read(extents, None).await.map_err(Self::map_err)?;
+        Ok(format!("{:x}", md5::Md5::digest(&data)))
+    }
+}
+
+/// A PUT's body as it is to be stored.
+struct TakenBody {
+    body: Body,
+    size: i64,
+    md5: [u8; 16],
+    /// Chunks to commit along (none for an inline body).
+    chunks: Option<PendingChunks>,
+}
+
+/// What [`S3Gateway::read_object`] read.
+struct ObjectRead {
+    view: ObjectView,
+    start: u64,
+    length: u64,
+    data: Bytes,
+}
+
+/// Read `stream` into `head` until it ends (the whole of it: `Some`) or
+/// passes `max` bytes (`None`; `head` holds what was read).
+async fn read_at_most<S>(stream: &mut S, max: u64, head: &mut Vec<Bytes>) -> anyhow::Result<Option<Vec<u8>>>
+where
+    S: futures::Stream<Item = anyhow::Result<Bytes>> + Unpin,
+{
+    let mut read = 0u64;
+    while let Some(b) = stream.next().await {
+        let b = b?;
+        read += b.len() as u64;
+        head.push(b);
+        if read > max {
+            return Ok(None);
+        }
+    }
+    Ok(Some(head.concat()))
+}
+
+/// The first byte and the length a GET's `Range` asks of `total` bytes
+/// (all of them without one).
+fn resolve_range(range: Option<&Range>, total: u64) -> S3Result<(u64, u64)> {
+    let (start, end_inclusive) = match range {
+        None if total == 0 => return Ok((0, 0)),
+        None => (0, total - 1),
+        Some(Range::Int { first, last }) => {
+            let last = last.unwrap_or(u64::MAX).min(total.saturating_sub(1));
+            if *first >= total || *first > last {
+                return Err(s3_error!(InvalidRange));
+            }
+            (*first, last)
+        }
+        Some(Range::Suffix { length }) => {
+            if *length == 0 || total == 0 {
+                return Err(s3_error!(InvalidRange));
+            }
+            (total.saturating_sub(*length), total - 1)
+        }
+    };
+    Ok((start, end_inclusive - start + 1))
+}
+
+/// The bucket and key of a copy's source (an access point is not supported).
+fn copy_source_of(source: CopySource) -> S3Result<(String, String)> {
+    match source {
+        CopySource::Bucket { bucket, key, .. } => Ok((bucket.to_string(), key.to_string())),
+        _ => Err(s3_error!(NotImplemented)),
+    }
+}
+
+/// A request's body as a stream (empty without one).
+fn body_stream(body: Option<StreamingBlob>) -> impl futures::Stream<Item = anyhow::Result<Bytes>> + Unpin {
+    match body {
+        Some(body) => body.map(|r| r.map_err(|e| anyhow::anyhow!(e))).left_stream(),
+        None => futures::stream::empty().right_stream(),
+    }
+}
+
+/// The answer to a CopyObject that wrote `dst`.
+fn copy_object_output(dst: &ObjectMeta) -> CopyObjectOutput {
+    CopyObjectOutput {
+        copy_object_result: Some(CopyObjectResult {
+            e_tag: Some(etag_hex(&dst.etag)),
+            last_modified: Some(ts(&dst.mtime)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The answer to an UploadPartCopy that wrote a part with `etag`.
+fn copy_part_output(etag: &str) -> UploadPartCopyOutput {
+    UploadPartCopyOutput {
+        copy_part_result: Some(CopyPartResult {
+            e_tag: Some(etag_hex(etag)),
+            last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
@@ -452,14 +665,7 @@ impl S3 for S3Gateway {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        if !self
-            .index
-            .bucket_exists(&req.input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
+        self.require_bucket(&req.input.bucket).await?;
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
@@ -467,14 +673,7 @@ impl S3 for S3Gateway {
         &self,
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        if !self
-            .index
-            .bucket_exists(&req.input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
+        self.require_bucket(&req.input.bucket).await?;
         // us-east-1 → null LocationConstraint (S3 convention).
         let location_constraint = if self.opts.region == "us-east-1" {
             None
@@ -491,14 +690,7 @@ impl S3 for S3Gateway {
         req: S3Request<ListObjectsInput>,
     ) -> S3Result<S3Response<ListObjectsOutput>> {
         let input = req.input;
-        if !self
-            .index
-            .bucket_exists(&input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
+        self.require_bucket(&input.bucket).await?;
 
         let prefix = input.prefix.as_deref().unwrap_or("");
         let (max_keys, max_keys_out) = clamp_max_keys(input.max_keys);
@@ -551,14 +743,7 @@ impl S3 for S3Gateway {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
-        if !self
-            .index
-            .bucket_exists(&input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
+        self.require_bucket(&input.bucket).await?;
 
         let prefix = input.prefix.as_deref().unwrap_or("");
         let (max_keys, max_keys_out) = clamp_max_keys(input.max_keys);
@@ -621,14 +806,7 @@ impl S3 for S3Gateway {
         // Non-versioned store: expose current objects as a single version with
         // VersionId "null" so clients (s3-tests nuke_bucket) can empty buckets.
         let input = req.input;
-        if !self
-            .index
-            .bucket_exists(&input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
+        self.require_bucket(&input.bucket).await?;
 
         let prefix = input.prefix.as_deref().unwrap_or("");
         let (max_keys, max_keys_out) = clamp_max_keys(input.max_keys);
@@ -704,14 +882,7 @@ impl S3 for S3Gateway {
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let trailing_headers = req.trailing_headers;
         let mut input = req.input;
-        if !self
-            .index
-            .bucket_exists(&input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
+        self.require_bucket(&input.bucket).await?;
 
         // Refuse a write bound to fail before reading its body; the command
         // decides again when it applies.
@@ -723,107 +894,36 @@ impl S3 for S3Gateway {
             Some(h) => parse_tagging_header(h)?,
             None => Vec::new(),
         };
-
         let mut expected = Checksum::default();
         copy_checksums!(input => expected);
-
         let checksums = IncomingChecksums::new(expected, &[input.checksum_algorithm.as_ref().map(|a| a.as_str())])?;
 
-        let stream = match input.body.take() {
-            Some(body) => body.map(|r| r.map_err(|e| anyhow::anyhow!(e))).left_stream(),
-            None => futures::stream::empty().right_stream(),
-        };
-        let mut stream = checksums.wrap(stream);
-
-        // A body of at most `inline_max` stays in the metadata
-        // (docs/inline-objects.md): read up to one byte more to know.
-        let mut head = Vec::new();
-        let mut inline = false;
-        if let Some(max) = self.opts.inline_max.map(|m| m as u64)
-            .filter(|&max| input.content_length.is_none_or(|n| (n as u64) <= max))
-        {
-            let mut read = 0u64;
-            loop {
-                match stream.next().await {
-                    Some(Ok(b)) => {
-                        read += b.len() as u64;
-                        head.push(b);
-                        if read > max {
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => return Err(Self::map_err(e)),
-                    None => {
-                        inline = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // The body as stored: inline bytes, or ingested chunks to commit along.
-        let (body, size, md5, chunks) = if inline {
-            let data: Vec<u8> = head.concat();
-            let md5: [u8; 16] = md5::Md5::digest(&data).into();
-            (Body::Inline(data.clone()), data.len() as i64, md5, None)
-        } else {
-            let stream = futures::stream::iter(head.into_iter().map(Ok)).chain(stream);
-            let ingested = self.store.ingest(stream, Some(self.ingest_options())).await.map_err(Self::map_err)?;
-            (Body::Chunks(ingested.extents), ingested.size, ingested.md5, Some(ingested.chunks))
-        };
-        let extents = body.extents().to_vec();
-
+        let stream = checksums.wrap(body_stream(input.body.take()));
+        let TakenBody { body, size, md5, chunks } = self.take_body(stream, input.content_length).await?;
         if let Some(exp) = expected_md5 {
             verify_content_md5_digest(exp, &md5)?;
         }
-
         let computed = checksums.verify(trailing_headers)?;
 
-        let content_type = input.content_type.as_deref();
-        let user_meta: Vec<(String, String)> = input
-            .metadata
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let user_meta: Vec<(String, String)> = input.metadata.unwrap_or_default().into_iter().collect();
         let checksums_json = computed.as_ref().map_or_else(|| "{}".to_string(), checksums::to_json);
         let etag = Self::etag_of(&md5);
-
+        let (extents, inline) = (body.extents().to_vec(), matches!(body, Body::Inline(_)));
         // The chunks (if any), the object and its tags: one entry.
         let put = self.index.prepare_put_object(
             &input.bucket,
             &input.key,
             &etag,
             size,
-            content_type,
+            input.content_type.as_deref(),
             body,
             &user_meta,
             &tags,
             &checksums_json,
             expect,
         );
-        let outcome = match chunks {
-            Some(chunks) => self.commit_with(chunks, put).await?,
-            None => self.commit(put).await?,
-        };
-        let old = match outcome {
-            Ok(old) => old,
-            Err(reject) => {
-                // The bucket went away or the condition failed meanwhile:
-                // nothing points at the chunks.
-                self.release_ids(&unique_chunk_ids(&extents)).await;
-                return Err(Self::refused(reject));
-            }
-        };
-        self.release_later(old);
-
-        info!(
-            bucket = %input.bucket,
-            key = %input.key,
-            size,
-            extents = extents.len(),
-            inline,
-            "PutObject ok"
-        );
+        self.commit_new(chunks, &extents, put, Self::refused).await?;
+        info!(bucket = %input.bucket, key = %input.key, size, extents = extents.len(), inline, "PutObject ok");
 
         let mut output = PutObjectOutput {
             e_tag: Some(etag_hex(&etag)),
@@ -840,95 +940,29 @@ impl S3 for S3Gateway {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
-        // Read one version of the object, then its chunks. If the chunks went
-        // away meanwhile (overwritten or deleted, then reclaimed), that version
-        // is gone: look the key up again.
-        let mut attempt = 0;
-        let (view, start, end_inclusive, length, body) = loop {
-            attempt += 1;
-            let view = self
-                .index
-                .get_object_view(&input.bucket, &input.key)
-                .await
-                .map_err(Self::map_err)?
-                .ok_or_else(|| s3_error!(NoSuchKey))?;
-            let total = view.meta.size as u64;
-            let (start, end_inclusive) = match input.range {
-                None => (0u64, total.saturating_sub(1)),
-                Some(Range::Int { first, last }) => {
-                    let last = last
-                        .unwrap_or(total.saturating_sub(1))
-                        .min(total.saturating_sub(1));
-                    if first >= total || first > last {
-                        return Err(s3_error!(InvalidRange));
-                    }
-                    (first, last)
-                }
-                Some(Range::Suffix { length }) => {
-                    if length == 0 || total == 0 {
-                        return Err(s3_error!(InvalidRange));
-                    }
-                    let start = total.saturating_sub(length);
-                    (start, total.saturating_sub(1))
-                }
-            };
-            let length = if total == 0 {
-                0
-            } else {
-                end_inclusive.saturating_sub(start) + 1
-            };
-            if length == 0 {
-                break (view, start, end_inclusive, length, Bytes::new());
-            }
-            let range = start..(start.saturating_add(length));
-            if let Body::Inline(bytes) = &view.body {
-                let data = Bytes::copy_from_slice(&bytes[range.start as usize..range.end as usize]);
-                break (view, start, end_inclusive, length, data);
-            }
-            match self.store.read(view.body.extents(), Some(range)).await {
-                Ok(data) => break (view, start, end_inclusive, length, data),
-                Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) && attempt < GET_ATTEMPTS => continue,
-                Err(e) => return Err(Self::map_err(e)),
-            }
-        };
-        let total = view.meta.size as u64;
+        let ObjectRead { view, start, length, data } =
+            self.read_object(&input.bucket, &input.key, input.range.as_ref()).await?;
         let meta = view.meta;
-        let body = Some(StreamingBlob::from_bytes(body));
-        let content_range = input
-            .range
-            .as_ref()
-            .map(|_| format!("bytes {start}-{end_inclusive}/{total}"));
-        let metadata = if view.user_meta.is_empty() {
-            None
-        } else {
-            Some(view.user_meta.into_iter().collect())
-        };
-        let tag_count = view.tag_count as i32;
-
-        let checksum_enabled = input
-            .checksum_mode
-            .as_ref()
-            .is_some_and(|m| m.as_str() == ChecksumMode::ENABLED);
-        let full_object = length == total;
-        let stored_checksum = if checksum_enabled && full_object {
-            checksums::from_json(&view.checksums_json)
-        } else {
-            Checksum::default()
-        };
-
+        let total = meta.size as u64;
+        // A range is never empty: `resolve_range` refuses one.
+        let content_range = input.range.as_ref().map(|_| format!("bytes {start}-{}/{total}", start + length - 1));
+        let metadata = view.user_meta.is_empty().not().then(|| view.user_meta.into_iter().collect());
         let mut output = GetObjectOutput {
-            body,
+            body: Some(StreamingBlob::from_bytes(data)),
             content_length: Some(length as i64),
             content_range,
             e_tag: Some(etag_hex(&meta.etag)),
             content_type: meta.content_type,
             last_modified: Some(ts(&meta.mtime)),
             metadata,
-            tag_count: Some(tag_count),
+            tag_count: Some(view.tag_count as i32),
             ..Default::default()
         };
-        if checksum_enabled && full_object {
-            copy_checksums!(stored_checksum => output);
+        // The stored checksums are of the whole object.
+        let checksum_enabled = input.checksum_mode.as_ref().is_some_and(|m| m.as_str() == ChecksumMode::ENABLED);
+        if checksum_enabled && length == total {
+            let stored = checksums::from_json(&view.checksums_json);
+            copy_checksums!(stored => output);
         }
         Ok(S3Response::new(output))
     }
@@ -1035,116 +1069,61 @@ impl S3 for S3Gateway {
         let input = req.input;
         let expect = expect_of(input.if_match, input.if_none_match)?;
         self.index.check_expect(&input.bucket, &input.key, expect.as_ref()).map_err(Self::write_err)?;
-        let (src_bucket, src_key) = match input.copy_source {
-            CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
-            _ => return Err(s3_error!(NotImplemented)),
-        };
-        if self
-            .index
-            .get_object(&src_bucket, &src_key)
-            .await
-            .map_err(Self::map_err)?
-            .is_none()
-        {
+        let (src_bucket, src_key) = copy_source_of(input.copy_source)?;
+        if self.index.get_object(&src_bucket, &src_key).await.map_err(Self::map_err)?.is_none() {
             return Err(s3_error!(NoSuchKey));
         }
-        if !self
-            .index
-            .bucket_exists(&input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
+        self.require_bucket(&input.bucket).await?;
 
-        let copy_source_meta = input
-            .metadata_directive
-            .as_ref()
-            .map(|d| d.as_str())
-            != Some(MetadataDirective::REPLACE);
-        let content_type = if copy_source_meta {
-            None
+        let copy_source_meta =
+            input.metadata_directive.as_ref().map(|d| d.as_str()) != Some(MetadataDirective::REPLACE);
+        let (content_type, user_meta): (_, Vec<(String, String)>) = if copy_source_meta {
+            (None, vec![])
         } else {
-            input.content_type.as_deref()
-        };
-        let user_meta: Vec<(String, String)> = if copy_source_meta {
-            vec![]
-        } else {
-            input.metadata.unwrap_or_default().into_iter().collect()
+            (input.content_type.as_deref(), input.metadata.unwrap_or_default().into_iter().collect())
         };
 
-        let (src, extents) = self
-            .pin_copy_source(&src_bucket, &src_key, |src| Ok(src.body.extents().to_vec()))
-            .await?;
+        let (src, extents) =
+            self.pin_copy_source(&src_bucket, &src_key, |src| Ok(src.body.extents().to_vec())).await?;
         // An inline source too large for inlining now (it is off, or the
         // threshold was lowered) is stored at the destination as new chunks.
-        if let Body::Inline(bytes) = &src.body {
-            if self.opts.inline_max.is_none_or(|max| bytes.len() > max) {
-                let data = Bytes::copy_from_slice(bytes);
-                let ingested = self
-                    .store
-                    .ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options()))
-                    .await
-                    .map_err(Self::map_err)?;
-                let (put, dst) = self.index.prepare_copy_object(
-                    &src,
-                    Body::Chunks(ingested.extents.clone()),
-                    &input.bucket,
-                    &input.key,
-                    content_type,
-                    &user_meta,
-                    copy_source_meta,
-                    expect,
-                );
-                let old = match self.commit_with(ingested.chunks, put).await? {
-                    Ok(old) => old,
-                    Err(reject) => {
-                        self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
-                        return Err(Self::refused(reject));
-                    }
-                };
-                self.release_later(old);
-                return Ok(S3Response::new(CopyObjectOutput {
-                    copy_object_result: Some(CopyObjectResult {
-                        e_tag: Some(etag_hex(&dst.etag)),
-                        last_modified: Some(ts(&dst.mtime)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }));
+        let rechunk = match &src.body {
+            Body::Inline(bytes) if self.opts.inline_max.is_none_or(|max| bytes.len() > max) => {
+                Some(Bytes::copy_from_slice(bytes))
             }
-        }
-
-        let held = unique_chunk_ids(&extents);
-        let (dst, old) = match self
-            .index
-            .copy_object(
+            _ => None,
+        };
+        if let Some(data) = rechunk {
+            let ingested = self.ingest_bytes(data).await?;
+            let (put, dst) = self.index.prepare_copy_object(
                 &src,
+                Body::Chunks(ingested.extents.clone()),
                 &input.bucket,
                 &input.key,
                 content_type,
                 &user_meta,
                 copy_source_meta,
                 expect,
-            )
-            .await
-        {
-            Ok(r) => r,
+            );
+            self.commit_new(Some(ingested.chunks), &ingested.extents, put, Self::refused).await?;
+            return Ok(S3Response::new(copy_object_output(&dst)));
+        }
+
+        let copied = self
+            .index
+            .copy_object(&src, &input.bucket, &input.key, content_type, &user_meta, copy_source_meta, expect)
+            .await;
+        let dst = match copied {
+            Ok((dst, old)) => {
+                self.release_later(old);
+                dst
+            }
             Err(e) => {
-                self.release_ids(&held).await;
+                self.release_ids(&unique_chunk_ids(&extents)).await;
                 return Err(Self::write_err(e));
             }
         };
-        self.release_later(old);
-
-        Ok(S3Response::new(CopyObjectOutput {
-            copy_object_result: Some(CopyObjectResult {
-                e_tag: Some(etag_hex(&dst.etag)),
-                last_modified: Some(ts(&dst.mtime)),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
+        Ok(S3Response::new(copy_object_output(&dst)))
     }
 
     async fn create_multipart_upload(
@@ -1152,14 +1131,7 @@ impl S3 for S3Gateway {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
-        if !self
-            .index
-            .bucket_exists(&input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
+        self.require_bucket(&input.bucket).await?;
         let tags = match input.tagging.as_deref() {
             Some(h) => parse_tagging_header(h)?,
             None => Vec::new(),
@@ -1209,44 +1181,21 @@ impl S3 for S3Gateway {
 
         let mut expected = Checksum::default();
         copy_checksums!(input => expected);
-
         let checksums = IncomingChecksums::new(
             expected,
             &[upload.checksum_algorithm.as_deref(), input.checksum_algorithm.as_ref().map(|a| a.as_str())],
         )?;
 
-        let stream = match input.body.take() {
-            Some(body) => body.map(|r| r.map_err(|e| anyhow::anyhow!(e))).left_stream(),
-            None => futures::stream::empty().right_stream(),
-        };
-        let stream = checksums.wrap(stream);
-
-        let mut ingested = self
-            .store
-            .ingest(stream, Some(self.ingest_options()))
-            .await
-            .map_err(Self::map_err)?;
-
+        let stream = checksums.wrap(body_stream(input.body.take()));
+        let ingested = self.store.ingest(stream, Some(self.ingest_options())).await.map_err(Self::map_err)?;
         if let Some(exp) = expected_md5 {
             verify_content_md5_digest(exp, &ingested.md5)?;
         }
-
         let computed = checksums.verify(trailing_headers)?;
 
         let etag = Self::etag_of(&ingested.md5);
         let put = self.index.prepare_put_part(&upload_id, part_number, &etag, ingested.size, &ingested.extents);
-        let chunks = std::mem::take(&mut ingested.chunks);
-        let old = match self.commit_with(chunks, put).await? {
-            Ok(old) => old,
-            Err(reject) => {
-                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
-                return Err(match reject {
-                    S3Reject::NoSuchUpload => s3_error!(NoSuchUpload),
-                    other => Self::map_err(format!("UploadPart rejected: {other:?}")),
-                });
-            }
-        };
-        self.release_later(old);
+        self.commit_new(Some(ingested.chunks), &ingested.extents, put, Self::part_refused).await?;
 
         let mut output = UploadPartOutput {
             e_tag: Some(etag_hex(&etag)),
@@ -1272,98 +1221,49 @@ impl S3 for S3Gateway {
         if upload.bucket != input.bucket || upload.key != input.key {
             return Err(s3_error!(NoSuchUpload));
         }
-
-        let (src_bucket, src_key) = match input.copy_source {
-            CopySource::Bucket { bucket, key, .. } => (bucket.to_string(), key.to_string()),
-            _ => return Err(s3_error!(NotImplemented)),
-        };
-        let range = input.copy_source_range.as_deref();
+        let (src_bucket, src_key) = copy_source_of(input.copy_source)?;
         let part_number = i64::from(input.part_number);
+        // The first byte and the length of the part in a source of `size`.
+        let span = |size: i64| match input.copy_source_range.as_deref() {
+            None => Ok((0u64, size as u64)),
+            Some(r) => parse_copy_source_range(r, size as u64),
+        };
 
         // An inline source has no chunks to share: its bytes become the part.
         if let Some(src) = self.index.get_copy_source(&src_bucket, &src_key).await.map_err(Self::map_err)? {
             if let Body::Inline(bytes) = &src.body {
-                let (start, length) = match range {
-                    None => (0u64, src.size as u64),
-                    Some(r) => parse_copy_source_range(r, src.size as u64)?,
-                };
+                let (start, length) = span(src.size)?;
                 let data = Bytes::copy_from_slice(&bytes[start as usize..(start + length) as usize]);
-                let ingested = self
-                    .store
-                    .ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options()))
-                    .await
-                    .map_err(Self::map_err)?;
+                let ingested = self.ingest_bytes(data).await?;
                 let etag = Self::etag_of(&ingested.md5);
-                let put = self.index.prepare_put_part(&input.upload_id, part_number, &etag, ingested.size, &ingested.extents);
-                let old = match self.commit_with(ingested.chunks, put).await? {
-                    Ok(old) => old,
-                    Err(reject) => {
-                        self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
-                        return Err(match reject {
-                            S3Reject::NoSuchUpload => s3_error!(NoSuchUpload),
-                            other => Self::map_err(format!("UploadPartCopy rejected: {other:?}")),
-                        });
-                    }
-                };
-                self.release_later(old);
-                return Ok(S3Response::new(UploadPartCopyOutput {
-                    copy_part_result: Some(CopyPartResult {
-                        e_tag: Some(etag_hex(&etag)),
-                        last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }));
+                let put =
+                    self.index.prepare_put_part(&input.upload_id, part_number, &etag, ingested.size, &ingested.extents);
+                self.commit_new(Some(ingested.chunks), &ingested.extents, put, Self::part_refused).await?;
+                return Ok(S3Response::new(copy_part_output(&etag)));
             }
         }
 
-        let (src, part_extents) = self
+        let (src, extents) = self
             .pin_copy_source(&src_bucket, &src_key, |src| {
-                let (start, length) = match range {
-                    None => (0u64, src.size as u64),
-                    Some(r) => parse_copy_source_range(r, src.size as u64)?,
-                };
+                let (start, length) = span(src.size)?;
                 Ok(slice_extents(src.body.extents(), start, length))
             })
             .await?;
-        let held = unique_chunk_ids(&part_extents);
-        let total = src.size as u64;
-        let length = part_extents.iter().map(|e| e.len).sum::<i64>() as u64;
-
-        let etag = if length == total && !src.etag.contains('-') {
-            src.etag.clone()
-        } else {
-            match self.store.read(&part_extents, None).await {
-                Ok(data) => {
-                    let mut md5 = md5::Md5::new();
-                    md5.update(&data);
-                    format!("{:x}", md5.finalize())
-                }
-                Err(e) => {
-                    self.release_ids(&held).await;
-                    return Err(Self::map_err(e));
-                }
-            }
+        let length = extents.iter().map(|e| e.len).sum::<i64>();
+        let put = async {
+            let etag = self.part_etag(&src, &extents).await?;
+            self.index
+                .put_multipart_part(&input.upload_id, part_number, &etag, length, &extents)
+                .await
+                .map_err(Self::map_err)
         };
-
-        let old = match self
-            .index
-            .put_multipart_part(
-                &input.upload_id,
-                part_number,
-                &etag,
-                length as i64,
-                &part_extents,
-            )
-            .await
-        {
-            Ok(old) => old,
+        match put.await {
+            Ok(old) => self.release_later(old),
             Err(e) => {
-                self.release_ids(&held).await;
-                return Err(Self::map_err(e));
+                self.release_ids(&unique_chunk_ids(&extents)).await;
+                return Err(e);
             }
-        };
-        self.release_later(old);
+        }
 
         let part = self
             .index
@@ -1371,16 +1271,9 @@ impl S3 for S3Gateway {
             .await
             .map_err(Self::map_err)?
             .ok_or_else(|| s3_error!(InternalError, "part missing after copy"))?;
-
-        Ok(S3Response::new(UploadPartCopyOutput {
-            copy_part_result: Some(CopyPartResult {
-                e_tag: Some(etag_hex(&part.etag)),
-                last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
+        Ok(S3Response::new(copy_part_output(&part.etag)))
     }
+
     async fn put_object_tagging(
         &self,
         req: S3Request<PutObjectTaggingInput>,
@@ -1507,14 +1400,7 @@ impl S3 for S3Gateway {
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
         let input = req.input;
-        if !self
-            .index
-            .bucket_exists(&input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
-            return Err(s3_error!(NoSuchBucket));
-        }
+        self.require_bucket(&input.bucket).await?;
         let prefix = input.prefix.as_deref().unwrap_or("");
         let (max_uploads, max_uploads_out) = clamp_max_keys(input.max_uploads);
         let (uploads, truncated, next) = self
