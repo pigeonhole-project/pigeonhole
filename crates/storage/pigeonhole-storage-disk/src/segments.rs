@@ -206,65 +206,16 @@ impl Locked<'_> {
         };
         let size = file.len()?;
         while pos < size {
-            let torn = |what: &str| -> Result<()> {
-                if last {
-                    Ok(())
-                } else {
-                    bail!("segment {seq}: {what} at {pos} in a segment that is not the last")
-                }
+            let found = read_record(file.as_ref(), pos, size, last).with_context(|| format!("segment {seq}"))?;
+            let (header, label) = match found {
+                Found::Record(header, label) => (header, label),
+                Found::Unwritten if last => break,
+                Found::Unwritten => bail!("segment {seq}: bad record magic at {pos}"),
+                Found::Torn(_) if last => break,
+                Found::Torn(what) => bail!("segment {seq}: {what} at {pos} in a segment that is not the last"),
             };
-            if size - pos < HEADER {
-                torn("a short header")?;
-                break;
-            }
-            let mut h = [0u8; HEADER as usize];
-            file.read_exact_at(&mut h, pos)?;
-            let magic = u32::from_le_bytes(h[0..4].try_into().unwrap());
-            let flags = h[4];
-            let label_len = u16::from_le_bytes(h[6..8].try_into().unwrap());
-            let data_len = u64::from_le_bytes(h[8..16].try_into().unwrap());
-            let prev = u64::from_le_bytes(h[16..24].try_into().unwrap());
-            let crc = u32::from_le_bytes(h[24..28].try_into().unwrap());
-            if magic != MAGIC {
-                if last && h.iter().all(|b| *b == 0) {
-                    break; // preallocated, never written
-                }
-                bail!("segment {seq}: bad record magic at {pos}");
-            }
-            let end = pos + HEADER + label_len as u64 + data_len;
-            if end > size {
-                torn("a record past the end")?;
-                break;
-            }
-            let mut label = vec![0; label_len as usize];
-            file.read_exact_at(&mut label, pos + HEADER)?;
-            let dead = flags & DEAD != 0;
-            // Only the last record can be torn with a whole length: check its
-            // data (a dead one may be a hole).
-            if last && end == size && !dead {
-                let mut data = vec![0; data_len as usize];
-                file.read_exact_at(&mut data, pos + HEADER + label_len as u64)?;
-                if record_crc(flags, &h, &label, &data) != crc {
-                    torn("a record failing its checksum")?;
-                    break;
-                }
-            }
-            let key = key_of(seq, pos);
-            let chain = (flags & CHAINED != 0).then(|| ChainRec {
-                prev: (prev != NO_PREV).then_some(prev),
-                label: String::from_utf8_lossy(&label).into_owned(),
-            });
-            if let Some(c) = &chain {
-                if let std::collections::hash_map::Entry::Vacant(e) = self.next.entry(c.prev) {
-                    e.insert(key);
-                    self.tail = Some(key);
-                }
-            }
-            if !dead {
-                self.segs.get_mut(&seq).unwrap().live += 1;
-            }
-            self.records.insert(key, Rec { data_len, label_len, dead, chain });
-            pos = end;
+            self.index(key_of(seq, pos), &header, &label);
+            pos += header.record_len();
         }
         if pos < size {
             // A torn tail: never acknowledged, drop it.
@@ -273,6 +224,26 @@ impl Locked<'_> {
         }
         self.segs.get_mut(&seq).unwrap().len = pos;
         Ok(())
+    }
+
+    /// Add a record found by [`Self::scan`] to the index; the first
+    /// successor of a chain record wins.
+    fn index(&mut self, key: u64, header: &Header, label: &[u8]) {
+        let chain = (header.flags & CHAINED != 0).then(|| ChainRec {
+            prev: (header.prev != NO_PREV).then_some(header.prev),
+            label: String::from_utf8_lossy(label).into_owned(),
+        });
+        if let Some(c) = &chain {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.next.entry(c.prev) {
+                e.insert(key);
+                self.tail = Some(key);
+            }
+        }
+        if !header.dead() {
+            self.segs.get_mut(&split(key).0).unwrap().live += 1;
+        }
+        let rec = Rec { data_len: header.data_len, label_len: header.label_len, dead: header.dead(), chain };
+        self.records.insert(key, rec);
     }
 
     /// Append one record and fsync it; its key.
@@ -295,18 +266,12 @@ impl Locked<'_> {
             Some((prev, _)) => (CHAINED, prev.unwrap_or(NO_PREV)),
             None => (0, NO_PREV),
         };
-        let mut h = [0u8; HEADER as usize];
-        h[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        h[4] = flags;
-        h[6..8].copy_from_slice(&(label.len() as u16).to_le_bytes());
-        h[8..16].copy_from_slice(&(data.len() as u64).to_le_bytes());
-        h[16..24].copy_from_slice(&prev.to_le_bytes());
-        let crc = record_crc(flags, &h, label.as_bytes(), data);
-        h[24..28].copy_from_slice(&crc.to_le_bytes());
+        let mut header = Header { flags, label_len: label.len() as u16, data_len: data.len() as u64, prev, crc: 0 };
+        header.crc = header.checksum(label.as_bytes(), data);
 
         let seg = self.segs.get_mut(&seq).unwrap();
         let pos = seg.len;
-        let mut head = h.to_vec();
+        let mut head = header.encode().to_vec();
         head.extend_from_slice(label.as_bytes());
         seg.file.write_all_at(&head, pos)?;
         seg.file.write_all_at(data, pos + head.len() as u64)?;
@@ -359,13 +324,106 @@ impl Locked<'_> {
     }
 }
 
-fn record_crc(flags: u8, header: &[u8], label: &[u8], data: &[u8]) -> u32 {
-    let mut h = crc32fast::Hasher::new();
-    h.update(&[flags & !DEAD]);
-    h.update(&header[6..24]);
-    h.update(label);
-    h.update(data);
-    h.finalize()
+/// A record's fixed header (see the module doc for the layout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Header {
+    flags: u8,
+    label_len: u16,
+    data_len: u64,
+    prev: u64,
+    crc: u32,
+}
+
+impl Header {
+    fn encode(&self) -> [u8; HEADER as usize] {
+        let mut h = [0u8; HEADER as usize];
+        h[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        h[4] = self.flags;
+        h[6..8].copy_from_slice(&self.label_len.to_le_bytes());
+        h[8..16].copy_from_slice(&self.data_len.to_le_bytes());
+        h[16..24].copy_from_slice(&self.prev.to_le_bytes());
+        h[24..28].copy_from_slice(&self.crc.to_le_bytes());
+        h
+    }
+
+    /// `None` without the magic.
+    fn decode(h: &[u8; HEADER as usize]) -> Option<Self> {
+        let u64_at = |i: usize| u64::from_le_bytes(h[i..i + 8].try_into().unwrap());
+        if h[0..4] != MAGIC.to_le_bytes() {
+            return None;
+        }
+        Some(Self {
+            flags: h[4],
+            label_len: u16::from_le_bytes([h[6], h[7]]),
+            data_len: u64_at(8),
+            prev: u64_at(16),
+            crc: u32::from_le_bytes(h[24..28].try_into().unwrap()),
+        })
+    }
+
+    fn dead(&self) -> bool {
+        self.flags & DEAD != 0
+    }
+
+    /// The header, the label and the data.
+    fn record_len(&self) -> u64 {
+        HEADER + self.label_len as u64 + self.data_len
+    }
+
+    /// What `crc` should be: the flags (without `DEAD`), the lengths,
+    /// `prev`, the label and the data.
+    fn checksum(&self, label: &[u8], data: &[u8]) -> u32 {
+        let mut h = crc32fast::Hasher::new();
+        h.update(&[self.flags & !DEAD]);
+        h.update(&self.label_len.to_le_bytes());
+        h.update(&self.data_len.to_le_bytes());
+        h.update(&self.prev.to_le_bytes());
+        h.update(label);
+        h.update(data);
+        h.finalize()
+    }
+}
+
+/// What a scan finds at a position of a segment.
+enum Found {
+    /// A whole record and its label.
+    Record(Header, Vec<u8>),
+    /// A torn write: what is wrong with it.
+    Torn(&'static str),
+    /// Zeros: preallocated, never written.
+    Unwritten,
+}
+
+/// The record at `pos` of a segment file of `size` bytes. A bad magic that
+/// is not all zeros is an error. Only the last record of the last segment
+/// can be torn with a whole length, so only its data is checked (a dead
+/// one may be a hole).
+fn read_record(file: &dyn FsFile, pos: u64, size: u64, last: bool) -> Result<Found> {
+    if size - pos < HEADER {
+        return Ok(Found::Torn("a short header"));
+    }
+    let mut h = [0u8; HEADER as usize];
+    file.read_exact_at(&mut h, pos)?;
+    let Some(header) = Header::decode(&h) else {
+        if h.iter().all(|b| *b == 0) {
+            return Ok(Found::Unwritten);
+        }
+        bail!("bad record magic at {pos}");
+    };
+    let end = pos + header.record_len();
+    if end > size {
+        return Ok(Found::Torn("a record past the end"));
+    }
+    let mut label = vec![0; header.label_len as usize];
+    file.read_exact_at(&mut label, pos + HEADER)?;
+    if last && end == size && !header.dead() {
+        let mut data = vec![0; header.data_len as usize];
+        file.read_exact_at(&mut data, pos + HEADER + header.label_len as u64)?;
+        if header.checksum(&label, &data) != header.crc {
+            return Ok(Found::Torn("a record failing its checksum"));
+        }
+    }
+    Ok(Found::Record(header, label))
 }
 
 /// Free the blocks fully inside `[off, off + len)`; the file keeps its size.

@@ -389,6 +389,7 @@ def main() -> int:
     ap.add_argument("--top", type=int, default=20, help="hotspot rows (default 20)")
     ap.add_argument("--max-cognitive", type=int,
                     help="fail if a non-test fn exceeds this cognitive complexity")
+    ap.add_argument("--max-lines", type=int, help="fail if a non-test fn is longer than this")
     args = ap.parse_args()
 
     crates = workspace()
@@ -488,13 +489,16 @@ def main() -> int:
     else:
         sys.stdout.write(text)
 
+    over = []
     if args.max_cognitive is not None:
-        over = [f for f in prod if f.cognitive > args.max_cognitive]
-        for f in over:
-            print(f"error: {f.file}:{f.line} `{f.name}` cognitive {f.cognitive} > {args.max_cognitive}",
-                  file=sys.stderr)
-        if over:
-            return 1
+        over += [f"{f.file}:{f.line} `{f.name}` cognitive {f.cognitive} > {args.max_cognitive}"
+                 for f in prod if f.cognitive > args.max_cognitive]
+    if args.max_lines is not None:
+        over += [f"{f.file}:{f.line} `{f.name}` {f.lines} lines > {args.max_lines}" for f in prod if f.lines > args.max_lines]
+    for msg in over:
+        print(f"error: {msg}", file=sys.stderr)
+    if over:
+        return 1
     return 0
 
 
