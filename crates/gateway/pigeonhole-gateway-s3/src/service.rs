@@ -1,7 +1,8 @@
 //! S3 API implementation on top of gateway index + ChunkStore (via s3s).
 
 use crate::checksums::{self, copy_checksums, IncomingChecksums};
-use crate::commands::{Expect, S3Reject, S3State};
+use crate::commands::{Body, Expect, S3Reject, S3State};
+use crate::cool::{CoolPolicy, CoolReason};
 use crate::index::{
     parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ListPage, Rejected, SourceSnapshot,
 };
@@ -25,6 +26,17 @@ use tracing::info;
 /// GET re-reads the object this many times if its chunks are reclaimed underneath it.
 const GET_ATTEMPTS: u32 = 5;
 
+/// What one [`S3Gateway::cool_pass`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CoolStats {
+    /// Moved out for not being rewritten for `cool_after`.
+    pub by_age: u64,
+    /// Moved out to bring the inline bytes under budget.
+    pub by_budget: u64,
+    /// Changed meanwhile: left as they are.
+    pub rejected: u64,
+}
+
 /// What the S3 gateway takes from the configuration.
 #[derive(Clone, Debug)]
 pub struct S3Options {
@@ -36,6 +48,9 @@ pub struct S3Options {
     pub block_size: usize,
     /// Process-wide ingest buffer budget (shared across PUTs).
     pub ingest_budget: Option<ByteBudget>,
+    /// Objects up to this size are stored inline in the metadata
+    /// (docs/inline-objects.md); `None`: never.
+    pub inline_max: Option<usize>,
 }
 
 impl S3Options {
@@ -47,6 +62,7 @@ impl S3Options {
             chunk_codec: ChunkCodec::Zstd,
             block_size: chunker::DEFAULT_BLOCK_SIZE,
             ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
+            inline_max: None,
         }
     }
 }
@@ -107,6 +123,39 @@ impl S3Gateway {
         let slot = proposal.push(command);
         let mut outcomes =
             self.store.commit_along(chunks, self.index.meta(), proposal).await.map_err(Self::map_err)?;
+        outcomes.take(slot).map_err(Self::map_err)
+    }
+
+    /// One pass of the cooler (docs/inline-objects.md § The cooler): move
+    /// the inline objects `policy` picks out to chunks, each as its chunk and
+    /// a `Cool` in one entry. An object rewritten or deleted meanwhile keeps
+    /// its new state; the chunk made for it is released.
+    pub async fn cool_pass(&self, policy: &CoolPolicy) -> anyhow::Result<CoolStats> {
+        let mut stats = CoolStats::default();
+        for c in self.index.cool_candidates(chrono::Utc::now(), policy) {
+            let data = Bytes::from(c.bytes.clone());
+            let ingested = self.store.ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options())).await?;
+            let cool = self.index.prepare_cool(&c, &ingested.extents);
+            let outcome = self.commit_with(ingested.chunks, cool).await.map_err(|e| anyhow::anyhow!("cool {}/{}: {e:?}", c.bucket, c.key))?;
+            match outcome {
+                Ok(_) => match c.reason {
+                    CoolReason::Age => stats.by_age += 1,
+                    CoolReason::Budget => stats.by_budget += 1,
+                },
+                Err(_) => {
+                    self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                    stats.rejected += 1;
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Commit `command` alone (nothing to upload); its outcome.
+    async fn commit(&self, command: Prepared<S3State>) -> S3Result<Outcome<S3State>> {
+        let mut proposal = Proposal::new();
+        let slot = proposal.push(command);
+        let mut outcomes = self.index.meta().propose_all(proposal).await.map_err(Self::map_err)?;
         outcomes.take(slot).map_err(Self::map_err)
     }
 
@@ -685,16 +734,48 @@ impl S3 for S3Gateway {
             Some(body) => body.map(|r| r.map_err(|e| anyhow::anyhow!(e))).left_stream(),
             None => futures::stream::empty().right_stream(),
         };
-        let stream = checksums.wrap(stream);
+        let mut stream = checksums.wrap(stream);
 
-        let mut ingested = self
-            .store
-            .ingest(stream, Some(self.ingest_options()))
-            .await
-            .map_err(Self::map_err)?;
+        // A body of at most `inline_max` stays in the metadata
+        // (docs/inline-objects.md): read up to one byte more to know.
+        let mut head = Vec::new();
+        let mut inline = false;
+        if let Some(max) = self.opts.inline_max.map(|m| m as u64)
+            .filter(|&max| input.content_length.is_none_or(|n| (n as u64) <= max))
+        {
+            let mut read = 0u64;
+            loop {
+                match stream.next().await {
+                    Some(Ok(b)) => {
+                        read += b.len() as u64;
+                        head.push(b);
+                        if read > max {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => return Err(Self::map_err(e)),
+                    None => {
+                        inline = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // The body as stored: inline bytes, or ingested chunks to commit along.
+        let (body, size, md5, chunks) = if inline {
+            let data: Vec<u8> = head.concat();
+            let md5: [u8; 16] = md5::Md5::digest(&data).into();
+            (Body::Inline(data.clone()), data.len() as i64, md5, None)
+        } else {
+            let stream = futures::stream::iter(head.into_iter().map(Ok)).chain(stream);
+            let ingested = self.store.ingest(stream, Some(self.ingest_options())).await.map_err(Self::map_err)?;
+            (Body::Chunks(ingested.extents), ingested.size, ingested.md5, Some(ingested.chunks))
+        };
+        let extents = body.extents().to_vec();
 
         if let Some(exp) = expected_md5 {
-            verify_content_md5_digest(exp, &ingested.md5)?;
+            verify_content_md5_digest(exp, &md5)?;
         }
 
         let computed = checksums.verify(trailing_headers)?;
@@ -706,28 +787,31 @@ impl S3 for S3Gateway {
             .into_iter()
             .collect();
         let checksums_json = computed.as_ref().map_or_else(|| "{}".to_string(), checksums::to_json);
-        let etag = Self::etag_of(&ingested.md5);
+        let etag = Self::etag_of(&md5);
 
-        // The chunks, the object and its tags: one entry.
+        // The chunks (if any), the object and its tags: one entry.
         let put = self.index.prepare_put_object(
             &input.bucket,
             &input.key,
             &etag,
-            ingested.size,
+            size,
             content_type,
-            &ingested.extents,
+            body,
             &user_meta,
             &tags,
             &checksums_json,
             expect,
         );
-        let chunks = std::mem::take(&mut ingested.chunks);
-        let old = match self.commit_with(chunks, put).await? {
+        let outcome = match chunks {
+            Some(chunks) => self.commit_with(chunks, put).await?,
+            None => self.commit(put).await?,
+        };
+        let old = match outcome {
             Ok(old) => old,
             Err(reject) => {
                 // The bucket went away or the condition failed meanwhile:
                 // nothing points at the chunks.
-                self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                self.release_ids(&unique_chunk_ids(&extents)).await;
                 return Err(Self::refused(reject));
             }
         };
@@ -736,8 +820,9 @@ impl S3 for S3Gateway {
         info!(
             bucket = %input.bucket,
             key = %input.key,
-            size = ingested.size,
-            extents = ingested.extents.len(),
+            size,
+            extents = extents.len(),
+            inline,
             "PutObject ok"
         );
 
@@ -797,7 +882,11 @@ impl S3 for S3Gateway {
                 break (view, start, end_inclusive, length, Bytes::new());
             }
             let range = start..(start.saturating_add(length));
-            match self.store.read(&view.extents, Some(range)).await {
+            if let Body::Inline(bytes) = &view.body {
+                let data = Bytes::copy_from_slice(&bytes[range.start as usize..range.end as usize]);
+                break (view, start, end_inclusive, length, data);
+            }
+            match self.store.read(view.body.extents(), Some(range)).await {
                 Ok(data) => break (view, start, end_inclusive, length, data),
                 Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) && attempt < GET_ATTEMPTS => continue,
                 Err(e) => return Err(Self::map_err(e)),
@@ -986,8 +1075,47 @@ impl S3 for S3Gateway {
         };
 
         let (src, extents) = self
-            .pin_copy_source(&src_bucket, &src_key, |src| Ok(src.extents.clone()))
+            .pin_copy_source(&src_bucket, &src_key, |src| Ok(src.body.extents().to_vec()))
             .await?;
+        // An inline source too large for inlining now (it is off, or the
+        // threshold was lowered) is stored at the destination as new chunks.
+        if let Body::Inline(bytes) = &src.body {
+            if self.opts.inline_max.is_none_or(|max| bytes.len() > max) {
+                let data = Bytes::copy_from_slice(bytes);
+                let ingested = self
+                    .store
+                    .ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options()))
+                    .await
+                    .map_err(Self::map_err)?;
+                let (put, dst) = self.index.prepare_copy_object(
+                    &src,
+                    Body::Chunks(ingested.extents.clone()),
+                    &input.bucket,
+                    &input.key,
+                    content_type,
+                    &user_meta,
+                    copy_source_meta,
+                    expect,
+                );
+                let old = match self.commit_with(ingested.chunks, put).await? {
+                    Ok(old) => old,
+                    Err(reject) => {
+                        self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                        return Err(Self::refused(reject));
+                    }
+                };
+                self.release_later(old);
+                return Ok(S3Response::new(CopyObjectOutput {
+                    copy_object_result: Some(CopyObjectResult {
+                        e_tag: Some(etag_hex(&dst.etag)),
+                        last_modified: Some(ts(&dst.mtime)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+            }
+        }
+
         let held = unique_chunk_ids(&extents);
         let (dst, old) = match self
             .index
@@ -1151,19 +1279,57 @@ impl S3 for S3Gateway {
             _ => return Err(s3_error!(NotImplemented)),
         };
         let range = input.copy_source_range.as_deref();
+        let part_number = i64::from(input.part_number);
+
+        // An inline source has no chunks to share: its bytes become the part.
+        if let Some(src) = self.index.get_copy_source(&src_bucket, &src_key).await.map_err(Self::map_err)? {
+            if let Body::Inline(bytes) = &src.body {
+                let (start, length) = match range {
+                    None => (0u64, src.size as u64),
+                    Some(r) => parse_copy_source_range(r, src.size as u64)?,
+                };
+                let data = Bytes::copy_from_slice(&bytes[start as usize..(start + length) as usize]);
+                let ingested = self
+                    .store
+                    .ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options()))
+                    .await
+                    .map_err(Self::map_err)?;
+                let etag = Self::etag_of(&ingested.md5);
+                let put = self.index.prepare_put_part(&input.upload_id, part_number, &etag, ingested.size, &ingested.extents);
+                let old = match self.commit_with(ingested.chunks, put).await? {
+                    Ok(old) => old,
+                    Err(reject) => {
+                        self.release_ids(&unique_chunk_ids(&ingested.extents)).await;
+                        return Err(match reject {
+                            S3Reject::NoSuchUpload => s3_error!(NoSuchUpload),
+                            other => Self::map_err(format!("UploadPartCopy rejected: {other:?}")),
+                        });
+                    }
+                };
+                self.release_later(old);
+                return Ok(S3Response::new(UploadPartCopyOutput {
+                    copy_part_result: Some(CopyPartResult {
+                        e_tag: Some(etag_hex(&etag)),
+                        last_modified: Some(Timestamp::from(std::time::SystemTime::now())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+            }
+        }
+
         let (src, part_extents) = self
             .pin_copy_source(&src_bucket, &src_key, |src| {
                 let (start, length) = match range {
                     None => (0u64, src.size as u64),
                     Some(r) => parse_copy_source_range(r, src.size as u64)?,
                 };
-                Ok(slice_extents(&src.extents, start, length))
+                Ok(slice_extents(src.body.extents(), start, length))
             })
             .await?;
         let held = unique_chunk_ids(&part_extents);
         let total = src.size as u64;
         let length = part_extents.iter().map(|e| e.len).sum::<i64>() as u64;
-        let part_number = i64::from(input.part_number);
 
         let etag = if length == total && !src.etag.contains('-') {
             src.etag.clone()

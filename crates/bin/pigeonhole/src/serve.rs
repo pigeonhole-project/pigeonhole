@@ -1,6 +1,6 @@
 //! Binary-only: `pigeonhole` (no subcommand) — run the S3 gateway and optional REAPI / metrics.
 
-use crate::background::spawn_background_tasks;
+use crate::background::{spawn_background_tasks, spawn_cooler};
 use crate::runtime::open_runtime;
 use anyhow::Context;
 use axum::error_handling::HandleError;
@@ -29,6 +29,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
 
     let s3_gateway = build_s3_gateway(cfg.s3_options(), index.clone(), rt.store.clone());
     spawn_background_tasks(&cfg, &rt);
+    spawn_cooler(&cfg, s3_gateway.clone());
     if cfg.metrics.enabled {
         pigeonhole::state_metrics::spawn(rt.meta.clone(), index.clone(), rt.store.db().clone());
     }

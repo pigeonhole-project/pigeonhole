@@ -848,3 +848,252 @@ async fn racing_creates_one_wins_and_losers_release_their_chunks() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
+
+/// One tablet, objects up to 1 KiB inline (docs/inline-objects.md).
+async fn setup_inline() -> (pigeonhole::service::S3Gateway, Arc<pigeonhole_meta::MetaStore>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config::for_test(dir.path());
+    let meta = pigeonhole_testkit::tablet(dir.path().join("meta"), |ns| Index::register(BlobDb::register(ns))).await;
+    let index = Index::open(meta.clone()).await.unwrap();
+    let db = BlobDb::open(meta.clone()).await.unwrap();
+    let opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
+    let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
+    let s3opts = pigeonhole::service::S3Options { inline_max: Some(1024), ..cfg.s3_options() };
+    let s3 = build_s3_gateway(s3opts, index, store);
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    (s3, meta, dir)
+}
+
+async fn get_all(s3: &pigeonhole::service::S3Gateway, key: &str, range: Option<Range>) -> Vec<u8> {
+    let out = s3
+        .get_object(req(GetObjectInput { bucket: "b".into(), key: key.into(), range, ..Default::default() }))
+        .await
+        .unwrap();
+    collect_body(out.output.body).await
+}
+
+fn put_len(key: &str, data: &[u8], with_length: bool) -> PutObjectInput {
+    PutObjectInput {
+        bucket: "b".into(),
+        key: key.into(),
+        content_length: with_length.then_some(data.len() as i64),
+        body: Some(StreamingBlob::from_bytes(Bytes::copy_from_slice(data))),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn small_objects_are_inline_large_ones_chunked() {
+    let (s3, meta, _dir) = setup_inline().await;
+    let small = vec![7u8; 1024];
+    let large = vec![9u8; 1025];
+    for with_length in [true, false] {
+        let before = meta.applied_position();
+        s3.put_object(req(put_len("small", &small, with_length))).await.unwrap();
+        assert_eq!(meta.applied_position(), before + 1, "one entry");
+        s3.put_object(req(put_len("large", &large, with_length))).await.unwrap();
+        let st = s3.index.stats();
+        assert_eq!((st.inline_objects, st.inline_bytes), (1, 1024), "with_length={with_length}");
+        assert!(s3.index.get_extents("b", "small").await.unwrap().unwrap().is_empty());
+        assert!(!s3.index.get_extents("b", "large").await.unwrap().unwrap().is_empty());
+        assert_eq!(get_all(&s3, "small", None).await, small);
+        assert_eq!(get_all(&s3, "large", None).await, large);
+    }
+    // A range of an inline object; its ETag is the MD5, as for any object.
+    let r = Range::Int { first: 10, last: Some(19) };
+    assert_eq!(get_all(&s3, "small", Some(r)).await, vec![7u8; 10]);
+    let put = s3.put_object(req(put_len("small", &small, true))).await.unwrap();
+    let head = s3.head_object(req(HeadObjectInput { bucket: "b".into(), key: "small".into(), ..Default::default() })).await.unwrap();
+    // md5 of 1024 × 0x07, as AWS would give.
+    assert_eq!(put.output.e_tag.unwrap().value(), "254a7725306413d2a8e39ad05ffa018a");
+    assert_eq!(head.output.e_tag.unwrap().value(), "254a7725306413d2a8e39ad05ffa018a");
+    // An empty object is inline too.
+    s3.put_object(req(put_len("empty", b"", true))).await.unwrap();
+    assert_eq!(get_all(&s3, "empty", None).await, b"");
+}
+
+#[tokio::test]
+async fn an_inline_put_checks_its_digest_and_commits_nothing_when_wrong() {
+    let (s3, meta, _dir) = setup_inline().await;
+    let before = meta.applied_position();
+    let mut bad = put_len("k", b"hello", true);
+    bad.content_md5 = Some("AAAAAAAAAAAAAAAAAAAAAA==".into());
+    assert!(s3.put_object(req(bad)).await.is_err());
+    assert_eq!(meta.applied_position(), before);
+    assert_eq!(s3.index.stats().inline_objects, 0);
+}
+
+#[tokio::test]
+async fn copies_from_an_inline_object() {
+    let (s3, _meta, _dir) = setup_inline().await;
+    let data: Vec<u8> = (0..200u8).collect();
+    s3.put_object(req(put_len("src", &data, true))).await.unwrap();
+    let copy = CopyObjectInput::builder()
+        .bucket("b".into())
+        .key("dst".into())
+        .copy_source(CopySource::Bucket { bucket: "b".into(), key: "src".into(), version_id: None })
+        .build()
+        .unwrap();
+    s3.copy_object(req(copy)).await.unwrap();
+    assert_eq!(get_all(&s3, "dst", None).await, data);
+    assert_eq!(s3.index.stats().inline_objects, 2);
+
+    // A part copied from an inline source, then completed.
+    let upload = s3
+        .create_multipart_upload(req(CreateMultipartUploadInput { bucket: "b".into(), key: "mp".into(), ..Default::default() }))
+        .await
+        .unwrap()
+        .output
+        .upload_id
+        .unwrap();
+    let part = s3
+        .upload_part_copy(req(UploadPartCopyInput::builder()
+            .bucket("b".into())
+            .key("mp".into())
+            .upload_id(upload.clone())
+            .part_number(1)
+            .copy_source(CopySource::Bucket { bucket: "b".into(), key: "src".into(), version_id: None })
+            .copy_source_range(Some("bytes=50-149".into()))
+            .build()
+            .unwrap()))
+        .await
+        .unwrap()
+        .output
+        .copy_part_result
+        .unwrap()
+        .e_tag;
+    s3.complete_multipart_upload(req(CompleteMultipartUploadInput {
+        bucket: "b".into(),
+        key: "mp".into(),
+        upload_id: upload,
+        multipart_upload: Some(CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart { part_number: Some(1), e_tag: part, ..Default::default() }]),
+        }),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    assert_eq!(get_all(&s3, "mp", None).await, data[50..150].to_vec());
+}
+
+#[tokio::test]
+async fn an_inline_rewrite_releases_the_chunks_it_replaces() {
+    let (s3, _meta, _dir) = setup_inline().await;
+    s3.put_object(req(put_len("k", &vec![1u8; 5000], true))).await.unwrap();
+    assert_eq!(s3.store.db().stats().live, 1);
+    s3.put_object(req(put_len("k", b"tiny", true))).await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while s3.store.db().stats().live != 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the old chunk is still live");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(get_all(&s3, "k", None).await, b"tiny");
+}
+
+#[tokio::test]
+async fn the_cooler_moves_inline_objects_out_and_reads_do_not_notice() {
+    let (s3, _meta, _dir) = setup_inline().await;
+    for i in 0..5 {
+        s3.put_object(req(put_len(&format!("k{i}"), format!("value {i}").as_bytes(), true))).await.unwrap();
+    }
+    assert_eq!(s3.index.stats().inline_objects, 5);
+    let none = pigeonhole::service::CoolPolicy { min_inline: std::time::Duration::from_secs(3600), ..Default::default() };
+    assert_eq!(s3.cool_pass(&none).await.unwrap(), pigeonhole::service::CoolStats::default(), "all too fresh");
+
+    let now = pigeonhole::service::CoolPolicy {
+        cool_after: Some(std::time::Duration::ZERO),
+        min_inline: std::time::Duration::ZERO,
+        batch: 3,
+        ..Default::default()
+    };
+    let stats = s3.cool_pass(&now).await.unwrap();
+    assert_eq!((stats.by_age, stats.rejected), (3, 0));
+    s3.cool_pass(&now).await.unwrap();
+    let st = s3.index.stats();
+    assert_eq!((st.inline_objects, st.inline_bytes), (0, 0));
+    assert_eq!(s3.store.db().stats().live, 5);
+    for i in 0..5 {
+        assert_eq!(get_all(&s3, &format!("k{i}"), None).await, format!("value {i}").as_bytes());
+    }
+}
+
+/// The cooler racing rewrites and deletes: the last write of every key
+/// reads back, and no chunk is left live that no object points at.
+#[tokio::test]
+async fn the_cooler_never_loses_a_rewrite_or_leaks_a_chunk() {
+    let (s3, _meta, _dir) = setup_inline().await;
+    let s3 = Arc::new(s3);
+    let keys = 8;
+    let writer = {
+        let s3 = s3.clone();
+        tokio::spawn(async move {
+            for round in 0..30 {
+                for k in 0..keys {
+                    let key = format!("k{k}");
+                    if (round + k) % 7 == 0 {
+                        let _ = s3.delete_object(req(DeleteObjectInput { bucket: "b".into(), key, ..Default::default() })).await;
+                    } else {
+                        let v = format!("round {round} key {k}");
+                        s3.put_object(req(put_len(&key, v.as_bytes(), true))).await.unwrap();
+                    }
+                }
+            }
+        })
+    };
+    let policy = pigeonhole::service::CoolPolicy {
+        cool_after: Some(std::time::Duration::ZERO),
+        min_inline: std::time::Duration::ZERO,
+        ..Default::default()
+    };
+    let mut cooled = 0;
+    while !writer.is_finished() {
+        let st = s3.cool_pass(&policy).await.unwrap();
+        cooled += st.by_age;
+        // A pass with nothing to do never yields; let the writer run.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    writer.await.unwrap();
+    assert!(cooled > 0, "the cooler did move something");
+
+    let mut chunked = 0;
+    for k in 0..keys {
+        let key = format!("k{k}");
+        let last = 29;
+        let deleted_last = (last + k) % 7 == 0;
+        match s3.index.get_object("b", &key).await.unwrap() {
+            None => assert!(deleted_last, "{key} vanished"),
+            Some(_) => {
+                assert!(!deleted_last, "{key} survived its delete");
+                assert_eq!(get_all(&s3, &key, None).await, format!("round {last} key {k}").as_bytes());
+                chunked += s3.index.get_extents("b", &key).await.unwrap().unwrap().len();
+            }
+        }
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while s3.store.db().stats().live as usize != chunked {
+        assert!(tokio::time::Instant::now() < deadline, "live chunks {} != referenced {chunked}", s3.store.db().stats().live);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// With inlining off (or the threshold lowered), a copy of a still-inline
+/// object is stored as chunks, as any new write then is.
+#[tokio::test]
+async fn a_copy_follows_the_current_threshold() {
+    let (s3, _meta, _dir) = setup_inline().await;
+    s3.put_object(req(put_len("src", b"0123456789", true))).await.unwrap();
+    let mut off = s3.clone();
+    off.opts.inline_max = None;
+    let copy = CopyObjectInput::builder()
+        .bucket("b".into())
+        .key("dst".into())
+        .copy_source(CopySource::Bucket { bucket: "b".into(), key: "src".into(), version_id: None })
+        .build()
+        .unwrap();
+    off.copy_object(req(copy)).await.unwrap();
+    assert!(s3.index.get_extents("b", "src").await.unwrap().unwrap().is_empty(), "the source stays inline");
+    assert!(!s3.index.get_extents("b", "dst").await.unwrap().unwrap().is_empty(), "the copy is chunked");
+    assert_eq!(get_all(&s3, "dst", None).await, b"0123456789");
+    let (src, dst) = (s3.index.get_object("b", "src").await.unwrap().unwrap(), s3.index.get_object("b", "dst").await.unwrap().unwrap());
+    assert_eq!(src.etag, dst.etag);
+}

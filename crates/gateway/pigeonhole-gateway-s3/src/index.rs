@@ -4,7 +4,7 @@
 //! an `s3` command (see [`crate::commands`]). Chunk refcounts live in the
 //! chunk store ([`ChunkStore::retain`] / [`release`]).
 
-use crate::commands::{Expect, ObjectRec, S3Command, S3Reject, S3State, UploadRec, NAMESPACE};
+use crate::commands::{Body, Expect, ObjectRec, S3Command, S3Reject, S3State, UploadRec, NAMESPACE};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
@@ -51,7 +51,7 @@ pub struct ObjectMeta {
 #[derive(Debug, Clone)]
 pub struct ObjectView {
     pub meta: ObjectMeta,
-    pub extents: Vec<Extent>,
+    pub body: Body,
     pub user_meta: Vec<(String, String)>,
     pub tag_count: usize,
     pub checksums_json: String,
@@ -63,7 +63,7 @@ pub struct SourceSnapshot {
     pub etag: String,
     pub size: i64,
     pub content_type: Option<String>,
-    pub extents: Vec<Extent>,
+    pub body: Body,
     pub user_meta: Vec<(String, String)>,
     pub checksums_json: String,
 }
@@ -126,6 +126,8 @@ impl Index {
             objects: s.objects.len() as u64,
             object_bytes: s.objects.values().map(|o| o.size.max(0) as u64).sum(),
             uploads: s.uploads.len() as u64,
+            inline_objects: s.objects.values().filter(|o| matches!(o.body, Body::Inline(_))).count() as u64,
+            inline_bytes: s.inline_bytes,
         })
     }
 
@@ -206,12 +208,12 @@ impl Index {
         etag: &str,
         size: i64,
         content_type: Option<&str>,
-        extents: &[Extent],
+        body: Body,
         user_meta: &[(String, String)],
         checksums_json: &str,
     ) -> Result<Vec<ChunkId>> {
         let mtime = Utc::now().to_rfc3339();
-        self.put_object_at(bucket, key, etag, size, content_type, extents, user_meta, checksums_json, &mtime, None)
+        self.put_object_at(bucket, key, etag, size, content_type, body, user_meta, checksums_json, &mtime, None)
             .await
     }
 
@@ -223,7 +225,7 @@ impl Index {
         etag: &str,
         size: i64,
         content_type: Option<&str>,
-        extents: &[Extent],
+        body: Body,
         user_meta: &[(String, String)],
         checksums_json: &str,
         mtime: &str,
@@ -235,7 +237,7 @@ impl Index {
             etag: etag.into(),
             size,
             content_type: content_type.map(Into::into),
-            extents: extents.to_vec(),
+            body,
             user_meta: user_meta.to_vec(),
             tags: Vec::new(),
             checksums_json: checksums_json.into(),
@@ -257,7 +259,7 @@ impl Index {
         etag: &str,
         size: i64,
         content_type: Option<&str>,
-        extents: &[Extent],
+        body: Body,
         user_meta: &[(String, String)],
         tags: &[(String, String)],
         checksums_json: &str,
@@ -269,12 +271,30 @@ impl Index {
             etag: etag.into(),
             size,
             content_type: content_type.map(Into::into),
-            extents: extents.to_vec(),
+            body,
             user_meta: user_meta.to_vec(),
             tags: tags.to_vec(),
             checksums_json: checksums_json.into(),
             mtime: Utc::now().to_rfc3339(),
             expect,
+        })
+    }
+
+    /// Inline objects to move out to chunks at `now` (docs/inline-objects.md).
+    pub fn cool_candidates(&self, now: DateTime<Utc>, policy: &crate::CoolPolicy) -> Vec<crate::CoolCandidate> {
+        self.read(|s| crate::cool::candidates(s, now, policy))
+    }
+
+    /// The `Cool` of `c`, to commit with the chunk its bytes were ingested
+    /// as. Outcome: nothing to release, or `PreconditionFailed` / `NoSuchKey`
+    /// if the object changed meanwhile (then the chunk is the caller's to
+    /// release).
+    pub fn prepare_cool(&self, c: &crate::CoolCandidate, extents: &[Extent]) -> Prepared<S3State> {
+        Prepared::new(&S3Command::Cool {
+            bucket: c.bucket.clone(),
+            key: c.key.clone(),
+            etag: c.etag.clone(),
+            extents: extents.to_vec(),
         })
     }
 
@@ -309,7 +329,7 @@ impl Index {
     pub async fn get_object_view(&self, bucket: &str, key: &str) -> Result<Option<ObjectView>> {
         Ok(self.object(bucket, key, |o| ObjectView {
             meta: object_meta(bucket, key, o),
-            extents: o.extents.clone(),
+            body: o.body.clone(),
             user_meta: pairs(&o.user_meta),
             tag_count: o.tags.len(),
             checksums_json: o.checksums_json.clone(),
@@ -317,7 +337,7 @@ impl Index {
     }
 
     pub async fn get_extents(&self, bucket: &str, key: &str) -> Result<Option<Vec<Extent>>> {
-        Ok(self.object(bucket, key, |o| o.extents.clone()))
+        Ok(self.object(bucket, key, |o| o.body.extents().to_vec()))
     }
 
     pub async fn get_object_checksums_json(
@@ -392,7 +412,7 @@ impl Index {
             etag: o.etag.clone(),
             size: o.size,
             content_type: o.content_type.clone(),
-            extents: o.extents.clone(),
+            body: o.body.clone(),
             user_meta: pairs(&o.user_meta),
             checksums_json: o.checksums_json.clone(),
         }))
@@ -426,7 +446,7 @@ impl Index {
                 &src.etag,
                 src.size,
                 ct,
-                &src.extents,
+                src.body.clone(),
                 meta,
                 &src.checksums_json,
                 &mtime,
@@ -445,6 +465,48 @@ impl Index {
             mtime,
         };
         Ok((dst, old))
+    }
+
+    /// [`Self::copy_object`] of `src` with `body` instead of its own (an
+    /// inline source stored as fresh chunks), to commit with those chunks
+    /// in one entry. The destination's meta as it will be written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_copy_object(
+        &self,
+        src: &SourceSnapshot,
+        body: Body,
+        dst_bucket: &str,
+        dst_key: &str,
+        content_type: Option<&str>,
+        user_meta: &[(String, String)],
+        copy_source_meta: bool,
+        expect: Option<Expect>,
+    ) -> (Prepared<S3State>, ObjectMeta) {
+        let ct = content_type.or(src.content_type.as_deref());
+        let meta = if copy_source_meta { &src.user_meta[..] } else { user_meta };
+        let mtime = Utc::now().to_rfc3339();
+        let put = Prepared::new(&S3Command::PutObject {
+            bucket: dst_bucket.into(),
+            key: dst_key.into(),
+            etag: src.etag.clone(),
+            size: src.size,
+            content_type: ct.map(Into::into),
+            body,
+            user_meta: meta.to_vec(),
+            tags: Vec::new(),
+            checksums_json: src.checksums_json.clone(),
+            mtime: mtime.clone(),
+            expect,
+        });
+        let dst = ObjectMeta {
+            bucket: dst_bucket.into(),
+            key: dst_key.into(),
+            etag: src.etag.clone(),
+            size: src.size,
+            content_type: ct.map(Into::into),
+            mtime,
+        };
+        (put, dst)
     }
 
     /// Up to `limit` objects of `bucket` with keys in `(lower, upper)` bounds,
@@ -986,6 +1048,9 @@ pub struct IndexStats {
     pub object_bytes: u64,
     /// Multipart uploads in progress.
     pub uploads: u64,
+    /// Objects stored inline, and their bytes (docs/inline-objects.md).
+    pub inline_objects: u64,
+    pub inline_bytes: u64,
 }
 
 #[cfg(test)]
@@ -1054,7 +1119,7 @@ mod list_tests {
             keys.sort();
             keys.dedup();
             for k in &keys {
-                ix.put_object(&bucket, k, "etag", 0, None, &[], &[], "{}").await.unwrap();
+                ix.put_object(&bucket, k, "etag", 0, None, Body::Chunks(vec![]), &[], "{}").await.unwrap();
             }
             for _ in 0..8 {
                 let prefix = if rng.next() % 3 == 0 { String::new() } else { rng.word(&alphabet, 2) };
@@ -1092,11 +1157,11 @@ mod list_tests {
         let ix = index().await;
         ix.create_bucket("b").await.unwrap();
         for i in 0..100 {
-            ix.put_object("b", &format!("a/k{i:03}"), "etag", 0, None, &[], &[], "{}")
+            ix.put_object("b", &format!("a/k{i:03}"), "etag", 0, None, Body::Chunks(vec![]), &[], "{}")
                 .await
                 .unwrap();
         }
-        ix.put_object("b", "c", "etag", 0, None, &[], &[], "{}")
+        ix.put_object("b", "c", "etag", 0, None, Body::Chunks(vec![]), &[], "{}")
             .await
             .unwrap();
         let page = ix

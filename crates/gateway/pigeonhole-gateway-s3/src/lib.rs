@@ -2,6 +2,7 @@
 
 mod checksums;
 mod commands;
+mod cool;
 pub mod index;
 mod service;
 
@@ -9,8 +10,9 @@ pub use index::{
     parse_rfc3339, Rejected, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ObjectMeta,
 };
 pub use pigeonhole_chunk_store::{ChunkStore, Extent};
-pub use commands::{Expect, Pairs, Released, S3Command, S3Reject, S3State};
-pub use service::{S3Gateway, S3Options};
+pub use commands::{Body, Expect, Pairs, Released, S3Command, S3Reject, S3State};
+pub use cool::{CoolCandidate, CoolPolicy, CoolReason};
+pub use service::{CoolStats, S3Gateway, S3Options};
 
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::SimpleAuth;

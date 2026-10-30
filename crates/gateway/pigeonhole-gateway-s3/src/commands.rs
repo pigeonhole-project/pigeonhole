@@ -28,6 +28,33 @@ pub enum Expect {
     ETag(String),
 }
 
+/// Where an object's bytes are (docs/inline-objects.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Body {
+    /// In chunks of the chunk store.
+    Chunks(Vec<Extent>),
+    /// In the record itself: a small object, in the log and snapshots.
+    Inline(Vec<u8>),
+}
+
+impl Body {
+    /// The chunk extents; none for an inline body.
+    pub fn extents(&self) -> &[Extent] {
+        match self {
+            Body::Chunks(extents) => extents,
+            Body::Inline(_) => &[],
+        }
+    }
+
+    /// Bytes held in the metadata.
+    pub fn inline_len(&self) -> u64 {
+        match self {
+            Body::Chunks(_) => 0,
+            Body::Inline(bytes) => bytes.len() as u64,
+        }
+    }
+}
+
 /// Commands of the `s3` namespace. Changing the shape of a variant or the
 /// order of variants needs a new [`S3State::VERSION`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,7 +69,7 @@ pub enum S3Command {
         etag: String,
         size: i64,
         content_type: Option<String>,
-        extents: Vec<Extent>,
+        body: Body,
         user_meta: Pairs,
         tags: Pairs,
         checksums_json: String,
@@ -73,6 +100,10 @@ pub enum S3Command {
         expect: Option<Expect>,
     },
     AbortUpload { upload_id: String },
+    /// Move an inline object out to chunks (the cooler); its bytes, ETag and
+    /// everything else stay. Rejected if the object is no longer the inline
+    /// one with `etag`: a rewrite or delete always wins over cooling.
+    Cool { bucket: String, key: String, etag: String, extents: Vec<Extent> },
 }
 
 /// Deterministic failure of an [`S3Command`].
@@ -106,7 +137,7 @@ pub(crate) struct ObjectRec {
     pub content_type: Option<String>,
     pub mtime: String,
     pub checksums_json: String,
-    pub extents: Vec<Extent>,
+    pub body: Body,
     /// Name → value, ordered by name.
     pub user_meta: BTreeMap<String, String>,
     pub tags: BTreeMap<String, String>,
@@ -137,11 +168,14 @@ pub struct S3State {
     pub(crate) buckets: BTreeMap<String, BucketRec>,
     pub(crate) objects: BTreeMap<(String, String), ObjectRec>,
     pub(crate) uploads: BTreeMap<String, UploadRec>,
+    /// Sum of the inline bodies (derived).
+    #[serde(skip)]
+    pub(crate) inline_bytes: u64,
 }
 
 impl StateMachine for S3State {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 3;
+    const VERSION: u32 = 4;
     type Command = S3Command;
     type Reply = Released;
     type Reject = S3Reject;
@@ -162,7 +196,7 @@ impl StateMachine for S3State {
                 etag,
                 size,
                 content_type,
-                extents,
+                body,
                 user_meta,
                 tags,
                 checksums_json,
@@ -181,7 +215,7 @@ impl StateMachine for S3State {
                     content_type,
                     mtime,
                     checksums_json,
-                    extents,
+                    body,
                     user_meta: user_meta.into_iter().collect(),
                     tags: tags.into_iter().collect(),
                 };
@@ -191,8 +225,8 @@ impl StateMachine for S3State {
                 if let Err(reject) = self.check(&bucket, &key, expect.as_ref()) {
                     return Ok(Err(reject));
                 }
-                match self.objects.remove(&(bucket, key)) {
-                    Some(o) => released(chunk_ids(&o.extents)),
+                match self.remove_object(bucket, key) {
+                    Some(o) => released(chunk_ids(o.body.extents())),
                     None => Err(S3Reject::NoSuchKey),
                 }
             }
@@ -248,7 +282,23 @@ impl StateMachine for S3State {
                 };
                 released(upload.parts.values().flat_map(|p| chunk_ids(&p.extents)).collect())
             }
+            S3Command::Cool { bucket, key, etag, extents } => {
+                if let Err(reject) = self.check(&bucket, &key, Some(&Expect::ETag(etag))) {
+                    return Ok(Err(reject));
+                }
+                let o = self.objects.get_mut(&(bucket, key)).expect("checked above");
+                let Body::Inline(bytes) = &o.body else {
+                    return Ok(Err(S3Reject::PreconditionFailed));
+                };
+                self.inline_bytes -= bytes.len() as u64;
+                o.body = Body::Chunks(extents);
+                ok()
+            }
         })
+    }
+
+    fn rebuild(&mut self) {
+        self.inline_bytes = self.objects.values().map(|o| o.body.inline_len()).sum();
     }
 }
 
@@ -290,8 +340,16 @@ impl S3State {
 
     /// Insert or replace an object; returns the replaced version's chunks.
     fn write_object(&mut self, bucket: String, key: String, rec: ObjectRec) -> Vec<ChunkId> {
-        let old = self.objects.insert((bucket, key), rec);
-        old.map(|o| chunk_ids(&o.extents)).unwrap_or_default()
+        self.inline_bytes += rec.body.inline_len();
+        let Some(old) = self.objects.insert((bucket, key), rec) else { return Vec::new() };
+        self.inline_bytes -= old.body.inline_len();
+        chunk_ids(old.body.extents())
+    }
+
+    fn remove_object(&mut self, bucket: String, key: String) -> Option<ObjectRec> {
+        let old = self.objects.remove(&(bucket, key))?;
+        self.inline_bytes -= old.body.inline_len();
+        Some(old)
     }
 
     /// Parts not listed are dropped with the upload.
@@ -322,7 +380,7 @@ impl S3State {
             content_type: upload.content_type,
             mtime,
             checksums_json: "{}".into(),
-            extents,
+            body: Body::Chunks(extents),
             user_meta: upload.user_meta,
             tags: upload.tags,
         };
@@ -358,7 +416,7 @@ mod tests {
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k', 1, 1, 1, b'e']);
         let cmd = S3Command::CreateBucket { name: "b".into(), created_at: "t".into() };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [0, 1, b'b', 1, b't']);
-        assert_eq!(S3State::VERSION, 3);
+        assert_eq!(S3State::VERSION, 4);
     }
 
     #[test]
@@ -370,7 +428,7 @@ mod tests {
             etag: "e".into(),
             size: 1,
             content_type: None,
-            extents: vec![Extent { chunk: 7, offset: 0, len: 1 }],
+            body: Body::Chunks(vec![Extent { chunk: 7, offset: 0, len: 1 }]),
             user_meta: vec![],
             tags: vec![],
             checksums_json: "{}".into(),
@@ -408,7 +466,7 @@ mod tests {
             etag: etag.into(),
             size: 1,
             content_type: None,
-            extents: vec![],
+            body: Body::Inline(etag.as_bytes().to_vec()),
             user_meta: vec![],
             tags: vec![],
             checksums_json: "{}".into(),
@@ -432,5 +490,58 @@ mod tests {
         assert_eq!(s.apply(put("2", etag("1"))).unwrap(), Ok(vec![]));
         assert_eq!(s.apply(del(etag("2"))).unwrap(), Ok(vec![]));
         assert!(s.objects.is_empty());
+    }
+
+    /// docs/inline-objects.md: inline bodies are counted; a rewrite moves an
+    /// object between inline and chunks; `Cool` loses to any rewrite.
+    #[test]
+    fn inline_bodies_and_cooling() {
+        let mut s = S3State::default();
+        s.apply(S3Command::CreateBucket { name: "b".into(), created_at: "t".into() }).unwrap().unwrap();
+        let put = |key: &str, etag: &str, body: Body| S3Command::PutObject {
+            bucket: "b".into(),
+            key: key.into(),
+            etag: etag.into(),
+            size: 3,
+            content_type: None,
+            body,
+            user_meta: vec![],
+            tags: vec![],
+            checksums_json: "{}".into(),
+            mtime: "t".into(),
+            expect: None,
+        };
+        let cool = |key: &str, etag: &str, chunk: ChunkId| S3Command::Cool {
+            bucket: "b".into(),
+            key: key.into(),
+            etag: etag.into(),
+            extents: vec![Extent { chunk, offset: 0, len: 3 }],
+        };
+        let chunks = |chunk: ChunkId| Body::Chunks(vec![Extent { chunk, offset: 0, len: 3 }]);
+
+        assert_eq!(s.apply(put("a", "1", Body::Inline(b"abc".to_vec()))).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(put("b", "1", Body::Inline(b"xyz".to_vec()))).unwrap(), Ok(vec![]));
+        assert_eq!(s.inline_bytes, 6);
+
+        // Inline over chunks releases them; chunks over inline release nothing.
+        assert_eq!(s.apply(put("c", "1", chunks(9))).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(put("c", "2", Body::Inline(b"new".to_vec()))).unwrap(), Ok(vec![9]));
+        assert_eq!(s.apply(put("c", "3", chunks(10))).unwrap(), Ok(vec![]));
+        assert_eq!(s.inline_bytes, 6);
+
+        // Cooling: accepted for the same inline version, refused otherwise.
+        assert_eq!(s.apply(cool("a", "1", 11)).unwrap(), Ok(vec![]));
+        assert_eq!(s.objects[&("b".into(), "a".into())].body, chunks(11));
+        assert_eq!(s.inline_bytes, 3);
+        assert_eq!(s.apply(cool("a", "1", 12)).unwrap(), Err(S3Reject::PreconditionFailed), "no longer inline");
+        assert_eq!(s.apply(cool("b", "0", 12)).unwrap(), Err(S3Reject::PreconditionFailed), "rewritten meanwhile");
+        assert_eq!(s.apply(cool("gone", "1", 12)).unwrap(), Err(S3Reject::NoSuchKey));
+
+        // Delete drops the count; a replay (decode + rebuild) recounts it.
+        assert_eq!(s.apply(S3Command::DeleteObject { bucket: "b".into(), key: "b".into(), expect: None }).unwrap(), Ok(vec![]));
+        assert_eq!(s.inline_bytes, 0);
+        s.apply(put("d", "1", Body::Inline(b"0123456789".to_vec()))).unwrap().unwrap();
+        let replayed: S3State = pigeonhole_meta::decode_state(&pigeonhole_meta::encode_state(&s)).unwrap();
+        assert_eq!(replayed.inline_bytes, 10);
     }
 }

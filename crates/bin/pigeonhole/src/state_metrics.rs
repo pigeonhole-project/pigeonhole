@@ -14,6 +14,10 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::gauge("pigeonhole_s3_objects", &[], "Objects"),
     MetricDoc::gauge("pigeonhole_s3_object_bytes", &[], "Logical bytes of all objects"),
     MetricDoc::gauge("pigeonhole_s3_uploads", &[], "Multipart uploads in progress"),
+    MetricDoc::gauge("pigeonhole_inline_objects", &[], "Objects stored inline in the metadata (docs/inline-objects.md)"),
+    MetricDoc::gauge("pigeonhole_inline_bytes", &[], "Bytes of the objects stored inline in the metadata"),
+    MetricDoc::counter("pigeonhole_cooled_total", &["reason"], "Inline objects the cooler moved out to chunks: age (not rewritten for cool_after) or budget"),
+    MetricDoc::counter("pigeonhole_cool_rejected_total", &[], "Inline objects the cooler picked that changed before it moved them (left as they are)"),
     MetricDoc::gauge("pigeonhole_chunks", &["state"], "Chunks: live, unreferenced (the sweeper's next work), reclaiming"),
     MetricDoc::gauge("pigeonhole_chunk_logical_bytes", &[], "Logical bytes of all chunks (shared extents count once)"),
     MetricDoc::gauge("pigeonhole_chunk_stored_bytes", &["instance"], "Stored bytes of the chunk replicas an instance holds"),
@@ -37,6 +41,8 @@ pub fn spawn(meta: Arc<MetaStore>, index: Index, chunks: BlobDb) {
             metrics::gauge!("pigeonhole_s3_objects").set(s3.objects as f64);
             metrics::gauge!("pigeonhole_s3_object_bytes").set(s3.object_bytes as f64);
             metrics::gauge!("pigeonhole_s3_uploads").set(s3.uploads as f64);
+            metrics::gauge!("pigeonhole_inline_objects").set(s3.inline_objects as f64);
+            metrics::gauge!("pigeonhole_inline_bytes").set(s3.inline_bytes as f64);
             let c = chunks.stats();
             metrics::gauge!("pigeonhole_chunks", "state" => "live").set(c.live as f64);
             metrics::gauge!("pigeonhole_chunks", "state" => "unreferenced").set(c.unreferenced as f64);
