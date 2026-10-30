@@ -2,10 +2,10 @@
 //! blocks, L2 the stored (compressed) ones. Chunk ids are never reused, so
 //! entries never go stale; dropped chunks age out.
 
+use crate::ChunkId;
 use bytes::Bytes;
 use moka::future::Cache;
 use pigeonhole_blob::{record_cache, set_cache_size};
-use crate::ChunkId;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 

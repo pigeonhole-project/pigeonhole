@@ -168,10 +168,15 @@ mod tests {
         let pool = Pool::new("-1", vec![reg.chat("a", "-1"), reg.chat("b", "-1")]);
         let t0 = Instant::now();
         let ran_on = pool
-            .run(Spend::Class(SEND), Duration::from_secs(300), |e: &u64| Some(Duration::from_secs(*e)), |m| {
-                let flood = (m == 0).then_some(40);
-                attempt(&pool, m, flood)
-            })
+            .run(
+                Spend::Class(SEND),
+                Duration::from_secs(300),
+                |e: &u64| Some(Duration::from_secs(*e)),
+                |m| {
+                    let flood = (m == 0).then_some(40);
+                    attempt(&pool, m, flood)
+                },
+            )
             .await
             .unwrap();
         assert_eq!(ran_on, 1, "the second bot ran it");
@@ -179,7 +184,12 @@ mod tests {
         assert!(pool.member(0).peek_wait(SEND) > Duration::from_secs(30), "the first bot stays cooled");
         // The next operation picks the free bot without trying the cooled one.
         let next = pool
-            .run(Spend::Class(SEND), Duration::from_secs(300), |e: &u64| Some(Duration::from_secs(*e)), |m| attempt(&pool, m, None))
+            .run(
+                Spend::Class(SEND),
+                Duration::from_secs(300),
+                |e: &u64| Some(Duration::from_secs(*e)),
+                |m| attempt(&pool, m, None),
+            )
             .await
             .unwrap();
         assert_eq!(next, 1);
@@ -193,11 +203,16 @@ mod tests {
         let mut tries = Vec::new();
         let t0 = Instant::now();
         let ran_on = pool
-            .run(Spend::Class(SEND), Duration::from_secs(300), |e: &u64| Some(Duration::from_secs(*e)), |m| {
-                tries.push(m);
-                let flood = (tries.len() == 1).then_some(10);
-                attempt(&pool, m, flood)
-            })
+            .run(
+                Spend::Class(SEND),
+                Duration::from_secs(300),
+                |e: &u64| Some(Duration::from_secs(*e)),
+                |m| {
+                    tries.push(m);
+                    let flood = (tries.len() == 1).then_some(10);
+                    attempt(&pool, m, flood)
+                },
+            )
             .await
             .unwrap();
         assert_eq!((ran_on, tries), (0, vec![0, 0]), "b is cooled for longer than a's 10 s");
@@ -215,7 +230,16 @@ mod tests {
         let pool = Pool::new("-1", vec![reg.chat("a", "-1"), reg.chat("b", "-1"), reg.chat("c", "-1")]);
         let mut ran = Vec::new();
         for _ in 0..6 {
-            ran.push(pool.run(Spend::Class(SEND), Duration::from_secs(1), |_: &u64| None, |m| async move { Ok::<_, u64>(m) }).await.unwrap());
+            ran.push(
+                pool.run(
+                    Spend::Class(SEND),
+                    Duration::from_secs(1),
+                    |_: &u64| None,
+                    |m| async move { Ok::<_, u64>(m) },
+                )
+                .await
+                .unwrap(),
+            );
         }
         assert_eq!(ran, vec![0, 1, 2, 0, 1, 2]);
     }

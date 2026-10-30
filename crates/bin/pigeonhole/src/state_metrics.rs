@@ -14,13 +14,33 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::gauge("pigeonhole_s3_objects", &[], "Objects"),
     MetricDoc::gauge("pigeonhole_s3_object_bytes", &[], "Logical bytes of all objects"),
     MetricDoc::gauge("pigeonhole_s3_uploads", &[], "Multipart uploads in progress"),
-    MetricDoc::gauge("pigeonhole_inline_objects", &[], "Objects stored inline in the metadata (docs/inline-objects.md)"),
+    MetricDoc::gauge(
+        "pigeonhole_inline_objects",
+        &[],
+        "Objects stored inline in the metadata (docs/inline-objects.md)",
+    ),
     MetricDoc::gauge("pigeonhole_inline_bytes", &[], "Bytes of the objects stored inline in the metadata"),
-    MetricDoc::counter("pigeonhole_cooled_total", &["reason"], "Inline objects the cooler moved out to chunks: age (not rewritten for cool_after) or budget"),
-    MetricDoc::counter("pigeonhole_cool_rejected_total", &[], "Inline objects the cooler picked that changed before it moved them (left as they are)"),
-    MetricDoc::gauge("pigeonhole_chunks", &["state"], "Chunks: live, unreferenced (the sweeper's next work), reclaiming"),
+    MetricDoc::counter(
+        "pigeonhole_cooled_total",
+        &["reason"],
+        "Inline objects the cooler moved out to chunks: age (not rewritten for cool_after) or budget",
+    ),
+    MetricDoc::counter(
+        "pigeonhole_cool_rejected_total",
+        &[],
+        "Inline objects the cooler picked that changed before it moved them (left as they are)",
+    ),
+    MetricDoc::gauge(
+        "pigeonhole_chunks",
+        &["state"],
+        "Chunks: live, unreferenced (the sweeper's next work), reclaiming",
+    ),
     MetricDoc::gauge("pigeonhole_chunk_logical_bytes", &[], "Logical bytes of all chunks (shared extents count once)"),
-    MetricDoc::gauge("pigeonhole_chunk_stored_bytes", &["instance"], "Stored bytes of the chunk replicas an instance holds"),
+    MetricDoc::gauge(
+        "pigeonhole_chunk_stored_bytes",
+        &["instance"],
+        "Stored bytes of the chunk replicas an instance holds",
+    ),
 ];
 
 /// How often the tablet gauges are refreshed (each refresh walks the state).

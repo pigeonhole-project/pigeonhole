@@ -336,7 +336,12 @@ pub struct ChatClient<C: RaftTypeConfig> {
 }
 
 impl<C: RaftTypeConfig> ChatClient<C> {
-    fn failed<E: std::error::Error>(&self, action: RPCTypes, ttl: Duration, e: CallError) -> RPCError<C::NodeId, C::Node, E> {
+    fn failed<E: std::error::Error>(
+        &self,
+        action: RPCTypes,
+        ttl: Duration,
+        e: CallError,
+    ) -> RPCError<C::NodeId, C::Node, E> {
         match e {
             CallError::Timeout => RPCError::Timeout(Timeout {
                 action,
@@ -344,7 +349,9 @@ impl<C: RaftTypeConfig> ChatClient<C> {
                 target: self.target.clone(),
                 timeout: ttl,
             }),
-            CallError::Mismatch => RPCError::Network(NetworkError::new(&AnyError::error("a response of the wrong kind"))),
+            CallError::Mismatch => {
+                RPCError::Network(NetworkError::new(&AnyError::error("a response of the wrong kind")))
+            }
         }
     }
 }

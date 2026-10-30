@@ -1,3 +1,7 @@
+use crate::bytestream_pb::byte_stream_server::{ByteStream, ByteStreamServer};
+use crate::bytestream_pb::{
+    QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest, WriteResponse,
+};
 use crate::cas::CasStore;
 use crate::cas_index::CasIndex;
 use crate::config::BytestreamConfig;
@@ -6,26 +10,19 @@ use crate::reapi::{
     action_cache_server::{ActionCache, ActionCacheServer},
     batch_read_blobs_response, batch_update_blobs_response,
     capabilities_server::{Capabilities, CapabilitiesServer},
-    compressor, content_addressable_storage_server::{
-        ContentAddressableStorage, ContentAddressableStorageServer,
-    },
-    digest_function, ActionCacheUpdateCapabilities, ActionResult, BatchReadBlobsRequest,
-    BatchReadBlobsResponse, BatchUpdateBlobsRequest, BatchUpdateBlobsResponse,
-    FindMissingBlobsRequest, FindMissingBlobsResponse, GetActionResultRequest,
-    GetCapabilitiesRequest, GetChunkMappingRequest, GetTreeRequest, RegisterChunkMappingRequest,
-    RegisterChunkMappingResponse, ServerCapabilities, SplitBlobRequest, SplitBlobResponse,
-    SpliceBlobRequest, SpliceBlobResponse, UpdateActionResultRequest,
-};
-use crate::bytestream_pb::byte_stream_server::{ByteStream, ByteStreamServer};
-use crate::bytestream_pb::{
-    QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
-    WriteResponse,
+    compressor,
+    content_addressable_storage_server::{ContentAddressableStorage, ContentAddressableStorageServer},
+    digest_function, ActionCacheUpdateCapabilities, ActionResult, BatchReadBlobsRequest, BatchReadBlobsResponse,
+    BatchUpdateBlobsRequest, BatchUpdateBlobsResponse, FindMissingBlobsRequest, FindMissingBlobsResponse,
+    GetActionResultRequest, GetCapabilitiesRequest, GetChunkMappingRequest, GetTreeRequest,
+    RegisterChunkMappingRequest, RegisterChunkMappingResponse, ServerCapabilities, SpliceBlobRequest,
+    SpliceBlobResponse, SplitBlobRequest, SplitBlobResponse, UpdateActionResultRequest,
 };
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
-use prost::Message;
 use pigeonhole_chunk_store::ChunkStore;
+use prost::Message;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,8 +37,7 @@ const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 macro_rules! limit_svc {
     ($svc:expr) => {
-        $svc.max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+        $svc.max_decoding_message_size(MAX_MESSAGE_BYTES).max_encoding_message_size(MAX_MESSAGE_BYTES)
     };
 }
 
@@ -81,9 +77,7 @@ pub async fn serve(cfg: BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>)
 
     tonic::transport::Server::builder()
         .add_service(limit_svc!(CapabilitiesServer::new(state.clone())))
-        .add_service(limit_svc!(ContentAddressableStorageServer::new(
-            state.clone()
-        )))
+        .add_service(limit_svc!(ContentAddressableStorageServer::new(state.clone())))
         .add_service(limit_svc!(ActionCacheServer::new(state.clone())))
         .add_service(limit_svc!(ByteStreamServer::new(state)))
         .serve(addr)
@@ -99,9 +93,7 @@ pub async fn serve_ephemeral(
     cas: CasIndex,
     store: Arc<ChunkStore>,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("bind ephemeral")?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind ephemeral")?;
     let addr = listener.local_addr()?;
     let mut cfg = cfg;
     cfg.listen_addr = addr.to_string();
@@ -119,9 +111,7 @@ pub async fn serve_ephemeral(
             .add_service(limit_svc!(svc_cas))
             .add_service(limit_svc!(svc_ac))
             .add_service(limit_svc!(svc_bs))
-            .serve_with_incoming(
-                tokio_stream::wrappers::TcpListenerStream::new(listener),
-            )
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .context("ephemeral serve")?;
         Ok(())
@@ -230,11 +220,7 @@ impl ReapiState {
         let (body, rx) = mpsc::channel::<Result<Bytes>>(8);
         let (cas, hash, size) = (self.cas.clone(), parsed.hash_hex.clone(), parsed.size);
         let ingest = tokio::spawn(async move { cas.put_stream(&hash, size, ReceiverStream::new(rx)).await });
-        let pending = PendingUpload {
-            committed_size: 0,
-            complete: false,
-            last_activity: Instant::now(),
-        };
+        let pending = PendingUpload { committed_size: 0, complete: false, last_activity: Instant::now() };
         self.uploads.lock().await.insert(parsed.upload_id.clone(), pending);
         Ok(Upload {
             resource_name: resource_name.to_string(),
@@ -289,9 +275,7 @@ impl Capabilities for ReapiState {
         Ok(Response::new(ServerCapabilities {
             cache_capabilities: Some(crate::reapi::CacheCapabilities {
                 digest_functions: vec![digest_function::Value::Sha256 as i32],
-                action_cache_update_capabilities: Some(ActionCacheUpdateCapabilities {
-                    update_enabled: true,
-                }),
+                action_cache_update_capabilities: Some(ActionCacheUpdateCapabilities { update_enabled: true }),
                 max_batch_total_size_bytes: self.max_batch_total_size_bytes,
                 ..Default::default()
             }),
@@ -303,54 +287,32 @@ impl Capabilities for ReapiState {
 #[tonic::async_trait]
 impl ContentAddressableStorage for ReapiState {
     type GetTreeStream = ReceiverStream<Result<crate::reapi::GetTreeResponse, Status>>;
-    type GetChunkMappingStream =
-        ReceiverStream<Result<crate::reapi::GetChunkMappingResponse, Status>>;
+    type GetChunkMappingStream = ReceiverStream<Result<crate::reapi::GetChunkMappingResponse, Status>>;
 
-    async fn get_tree(
-        &self,
-        _request: Request<GetTreeRequest>,
-    ) -> Result<Response<Self::GetTreeStream>, Status> {
+    async fn get_tree(&self, _request: Request<GetTreeRequest>) -> Result<Response<Self::GetTreeStream>, Status> {
         Err(grpc_status(tonic::Code::Unimplemented, "GetTree not supported"))
     }
 
-    async fn split_blob(
-        &self,
-        _request: Request<SplitBlobRequest>,
-    ) -> Result<Response<SplitBlobResponse>, Status> {
-        Err(grpc_status(
-            tonic::Code::Unimplemented,
-            "SplitBlob not supported",
-        ))
+    async fn split_blob(&self, _request: Request<SplitBlobRequest>) -> Result<Response<SplitBlobResponse>, Status> {
+        Err(grpc_status(tonic::Code::Unimplemented, "SplitBlob not supported"))
     }
 
     async fn get_chunk_mapping(
         &self,
         _request: Request<GetChunkMappingRequest>,
     ) -> Result<Response<Self::GetChunkMappingStream>, Status> {
-        Err(grpc_status(
-            tonic::Code::Unimplemented,
-            "GetChunkMapping not supported",
-        ))
+        Err(grpc_status(tonic::Code::Unimplemented, "GetChunkMapping not supported"))
     }
 
-    async fn splice_blob(
-        &self,
-        _request: Request<SpliceBlobRequest>,
-    ) -> Result<Response<SpliceBlobResponse>, Status> {
-        Err(grpc_status(
-            tonic::Code::Unimplemented,
-            "SpliceBlob not supported",
-        ))
+    async fn splice_blob(&self, _request: Request<SpliceBlobRequest>) -> Result<Response<SpliceBlobResponse>, Status> {
+        Err(grpc_status(tonic::Code::Unimplemented, "SpliceBlob not supported"))
     }
 
     async fn register_chunk_mapping(
         &self,
         _request: Request<Streaming<RegisterChunkMappingRequest>>,
     ) -> Result<Response<RegisterChunkMappingResponse>, Status> {
-        Err(grpc_status(
-            tonic::Code::Unimplemented,
-            "RegisterChunkMapping not supported",
-        ))
+        Err(grpc_status(tonic::Code::Unimplemented, "RegisterChunkMapping not supported"))
     }
 
     async fn find_missing_blobs(
@@ -363,9 +325,7 @@ impl ContentAddressableStorage for ReapiState {
             .find_missing(&req.blob_digests)
             .await
             .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
-        Ok(Response::new(FindMissingBlobsResponse {
-            missing_blob_digests: missing,
-        }))
+        Ok(Response::new(FindMissingBlobsResponse { missing_blob_digests: missing }))
     }
 
     async fn batch_update_blobs(
@@ -378,42 +338,28 @@ impl ContentAddressableStorage for ReapiState {
         for r in req.requests {
             total += r.data.len() as i64;
             if total > self.max_batch_total_size_bytes {
-                return Err(grpc_status(
-                    tonic::Code::InvalidArgument,
-                    "batch exceeds max_batch_total_size_bytes",
-                ));
+                return Err(grpc_status(tonic::Code::InvalidArgument, "batch exceeds max_batch_total_size_bytes"));
             }
-            let digest = r
-                .digest
-                .as_ref()
-                .ok_or_else(|| grpc_status(tonic::Code::InvalidArgument, "missing digest"))?;
-            let hash_hex = digest_hash_hex(digest)
-                .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
+            let digest =
+                r.digest.as_ref().ok_or_else(|| grpc_status(tonic::Code::InvalidArgument, "missing digest"))?;
+            let hash_hex =
+                digest_hash_hex(digest).map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
             match verify_sha256(&r.data, &hash_hex, digest.size_bytes) {
                 Ok(()) => {
-                    if let Err(e) = self
-                        .cas
-                        .put_bytes(&hash_hex, digest.size_bytes, Bytes::from(r.data))
-                        .await
-                    {
+                    if let Err(e) = self.cas.put_bytes(&hash_hex, digest.size_bytes, Bytes::from(r.data)).await {
                         responses.push(batch_update_blobs_response::Response {
                             digest: Some(digest.clone()),
                             status: Some(google_rpc_status(tonic::Code::Internal, e.to_string())),
                         });
                     } else {
-                        responses.push(batch_update_blobs_response::Response {
-                            digest: Some(digest.clone()),
-                            status: None,
-                        });
+                        responses
+                            .push(batch_update_blobs_response::Response { digest: Some(digest.clone()), status: None });
                     }
                 }
                 Err(e) => {
                     responses.push(batch_update_blobs_response::Response {
                         digest: Some(digest.clone()),
-                        status: Some(google_rpc_status(
-                            tonic::Code::InvalidArgument,
-                            e.to_string(),
-                        )),
+                        status: Some(google_rpc_status(tonic::Code::InvalidArgument, e.to_string())),
                     });
                 }
             }
@@ -431,13 +377,10 @@ impl ContentAddressableStorage for ReapiState {
         for digest in req.digests {
             total += digest.size_bytes;
             if total > self.max_batch_total_size_bytes {
-                return Err(grpc_status(
-                    tonic::Code::InvalidArgument,
-                    "batch exceeds max_batch_total_size_bytes",
-                ));
+                return Err(grpc_status(tonic::Code::InvalidArgument, "batch exceeds max_batch_total_size_bytes"));
             }
-            let hash_hex = digest_hash_hex(&digest)
-                .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
+            let hash_hex =
+                digest_hash_hex(&digest).map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
             match self.cas.get_bytes(&hash_hex, digest.size_bytes).await {
                 Ok(Some(data)) => {
                     responses.push(batch_read_blobs_response::Response {
@@ -452,10 +395,7 @@ impl ContentAddressableStorage for ReapiState {
                         digest: Some(digest),
                         data: Vec::new(),
                         compressor: compressor::Value::Identity as i32,
-                        status: Some(google_rpc_status(
-                            tonic::Code::NotFound,
-                            "missing blob".into(),
-                        )),
+                        status: Some(google_rpc_status(tonic::Code::NotFound, "missing blob".into())),
                     });
                 }
                 Err(e) => {
@@ -483,16 +423,15 @@ impl ActionCache for ReapiState {
             .action_digest
             .as_ref()
             .ok_or_else(|| grpc_status(tonic::Code::InvalidArgument, "missing action_digest"))?;
-        let hash_hex = digest_hash_hex(digest)
-            .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
+        let hash_hex = digest_hash_hex(digest).map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
         let data = self
             .cas
             .get_bytes(&hash_hex, digest.size_bytes)
             .await
             .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?
             .ok_or_else(|| grpc_status(tonic::Code::NotFound, "missing action result"))?;
-        let result = ActionResult::decode(data.as_ref())
-            .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
+        let result =
+            ActionResult::decode(data.as_ref()).map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
         Ok(Response::new(result))
     }
 
@@ -516,8 +455,7 @@ impl ActionCache for ReapiState {
                 "action_result encoded size does not match action_digest.size_bytes",
             ));
         }
-        let hash_hex = digest_hash_hex(digest)
-            .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
+        let hash_hex = digest_hash_hex(digest).map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
         verify_sha256(&bytes, &hash_hex, digest.size_bytes)
             .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
         self.cas
@@ -526,17 +464,13 @@ impl ActionCache for ReapiState {
             .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
         Ok(Response::new(result.clone()))
     }
-
 }
 
 #[tonic::async_trait]
 impl ByteStream for ReapiState {
     type ReadStream = ReceiverStream<Result<ReadResponse, Status>>;
 
-    async fn read(
-        &self,
-        request: Request<ReadRequest>,
-    ) -> Result<Response<Self::ReadStream>, Status> {
+    async fn read(&self, request: Request<ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
         let req = request.into_inner();
         let (hash_hex, size) = parse_blob_resource(&self.instance, &req.resource_name)
             .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
@@ -559,13 +493,7 @@ impl ByteStream for ReapiState {
                 while pending.len() >= CHUNK {
                     let piece = pending.slice(0..CHUNK);
                     pending = pending.slice(CHUNK..);
-                    if tx
-                        .send(Ok(ReadResponse {
-                            data: piece.to_vec(),
-                        }))
-                        .await
-                        .is_err()
-                    {
+                    if tx.send(Ok(ReadResponse { data: piece.to_vec() })).await.is_err() {
                         return;
                     }
                 }
@@ -581,18 +509,12 @@ impl ByteStream for ReapiState {
                         }
                     }
                     Some(Err(e)) => {
-                        let _ = tx
-                            .send(Err(grpc_status(tonic::Code::Internal, e.to_string())))
-                            .await;
+                        let _ = tx.send(Err(grpc_status(tonic::Code::Internal, e.to_string()))).await;
                         return;
                     }
                     None => {
                         if !pending.is_empty() {
-                            let _ = tx
-                                .send(Ok(ReadResponse {
-                                    data: pending.to_vec(),
-                                }))
-                                .await;
+                            let _ = tx.send(Ok(ReadResponse { data: pending.to_vec() })).await;
                         }
                         return;
                     }
@@ -602,10 +524,7 @@ impl ByteStream for ReapiState {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn write(
-        &self,
-        request: Request<Streaming<WriteRequest>>,
-    ) -> Result<Response<WriteResponse>, Status> {
+    async fn write(&self, request: Request<Streaming<WriteRequest>>) -> Result<Response<WriteResponse>, Status> {
         let mut stream = request.into_inner();
         let mut upload: Option<Upload> = None;
         let mut finished = false;
@@ -639,19 +558,12 @@ impl ByteStream for ReapiState {
         let Some(upload) = uploads.get(&parsed.upload_id) else {
             return Err(grpc_status(tonic::Code::NotFound, "unknown upload"));
         };
-        Ok(Response::new(QueryWriteStatusResponse {
-            committed_size: upload.committed_size,
-            complete: upload.complete,
-        }))
+        Ok(Response::new(QueryWriteStatusResponse { committed_size: upload.committed_size, complete: upload.complete }))
     }
 }
 
 fn google_rpc_status(code: tonic::Code, message: String) -> crate::google::rpc::Status {
-    crate::google::rpc::Status {
-        code: code as i32,
-        message,
-        details: Vec::new(),
-    }
+    crate::google::rpc::Status { code: code as i32, message, details: Vec::new() }
 }
 
 struct UploadResource {
@@ -671,19 +583,11 @@ fn parse_blob_resource(instance: &str, name: &str) -> Result<(String, i64)> {
 
 fn parse_upload_resource(instance: &str, name: &str) -> Result<UploadResource> {
     let parts: Vec<&str> = name.split('/').collect();
-    if parts.len() != 6
-        || parts[0] != instance
-        || parts[1] != "uploads"
-        || parts[3] != "blobs"
-    {
+    if parts.len() != 6 || parts[0] != instance || parts[1] != "uploads" || parts[3] != "blobs" {
         bail!("expected {{instance}}/uploads/{{uuid}}/blobs/{{hash}}/{{size}}, got {name:?}");
     }
     let size: i64 = parts[5].parse().context("size")?;
-    Ok(UploadResource {
-        upload_id: parts[2].to_string(),
-        hash_hex: parts[4].to_string(),
-        size,
-    })
+    Ok(UploadResource { upload_id: parts[2].to_string(), hash_hex: parts[4].to_string(), size })
 }
 
 #[cfg(test)]

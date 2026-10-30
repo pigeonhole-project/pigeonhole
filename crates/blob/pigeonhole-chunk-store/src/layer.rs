@@ -3,22 +3,19 @@
 //! Gateways see only [`ChunkId`] / [`Extent`] — not locators or instances.
 
 use crate::blob_db::{BlobDb, StoredBlock};
-use crate::commands::ChunkState;
-use pigeonhole_meta::{Outcomes, Proposal, Prepared, Slot};
 use crate::block_cache::BlockCache;
+use crate::commands::ChunkState;
 use crate::ingest::IngestOptions;
+use crate::repair::spawn_enqueue_repair;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use md5::{Digest, Md5};
 use pigeonhole_blob::{
-    collect_stream, erase, BlobBackend, CheapestFirst, EncodedBlock, ReplicaLayout, Replicated,
-    SharedBackend,
+    collect_stream, erase, BlobBackend, CheapestFirst, EncodedBlock, ReplicaLayout, Replicated, SharedBackend,
 };
-use crate::repair::spawn_enqueue_repair;
-use pigeonhole_codec::{
-    decode_block_slice, encode_block_bytes, ByteBudget, ChunkCodec, DEFAULT_LOGICAL_CHUNK_SIZE,
-};
+use pigeonhole_codec::{decode_block_slice, encode_block_bytes, ByteBudget, ChunkCodec, DEFAULT_LOGICAL_CHUNK_SIZE};
+use pigeonhole_meta::{Outcomes, Prepared, Proposal, Slot};
 use pigeonhole_types::ByteRange;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,33 +124,17 @@ pub struct ChunkStore {
 
 impl ChunkStore {
     /// Open with a single backend (write quorum 1).
-    pub async fn open<B: BlobBackend>(
-        db: BlobDb,
-        backend: B,
-        opts: IngestOptions,
-    ) -> Result<Self> {
+    pub async fn open<B: BlobBackend>(db: BlobDb, backend: B, opts: IngestOptions) -> Result<Self> {
         let backend: SharedBackend = Arc::new(erase(backend));
         let info = backend.instance().clone();
         db.sync_instances(&[info]).await?;
-        let replicated = Replicated::new(
-            vec![backend],
-            1,
-            Arc::new(CheapestFirst::new()),
-        )?;
+        let replicated = Replicated::new(vec![backend], 1, Arc::new(CheapestFirst::new()))?;
         Self::open_replicated(db, Arc::new(replicated), opts).await
     }
 
     /// Open with an existing placement group.
-    pub async fn open_replicated(
-        db: BlobDb,
-        replicated: Arc<Replicated>,
-        opts: IngestOptions,
-    ) -> Result<Self> {
-        let infos: Vec<_> = replicated
-            .members()
-            .iter()
-            .map(|m| m.instance().clone())
-            .collect();
+    pub async fn open_replicated(db: BlobDb, replicated: Arc<Replicated>, opts: IngestOptions) -> Result<Self> {
+        let infos: Vec<_> = replicated.members().iter().map(|m| m.instance().clone()).collect();
         db.sync_instances(&infos).await?;
         check_block_fits_members(opts.block_size, replicated.as_ref())?;
         // Uncommitted parts at or below the highest committed key are a dead
@@ -213,12 +194,7 @@ impl ChunkStore {
         let logical = data.len() as i64;
         let crc = crc32fast::hash(data.as_ref());
         let mut w = self.replicated.chunk_writer();
-        w.push(EncodedBlock {
-            stored: data,
-            logical_len: logical as u32,
-            codec: "raw".into(),
-        })
-        .await?;
+        w.push(EncodedBlock { stored: data, logical_len: logical as u32, codec: "raw".into() }).await?;
         let sealed = w.finish().await?;
         let blocks = vec![StoredBlock {
             block_no: 0,
@@ -228,12 +204,8 @@ impl ChunkStore {
             codec: "raw".into(),
             crc32: crc,
         }];
-        let chunk_id = self
-            .db
-            .commit_chunk(logical, crc, &blocks, &sealed.layouts)
-            .await?;
-        self.enqueue_missing_replicas(chunk_id, &sealed.layouts)
-            .await?;
+        let chunk_id = self.db.commit_chunk(logical, crc, &blocks, &sealed.layouts).await?;
+        self.enqueue_missing_replicas(chunk_id, &sealed.layouts).await?;
         drop(sealed.pins);
         Ok(chunk_id)
     }
@@ -313,11 +285,7 @@ impl ChunkStore {
     /// delete their parts underneath it. A chunk already reclaimed (the object
     /// was overwritten or deleted after its extents were read) fails with
     /// [`ChunkGone`](crate::ChunkGone): re-read the extents and retry.
-    pub async fn read(
-        &self,
-        extents: &[Extent],
-        range: Option<ByteRange>,
-    ) -> Result<Bytes> {
+    pub async fn read(&self, extents: &[Extent], range: Option<ByteRange>) -> Result<Bytes> {
         let ids: Vec<ChunkId> = extents.iter().map(|e| e.chunk).collect();
         let _pin = self.db.pin_reads(&ids);
         for &chunk_id in &ids {
@@ -328,11 +296,7 @@ impl ChunkStore {
         let mut pieces = Vec::new();
         let mut cursor = 0u64;
         for ext in extents {
-            let meta = self
-                .db
-                .chunk_meta(ext.chunk)
-                .await?
-                .ok_or(crate::ChunkGone { chunk_id: ext.chunk })?;
+            let meta = self.db.chunk_meta(ext.chunk).await?.ok_or(crate::ChunkGone { chunk_id: ext.chunk })?;
             let chunk_size = meta.0;
             let ext_off = ext.offset.max(0);
             let ext_len = if ext.len < 0 {
@@ -386,8 +350,7 @@ impl ChunkStore {
         to: usize,
         replicas: &[ReplicaLayout],
     ) -> Result<Bytes> {
-        self.read_chunk_range_with(chunk_id, from, to, replicas)
-            .await
+        self.read_chunk_range_with(chunk_id, from, to, replicas).await
     }
 
     async fn read_chunk_range(&self, chunk_id: ChunkId, from: usize, to: usize) -> Result<Bytes> {
@@ -395,8 +358,7 @@ impl ChunkStore {
         if replicas.is_empty() {
             bail!("no parts for chunk {chunk_id}");
         }
-        self.read_chunk_range_with(chunk_id, from, to, &replicas)
-            .await
+        self.read_chunk_range_with(chunk_id, from, to, &replicas).await
     }
 
     async fn read_chunk_range_with(
@@ -417,10 +379,7 @@ impl ChunkStore {
             // Single raw part covering the whole chunk (put_small).
             let hook = self.not_found_hook(chunk_id);
             let stored = collect_stream(
-                self.replicated
-                    .read_with_hook(replicas, 0..1, hook)
-                    .await
-                    .context("replicated read raw")?,
+                self.replicated.read_with_hook(replicas, 0..1, hook).await.context("replicated read raw")?,
             )
             .await?;
             if to > stored.len() {
@@ -446,9 +405,7 @@ impl ChunkStore {
 
         let mut out = Vec::with_capacity(to - from);
         for b in needed {
-            let decoded = self
-                .load_decoded_block(chunk_id, b, replicas, first_no..last_no)
-                .await?;
+            let decoded = self.load_decoded_block(chunk_id, b, replicas, first_no..last_no).await?;
             let start = b.logical_off as usize;
             let flen = decoded.len();
             let local_from = from.saturating_sub(start).min(flen);
@@ -471,25 +428,13 @@ impl ChunkStore {
         if let Some(l1) = &self.block_cache {
             return l1
                 .get_or_load(chunk_id, block_no, || async {
-                    let stored = self
-                        .load_compressed_block(chunk_id, block, replicas, fetch_range.clone())
-                        .await?;
-                    decode_block_slice(
-                        stored.as_ref(),
-                        &block.codec,
-                        block.logical_len.max(1) as usize,
-                    )
+                    let stored = self.load_compressed_block(chunk_id, block, replicas, fetch_range.clone()).await?;
+                    decode_block_slice(stored.as_ref(), &block.codec, block.logical_len.max(1) as usize)
                 })
                 .await;
         }
-        let stored = self
-            .load_compressed_block(chunk_id, block, replicas, fetch_range)
-            .await?;
-        decode_block_slice(
-            stored.as_ref(),
-            &block.codec,
-            block.logical_len.max(1) as usize,
-        )
+        let stored = self.load_compressed_block(chunk_id, block, replicas, fetch_range).await?;
+        decode_block_slice(stored.as_ref(), &block.codec, block.logical_len.max(1) as usize)
     }
 
     async fn load_compressed_block(
@@ -515,12 +460,7 @@ impl ChunkStore {
             if raw.len() as i64 != block.stored_len && block.stored_len > 0 {
                 // Best-effort: tolerate missing stored_len on migrated empty counts.
                 if raw.len() < block.stored_len as usize {
-                    bail!(
-                        "block {} stored len {} < expected {}",
-                        block_no,
-                        raw.len(),
-                        block.stored_len
-                    );
+                    bail!("block {} stored len {} < expected {}", block_no, raw.len(), block.stored_len);
                 }
             }
             Ok(raw)
@@ -542,7 +482,8 @@ impl ChunkStore {
     ) -> Result<Bytes> {
         let block_no = block.block_no as u32;
         for r in replicas {
-            let Ok(stream) = self.replicated.read_with_hook(std::slice::from_ref(r), block_no..block_no + 1, None).await
+            let Ok(stream) =
+                self.replicated.read_with_hook(std::slice::from_ref(r), block_no..block_no + 1, None).await
             else {
                 continue;
             };
@@ -555,10 +496,7 @@ impl ChunkStore {
         bail!("chunk {chunk_id} block {block_no} fails its checksum on every replica")
     }
 
-    fn not_found_hook(
-        &self,
-        chunk_id: ChunkId,
-    ) -> Option<pigeonhole_blob::NotFoundHook> {
+    fn not_found_hook(&self, chunk_id: ChunkId) -> Option<pigeonhole_blob::NotFoundHook> {
         let db = self.db.clone();
         Some(Arc::new(move |instance_id: &str| {
             spawn_enqueue_repair(db.clone(), chunk_id, instance_id.to_string());
@@ -566,13 +504,8 @@ impl ChunkStore {
     }
 
     /// After a quorum write, enqueue backfill for placement members that missed.
-    async fn enqueue_missing_replicas(
-        &self,
-        chunk_id: ChunkId,
-        layouts: &[ReplicaLayout],
-    ) -> Result<()> {
-        let have: std::collections::HashSet<&str> =
-            layouts.iter().map(|l| l.instance.as_str()).collect();
+    async fn enqueue_missing_replicas(&self, chunk_id: ChunkId, layouts: &[ReplicaLayout]) -> Result<()> {
+        let have: std::collections::HashSet<&str> = layouts.iter().map(|l| l.instance.as_str()).collect();
         for m in self.replicated.members() {
             let id = m.instance().id.as_str();
             if !have.contains(id) {
@@ -633,11 +566,7 @@ impl ChunkStore {
         let block_no = open.blocks.len() as i64;
         let logical_off = open.logical;
         open.writer
-            .push(EncodedBlock {
-                stored: stored.clone(),
-                logical_len: logical_len as u32,
-                codec: stored_codec.clone(),
-            })
+            .push(EncodedBlock { stored: stored.clone(), logical_len: logical_len as u32, codec: stored_codec.clone() })
             .await
             .context("replicated push block")?;
 
@@ -658,11 +587,7 @@ impl ChunkStore {
         Ok(())
     }
 
-    async fn seal_open_chunk(
-        &self,
-        open: &mut OpenChunk,
-        pending: &mut PendingChunks,
-    ) -> Result<Extent> {
+    async fn seal_open_chunk(&self, open: &mut OpenChunk, pending: &mut PendingChunks) -> Result<Extent> {
         let blocks = std::mem::take(&mut open.blocks);
         let stored = std::mem::take(&mut open.stored);
         let logical = open.logical;
@@ -688,11 +613,7 @@ impl ChunkStore {
             }
         }
         pending.chunks.push(PendingChunk { chunk_id, commit, layouts: sealed.layouts, pins: sealed.pins });
-        Ok(Extent {
-            chunk: chunk_id,
-            offset: 0,
-            len: logical,
-        })
+        Ok(Extent { chunk: chunk_id, offset: 0, len: logical })
     }
 }
 
@@ -796,15 +717,9 @@ struct OpenChunk {
 
 impl OpenChunk {
     fn new(writer: pigeonhole_blob::ChunkReplicaWriter) -> Self {
-        Self {
-            writer,
-            blocks: Vec::new(),
-            stored: Vec::new(),
-            logical: 0,
-        }
+        Self { writer, blocks: Vec::new(), stored: Vec::new(), logical: 0 }
     }
 }
-
 
 /// E.4: block_size (+ margin for incompressible / header) must fit every member.
 pub fn check_block_fits_members(block_size: usize, replicated: &Replicated) -> Result<()> {
@@ -812,14 +727,10 @@ pub fn check_block_fits_members(block_size: usize, replicated: &Replicated) -> R
     let need = block_size.saturating_add(pigeonhole_codec::COMPRESS_SIZE_MARGIN.min(64 * 1024));
     // Incompressible path stores raw `block_size` bytes; require block_size < min max.
     if block_size >= min_max {
-        bail!(
-            "chunk.block_size ({block_size}) must be < min(max_blob_size) of placement group ({min_max})"
-        );
+        bail!("chunk.block_size ({block_size}) must be < min(max_blob_size) of placement group ({min_max})");
     }
     if need >= min_max && block_size + 64 >= min_max {
-        bail!(
-            "chunk.block_size ({block_size}) with margin exceeds min(max_blob_size) ({min_max})"
-        );
+        bail!("chunk.block_size ({block_size}) with margin exceeds min(max_blob_size) ({min_max})");
     }
     let _ = need;
     Ok(())
@@ -861,10 +772,7 @@ mod tests {
             joins.push(tokio::spawn(async move {
                 let body = Bytes::from(vec![i; 256 * 1024]);
                 layer
-                    .ingest_and_commit(
-                        stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]),
-                        None,
-                    )
+                    .ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]), None)
                     .await
                     .map(|ing| (ing, body))
             }));
@@ -907,10 +815,8 @@ mod tests {
         let layer = open_memory_chunk_store(&log_dir).await.unwrap();
 
         let body = Bytes::from(vec![7u8; 200_000]);
-        let ingested = layer
-            .ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]), None)
-            .await
-            .unwrap();
+        let ingested =
+            layer.ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]), None).await.unwrap();
         assert_eq!(ingested.size, body.len() as i64);
         assert!(!ingested.extents.is_empty());
 
@@ -918,10 +824,7 @@ mod tests {
         assert_eq!(got, body);
 
         let mid = body.len() as u64 / 2;
-        let slice = layer
-            .read(&ingested.extents, Some(mid..mid + 10))
-            .await
-            .unwrap();
+        let slice = layer.read(&ingested.extents, Some(mid..mid + 10)).await.unwrap();
         assert_eq!(slice.as_ref(), &body[mid as usize..mid as usize + 10]);
 
         let ids: Vec<_> = ingested.extents.iter().map(|e| e.chunk).collect();
@@ -950,10 +853,7 @@ mod tests {
         .with_instance_id("b-10");
         let rep = Arc::new(
             Replicated::new(
-                vec![
-                    Arc::new(erase(a)) as SharedBackend,
-                    Arc::new(erase(b)) as SharedBackend,
-                ],
+                vec![Arc::new(erase(a)) as SharedBackend, Arc::new(erase(b)) as SharedBackend],
                 2,
                 Arc::new(CheapestFirst::new()),
             )
@@ -961,9 +861,7 @@ mod tests {
         );
         let mut opts = IngestOptions::new(64 * MIB, ChunkCodec::Raw);
         opts.block_size = 6 * MIB;
-        let layer = ChunkStore::open_replicated(db, rep.clone(), opts)
-            .await
-            .unwrap();
+        let layer = ChunkStore::open_replicated(db, rep.clone(), opts).await.unwrap();
 
         let n = 200 * MIB;
         let piece = 4 * MIB;
@@ -988,25 +886,13 @@ mod tests {
 
         // Range across a chunk boundary (64 MiB).
         let cross = 64 * MIB as u64 - 100;
-        let slice = layer
-            .read(&ingested.extents, Some(cross..cross + 200))
-            .await
-            .unwrap();
-        assert_eq!(
-            slice.as_ref(),
-            &expect[cross as usize..cross as usize + 200]
-        );
+        let slice = layer.read(&ingested.extents, Some(cross..cross + 200)).await.unwrap();
+        assert_eq!(slice.as_ref(), &expect[cross as usize..cross as usize + 200]);
 
         // Range across a part boundary inside first chunk (6 MiB blocks; 10 MiB → 1 block/part).
         let part_cross = 6 * MIB as u64 - 50;
-        let slice = layer
-            .read(&ingested.extents, Some(part_cross..part_cross + 100))
-            .await
-            .unwrap();
-        assert_eq!(
-            slice.as_ref(),
-            &expect[part_cross as usize..part_cross as usize + 100]
-        );
+        let slice = layer.read(&ingested.extents, Some(part_cross..part_cross + 100)).await.unwrap();
+        assert_eq!(slice.as_ref(), &expect[part_cross as usize..part_cross as usize + 100]);
 
         // Each replica alone.
         for ext in &ingested.extents {
@@ -1014,26 +900,12 @@ mod tests {
             assert_eq!(layouts.len(), 2);
             for layout in &layouts {
                 let got = layer
-                    .read_from_replicas(
-                        ext.chunk,
-                        0,
-                        ext.len as usize,
-                        std::slice::from_ref(layout),
-                    )
+                    .read_from_replicas(ext.chunk, 0, ext.len as usize, std::slice::from_ref(layout))
                     .await
                     .unwrap();
-                let start = ingested
-                    .extents
-                    .iter()
-                    .take_while(|e| e.chunk != ext.chunk)
-                    .map(|e| e.len as usize)
-                    .sum::<usize>();
-                assert_eq!(
-                    got.as_ref(),
-                    &expect[start..start + ext.len as usize],
-                    "replica {}",
-                    layout.instance
-                );
+                let start =
+                    ingested.extents.iter().take_while(|e| e.chunk != ext.chunk).map(|e| e.len as usize).sum::<usize>();
+                assert_eq!(got.as_ref(), &expect[start..start + ext.len as usize], "replica {}", layout.instance);
             }
         }
     }
@@ -1044,17 +916,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
-        let a = MemoryBlobStore::with_limits(BackendLimits::memory())
-            .with_instance_id("a")
-            .with_unavailable_flag();
+        let a = MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("a").with_unavailable_flag();
         let flag = a.unavailable_flag();
         let b = MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("b");
         let rep = Arc::new(
             Replicated::new(
-                vec![
-                    Arc::new(erase(a)) as SharedBackend,
-                    Arc::new(erase(b)) as SharedBackend,
-                ],
+                vec![Arc::new(erase(a)) as SharedBackend, Arc::new(erase(b)) as SharedBackend],
                 2,
                 Arc::new(CheapestFirst::new()),
             )
@@ -1064,10 +931,8 @@ mod tests {
         opts.block_size = MIB;
         let layer = ChunkStore::open_replicated(db, rep, opts).await.unwrap();
         let data = Bytes::from(vec![9u8; 3 * MIB]);
-        let ingested = layer
-            .ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None)
-            .await
-            .unwrap();
+        let ingested =
+            layer.ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None).await.unwrap();
         flag.store(true, Ordering::Relaxed);
         let got = layer.read(&ingested.extents, None).await.unwrap();
         assert_eq!(got, data);
@@ -1080,7 +945,9 @@ mod tests {
         const MIB: usize = 1024 * 1024;
         for write_through in [true, false] {
             let dir = tempfile::tempdir().unwrap();
-            let db = BlobDb::open(pigeonhole_testkit::tablet(&dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
+            let db = BlobDb::open(pigeonhole_testkit::tablet(&dir.path().join("blob.log"), BlobDb::register).await)
+                .await
+                .unwrap();
             let store = MemoryBlobStore::with_limits(BackendLimits::memory()).with_unavailable_flag();
             let down = store.unavailable_flag();
             let mut opts = IngestOptions::new(8 * MIB, ChunkCodec::Zstd);
@@ -1088,10 +955,8 @@ mod tests {
             let l2 = Arc::new(BlockCache::new("l2", 64 * MIB));
             let layer = ChunkStore::open(db, store, opts).await.unwrap().with_caches(None, Some(l2), write_through);
             let data: Bytes = (0..3 * MIB + 5).map(|i| (i / 1000) as u8).collect::<Vec<_>>().into();
-            let ingested = layer
-                .ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None)
-                .await
-                .unwrap();
+            let ingested =
+                layer.ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None).await.unwrap();
             down.store(true, Ordering::Relaxed);
             let got = layer.read(&ingested.extents, None).await;
             if write_through {
@@ -1113,9 +978,7 @@ mod tests {
         opts.block_size = 1024 * 1024;
         opts.memory_budget = Some(budget.clone());
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
-        let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
-            .await
-            .unwrap();
+        let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap();
         let n = 300 * 1024 * 1024;
         let piece = 4 * 1024 * 1024;
         let body = futures::stream::unfold(0usize, move |off| async move {
@@ -1125,10 +988,7 @@ mod tests {
             let len = (n - off).min(piece);
             Some((Ok::<_, anyhow::Error>(Bytes::from(vec![0u8; len])), off + len))
         });
-        let r = layer
-            .ingest_and_commit(Box::pin(body), None)
-            .await
-            .expect("300 MiB ingest under 32 MiB budget");
+        let r = layer.ingest_and_commit(Box::pin(body), None).await.expect("300 MiB ingest under 32 MiB budget");
         assert_eq!(r.size, n as i64);
         assert!(!r.extents.is_empty());
         assert_eq!(budget.available_permits(), budget.capacity());
@@ -1147,9 +1007,7 @@ mod tests {
                 opts.block_size = 512 * 1024;
                 opts.memory_budget = Some(budget);
                 let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
-                let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
-                    .await
-                    .unwrap();
+                let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap();
                 let n = 64 * 1024 * 1024;
                 let piece = 2 * 1024 * 1024;
                 let body = futures::stream::unfold(0usize, move |off| async move {
@@ -1163,9 +1021,7 @@ mod tests {
             }));
         }
         for j in joins {
-            j.await
-                .expect("join")
-                .expect("parallel 64 MiB ingest under 64 MiB shared budget");
+            j.await.expect("join").expect("parallel 64 MiB ingest under 64 MiB shared budget");
         }
         assert_eq!(budget.available_permits(), budget.capacity());
     }
@@ -1186,9 +1042,7 @@ mod tests {
                 opts.block_size = frame;
                 opts.memory_budget = Some(budget);
                 let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
-                let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts)
-                    .await
-                    .unwrap();
+                let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap();
                 let n = 8 * 1024 * 1024;
                 let piece = 256 * 1024;
                 let body = futures::stream::unfold(0usize, move |off| async move {
@@ -1203,16 +1057,11 @@ mod tests {
         }
         let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             for j in joins {
-                j.await
-                    .expect("join")
-                    .expect("parallel 8 MiB ingest under 4*block_size budget");
+                j.await.expect("join").expect("parallel 8 MiB ingest under 4*block_size budget");
             }
         })
         .await;
-        assert!(
-            result.is_ok(),
-            "64 parallel 8 MiB PUTs under 4*block_size budget timed out"
-        );
+        assert!(result.is_ok(), "64 parallel 8 MiB PUTs under 4*block_size budget timed out");
         assert_eq!(budget.available_permits(), budget.capacity());
     }
 
@@ -1225,11 +1074,7 @@ mod tests {
         opts.block_size = 512 * 1024;
         opts.memory_budget = Some(budget.clone());
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
-        let layer = Arc::new(
-            ChunkStore::open(db, MemoryBlobStore::new(), opts)
-                .await
-                .unwrap(),
-        );
+        let layer = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
         let budget_c = budget.clone();
         let layer_c = layer.clone();
         let handle = tokio::spawn(async move {

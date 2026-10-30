@@ -37,7 +37,10 @@ struct Yes {
 
 #[async_trait]
 impl Handler<Config> for Yes {
-    async fn append_entries(&self, _: AppendEntriesRequest<Config>) -> Result<AppendEntriesResponse<u64>, RaftError<u64>> {
+    async fn append_entries(
+        &self,
+        _: AppendEntriesRequest<Config>,
+    ) -> Result<AppendEntriesResponse<u64>, RaftError<u64>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(AppendEntriesResponse::Success)
     }
@@ -67,7 +70,12 @@ async fn pair(chat: &FakeChat, key2: [u8; 32], handler: Arc<Yes>) -> (ChatNetwor
 }
 
 #[allow(clippy::result_large_err)] // openraft's RPCError, as its API returns it
-async fn vote(net: &mut ChatNetwork<Config>, target: u64, term: u64, ttl: Duration) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+async fn vote(
+    net: &mut ChatNetwork<Config>,
+    target: u64,
+    term: u64,
+    ttl: Duration,
+) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
     let mut client = net.new_client(target, &BasicNode::default()).await;
     client.vote(VoteRequest::new(Vote::new(term, 1), None), RPCOption::new(ttl)).await
 }
@@ -194,15 +202,17 @@ async fn calls_frames_and_posts_are_counted() {
             })
             .map_or_else(|| panic!("{name} {labels:?}"), |(.., v)| v)
     };
-    let calls = |outcome| match find("openraft_chat_call_seconds", &[("peer", "2"), ("rpc", "vote"), ("outcome", outcome)]) {
-        DebugValue::Histogram(h) => h.len(),
-        other => panic!("{other:?}"),
-    };
+    let calls =
+        |outcome| match find("openraft_chat_call_seconds", &[("peer", "2"), ("rpc", "vote"), ("outcome", outcome)]) {
+            DebugValue::Histogram(h) => h.len(),
+            other => panic!("{other:?}"),
+        };
     assert_eq!((calls("ok"), calls("timeout")), (3, 1));
-    let frames = |peer, outcome| match find("openraft_chat_frames_received_total", &[("peer", peer), ("outcome", outcome)]) {
-        DebugValue::Counter(c) => *c,
-        other => panic!("{other:?}"),
-    };
+    let frames =
+        |peer, outcome| match find("openraft_chat_frames_received_total", &[("peer", peer), ("outcome", outcome)]) {
+            DebugValue::Counter(c) => *c,
+            other => panic!("{other:?}"),
+        };
     assert_eq!(frames("1", "ok"), 3, "node 2 got the 3 requests once");
     assert_eq!(frames("1", "duplicate"), 3, "and each a second time");
     assert!(matches!(find("openraft_chat_posts_total", &[("outcome", "ok")]), DebugValue::Counter(n) if *n >= 6));

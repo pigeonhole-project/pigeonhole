@@ -26,10 +26,7 @@ pub struct SweepConfig {
 
 impl Default for SweepConfig {
     fn default() -> Self {
-        Self {
-            batch_size: SWEEP_BATCH_SIZE,
-            interval: DEFAULT_SWEEP_INTERVAL,
-        }
+        Self { batch_size: SWEEP_BATCH_SIZE, interval: DEFAULT_SWEEP_INTERVAL }
     }
 }
 
@@ -51,12 +48,7 @@ pub struct Sweeper {
 }
 
 impl Sweeper {
-    pub fn new(
-        db: BlobDb,
-        members: Vec<SharedBackend>,
-        config: SweepConfig,
-        pins: Arc<UploadPins>,
-    ) -> Self {
+    pub fn new(db: BlobDb, members: Vec<SharedBackend>, config: SweepConfig, pins: Arc<UploadPins>) -> Self {
         Self { db, members, config, pins }
     }
 
@@ -90,10 +82,7 @@ impl Sweeper {
                             "sweep pass complete"
                         );
                     } else {
-                        debug!(
-                            keys_skipped_live = stats.keys_skipped_live,
-                            "sweep pass idle"
-                        );
+                        debug!(keys_skipped_live = stats.keys_skipped_live, "sweep pass idle");
                     }
                 }
                 Err(e) => warn!(error = %e, "sweep pass failed"),
@@ -134,11 +123,7 @@ impl Sweeper {
             }
             let layouts = self.db.get_replica_layouts(chunk_id).await?;
             for layout in &layouts {
-                let Some(backend) = self
-                    .members
-                    .iter()
-                    .find(|m| m.instance().id == layout.instance)
-                else {
+                let Some(backend) = self.members.iter().find(|m| m.instance().id == layout.instance) else {
                     warn!(
                         chunk_id,
                         instance = %layout.instance,
@@ -146,21 +131,11 @@ impl Sweeper {
                     );
                     continue;
                 };
-                let keys: Vec<Vec<u8>> = layout
-                    .parts
-                    .iter()
-                    .map(|p| p.locator.key.clone())
-                    .collect();
+                let keys: Vec<Vec<u8>> = layout.parts.iter().map(|p| p.locator.key.clone()).collect();
                 if !keys.is_empty() {
-                    backend
-                        .delete(&keys)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "delete zero-ref parts chunk={chunk_id} instance={}",
-                                layout.instance
-                            )
-                        })?;
+                    backend.delete(&keys).await.with_context(|| {
+                        format!("delete zero-ref parts chunk={chunk_id} instance={}", layout.instance)
+                    })?;
                 }
             }
             self.db.delete_chunk_metadata(chunk_id).await?;
@@ -197,22 +172,14 @@ impl Sweeper {
                 // Orphans are judged by this incarnation's state: delete only
                 // while it still holds the generation. (Reclaim needs no check:
                 // its deletes follow a committed BeginReclaim.)
-                self.db
-                    .confirm_active()
-                    .await
-                    .context("confirm the tablet's generation before deleting orphans")?;
-                backend
-                    .delete(&to_delete)
-                    .await
-                    .with_context(|| format!("batch delete on {instance_id}"))?;
+                self.db.confirm_active().await.context("confirm the tablet's generation before deleting orphans")?;
+                backend.delete(&to_delete).await.with_context(|| format!("batch delete on {instance_id}"))?;
                 deleted += to_delete.len() as u64;
             }
 
             let last = keys.last().cloned();
             after = last.clone();
-            self.db
-                .set_sweep_cursor(instance_id, last.as_deref())
-                .await?;
+            self.db.set_sweep_cursor(instance_id, last.as_deref()).await?;
 
             if keys.len() < batch {
                 self.db.set_sweep_cursor(instance_id, None).await?;
@@ -225,11 +192,7 @@ impl Sweeper {
     /// Split a candidate batch (all at or below the horizon) into
     /// `(to_delete, skipped)`: parts of any chunk in the state stay (live ones,
     /// and released ones that reclaim will delete once nobody reads them).
-    async fn filter_deletable(
-        &self,
-        instance_id: &str,
-        keys: &[Vec<u8>],
-    ) -> Result<(Vec<Vec<u8>>, u64)> {
+    async fn filter_deletable(&self, instance_id: &str, keys: &[Vec<u8>]) -> Result<(Vec<Vec<u8>>, u64)> {
         let owned = self.db.owned_part_keys_among(instance_id, keys).await?;
         let to_delete: Vec<Vec<u8>> = keys.iter().filter(|k| !owned.contains(*k)).cloned().collect();
         let skipped = (keys.len() - to_delete.len()) as u64;
@@ -257,9 +220,8 @@ mod tests {
     }
 
     async fn open_layer(db: BlobDb, backend: SharedBackend) -> (ChunkStore, Arc<UploadPins>) {
-        let replicated = Arc::new(
-            Replicated::new(vec![backend], 1, Arc::new(pigeonhole_blob::CheapestFirst::new())).unwrap(),
-        );
+        let replicated =
+            Arc::new(Replicated::new(vec![backend], 1, Arc::new(pigeonhole_blob::CheapestFirst::new())).unwrap());
         let pins = replicated.pins().clone();
         let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
         opts.block_size = 64 * 1024;
@@ -269,7 +231,9 @@ mod tests {
 
     async fn setup() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
         let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
         let backend: SharedBackend = Arc::new(erase(mem.clone()));
         let (layer, pins) = open_layer(db.clone(), backend.clone()).await;
@@ -306,7 +270,9 @@ mod tests {
         let f = setup().await;
         let loc = orphan(&f, b"orphan").await;
         // A newer incarnation claims the same log; this one has not written since.
-        let _newer = BlobDb::open(pigeonhole_testkit::tablet(f.dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
+        let _newer = BlobDb::open(pigeonhole_testkit::tablet(f.dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
 
         let err = sweeper(&f).sweep_once().await.unwrap_err();
         assert!(format!("{err:#}").contains("fenced"), "{err:#}");
@@ -433,9 +399,7 @@ mod tests {
         };
         let (log, snapshots) = pigeonhole_testkit::disk_meta(dir.path());
         let namespaces = BlobDb::register(Default::default());
-        let meta = pigeonhole_meta::MetaStore::open(log, snapshots, namespaces, opts)
-            .await
-            .unwrap();
+        let meta = pigeonhole_meta::MetaStore::open(log, snapshots, namespaces, opts).await.unwrap();
         let db = BlobDb::open(meta.clone()).await.unwrap();
         let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
         let backend: SharedBackend = Arc::new(erase(mem.clone()));
@@ -469,10 +433,7 @@ mod tests {
         // Restart: fresh pins, nothing returned in this process yet.
         let (_layer, pins) = open_layer(f.db.clone(), f.backend.clone()).await;
         let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: Duration::from_secs(1) };
-        let stats = Sweeper::new(f.db.clone(), vec![f.backend.clone()], config, pins)
-            .sweep_once()
-            .await
-            .unwrap();
+        let stats = Sweeper::new(f.db.clone(), vec![f.backend.clone()], config, pins).sweep_once().await.unwrap();
         assert_eq!(stats.keys_deleted, 1);
         assert!(!on_backend(&f, &dead));
         assert!(f.db.chunk_meta(id).await.unwrap().is_some());

@@ -54,11 +54,7 @@ impl CasIndex {
 
     pub async fn find_missing(&self, digests: &[(String, i64)]) -> Result<Vec<(String, i64)>> {
         Ok(self.meta.read::<CasState, _>(|s| {
-            digests
-                .iter()
-                .filter(|(hash, size)| !s.blobs.contains_key(&(hash.clone(), *size)))
-                .cloned()
-                .collect()
+            digests.iter().filter(|(hash, size)| !s.blobs.contains_key(&(hash.clone(), *size))).cloned().collect()
         }))
     }
 

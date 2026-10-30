@@ -14,11 +14,11 @@ mod segments;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_storage_api::{
-    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked,
-    MakeAfter, NotFound, OpKind,
-};
 use pigeonhole_limits::StoreLimiter;
+use pigeonhole_storage_api::{
+    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked, MakeAfter,
+    NotFound, OpKind,
+};
 use pigeonhole_types::{BackendLimits, ByteRange};
 use segments::Segments;
 use serde::{Deserialize, Serialize};
@@ -115,7 +115,8 @@ impl DiskBlobStore {
 
     /// At most `rate_per_sec` operations a second (`burst` at once).
     pub fn with_rate(mut self, rate_per_sec: f64, burst: f64) -> Self {
-        self.limiter = Arc::new(StoreLimiter::new(&self.instance.id).with_rate(pigeonhole_limits::Rate::new(rate_per_sec, burst)));
+        self.limiter =
+            Arc::new(StoreLimiter::new(&self.instance.id).with_rate(pigeonhole_limits::Rate::new(rate_per_sec, burst)));
         self
     }
 
@@ -317,8 +318,9 @@ impl Chain for DiskBlobStore {
     /// Background work: a batch at a time, each when no other operation runs.
     async fn prune(&self, below: &Self::Id) -> Result<()> {
         let below = below.key;
-        let doomed: Vec<u64> =
-            self.locked(move |s| Ok(s.records.range(..below).filter(|(_, r)| !r.dead).map(|(k, _)| *k).collect())).await?;
+        let doomed: Vec<u64> = self
+            .locked(move |s| Ok(s.records.range(..below).filter(|(_, r)| !r.dead).map(|(k, _)| *k).collect()))
+            .await?;
         for batch in doomed.chunks(PRUNE_BATCH) {
             self.limiter.wait_idle().await;
             let batch = batch.to_vec();

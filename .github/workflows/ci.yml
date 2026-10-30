@@ -25,14 +25,16 @@ jobs:
       - run: cargo test --workspace
 
   clippy:
-    name: clippy
+    name: clippy and rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Formatted (rustfmt.toml)
+        run: cargo fmt --all --check
       # The lints are in Cargo.toml ([workspace.lints]); both feature ends,
       # so code behind a feature or behind its absence is linted too.
       - run: make lint

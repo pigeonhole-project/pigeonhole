@@ -32,12 +32,6 @@ pub struct IngestOptions {
 
 impl IngestOptions {
     pub fn new(chunk_size: usize, codec: ChunkCodec) -> Self {
-        Self {
-            chunk_size,
-            codec,
-            block_size: chunker::DEFAULT_BLOCK_SIZE,
-            memory_budget: None,
-            compress_calls: None,
-        }
+        Self { chunk_size, codec, block_size: chunker::DEFAULT_BLOCK_SIZE, memory_budget: None, compress_calls: None }
     }
 }

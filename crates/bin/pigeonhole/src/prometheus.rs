@@ -13,8 +13,8 @@ use tracing::{info, warn};
 /// Buckets for `*_seconds` histograms: a local disk answers in well under a
 /// millisecond, a chat upload or a flood wait takes seconds to minutes.
 const SECONDS_BUCKETS: &[f64] = &[
-    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
-    5.0, 10.0, 30.0, 60.0, 300.0,
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+    300.0,
 ];
 
 /// Stored / logical size of a block: 0 (all zeroes) … 1 (incompressible).
@@ -54,11 +54,7 @@ pub fn install_recorder() -> anyhow::Result<&'static PrometheusHandle> {
 /// Axum route handler for `GET /metrics`.
 async fn render_metrics() -> impl IntoResponse {
     match HANDLE.get() {
-        Some(h) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-            h.render(),
-        )
+        Some(h) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], h.render())
             .into_response(),
         None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }

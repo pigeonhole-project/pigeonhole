@@ -67,10 +67,7 @@ pub struct BlobKey {
 
 impl BlobKey {
     pub fn new(backend_id: BackendId, key: impl Into<String>) -> Self {
-        Self {
-            backend_id,
-            key: key.into(),
-        }
+        Self { backend_id, key: key.into() }
     }
 }
 
@@ -97,28 +94,16 @@ impl BackendLimits {
     /// MTProto: a bot posts files far larger than any chunk (`MAX_LOGICAL_CHUNK`)
     /// and reads any 4 KiB-aligned window; the channel can be listed.
     pub fn telegram() -> Self {
-        Self {
-            max_blob_size: 256 * 1024 * 1024,
-            supports_range: RangeSupport::BestEffort,
-            can_list: true,
-        }
+        Self { max_blob_size: 256 * 1024 * 1024, supports_range: RangeSupport::BestEffort, can_list: true }
     }
 
     pub fn memory() -> Self {
-        Self {
-            max_blob_size: 20 * 1024 * 1024 - 1,
-            supports_range: RangeSupport::BestEffort,
-            can_list: false,
-        }
+        Self { max_blob_size: 20 * 1024 * 1024 - 1, supports_range: RangeSupport::BestEffort, can_list: false }
     }
 
     /// One file per blob; large enough for any chunk (`MAX_LOGICAL_CHUNK`).
     pub fn local_disk() -> Self {
-        Self {
-            max_blob_size: 256 * 1024 * 1024,
-            supports_range: RangeSupport::BestEffort,
-            can_list: true,
-        }
+        Self { max_blob_size: 256 * 1024 * 1024, supports_range: RangeSupport::BestEffort, can_list: true }
     }
 
     /// Discord's attachment limit: exactly 20 MiB per file since September

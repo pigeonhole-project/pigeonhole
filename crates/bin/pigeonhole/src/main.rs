@@ -2,9 +2,9 @@
 
 mod admin;
 mod background;
+mod channel_log;
 mod runtime;
 mod serve;
-mod channel_log;
 
 use admin::{cmd_purge, cmd_restore};
 use anyhow::{bail, Context};
@@ -39,14 +39,9 @@ async fn main() -> anyhow::Result<()> {
                         warn!("--expect-messages ignored (refs live in blob.db; sweeper is stage H)");
                     }
                     "--expect-chat" => {
-                        expect_chat = Some(
-                            rest.next()
-                                .context("--expect-chat requires chat_id")?.clone(),
-                        );
+                        expect_chat = Some(rest.next().context("--expect-chat requires chat_id")?.clone());
                     }
-                    other => bail!(
-                        "unknown purge flag {other}; usage: pigeonhole purge --yes [--expect-chat CHAT_ID]"
-                    ),
+                    other => bail!("unknown purge flag {other}; usage: pigeonhole purge --yes [--expect-chat CHAT_ID]"),
                 }
             }
             cmd_purge(yes, expect_chat.as_deref()).await

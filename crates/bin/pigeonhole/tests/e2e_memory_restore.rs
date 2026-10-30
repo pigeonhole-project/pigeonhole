@@ -4,18 +4,16 @@
 
 use bytes::Bytes;
 use futures::StreamExt;
-use http::{HeaderMap, Method, Uri};
 use http::Extensions;
+use http::{HeaderMap, Method, Uri};
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
-use pigeonhole_blob::{
-    erase, CheapestFirst, Replicated, SharedBackend,
-};
+use pigeonhole_blob::{erase, CheapestFirst, Replicated, SharedBackend};
 use pigeonhole_meta::{MetaOptions, MetaStore, Namespaces};
 use s3s::dto::*;
-use s3s::{S3, S3Request};
+use s3s::{S3Request, S3};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -73,12 +71,7 @@ async fn memory_put_restart_replay_get() {
 
     let s3 = open_with_shared_mem(dir.path(), &idx_log, &blob_log, mem.clone()).await;
 
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let payload = Bytes::from_static(b"stage-g-restore-payload");
     s3.put_object(req(PutObjectInput {
@@ -99,11 +92,7 @@ async fn memory_put_restart_replay_get() {
 
 async fn s3s2_get(s3: &pigeonhole::S3Gateway) -> Vec<u8> {
     let got = s3
-        .get_object(req(GetObjectInput {
-            bucket: "demo".into(),
-            key: "obj.bin".into(),
-            ..Default::default()
-        }))
+        .get_object(req(GetObjectInput { bucket: "demo".into(), key: "obj.bin".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -138,9 +127,7 @@ async fn lost_log_restores_from_stored_snapshots() {
     let dir = tempfile::tempdir().unwrap();
     let mem = Arc::new(MemoryBlobStore::new());
     let (s3, meta) = open_snapshotting(dir.path(), mem.clone()).await;
-    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() }))
-        .await
-        .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     let payload = Bytes::from_static(b"exported-payload");
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),

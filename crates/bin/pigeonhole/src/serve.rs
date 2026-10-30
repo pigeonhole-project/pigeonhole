@@ -9,8 +9,8 @@ use axum::Router;
 use pigeonhole::config::Config;
 use pigeonhole::gateway_metrics::track_gateway;
 use pigeonhole::http_timeout::with_http_timeouts;
-use pigeonhole::request_log::trace_request;
 use pigeonhole::index::Index;
+use pigeonhole::request_log::trace_request;
 use pigeonhole::{build_s3_gateway, build_s3_service, S3Gateway};
 use s3s::{Body, HttpError};
 use tracing::info;
@@ -23,9 +23,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     // Before the runtime: booting the tablet records metrics too.
     let metrics_on_main = setup_metrics(&cfg)?;
     let rt = open_runtime(&cfg).await.context("open runtime")?;
-    let index = Index::open(rt.meta.clone())
-        .await
-        .context("open s3 index")?;
+    let index = Index::open(rt.meta.clone()).await.context("open s3 index")?;
 
     let s3_gateway = build_s3_gateway(cfg.s3_options(), index.clone(), rt.store.clone());
     spawn_background_tasks(&cfg, &rt);
@@ -40,14 +38,8 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     let app = s3_app(&cfg, s3_gateway, metrics_on_main);
 
     let addr = cfg.listen_addr.clone();
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("bind {addr}"))?;
-    let instances: Vec<String> = cfg
-        .instances
-        .iter()
-        .map(|i| format!("{}:{}", i.info.id, i.info.kind))
-        .collect();
+    let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
+    let instances: Vec<String> = cfg.instances.iter().map(|i| format!("{}:{}", i.info.id, i.info.kind)).collect();
     info!(
         ?instances,
         shards = ?cfg.placement.shards.iter().map(|s| s.group.clone()).collect::<Vec<_>>(),
@@ -122,13 +114,9 @@ fn s3_app(cfg: &Config, s3_gateway: S3Gateway, metrics_on_main: bool) -> Router 
             let max = max_headers;
             async move { limit_request_headers(max, req, next).await }
         }))
-        .layer(axum::middleware::from_fn(|req, next| {
-            track_gateway("s3", req, next)
-        }))
+        .layer(axum::middleware::from_fn(|req, next| track_gateway("s3", req, next)))
         // Outermost: the request's span covers everything below.
-        .layer(axum::middleware::from_fn(move |req, next| {
-            trace_request("s3", slow_request, req, next)
-        }));
+        .layer(axum::middleware::from_fn(move |req, next| trace_request("s3", slow_request, req, next)));
     with_http_timeouts(app, cfg.http.headers_timeout, cfg.http.request_timeout, cfg.http.max_concurrent_requests)
 }
 
@@ -160,9 +148,8 @@ fn setup_metrics(cfg: &Config) -> anyhow::Result<bool> {
         pigeonhole::prometheus::install_recorder()?;
         match &cfg.metrics.listen_addr {
             Some(addr) => {
-                let sock: std::net::SocketAddr = addr
-                    .parse()
-                    .with_context(|| format!("parse metrics.listen_addr {addr}"))?;
+                let sock: std::net::SocketAddr =
+                    addr.parse().with_context(|| format!("parse metrics.listen_addr {addr}"))?;
                 pigeonhole::prometheus::spawn_dedicated_listener(sock);
                 Ok(false)
             }

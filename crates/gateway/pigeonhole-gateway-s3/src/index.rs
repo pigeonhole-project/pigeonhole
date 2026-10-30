@@ -132,10 +132,7 @@ impl Index {
     }
 
     /// Propose one s3 command; `Ok(Err(reason))` is a deterministic rejection.
-    async fn propose(
-        &self,
-        cmd: S3Command,
-    ) -> Result<std::result::Result<Vec<ChunkId>, S3Reject>> {
+    async fn propose(&self, cmd: S3Command) -> Result<std::result::Result<Vec<ChunkId>, S3Reject>> {
         self.meta.propose::<S3State>(cmd).await
     }
 
@@ -163,10 +160,7 @@ impl Index {
 
     /// Returns false when the bucket already exists.
     pub async fn create_bucket(&self, name: &str) -> Result<bool> {
-        let cmd = S3Command::CreateBucket {
-            name: name.into(),
-            created_at: Utc::now().to_rfc3339(),
-        };
+        let cmd = S3Command::CreateBucket { name: name.into(), created_at: Utc::now().to_rfc3339() };
         match self.propose(cmd).await? {
             Ok(_) => Ok(true),
             Err(S3Reject::BucketExists) => Ok(false),
@@ -185,13 +179,7 @@ impl Index {
 
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>> {
         Ok(self.read(|s| {
-            s.buckets
-                .iter()
-                .map(|(name, b)| Bucket {
-                    name: name.clone(),
-                    created_at: b.created_at.clone(),
-                })
-                .collect()
+            s.buckets.iter().map(|(name, b)| Bucket { name: name.clone(), created_at: b.created_at.clone() }).collect()
         }))
     }
 
@@ -213,8 +201,7 @@ impl Index {
         checksums_json: &str,
     ) -> Result<Vec<ChunkId>> {
         let mtime = Utc::now().to_rfc3339();
-        self.put_object_at(bucket, key, etag, size, content_type, body, user_meta, checksums_json, &mtime, None)
-            .await
+        self.put_object_at(bucket, key, etag, size, content_type, body, user_meta, checksums_json, &mtime, None).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -340,38 +327,21 @@ impl Index {
         Ok(self.object(bucket, key, |o| o.body.extents().to_vec()))
     }
 
-    pub async fn get_object_checksums_json(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<String>> {
+    pub async fn get_object_checksums_json(&self, bucket: &str, key: &str) -> Result<Option<String>> {
         Ok(self.object(bucket, key, |o| o.checksums_json.clone()))
     }
 
     /// Ordered by name; empty for a missing object.
-    pub async fn get_user_metadata(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Vec<(String, String)>> {
+    pub async fn get_user_metadata(&self, bucket: &str, key: &str) -> Result<Vec<(String, String)>> {
         Ok(self.object(bucket, key, |o| pairs(&o.user_meta)).unwrap_or_default())
     }
 
     /// Ordered by tag key; empty for a missing object.
-    pub async fn get_object_tags(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Vec<(String, String)>> {
+    pub async fn get_object_tags(&self, bucket: &str, key: &str) -> Result<Vec<(String, String)>> {
         Ok(self.object(bucket, key, |o| pairs(&o.tags)).unwrap_or_default())
     }
 
-    pub async fn put_object_tags(
-        &self,
-        bucket: &str,
-        key: &str,
-        tags: &[(String, String)],
-    ) -> Result<()> {
+    pub async fn put_object_tags(&self, bucket: &str, key: &str, tags: &[(String, String)]) -> Result<()> {
         self.propose_infallible(S3Command::PutObjectTags {
             bucket: bucket.into(),
             key: key.into(),
@@ -382,12 +352,8 @@ impl Index {
     }
 
     pub async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<()> {
-        self.propose_infallible(S3Command::PutObjectTags {
-            bucket: bucket.into(),
-            key: key.into(),
-            tags: Vec::new(),
-        })
-        .await?;
+        self.propose_infallible(S3Command::PutObjectTags { bucket: bucket.into(), key: key.into(), tags: Vec::new() })
+            .await?;
         Ok(())
     }
 
@@ -471,13 +437,7 @@ impl Index {
 
     /// Up to `limit` objects of `bucket` with keys in `(lower, upper)` bounds,
     /// in byte order.
-    fn scan_objects(
-        &self,
-        bucket: &str,
-        lower: Bound<&str>,
-        upper: Option<&str>,
-        limit: usize,
-    ) -> Vec<ObjectMeta> {
+    fn scan_objects(&self, bucket: &str, lower: Bound<&str>, upper: Option<&str>, limit: usize) -> Vec<ObjectMeta> {
         let start = match lower {
             Bound::Included(k) => Bound::Included((bucket.to_string(), k.to_string())),
             Bound::Excluded(k) => Bound::Excluded((bucket.to_string(), k.to_string())),
@@ -511,33 +471,14 @@ impl Index {
         })
     }
 
-    fn list_flat(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        max_keys: usize,
-        start_after: Option<&str>,
-    ) -> ListPage {
-        let cursor =
-            start_after.map_or_else(|| Cursor::From(prefix.into()), |a| Cursor::After(a.into()));
+    fn list_flat(&self, bucket: &str, prefix: &str, max_keys: usize, start_after: Option<&str>) -> ListPage {
+        let cursor = start_after.map_or_else(|| Cursor::From(prefix.into()), |a| Cursor::After(a.into()));
         let end = exclusive_prefix_end(prefix);
-        let mut objects = self.scan_objects(
-            bucket,
-            cursor.lower_bound(prefix),
-            end.as_deref(),
-            max_keys + 1,
-        );
+        let mut objects = self.scan_objects(bucket, cursor.lower_bound(prefix), end.as_deref(), max_keys + 1);
         let truncated = objects.len() > max_keys;
         objects.truncate(max_keys);
-        let next = truncated
-            .then(|| objects.last().map(|o| o.key.clone()))
-            .flatten();
-        ListPage {
-            objects,
-            prefixes: Vec::new(),
-            truncated,
-            next,
-        }
+        let next = truncated.then(|| objects.last().map(|o| o.key.clone())).flatten();
+        ListPage { objects, prefixes: Vec::new(), truncated, next }
     }
 
     /// Scans in batches: a common prefix may stand for any number of keys,
@@ -651,30 +592,15 @@ impl Index {
         .await
     }
 
-    pub async fn get_multipart_part(
-        &self,
-        upload_id: &str,
-        part_number: i64,
-    ) -> Result<Option<MultipartPart>> {
+    pub async fn get_multipart_part(&self, upload_id: &str, part_number: i64) -> Result<Option<MultipartPart>> {
         Ok(self.read(|s| {
             let p = s.uploads.get(upload_id)?.parts.get(&part_number)?;
-            Some(MultipartPart {
-                upload_id: upload_id.into(),
-                part_number,
-                etag: p.etag.clone(),
-                size: p.size,
-            })
+            Some(MultipartPart { upload_id: upload_id.into(), part_number, etag: p.etag.clone(), size: p.size })
         }))
     }
 
-    pub async fn get_multipart_part_extents(
-        &self,
-        upload_id: &str,
-        part_number: i64,
-    ) -> Result<Option<Vec<Extent>>> {
-        Ok(self.read(|s| {
-            Some(s.uploads.get(upload_id)?.parts.get(&part_number)?.extents.clone())
-        }))
+    pub async fn get_multipart_part_extents(&self, upload_id: &str, part_number: i64) -> Result<Option<Vec<Extent>>> {
+        Ok(self.read(|s| Some(s.uploads.get(upload_id)?.parts.get(&part_number)?.extents.clone())))
     }
 
     /// Assemble object from parts (ownership transfer). Returns old object chunk ids to release.
@@ -729,9 +655,7 @@ impl Index {
                 .iter()
                 .filter(|(_, u)| u.bucket == bucket && u.key.starts_with(prefix))
                 .filter(|(id, u)| match (key_marker, upload_id_marker) {
-                    (Some(km), Some(um)) => {
-                        u.key.as_str() > km || (u.key == km && id.as_str() > um)
-                    }
+                    (Some(km), Some(um)) => u.key.as_str() > km || (u.key == km && id.as_str() > um),
                     (Some(km), None) => u.key.as_str() > km,
                     (None, _) => true,
                 })
@@ -741,11 +665,7 @@ impl Index {
         rows.sort_by(|a, b| (&a.key, &a.upload_id).cmp(&(&b.key, &b.upload_id)));
         let truncated = rows.len() > max_uploads;
         rows.truncate(max_uploads);
-        let next = if truncated {
-            rows.last().map(|u| (u.key.clone(), u.upload_id.clone()))
-        } else {
-            None
-        };
+        let next = if truncated { rows.last().map(|u| (u.key.clone(), u.upload_id.clone())) } else { None };
         Ok((rows, truncated, next))
     }
 
@@ -774,11 +694,7 @@ impl Index {
         });
         let truncated = rows.len() > max_parts;
         rows.truncate(max_parts);
-        let next = if truncated {
-            rows.last().map(|p| p.part_number)
-        } else {
-            None
-        };
+        let next = if truncated { rows.last().map(|p| p.part_number) } else { None };
         Ok((rows, truncated, next))
     }
 }
@@ -838,11 +754,7 @@ pub fn slice_extents(extents: &[Extent], start: u64, length: u64) -> Vec<Extent>
         let from = start.saturating_sub(estart);
         let to = end.min(eend).saturating_sub(estart);
         if to > from {
-            out.push(Extent {
-                chunk: ext.chunk,
-                offset: ext.offset + from as i64,
-                len: (to - from) as i64,
-            });
+            out.push(Extent { chunk: ext.chunk, offset: ext.offset + from as i64, len: (to - from) as i64 });
         }
     }
     out
@@ -904,11 +816,7 @@ struct DelimitedPage<'a> {
 
 impl<'a> DelimitedPage<'a> {
     fn new(max_keys: usize, start_after: Option<&'a str>) -> Self {
-        Self {
-            max_keys,
-            start_after,
-            entries: Vec::new(),
-        }
+        Self { max_keys, start_after, entries: Vec::new() }
     }
 
     fn push(&mut self, key: String, entry: DelimEntry) -> Fill {
@@ -927,9 +835,7 @@ impl<'a> DelimitedPage<'a> {
     fn finish(mut self) -> ListPage {
         let truncated = self.entries.len() > self.max_keys;
         self.entries.truncate(self.max_keys);
-        let next = truncated
-            .then(|| self.entries.last().map(|(k, _)| k.clone()))
-            .flatten();
+        let next = truncated.then(|| self.entries.last().map(|(k, _)| k.clone())).flatten();
         let (mut objects, mut prefixes) = (Vec::new(), Vec::new());
         for (_, e) in self.entries {
             match e {
@@ -937,12 +843,7 @@ impl<'a> DelimitedPage<'a> {
                 DelimEntry::Prefix(p) => prefixes.push(p),
             }
         }
-        ListPage {
-            objects,
-            prefixes,
-            truncated,
-            next,
-        }
+        ListPage { objects, prefixes, truncated, next }
     }
 }
 
@@ -965,18 +866,12 @@ fn exclusive_prefix_end(prefix: &str) -> Option<String> {
 /// Whether `s` is a common prefix of this listing (`prefix`, then text
 /// without `delim`, then `delim`), not a key that merely ends with `delim`.
 fn is_common_prefix(s: &str, prefix: &str, delim: &str) -> bool {
-    s.strip_prefix(prefix)
-        .and_then(|rest| rest.find(delim).map(|i| i + delim.len() == rest.len()))
-        .unwrap_or(false)
+    s.strip_prefix(prefix).and_then(|rest| rest.find(delim).map(|i| i + delim.len() == rest.len())).unwrap_or(false)
 }
 
 /// Each object under `prefix` as itself, or as the common prefix it rolls up
 /// into (repeated for each object under it: they are adjacent in key order).
-fn group_delimiter_entries(
-    prefix: &str,
-    delim: &str,
-    objs: Vec<ObjectMeta>,
-) -> Vec<(String, DelimEntry)> {
+fn group_delimiter_entries(prefix: &str, delim: &str, objs: Vec<ObjectMeta>) -> Vec<(String, DelimEntry)> {
     objs.into_iter()
         .filter_map(|obj| {
             let rest = obj.key.strip_prefix(prefix)?;
@@ -1153,22 +1048,12 @@ mod list_tests {
         let ix = index().await;
         ix.create_bucket("b").await.unwrap();
         for i in 0..100 {
-            ix.put_object("b", &format!("a/k{i:03}"), "etag", 0, None, Body::Chunks(vec![]), &[], "{}")
-                .await
-                .unwrap();
+            ix.put_object("b", &format!("a/k{i:03}"), "etag", 0, None, Body::Chunks(vec![]), &[], "{}").await.unwrap();
         }
-        ix.put_object("b", "c", "etag", 0, None, Body::Chunks(vec![]), &[], "{}")
-            .await
-            .unwrap();
-        let page = ix
-            .list_objects("b", "", Some("/"), 1, Some("a/b"))
-            .await
-            .unwrap();
+        ix.put_object("b", "c", "etag", 0, None, Body::Chunks(vec![]), &[], "{}").await.unwrap();
+        let page = ix.list_objects("b", "", Some("/"), 1, Some("a/b")).await.unwrap();
         let keys: Vec<_> = page.objects.into_iter().map(|o| o.key).collect();
-        assert_eq!(
-            (keys, page.prefixes, page.truncated),
-            (vec!["c".to_string()], vec![], false)
-        );
+        assert_eq!((keys, page.prefixes, page.truncated), (vec!["c".to_string()], vec![], false));
     }
 
     #[test]

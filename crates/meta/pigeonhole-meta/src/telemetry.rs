@@ -29,7 +29,11 @@ pub const METRICS: &[MetricDoc] = &[
         &[],
         "Entries that reached MAX_BATCH commands (a proposal that did not fit waits for the next)",
     ),
-    MetricDoc::histogram("pigeonhole_meta_log_append_seconds", &["outcome"], "LogStore append of a batch of entries (fsync / chat message)"),
+    MetricDoc::histogram(
+        "pigeonhole_meta_log_append_seconds",
+        &["outcome"],
+        "LogStore append of a batch of entries (fsync / chat message)",
+    ),
     MetricDoc::histogram(
         "pigeonhole_meta_log_write_seconds",
         &["op", "outcome"],
@@ -51,11 +55,23 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::gauge("pigeonhole_meta_snapshot_bytes", &[], "Size of the newest snapshot (stored, or loaded on boot)"),
     MetricDoc::counter("pigeonhole_meta_snapshots_total", &[], "Snapshots stored"),
     MetricDoc::gauge("pigeonhole_meta_applied_position", &[], "Position of the last applied entry"),
-    MetricDoc::gauge("pigeonhole_meta_base_position", &[], "Position of the snapshot the log starts from (the log holds applied - base entries)"),
+    MetricDoc::gauge(
+        "pigeonhole_meta_base_position",
+        &[],
+        "Position of the snapshot the log starts from (the log holds applied - base entries)",
+    ),
     MetricDoc::gauge("pigeonhole_meta_generation", &[], "Generation this tablet claimed on boot"),
     MetricDoc::gauge("pigeonhole_meta_stopped", &[], "1 once the tablet stopped (fenced or failed)"),
-    MetricDoc::gauge("pigeonhole_meta_boot_seconds", &[], "Time the last boot took: claim, load the snapshot, replay the log"),
-    MetricDoc::gauge("pigeonhole_meta_boot_replayed_entries", &[], "Entries the last boot replayed on top of its snapshot"),
+    MetricDoc::gauge(
+        "pigeonhole_meta_boot_seconds",
+        &[],
+        "Time the last boot took: claim, load the snapshot, replay the log",
+    ),
+    MetricDoc::gauge(
+        "pigeonhole_meta_boot_replayed_entries",
+        &[],
+        "Entries the last boot replayed on top of its snapshot",
+    ),
     MetricDoc::counter(
         "pigeonhole_meta_snapshot_fallbacks_total",
         &[],
@@ -185,7 +201,8 @@ pub(crate) fn record_raft(m: &RaftMetrics<NodeId, BasicNode>) {
 }
 
 pub(crate) fn record_log_write(op: &'static str, ok: bool, d: Duration) {
-    metrics::histogram!("pigeonhole_meta_log_write_seconds", "op" => op, "outcome" => outcome(ok)).record(d.as_secs_f64());
+    metrics::histogram!("pigeonhole_meta_log_write_seconds", "op" => op, "outcome" => outcome(ok))
+        .record(d.as_secs_f64());
 }
 
 pub(crate) fn record_lease_wait(reason: &'static str, d: Duration) {

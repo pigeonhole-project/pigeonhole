@@ -74,7 +74,8 @@ sim:
 sim-all:
 	RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test --workspace --exclude pigeonhole
 
-# Clippy as CI runs it: every warning fails (lints: [workspace.lints] in Cargo.toml).
+# rustfmt and clippy as CI runs them: every warning fails (lints: [workspace.lints] in Cargo.toml).
 lint:
+	cargo fmt --all --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cargo clippy --workspace --all-targets --no-default-features -- -D warnings

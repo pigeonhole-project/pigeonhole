@@ -77,7 +77,8 @@ async fn a_claim_follows_an_older_generations_late_append() {
     // The claimant read the tail before the append below landed.
     let tail = mem.tail().await.unwrap().unwrap();
     a.append(1, &[entry(2)]).await.unwrap();
-    let After::Lost(winner) = mem.put_after(Some(&tail.id), "log-claim-2", Bytes::from_static(b"x")).await.unwrap() else {
+    let After::Lost(winner) = mem.put_after(Some(&tail.id), "log-claim-2", Bytes::from_static(b"x")).await.unwrap()
+    else {
         panic!("the append took the place first")
     };
     assert_eq!(winner.label, "log-batch-1");
@@ -120,7 +121,10 @@ async fn a_rebase_does_not_wait_for_its_collection() {
     }
     let gate = mem.hold_deletes();
     let base = Base { at: 3, term: 1, leader: 0, snapshot: crate::snapshot::SnapshotRef("s3".into()) };
-    tokio::time::timeout(std::time::Duration::from_secs(5), a.rebase(1, base, 1)).await.expect("rebase waited for its prune").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), a.rebase(1, base, 1))
+        .await
+        .expect("rebase waited for its prune")
+        .unwrap();
     a.append(1, &[entry(5)]).await.unwrap();
     drop(gate);
     a.settle().await;
@@ -241,7 +245,8 @@ async fn confirm_looks_past_our_own_append_in_flight() {
     a.append(1, &[entry(1)]).await.unwrap();
     // What an append in flight leaves: a batch of generation 1 after the tip.
     let tip = mem.tail().await.unwrap().unwrap();
-    let After::Won(ours) = mem.put_after(Some(&tip.id), "log-batch-1", Bytes::from_static(b"in flight")).await.unwrap() else {
+    let After::Won(ours) = mem.put_after(Some(&tip.id), "log-batch-1", Bytes::from_static(b"in flight")).await.unwrap()
+    else {
         panic!("the tip has no successor yet")
     };
     a.confirm(1).await.unwrap();

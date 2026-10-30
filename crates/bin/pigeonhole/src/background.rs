@@ -9,25 +9,13 @@ use tracing::{info, warn};
 
 pub fn spawn_background_tasks(cfg: &Config, rt: &Runtime) {
     let members: Vec<_> = rt.store.replicated().members().to_vec();
-    let sweeper = Sweeper::new(
-        rt.store.db().clone(),
-        members,
-        cfg.sweep.clone(),
-        rt.store.replicated().pins().clone(),
-    );
+    let sweeper = Sweeper::new(rt.store.db().clone(), members, cfg.sweep.clone(), rt.store.replicated().pins().clone());
     tokio::spawn(async move {
         sweeper.run_loop().await;
     });
-    info!(
-        interval_secs = cfg.sweep.interval.as_secs(),
-        "sweeper background task started"
-    );
+    info!(interval_secs = cfg.sweep.interval.as_secs(), "sweeper background task started");
 
-    let repairer = Repairer::new(
-        rt.store.db().clone(),
-        rt.store.replicated().clone(),
-        cfg.repair.clone(),
-    );
+    let repairer = Repairer::new(rt.store.db().clone(), rt.store.replicated().clone(), cfg.repair.clone());
     tokio::spawn(async move {
         repairer.run_loop().await;
     });
@@ -55,7 +43,12 @@ pub fn spawn_cooler(cfg: &Config, gateway: S3Gateway) {
                     metrics::counter!("pigeonhole_cooled_total", "reason" => "budget").increment(s.by_budget);
                     metrics::counter!("pigeonhole_cool_rejected_total").increment(s.rejected);
                     if s.by_age + s.by_budget + s.rejected > 0 {
-                        info!(by_age = s.by_age, by_budget = s.by_budget, rejected = s.rejected, "cooled inline objects");
+                        info!(
+                            by_age = s.by_age,
+                            by_budget = s.by_budget,
+                            rejected = s.rejected,
+                            "cooled inline objects"
+                        );
                     }
                     pigeonhole_blob::record_background_pass("cool", true, t0.elapsed());
                 }

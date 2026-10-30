@@ -136,7 +136,13 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
     }
 
     /// The first member in `(lo, hi)` that names `prev`, read and settled.
-    async fn first_naming(&self, view: &mut View, lo: i64, hi: i64, prev: Option<i64>) -> Result<Option<Linked<TelegramId>>> {
+    async fn first_naming(
+        &self,
+        view: &mut View,
+        lo: i64,
+        hi: i64,
+        prev: Option<i64>,
+    ) -> Result<Option<Linked<TelegramId>>> {
         self.fill(view, lo + 1, hi - 1).await?;
         self.settle(view, lo, hi).await?;
         Ok(view.range(lo + 1..hi).find_map(|(id, s)| match s {
@@ -228,11 +234,8 @@ impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
             let lo = (hi - IDS_PER_CALL as i64 + 1).max(1);
             let mut view = View::new();
             self.page(&mut view, lo, hi).await?;
-            let ours: Vec<i64> = view
-                .iter()
-                .filter(|(_, s)| matches!(s, Seen::Member(..) | Seen::Probe))
-                .map(|(id, _)| *id)
-                .collect();
+            let ours: Vec<i64> =
+                view.iter().filter(|(_, s)| matches!(s, Seen::Member(..) | Seen::Probe)).map(|(id, _)| *id).collect();
             if ours.is_empty() {
                 break;
             }

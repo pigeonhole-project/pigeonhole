@@ -15,7 +15,10 @@ enum Stored {
     /// A foreign message that is neither text nor a document.
     Other,
     Text(String),
-    Doc { name: String, data: Bytes },
+    Doc {
+        name: String,
+        data: Bytes,
+    },
 }
 
 #[derive(Default)]

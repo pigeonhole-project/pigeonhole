@@ -16,11 +16,7 @@ pub const DELETE: Class = Class("delete");
 pub fn limits() -> ChatLimiterConfig {
     ChatLimiterConfig {
         bot: Rate::new(25.0, 30.0),
-        classes: vec![
-            (SEND, Rate::new(0.3, 3.0)),
-            (READ, Rate::new(2.0, 5.0)),
-            (DELETE, Rate::new(1.0, 5.0)),
-        ],
+        classes: vec![(SEND, Rate::new(0.3, 3.0)), (READ, Rate::new(2.0, 5.0)), (DELETE, Rate::new(1.0, 5.0))],
         upload_concurrency: 2,
         download_concurrency: 8,
     }

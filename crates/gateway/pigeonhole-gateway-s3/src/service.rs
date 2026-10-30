@@ -4,25 +4,24 @@ use crate::checksums::{self, copy_checksums, IncomingChecksums};
 use crate::commands::{Body, Expect, S3Reject, S3State};
 use crate::cool::{CoolPolicy, CoolReason};
 use crate::index::{
-    parse_rfc3339, slice_extents, CopyDest, unique_chunk_ids, DeleteBucketResult, Index, ListPage, ObjectMeta, ObjectView, Rejected,
-    SourceSnapshot,
+    parse_rfc3339, slice_extents, unique_chunk_ids, CopyDest, DeleteBucketResult, Index, ListPage, ObjectMeta,
+    ObjectView, Rejected, SourceSnapshot,
 };
-use pigeonhole_meta::{Outcome, Prepared, Proposal};
-use pigeonhole_chunk_store::Extent;
-use pigeonhole_chunk_store::{ChunkStore, IngestOptions, Ingested, PendingChunks};
-use pigeonhole_codec::{self as chunker, ByteBudget, ChunkCodec};
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
 use futures::StreamExt;
 use md5::Digest;
+use pigeonhole_chunk_store::Extent;
+use pigeonhole_chunk_store::{ChunkStore, IngestOptions, Ingested, PendingChunks};
+use pigeonhole_codec::{self as chunker, ByteBudget, ChunkCodec};
+use pigeonhole_meta::{Outcome, Prepared, Proposal};
 use s3s::dto::*;
 use s3s::s3_error;
-use s3s::{S3, S3Request, S3Response, S3Result};
+use s3s::{S3Request, S3Response, S3Result, S3};
 use std::ops::Not;
 use std::sync::Arc;
 use tracing::info;
-
 
 /// GET re-reads the object this many times if its chunks are reclaimed underneath it.
 const GET_ATTEMPTS: u32 = 5;
@@ -122,8 +121,7 @@ impl S3Gateway {
     ) -> S3Result<Outcome<S3State>> {
         let mut proposal = Proposal::new();
         let slot = proposal.push(command);
-        let mut outcomes =
-            self.store.commit_along(chunks, self.index.meta(), proposal).await.map_err(Self::map_err)?;
+        let mut outcomes = self.store.commit_along(chunks, self.index.meta(), proposal).await.map_err(Self::map_err)?;
         outcomes.take(slot).map_err(Self::map_err)
     }
 
@@ -137,7 +135,10 @@ impl S3Gateway {
             let data = Bytes::from(c.bytes.clone());
             let ingested = self.store.ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options())).await?;
             let cool = self.index.prepare_cool(&c, &ingested.extents);
-            let outcome = self.commit_with(ingested.chunks, cool).await.map_err(|e| anyhow::anyhow!("cool {}/{}: {e:?}", c.bucket, c.key))?;
+            let outcome = self
+                .commit_with(ingested.chunks, cool)
+                .await
+                .map_err(|e| anyhow::anyhow!("cool {}/{}: {e:?}", c.bucket, c.key))?;
             match outcome {
                 Ok(_) => match c.reason {
                     CoolReason::Age => stats.by_age += 1,
@@ -188,12 +189,7 @@ impl S3Gateway {
     /// chunks. If the source is deleted or overwritten between the snapshot and
     /// `retain`, its chunks may already be unreferenced (`ChunkGone`); re-read and
     /// retry, and report `NoSuchKey` only when the source is really gone.
-    async fn pin_copy_source<F>(
-        &self,
-        bucket: &str,
-        key: &str,
-        select: F,
-    ) -> S3Result<(SourceSnapshot, Vec<Extent>)>
+    async fn pin_copy_source<F>(&self, bucket: &str, key: &str, select: F) -> S3Result<(SourceSnapshot, Vec<Extent>)>
     where
         F: Fn(&SourceSnapshot) -> S3Result<Vec<Extent>>,
     {
@@ -279,7 +275,8 @@ impl S3Gateway {
     where
         S: futures::Stream<Item = anyhow::Result<Bytes>> + Unpin,
     {
-        let max = self.opts.inline_max.map(|m| m as u64).filter(|&max| content_length.is_none_or(|n| (n as u64) <= max));
+        let max =
+            self.opts.inline_max.map(|m| m as u64).filter(|&max| content_length.is_none_or(|n| (n as u64) <= max));
         let mut head = Vec::new();
         if let Some(max) = max {
             if let Some(data) = read_at_most(&mut stream, max, &mut head).await.map_err(Self::map_err)? {
@@ -470,24 +467,13 @@ fn parse_content_md5_header(expected: Option<&str>) -> S3Result<Option<[u8; 16]>
     };
     // Empty header is invalid (AWS InvalidDigest), not "absent".
     if exp.is_empty() {
-        return Err(s3_error!(
-            InvalidDigest,
-            "The Content-MD5 you specified is not valid."
-        ));
+        return Err(s3_error!(InvalidDigest, "The Content-MD5 you specified is not valid."));
     }
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(exp)
-        .map_err(|_| {
-            s3_error!(
-                InvalidDigest,
-                "The Content-MD5 you specified is not valid."
-            )
-        })?;
+        .map_err(|_| s3_error!(InvalidDigest, "The Content-MD5 you specified is not valid."))?;
     if decoded.len() != 16 {
-        return Err(s3_error!(
-            InvalidDigest,
-            "The Content-MD5 you specified is not valid."
-        ));
+        return Err(s3_error!(InvalidDigest, "The Content-MD5 you specified is not valid."));
     }
     let mut dig = [0u8; 16];
     dig.copy_from_slice(&decoded);
@@ -496,10 +482,7 @@ fn parse_content_md5_header(expected: Option<&str>) -> S3Result<Option<[u8; 16]>
 
 fn verify_content_md5_digest(expected: [u8; 16], md5: &[u8; 16]) -> S3Result<()> {
     if expected != *md5 {
-        return Err(s3_error!(
-            BadDigest,
-            "The Content-MD5 you specified did not match what we received."
-        ));
+        return Err(s3_error!(BadDigest, "The Content-MD5 you specified did not match what we received."));
     }
     Ok(())
 }
@@ -581,18 +564,10 @@ fn validate_tag_set(tags: &[(String, String)]) -> S3Result<()> {
 }
 
 fn parse_copy_source_range(range: &str, total: u64) -> S3Result<(u64, u64)> {
-    let s = range
-        .strip_prefix("bytes=")
-        .ok_or_else(|| s3_error!(InvalidArgument, "Invalid copy source range"))?;
-    let (a, b) = s
-        .split_once('-')
-        .ok_or_else(|| s3_error!(InvalidArgument, "Invalid copy source range"))?;
-    let first: u64 = a
-        .parse()
-        .map_err(|_| s3_error!(InvalidArgument, "Invalid copy source range"))?;
-    let last: u64 = b
-        .parse()
-        .map_err(|_| s3_error!(InvalidArgument, "Invalid copy source range"))?;
+    let s = range.strip_prefix("bytes=").ok_or_else(|| s3_error!(InvalidArgument, "Invalid copy source range"))?;
+    let (a, b) = s.split_once('-').ok_or_else(|| s3_error!(InvalidArgument, "Invalid copy source range"))?;
+    let first: u64 = a.parse().map_err(|_| s3_error!(InvalidArgument, "Invalid copy source range"))?;
+    let last: u64 = b.parse().map_err(|_| s3_error!(InvalidArgument, "Invalid copy source range"))?;
     if total == 0 {
         return Err(s3_error!(InvalidArgument, "Invalid copy source range"));
     }
@@ -605,39 +580,22 @@ fn parse_copy_source_range(range: &str, total: u64) -> S3Result<(u64, u64)> {
 
 #[async_trait]
 impl S3 for S3Gateway {
-    async fn list_buckets(
-        &self,
-        _req: S3Request<ListBucketsInput>,
-    ) -> S3Result<S3Response<ListBucketsOutput>> {
+    async fn list_buckets(&self, _req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         let buckets = self.index.list_buckets().await.map_err(Self::map_err)?;
         let buckets = buckets
             .into_iter()
-            .map(|b| Bucket {
-                name: Some(b.name),
-                creation_date: Some(ts(&b.created_at)),
-                ..Default::default()
-            })
+            .map(|b| Bucket { name: Some(b.name), creation_date: Some(ts(&b.created_at)), ..Default::default() })
             .collect::<Vec<_>>();
         Ok(S3Response::new(ListBucketsOutput {
             buckets: Some(buckets),
-            owner: Some(Owner {
-                display_name: Some("pigeonhole".into()),
-                id: Some("pigeonhole".into()),
-            }),
+            owner: Some(Owner { display_name: Some("pigeonhole".into()), id: Some("pigeonhole".into()) }),
             ..Default::default()
         }))
     }
 
-    async fn create_bucket(
-        &self,
-        req: S3Request<CreateBucketInput>,
-    ) -> S3Result<S3Response<CreateBucketOutput>> {
+    async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         let name = req.input.bucket;
-        let created = self
-            .index
-            .create_bucket(&name)
-            .await
-            .map_err(Self::map_err)?;
+        let created = self.index.create_bucket(&name).await.map_err(Self::map_err)?;
         if !created && self.index.bucket_exists(&name).await.map_err(Self::map_err)? {
             return Ok(S3Response::new(CreateBucketOutput::default()));
         }
@@ -645,26 +603,15 @@ impl S3 for S3Gateway {
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
-    async fn delete_bucket(
-        &self,
-        req: S3Request<DeleteBucketInput>,
-    ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        match self
-            .index
-            .delete_bucket(&req.input.bucket)
-            .await
-            .map_err(Self::map_err)?
-        {
+    async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+        match self.index.delete_bucket(&req.input.bucket).await.map_err(Self::map_err)? {
             DeleteBucketResult::Deleted => Ok(S3Response::new(DeleteBucketOutput::default())),
             DeleteBucketResult::NotFound => Err(s3_error!(NoSuchBucket)),
             DeleteBucketResult::NotEmpty => Err(s3_error!(BucketNotEmpty)),
         }
     }
 
-    async fn head_bucket(
-        &self,
-        req: S3Request<HeadBucketInput>,
-    ) -> S3Result<S3Response<HeadBucketOutput>> {
+    async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         self.require_bucket(&req.input.bucket).await?;
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
@@ -680,15 +627,10 @@ impl S3 for S3Gateway {
         } else {
             Some(BucketLocationConstraint::from(self.opts.region.clone()))
         };
-        Ok(S3Response::new(GetBucketLocationOutput {
-            location_constraint,
-        }))
+        Ok(S3Response::new(GetBucketLocationOutput { location_constraint }))
     }
 
-    async fn list_objects(
-        &self,
-        req: S3Request<ListObjectsInput>,
-    ) -> S3Result<S3Response<ListObjectsOutput>> {
+    async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let input = req.input;
         self.require_bucket(&input.bucket).await?;
 
@@ -696,13 +638,7 @@ impl S3 for S3Gateway {
         let (max_keys, max_keys_out) = clamp_max_keys(input.max_keys);
         let ListPage { objects, prefixes: common, truncated, next } = self
             .index
-            .list_objects(
-                &input.bucket,
-                prefix,
-                input.delimiter.as_deref(),
-                max_keys,
-                input.marker.as_deref(),
-            )
+            .list_objects(&input.bucket, prefix, input.delimiter.as_deref(), max_keys, input.marker.as_deref())
             .await
             .map_err(Self::map_err)?;
 
@@ -716,12 +652,7 @@ impl S3 for S3Gateway {
                 ..Default::default()
             })
             .collect::<Vec<_>>();
-        let common_prefixes = common
-            .into_iter()
-            .map(|p| CommonPrefix {
-                prefix: Some(p),
-            })
-            .collect::<Vec<_>>();
+        let common_prefixes = common.into_iter().map(|p| CommonPrefix { prefix: Some(p) }).collect::<Vec<_>>();
 
         Ok(S3Response::new(ListObjectsOutput {
             name: Some(input.bucket),
@@ -737,29 +668,17 @@ impl S3 for S3Gateway {
         }))
     }
 
-    async fn list_objects_v2(
-        &self,
-        req: S3Request<ListObjectsV2Input>,
-    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+    async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
         self.require_bucket(&input.bucket).await?;
 
         let prefix = input.prefix.as_deref().unwrap_or("");
         let (max_keys, max_keys_out) = clamp_max_keys(input.max_keys);
-        let start_after = input
-            .continuation_token
-            .as_deref()
-            .or(input.start_after.as_deref());
+        let start_after = input.continuation_token.as_deref().or(input.start_after.as_deref());
 
         let ListPage { objects, prefixes: common, truncated, next } = self
             .index
-            .list_objects(
-                &input.bucket,
-                prefix,
-                input.delimiter.as_deref(),
-                max_keys,
-                start_after,
-            )
+            .list_objects(&input.bucket, prefix, input.delimiter.as_deref(), max_keys, start_after)
             .await
             .map_err(Self::map_err)?;
 
@@ -774,12 +693,7 @@ impl S3 for S3Gateway {
                 ..Default::default()
             })
             .collect::<Vec<_>>();
-        let common_prefixes = common
-            .into_iter()
-            .map(|p| CommonPrefix {
-                prefix: Some(p),
-            })
-            .collect::<Vec<_>>();
+        let common_prefixes = common.into_iter().map(|p| CommonPrefix { prefix: Some(p) }).collect::<Vec<_>>();
 
         Ok(S3Response::new(ListObjectsV2Output {
             name: Some(input.bucket),
@@ -810,20 +724,11 @@ impl S3 for S3Gateway {
         let (max_keys, max_keys_out) = clamp_max_keys(input.max_keys);
         let ListPage { objects, prefixes: common, truncated, next } = self
             .index
-            .list_objects(
-                &input.bucket,
-                prefix,
-                input.delimiter.as_deref(),
-                max_keys,
-                input.key_marker.as_deref(),
-            )
+            .list_objects(&input.bucket, prefix, input.delimiter.as_deref(), max_keys, input.key_marker.as_deref())
             .await
             .map_err(Self::map_err)?;
 
-        let owner = Owner {
-            display_name: Some("pigeonhole".into()),
-            id: Some("pigeonhole".into()),
-        };
+        let owner = Owner { display_name: Some("pigeonhole".into()), id: Some("pigeonhole".into()) };
         let versions = objects
             .into_iter()
             .map(|o| ObjectVersion {
@@ -833,28 +738,15 @@ impl S3 for S3Gateway {
                 e_tag: Some(etag_hex(&o.etag)),
                 size: Some(o.size),
                 last_modified: Some(ts(&o.mtime)),
-                storage_class: Some(ObjectVersionStorageClass::from_static(
-                    ObjectVersionStorageClass::STANDARD,
-                )),
+                storage_class: Some(ObjectVersionStorageClass::from_static(ObjectVersionStorageClass::STANDARD)),
                 owner: Some(owner.clone()),
                 ..Default::default()
             })
             .collect::<Vec<_>>();
-        let common_prefixes = common
-            .into_iter()
-            .map(|p| CommonPrefix {
-                prefix: Some(p),
-            })
-            .collect::<Vec<_>>();
+        let common_prefixes = common.into_iter().map(|p| CommonPrefix { prefix: Some(p) }).collect::<Vec<_>>();
 
-        let (next_key_marker, next_version_id_marker) = if truncated {
-            (
-                next.clone(),
-                next.as_ref().map(|_| "null".into()),
-            )
-        } else {
-            (None, None)
-        };
+        let (next_key_marker, next_version_id_marker) =
+            if truncated { (next.clone(), next.as_ref().map(|_| "null".into())) } else { (None, None) };
 
         Ok(S3Response::new(ListObjectVersionsOutput {
             name: Some(input.bucket),
@@ -872,11 +764,7 @@ impl S3 for S3Gateway {
         }))
     }
 
-
-    async fn put_object(
-        &self,
-        req: S3Request<PutObjectInput>,
-    ) -> S3Result<S3Response<PutObjectOutput>> {
+    async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let trailing_headers = req.trailing_headers;
         let mut input = req.input;
         self.require_bucket(&input.bucket).await?;
@@ -922,20 +810,14 @@ impl S3 for S3Gateway {
         self.commit_new(chunks, &extents, put, Self::refused).await?;
         info!(bucket = %input.bucket, key = %input.key, size, extents = extents.len(), inline, "PutObject ok");
 
-        let mut output = PutObjectOutput {
-            e_tag: Some(etag_hex(&etag)),
-            ..Default::default()
-        };
+        let mut output = PutObjectOutput { e_tag: Some(etag_hex(&etag)), ..Default::default() };
         if let Some(c) = computed {
             copy_checksums!(c => output);
         }
         Ok(S3Response::new(output))
     }
 
-    async fn get_object(
-        &self,
-        req: S3Request<GetObjectInput>,
-    ) -> S3Result<S3Response<GetObjectOutput>> {
+    async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
         let ObjectRead { view, start, length, data } =
             self.read_object(&input.bucket, &input.key, input.range.as_ref()).await?;
@@ -964,10 +846,7 @@ impl S3 for S3Gateway {
         Ok(S3Response::new(output))
     }
 
-    async fn head_object(
-        &self,
-        req: S3Request<HeadObjectInput>,
-    ) -> S3Result<S3Response<HeadObjectOutput>> {
+    async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
         let meta = self
             .index
@@ -975,22 +854,10 @@ impl S3 for S3Gateway {
             .await
             .map_err(Self::map_err)?
             .ok_or_else(|| s3_error!(NoSuchKey))?;
-        let tag_count = self
-            .index
-            .get_object_tags(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?
-            .len() as i32;
-        let user_meta = self
-            .index
-            .get_user_metadata(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?;
-        let metadata = if user_meta.is_empty() {
-            None
-        } else {
-            Some(user_meta.into_iter().collect())
-        };
+        let tag_count =
+            self.index.get_object_tags(&input.bucket, &input.key).await.map_err(Self::map_err)?.len() as i32;
+        let user_meta = self.index.get_user_metadata(&input.bucket, &input.key).await.map_err(Self::map_err)?;
+        let metadata = if user_meta.is_empty() { None } else { Some(user_meta.into_iter().collect()) };
         Ok(S3Response::new(HeadObjectOutput {
             e_tag: Some(etag_hex(&meta.etag)),
             content_length: Some(meta.size),
@@ -1002,27 +869,16 @@ impl S3 for S3Gateway {
         }))
     }
 
-    async fn delete_object(
-        &self,
-        req: S3Request<DeleteObjectInput>,
-    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+    async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
         let expect = expect_of(input.if_match, None)?;
-        if let Some(ids) = self
-            .index
-            .delete_object(&input.bucket, &input.key, expect)
-            .await
-            .map_err(Self::write_err)?
-        {
+        if let Some(ids) = self.index.delete_object(&input.bucket, &input.key, expect).await.map_err(Self::write_err)? {
             self.release_later(ids);
         }
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
 
-    async fn delete_objects(
-        &self,
-        req: S3Request<DeleteObjectsInput>,
-    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+    async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let input = req.input;
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
@@ -1031,16 +887,10 @@ impl S3 for S3Gateway {
             match self.index.delete_object(&input.bucket, &key, None).await {
                 Ok(Some(ids)) => {
                     self.release_later(ids);
-                    deleted.push(DeletedObject {
-                        key: Some(key),
-                        ..Default::default()
-                    });
+                    deleted.push(DeletedObject { key: Some(key), ..Default::default() });
                 }
                 Ok(None) => {
-                    deleted.push(DeletedObject {
-                        key: Some(key),
-                        ..Default::default()
-                    });
+                    deleted.push(DeletedObject { key: Some(key), ..Default::default() });
                 }
                 Err(e) => {
                     errors.push(Error {
@@ -1059,10 +909,7 @@ impl S3 for S3Gateway {
         }))
     }
 
-    async fn copy_object(
-        &self,
-        req: S3Request<CopyObjectInput>,
-    ) -> S3Result<S3Response<CopyObjectOutput>> {
+    async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let input = req.input;
         let expect = expect_of(input.if_match, input.if_none_match)?;
         self.index.check_expect(&input.bucket, &input.key, expect.as_ref()).map_err(Self::write_err)?;
@@ -1084,8 +931,7 @@ impl S3 for S3Gateway {
             expect,
         };
 
-        let (src, extents) =
-            self.pin_copy_source(&src_bucket, &src_key, |src| Ok(src.body.extents().to_vec())).await?;
+        let (src, extents) = self.pin_copy_source(&src_bucket, &src_key, |src| Ok(src.body.extents().to_vec())).await?;
         // An inline source too large for inlining now (it is off, or the
         // threshold was lowered) is stored at the destination as new chunks.
         let rechunk = match &src.body {
@@ -1125,11 +971,7 @@ impl S3 for S3Gateway {
             Some(h) => parse_tagging_header(h)?,
             None => Vec::new(),
         };
-        let user_meta: Vec<(String, String)> = input
-            .metadata
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let user_meta: Vec<(String, String)> = input.metadata.unwrap_or_default().into_iter().collect();
         let upload_id = uuid::Uuid::new_v4().to_string();
         self.index
             .create_multipart_upload(
@@ -1151,10 +993,7 @@ impl S3 for S3Gateway {
         }))
     }
 
-    async fn upload_part(
-        &self,
-        req: S3Request<UploadPartInput>,
-    ) -> S3Result<S3Response<UploadPartOutput>> {
+    async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         let trailing_headers = req.trailing_headers;
         let mut input = req.input;
         let upload_id = input.upload_id.clone();
@@ -1186,10 +1025,7 @@ impl S3 for S3Gateway {
         let put = self.index.prepare_put_part(&upload_id, part_number, &etag, ingested.size, &ingested.extents);
         self.commit_new(Some(ingested.chunks), &ingested.extents, put, Self::part_refused).await?;
 
-        let mut output = UploadPartOutput {
-            e_tag: Some(etag_hex(&etag)),
-            ..Default::default()
-        };
+        let mut output = UploadPartOutput { e_tag: Some(etag_hex(&etag)), ..Default::default() };
         if let Some(c) = computed {
             copy_checksums!(c => output);
         }
@@ -1268,20 +1104,11 @@ impl S3 for S3Gateway {
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
         let input = req.input;
-        if self
-            .index
-            .get_object(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?
-            .is_none()
-        {
+        if self.index.get_object(&input.bucket, &input.key).await.map_err(Self::map_err)?.is_none() {
             return Err(s3_error!(NoSuchKey));
         }
         let tags = tags_from_tagging(&input.tagging)?;
-        self.index
-            .put_object_tags(&input.bucket, &input.key, &tags)
-            .await
-            .map_err(Self::map_err)?;
+        self.index.put_object_tags(&input.bucket, &input.key, &tags).await.map_err(Self::map_err)?;
         Ok(S3Response::new(PutObjectTaggingOutput::default()))
     }
 
@@ -1290,31 +1117,12 @@ impl S3 for S3Gateway {
         req: S3Request<GetObjectTaggingInput>,
     ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         let input = req.input;
-        if self
-            .index
-            .get_object(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?
-            .is_none()
-        {
+        if self.index.get_object(&input.bucket, &input.key).await.map_err(Self::map_err)?.is_none() {
             return Err(s3_error!(NoSuchKey));
         }
-        let tags = self
-            .index
-            .get_object_tags(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?;
-        let tag_set = tags
-            .into_iter()
-            .map(|(k, v)| Tag {
-                key: Some(k),
-                value: Some(v),
-            })
-            .collect();
-        Ok(S3Response::new(GetObjectTaggingOutput {
-            tag_set,
-            ..Default::default()
-        }))
+        let tags = self.index.get_object_tags(&input.bucket, &input.key).await.map_err(Self::map_err)?;
+        let tag_set = tags.into_iter().map(|(k, v)| Tag { key: Some(k), value: Some(v) }).collect();
+        Ok(S3Response::new(GetObjectTaggingOutput { tag_set, ..Default::default() }))
     }
 
     async fn delete_object_tagging(
@@ -1322,26 +1130,14 @@ impl S3 for S3Gateway {
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
         let input = req.input;
-        if self
-            .index
-            .get_object(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?
-            .is_none()
-        {
+        if self.index.get_object(&input.bucket, &input.key).await.map_err(Self::map_err)?.is_none() {
             return Err(s3_error!(NoSuchKey));
         }
-        self.index
-            .delete_object_tags(&input.bucket, &input.key)
-            .await
-            .map_err(Self::map_err)?;
+        self.index.delete_object_tags(&input.bucket, &input.key).await.map_err(Self::map_err)?;
         Ok(S3Response::new(DeleteObjectTaggingOutput::default()))
     }
 
-    async fn list_parts(
-        &self,
-        req: S3Request<ListPartsInput>,
-    ) -> S3Result<S3Response<ListPartsOutput>> {
+    async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
         let input = req.input;
         let upload = self
             .index
@@ -1355,11 +1151,8 @@ impl S3 for S3Gateway {
 
         let (max_parts, max_parts_out) = clamp_max_keys(input.max_parts);
         let marker = input.part_number_marker.map(i64::from);
-        let (parts, truncated, next) = self
-            .index
-            .list_parts(&input.upload_id, marker, max_parts)
-            .await
-            .map_err(Self::map_err)?;
+        let (parts, truncated, next) =
+            self.index.list_parts(&input.upload_id, marker, max_parts).await.map_err(Self::map_err)?;
 
         let parts = parts
             .into_iter()
@@ -1434,7 +1227,6 @@ impl S3 for S3Gateway {
         }))
     }
 
-
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
@@ -1449,10 +1241,7 @@ impl S3 for S3Gateway {
             .map_err(Self::map_err)?
             .ok_or_else(|| s3_error!(NoSuchUpload))?;
 
-        let parts = input
-            .multipart_upload
-            .and_then(|m| m.parts)
-            .unwrap_or_default();
+        let parts = input.multipart_upload.and_then(|m| m.parts).unwrap_or_default();
         if parts.is_empty() {
             return Err(s3_error!(InvalidArgument, "empty parts list"));
         }
@@ -1461,14 +1250,8 @@ impl S3 for S3Gateway {
         let mut total_size: i64 = 0;
         let mut part_numbers = Vec::new();
         for p in &parts {
-            let pn = i64::from(
-                p.part_number
-                    .ok_or_else(|| s3_error!(InvalidArgument, "missing PartNumber"))?,
-            );
-            let client_etag = p
-                .e_tag
-                .as_ref()
-                .ok_or_else(|| s3_error!(InvalidArgument, "missing ETag"))?;
+            let pn = i64::from(p.part_number.ok_or_else(|| s3_error!(InvalidArgument, "missing PartNumber"))?);
+            let client_etag = p.e_tag.as_ref().ok_or_else(|| s3_error!(InvalidArgument, "missing ETag"))?;
             let part = self
                 .index
                 .get_multipart_part(&upload_id, pn)
@@ -1507,12 +1290,7 @@ impl S3 for S3Gateway {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         let upload_id = req.input.upload_id;
-        match self
-            .index
-            .abort_multipart_upload(&upload_id)
-            .await
-            .map_err(Self::map_err)?
-        {
+        match self.index.abort_multipart_upload(&upload_id).await.map_err(Self::map_err)? {
             None => Err(s3_error!(NoSuchUpload)),
             Some(ids) => {
                 self.release_later(ids);

@@ -7,11 +7,9 @@ use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
-use pigeonhole_gateway_s3::S3State;
 use pigeonhole_chunk_store::ChunkState;
-use pigeonhole_meta::{
-    decode_state, encode_state, MetaOptions, MetaStore, Namespaces,
-};
+use pigeonhole_gateway_s3::S3State;
+use pigeonhole_meta::{decode_state, encode_state, MetaOptions, MetaStore, Namespaces};
 use s3s::dto::*;
 use s3s::{S3Request, S3};
 use std::path::Path;
@@ -68,9 +66,7 @@ async fn rebuild(snapshot_every: Option<u64>) {
     let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
     let s3 = build_s3_gateway(cfg.s3_options(), Index::open(meta.clone()).await.unwrap(), store);
 
-    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() }))
-        .await
-        .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
     for i in 0..20u8 {
         s3.put_object(req(PutObjectInput {
             bucket: "b".into(),
@@ -92,9 +88,8 @@ async fn rebuild(snapshot_every: Option<u64>) {
         .await
         .unwrap();
     // Rejected command: deleting a missing key still takes a log position.
-    let _ = s3
-        .delete_object(req(DeleteObjectInput { bucket: "b".into(), key: "nope".into(), ..Default::default() }))
-        .await;
+    let _ =
+        s3.delete_object(req(DeleteObjectInput { bucket: "b".into(), key: "nope".into(), ..Default::default() })).await;
 
     let before = replicated_state(&meta);
     let position = meta.applied_position();

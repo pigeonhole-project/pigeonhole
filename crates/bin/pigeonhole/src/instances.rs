@@ -59,7 +59,11 @@ pub struct TelegramLogin {
 impl std::fmt::Debug for TelegramLogin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let bot = self.bot_token.split(':').next().unwrap_or_default();
-        f.debug_struct("TelegramLogin").field("bot", &bot).field("api_id", &self.api_id).field("session", &self.session).finish()
+        f.debug_struct("TelegramLogin")
+            .field("bot", &bot)
+            .field("api_id", &self.api_id)
+            .field("session", &self.session)
+            .finish()
     }
 }
 
@@ -101,12 +105,7 @@ pub fn memory_location(id: &str) -> String {
 
 /// Discord bot tokens are `app_id.xxx.yyy` or just use full token prefix before `.`.
 pub fn discord_app_id_from_token(token: &str) -> String {
-    token
-        .split('.')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unknown")
-        .to_string()
+    token.split('.').next().filter(|s| !s.is_empty()).unwrap_or("unknown").to_string()
 }
 
 /// In-process memory instance (tests, local runs).
@@ -151,14 +150,8 @@ pub fn validate_instances(instances: &[InstanceConfig]) -> Result<()> {
 
 /// Compare live config fingerprints against rows loaded from `instances` table.
 /// Returns Ok if every configured id matches, or the id is new; Err on mismatch.
-pub fn check_fingerprints(
-    configured: &[InstanceConfig],
-    stored: &[(String, String /* fingerprint */)],
-) -> Result<()> {
-    let map: HashMap<&str, &str> = stored
-        .iter()
-        .map(|(id, fp)| (id.as_str(), fp.as_str()))
-        .collect();
+pub fn check_fingerprints(configured: &[InstanceConfig], stored: &[(String, String /* fingerprint */)]) -> Result<()> {
+    let map: HashMap<&str, &str> = stored.iter().map(|(id, fp)| (id.as_str(), fp.as_str())).collect();
     for inst in configured {
         if let Some(prev) = map.get(inst.info.id.as_str()) {
             if *prev != inst.info.fingerprint.as_str() {
@@ -248,19 +241,12 @@ mod tests {
             max_blob_size: None,
             telegram: Vec::new(),
         };
-        let err = check_fingerprints(
-            &[cfg],
-            &[("tg-main".into(), "tg:9:-100".into())],
-        )
-        .unwrap_err();
+        let err = check_fingerprints(&[cfg], &[("tg-main".into(), "tg:9:-100".into())]).unwrap_err();
         assert!(err.to_string().contains("fingerprint mismatch"));
     }
 
     #[test]
     fn telegram_fp_from_token() {
-        assert_eq!(
-            telegram_fingerprint("123456:ABC-DEF", "-1001").unwrap(),
-            "tg:123456:-1001"
-        );
+        assert_eq!(telegram_fingerprint("123456:ABC-DEF", "-1001").unwrap(), "tg:123456:-1001");
     }
 }

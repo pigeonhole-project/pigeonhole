@@ -1,18 +1,16 @@
 //! Binary-only: boot the metadata tablet, build the placement group, and wire the `ChunkStore`.
 
+use crate::channel_log;
 use anyhow::Context;
 use pigeonhole::config::Config;
-use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole_blob::{
-    erase, CheapestFirst, MetricsBackend, Replicated, SharedBackend,
-};
 use pigeonhole::config::{LogSettings, SnapshotSettings};
-use pigeonhole::instances::{check_fingerprints, InstanceConfig, InstanceKind, TelegramLogin};
-use pigeonhole_chunk_store::{BlockCache, BlobDb, ChunkStore, IngestOptions};
 use pigeonhole::index::Index;
-use crate::channel_log;
+use pigeonhole::instances::{check_fingerprints, InstanceConfig, InstanceKind, TelegramLogin};
+use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::telegram::{Lane, PooledChannel, TelegramBlobStore};
+use pigeonhole_blob::{erase, CheapestFirst, MetricsBackend, Replicated, SharedBackend};
 use pigeonhole_blob::{InstanceInfo, InstanceRole};
+use pigeonhole_chunk_store::{BlobDb, BlockCache, ChunkStore, IngestOptions};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, SnapshotStore};
 use pigeonhole_meta::{LogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_storage_disk::DiskBlobStore;
@@ -72,19 +70,28 @@ pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStor
             Arc::new(BlobSnapshotStore::new(meta_channel_store(cfg, logins, chat_id, "snapshots").await?))
         }
         #[cfg(not(feature = "discord"))]
-        SnapshotSettings::Discord { .. } => anyhow::bail!("[meta] snapshot is discord: build with `--features discord`"),
+        SnapshotSettings::Discord { .. } => {
+            anyhow::bail!("[meta] snapshot is discord: build with `--features discord`")
+        }
         #[cfg(feature = "discord")]
         SnapshotSettings::Discord { channel_id, bot_tokens, max_blob_size } => {
             info!(channel_id = %channel_id, bots = bot_tokens.len(), "metadata snapshots in a Discord channel");
-            meta_discord(cfg, channel_id, bot_tokens, *max_blob_size, "snapshots", |s| Arc::new(BlobSnapshotStore::new(s)))
-                .await?
+            meta_discord(cfg, channel_id, bot_tokens, *max_blob_size, "snapshots", |s| {
+                Arc::new(BlobSnapshotStore::new(s))
+            })
+            .await?
         }
     })
 }
 
 /// Channel `chat_id` through every bot of `logins` (the primary first), on
 /// `lane`: one pool.
-async fn telegram_channel(cfg: &Config, logins: &[TelegramLogin], chat_id: &str, lane: Lane) -> anyhow::Result<PooledChannel> {
+async fn telegram_channel(
+    cfg: &Config,
+    logins: &[TelegramLogin],
+    chat_id: &str,
+    lane: Lane,
+) -> anyhow::Result<PooledChannel> {
     let chat = parse_chat(chat_id)?;
     let mut members = Vec::new();
     for login in logins {
@@ -108,7 +115,8 @@ async fn meta_channel_store(
     chat_id: &str,
     purpose: &str,
 ) -> anyhow::Result<Arc<TelegramBlobStore<PooledChannel>>> {
-    let channel = telegram_channel(cfg, logins, chat_id, Lane::Meta).await.with_context(|| format!("{purpose} channel"))?;
+    let channel =
+        telegram_channel(cfg, logins, chat_id, Lane::Meta).await.with_context(|| format!("{purpose} channel"))?;
     let info = InstanceInfo {
         id: format!("meta-{purpose}"),
         kind: InstanceKind::Telegram.as_str(),
@@ -152,7 +160,9 @@ async fn meta_discord<T: ?Sized>(
     bot_tokens: &[String],
     max_blob_size: Option<usize>,
     purpose: &str,
-    wrap: impl FnOnce(Arc<pigeonhole_storage_discord::DiscordBlobStore<pigeonhole_storage_discord::PooledDiscord>>) -> Arc<T>,
+    wrap: impl FnOnce(
+        Arc<pigeonhole_storage_discord::DiscordBlobStore<pigeonhole_storage_discord::PooledDiscord>>,
+    ) -> Arc<T>,
 ) -> anyhow::Result<Arc<T>> {
     use pigeonhole_storage_discord::{discord_fingerprint, discord_location, DiscordBlobStore};
     let (channel, app_id) =
@@ -185,17 +195,10 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
         keep_snapshots: cfg.meta.keep_snapshots,
         ..MetaOptions::default()
     };
-    let meta = MetaStore::open(log, snapshots, namespaces, opts)
-        .await
-        .context("boot metadata tablet")?;
-    let blob_db = BlobDb::open(meta.clone())
-        .await
-        .context("open chunk metadata")?;
+    let meta = MetaStore::open(log, snapshots, namespaces, opts).await.context("boot metadata tablet")?;
+    let blob_db = BlobDb::open(meta.clone()).await.context("open chunk metadata")?;
 
-    let stored = blob_db
-        .list_instance_fingerprints()
-        .await
-        .context("list instance fingerprints")?;
+    let stored = blob_db.list_instance_fingerprints().await.context("list instance fingerprints")?;
     check_fingerprints(&cfg.instances, &stored).context("fingerprint check")?;
 
     let replicated = build_placement(cfg).await.context("build placement group")?;
@@ -204,9 +207,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     opts.block_size = cfg.block_size;
     opts.memory_budget = cfg.ingest_budget.clone();
 
-    let layer = ChunkStore::open_replicated(blob_db, replicated, opts)
-        .await
-        .context("open ChunkStore")?;
+    let layer = ChunkStore::open_replicated(blob_db, replicated, opts).await.context("open ChunkStore")?;
     let store = Arc::new(with_optional_caches(layer, cfg));
     Ok(Runtime { meta, store })
 }
@@ -235,9 +236,7 @@ async fn build_member(cfg: &Config, inst: &InstanceConfig) -> anyhow::Result<Sha
     Ok(match inst.kind {
         InstanceKind::Memory => {
             warn!("memory instance {id}: in-process MemoryBlobStore (data does not survive the process)");
-            let mem = Arc::new(
-                MemoryBlobStore::new().with_instance_info(inst.info.clone()),
-            );
+            let mem = Arc::new(MemoryBlobStore::new().with_instance_info(inst.info.clone()));
             MetricsBackend::wrap(Arc::new(erase(mem)))
         }
         InstanceKind::LocalDisk => {
@@ -269,9 +268,7 @@ async fn build_member(cfg: &Config, inst: &InstanceConfig) -> anyhow::Result<Sha
             }
             #[cfg(not(feature = "discord"))]
             {
-                anyhow::bail!(
-                    "store {id:?} is discord but this binary was built without `--features discord`"
-                );
+                anyhow::bail!("store {id:?} is discord but this binary was built without `--features discord`");
             }
         }
     })

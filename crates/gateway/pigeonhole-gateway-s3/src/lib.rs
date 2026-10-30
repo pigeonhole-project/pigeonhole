@@ -6,12 +6,10 @@ mod cool;
 pub mod index;
 mod service;
 
-pub use index::{
-    parse_rfc3339, Rejected, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ObjectMeta,
-};
-pub use pigeonhole_chunk_store::{ChunkStore, Extent};
 pub use commands::{Body, Expect, Pairs, Released, S3Command, S3Reject, S3State};
 pub use cool::{CoolCandidate, CoolPolicy, CoolReason};
+pub use index::{parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ObjectMeta, Rejected};
+pub use pigeonhole_chunk_store::{ChunkStore, Extent};
 pub use service::{CoolStats, S3Gateway, S3Options};
 
 use s3s::access::{S3Access, S3AccessContext};
@@ -28,10 +26,7 @@ pub fn build_s3_gateway(opts: S3Options, index: Index, store: Arc<ChunkStore>) -
 /// Wrap [`S3Gateway`] in an authenticated s3s HTTP service.
 pub fn build_s3_service(gateway: S3Gateway, access_key: &str, secret_key: &str) -> S3Service {
     let mut builder = S3ServiceBuilder::new(gateway);
-    builder.set_auth(SimpleAuth::from_single(
-        access_key.to_string(),
-        secret_key.to_string(),
-    ));
+    builder.set_auth(SimpleAuth::from_single(access_key.to_string(), secret_key.to_string()));
     builder.set_access(NameOp);
     builder.build()
 }

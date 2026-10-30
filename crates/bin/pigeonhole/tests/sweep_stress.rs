@@ -16,9 +16,7 @@ use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
-use pigeonhole_blob::{
-    erase, BlobBackend, CheapestFirst, OrderedKey, Replicated, SharedBackend,
-};
+use pigeonhole_blob::{erase, BlobBackend, CheapestFirst, OrderedKey, Replicated, SharedBackend};
 use pigeonhole_chunk_store::{SweepConfig, Sweeper};
 use s3s::dto::*;
 use s3s::{S3ErrorCode, S3Request, S3};
@@ -126,17 +124,10 @@ async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
     // Same wiring as the binary: uploads are pinned until committed, the
     // sweeper stops at the pins' horizon.
     let backend: SharedBackend = Arc::new(erase(mem));
-    let rep = Arc::new(
-        Replicated::new(vec![backend.clone()], 1, Arc::new(CheapestFirst::new())).unwrap(),
-    );
+    let rep = Arc::new(Replicated::new(vec![backend.clone()], 1, Arc::new(CheapestFirst::new())).unwrap());
     let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
     let s3 = build_s3_gateway(cfg.s3_options(), index, store.clone());
-    Node {
-        s3,
-        store,
-        backend,
-        instance_id: info.id,
-    }
+    Node { s3, store, backend, instance_id: info.id }
 }
 
 fn sweeper(node: &Node) -> Sweeper {
@@ -149,18 +140,12 @@ fn sweeper(node: &Node) -> Sweeper {
 }
 
 async fn get_object(s3: &pigeonhole::S3Gateway, k: &str) -> Result<Option<Vec<u8>>, String> {
-    let out = match s3
-        .get_object(req(GetObjectInput {
-            bucket: BUCKET.into(),
-            key: k.into(),
-            ..Default::default()
-        }))
-        .await
-    {
-        Ok(r) => r.output,
-        Err(e) if *e.code() == S3ErrorCode::NoSuchKey => return Ok(None),
-        Err(e) => return Err(format!("get {k}: {e:?}")),
-    };
+    let out =
+        match s3.get_object(req(GetObjectInput { bucket: BUCKET.into(), key: k.into(), ..Default::default() })).await {
+            Ok(r) => r.output,
+            Err(e) if *e.code() == S3ErrorCode::NoSuchKey => return Ok(None),
+            Err(e) => return Err(format!("get {k}: {e:?}")),
+        };
     let mut body = out.body.ok_or_else(|| format!("get {k}: no body"))?;
     let mut data = Vec::new();
     while let Some(chunk) = body.next().await {
@@ -215,8 +200,7 @@ async fn worker(s3: Arc<pigeonhole::S3Gateway>, id: u64, c: Arc<Counters>) -> Ve
                     })
                     .build()
                     .unwrap();
-                match s3.copy_object(req(input)).await
-                {
+                match s3.copy_object(req(input)).await {
                     Ok(_) => c.copies.fetch_add(1, Ordering::Relaxed),
                     Err(e) if *e.code() == S3ErrorCode::NoSuchKey => {
                         c.copies_src_missing.fetch_add(1, Ordering::Relaxed)
@@ -287,13 +271,7 @@ async fn backend_keys(mem: &MemoryBlobStore) -> BTreeSet<Vec<u8>> {
 }
 
 async fn expected_keys(node: &Node) -> BTreeSet<Vec<u8>> {
-    node.store
-        .db()
-        .live_part_keys(&node.instance_id)
-        .await
-        .unwrap()
-        .into_iter()
-        .collect()
+    node.store.db().live_part_keys(&node.instance_id).await.unwrap().into_iter().collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -302,13 +280,7 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     let mem = Arc::new(MemoryBlobStore::new());
     let node = open_node(dir.path(), mem.clone()).await;
 
-    node.s3
-        .create_bucket(req(CreateBucketInput {
-            bucket: BUCKET.into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
+    node.s3.create_bucket(req(CreateBucketInput { bucket: BUCKET.into(), ..Default::default() })).await.unwrap();
 
     // A dead writer's uploads: on the backend, never committed to chunk_parts.
     for i in 0..5u64 {
@@ -334,9 +306,7 @@ async fn concurrent_ops_with_aggressive_sweeper() {
 
     let s3 = Arc::new(node.s3);
     let counters = Arc::new(Counters::default());
-    let workers: Vec<_> = (0..WORKERS)
-        .map(|id| tokio::spawn(worker(s3.clone(), id, counters.clone())))
-        .collect();
+    let workers: Vec<_> = (0..WORKERS).map(|id| tokio::spawn(worker(s3.clone(), id, counters.clone()))).collect();
     let mut failures = Vec::new();
     for w in workers {
         failures.extend(w.await.unwrap());
@@ -369,11 +339,7 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     for _ in 0..3 {
         sw.sweep_once().await.unwrap();
     }
-    assert_eq!(
-        verify_all(&node.s3, "after final sweep").await,
-        live,
-        "final sweep changed object contents"
-    );
+    assert_eq!(verify_all(&node.s3, "after final sweep").await, live, "final sweep changed object contents");
 
     let on_backend = backend_keys(&mem).await;
     let expected = expected_keys(&node).await;
@@ -386,9 +352,5 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     drop(sw);
     drop(node);
     let restored = open_node(dir.path(), mem).await;
-    assert_eq!(
-        verify_all(&restored.s3, "after replay").await,
-        live,
-        "replay lost or changed objects"
-    );
+    assert_eq!(verify_all(&restored.s3, "after replay").await, live, "replay lost or changed objects");
 }

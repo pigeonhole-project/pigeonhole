@@ -11,11 +11,7 @@ use tracing::{info, warn};
 /// blobs are then reclaimed by the sweeper.
 pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
-    if cfg
-        .instances
-        .iter()
-        .all(|i| i.kind == pigeonhole::instances::InstanceKind::Memory)
-    {
+    if cfg.instances.iter().all(|i| i.kind == pigeonhole::instances::InstanceKind::Memory) {
         bail!("refuse to purge: only memory instances are configured");
     }
     let scope = cfg.primary_scope_id().context("primary scope_id")?;

@@ -19,7 +19,13 @@ fn table() -> String {
         out.push_str(&format!("\n### {name}\n\n| Metric | Kind | Labels | Meaning |\n|---|---|---|---|\n"));
         for d in docs {
             let labels = d.labels.iter().map(|l| format!("`{l}`")).collect::<Vec<_>>().join(", ");
-            out.push_str(&format!("| `{}` | {} | {} | {} |\n", d.name, d.kind.as_str(), labels, d.help.replace('|', "\\|")));
+            out.push_str(&format!(
+                "| `{}` | {} | {} | {} |\n",
+                d.name,
+                d.kind.as_str(),
+                labels,
+                d.help.replace('|', "\\|")
+            ));
         }
     }
     out
@@ -50,6 +56,9 @@ fn docs_list_every_metric() {
     if std::env::var_os("UPDATE_METRICS_DOC").is_some() {
         std::fs::write(&path, want).unwrap();
     } else {
-        assert!(doc == want, "docs/metrics.md is stale: UPDATE_METRICS_DOC=1 cargo test -p pigeonhole --test metrics_doc");
+        assert!(
+            doc == want,
+            "docs/metrics.md is stale: UPDATE_METRICS_DOC=1 cargo test -p pigeonhole --test metrics_doc"
+        );
     }
 }

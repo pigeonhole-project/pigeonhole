@@ -7,10 +7,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 pub fn verify_sha256(data: &[u8], hash_hex: &str, size: i64) -> Result<()> {
     if data.len() as i64 != size {
-        bail!(
-            "blob size {} does not match digest size_bytes {size}",
-            data.len()
-        );
+        bail!("blob size {} does not match digest size_bytes {size}", data.len());
     }
     let got = sha256_hex(data);
     if !hash_eq(&got, hash_hex) {
@@ -21,10 +18,7 @@ pub fn verify_sha256(data: &[u8], hash_hex: &str, size: i64) -> Result<()> {
 
 /// Constant-time-ish hex compare (case insensitive).
 pub fn hash_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .all(|(x, y)| x.eq_ignore_ascii_case(&y))
+    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
 pub fn digest_hash_hex(d: &crate::reapi::Digest) -> Result<String> {

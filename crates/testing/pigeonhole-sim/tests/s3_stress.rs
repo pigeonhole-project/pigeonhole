@@ -73,7 +73,11 @@ struct Node {
 }
 
 /// Every chunk goes to every member; one success is enough.
-async fn open_node(log: &Arc<MemoryBlobStore>, snaps: &Arc<MemoryBlobStore>, members: &[Arc<Faulty<MemoryBlobStore>>]) -> Node {
+async fn open_node(
+    log: &Arc<MemoryBlobStore>,
+    snaps: &Arc<MemoryBlobStore>,
+    members: &[Arc<Faulty<MemoryBlobStore>>],
+) -> Node {
     let meta = MetaStore::open(
         Arc::new(ChainLogStore::new(log.clone())),
         Arc::new(BlobSnapshotStore::new(snaps.clone())),
@@ -103,11 +107,12 @@ fn sweeper(node: &Node) -> Sweeper {
 }
 
 async fn get(s3: &S3Gateway, k: &str) -> Result<Option<Vec<u8>>, String> {
-    let out = match s3.get_object(req(GetObjectInput { bucket: BUCKET.into(), key: k.into(), ..Default::default() })).await {
-        Ok(r) => r.output,
-        Err(e) if *e.code() == S3ErrorCode::NoSuchKey => return Ok(None),
-        Err(e) => return Err(format!("{e:?}")),
-    };
+    let out =
+        match s3.get_object(req(GetObjectInput { bucket: BUCKET.into(), key: k.into(), ..Default::default() })).await {
+            Ok(r) => r.output,
+            Err(e) if *e.code() == S3ErrorCode::NoSuchKey => return Ok(None),
+            Err(e) => return Err(format!("{e:?}")),
+        };
     let mut body = out.body.ok_or("no body")?;
     let mut data = Vec::new();
     while let Some(chunk) = body.next().await {
@@ -123,7 +128,12 @@ async fn worker(s3: Arc<S3Gateway>, id: u64, damaged: Arc<Mutex<Vec<String>>>) {
         match random_u64() % 10 {
             0..=3 => {
                 let body = payload(id << 32 | op, HEADER + (random_u64() % 60_000) as usize);
-                let input = PutObjectInput { bucket: BUCKET.into(), key: k, body: Some(StreamingBlob::from_bytes(body)), ..Default::default() };
+                let input = PutObjectInput {
+                    bucket: BUCKET.into(),
+                    key: k,
+                    body: Some(StreamingBlob::from_bytes(body)),
+                    ..Default::default()
+                };
                 let _ = s3.put_object(req(input)).await;
             }
             4..=5 => {
@@ -137,7 +147,9 @@ async fn worker(s3: Arc<S3Gateway>, id: u64, damaged: Arc<Mutex<Vec<String>>>) {
                 let _ = s3.copy_object(req(input)).await;
             }
             6 => {
-                let _ = s3.delete_object(req(DeleteObjectInput { bucket: BUCKET.into(), key: k, ..Default::default() })).await;
+                let _ = s3
+                    .delete_object(req(DeleteObjectInput { bucket: BUCKET.into(), key: k, ..Default::default() }))
+                    .await;
             }
             _ => {
                 if let Ok(Some(data)) = get(&s3, &k).await {
@@ -202,7 +214,12 @@ async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) {
     // is garbage the sweeper reaches once a newer upload returns a higher
     // key (sweep-invariants.md). Make one.
     let marker = payload(u64::MAX, 100);
-    let input = PutObjectInput { bucket: BUCKET.into(), key: "marker".into(), body: Some(StreamingBlob::from_bytes(marker)), ..Default::default() };
+    let input = PutObjectInput {
+        bucket: BUCKET.into(),
+        key: "marker".into(),
+        body: Some(StreamingBlob::from_bytes(marker)),
+        ..Default::default()
+    };
     node.s3.put_object(req(input)).await.unwrap();
     let live = read_all(&node.s3).await;
     let sw = sweeper(&node);

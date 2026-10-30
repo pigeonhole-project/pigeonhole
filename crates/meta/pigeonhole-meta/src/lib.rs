@@ -35,9 +35,9 @@ use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::any::Any;
-use std::marker::PhantomData;
 use std::collections::HashMap;
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -51,11 +51,11 @@ pub mod snapshot;
 mod telemetry;
 
 pub use log::{
-    Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult,
-    LogStore, Position, LOG_FORMAT, ChainLogStore, Lease,
+    Base, Batch, ChainLogStore, Discovered, Entry, EntryStream, Head, Lease, LogError, LogId, LogResult, LogStore,
+    Position, LOG_FORMAT,
 };
-pub use telemetry::METRICS;
 pub use snapshot::{BlobSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
+pub use telemetry::METRICS;
 
 /// A rejection that cannot happen (a namespace whose commands never fail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -257,12 +257,7 @@ struct StateCell<S>(RwLock<S>);
 impl<S: StateMachine> AnyState for StateCell<S> {
     fn apply(&self, command: &Command) -> Result<Vec<u8>> {
         if command.version != S::VERSION {
-            bail!(
-                "{} command in format {}, this binary reads {}",
-                S::NAME,
-                command.version,
-                S::VERSION
-            );
+            bail!("{} command in format {}, this binary reads {}", S::NAME, command.version, S::VERSION);
         }
         let cmd: S::Command =
             postcard::from_bytes(&command.command).with_context(|| format!("decode {} command", S::NAME))?;
@@ -613,8 +608,7 @@ impl MetaStore {
             // So that the snapshot that failed stops being the base.
             let _ = raft.trigger().snapshot().await;
         }
-        *store.ticker.lock().unwrap() =
-            opts.snapshot_interval.map(|every| spawn_snapshot_ticker(raft, shared, every));
+        *store.ticker.lock().unwrap() = opts.snapshot_interval.map(|every| spawn_snapshot_ticker(raft, shared, every));
         telemetry::record_boot(store.applied_position().saturating_sub(store.base_position()), t0.elapsed());
         tracing::info!(
             generation = gen,
@@ -936,7 +930,12 @@ async fn load_some_base(
 }
 
 /// Restore the states from the snapshot of `base`.
-async fn load_base(sm: &mut raft::StateMachine, snapshots: &dyn SnapshotStore, base: &Base, log_id: LogId) -> Result<()> {
+async fn load_base(
+    sm: &mut raft::StateMachine,
+    snapshots: &dyn SnapshotStore,
+    base: &Base,
+    log_id: LogId,
+) -> Result<()> {
     let stored = snapshots
         .get(&base.snapshot)
         .await
@@ -1033,9 +1032,7 @@ pub(crate) fn apply_command(states: &States, pos: Position, command: &Command) -
     let state = states
         .get(command.namespace.as_str())
         .with_context(|| format!("entry {pos}: unknown namespace {:?}", command.namespace))?;
-    state
-        .apply(command)
-        .with_context(|| format!("apply {} entry {pos}", command.namespace))
+    state.apply(command).with_context(|| format!("apply {} entry {pos}", command.namespace))
 }
 
 /// Encode every state as of `position` (between applies, so nothing is half
@@ -1055,9 +1052,7 @@ pub(crate) fn take_snapshot(states: &States, position: Position) -> TabletSnapsh
 /// Load every namespace's state from `snap`.
 pub(crate) fn restore_states(states: &States, snap: &TabletSnapshot) -> Result<()> {
     for (name, version, data) in &snap.states {
-        let state = states
-            .get(name.as_str())
-            .with_context(|| format!("snapshot has unknown namespace {name:?}"))?;
+        let state = states.get(name.as_str()).with_context(|| format!("snapshot has unknown namespace {name:?}"))?;
         state.restore(*version, data)?;
     }
     Ok(())

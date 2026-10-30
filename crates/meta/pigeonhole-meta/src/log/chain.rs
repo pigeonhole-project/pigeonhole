@@ -27,7 +27,9 @@
 //! reads the tail it links after. For a store whose links are scarce (a
 //! Discord thread per link) and whose ids carry the store's time.
 
-use super::{Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position, LOG_FORMAT};
+use super::{
+    Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position, LOG_FORMAT,
+};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -141,8 +143,8 @@ impl<Id: Serialize + for<'de> Deserialize<'de>> ChainDoc<Id> {
     }
 
     fn decode(data: &[u8]) -> LogResult<Self> {
-        let (format, _) = postcard::take_from_bytes::<u32>(data)
-            .map_err(|e| LogError::Lost(format!("log blob header: {e}")))?;
+        let (format, _) =
+            postcard::take_from_bytes::<u32>(data).map_err(|e| LogError::Lost(format!("log blob header: {e}")))?;
         if format != LOG_FORMAT {
             return Err(LogError::Lost(format!("log blob in format {format}, this binary reads {LOG_FORMAT}")));
         }
@@ -305,7 +307,11 @@ impl<C: Chain> ChainLogStore<C> {
     /// store's ms: its stamp plus the lease, or the stamp for a release.
     fn expiry(&self, l: &Leased<C::Id>, record: &C::Id, label: &str) -> u64 {
         let stamp = l.store.stamp_ms(record);
-        if label.starts_with("log-release-") { stamp } else { stamp + l.lease.duration.as_millis() as u64 }
+        if label.starts_with("log-release-") {
+            stamp
+        } else {
+            stamp + l.lease.duration.as_millis() as u64
+        }
     }
 
     /// The tip as of lease record `record` of generation `gen`: its newest
@@ -811,7 +817,8 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         };
         let this = self.reader();
         let fut = async move {
-            let tip = tip.ok_or_else(|| LogError::Lost(format!("no head of log {} known to this handle", head.log_id)))?;
+            let tip =
+                tip.ok_or_else(|| LogError::Lost(format!("no head of log {} known to this handle", head.log_id)))?;
             this.read_all(tip, from, head).await
         };
         Box::pin(
@@ -831,11 +838,8 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             return Err(LogError::Other(anyhow!("rebase at {at} behind the base {old_at}")));
         }
         // Past the head (a snapshot from elsewhere): the log jumps to `at`.
-        let (first, head_term) = if at > old_tip.position {
-            (at + 1, base.term)
-        } else {
-            (old_tip.position + 1, old_tip.head_term)
-        };
+        let (first, head_term) =
+            if at > old_tip.position { (at + 1, base.term) } else { (old_tip.position + 1, old_tip.head_term) };
         // The bases kept, newest first; a repeated base counts once.
         let mut older: Vec<Base> = old_tip.base.iter().chain(&old_tip.older).filter(|b| **b != base).cloned().collect();
         let dropped = older.split_off(older.len().min(keep.max(1) - 1));

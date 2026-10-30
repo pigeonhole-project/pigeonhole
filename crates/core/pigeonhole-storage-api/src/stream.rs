@@ -8,8 +8,7 @@ use pigeonhole_types::ByteRange;
 use std::pin::Pin;
 
 /// Stream of blob bytes returned by [`crate::BlobBackend::get`].
-pub type BoxByteStream =
-    Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send>>;
+pub type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send>>;
 
 /// Collect a [`BoxByteStream`] into a single [`Bytes`].
 pub async fn collect_stream(mut stream: BoxByteStream) -> Result<Bytes> {
@@ -34,12 +33,7 @@ pub fn slice_range(data: Bytes, range: Option<ByteRange>) -> Result<Bytes> {
     let start = r.start as usize;
     let end = r.end as usize;
     if start > end || end > data.len() {
-        anyhow::bail!(
-            "byte range {}..{} outside blob of {} bytes",
-            r.start,
-            r.end,
-            data.len()
-        );
+        anyhow::bail!("byte range {}..{} outside blob of {} bytes", r.start, r.end, data.len());
     }
     Ok(data.slice(start..end))
 }

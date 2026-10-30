@@ -46,8 +46,14 @@ pub enum ChannelMessage {
     /// Anything that is neither text nor a document (a service message, a photo).
     Other,
     /// A plain text message.
-    Text { text: String },
-    Document { name: String, size: u64, file: FileLocation },
+    Text {
+        text: String,
+    },
+    Document {
+        name: String,
+        size: u64,
+        file: FileLocation,
+    },
 }
 
 /// A posted document.

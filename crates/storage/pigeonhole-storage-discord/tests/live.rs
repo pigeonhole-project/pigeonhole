@@ -6,12 +6,12 @@
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_meta::{
     Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogId, LogStore, SnapshotRef, SnapshotStore,
     StoredSnapshot,
 };
+use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
 use pigeonhole_storage_discord::{DiscordApi, DiscordBlobStore, DiscordChannel, DiscordClient, PAGE};
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +24,9 @@ fn env(k: &str) -> String {
 }
 
 fn channel(var: &str) -> (Arc<DiscordChannel>, Arc<ChatLimiter>, DiscordClient, u64) {
-    let _ = tracing_subscriber::fmt().with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .try_init();
     let id: u64 = env(var).parse().unwrap();
     let client = DiscordClient::new(env("DISCORD_BOT_TOKEN")).unwrap();
     let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_discord::limits()));
@@ -51,9 +53,11 @@ async fn empty(ch: &DiscordChannel) {
         let page = ch.list(before, None, PAGE).await.unwrap();
         ids.extend(page.iter().map(|m| m.id));
         for m in &page {
-            let name = m.attachment.as_ref().map(|a| a.filename.clone()).or_else(|| {
-                pigeonhole_storage_api::text::name_of(&m.content).map(str::to_string)
-            });
+            let name = m
+                .attachment
+                .as_ref()
+                .map(|a| a.filename.clone())
+                .or_else(|| pigeonhole_storage_api::text::name_of(&m.content).map(str::to_string));
             if let Some(prev) = name.and_then(|n| n.strip_suffix(".bin")?.rsplit_once('~')?.1.parse::<u64>().ok()) {
                 ids.push(prev);
             }

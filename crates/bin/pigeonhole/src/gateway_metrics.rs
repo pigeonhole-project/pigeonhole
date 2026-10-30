@@ -97,10 +97,7 @@ where
     type Data = B::Data;
     type Error = B::Error;
 
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
         let polled = this.inner.poll_frame(cx);
         if let Poll::Ready(Some(Ok(frame))) = &polled {

@@ -15,10 +15,22 @@ pub(crate) const NAMESPACE: &str = "cas";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CasCommand {
     /// Store `(hash, size)` → extents unless it exists; an existing entry is touched.
-    PutEntry { hash: String, size: i64, extents: Vec<Extent>, at: String },
-    TouchEntry { hash: String, size: i64, at: String },
+    PutEntry {
+        hash: String,
+        size: i64,
+        extents: Vec<Extent>,
+        at: String,
+    },
+    TouchEntry {
+        hash: String,
+        size: i64,
+        at: String,
+    },
     /// Remove an entry (no-op if missing).
-    DropEntry { hash: String, size: i64 },
+    DropEntry {
+        hash: String,
+        size: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,18 +66,16 @@ impl StateMachine for CasState {
 
     fn apply(&mut self, command: CasCommand) -> Result<Outcome<Self>> {
         Ok(Ok(match command {
-            CasCommand::PutEntry { hash, size, extents, at } => {
-                match self.blobs.get_mut(&(hash.clone(), size)) {
-                    Some(r) => {
-                        r.last_access = at;
-                        CasReply::Existing(r.extents.clone())
-                    }
-                    None => {
-                        self.blobs.insert((hash, size), CasRecord { extents, last_access: at });
-                        CasReply::Stored
-                    }
+            CasCommand::PutEntry { hash, size, extents, at } => match self.blobs.get_mut(&(hash.clone(), size)) {
+                Some(r) => {
+                    r.last_access = at;
+                    CasReply::Existing(r.extents.clone())
                 }
-            }
+                None => {
+                    self.blobs.insert((hash, size), CasRecord { extents, last_access: at });
+                    CasReply::Stored
+                }
+            },
             CasCommand::TouchEntry { hash, size, at } => {
                 if let Some(r) = self.blobs.get_mut(&(hash, size)) {
                     r.last_access = at;
