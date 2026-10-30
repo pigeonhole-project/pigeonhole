@@ -193,7 +193,7 @@ trait Bucket {
 
 ### Background work
 
-`wait_idle` stays: background work (log collection, the sweeper) reserves
+`wait_idle` stays: background work (log collection, the sweeper) takes
 nothing until every bucket of its plan has no caller waiting and is at
 least half full, then takes a ticket as usual. With a pool it asks for
 **any** idle account.
@@ -269,7 +269,7 @@ one store, many bots.
   that set `ready_at` (which budget is the bottleneck).
 - `pigeonhole_limiter_penalties_total{service, level}`.
 - `pigeonhole_pool_calls_total{store, account}`: how the pool spreads load.
-- `pigeonhole_limiter_reserved{level}`: calls waiting on a level.
+- `pigeonhole_limiter_waiting{level}`: calls waiting on a level.
 
 ## Spike findings (2026-10-30)
 
