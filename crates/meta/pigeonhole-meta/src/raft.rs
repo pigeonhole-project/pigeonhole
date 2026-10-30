@@ -24,8 +24,8 @@ use openraft::raft::{
 };
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use openraft::{
-    AnyError, BasicNode, EntryPayload, LogState, RaftLogReader, RaftNetwork, RaftNetworkFactory,
-    RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
+    AnyError, BasicNode, EntryPayload, LogState, RaftLogReader, RaftNetwork, RaftNetworkFactory, RaftSnapshotBuilder,
+    Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -199,7 +199,13 @@ impl LogAdapter {
         this
     }
 
-    async fn write_loop(self, gen: u64, snapshots: Arc<dyn SnapshotStore>, keep: Keep, mut rx: mpsc::UnboundedReceiver<Op>) {
+    async fn write_loop(
+        self,
+        gen: u64,
+        snapshots: Arc<dyn SnapshotStore>,
+        keep: Keep,
+        mut rx: mpsc::UnboundedReceiver<Op>,
+    ) {
         let mut next = None;
         loop {
             let op = match next.take() {
@@ -226,30 +232,7 @@ impl LogAdapter {
                             }
                         }
                     }
-                    let ours: Vec<Entry> = entries
-                        .iter()
-                        .map(|e| Entry {
-                            term: e.log_id.leader_id.term,
-                            payload: postcard::to_stdvec(e).expect("an entry always encodes"),
-                        })
-                        .collect();
-                    let (bytes, t0) = (ours.iter().map(|e| e.payload.len()).sum(), std::time::Instant::now());
-                    let appended = self.log.append(gen, &ours).await;
-                    crate::telemetry::record_append(appended.is_ok(), ours.len(), bytes, t0.elapsed());
-                    let result = match appended {
-                        Ok(last) => {
-                            self.durable.store(last, Ordering::SeqCst);
-                            let mut tail = self.tail.lock().unwrap();
-                            let keep_from = last.saturating_sub(TAIL_KEEP) + 1;
-                            *tail = tail.split_off(&keep_from);
-                            Ok(())
-                        }
-                        Err(e) => {
-                            let msg = e.to_string();
-                            self.shared.log_error(e);
-                            Err(msg)
-                        }
-                    };
+                    let result = self.append_batch(gen, &entries).await;
                     for callback in callbacks {
                         callback.log_io_completed(result.clone().map_err(std::io::Error::other));
                     }
@@ -291,6 +274,35 @@ impl LogAdapter {
                     crate::telemetry::record_log_write("vote", r.is_ok(), t0.elapsed());
                     let _ = done.send(r);
                 }
+            }
+        }
+    }
+
+    /// Append `entries` as one write of the log; the error as text, for
+    /// every caller of the batch.
+    async fn append_batch(&self, gen: u64, entries: &[RaftEntry]) -> Result<(), String> {
+        let ours: Vec<Entry> = entries
+            .iter()
+            .map(|e| Entry {
+                term: e.log_id.leader_id.term,
+                payload: postcard::to_stdvec(e).expect("an entry always encodes"),
+            })
+            .collect();
+        let (bytes, t0) = (ours.iter().map(|e| e.payload.len()).sum(), std::time::Instant::now());
+        let appended = self.log.append(gen, &ours).await;
+        crate::telemetry::record_append(appended.is_ok(), ours.len(), bytes, t0.elapsed());
+        match appended {
+            Ok(last) => {
+                self.durable.store(last, Ordering::SeqCst);
+                let mut tail = self.tail.lock().unwrap();
+                let keep_from = last.saturating_sub(TAIL_KEEP) + 1;
+                *tail = tail.split_off(&keep_from);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.shared.log_error(e);
+                Err(msg)
             }
         }
     }
@@ -360,11 +372,8 @@ impl RaftLogStorage<TypeConfig> for LogAdapter {
         let purged = base.as_ref().filter(|b| b.at > 0).map(|b| log_id(b.term, b.leader, b.at - 1));
         let head = d.head.position;
         let base_at = base.as_ref().map_or(0, |b| b.at);
-        let last = if head > base_at {
-            self.read_positions(head - 1, head).await?.pop().map(|e| e.log_id)
-        } else {
-            purged
-        };
+        let last =
+            if head > base_at { self.read_positions(head - 1, head).await?.pop().map(|e| e.log_id) } else { purged };
         Ok(LogState { last_purged_log_id: purged, last_log_id: last })
     }
 
@@ -431,7 +440,12 @@ impl RaftLogStorage<TypeConfig> for LogAdapter {
             )))
             .into());
         };
-        let base = Base { at: position(&id), term: id.leader_id.term, leader: id.leader_id.node_id, snapshot: current.snapshot };
+        let base = Base {
+            at: position(&id),
+            term: id.leader_id.term,
+            leader: id.leader_id.node_id,
+            snapshot: current.snapshot,
+        };
         self.write(|done| Op::Rebase(base, done)).await?;
         let mut head = self.head.lock().unwrap();
         *head = (*head).max(position(&id));
