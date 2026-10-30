@@ -41,7 +41,7 @@ the old ETag, was refused, so T4 stepped down (docs/conditional-writes.md
 § Live). Now the lock (~250 B), the manifests and most WAL segments are
 inline in pigeonhole's metadata (docs/inline-objects.md): a renewal is a
 commit to the Discord log, ~1 s, and the takeover holds with objects in
-Telegram too. With `[inline] max_object_bytes = 0` the old behaviour is
+Telegram too. With `[inline] max_object_size = 0` the old behaviour is
 back.
 
 ## Toward Kubernetes

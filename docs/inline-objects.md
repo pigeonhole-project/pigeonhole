@@ -21,18 +21,18 @@ append and no post at all; its read is a lookup in memory.
 
 ## What
 
-An object whose body is at most `max_object_bytes` is stored **inline**:
+An object whose body is at most `max_object_size` is stored **inline**:
 its bytes are part of its record in the `s3` namespace (in the log entry
 that writes it, then in snapshots), and it has no chunks.
 
 A background **cooler** moves inline objects out to chunks, as an ordinary
-object, when they are cold (not rewritten for `cool_after_secs`) or when the
-inline bytes of the tablet exceed `budget_bytes`. A cooled object is like
+object, when they are cold (not rewritten for `cool_after`) or when the
+inline bytes of the tablet exceed `budget`. A cooled object is like
 any other until it is rewritten; a rewrite of a small object is inline
 again. So hot small objects (locks, manifests) live in the tablet and the
 rest of the small objects drift out of it.
 
-Every knob is configurable; `max_object_bytes = 0` turns inlining off and
+Every knob is configurable; `max_object_size = 0` turns inlining off and
 the gateway behaves as today.
 
 ```toml
@@ -40,20 +40,20 @@ the gateway behaves as today.
 # Objects up to this size are stored in the metadata, not as chunks
 # (0 = never). Applies to PutObject and CopyObject; multipart uploads never
 # inline.
-max_object_bytes = 1024
+max_object_size = "1 KiB"
 # All inline bytes of the tablet. Above it the cooler moves the coldest
-# inline objects out until they fit under low_watermark * budget_bytes.
+# inline objects out until they fit under low_watermark * budget.
 # A write never fails on the budget (it is enforced after the fact).
-budget_bytes = 67108864            # 64 MiB
+budget = "64 MiB"
 low_watermark = 0.9
-# An inline object not rewritten for this long is moved out (0 = only by
-# budget). Locks and manifests rewritten every few seconds never get there.
-cool_after_secs = 600
+# An inline object not rewritten for this long is moved out ("0s" = only
+# by budget). Locks and manifests rewritten every few seconds never get there.
+cool_after = "10m"
 # Never move out an object written less than this long ago, budget or not
 # (a lock in use stays inline).
-min_inline_secs = 30
+min_inline = "30s"
 # How often the cooler looks; how many objects one pass moves at most.
-cool_every_secs = 60
+cool_every = "1m"
 cool_batch = 64
 ```
 
@@ -93,10 +93,10 @@ the cooler goes by `mtime` alone.
 
 ## Paths
 
-- **PutObject.** With `Content-Length ≤ max_object_bytes` the gateway reads
+- **PutObject.** With `Content-Length ≤ max_object_size` the gateway reads
   the body into memory, checks Content-MD5 and checksums as today, and
   proposes `PutObject { body: Inline }`, without ingest or a chunk commit.
-  With no length (aws-chunked), it reads up to `max_object_bytes + 1`
+  With no length (aws-chunked), it reads up to `max_object_size + 1`
   bytes: if the body ends there it is inline, else those bytes are prepended
   to the stream and it is ingested as today. The ETag is the MD5, as for
   any single-part object.
@@ -119,17 +119,17 @@ the cooler goes by `mtime` alone.
 A background task like the sweeper and the repairer (only on the node that
 holds the tablet; with Raft, the leader). Each pass:
 
-1. Candidates: inline objects with `mtime` older than `cool_after_secs`;
-   if `inline_bytes > budget_bytes`, also the oldest by `mtime` until the
-   projected total is under `low_watermark × budget_bytes`. Never one
-   written within `min_inline_secs`. At most `cool_batch`.
+1. Candidates: inline objects with `mtime` older than `cool_after`;
+   if `inline_bytes > budget`, also the oldest by `mtime` until the
+   projected total is under `low_watermark × budget`. Never one
+   written within `min_inline`. At most `cool_batch`.
 2. For each: ingest its bytes as a chunk (the ordinary write path, so the
    placement, replication and codec settings apply), then commit the chunk
    along with `Cool { etag }` in one entry. A rejected `Cool` releases the
    chunk.
 
 A pass moves at most `cool_batch` objects, one after the other, every
-`cool_every_secs`. It does not yet wait for the stores' spare budget (as the
+`cool_every`. It does not yet wait for the stores' spare budget (as the
 log's collection does with `wait_idle`), so a pass in a busy channel queues
 with client writes: keep `cool_batch` small there.
 
@@ -140,7 +140,7 @@ place every object's existence already depends on. With Raft between nodes
 it replicates with the log. Under a `memory` log it is gone with the
 process, as all metadata is.
 
-The cost is RAM and snapshot size, bounded by `budget_bytes` (plus what
+The cost is RAM and snapshot size, bounded by `budget` (plus what
 arrives between cooler passes), and log volume: every rewrite of an inline
 object carries its bytes. A 223-byte lock rewritten every 2 s adds ~10 MiB
 of log a day until the next snapshot rebases it away.

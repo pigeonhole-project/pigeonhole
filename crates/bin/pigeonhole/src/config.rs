@@ -87,7 +87,8 @@ pub struct Config {
 /// `[inline]` (docs/inline-objects.md).
 #[derive(Clone, Debug, PartialEq)]
 pub struct InlineSettings {
-    /// Objects up to this size are stored inline; 0 = never.
+    /// Objects up to this size are stored inline; 0 = never
+    /// (`max_object_size`).
     pub max_object_bytes: usize,
     /// When the cooler moves inline objects out.
     pub cool: CoolPolicy,
@@ -688,12 +689,17 @@ impl FileMetrics {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileInline {
-    max_object_bytes: usize,
-    budget_bytes: u64,
+    #[serde(deserialize_with = "units::size")]
+    max_object_size: usize,
+    #[serde(deserialize_with = "units::size")]
+    budget: usize,
     low_watermark: f64,
-    cool_after_secs: u64,
-    min_inline_secs: u64,
-    cool_every_secs: u64,
+    #[serde(with = "humantime_serde")]
+    cool_after: Duration,
+    #[serde(with = "humantime_serde")]
+    min_inline: Duration,
+    #[serde(with = "humantime_serde")]
+    cool_every: Duration,
     cool_batch: usize,
 }
 
@@ -701,12 +707,12 @@ impl Default for FileInline {
     fn default() -> Self {
         let p = CoolPolicy::default();
         Self {
-            max_object_bytes: 1024,
-            budget_bytes: p.budget_bytes,
+            max_object_size: 1024,
+            budget: p.budget_bytes as usize,
             low_watermark: p.low_watermark,
-            cool_after_secs: p.cool_after.map_or(0, |d| d.as_secs()),
-            min_inline_secs: p.min_inline.as_secs(),
-            cool_every_secs: 60,
+            cool_after: p.cool_after.unwrap_or_default(),
+            min_inline: p.min_inline,
+            cool_every: Duration::from_secs(60),
             cool_batch: p.batch,
         }
     }
@@ -718,15 +724,15 @@ impl FileInline {
             bail!("inline.low_watermark must be within 0..=1");
         }
         Ok(InlineSettings {
-            max_object_bytes: self.max_object_bytes,
+            max_object_bytes: self.max_object_size,
             cool: CoolPolicy {
-                budget_bytes: self.budget_bytes,
+                budget_bytes: self.budget as u64,
                 low_watermark: self.low_watermark,
-                cool_after: (self.cool_after_secs > 0).then(|| Duration::from_secs(self.cool_after_secs)),
-                min_inline: Duration::from_secs(self.min_inline_secs),
+                cool_after: (!self.cool_after.is_zero()).then_some(self.cool_after),
+                min_inline: self.min_inline,
                 batch: self.cool_batch.max(1),
             },
-            cool_every: Duration::from_secs(self.cool_every_secs.max(1)),
+            cool_every: self.cool_every.max(Duration::from_secs(1)),
         })
     }
 }
@@ -1291,6 +1297,21 @@ upload_concurrency = 4
         assert!(format!("{err:#}").contains("shards of shards"), "{err:#}");
         let err = load(&format!("[chunk]\nstore = \"a\"\n{stores}{shards}")).unwrap_err();
         assert!(format!("{err:#}").contains("group blobs is not used"), "{err:#}");
+    }
+
+    #[test]
+    fn inline_takes_units_and_defaults() {
+        let cfg = load_mem("").unwrap();
+        assert_eq!(cfg.inline.max_object_bytes, 1024);
+        assert_eq!(cfg.inline.cool.cool_after, Some(Duration::from_secs(600)));
+        let cfg = load_mem("[inline]\nmax_object_size = \"4 KiB\"\nbudget = \"1 MiB\"\ncool_after = \"0s\"\nmin_inline = \"5s\"\ncool_every = \"2m\"\n").unwrap();
+        assert_eq!(cfg.inline.max_object_bytes, 4096);
+        assert_eq!(cfg.inline.cool.budget_bytes, 1 << 20);
+        assert_eq!(cfg.inline.cool.cool_after, None, "0s: only by budget");
+        assert_eq!(cfg.inline.cool.min_inline, Duration::from_secs(5));
+        assert_eq!(cfg.inline.cool_every, Duration::from_secs(120));
+        assert!(load_mem("[inline]\nmax_object_size = \"1 KB\"\n").is_err(), "decimal units refused");
+        assert!(load_mem("[inline]\nlow_watermark = 1.5\n").is_err());
     }
 
     #[test]
