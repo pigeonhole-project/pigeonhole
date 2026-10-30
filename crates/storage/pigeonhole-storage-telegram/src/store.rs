@@ -1,6 +1,6 @@
 //! [`BlobBackend`] over one channel.
 
-use crate::channel::{windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, IDS_PER_CALL, WINDOW};
+use crate::channel::{windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, ReadVia, IDS_PER_CALL, WINDOW};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,16 +24,19 @@ pub struct TelegramId {
     pub message_id: i64,
 }
 
-/// Locations of recently seen documents (saves a `getMessages` per read).
+/// Locations of recently seen documents (saves a `getMessages` per read):
+/// each bot's that read or posted it (its replicas), since a bot downloads
+/// only with its own.
 const LOCATION_CACHE: usize = 4096;
 /// Windows of one blob fetched at a time.
 const WINDOWS_IN_FLIGHT: usize = 4;
 
-/// Where a blob's bytes are: a document's file, or the bytes themselves (a
-/// text message, [`pigeonhole_storage_api::text`]).
+/// Where a blob's bytes are: a document's file (a location per bot that
+/// has one, [`FileLocation::bot`]), or the bytes themselves (a text message,
+/// [`pigeonhole_storage_api::text`]).
 #[derive(Clone)]
 pub(crate) enum Located {
-    Doc { size: u64, file: FileLocation },
+    Doc { size: u64, files: Vec<FileLocation> },
     Inline(Bytes),
 }
 
@@ -41,7 +44,7 @@ impl Located {
     /// What message `msg` holds, if it is a blob.
     pub(crate) fn of(msg: &ChannelMessage) -> Option<Self> {
         match msg {
-            ChannelMessage::Document { size, file, .. } => Some(Located::Doc { size: *size, file: file.clone() }),
+            ChannelMessage::Document { size, file, .. } => Some(Located::Doc { size: *size, files: vec![file.clone()] }),
             ChannelMessage::Text { text } => pigeonhole_storage_api::text::decode(text).map(|(_, data)| Located::Inline(data)),
             _ => None,
         }
@@ -73,7 +76,7 @@ pub struct TelegramBlobStore<C> {
 pub(crate) struct Reader<C> {
     pub(crate) channel: Arc<C>,
     limiter: Arc<ChatLimiter>,
-    locations: Locations,
+    pub(crate) locations: Locations,
 }
 
 impl<C> Clone for Reader<C> {
@@ -124,7 +127,7 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
         let size = data.len() as u64;
         let sent = channel.send_document(name, data, random_id).await?;
         if let Some(file) = sent.file {
-            self.reader.remember(sent.message_id, Located::Doc { size, file });
+            self.reader.remember(sent.message_id, Located::Doc { size, files: vec![file] });
         }
         tracing::debug!(%store, message_id = sent.message_id, name, bytes = size, kind = "document", "posted");
         Ok(sent.message_id)
@@ -142,8 +145,51 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
 }
 
 impl<C: ChannelApi> Reader<C> {
+    /// Where blob `message_id` is; a document's locations join the ones
+    /// other bots hold (one per bot, the newest).
     pub(crate) fn remember(&self, message_id: i64, located: Located) {
-        self.locations.lock().unwrap().put(message_id, located);
+        let mut cache = self.locations.lock().unwrap();
+        let located = match (cache.get(&message_id), located) {
+            (Some(Located::Doc { files: held, .. }), Located::Doc { size, files }) => {
+                let mut all: Vec<FileLocation> = held.iter().filter(|h| files.iter().all(|f| f.bot != h.bot)).cloned().collect();
+                all.extend(files);
+                Located::Doc { size, files: all }
+            }
+            (_, located) => located,
+        };
+        cache.put(message_id, located);
+    }
+
+    /// Bot `bot`'s location of blob `message_id` no longer works.
+    fn forget(&self, message_id: i64, bot: usize) {
+        let mut cache = self.locations.lock().unwrap();
+        if let Some(Located::Doc { files, .. }) = cache.get_mut(&message_id) {
+            files.retain(|f| f.bot != bot);
+            if files.is_empty() {
+                cache.pop(&message_id);
+            }
+        }
+    }
+
+    /// The location to download blob `message_id` with: a holder's the
+    /// channel picks, or that of the bot that reads the message again.
+    async fn pick(&self, message_id: i64, files: &[FileLocation]) -> Result<FileLocation> {
+        let holders: Vec<usize> = files.iter().map(|f| f.bot).collect();
+        match self.channel.read_via(&holders) {
+            ReadVia::Holder(bot) => {
+                Ok(files.iter().find(|f| f.bot == bot).cloned().context("the channel picked a bot holding no location")?)
+            }
+            ReadVia::Locate => self.relocate(message_id).await,
+        }
+    }
+
+    /// Read blob `message_id` again (through whichever bot the channel
+    /// picks): its location, with a fresh file reference.
+    async fn relocate(&self, message_id: i64) -> Result<FileLocation> {
+        match self.locate(message_id, true).await? {
+            Located::Doc { files, .. } => files.into_iter().next().context("a document without a location"),
+            Located::Inline(_) => bail!("blob {message_id} is no longer a document"),
+        }
     }
 
     /// Read messages `ids` (at most [`IDS_PER_CALL`]), remembering where
@@ -182,9 +228,8 @@ impl<C: ChannelApi> Reader<C> {
         let _permit = self.limiter.acquire_download().await;
         let bytes = match self.channel.get_file(&file, offset, WINDOW).await {
             Err(e) if e.is::<FileReferenceExpired>() => {
-                let Located::Doc { file: fresh, .. } = self.locate(message_id, true).await? else {
-                    bail!("blob {message_id} is no longer a document")
-                };
+                self.forget(message_id, file.bot);
+                let fresh = self.relocate(message_id).await?;
                 self.channel.get_file(&fresh, offset, WINDOW).await
             }
             other => other,
@@ -240,13 +285,14 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let message_id = id.message_id;
-        let (size, file) = match self.reader.locate(message_id, false).await? {
+        let (size, files) = match self.reader.locate(message_id, false).await? {
             Located::Inline(data) => {
                 tracing::debug!(store = %self.instance.id, message_id = message_id, ?range, kind = "text", "read");
                 return Ok(bytes_stream(slice_range(data, range)?));
             }
-            Located::Doc { size, file } => (size, file),
+            Located::Doc { size, files } => (size, files),
         };
+        let file = self.reader.pick(message_id, &files).await?;
         tracing::debug!(store = %self.instance.id, message_id = message_id, ?range, size, kind = "document", "read");
         let (start, end) = match range {
             Some(r) if r.start > r.end || r.end > size => {

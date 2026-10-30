@@ -199,3 +199,52 @@ async fn a_pool_of_two_bots_sends_twice_as_fast() {
         pooled.delete_messages(part).await.unwrap();
     }
 }
+
+/// A blob store over a pool of the two bots: documents posted through both
+/// read back, by the bot that posted each (read after write) and, through a
+/// fresh store with no cache, by whichever bot reads the message.
+#[tokio::test]
+#[ignore = "needs two Telegram bots, admins of a test channel"]
+async fn a_pooled_store_reads_with_each_bots_own_locations() {
+    use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
+    use pigeonhole_storage_telegram::{PooledChannel, TelegramBlobStore};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
+    let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_storage_telegram::limits());
+    let mut members = Vec::new();
+    for (n, var) in [(1, "TG_BOT_TOKEN"), (2, "TG_BOT_TOKEN_2")] {
+        let cfg = MtprotoConfig {
+            api_id: env("TG_API_ID").parse().unwrap(),
+            api_hash: env("TG_API_HASH"),
+            bot_token: env(var),
+            session: root.join(format!(".cache/spike-tg-{n}.session")),
+        };
+        let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+        let limiter = reg.chat(&tg.bot_id().to_string(), &chat_id.to_string());
+        members.push(tg.channel(chat_id, Lane::Blobs, limiter).await.unwrap());
+    }
+    let pooled = Arc::new(PooledChannel::of(members));
+    let info = InstanceInfo {
+        id: "pooled".into(),
+        kind: pigeonhole_storage_telegram::KIND,
+        fingerprint: "tg:pooled".into(),
+        location: format!("tg:chat:{chat_id}"),
+        role: InstanceRole::ReadWrite,
+    };
+    let store = TelegramBlobStore::new(pooled.clone(), pooled.limiter().clone(), info.clone()).with_inline(false);
+    let blobs: Vec<Bytes> = (0..4u8).map(|i| Bytes::from(vec![i; 700_000 + i as usize])).collect();
+    let mut ids = Vec::new();
+    for data in &blobs {
+        ids.push(store.put(data.clone(), &BlobId::random().name()).await.unwrap());
+    }
+    for (id, data) in ids.iter().zip(&blobs) {
+        assert!(collect_stream(store.get(id, None).await.unwrap()).await.unwrap() == *data, "read after write");
+    }
+    let fresh = TelegramBlobStore::new(pooled.clone(), pooled.limiter().clone(), info).with_inline(false);
+    for (id, data) in ids.iter().zip(&blobs) {
+        assert!(collect_stream(fresh.get(id, None).await.unwrap()).await.unwrap() == *data, "read through a fresh store");
+    }
+    println!("4 documents through a pool of 2: read back after write and through a fresh store");
+    store.delete(&ids.iter().map(|i| i.message_id).collect::<Vec<_>>()).await.unwrap();
+}

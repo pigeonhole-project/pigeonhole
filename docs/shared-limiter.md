@@ -337,6 +337,15 @@ until the round trip (~0.3–0.5 s per send) is what is left.
    member, moves, retry waits. Live, two bots, default limits, sends one
    after another: Telegram 30 in 40 s (44.8/min, one bot's budget 18/min),
    Discord 40 in 16 s (147/min, one bot's 60/min), no rate limit hit.
+   Telegram reads spread too (decided with the user): a location carries
+   its bot (`FileLocation::bot`), a download goes to that bot, and the
+   store's location cache keeps every bot's location of a document
+   (replicas). `ChannelApi::read_via` picks the holder whose budget is ready
+   soonest, or has a freer bot read the message and add its own; an expired
+   location drops that bot's replica only. A send's answer gives the
+   sender's location, so a read after write needs no `getMessages` on any
+   bot. Live: documents posted through both bots read back after write and
+   through a fresh store, no `FILE_REFERENCE_EXPIRED`.
 5. Bench: log entries per second with 1, 2, 4 bots against
    [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md).
 6. Only as far as the bench shows a need: the Discord `Pacer` as a kind of

@@ -68,13 +68,43 @@ impl Pool {
         spend: Spend,
         deadline: Duration,
         rate_limited: impl Fn(&E) -> Option<Duration>,
+        op: impl FnMut(usize) -> Fut,
+    ) -> Result<T, E>
+    where
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let (member, _) = self.pick(spend, None).expect("a pool has members");
+        self.drive(member, Some(spend), deadline, rate_limited, op).await
+    }
+
+    /// [`Self::run`] on `member` only: what only that bot can do (download
+    /// with its own file location). A rate limit is waited out.
+    pub async fn run_on<T, E, Fut>(
+        &self,
+        member: usize,
+        deadline: Duration,
+        rate_limited: impl Fn(&E) -> Option<Duration>,
+        op: impl FnMut(usize) -> Fut,
+    ) -> Result<T, E>
+    where
+        Fut: Future<Output = Result<T, E>>,
+    {
+        self.drive(member, None, deadline, rate_limited, op).await
+    }
+
+    /// Run from `member`, moving (with `spend` to compare by) or not.
+    async fn drive<T, E, Fut>(
+        &self,
+        mut member: usize,
+        moves: Option<Spend>,
+        deadline: Duration,
+        rate_limited: impl Fn(&E) -> Option<Duration>,
         mut op: impl FnMut(usize) -> Fut,
     ) -> Result<T, E>
     where
         Fut: Future<Output = Result<T, E>>,
     {
         let give_up = Instant::now() + deadline;
-        let (mut member, _) = self.pick(spend, None).expect("a pool has members");
         loop {
             self.picked(member);
             let err = match op(member).await {
@@ -82,7 +112,7 @@ impl Pool {
                 Err(e) => e,
             };
             let Some(after) = rate_limited(&err) else { return Err(err) };
-            if let Some((other, ready)) = self.pick(spend, Some(member)) {
+            if let Some((other, ready)) = moves.and_then(|spend| self.pick(spend, Some(member))) {
                 if ready < after {
                     metrics::counter!("pigeonhole_pool_moves_total", "chat" => self.chat.clone()).increment(1);
                     tracing::debug!(chat = %self.chat, from = member, to = other, ?after, "rate limited: moving to another bot");

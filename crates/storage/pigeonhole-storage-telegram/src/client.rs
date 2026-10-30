@@ -509,7 +509,7 @@ fn channel_message(m: enums::Message) -> (i64, ChannelMessage) {
                 enums::DocumentAttribute::Filename(f) => Some(f.file_name.clone()),
                 _ => None,
             });
-            let file = FileLocation { id: d.id, access_hash: d.access_hash, file_reference: d.file_reference, dc_id: d.dc_id };
+            let file = FileLocation { id: d.id, access_hash: d.access_hash, file_reference: d.file_reference, dc_id: d.dc_id, bot: 0 };
             let msg = ChannelMessage::Document { name: name.unwrap_or_default(), size: d.size.max(0) as u64, file };
             (m.id as i64, msg)
         }
