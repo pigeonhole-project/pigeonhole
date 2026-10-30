@@ -606,7 +606,7 @@ mod tests {
             location: "memory:local".into(),
             role: InstanceRole::ReadWrite,
         };
-        db.sync_instances(&[a.clone()]).await.unwrap();
+        db.sync_instances(std::slice::from_ref(&a)).await.unwrap();
         db.sync_instances(&[]).await.unwrap();
         assert_eq!(db.instance_state("a").await.unwrap().as_deref(), Some("retired"));
     }

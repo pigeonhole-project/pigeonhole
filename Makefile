@@ -1,4 +1,4 @@
-.PHONY: sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report
+.PHONY: sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint
 
 run:
 	cargo run --release
@@ -73,3 +73,8 @@ sim:
 # not built there).
 sim-all:
 	RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test --workspace --exclude pigeonhole
+
+# Clippy as CI runs it: every warning fails (lints: [workspace.lints] in Cargo.toml).
+lint:
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --all-targets --no-default-features -- -D warnings

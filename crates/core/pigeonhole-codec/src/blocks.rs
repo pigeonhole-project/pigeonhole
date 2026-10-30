@@ -39,13 +39,13 @@ impl BlockRecord {
 
 /// A finished on-wire chunk ready for backend upload.
 ///
-/// `_permits` holds ingest-budget slots for this chunk's logical bytes; they are
+/// `permits` holds ingest-budget slots for this chunk's logical bytes; they are
 /// released when the chunk is dropped (after a successful put, or on cancel/error).
 pub struct CompletedChunk {
     pub payload: Bytes,
     pub logical_size: i64,
     pub blocks: Vec<BlockRecord>,
-    _permits: Vec<BudgetPermit>,
+    permits: Vec<BudgetPermit>,
 }
 
 impl std::fmt::Debug for CompletedChunk {
@@ -56,7 +56,7 @@ impl std::fmt::Debug for CompletedChunk {
             .field("blocks", &self.blocks.len())
             .field(
                 "permits",
-                &self._permits.iter().map(|p| p.bytes()).sum::<usize>(),
+                &self.permits.iter().map(|p| p.bytes()).sum::<usize>(),
             )
             .finish()
     }
@@ -342,7 +342,7 @@ impl BlockWriter {
             payload,
             logical_size,
             blocks,
-            _permits: permits,
+            permits,
         })
     }
 
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(consumed, n);
         chunks.extend(w.finish().await.unwrap());
         assert!(!chunks.is_empty());
-        let expected_calls = (n + frame - 1) / frame;
+        let expected_calls = n.div_ceil(frame);
         assert_eq!(calls.load(Ordering::Relaxed) as usize, expected_calls);
         let mut out = Vec::new();
         for c in &chunks {
@@ -552,7 +552,7 @@ mod tests {
         ];
         let mid = decode_blocks_range(&stored, &frames, 90, 110).unwrap();
         let mut expect = vec![1u8; 10];
-        expect.extend(std::iter::repeat(2u8).take(10));
+        expect.extend(std::iter::repeat_n(2u8, 10));
         assert_eq!(mid.as_ref(), expect.as_slice());
     }
 

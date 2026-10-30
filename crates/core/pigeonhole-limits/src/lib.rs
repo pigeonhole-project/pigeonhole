@@ -382,12 +382,12 @@ impl ChatLimiter {
 
     /// `sendDocument` / `sendMessage` / pin / unpin.
     pub async fn acquire_send(&self) {
-        self.take(&self.send, "send").await
+        self.take(&self.send, "send").await;
     }
 
     /// `getChat`, `setChatDescription`.
     pub async fn acquire_info(&self) {
-        self.take(&self.info, "info").await
+        self.take(&self.info, "info").await;
     }
 
     pub fn penalize_info(&self, retry_after: Duration) {
@@ -402,7 +402,7 @@ impl ChatLimiter {
 
     /// `getFile` only (not the CDN byte stream).
     pub async fn acquire_get_file(&self) {
-        self.take(&self.get_file, "get_file").await
+        self.take(&self.get_file, "get_file").await;
     }
 
     /// `getFile` is not tied to a chat: its 429 holds the whole bot.
@@ -414,7 +414,7 @@ impl ChatLimiter {
 
     /// `deleteMessage`.
     pub async fn acquire_delete(&self) {
-        self.take(&self.delete, "delete").await
+        self.take(&self.delete, "delete").await;
     }
 
     pub fn penalize_delete(&self, retry_after: Duration) {

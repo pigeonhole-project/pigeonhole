@@ -422,91 +422,51 @@ impl Index {
     /// `retain` the source extents' chunks **before** calling this, so the new object
     /// never points at chunks it does not hold a ref on. Returns the destination row as
     /// written and the previous destination chunk ids to `release`.
-    pub async fn copy_object(
-        &self,
-        src: &SourceSnapshot,
-        dst_bucket: &str,
-        dst_key: &str,
-        content_type: Option<&str>,
-        user_meta: &[(String, String)],
-        copy_source_meta: bool,
-        expect: Option<Expect>,
-    ) -> Result<(ObjectMeta, Vec<ChunkId>)> {
-        let ct = content_type.or(src.content_type.as_deref());
-        let meta = if copy_source_meta {
-            &src.user_meta[..]
-        } else {
-            user_meta
-        };
+    pub async fn copy_object(&self, src: &SourceSnapshot, dst: CopyDest<'_>) -> Result<(ObjectMeta, Vec<ChunkId>)> {
         let mtime = Utc::now().to_rfc3339();
         let old = self
             .put_object_at(
-                dst_bucket,
-                dst_key,
+                dst.bucket,
+                dst.key,
                 &src.etag,
                 src.size,
-                ct,
+                dst.content_type(src),
                 src.body.clone(),
-                meta,
+                dst.user_meta(src),
                 &src.checksums_json,
                 &mtime,
-                expect,
+                dst.expect.clone(),
             )
             .await?;
-
         // The row as written, not re-read: a concurrent delete or overwrite of
         // `dst` may already be applied after this put.
-        let dst = ObjectMeta {
-            bucket: dst_bucket.into(),
-            key: dst_key.into(),
-            etag: src.etag.clone(),
-            size: src.size,
-            content_type: ct.map(Into::into),
-            mtime,
-        };
-        Ok((dst, old))
+        Ok((dst.written(src, mtime), old))
     }
 
     /// [`Self::copy_object`] of `src` with `body` instead of its own (an
     /// inline source stored as fresh chunks), to commit with those chunks
     /// in one entry. The destination's meta as it will be written.
-    #[allow(clippy::too_many_arguments)]
     pub fn prepare_copy_object(
         &self,
         src: &SourceSnapshot,
         body: Body,
-        dst_bucket: &str,
-        dst_key: &str,
-        content_type: Option<&str>,
-        user_meta: &[(String, String)],
-        copy_source_meta: bool,
-        expect: Option<Expect>,
+        dst: CopyDest<'_>,
     ) -> (Prepared<S3State>, ObjectMeta) {
-        let ct = content_type.or(src.content_type.as_deref());
-        let meta = if copy_source_meta { &src.user_meta[..] } else { user_meta };
         let mtime = Utc::now().to_rfc3339();
         let put = Prepared::new(&S3Command::PutObject {
-            bucket: dst_bucket.into(),
-            key: dst_key.into(),
+            bucket: dst.bucket.into(),
+            key: dst.key.into(),
             etag: src.etag.clone(),
             size: src.size,
-            content_type: ct.map(Into::into),
+            content_type: dst.content_type(src).map(Into::into),
             body,
-            user_meta: meta.to_vec(),
+            user_meta: dst.user_meta(src).to_vec(),
             tags: Vec::new(),
             checksums_json: src.checksums_json.clone(),
             mtime: mtime.clone(),
-            expect,
+            expect: dst.expect.clone(),
         });
-        let dst = ObjectMeta {
-            bucket: dst_bucket.into(),
-            key: dst_key.into(),
-            etag: src.etag.clone(),
-            size: src.size,
-            content_type: ct.map(Into::into),
-            mtime,
-        };
-        (put, dst)
+        (put, dst.written(src, mtime))
     }
 
     /// Up to `limit` objects of `bucket` with keys in `(lower, upper)` bounds,
@@ -1034,9 +994,7 @@ fn group_delimiter_entries(
 }
 
 pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+    DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |d| d.with_timezone(&Utc))
 }
 
 /// What [`Index::stats`] counts.
@@ -1051,6 +1009,44 @@ pub struct IndexStats {
     /// Objects stored inline, and their bytes (docs/inline-objects.md).
     pub inline_objects: u64,
     pub inline_bytes: u64,
+}
+
+/// Where a copy goes, and which content type and user metadata it gets.
+pub struct CopyDest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    /// `None`: the source's.
+    pub content_type: Option<&'a str>,
+    pub user_meta: &'a [(String, String)],
+    /// Keep the source's user metadata (directive `COPY`), not `user_meta`.
+    pub copy_source_meta: bool,
+    pub expect: Option<Expect>,
+}
+
+impl CopyDest<'_> {
+    fn content_type<'s>(&'s self, src: &'s SourceSnapshot) -> Option<&'s str> {
+        self.content_type.or(src.content_type.as_deref())
+    }
+
+    fn user_meta<'s>(&'s self, src: &'s SourceSnapshot) -> &'s [(String, String)] {
+        if self.copy_source_meta {
+            &src.user_meta
+        } else {
+            self.user_meta
+        }
+    }
+
+    /// The destination's row as a copy of `src` written at `mtime`.
+    fn written(&self, src: &SourceSnapshot, mtime: String) -> ObjectMeta {
+        ObjectMeta {
+            bucket: self.bucket.into(),
+            key: self.key.into(),
+            etag: src.etag.clone(),
+            size: src.size,
+            content_type: self.content_type(src).map(Into::into),
+            mtime,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1122,7 +1118,7 @@ mod list_tests {
                 ix.put_object(&bucket, k, "etag", 0, None, Body::Chunks(vec![]), &[], "{}").await.unwrap();
             }
             for _ in 0..8 {
-                let prefix = if rng.next() % 3 == 0 { String::new() } else { rng.word(&alphabet, 2) };
+                let prefix = if rng.next().is_multiple_of(3) { String::new() } else { rng.word(&alphabet, 2) };
                 let delim = *rng.pick(&delimiters);
                 let max_keys = 1 + (rng.next() % 5) as i64;
                 let want = model(&keys, &prefix, delim);

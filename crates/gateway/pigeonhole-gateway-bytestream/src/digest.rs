@@ -24,7 +24,7 @@ pub fn hash_eq(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())
-            .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+            .all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
 pub fn digest_hash_hex(d: &crate::reapi::Digest) -> Result<String> {

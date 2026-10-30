@@ -229,7 +229,7 @@ impl ChannelApi for FakeChannel {
     }
 
     async fn get_file(&self, file: &FileLocation, offset: u64, limit: u64) -> Result<Bytes> {
-        if offset % 4096 != 0 || limit % 4096 != 0 || limit == 0 || limit > WINDOW {
+        if !offset.is_multiple_of(4096) || !limit.is_multiple_of(4096) || limit == 0 || limit > WINDOW {
             bail!("LIMIT_INVALID: offset {offset} limit {limit}");
         }
         if offset >> 20 != (offset + limit - 1) >> 20 {

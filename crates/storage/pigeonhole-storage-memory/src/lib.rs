@@ -279,7 +279,7 @@ impl BlobBackend for MemoryBlobStore {
             .keys()
             .copied()
             .map(|m| m as u64)
-            .filter(|&k| k <= upto && after.map(|a| k > a).unwrap_or(true))
+            .filter(|&k| k <= upto && after.is_none_or(|a| k > a))
             .collect();
         keys.sort_unstable();
         keys.truncate(limit);

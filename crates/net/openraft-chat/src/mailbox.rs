@@ -116,8 +116,8 @@ impl Mailbox for FakeMailbox {
         s.posts += 1;
         *s.attempts.entry(self.owner).or_default() += 1;
         let n = s.posts;
-        let lost = s.lose_every.is_some_and(|k| n % k == 0);
-        let twice = s.duplicate_every.is_some_and(|k| n % k == 0);
+        let lost = s.lose_every.is_some_and(|k| n.is_multiple_of(k));
+        let twice = s.duplicate_every.is_some_and(|k| n.is_multiple_of(k));
         let outbox = s.outboxes.entry(self.owner).or_default();
         if !lost {
             outbox.push(frame.clone());

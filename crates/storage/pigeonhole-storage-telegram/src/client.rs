@@ -639,7 +639,7 @@ impl ChannelApi for MtprotoChannel {
     }
 
     async fn get_file(&self, file: &FileLocation, offset: u64, limit: u64) -> Result<Bytes> {
-        if limit > WINDOW || offset % 4096 != 0 || limit % 4096 != 0 {
+        if limit > WINDOW || !offset.is_multiple_of(4096) || !limit.is_multiple_of(4096) {
             bail!("getFile window {offset}+{limit} is not 4 KiB-aligned within {WINDOW}");
         }
         let request = functions::upload::GetFile {

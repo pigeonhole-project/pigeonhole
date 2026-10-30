@@ -41,8 +41,7 @@ async fn main() -> anyhow::Result<()> {
                     "--expect-chat" => {
                         expect_chat = Some(
                             rest.next()
-                                .context("--expect-chat requires chat_id")?
-                                .to_string(),
+                                .context("--expect-chat requires chat_id")?.clone(),
                         );
                     }
                     other => bail!(

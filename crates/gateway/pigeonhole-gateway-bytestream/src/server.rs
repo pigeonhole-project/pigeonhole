@@ -55,8 +55,6 @@ pub struct ReapiState {
 }
 
 struct PendingUpload {
-    hash_hex: String,
-    size: i64,
     committed_size: i64,
     complete: bool,
     last_activity: Instant,
@@ -233,8 +231,6 @@ impl ReapiState {
         let (cas, hash, size) = (self.cas.clone(), parsed.hash_hex.clone(), parsed.size);
         let ingest = tokio::spawn(async move { cas.put_stream(&hash, size, ReceiverStream::new(rx)).await });
         let pending = PendingUpload {
-            hash_hex: parsed.hash_hex.clone(),
-            size: parsed.size,
             committed_size: 0,
             complete: false,
             last_activity: Instant::now(),

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_CHUNK_SIZE: usize = 20 * 1024 * 1024 - 1;
 /// Default max **stored** (on-wire) chunk size.
 pub const DEFAULT_CHUNK_SIZE: usize = 19 * 1024 * 1024;
+const _: () = assert!(DEFAULT_CHUNK_SIZE <= MAX_CHUNK_SIZE);
 /// Default max **logical** chunk size for ChunkStore part packing (stage E).
 pub const DEFAULT_LOGICAL_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 /// Probe window before committing to compression for a chunk.
@@ -98,7 +99,7 @@ pub fn validate_chunk_size(n: usize) -> Result<()> {
 
 /// Target compressed/raw fill size: stay under `chunk_size` with a safety margin.
 pub fn fill_target(chunk_size: usize) -> usize {
-    let capped = chunk_size.min(MAX_CHUNK_SIZE).max(1024);
+    let capped = chunk_size.clamp(1024, MAX_CHUNK_SIZE);
     let margin = COMPRESS_SIZE_MARGIN.min(capped / 8).max(256);
     capped.saturating_sub(margin).max(1024).min(capped)
 }
@@ -115,7 +116,6 @@ mod tests {
 
     #[test]
     fn default_under_limit() {
-        assert!(DEFAULT_CHUNK_SIZE <= MAX_CHUNK_SIZE);
         validate_chunk_size(DEFAULT_CHUNK_SIZE).unwrap();
     }
 

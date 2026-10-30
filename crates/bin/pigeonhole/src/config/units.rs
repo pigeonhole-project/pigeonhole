@@ -88,7 +88,7 @@ struct SizeVisitor {
 impl<'de> Visitor<'de> for SizeVisitor {
     type Value = usize;
 
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a size: bytes, or a string like \"1 MiB\"")?;
         if self.off {
             write!(f, ", or \"{OFF}\"")?;
@@ -120,7 +120,7 @@ struct CountVisitor;
 impl<'de> Visitor<'de> for CountVisitor {
     type Value = Option<u64>;
 
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "a positive number, or \"{OFF}\"")
     }
 

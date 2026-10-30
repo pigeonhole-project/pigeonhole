@@ -38,7 +38,7 @@ pub fn snowflake_bulk_deletable(id: u64, unix_now_ms: u64) -> bool {
 }
 
 fn unix_now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Which local budget a request spends.

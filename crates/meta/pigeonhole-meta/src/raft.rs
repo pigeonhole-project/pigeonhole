@@ -8,6 +8,9 @@
 //! is put into the node's snapshot store when it is built or received, and the
 //! log is rebased on the newest one when openraft purges it.
 
+// openraft's StorageError is large, and its traits return it as is.
+#![allow(clippy::result_large_err)]
+
 use crate::log::{Base, Entry, Head, LogError, LogId as HistoryId, LogStore, Position};
 use crate::snapshot::{SnapshotRef, SnapshotStore, StoredSnapshot};
 use crate::{apply_command, take_snapshot, Command, States, Stop, TabletSnapshot};
@@ -266,15 +269,14 @@ impl LogAdapter {
                     let t0 = std::time::Instant::now();
                     let r = self.log.rebase(gen, base.clone(), keep.0).await.map_err(|e| self.shared.log_error(e));
                     crate::telemetry::record_log_write("rebase", r.is_ok(), t0.elapsed());
-                    let r = r.map(|dropped| {
+                    let r = r.inspect(|_| {
                         tracing::info!(at, snapshot = %new_ref.0, "log rebased on a snapshot");
                         self.durable.fetch_max(at, Ordering::SeqCst);
                         self.tail.lock().unwrap().retain(|p, _| *p > at);
                         self.shared.based.store(at, Ordering::SeqCst);
                         *self.shared.base.lock().unwrap() = Some(base);
-                        dropped
                     });
-                    let dropped = r.as_ref().map(|d| d.clone()).unwrap_or_default();
+                    let dropped = r.clone().unwrap_or_default();
                     let _ = done.send(r.map(|_| ()));
                     // Nothing starts from them any more (best effort).
                     for old in dropped.into_iter().filter(|o| o.snapshot != new_ref) {

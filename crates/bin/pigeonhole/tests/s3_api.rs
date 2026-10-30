@@ -481,7 +481,6 @@ async fn upload_part_copy_range() {
                 part_number: Some(1),
                 ..Default::default()
             }]),
-            ..Default::default()
         }),
         ..Default::default()
     }))
@@ -574,7 +573,6 @@ async fn upload_part_copy_whole_object_reuses_chunks() {
                 part_number: Some(1),
                 ..Default::default()
             }]),
-            ..Default::default()
         }),
         ..Default::default()
     }))

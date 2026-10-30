@@ -88,10 +88,11 @@ impl PartPacker {
             );
         }
 
-        let mut sealed = None;
-        if !self.open_stored.is_empty() && self.open_total + stored_len > self.max_blob_size {
-            sealed = Some(self.flush_open().await?);
-        }
+        let sealed = if !self.open_stored.is_empty() && self.open_total + stored_len > self.max_blob_size {
+            Some(self.flush_open().await?)
+        } else {
+            None
+        };
 
         if self.open_stored.is_empty() {
             self.open_first = self.next_block;

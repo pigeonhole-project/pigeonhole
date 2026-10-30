@@ -274,7 +274,7 @@ impl S3State {
     pub(crate) fn check(&self, bucket: &str, key: &str, expect: Option<&Expect>) -> std::result::Result<(), S3Reject> {
         let current = self.objects.get(&(bucket.to_string(), key.to_string()));
         match (expect, current) {
-            (None, _) | (Some(Expect::Absent), None) | (Some(Expect::NotETag(_)), None) => Ok(()),
+            (None, _) | (Some(Expect::Absent | Expect::NotETag(_)), None) => Ok(()),
             (Some(Expect::ETag(e)), Some(o)) if o.etag == *e => Ok(()),
             (Some(Expect::NotETag(e)), Some(o)) if o.etag != *e => Ok(()),
             (Some(Expect::Present), Some(_)) => Ok(()),

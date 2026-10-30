@@ -24,6 +24,19 @@ jobs:
         run: ./scripts/check-deps.sh --strict
       - run: cargo test --workspace
 
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The lints are in Cargo.toml ([workspace.lints]); both feature ends,
+      # so code behind a feature or behind its absence is linted too.
+      - run: make lint
+
   simulation:
     name: simulation (madsim)
     # madsim makes entropy deterministic on macOS (symbol overrides); on Linux
