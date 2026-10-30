@@ -346,3 +346,71 @@ async fn bench_window() {
         std::fs::write(&marks, lines.join("\n") + "\n").unwrap();
     }
 }
+
+/// docs/raft-over-chat.md § What has to be true (1, 4): the bot of
+/// `TG_BOT_TOKEN_2` sees a post the bot of `TG_BOT_TOKEN` made in the
+/// channel TG_BLOBS_CHAT_ID, by id and as a pushed update. Both bots must be
+/// admins there. Deletes its post.
+/// `cargo test -p pigeonhole-storage-telegram --test live second_bot_sees -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs two Telegram bots in a test channel"]
+async fn second_bot_sees_first_bots_posts() {
+    use grammers_session::updates::UpdatesLike;
+    use grammers_tl_types::enums;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let login = |token: &str, session: &str| MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env(token),
+        session: root.join(format!(".cache/{session}")),
+    };
+    let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
+    let limiter = || Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let (second, mut updates) = TelegramMtproto::connect_with_updates(&login("TG_BOT_TOKEN_2", "tgm-live-2.session")).await.unwrap();
+    let first = TelegramMtproto::connect(&login("TG_BOT_TOKEN", "tgm-live.session")).await.unwrap();
+    let theirs = second.channel(chat_id, Lane::Meta, limiter()).await.unwrap();
+    let mine = first.channel(chat_id, Lane::Meta, limiter()).await.unwrap();
+
+    let text = format!("raft-chat probe {}", uuid_like());
+    let t0 = Instant::now();
+    let id = mine.send_text(&text, uuid_like()).await.unwrap().message_id;
+    println!("bot {} posted {id}", first.bot_id());
+
+    // By id.
+    let read = theirs.get_messages(&[id]).await.unwrap();
+    let by_id = matches!(&read[..], [pigeonhole_storage_telegram::ChannelMessage::Text { text: t }] if *t == text);
+    println!("by id: {} ({:?})", if by_id { "seen" } else { "NOT seen" }, t0.elapsed());
+
+    // Pushed.
+    let channel_id = theirs.channel_id();
+    let pushed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while let Some(u) = updates.recv().await {
+            let UpdatesLike::Updates(u) = u else { continue };
+            let list = match u {
+                enums::Updates::Updates(u) => u.updates,
+                enums::Updates::Combined(u) => u.updates,
+                enums::Updates::UpdateShort(u) => vec![u.update],
+                _ => continue,
+            };
+            for up in list {
+                if let enums::Update::NewChannelMessage(n) = up {
+                    if let enums::Message::Message(m) = n.message {
+                        let in_channel = matches!(m.peer_id, enums::Peer::Channel(ref c) if c.channel_id == channel_id);
+                        if in_channel && i64::from(m.id) == id {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    println!("pushed: {} ({:?})", if pushed { "seen" } else { "NOT seen within 30 s" }, t0.elapsed());
+
+    mine.delete_messages(&[id]).await.unwrap();
+    assert!(by_id, "the second bot does not read the first one's post by id");
+}

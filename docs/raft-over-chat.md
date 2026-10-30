@@ -204,7 +204,7 @@ rtt ≲ 2·tick + 2·post_latency                (push updates)
 ```
 
 On Telegram with tick 4 s, poll 3 s and post ~0.5 s: up to ~15 s polling,
-~9 s with push. On Discord with tick 1 s, poll 1 s: ~3–5 s polling, ~2–3 s
+~9 s with push (a push arrived 0.19 s after the post in the check below). On Discord with tick 1 s, poll 1 s: ~3–5 s polling, ~2–3 s
 with push.
 
 openraft's defaults (heartbeat 50 ms, election 150–300 ms) assume a LAN.
@@ -294,10 +294,10 @@ transport.
 
 ## What has to be true (checks before code)
 
-1. **Reading another bot's posts in a channel.** By id (`channels.getMessages`)
-   a bot reads every post of a channel it belongs to, whoever wrote it. That
-   is what pigeonhole already does to read its log. Check it live with a second
-   bot.
+1. ~~**Reading another bot's posts in a channel.**~~ Confirmed 2026-10-30
+   (`tests/live.rs` `second_bot_sees_first_bots_posts`): a second bot reads
+   the first one's post by id (`channels.getMessages`) 0.19 s after it was
+   sent.
 2. **Discord: other bots' content.** Without the Message Content intent,
    Discord returns empty `content` for messages that are not the bot's own,
    on REST too. The intent is a switch in the developer portal (no review
@@ -305,12 +305,14 @@ transport.
    and bytes are not gated.
 3. **Polling cost** stays within the read budgets above for 3 nodes at the
    suggested poll intervals. Measure it with `pigeonhole_limiter_wait_seconds`.
-4. **MTProto updates** (push) for posts of another bot: a bot gets
-   `updateNewChannelMessage` for channels it is in, and posts in a channel
-   are the channel's, so the "bots do not see bots" rule of groups should not
-   apply. Check it with two bots. If it holds, push is the main path and
-   polling only fills gaps. Also check whether several processes logged in
-   as one bot all get the updates (one bot per node avoids the question).
+4. ~~**MTProto updates** (push) for posts of another bot.~~ Confirmed the
+   same day, same test: the second bot got `updateNewChannelMessage` for the
+   first one's post 0.19 s after it was sent, once it had asked for updates
+   (`updates.getState`; `TelegramMtproto::connect_with_updates`). Posts in a
+   channel are the channel's, so the "bots do not see bots" rule of groups
+   does not apply. Push is the main path; polling fills gaps. Open: whether
+   several processes logged in as one bot all get the updates (one bot per
+   node avoids the question).
 
 Setting up a second bot takes a person: create it in BotFather (bots cannot
 create bots), put its token in `.env` as `TG_BOT_TOKEN_2`, and add it as an
