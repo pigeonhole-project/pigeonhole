@@ -8,7 +8,7 @@
 //! posted.
 
 use bytes::Bytes;
-use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, Rate};
 use pigeonhole_storage_telegram::{ChannelApi, ChannelMessage, Lane, MtprotoChannel, MtprotoConfig, TelegramMtproto};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -21,20 +21,7 @@ fn env(k: &str) -> String {
 
 /// Our own limits far above the server's: what paces the sends is Telegram.
 fn loose() -> ChatLimiterConfig {
-    ChatLimiterConfig {
-        bot_rate_per_sec: 1000.0,
-        bot_burst: 1000.0,
-        send_rate_per_sec: 1000.0,
-        send_burst: 1000.0,
-        get_file_rate_per_sec: 1000.0,
-        get_file_burst: 1000.0,
-        delete_rate_per_sec: 1000.0,
-        delete_burst: 1000.0,
-        info_rate_per_sec: 1000.0,
-        info_burst: 1000.0,
-        upload_concurrency: 8,
-        download_concurrency: 8,
-    }
+    ChatLimiterConfig { upload_concurrency: 8, download_concurrency: 8, ..pigeonhole_storage_telegram::limits().with_all(Rate::new(1000.0, 1000.0)) }
 }
 
 fn random_id() -> i64 {

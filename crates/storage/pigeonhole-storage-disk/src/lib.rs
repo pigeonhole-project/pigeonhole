@@ -115,7 +115,7 @@ impl DiskBlobStore {
 
     /// At most `rate_per_sec` operations a second (`burst` at once).
     pub fn with_rate(mut self, rate_per_sec: f64, burst: f64) -> Self {
-        self.limiter = Arc::new(StoreLimiter::new(&self.instance.id).with_rate(rate_per_sec, burst));
+        self.limiter = Arc::new(StoreLimiter::new(&self.instance.id).with_rate(pigeonhole_limits::Rate::new(rate_per_sec, burst)));
         self
     }
 

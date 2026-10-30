@@ -7,7 +7,7 @@
 use bytes::Bytes;
 use futures::TryStreamExt;
 use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
-use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
+use pigeonhole_limits::{ChatLimiter};
 use pigeonhole_meta::{
     Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogId, LogStore, SnapshotRef, SnapshotStore,
     StoredSnapshot,
@@ -27,7 +27,7 @@ fn channel(var: &str) -> (Arc<DiscordChannel>, Arc<ChatLimiter>, DiscordClient, 
     let _ = tracing_subscriber::fmt().with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())).try_init();
     let id: u64 = env(var).parse().unwrap();
     let client = DiscordClient::new(env("DISCORD_BOT_TOKEN")).unwrap();
-    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::discord()));
+    let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_discord::limits()));
     (Arc::new(client.channel(id, limiter.clone())), limiter, client, id)
 }
 

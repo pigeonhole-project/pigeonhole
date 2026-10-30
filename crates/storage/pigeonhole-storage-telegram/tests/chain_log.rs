@@ -3,7 +3,7 @@
 
 use futures::TryStreamExt;
 use pigeonhole_storage_api::{InstanceInfo, InstanceRole};
-use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
+use pigeonhole_limits::{ChatLimiter, Rate};
 use pigeonhole_meta::log::conformance;
 use pigeonhole_meta::snapshot::conformance as snapshot_conformance;
 use pigeonhole_meta::{
@@ -17,13 +17,7 @@ use std::time::Duration;
 type Store = TelegramBlobStore<FakeChannel>;
 
 fn channel_store(channel: &Arc<FakeChannel>) -> Arc<Store> {
-    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig {
-        bot_rate_per_sec: 1000.0,
-        send_rate_per_sec: 1000.0,
-        info_rate_per_sec: 1000.0,
-        delete_rate_per_sec: 1000.0,
-        ..ChatLimiterConfig::default()
-    }));
+    let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits().with_all(Rate::new(1000.0, 100.0))));
     let info = InstanceInfo {
         id: "log".into(),
         kind: pigeonhole_storage_telegram::KIND,

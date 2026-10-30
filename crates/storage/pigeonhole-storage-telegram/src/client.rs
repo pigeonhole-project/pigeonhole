@@ -5,7 +5,7 @@
 //! goes through [`TelegramMtproto::invoke`], so through the limiter
 //! ([`pigeonhole_limits::run`]): it takes the request's tokens, a
 //! `FLOOD_WAIT_X` cools the buckets the request names ([`Budgeted`]) and is
-//! waited out, like every other transient failure, within [`CALL_BUDGET`].
+//! waited out, like every other transient failure, within [`CALL_DEADLINE`].
 //! Every call we make is idempotent (a send carries its `random_id`), so all
 //! of them may be retried. Only the login runs outside it.
 
@@ -18,7 +18,8 @@ use futures::{StreamExt, TryStreamExt};
 use grammers_mtsender::{ConnectionParams, InvocationError, NoRetries, SenderPool, SenderPoolHandle};
 use grammers_tl_types::{self as tl, enums, functions, types};
 use pigeonhole_storage_api::{RateLimited, Unavailable};
-use pigeonhole_limits::{Call, ChatLimiter, Failed, LimitBudget, Penalty, Retry, Verdict};
+use crate::limits::{DELETE, READ, SEND};
+use pigeonhole_limits::{Call, ChatLimiter, Failed, Level, Retry, Spend, Verdict};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,9 +28,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 /// How long one call keeps retrying flood waits and network errors.
-pub const CALL_BUDGET: Duration = Duration::from_secs(300);
+pub const CALL_DEADLINE: Duration = Duration::from_secs(300);
 const RETRY: Retry = Retry {
-    budget: CALL_BUDGET,
+    deadline: CALL_DEADLINE,
     attempts: u32::MAX,
     backoff: Duration::from_millis(500),
     max_backoff: Duration::from_secs(16),
@@ -287,7 +288,7 @@ impl TelegramMtproto {
             id: vec![types::InputChannel { channel_id, access_hash: 0 }.into()],
         };
         let chats = self
-            .invoke(lane, None, None, &request)
+            .invoke(lane, None, Some(limiter.as_ref()), &request)
             .await
             .with_context(|| format!("chat {chat_id}: is the bot a member of this channel?"))?;
         let channel = chats
@@ -323,38 +324,38 @@ pub fn channel_id_of(chat_id: i64) -> Result<i64> {
     Ok(PREFIX - chat_id)
 }
 
-/// What a request spends and which buckets its `FLOOD_WAIT` cools. A
-/// request without it cannot be sent ([`TelegramMtproto::invoke`]).
+/// What a request spends and what its `FLOOD_WAIT` cools. A request
+/// without it cannot be sent ([`TelegramMtproto::invoke`]).
 trait Budgeted: tl::RemoteCall {
     const CALL: Call;
 }
 
 macro_rules! budgeted {
-    ($($request:ty => $what:literal, $budget:expr, $penalty:expr;)*) => {
+    ($($request:ty => $what:literal, $spend:expr, $cools:expr;)*) => {
         $(impl Budgeted for $request {
-            const CALL: Call = Call { service: "telegram", what: $what, budget: $budget, penalty: $penalty };
+            const CALL: Call = Call { service: "telegram", what: $what, spend: $spend, cools: Some($cools) };
         })*
     };
 }
 
 budgeted! {
-    functions::updates::GetState => "updates.getState", None, Penalty::None;
-    functions::channels::GetChannels => "channels.getChannels", None, Penalty::None;
-    functions::channels::GetMessages => "channels.getMessages", Some(LimitBudget::Info), Penalty::Class(LimitBudget::Info);
-    functions::messages::SendMedia => "messages.sendMedia", Some(LimitBudget::Send), Penalty::Class(LimitBudget::Send);
-    functions::messages::SendMessage => "messages.sendMessage", Some(LimitBudget::Send), Penalty::Class(LimitBudget::Send);
-    functions::channels::DeleteMessages => "channels.deleteMessages", Some(LimitBudget::Delete), Penalty::Class(LimitBudget::Delete);
+    functions::updates::GetState => "updates.getState", Spend::Bot, Level::Bot;
+    functions::channels::GetChannels => "channels.getChannels", Spend::Bot, Level::Bot;
+    functions::channels::GetMessages => "channels.getMessages", Spend::Class(READ), Level::Class;
+    functions::messages::SendMedia => "messages.sendMedia", Spend::Class(SEND), Level::Class;
+    functions::messages::SendMessage => "messages.sendMessage", Spend::Class(SEND), Level::Class;
+    functions::channels::DeleteMessages => "channels.deleteMessages", Spend::Class(DELETE), Level::Class;
     // Not tied to a chat: a flood wait holds the whole bot.
-    functions::upload::GetFile => "upload.getFile", None, Penalty::Bot;
-    functions::upload::SaveFilePart => "upload.saveFilePart", None, Penalty::Bot;
-    functions::upload::SaveBigFilePart => "upload.saveBigFilePart", None, Penalty::Bot;
+    functions::upload::GetFile => "upload.getFile", Spend::Bot, Level::Bot;
+    functions::upload::SaveFilePart => "upload.saveFilePart", Spend::Bot, Level::Bot;
+    functions::upload::SaveBigFilePart => "upload.saveBigFilePart", Spend::Bot, Level::Bot;
 }
 
 fn classify(e: &InvocationError) -> Verdict {
     match e {
         InvocationError::Rpc(rpc) if rpc.code == 420 || rpc.name.ends_with("_WAIT") => Verdict::Wait {
             after: Duration::from_secs(rpc.value.unwrap_or(1).max(1) as u64),
-            whole_bot: false,
+            level: None,
         },
         InvocationError::Rpc(rpc) if rpc.code >= 500 || rpc.code == -503 || rpc.name == "AUTH_KEY_UNREGISTERED" => {
             Verdict::Transient
@@ -714,7 +715,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn flood_waits_are_waited_out_until_the_budget_runs_out() {
         let tries = std::sync::atomic::AtomicU32::new(0);
-        let limiter = ChatLimiter::new(pigeonhole_limits::ChatLimiterConfig::default());
+        let limiter = ChatLimiter::new(crate::limits());
         let t0 = tokio::time::Instant::now();
         let call = <functions::messages::SendMessage as Budgeted>::CALL;
         let v = metered(&call, Some(&limiter), || {
@@ -726,7 +727,7 @@ mod tests {
         assert_eq!(v, 9);
         assert!(t0.elapsed() >= Duration::from_secs(10), "two flood waits of 5 s");
 
-        // A wait past CALL_BUDGET ends the call.
+        // A wait past CALL_DEADLINE ends the call.
         let err = metered(&call, None, || async { Err::<(), _>(rpc(420, "FLOOD_WAIT_400")) }).await.unwrap_err();
         assert!(err.is::<RateLimited>(), "{err:#}");
     }
@@ -757,7 +758,7 @@ mod abandoned_send_live {
             session: root.join(".cache/tgm-live.session"),
         };
         let tg = TelegramMtproto::connect(&cfg).await.unwrap();
-        let limiter = Arc::new(ChatLimiter::new(pigeonhole_limits::ChatLimiterConfig::default()));
+        let limiter = Arc::new(ChatLimiter::new(crate::limits()));
         let ch = tg.channel(env("TG_BLOBS_CHAT_ID").parse().unwrap(), Lane::Blobs, limiter).await.unwrap();
 
         let probe_name = format!("abandoned-{}.bin", random_i64().unsigned_abs());

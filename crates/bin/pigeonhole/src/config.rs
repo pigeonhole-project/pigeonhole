@@ -6,12 +6,13 @@ use pigeonhole_chunk_store::{
 };
 use crate::instances::InstanceKind;
 use pigeonhole_blob::CacheConfig;
-use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, LimiterRegistry};
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, LimiterRegistry, Rate};
 use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
 use pigeonhole_gateway_s3::{CoolPolicy, S3Options};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -330,11 +331,8 @@ impl Config {
         }
         let ingest_budget = Some(ByteBudget::new(memory_budget));
 
-        let tg = file.telegram.into_limiter_config("telegram", ChatLimiterConfig::default())?;
-        let discord = file.discord.into_limiter_config("discord", ChatLimiterConfig::discord())?;
-        if tg.upload_concurrency == 0 || tg.download_concurrency == 0 {
-            bail!("telegram upload/download concurrency must be >= 1");
-        }
+        let tg = file.telegram.into_limiter_config("telegram", pigeonhole_storage_telegram::limits())?;
+        let discord = file.discord.into_limiter_config("discord", discord_limits())?;
 
         let mut topology = Topology::new(file.store, file.replicas, file.shards)?;
         let meta = file.meta.into_settings(&mut topology)?;
@@ -375,21 +373,9 @@ impl Config {
         })
     }
 
-    fn test_limits() -> ChatLimiterConfig {
-        ChatLimiterConfig {
-            bot_rate_per_sec: 1000.0,
-            bot_burst: 100.0,
-            send_rate_per_sec: 1000.0,
-            send_burst: 100.0,
-            get_file_rate_per_sec: 1000.0,
-            get_file_burst: 100.0,
-            delete_rate_per_sec: 1000.0,
-            delete_burst: 100.0,
-            info_rate_per_sec: 1000.0,
-            info_burst: 100.0,
-            upload_concurrency: 8,
-            download_concurrency: 8,
-        }
+    /// `limits` that never bind (in-process tests).
+    fn test_limits(limits: ChatLimiterConfig) -> ChatLimiterConfig {
+        ChatLimiterConfig { upload_concurrency: 8, download_concurrency: 8, ..limits.with_all(Rate::new(1000.0, 100.0)) }
     }
 
     /// Defaults for in-process tests; metadata files go under `dir`.
@@ -404,10 +390,10 @@ impl Config {
             chunk_codec: ChunkCodec::Zstd,
             block_size: chunker::DEFAULT_BLOCK_SIZE,
             ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
-            tg: Self::test_limits(),
-            limiters: Arc::new(LimiterRegistry::new(Self::test_limits())),
-            discord: Self::test_limits(),
-            discord_limiters: Arc::new(LimiterRegistry::new(Self::test_limits())),
+            tg: Self::test_limits(pigeonhole_storage_telegram::limits()),
+            limiters: Arc::new(LimiterRegistry::new(Self::test_limits(pigeonhole_storage_telegram::limits()))),
+            discord: Self::test_limits(discord_limits()),
+            discord_limiters: Arc::new(LimiterRegistry::new(Self::test_limits(discord_limits()))),
             cache: CacheConfig {
                 enabled: false,
                 ..CacheConfig::default()
@@ -961,43 +947,68 @@ impl Default for FileIngest {
     }
 }
 
-/// `[telegram]` / `[discord]`: what is not set keeps the service's default.
+/// Discord's default limits; without the backend built in, only its bot's
+/// rate (there is nothing to call).
+fn discord_limits() -> ChatLimiterConfig {
+    #[cfg(feature = "discord")]
+    {
+        pigeonhole_storage_discord::limits()
+    }
+    #[cfg(not(feature = "discord"))]
+    {
+        ChatLimiterConfig { bot: Rate::new(40.0, 50.0), classes: Vec::new(), upload_concurrency: 2, download_concurrency: 8 }
+    }
+}
+
+/// `[telegram]` / `[discord]`: transfers at once, and a table per rate:
+/// `[telegram.bot]` (every call of a bot) and one per class of call
+/// (`[telegram.send]`, …). What is not set keeps the service's default.
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct FileLimits {
-    bot_rate_per_sec: Option<f64>,
-    bot_burst: Option<f64>,
-    info_rate_per_sec: Option<f64>,
-    info_burst: Option<f64>,
-    send_rate_per_sec: Option<f64>,
-    send_burst: Option<f64>,
-    get_file_rate_per_sec: Option<f64>,
-    get_file_burst: Option<f64>,
-    delete_rate_per_sec: Option<f64>,
-    delete_burst: Option<f64>,
     upload_concurrency: Option<usize>,
     download_concurrency: Option<usize>,
+    /// `bot` and the classes; checked against the service's in
+    /// [`Self::into_limiter_config`] (a flattened map cannot deny unknown keys).
+    #[serde(flatten)]
+    rates: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileRate {
+    rate_per_sec: Option<f64>,
+    burst: Option<f64>,
 }
 
 impl FileLimits {
     fn into_limiter_config(self, section: &str, d: ChatLimiterConfig) -> Result<ChatLimiterConfig> {
-        let c = ChatLimiterConfig {
-            bot_rate_per_sec: self.bot_rate_per_sec.unwrap_or(d.bot_rate_per_sec),
-            bot_burst: self.bot_burst.unwrap_or(d.bot_burst),
-            info_rate_per_sec: self.info_rate_per_sec.unwrap_or(d.info_rate_per_sec),
-            info_burst: self.info_burst.unwrap_or(d.info_burst),
-            send_rate_per_sec: self.send_rate_per_sec.unwrap_or(d.send_rate_per_sec),
-            send_burst: self.send_burst.unwrap_or(d.send_burst),
-            get_file_rate_per_sec: self.get_file_rate_per_sec.unwrap_or(d.get_file_rate_per_sec),
-            get_file_burst: self.get_file_burst.unwrap_or(d.get_file_burst),
-            delete_rate_per_sec: self.delete_rate_per_sec.unwrap_or(d.delete_rate_per_sec),
-            delete_burst: self.delete_burst.unwrap_or(d.delete_burst),
-            upload_concurrency: self.upload_concurrency.unwrap_or(d.upload_concurrency).max(1),
-            download_concurrency: self.download_concurrency.unwrap_or(d.download_concurrency).max(1),
+        let names = || {
+            std::iter::once("bot".to_string()).chain(d.classes.iter().map(|(c, _)| c.to_string())).collect::<Vec<_>>().join(", ")
         };
-        if c.send_rate_per_sec <= 0.0 || c.get_file_rate_per_sec <= 0.0 || c.delete_rate_per_sec <= 0.0 {
-            bail!("{section}.*_rate_per_sec must be > 0");
+        let mut c = d.clone();
+        for (name, value) in self.rates {
+            if !value.is_table() {
+                bail!("[{section}]: unknown field `{name}` (rates are tables of rate_per_sec, burst: {})", names());
+            }
+            let class = (name != "bot").then(|| d.classes.iter().map(|(c, _)| *c).find(|c| c.0 == name));
+            let current = match class {
+                None => d.bot,
+                Some(Some(class)) => d.rate(class).expect("a class of the defaults"),
+                Some(None) => bail!("[{section}.{name}]: {section} has no such rate ({})", names()),
+            };
+            let file: FileRate = value.try_into().with_context(|| format!("[{section}.{name}]"))?;
+            let rate = Rate::new(file.rate_per_sec.unwrap_or(current.per_sec), file.burst.unwrap_or(current.burst));
+            if rate.per_sec <= 0.0 || rate.burst < 1.0 {
+                bail!("[{section}.{name}]: rate_per_sec must be > 0 and burst >= 1");
+            }
+            c = match class {
+                Some(Some(class)) => c.with(class, rate),
+                _ => ChatLimiterConfig { bot: rate, ..c },
+            };
         }
+        c.upload_concurrency = self.upload_concurrency.unwrap_or(d.upload_concurrency).max(1);
+        c.download_concurrency = self.download_concurrency.unwrap_or(d.download_concurrency).max(1);
         Ok(c)
     }
 }
@@ -1005,6 +1016,7 @@ impl FileLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pigeonhole_limits::Class;
     use std::io::Write;
 
     /// The tests set and read the environment from many threads, which is
@@ -1042,10 +1054,11 @@ mod tests {
 
     #[test]
     fn discord_limits_are_its_own() {
-        let cfg = load_mem("[discord]\nsend_rate_per_sec = 2.0\n[telegram]\nsend_rate_per_sec = 0.5\n").unwrap();
-        assert_eq!((cfg.discord.send_rate_per_sec, cfg.tg.send_rate_per_sec), (2.0, 0.5));
-        assert_eq!(cfg.discord.send_burst, ChatLimiterConfig::discord().send_burst);
-        assert!(load_mem("[discord]\nsend_rate_per_sec = 0.0\n").is_err());
+        let send = Class("send");
+        let cfg = load_mem("[discord.send]\nrate_per_sec = 2.0\n[telegram.send]\nrate_per_sec = 0.5\n").unwrap();
+        assert_eq!((cfg.discord.rate(send).unwrap().per_sec, cfg.tg.rate(send).unwrap().per_sec), (2.0, 0.5));
+        assert_eq!(cfg.discord.rate(send).unwrap().burst, discord_limits().rate(send).unwrap().burst);
+        assert!(load_mem("[discord.send]\nrate_per_sec = 0.0\n").is_err());
         // Keyed by the bot's id, and each service by its own registry.
         let dc = cfg.chat_limiter(InstanceKind::Discord, "MTIz.ts.hmac-a", "7");
         assert!(Arc::ptr_eq(&dc, &cfg.chat_limiter(InstanceKind::Discord, "MTIz.ts2.hmac-b", "7")));
@@ -1061,19 +1074,29 @@ listen_addr = "127.0.0.1:9"
 size = 1024
 codec = "raw"
 [telegram]
-send_rate_per_sec = 1.0
-send_burst = 2.0
-get_file_rate_per_sec = 20.0
 upload_concurrency = 4
+[telegram.send]
+rate_per_sec = 1.0
+burst = 2.0
+[telegram.read]
+rate_per_sec = 20.0
 "#,
         )
         .unwrap();
         assert_eq!(cfg.chunk_size, 1024);
         assert_eq!(cfg.chunk_codec, ChunkCodec::Raw);
-        assert_eq!(cfg.tg.send_rate_per_sec, 1.0);
-        assert_eq!(cfg.tg.get_file_rate_per_sec, 20.0);
+        assert_eq!(cfg.tg.rate(Class("send")), Some(Rate::new(1.0, 2.0)));
+        assert_eq!(cfg.tg.rate(Class("read")), Some(Rate::new(20.0, 5.0)), "an unset burst keeps the default");
         assert_eq!(cfg.tg.upload_concurrency, 4);
-        assert_eq!(cfg.discord.send_rate_per_sec, ChatLimiterConfig::discord().send_rate_per_sec, "[discord] keeps its own defaults");
+        assert_eq!(cfg.discord.rate(Class("send")), discord_limits().rate(Class("send")), "[discord] keeps its own defaults");
+        for (bad, want) in [
+            ("[telegram]\nsend_rate_per_sec = 0.3\n", "unknown field `send_rate_per_sec`"),
+            ("[telegram.get_file]\nrate_per_sec = 1.0\n", "telegram has no such rate (bot, send, read, delete)"),
+            ("[telegram.send]\nrate = 1.0\n", "unknown field `rate`"),
+        ] {
+            let err = format!("{:#}", load_mem(bad).unwrap_err());
+            assert!(err.contains(want), "{bad:?}: want {want:?} in {err}");
+        }
         assert_eq!(cfg.placement, PlacementConfig::single("mem"));
         assert_eq!(cfg.meta.snapshot_every_entries, Some(10_000));
         assert_eq!(cfg.meta.snapshot_interval, Some(Duration::from_secs(600)));

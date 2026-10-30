@@ -6,12 +6,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_storage_api::{RateLimited, Unavailable};
-use pigeonhole_limits::{Call, ChatLimiter, Failed, LimitBudget, Penalty, Retry, Verdict};
+use crate::limits::{DELETE, READ, SEND};
+use pigeonhole_limits::{Call, ChatLimiter, Class, Failed, Level, Retry, Spend, Verdict};
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
@@ -26,7 +27,7 @@ const SUPPRESS_EMBEDS: u64 = 1 << 2;
 /// Attempts per request (network errors, 5xx and 429s); a 429's wait is
 /// always waited out, however long.
 const RETRY: Retry = Retry {
-    budget: Duration::from_secs(3600),
+    deadline: Duration::from_secs(3600),
     attempts: 6,
     backoff: Duration::from_millis(200),
     max_backoff: Duration::from_millis(6400),
@@ -47,54 +48,6 @@ fn unix_now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Which local budget a request spends.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RateBudget {
-    Send,
-    Read,
-    Delete,
-    Download,
-}
-
-/// Per-route wait derived from `X-RateLimit-*` response headers (no token capture).
-#[derive(Default)]
-struct RouteLimitState {
-    /// Cool-down deadline per local rate budget (send / read / delete).
-    cool_down_until: [Option<Instant>; 3],
-}
-
-impl RouteLimitState {
-    fn idx(budget: RateBudget) -> Option<usize> {
-        match budget {
-            RateBudget::Send => Some(0),
-            RateBudget::Read => Some(1),
-            RateBudget::Delete => Some(2),
-            RateBudget::Download => None,
-        }
-    }
-
-    fn observe(&mut self, budget: RateBudget, headers: &HeaderMap) {
-        let Some(i) = Self::idx(budget) else { return };
-        let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
-        let remaining = header("x-ratelimit-remaining").and_then(|s| s.parse::<u64>().ok());
-        let reset_after = header("x-ratelimit-reset-after").and_then(|s| s.parse::<f64>().ok());
-        match (remaining, reset_after) {
-            (Some(0), Some(secs)) if secs > 0.0 => {
-                let until = Instant::now() + Duration::from_secs_f64(secs);
-                self.cool_down_until[i] = Some(self.cool_down_until[i].map_or(until, |prev| prev.max(until)));
-            }
-            (Some(r), _) if r > 0 => self.cool_down_until[i] = None,
-            _ => {}
-        }
-    }
-
-    fn wait_secs(&self, budget: RateBudget) -> f64 {
-        Self::idx(budget)
-            .and_then(|i| self.cool_down_until[i])
-            .map_or(0.0, |until| until.saturating_duration_since(Instant::now()).as_secs_f64())
-    }
-}
-
 /// Seconds a 429 asks to wait.
 fn retry_after(headers: &HeaderMap, body: &serde_json::Value) -> f64 {
     body.get("retry_after")
@@ -110,19 +63,24 @@ fn retry_after(headers: &HeaderMap, body: &serde_json::Value) -> f64 {
         .max(0.1)
 }
 
-/// What a request spends: sends, deletes and reads have a bucket per
-/// channel. A 429 belongs to its route: it cools the request's bucket, and
-/// the whole bot only when Discord says `global`. CDN downloads are not API
-/// calls.
-fn call_of(budget: RateBudget, what: &'static str) -> Call {
-    let (budget, penalty) = match budget {
-        RateBudget::Send => (Some(LimitBudget::Send), Penalty::Class(LimitBudget::Send)),
-        RateBudget::Delete => (Some(LimitBudget::Delete), Penalty::Class(LimitBudget::Delete)),
-        RateBudget::Read => (Some(LimitBudget::GetFile), Penalty::Class(LimitBudget::GetFile)),
-        RateBudget::Download => (None, Penalty::None),
-    };
-    Call { service: "discord", what, budget, penalty }
+/// An API request of `class`: a 429 cools that class in its channel (the
+/// whole bot only when Discord says `global`, see [`classify`]).
+const fn api(what: &'static str, class: Class) -> Call {
+    Call { service: "discord", what, spend: Spend::Class(class), cools: Some(Level::Class) }
 }
+
+const GET_CHANNEL: Call = api("get channel", READ);
+const READ_HISTORY: Call = api("read history", READ);
+const GET_MESSAGE: Call = api("get message", READ);
+const LIST_MESSAGES: Call = api("list messages", READ);
+const GET_THREAD: Call = api("get thread", READ);
+const SEND_MESSAGE: Call = api("send message", SEND);
+const SEND_ATTACHMENT: Call = api("send attachment", SEND);
+const START_THREAD: Call = api("start thread", SEND);
+const DELETE_MESSAGE: Call = api("delete message", DELETE);
+const BULK_DELETE: Call = api("bulk delete", DELETE);
+const ARCHIVE_THREAD: Call = api("archive thread", DELETE);
+const DELETE_THREAD: Call = api("delete thread", DELETE);
 
 /// Why one attempt failed.
 #[derive(Debug)]
@@ -145,7 +103,9 @@ impl std::fmt::Display for AttemptFailed {
 
 fn classify(e: &AttemptFailed) -> Verdict {
     match e {
-        AttemptFailed::RateLimited { wait, global } => Verdict::Wait { after: *wait, whole_bot: *global },
+        AttemptFailed::RateLimited { wait, global } => {
+            Verdict::Wait { after: *wait, level: global.then_some(Level::Bot) }
+        }
         AttemptFailed::Network(_) | AttemptFailed::Server { .. } => Verdict::Transient,
     }
 }
@@ -156,7 +116,6 @@ pub struct DiscordClient {
     http: reqwest::Client,
     bot_token: String,
     api_base: String,
-    route_limits: Arc<Mutex<RouteLimitState>>,
 }
 
 /// One answer: status and JSON body (`Null` if none).
@@ -181,17 +140,12 @@ impl DiscordClient {
             .user_agent("DiscordBot (https://github.com/pigeonhole-project/pigeonhole, 0.1)")
             .default_headers(headers)
             .build()?;
-        Ok(Self { http, bot_token, api_base, route_limits: Arc::default() })
+        Ok(Self { http, bot_token, api_base })
     }
 
     /// Application id prefix of the bot token (`app_id.xxx.yyy`); never logs the secret.
     pub fn app_id(&self) -> String {
         self.bot_token.split('.').next().filter(|s| !s.is_empty()).unwrap_or("unknown").to_string()
-    }
-
-    /// Wait implied by the last `X-RateLimit-*` answer for this budget.
-    pub fn route_wait_secs(&self, budget: RateBudget) -> f64 {
-        self.route_limits.lock().unwrap().wait_secs(budget)
     }
 
     /// Channel `channel_id` through this client.
@@ -209,16 +163,14 @@ impl DiscordClient {
     async fn request(
         &self,
         limiter: &ChatLimiter,
-        budget: RateBudget,
-        what: &'static str,
+        call: &Call,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<Answer> {
-        let call = call_of(budget, what);
-        let answer = pigeonhole_limits::run(Some(limiter), &call, &RETRY, classify, || async {
+        let what = call.what;
+        let answer = pigeonhole_limits::run(Some(limiter), call, &RETRY, classify, || async {
             let resp = build().send().await.map_err(AttemptFailed::Network)?;
             let status = resp.status().as_u16();
             let headers = resp.headers().clone();
-            self.route_limits.lock().unwrap().observe(budget, &headers);
             let text = resp.text().await.unwrap_or_default();
             let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
             if status == 429 {
@@ -248,7 +200,7 @@ impl DiscordClient {
     /// rights (`chain`) show at the first use.
     pub async fn ensure_permissions(&self, channel_id: u64, chain: bool, limiter: &ChatLimiter) -> Result<()> {
         let path = format!("channels/{channel_id}");
-        let a = self.request(limiter, RateBudget::Read, "get channel", || self.http.get(self.url(&path))).await?;
+        let a = self.request(limiter, &GET_CHANNEL, || self.http.get(self.url(&path))).await?;
         if a.status != 200 {
             bail!("channel {channel_id}: answered {} (is the bot in this guild and allowed to view it?)", a.status);
         }
@@ -258,7 +210,7 @@ impl DiscordClient {
             bail!("channel {channel_id} is of type {kind}: the log needs a text channel");
         }
         let path = format!("channels/{channel_id}/messages?limit=1");
-        let a = self.request(limiter, RateBudget::Read, "read history", || self.http.get(self.url(&path))).await?;
+        let a = self.request(limiter, &READ_HISTORY, || self.http.get(self.url(&path))).await?;
         if a.status != 200 {
             bail!("channel {channel_id}: cannot read the history ({})", a.status);
         }
@@ -286,7 +238,7 @@ impl DiscordChannel {
     async fn delete_one(&self, id: u64) -> Result<()> {
         let path = self.path(&format!("messages/{id}"));
         let c = &self.client;
-        let a = c.request(&self.limiter, RateBudget::Delete, "delete message", || c.http.delete(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &DELETE_MESSAGE, || c.http.delete(c.url(&path))).await?;
         match a.status {
             200..=299 | 404 => Ok(()),
             s => bail!("delete message {id}: {s} {}", a.body),
@@ -360,14 +312,14 @@ impl DiscordApi for DiscordChannel {
         let c = &self.client;
         let a = match file {
             None => {
-                c.request(&self.limiter, RateBudget::Send, "send message", || c.http.post(c.url(&path)).json(&payload))
+                c.request(&self.limiter, &SEND_MESSAGE, || c.http.post(c.url(&path)).json(&payload))
                     .await?
             }
             Some((name, data)) => {
                 let _upload = self.limiter.acquire_upload().await;
                 payload["attachments"] = serde_json::json!([{ "id": 0, "filename": name }]);
                 let payload = payload.to_string();
-                c.request(&self.limiter, RateBudget::Send, "send attachment", || {
+                c.request(&self.limiter, &SEND_ATTACHMENT, || {
                     let part = Part::stream_with_length(reqwest::Body::from(data.clone()), data.len() as u64)
                         .file_name(name.to_string())
                         .mime_str("application/octet-stream")
@@ -387,7 +339,7 @@ impl DiscordApi for DiscordChannel {
     async fn get_message(&self, id: u64) -> Result<Option<DcMessage>> {
         let path = self.path(&format!("messages/{id}"));
         let c = &self.client;
-        let a = c.request(&self.limiter, RateBudget::Read, "get message", || c.http.get(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &GET_MESSAGE, || c.http.get(c.url(&path))).await?;
         match a.status {
             200 => Ok(Some(message(a.body)?)),
             404 => Ok(None),
@@ -405,7 +357,7 @@ impl DiscordApi for DiscordChannel {
         }
         let path = self.path(&query);
         let c = &self.client;
-        let a = c.request(&self.limiter, RateBudget::Read, "list messages", || c.http.get(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &LIST_MESSAGES, || c.http.get(c.url(&path))).await?;
         if a.status != 200 {
             bail!("list messages: {} {}", a.status, a.body);
         }
@@ -435,7 +387,7 @@ impl DiscordApi for DiscordChannel {
             let path = self.path("messages/bulk-delete");
             let c = &self.client;
             let a = c
-                .request(&self.limiter, RateBudget::Delete, "bulk delete", || c.http.post(c.url(&path)).json(&body))
+                .request(&self.limiter, &BULK_DELETE, || c.http.post(c.url(&path)).json(&body))
                 .await?;
             if !(200..300).contains(&a.status) {
                 debug!(status = a.status, "bulk delete refused; one by one");
@@ -458,7 +410,7 @@ impl DiscordApi for DiscordChannel {
         let pacer = crate::pacer::threads_of(&c.app_id());
         pacer.wait().await;
         let a = c
-            .request(&self.limiter, RateBudget::Send, "start thread", || c.http.post(c.url(&path)).json(&body))
+            .request(&self.limiter, &START_THREAD, || c.http.post(c.url(&path)).json(&body))
             .await?;
         pacer.observe(a.remaining, a.reset_after);
         match (a.status, code(&a.body)) {
@@ -472,7 +424,7 @@ impl DiscordApi for DiscordChannel {
     async fn thread_name(&self, message_id: u64) -> Result<Option<String>> {
         let path = format!("channels/{message_id}");
         let c = &self.client;
-        let a = c.request(&self.limiter, RateBudget::Read, "get thread", || c.http.get(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &GET_THREAD, || c.http.get(c.url(&path))).await?;
         match a.status {
             200 => Ok(a.body["name"].as_str().map(str::to_string)),
             404 => Ok(None),
@@ -485,7 +437,7 @@ impl DiscordApi for DiscordChannel {
         let body = serde_json::json!({ "archived": true });
         let c = &self.client;
         let a = c
-            .request(&self.limiter, RateBudget::Delete, "archive thread", || c.http.patch(c.url(&path)).json(&body))
+            .request(&self.limiter, &ARCHIVE_THREAD, || c.http.patch(c.url(&path)).json(&body))
             .await?;
         match a.status {
             200..=299 => Ok(()),
@@ -496,7 +448,7 @@ impl DiscordApi for DiscordChannel {
     async fn delete_thread(&self, message_id: u64) -> Result<()> {
         let path = format!("channels/{message_id}");
         let c = &self.client;
-        let a = c.request(&self.limiter, RateBudget::Delete, "delete thread", || c.http.delete(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &DELETE_THREAD, || c.http.delete(c.url(&path))).await?;
         match a.status {
             200..=299 | 404 => Ok(()),
             s => bail!("delete thread {message_id}: {s} {}", a.body),
@@ -538,8 +490,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_read_429_cools_its_channel_and_the_bot_only_when_global() {
-        let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_limits::ChatLimiterConfig::discord());
-        let call = call_of(RateBudget::Read, "get message");
+        let reg = pigeonhole_limits::LimiterRegistry::new(crate::limits());
+        let call = GET_MESSAGE;
         let once = Retry { attempts: 1, ..RETRY };
         for global in [false, true] {
             let (a, b) = (reg.chat(&format!("bot-{global}"), "1"), reg.chat(&format!("bot-{global}"), "2"));
@@ -548,8 +500,8 @@ mod tests {
             })
             .await;
             assert!(matches!(failed, Err(Failed::RateLimited { .. })));
-            assert!(a.peek_wait(LimitBudget::GetFile) > Duration::from_secs(3), "the read's own bucket");
-            let other = b.peek_wait(LimitBudget::Send);
+            assert!(a.peek_wait(READ) > Duration::from_secs(3), "the read's own bucket");
+            let other = b.peek_wait(SEND);
             assert_eq!(other > Duration::from_secs(3), global, "another channel's sends (global: {global})");
         }
     }
@@ -567,17 +519,6 @@ mod tests {
         let old_id = (now_ms - 20 * 24 * 60 * 60 * 1000 - DISCORD_EPOCH_MS) << 22;
         assert!(snowflake_bulk_deletable(young_id, now_ms));
         assert!(!snowflake_bulk_deletable(old_id, now_ms));
-    }
-
-    #[test]
-    fn route_limit_observe_remaining_zero() {
-        let mut st = RouteLimitState::default();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
-        headers.insert("x-ratelimit-reset-after", "1.5".parse().unwrap());
-        st.observe(RateBudget::Delete, &headers);
-        assert!(st.wait_secs(RateBudget::Delete) > 1.0);
-        assert_eq!(st.wait_secs(RateBudget::Send), 0.0);
     }
 
     #[test]

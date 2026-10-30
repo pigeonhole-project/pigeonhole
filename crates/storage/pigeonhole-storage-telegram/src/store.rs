@@ -9,7 +9,8 @@ use lru::LruCache;
 use pigeonhole_storage_api::{
     bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
 };
-use pigeonhole_limits::{ChatLimiter, LimitBudget};
+use crate::limits::{DELETE, READ, SEND};
+use pigeonhole_limits::ChatLimiter;
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -215,12 +216,12 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
 
     fn cost(&self, op: OpKind, id: Option<&Self::Id>) -> CostHint {
         let wait = match op {
-            OpKind::Put => self.limiter.peek_wait(LimitBudget::Send),
+            OpKind::Put => self.limiter.peek_wait(SEND),
             OpKind::Get if id.is_some_and(|i| self.reader.locations.lock().unwrap().contains(&i.message_id)) => {
                 std::time::Duration::ZERO
             }
-            OpKind::Get | OpKind::List => self.limiter.peek_wait(LimitBudget::Info),
-            OpKind::Delete => self.limiter.peek_wait(LimitBudget::Delete),
+            OpKind::Get | OpKind::List => self.limiter.peek_wait(READ),
+            OpKind::Delete => self.limiter.peek_wait(DELETE),
         };
         CostHint { wait_secs: wait.as_secs_f64(), latency_ewma_secs: 0.0, inflight: 0 }
     }

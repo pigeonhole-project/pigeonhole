@@ -1,15 +1,15 @@
-//! Rate limits a store paces its calls with. A chat service (Telegram,
-//! Discord) limits on two levels, plus explicit cool-downs from 429s:
+//! Rate limits a store paces its calls with (docs/shared-limiter.md). A
+//! chat service (Telegram, Discord) limits on two levels, plus explicit
+//! cool-downs from 429s:
 //!
 //! - **Bot** ([`BotLimiter`]): every call of one bot token, across all its
 //!   chats (Telegram: about 30 per second).
-//! - **Chat** ([`ChatLimiter`]): per chat and per class of call. Sends and
-//!   pins (a pin posts a service message: ~20 messages per minute in
-//!   channels and groups), `getFile`, deletes, and info calls (`getChat`,
-//!   descriptions) have separate buckets; each call also takes a bot token.
-//! - **429**: `retry_after` freezes the bucket that was hit (the chat's for a
-//!   chat-scoped call, the bot's for `getFile`) so that the other callers wait
-//!   too; retrying is up to the caller.
+//! - **Class** ([`ChatLimiter`]): per chat and per [`Class`] of call (sends,
+//!   reads, deletes…). The service names its classes and their rates
+//!   ([`ChatLimiterConfig`]); this crate knows no service. A call of a
+//!   class also takes a bot token ([`Spend`]).
+//! - **429**: `retry_after` freezes the [`Level`] that was hit, so that the
+//!   other callers wait too ([`run`] does it, and the retrying).
 //!
 //! File CDN byte streams are not API-metered, only capped by a download
 //! connection semaphore. [`LimiterRegistry`] hands out one limiter per
@@ -32,7 +32,7 @@ use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use tokio::time::Instant;
 
 mod run;
-pub use run::{run, Call, Failed, Penalty, Retry, Verdict};
+pub use run::{run, Call, Failed, Retry, Verdict};
 use tracing::debug;
 
 /// The metrics this crate records.
@@ -71,7 +71,51 @@ pub fn record_limiter_wait(chat: &str, op: &str, d: Duration) {
     .record(d.as_secs_f64());
 }
 
-#[derive(Debug)]
+/// A class of calls with a bucket of its own in each chat: sends, reads,
+/// deletes… The service names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Class(pub &'static str);
+
+impl std::fmt::Display for Class {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// A token bucket's rate: `per_sec` tokens a second, `burst` at most.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rate {
+    pub per_sec: f64,
+    pub burst: f64,
+}
+
+impl Rate {
+    pub const fn new(per_sec: f64, burst: f64) -> Self {
+        Self { per_sec, burst }
+    }
+}
+
+/// What a call takes from its limiter, before each attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spend {
+    /// Nothing (a CDN download: not an API call).
+    Nothing,
+    /// A token of the bot's.
+    Bot,
+    /// A token of the class's bucket in the chat, and one of the bot's.
+    Class(Class),
+}
+
+/// What a rate limit cools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// The call's class in its chat (the bot's bucket for a call of no class).
+    Class,
+    /// Every call of the bot, in every chat.
+    Bot,
+}
+
+#[derive(Debug, Clone)]
 struct BucketState {
     tokens: f64,
     last_refill: Instant,
@@ -81,9 +125,9 @@ struct BucketState {
 }
 
 impl BucketState {
-    fn new(rate_per_sec: f64, burst: f64) -> Self {
-        let rate_per_sec = rate_per_sec.max(0.01);
-        let capacity = burst.max(1.0);
+    fn new(rate: Rate) -> Self {
+        let rate_per_sec = rate.per_sec.max(0.01);
+        let capacity = rate.burst.max(1.0);
         Self {
             tokens: capacity,
             last_refill: Instant::now(),
@@ -139,34 +183,8 @@ impl BucketState {
 
     /// Estimated wait until a token is available (no capture, no state mutation).
     fn peek_wait(&self) -> Duration {
-        let now = Instant::now();
-        if let Some(until) = self.cool_down_until {
-            if now < until {
-                return until.saturating_duration_since(now);
-            }
-        }
-        let elapsed = now.saturating_duration_since(self.last_refill);
-        let tokens = (self.tokens + elapsed.as_secs_f64() * self.rate_per_sec).min(self.capacity);
-        if tokens >= 1.0 {
-            return Duration::ZERO;
-        }
-        let need = 1.0 - tokens;
-        let secs = if self.rate_per_sec > 0.0 {
-            need / self.rate_per_sec
-        } else {
-            1.0
-        };
-        Duration::from_secs_f64(secs.max(0.001))
+        self.clone().wait(Instant::now())
     }
-}
-
-/// Which ChatLimiter bucket to peek / acquire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LimitBudget {
-    Send,
-    GetFile,
-    Delete,
-    Info,
 }
 
 struct TokenBucket {
@@ -195,9 +213,9 @@ impl Drop for Waiting<'_> {
 const IDLE_POLL: Duration = Duration::from_millis(100);
 
 impl TokenBucket {
-    fn new(rate_per_sec: f64, burst: f64) -> Self {
+    fn new(rate: Rate) -> Self {
         Self {
-            state: Mutex::new(BucketState::new(rate_per_sec, burst)),
+            state: Mutex::new(BucketState::new(rate)),
             waiting: AtomicUsize::new(0),
         }
     }
@@ -268,8 +286,8 @@ pub struct BotLimiter {
 }
 
 impl BotLimiter {
-    pub fn new(rate_per_sec: f64, burst: f64) -> Self {
-        Self { calls: TokenBucket::new(rate_per_sec, burst) }
+    pub fn new(rate: Rate) -> Self {
+        Self { calls: TokenBucket::new(rate) }
     }
 
     fn idle(&self) -> bool {
@@ -277,7 +295,7 @@ impl BotLimiter {
     }
 
     /// A 429 not tied to one chat: every chat of the bot waits.
-    pub fn penalize(&self, retry_after: Duration) {
+    fn penalize(&self, retry_after: Duration) {
         cool_down("", "bot", retry_after);
         self.calls.penalize(retry_after);
     }
@@ -288,79 +306,49 @@ pub struct ChatLimiter {
     /// The chat / channel id, a metrics label.
     chat: String,
     bot: Arc<BotLimiter>,
-    send: TokenBucket,
-    get_file: TokenBucket,
-    delete: TokenBucket,
-    info: TokenBucket,
+    classes: Vec<(Class, TokenBucket)>,
     upload_sem: Semaphore,
     download_sem: Semaphore,
 }
 
+/// A service's limits: its bot's rate and each class's per chat.
 #[derive(Debug, Clone)]
 pub struct ChatLimiterConfig {
-    /// Bot level: all calls of one token.
-    pub bot_rate_per_sec: f64,
-    pub bot_burst: f64,
-    pub send_rate_per_sec: f64,
-    pub send_burst: f64,
-    pub get_file_rate_per_sec: f64,
-    pub get_file_burst: f64,
-    pub delete_rate_per_sec: f64,
-    pub delete_burst: f64,
-    /// `getChat`, descriptions.
-    pub info_rate_per_sec: f64,
-    pub info_burst: f64,
+    /// Every call of one bot token.
+    pub bot: Rate,
+    pub classes: Vec<(Class, Rate)>,
     pub upload_concurrency: usize,
     pub download_concurrency: usize,
 }
 
 impl ChatLimiterConfig {
-    /// Discord: ~50 requests a second per bot; per channel ~5 messages per
-    /// 5 s (a log entry is a message and a thread: two sends) and route
-    /// limits the client also reads from the headers.
-    pub fn discord() -> Self {
-        Self {
-            bot_rate_per_sec: 40.0,
-            bot_burst: 50.0,
-            send_rate_per_sec: 1.0,
-            send_burst: 5.0,
-            get_file_rate_per_sec: 5.0,
-            get_file_burst: 10.0,
-            delete_rate_per_sec: 1.0,
-            delete_burst: 5.0,
-            info_rate_per_sec: 2.0,
-            info_burst: 5.0,
-            upload_concurrency: 2,
-            download_concurrency: 8,
-        }
+    pub fn rate(&self, class: Class) -> Option<Rate> {
+        self.classes.iter().find(|(c, _)| *c == class).map(|(_, r)| *r)
     }
-}
 
-impl Default for ChatLimiterConfig {
-    fn default() -> Self {
-        Self {
-            bot_rate_per_sec: 25.0,
-            bot_burst: 30.0,
-            // 18 a minute: under the ~20 messages a minute of a channel; a pin
-            // counts (it posts a service message).
-            send_rate_per_sec: 0.3,
-            send_burst: 3.0,
-            get_file_rate_per_sec: 15.0,
-            get_file_burst: 30.0,
-            delete_rate_per_sec: 1.0,
-            delete_burst: 5.0,
-            info_rate_per_sec: 2.0,
-            info_burst: 5.0,
-            upload_concurrency: 2,
-            download_concurrency: 8,
+    /// `class` at `rate` (added if the service has no such class).
+    pub fn with(mut self, class: Class, rate: Rate) -> Self {
+        match self.classes.iter_mut().find(|(c, _)| *c == class) {
+            Some((_, r)) => *r = rate,
+            None => self.classes.push((class, rate)),
         }
+        self
+    }
+
+    /// The bot and every class at `rate` (tests: limits that never bind).
+    pub fn with_all(mut self, rate: Rate) -> Self {
+        self.bot = rate;
+        for (_, r) in &mut self.classes {
+            *r = rate;
+        }
+        self
     }
 }
 
 impl ChatLimiter {
     /// A chat with a bot of its own (tests, single-chat tools).
     pub fn new(cfg: ChatLimiterConfig) -> Self {
-        let bot = Arc::new(BotLimiter::new(cfg.bot_rate_per_sec, cfg.bot_burst));
+        let bot = Arc::new(BotLimiter::new(cfg.bot));
         Self::for_bot(cfg, bot, "")
     }
 
@@ -369,10 +357,7 @@ impl ChatLimiter {
         Self {
             chat: chat.to_owned(),
             bot,
-            send: TokenBucket::new(cfg.send_rate_per_sec, cfg.send_burst),
-            get_file: TokenBucket::new(cfg.get_file_rate_per_sec, cfg.get_file_burst),
-            delete: TokenBucket::new(cfg.delete_rate_per_sec, cfg.delete_burst),
-            info: TokenBucket::new(cfg.info_rate_per_sec, cfg.info_burst),
+            classes: cfg.classes.iter().map(|(c, r)| (*c, TokenBucket::new(*r))).collect(),
             upload_sem: Semaphore::new(cfg.upload_concurrency.max(1)),
             download_sem: Semaphore::new(cfg.download_concurrency.max(1)),
         }
@@ -382,33 +367,34 @@ impl ChatLimiter {
         &self.bot
     }
 
-    /// A token of `bucket` and one of the bot's, at once.
-    async fn take(&self, bucket: &TokenBucket, name: &'static str) {
-        let waited = take_all(&[bucket, &self.bot.calls]).await;
-        record_limiter_wait(&self.chat, name, waited);
+    fn bucket(&self, class: Class) -> &TokenBucket {
+        self.classes
+            .iter()
+            .find(|(c, _)| *c == class)
+            .map(|(_, b)| b)
+            .unwrap_or_else(|| panic!("class {class} is not in this limiter's config"))
     }
 
-    /// A token of `budget` (and one of the bot's).
-    pub async fn acquire(&self, budget: LimitBudget) {
-        let name = match budget {
-            LimitBudget::Send => "send",
-            LimitBudget::GetFile => "get_file",
-            LimitBudget::Delete => "delete",
-            LimitBudget::Info => "info",
+    /// Take what `spend` names: a class's token and the bot's at once.
+    pub async fn acquire(&self, spend: Spend) {
+        let (waited, op) = match spend {
+            Spend::Nothing => return,
+            Spend::Bot => (take_all(&[&self.bot.calls]).await, "bot"),
+            Spend::Class(c) => (take_all(&[self.bucket(c), &self.bot.calls]).await, c.0),
         };
-        self.take(self.bucket(budget), name).await;
+        record_limiter_wait(&self.chat, op, waited);
     }
 
-    /// Cool `budget`'s bucket in this chat only.
-    pub fn penalize_budget(&self, budget: LimitBudget, retry_after: Duration) {
-        let name = match budget {
-            LimitBudget::Send => "send",
-            LimitBudget::GetFile => "getFile",
-            LimitBudget::Delete => "delete",
-            LimitBudget::Info => "info",
-        };
-        cool_down(&self.chat, name, retry_after);
-        self.bucket(budget).penalize(retry_after);
+    /// A rate limit on a call that spends `spend`: cool `level`.
+    pub fn cool(&self, spend: Spend, level: Level, retry_after: Duration) {
+        match (level, spend) {
+            (Level::Bot, _) | (Level::Class, Spend::Bot) => self.bot.penalize(retry_after),
+            (Level::Class, Spend::Class(c)) => {
+                cool_down(&self.chat, c.0, retry_after);
+                self.bucket(c).penalize(retry_after);
+            }
+            (Level::Class, Spend::Nothing) => {}
+        }
     }
 
     pub async fn acquire_upload(&self) -> SemaphorePermit<'_> {
@@ -426,29 +412,20 @@ impl ChatLimiter {
             .expect("download semaphore closed")
     }
 
-    fn bucket(&self, budget: LimitBudget) -> &TokenBucket {
-        match budget {
-            LimitBudget::Send => &self.send,
-            LimitBudget::GetFile => &self.get_file,
-            LimitBudget::Delete => &self.delete,
-            LimitBudget::Info => &self.info,
-        }
-    }
-
-    /// Background work: wait until `budget` and the bot's have spare tokens
+    /// Background work: wait until `class` and the bot's have spare tokens
     /// and nobody waits for them. Takes no token; under steady foreground
     /// load it waits as long as the load lasts.
-    pub async fn wait_idle(&self, budget: LimitBudget) {
+    pub async fn wait_idle(&self, class: Class) {
         let started = Instant::now();
-        while !(self.bucket(budget).idle() && self.bot.idle()) {
+        while !(self.bucket(class).idle() && self.bot.idle()) {
             tokio::time::sleep(IDLE_POLL).await;
         }
         record_limiter_wait(&self.chat, "idle", started.elapsed());
     }
 
-    /// Estimated wait before the next token for `budget` (does not capture a token).
-    pub fn peek_wait(&self, budget: LimitBudget) -> Duration {
-        self.bucket(budget).peek_wait().max(self.bot.calls.peek_wait())
+    /// Estimated wait before the next token for `class` (does not capture a token).
+    pub fn peek_wait(&self, class: Class) -> Duration {
+        self.bucket(class).peek_wait().max(self.bot.calls.peek_wait())
     }
 }
 
@@ -481,8 +458,8 @@ impl StoreLimiter {
     }
 
     /// At most `rate_per_sec` operations a second, `burst` at once.
-    pub fn with_rate(mut self, rate_per_sec: f64, burst: f64) -> Self {
-        self.rate = Some(TokenBucket::new(rate_per_sec, burst));
+    pub fn with_rate(mut self, rate: Rate) -> Self {
+        self.rate = Some(TokenBucket::new(rate));
         self
     }
 
@@ -556,7 +533,7 @@ impl LimiterRegistry {
             .lock()
             .unwrap()
             .entry(bot.to_string())
-            .or_insert_with(|| Arc::new(BotLimiter::new(self.cfg.bot_rate_per_sec, self.cfg.bot_burst)))
+            .or_insert_with(|| Arc::new(BotLimiter::new(self.cfg.bot)))
             .clone();
         let l = Arc::new(ChatLimiter::for_bot(self.cfg.clone(), bot_limiter, chat));
         chats.insert((bot.to_string(), chat.to_string()), l.clone());
@@ -566,7 +543,7 @@ impl LimiterRegistry {
 
 /// A rate limit the server asked for: `info` when it is long enough for a
 /// person to notice (a stalled upload, a slow boot), `debug` otherwise.
-fn cool_down(chat: &str, budget: &'static str, retry_after: Duration) {
+fn cool_down(chat: &str, budget: &str, retry_after: Duration) {
     if retry_after >= Duration::from_secs(5) {
         tracing::info!(chat, budget, wait_secs = retry_after.as_secs_f64(), "rate limited: waiting");
     } else {
@@ -579,146 +556,125 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    const SEND: Class = Class("send");
+    const GET_FILE: Class = Class("get_file");
+    const DELETE: Class = Class("delete");
+    const INFO: Class = Class("info");
+
+    /// Telegram-like limits with four classes.
+    fn cfg() -> ChatLimiterConfig {
+        ChatLimiterConfig {
+            bot: Rate::new(25.0, 30.0),
+            classes: vec![
+                (SEND, Rate::new(0.3, 3.0)),
+                (GET_FILE, Rate::new(15.0, 30.0)),
+                (DELETE, Rate::new(1.0, 5.0)),
+                (INFO, Rate::new(2.0, 5.0)),
+            ],
+            upload_concurrency: 2,
+            download_concurrency: 8,
+        }
+    }
+
     fn fast_send() -> ChatLimiter {
-        ChatLimiter::new(ChatLimiterConfig {
-            send_rate_per_sec: 100.0,
-            send_burst: 2.0,
-            get_file_rate_per_sec: 1000.0,
-            get_file_burst: 100.0,
-            delete_rate_per_sec: 1000.0,
-            delete_burst: 100.0,
-            upload_concurrency: 4,
-            download_concurrency: 4,
-            ..ChatLimiterConfig::default()
-        })
+        ChatLimiter::new(ChatLimiterConfig { upload_concurrency: 4, download_concurrency: 4, ..cfg().with(SEND, Rate::new(100.0, 2.0)).with(GET_FILE, Rate::new(1000.0, 100.0)).with(DELETE, Rate::new(1000.0, 100.0)) })
     }
 
     #[tokio::test]
     async fn chats_share_their_bot_and_nothing_else() {
-        let reg = LimiterRegistry::new(ChatLimiterConfig {
-            bot_rate_per_sec: 0.01,
-            bot_burst: 2.0,
-            send_rate_per_sec: 0.01,
-            send_burst: 1.0,
-            ..ChatLimiterConfig::default()
-        });
+        let reg = LimiterRegistry::new(ChatLimiterConfig { bot: Rate::new(0.01, 2.0), ..cfg().with(SEND, Rate::new(0.01, 1.0)) });
         let (a, b, a_again) = (reg.chat("bot1", "-1"), reg.chat("bot1", "-2"), reg.chat("bot1", "-1"));
         assert!(Arc::ptr_eq(&a, &a_again), "one limiter per chat");
         assert!(Arc::ptr_eq(a.bot(), b.bot()), "one bot limiter per bot");
         assert!(!Arc::ptr_eq(a.bot(), reg.chat("bot2", "-1").bot()));
 
-        a.acquire(LimitBudget::Send).await;
-        assert!(a.peek_wait(LimitBudget::Send) > Duration::from_secs(1), "chat a's send bucket is empty");
-        assert_eq!(b.peek_wait(LimitBudget::Send), Duration::ZERO, "chat b's is not");
-        b.acquire(LimitBudget::Send).await;
+        a.acquire(Spend::Class(SEND)).await;
+        assert!(a.peek_wait(SEND) > Duration::from_secs(1), "chat a's send bucket is empty");
+        assert_eq!(b.peek_wait(SEND), Duration::ZERO, "chat b's is not");
+        b.acquire(Spend::Class(SEND)).await;
         // Two calls took the bot's burst of 2: every chat of the bot now waits.
-        assert!(reg.chat("bot1", "-3").peek_wait(LimitBudget::Info) > Duration::from_secs(1));
-        assert_eq!(reg.chat("bot2", "-3").peek_wait(LimitBudget::Info), Duration::ZERO);
+        assert!(reg.chat("bot1", "-3").peek_wait(INFO) > Duration::from_secs(1));
+        assert_eq!(reg.chat("bot2", "-3").peek_wait(INFO), Duration::ZERO);
     }
 
     #[tokio::test]
-    async fn a_get_file_429_holds_the_bot_a_send_429_only_the_chat() {
-        let reg = LimiterRegistry::new(ChatLimiterConfig::default());
+    async fn a_bot_level_429_holds_every_chat_a_class_429_only_its_own() {
+        let reg = LimiterRegistry::new(cfg());
         let (a, b) = (reg.chat("bot", "-1"), reg.chat("bot", "-2"));
-        a.penalize_budget(LimitBudget::Send, Duration::from_secs(20));
-        assert!(a.peek_wait(LimitBudget::Send) > Duration::from_secs(10));
-        assert_eq!(b.peek_wait(LimitBudget::Send), Duration::ZERO);
-        a.cool(Penalty::ClassAndBot(LimitBudget::GetFile), false, Duration::from_secs(20));
-        assert!(b.peek_wait(LimitBudget::Delete) > Duration::from_secs(10), "getFile is not chat-scoped");
+        a.cool(Spend::Class(SEND), Level::Class, Duration::from_secs(20));
+        assert!(a.peek_wait(SEND) > Duration::from_secs(10));
+        assert_eq!(b.peek_wait(SEND), Duration::ZERO);
+        a.cool(Spend::Bot, Level::Bot, Duration::from_secs(20));
+        assert!(b.peek_wait(DELETE) > Duration::from_secs(10), "the bot's level holds every chat");
     }
 
     #[tokio::test]
     async fn waiting_for_the_bot_holds_no_chat_token() {
-        let lim = Arc::new(ChatLimiter::new(ChatLimiterConfig {
-            bot_rate_per_sec: 10.0,
-            bot_burst: 1.0,
-            send_rate_per_sec: 0.01,
-            send_burst: 1.0,
-            ..ChatLimiterConfig::default()
-        }));
-        lim.acquire(LimitBudget::Info).await; // the bot's only token
+        let lim = Arc::new(ChatLimiter::new(ChatLimiterConfig { bot: Rate::new(10.0, 1.0), ..cfg().with(SEND, Rate::new(0.01, 1.0)) }));
+        lim.acquire(Spend::Class(INFO)).await; // the bot's only token
         let send = {
             let lim = lim.clone();
-            tokio::spawn(async move { lim.acquire(LimitBudget::Send).await })
+            tokio::spawn(async move { lim.acquire(Spend::Class(SEND)).await })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!send.is_finished(), "the send waits for the bot");
-        assert_eq!(lim.send.peek_wait(), Duration::ZERO, "and has not taken the chat's send token");
+        assert_eq!(lim.bucket(SEND).peek_wait(), Duration::ZERO, "and has not taken the chat's send token");
         send.await.unwrap();
-        assert!(lim.peek_wait(LimitBudget::Send) > Duration::from_secs(1), "now it has");
+        assert!(lim.peek_wait(SEND) > Duration::from_secs(1), "now it has");
     }
 
     #[tokio::test]
     async fn waiting_for_the_chat_holds_no_bot_token() {
-        let reg = LimiterRegistry::new(ChatLimiterConfig {
-            bot_rate_per_sec: 0.01,
-            bot_burst: 2.0,
-            send_rate_per_sec: 10.0,
-            send_burst: 1.0,
-            ..ChatLimiterConfig::default()
-        });
+        let reg = LimiterRegistry::new(ChatLimiterConfig { bot: Rate::new(0.01, 2.0), ..cfg().with(SEND, Rate::new(10.0, 1.0)) });
         let (a, b) = (reg.chat("bot", "-1"), reg.chat("bot", "-2"));
-        a.acquire(LimitBudget::Send).await; // a's send token, and one of the bot's two
+        a.acquire(Spend::Class(SEND)).await; // a's send token, and one of the bot's two
         let again = {
             let a = a.clone();
-            tokio::spawn(async move { a.acquire(LimitBudget::Send).await })
+            tokio::spawn(async move { a.acquire(Spend::Class(SEND)).await })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!again.is_finished(), "a's second send waits for its chat");
         let t0 = Instant::now();
-        b.acquire(LimitBudget::Send).await;
+        b.acquire(Spend::Class(SEND)).await;
         assert!(t0.elapsed() < Duration::from_millis(50), "the bot's last token went to chat b");
         again.abort();
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_cooled_bucket_starts_empty_when_the_cool_down_ends() {
-        let lim = ChatLimiter::new(ChatLimiterConfig {
-            send_rate_per_sec: 1.0,
-            send_burst: 3.0,
-            ..ChatLimiterConfig::default()
-        });
-        lim.penalize_budget(LimitBudget::Send, Duration::from_secs(35));
+        let lim = ChatLimiter::new(cfg().with(SEND, Rate::new(1.0, 3.0)));
+        lim.cool(Spend::Class(SEND), Level::Class, Duration::from_secs(35));
         tokio::time::sleep(Duration::from_secs(35)).await;
         // Not a burst of three at once: one token a second from here.
         let t0 = Instant::now();
         for _ in 0..3 {
-            lim.acquire(LimitBudget::Send).await;
+            lim.acquire(Spend::Class(SEND)).await;
         }
         assert!(t0.elapsed() >= Duration::from_millis(2900), "{:?}", t0.elapsed());
     }
 
     #[tokio::test]
     async fn send_bucket_independent_of_get_file() {
-        let lim = ChatLimiter::new(ChatLimiterConfig {
-            send_rate_per_sec: 0.01,
-            send_burst: 1.0,
-            get_file_rate_per_sec: 1000.0,
-            get_file_burst: 100.0,
-            ..ChatLimiterConfig::default()
-        });
-        lim.acquire(LimitBudget::Send).await;
+        let lim = ChatLimiter::new(cfg().with(SEND, Rate::new(0.01, 1.0)).with(GET_FILE, Rate::new(1000.0, 100.0)));
+        lim.acquire(Spend::Class(SEND)).await;
         // getFile still has tokens even though send is exhausted.
         let t0 = Instant::now();
-        lim.acquire(LimitBudget::GetFile).await;
+        lim.acquire(Spend::Class(GET_FILE)).await;
         assert!(t0.elapsed() < Duration::from_millis(50));
     }
 
     #[tokio::test]
     async fn penalize_send_does_not_block_get_file() {
         let lim = Arc::new(fast_send());
-        lim.penalize_budget(LimitBudget::Send, Duration::from_millis(200));
+        lim.cool(Spend::Class(SEND), Level::Class, Duration::from_millis(200));
         let t0 = Instant::now();
-        lim.acquire(LimitBudget::GetFile).await;
+        lim.acquire(Spend::Class(GET_FILE)).await;
         assert!(t0.elapsed() < Duration::from_millis(50));
     }
 
     #[tokio::test]
     async fn upload_semaphore_caps_concurrency() {
-        let lim = Arc::new(ChatLimiter::new(ChatLimiterConfig {
-            upload_concurrency: 1,
-            ..ChatLimiterConfig::default()
-        }));
+        let lim = Arc::new(ChatLimiter::new(ChatLimiterConfig { upload_concurrency: 1, ..cfg() }));
         let p1 = lim.acquire_upload().await;
         let lim2 = lim.clone();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
@@ -735,41 +691,33 @@ mod tests {
 
     #[tokio::test]
     async fn peek_wait_does_not_capture_tokens() {
-        let lim = ChatLimiter::new(ChatLimiterConfig {
-            send_rate_per_sec: 0.01,
-            send_burst: 1.0,
-            ..ChatLimiterConfig::default()
-        });
-        assert_eq!(lim.peek_wait(LimitBudget::Send), Duration::ZERO);
-        lim.acquire(LimitBudget::Send).await;
-        let peeked = lim.peek_wait(LimitBudget::Send);
+        let lim = ChatLimiter::new(cfg().with(SEND, Rate::new(0.01, 1.0)));
+        assert_eq!(lim.peek_wait(SEND), Duration::ZERO);
+        lim.acquire(Spend::Class(SEND)).await;
+        let peeked = lim.peek_wait(SEND);
         assert!(peeked > Duration::from_millis(50));
         // Second peek must not change the estimate (no capture).
-        let peeked2 = lim.peek_wait(LimitBudget::Send);
+        let peeked2 = lim.peek_wait(SEND);
         assert!((peeked2.as_secs_f64() - peeked.as_secs_f64()).abs() < 0.05);
-        assert_eq!(lim.peek_wait(LimitBudget::GetFile), Duration::ZERO);
+        assert_eq!(lim.peek_wait(GET_FILE), Duration::ZERO);
     }
 
     #[tokio::test]
     async fn background_waits_for_a_foreground_caller_and_spare_tokens() {
-        let l = Arc::new(ChatLimiter::new(ChatLimiterConfig {
-            delete_rate_per_sec: 20.0,
-            delete_burst: 2.0,
-            ..ChatLimiterConfig::default()
-        }));
-        l.wait_idle(LimitBudget::Delete).await; // a fresh budget is idle
-        l.acquire(LimitBudget::Delete).await;
-        l.acquire(LimitBudget::Delete).await;
+        let l = Arc::new(ChatLimiter::new(cfg().with(DELETE, Rate::new(20.0, 2.0))));
+        l.wait_idle(DELETE).await; // a fresh budget is idle
+        l.acquire(Spend::Class(DELETE)).await;
+        l.acquire(Spend::Class(DELETE)).await;
         let order = Arc::new(Mutex::new(Vec::new()));
         let fg = {
             let (l, order) = (l.clone(), order.clone());
             tokio::spawn(async move {
-                l.acquire(LimitBudget::Delete).await; // waits ~50 ms for a token
+                l.acquire(Spend::Class(DELETE)).await; // waits ~50 ms for a token
                 order.lock().unwrap().push("foreground");
             })
         };
         tokio::task::yield_now().await;
-        l.wait_idle(LimitBudget::Delete).await;
+        l.wait_idle(DELETE).await;
         order.lock().unwrap().push("background");
         fg.await.unwrap();
         assert_eq!(*order.lock().unwrap(), vec!["foreground", "background"]);

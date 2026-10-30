@@ -232,7 +232,7 @@ comments. Sections:
 | `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every` (`"off"` = never), `keep_snapshots` (the newest snapshots kept with the log between them; default 2) |
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
-| `[telegram]` | Rate limits on two levels: per bot (`bot_rate_per_sec`) and per channel (send / getFile / delete / info budgets); a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency |
+| `[telegram]` | Rate limits on two levels: per bot (`[telegram.bot]`) and per channel and class of call (`[telegram.send]`, `read`, `delete`), each `rate_per_sec` / `burst`; a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency. `[discord]` takes the same tables |
 | `[cache]` | In-memory block caches: L1 decoded, L2 stored (compressed) blocks |
 | `[sweep]` | Garbage collector: `interval`, `batch_size` |
 | `[repair]` | Replica repair/backfill: interval, batch, cost limit, `scrub` |
