@@ -135,3 +135,29 @@ async fn two_bots_in_one_channel() {
     delete_all(&a, &ra.sent).await;
     delete_all(&b, &rb.sent).await;
 }
+
+/// Can bot B download a document with the location bot A got for it (from
+/// A's send answer, from A's getMessages), without reading it itself?
+#[tokio::test]
+#[ignore = "needs two Telegram bots, admins of a test channel"]
+async fn handles_across_bots() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
+    let (_, a) = bot(&root, "TG_BOT_TOKEN", 1, chat_id).await;
+    let (_, b) = bot(&root, "TG_BOT_TOKEN_2", 2, chat_id).await;
+    let data = Bytes::from((0..300_000u32).map(|i| (i % 249) as u8).collect::<Vec<_>>());
+    let sent = a.send_document("spike-handles.bin", data.clone(), random_id()).await.unwrap();
+    let from_send = sent.file.clone().expect("the send answer carries the document");
+    let from_read = match &a.get_messages(&[sent.message_id]).await.unwrap()[0] {
+        ChannelMessage::Document { file, .. } => file.clone(),
+        other => panic!("{other:?}"),
+    };
+    for (what, file) in [("A's send answer", &from_send), ("A's getMessages", &from_read)] {
+        match b.get_file(file, 0, 256 * 1024).await {
+            Ok(bytes) => println!("B with {what}: {} B, matches = {}", bytes.len(), bytes[..] == data[..bytes.len()]),
+            Err(e) => println!("B with {what}: {e:#}"),
+        }
+    }
+    a.delete_messages(&[sent.message_id]).await.unwrap();
+}

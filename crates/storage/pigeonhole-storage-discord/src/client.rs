@@ -31,7 +31,11 @@ const RETRY: Retry = Retry {
     attempts: 6,
     backoff: Duration::from_millis(200),
     max_backoff: Duration::from_millis(6400),
+    give_way: false,
 };
+/// A member of a [`PooledDiscord`](crate::PooledDiscord): a 429 ends the
+/// call at once, so that the pool may move it to another bot.
+const RETRY_IN_POOL: Retry = Retry { give_way: true, ..RETRY };
 
 /// Milliseconds since Unix epoch encoded in a Discord snowflake.
 pub fn snowflake_timestamp_ms(id: u64) -> u64 {
@@ -150,7 +154,7 @@ impl DiscordClient {
 
     /// Channel `channel_id` through this client.
     pub fn channel(&self, channel_id: u64, limiter: Arc<ChatLimiter>) -> DiscordChannel {
-        DiscordChannel { client: self.clone(), channel_id, limiter }
+        DiscordChannel { client: self.clone(), channel_id, limiter, retry: RETRY }
     }
 
     fn url(&self, path: &str) -> String {
@@ -163,11 +167,12 @@ impl DiscordClient {
     async fn request(
         &self,
         limiter: &ChatLimiter,
+        retry: &Retry,
         call: &Call,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<Answer> {
         let what = call.what;
-        let answer = pigeonhole_limits::run(Some(limiter), call, &RETRY, classify, || async {
+        let answer = pigeonhole_limits::run(Some(limiter), call, retry, classify, || async {
             let resp = build().send().await.map_err(AttemptFailed::Network)?;
             let status = resp.status().as_u16();
             let headers = resp.headers().clone();
@@ -200,7 +205,7 @@ impl DiscordClient {
     /// rights (`chain`) show at the first use.
     pub async fn ensure_permissions(&self, channel_id: u64, chain: bool, limiter: &ChatLimiter) -> Result<()> {
         let path = format!("channels/{channel_id}");
-        let a = self.request(limiter, &GET_CHANNEL, || self.http.get(self.url(&path))).await?;
+        let a = self.request(limiter, &RETRY, &GET_CHANNEL, || self.http.get(self.url(&path))).await?;
         if a.status != 200 {
             bail!("channel {channel_id}: answered {} (is the bot in this guild and allowed to view it?)", a.status);
         }
@@ -210,7 +215,7 @@ impl DiscordClient {
             bail!("channel {channel_id} is of type {kind}: the log needs a text channel");
         }
         let path = format!("channels/{channel_id}/messages?limit=1");
-        let a = self.request(limiter, &READ_HISTORY, || self.http.get(self.url(&path))).await?;
+        let a = self.request(limiter, &RETRY, &READ_HISTORY, || self.http.get(self.url(&path))).await?;
         if a.status != 200 {
             bail!("channel {channel_id}: cannot read the history ({})", a.status);
         }
@@ -224,11 +229,23 @@ pub struct DiscordChannel {
     client: DiscordClient,
     channel_id: u64,
     limiter: Arc<ChatLimiter>,
+    retry: Retry,
 }
 
 impl DiscordChannel {
     pub fn client(&self) -> &DiscordClient {
         &self.client
+    }
+
+    pub fn limiter(&self) -> &Arc<ChatLimiter> {
+        &self.limiter
+    }
+
+    /// The same channel as a member of a [`PooledDiscord`](crate::PooledDiscord):
+    /// a 429 ends a call at once instead of being waited out (unless the
+    /// call's outcome is unknown), so the pool can move it to another bot.
+    pub fn in_pool(&self) -> Self {
+        Self { retry: RETRY_IN_POOL, ..self.clone() }
     }
 
     fn path(&self, rest: &str) -> String {
@@ -238,7 +255,7 @@ impl DiscordChannel {
     async fn delete_one(&self, id: u64) -> Result<()> {
         let path = self.path(&format!("messages/{id}"));
         let c = &self.client;
-        let a = c.request(&self.limiter, &DELETE_MESSAGE, || c.http.delete(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &self.retry, &DELETE_MESSAGE, || c.http.delete(c.url(&path))).await?;
         match a.status {
             200..=299 | 404 => Ok(()),
             s => bail!("delete message {id}: {s} {}", a.body),
@@ -312,14 +329,14 @@ impl DiscordApi for DiscordChannel {
         let c = &self.client;
         let a = match file {
             None => {
-                c.request(&self.limiter, &SEND_MESSAGE, || c.http.post(c.url(&path)).json(&payload))
+                c.request(&self.limiter, &self.retry, &SEND_MESSAGE, || c.http.post(c.url(&path)).json(&payload))
                     .await?
             }
             Some((name, data)) => {
                 let _upload = self.limiter.acquire_upload().await;
                 payload["attachments"] = serde_json::json!([{ "id": 0, "filename": name }]);
                 let payload = payload.to_string();
-                c.request(&self.limiter, &SEND_ATTACHMENT, || {
+                c.request(&self.limiter, &self.retry, &SEND_ATTACHMENT, || {
                     let part = Part::stream_with_length(reqwest::Body::from(data.clone()), data.len() as u64)
                         .file_name(name.to_string())
                         .mime_str("application/octet-stream")
@@ -339,7 +356,7 @@ impl DiscordApi for DiscordChannel {
     async fn get_message(&self, id: u64) -> Result<Option<DcMessage>> {
         let path = self.path(&format!("messages/{id}"));
         let c = &self.client;
-        let a = c.request(&self.limiter, &GET_MESSAGE, || c.http.get(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &self.retry, &GET_MESSAGE, || c.http.get(c.url(&path))).await?;
         match a.status {
             200 => Ok(Some(message(a.body)?)),
             404 => Ok(None),
@@ -357,7 +374,7 @@ impl DiscordApi for DiscordChannel {
         }
         let path = self.path(&query);
         let c = &self.client;
-        let a = c.request(&self.limiter, &LIST_MESSAGES, || c.http.get(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &self.retry, &LIST_MESSAGES, || c.http.get(c.url(&path))).await?;
         if a.status != 200 {
             bail!("list messages: {} {}", a.status, a.body);
         }
@@ -387,7 +404,7 @@ impl DiscordApi for DiscordChannel {
             let path = self.path("messages/bulk-delete");
             let c = &self.client;
             let a = c
-                .request(&self.limiter, &BULK_DELETE, || c.http.post(c.url(&path)).json(&body))
+                .request(&self.limiter, &self.retry, &BULK_DELETE, || c.http.post(c.url(&path)).json(&body))
                 .await?;
             if !(200..300).contains(&a.status) {
                 debug!(status = a.status, "bulk delete refused; one by one");
@@ -410,7 +427,7 @@ impl DiscordApi for DiscordChannel {
         let pacer = crate::pacer::threads_of(&c.app_id());
         pacer.wait().await;
         let a = c
-            .request(&self.limiter, &START_THREAD, || c.http.post(c.url(&path)).json(&body))
+            .request(&self.limiter, &self.retry, &START_THREAD, || c.http.post(c.url(&path)).json(&body))
             .await?;
         pacer.observe(a.remaining, a.reset_after);
         match (a.status, code(&a.body)) {
@@ -424,7 +441,7 @@ impl DiscordApi for DiscordChannel {
     async fn thread_name(&self, message_id: u64) -> Result<Option<String>> {
         let path = format!("channels/{message_id}");
         let c = &self.client;
-        let a = c.request(&self.limiter, &GET_THREAD, || c.http.get(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &self.retry, &GET_THREAD, || c.http.get(c.url(&path))).await?;
         match a.status {
             200 => Ok(a.body["name"].as_str().map(str::to_string)),
             404 => Ok(None),
@@ -437,7 +454,7 @@ impl DiscordApi for DiscordChannel {
         let body = serde_json::json!({ "archived": true });
         let c = &self.client;
         let a = c
-            .request(&self.limiter, &ARCHIVE_THREAD, || c.http.patch(c.url(&path)).json(&body))
+            .request(&self.limiter, &self.retry, &ARCHIVE_THREAD, || c.http.patch(c.url(&path)).json(&body))
             .await?;
         match a.status {
             200..=299 => Ok(()),
@@ -448,7 +465,7 @@ impl DiscordApi for DiscordChannel {
     async fn delete_thread(&self, message_id: u64) -> Result<()> {
         let path = format!("channels/{message_id}");
         let c = &self.client;
-        let a = c.request(&self.limiter, &DELETE_THREAD, || c.http.delete(c.url(&path))).await?;
+        let a = c.request(&self.limiter, &self.retry, &DELETE_THREAD, || c.http.delete(c.url(&path))).await?;
         match a.status {
             200..=299 | 404 => Ok(()),
             s => bail!("delete thread {message_id}: {s} {}", a.body),

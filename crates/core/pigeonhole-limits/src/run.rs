@@ -4,7 +4,7 @@
 //! (docs/shared-limiter.md, § The API). The services bring the call and its
 //! `classify`; nothing here knows Telegram or Discord.
 
-use crate::{record_throttle, ChatLimiter, Level, Spend};
+use crate::{record_retry_wait, record_throttle, ChatLimiter, Level, Spend};
 use std::future::Future;
 use std::time::Duration;
 use tracing::warn;
@@ -47,6 +47,12 @@ pub struct Retry {
     /// The first backoff after a transient failure, doubled up to `max_backoff`.
     pub backoff: Duration,
     pub max_backoff: Duration,
+    /// In a [`Pool`](crate::Pool): a rate limit ends the call at once
+    /// ([`Failed::RateLimited`], the bucket cooled), so that the pool may
+    /// move the operation to another bot. Not once an attempt of the call
+    /// failed transiently: its outcome is unknown, and only this bot (with
+    /// the same `random_id` / nonce) can repeat it without posting twice.
+    pub give_way: bool,
 }
 
 /// How a call failed for good.
@@ -78,9 +84,16 @@ where
     let deadline = started + retry.deadline;
     let mut backoff = retry.backoff;
     let mut tries = 0;
+    // An attempt failed with an unknown outcome: the call stays on this bot.
+    let mut pinned = false;
+    // When the last rate limit came: the wait of the retry after it is measured.
+    let mut limited_at = None;
     loop {
         if let Some(limiter) = limiter {
             limiter.acquire(call.spend).await;
+        }
+        if let Some(at) = limited_at.take() {
+            record_retry_wait(call.service, call.what, tokio::time::Instant::now() - at);
         }
         tries += 1;
         let err = match attempt().await {
@@ -95,12 +108,15 @@ where
                 if let (Some(limiter), Some(level)) = (limiter, level.or(call.cools)) {
                     limiter.cool(call.spend, level, after);
                 }
-                if last_try || tokio::time::Instant::now() + after >= deadline {
+                let give_way = retry.give_way && !pinned;
+                if give_way || last_try || tokio::time::Instant::now() + after >= deadline {
                     return Err(Failed::RateLimited { retry_after: after, last: err });
                 }
+                limited_at = Some(tokio::time::Instant::now());
                 after
             }
             Verdict::Transient => {
+                pinned = true;
                 let wait = backoff;
                 backoff = (backoff * 2).min(retry.max_backoff);
                 if last_try || tokio::time::Instant::now() + wait >= deadline {
@@ -128,6 +144,7 @@ mod tests {
         attempts: u32::MAX,
         backoff: Duration::from_millis(500),
         max_backoff: Duration::from_secs(16),
+        give_way: false,
     };
 
     #[derive(Debug, PartialEq)]
@@ -239,5 +256,40 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         run(Some(&lim), &cdn, &RETRY, classify, || async { Ok::<_, E>(()) }).await.unwrap();
         assert_eq!(t0.elapsed(), Duration::ZERO, "a CDN read takes nothing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn giving_way_ends_a_rate_limited_call_unless_its_outcome_is_unknown() {
+        let lim = ChatLimiter::new(limits(Rate::new(1000.0, 1000.0)));
+        let give_way = Retry { give_way: true, ..RETRY };
+        let tries = AtomicU32::new(0);
+        let r = run(Some(&lim), &CALL, &give_way, classify, || {
+            tries.fetch_add(1, Ordering::SeqCst);
+            async { Err::<(), _>(E::Flood(40)) }
+        })
+        .await;
+        assert!(matches!(r, Err(Failed::RateLimited { .. })));
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "given way at the first flood");
+        assert!(lim.peek_wait(SEND) > Duration::from_secs(30), "with the bucket cooled");
+
+        // A lost answer first: the call may have been applied, so it waits
+        // the flood out on this bot instead of moving.
+        let lim = ChatLimiter::new(limits(Rate::new(1000.0, 1000.0)));
+        let tries = AtomicU32::new(0);
+        let t0 = tokio::time::Instant::now();
+        let v = run(Some(&lim), &CALL, &give_way, classify, || {
+            let n = tries.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match n {
+                    0 => Err(E::Lost),
+                    1 => Err(E::Flood(40)),
+                    _ => Ok(7),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((v, tries.load(Ordering::SeqCst)), (7, 3));
+        assert!(t0.elapsed() >= Duration::from_secs(40));
     }
 }

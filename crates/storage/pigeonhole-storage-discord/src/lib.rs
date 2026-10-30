@@ -12,11 +12,13 @@ mod client;
 pub mod limits;
 pub mod fake;
 mod pacer;
+mod pool;
 mod store;
 
 pub use api::{CdnStale, DcAttachment, DcMessage, DiscordApi, ThreadStart, CONTENT_MAX_CHARS, PAGE};
 pub use client::{snowflake_bulk_deletable, snowflake_timestamp_ms, DiscordChannel, DiscordClient, DISCORD_EPOCH_MS};
 pub use limits::limits;
+pub use pool::PooledDiscord;
 pub use pigeonhole_storage_api::{BlobBackend, Chain, LeaseChain};
 pub use store::{blob_nonce, discord_fingerprint, discord_location, DiscordBlobStore, DiscordId};
 

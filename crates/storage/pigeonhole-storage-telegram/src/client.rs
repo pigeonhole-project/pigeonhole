@@ -34,7 +34,11 @@ const RETRY: Retry = Retry {
     attempts: u32::MAX,
     backoff: Duration::from_millis(500),
     max_backoff: Duration::from_secs(16),
+    give_way: false,
 };
+/// A member of a [`PooledChannel`](crate::PooledChannel): a flood wait ends
+/// the call at once, so that the pool may move it to another bot.
+const RETRY_IN_POOL: Retry = Retry { give_way: true, ..RETRY };
 /// Upload parts of one file in flight.
 const PARTS_IN_FLIGHT: usize = 4;
 /// Upload part size (the most Telegram takes).
@@ -143,7 +147,7 @@ impl TelegramMtproto {
                 }
             });
         }
-        this.invoke(Lane::Meta, None, None, &functions::updates::GetState {}).await?;
+        this.invoke(Lane::Meta, None, None, &RETRY, &functions::updates::GetState {}).await?;
         Ok((this, merged))
     }
 
@@ -232,9 +236,10 @@ impl TelegramMtproto {
         lane: Lane,
         dc: Option<i32>,
         limiter: Option<&ChatLimiter>,
+        retry: &Retry,
         request: &R,
     ) -> Result<R::Return> {
-        metered(&R::CALL, limiter, || async move {
+        metered(&R::CALL, limiter, retry, || async move {
             match dc {
                 Some(dc) => self.in_dc(lane, dc, request).await,
                 None => self.home(lane, request).await,
@@ -288,7 +293,7 @@ impl TelegramMtproto {
             id: vec![types::InputChannel { channel_id, access_hash: 0 }.into()],
         };
         let chats = self
-            .invoke(lane, None, Some(limiter.as_ref()), &request)
+            .invoke(lane, None, Some(limiter.as_ref()), &RETRY, &request)
             .await
             .with_context(|| format!("chat {chat_id}: is the bot a member of this channel?"))?;
         let channel = chats
@@ -310,7 +315,7 @@ impl TelegramMtproto {
         }
         let access_hash = channel.access_hash.context("channel without an access hash")?;
         debug!(chat_id, title = %channel.title, "resolved channel");
-        Ok(MtprotoChannel { client: self.clone(), lane, channel_id, access_hash, limiter })
+        Ok(MtprotoChannel { client: self.clone(), lane, channel_id, access_hash, limiter, retry: RETRY })
     }
 }
 
@@ -372,12 +377,17 @@ fn classify(e: &InvocationError) -> Verdict {
 
 /// `attempt` through the limiter; a failure for good as our error types: a
 /// flood wait that does not fit is [`RateLimited`].
-async fn metered<T, Fut>(call: &Call, limiter: Option<&ChatLimiter>, attempt: impl FnMut() -> Fut) -> Result<T>
+async fn metered<T, Fut>(
+    call: &Call,
+    limiter: Option<&ChatLimiter>,
+    retry: &Retry,
+    attempt: impl FnMut() -> Fut,
+) -> Result<T>
 where
     Fut: std::future::Future<Output = Result<T, InvocationError>>,
 {
     let what = call.what;
-    pigeonhole_limits::run(limiter, call, &RETRY, classify, attempt).await.map_err(|f| match f {
+    pigeonhole_limits::run(limiter, call, retry, classify, attempt).await.map_err(|f| match f {
         Failed::RateLimited { retry_after, .. } => anyhow::Error::new(RateLimited { method: what, retry_after }),
         Failed::Unavailable { last, after } => anyhow::Error::new(Unavailable(what.to_string()))
             .context(format!("{what}: {last} (still failing after {after:?})")),
@@ -400,6 +410,7 @@ pub struct MtprotoChannel {
     channel_id: i64,
     access_hash: i64,
     limiter: Arc<ChatLimiter>,
+    retry: Retry,
 }
 
 impl MtprotoChannel {
@@ -420,9 +431,16 @@ impl MtprotoChannel {
         Self { lane, ..self.clone() }
     }
 
+    /// The same channel as a member of a [`PooledChannel`](crate::PooledChannel):
+    /// a flood wait ends a call at once instead of being waited out (unless
+    /// the call's outcome is unknown), so the pool can move it to another bot.
+    pub fn in_pool(&self) -> Self {
+        Self { retry: RETRY_IN_POOL, ..self.clone() }
+    }
+
     /// `request` on this channel's lane, metered by its limiter.
     async fn invoke<R: Budgeted>(&self, dc: Option<i32>, request: &R) -> Result<R::Return> {
-        self.client.invoke(self.lane, dc, Some(&self.limiter), request).await
+        self.client.invoke(self.lane, dc, Some(&self.limiter), &self.retry, request).await
     }
 
     /// Upload `data` as one file; returns what `sendMedia` takes.
@@ -718,7 +736,7 @@ mod tests {
         let limiter = ChatLimiter::new(crate::limits());
         let t0 = tokio::time::Instant::now();
         let call = <functions::messages::SendMessage as Budgeted>::CALL;
-        let v = metered(&call, Some(&limiter), || {
+        let v = metered(&call, Some(&limiter), &RETRY, || {
             let n = tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move { if n < 2 { Err(rpc(420, "FLOOD_WAIT_5")) } else { Ok(9) } }
         })
@@ -728,7 +746,7 @@ mod tests {
         assert!(t0.elapsed() >= Duration::from_secs(10), "two flood waits of 5 s");
 
         // A wait past CALL_DEADLINE ends the call.
-        let err = metered(&call, None, || async { Err::<(), _>(rpc(420, "FLOOD_WAIT_400")) }).await.unwrap_err();
+        let err = metered(&call, None, &RETRY, || async { Err::<(), _>(rpc(420, "FLOOD_WAIT_400")) }).await.unwrap_err();
         assert!(err.is::<RateLimited>(), "{err:#}");
     }
 }

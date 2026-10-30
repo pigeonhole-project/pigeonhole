@@ -31,7 +31,9 @@ use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 // a bucket's refill and the sleeps waiting for it agree.
 use tokio::time::Instant;
 
+mod pool;
 mod run;
+pub use pool::Pool;
 pub use run::{run, Call, Failed, Retry, Verdict};
 use tracing::debug;
 
@@ -47,12 +49,36 @@ pub const METRICS: &[MetricDoc] = &[
         &["chat", "op"],
         "Time waiting for our own rate-limit buckets of a chat / channel (waits > 0 only)",
     ),
+    MetricDoc::histogram(
+        "pigeonhole_limiter_retry_wait_seconds",
+        &["service", "method"],
+        "From a rate limit to the next attempt of that call on the same bot (the wait plus the tokens after it)",
+    ),
+    MetricDoc::counter(
+        "pigeonhole_pool_calls_total",
+        &["chat", "member"],
+        "Operations a pool of bots ran, by the member (0 = the primary) they ran on",
+    ),
+    MetricDoc::counter(
+        "pigeonhole_pool_moves_total",
+        &["chat"],
+        "Operations a pool moved to another bot after a rate limit (it was not applied)",
+    ),
 ];
 
 /// A chat service told us to wait `d` before calling `method` again.
 pub fn record_throttle(service: &str, method: &str, d: Duration) {
     metrics::histogram!(
         "pigeonhole_backend_throttle_wait_seconds",
+        "service" => service.to_owned(),
+        "method" => method.to_owned()
+    )
+    .record(d.as_secs_f64());
+}
+
+fn record_retry_wait(service: &str, method: &str, d: Duration) {
+    metrics::histogram!(
+        "pigeonhole_limiter_retry_wait_seconds",
         "service" => service.to_owned(),
         "method" => method.to_owned()
     )
@@ -421,6 +447,15 @@ impl ChatLimiter {
             tokio::time::sleep(IDLE_POLL).await;
         }
         record_limiter_wait(&self.chat, "idle", started.elapsed());
+    }
+
+    /// Estimated wait before `spend` could be taken (captures nothing).
+    pub fn peek(&self, spend: Spend) -> Duration {
+        match spend {
+            Spend::Nothing => Duration::ZERO,
+            Spend::Bot => self.bot.calls.peek_wait(),
+            Spend::Class(c) => self.peek_wait(c),
+        }
     }
 
     /// Estimated wait before the next token for `class` (does not capture a token).

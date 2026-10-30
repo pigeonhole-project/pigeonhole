@@ -88,6 +88,28 @@ pub trait ChannelApi: Send + Sync + 'static {
     async fn delete_messages(&self, ids: &[i64]) -> Result<()>;
 }
 
+#[async_trait]
+impl<C: ChannelApi + ?Sized> ChannelApi for std::sync::Arc<C> {
+    fn channel_id(&self) -> i64 {
+        (**self).channel_id()
+    }
+    async fn get_messages(&self, ids: &[i64]) -> Result<Vec<ChannelMessage>> {
+        (**self).get_messages(ids).await
+    }
+    async fn send_document(&self, name: &str, data: Bytes, random_id: i64) -> Result<Sent> {
+        (**self).send_document(name, data, random_id).await
+    }
+    async fn send_text(&self, text: &str, random_id: i64) -> Result<Sent> {
+        (**self).send_text(text, random_id).await
+    }
+    async fn get_file(&self, file: &FileLocation, offset: u64, limit: u64) -> Result<Bytes> {
+        (**self).get_file(file, offset, limit).await
+    }
+    async fn delete_messages(&self, ids: &[i64]) -> Result<()> {
+        (**self).delete_messages(ids).await
+    }
+}
+
 /// `[start, end)` cut into the windows `get_file` takes: aligned to
 /// [`WINDOW`], so none crosses a 1 MiB boundary. Each is `(offset, skip,
 /// take)`: fetch the window at `offset`, keep `take` bytes after `skip`.
