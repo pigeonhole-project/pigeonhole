@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
-use pigeonhole_limits::{ChatLimiter};
+use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_telegram::{ChannelApi, Lane, TelegramBlobStore, MtprotoConfig, TelegramMtproto};
 use std::path::Path;
 use std::sync::Arc;

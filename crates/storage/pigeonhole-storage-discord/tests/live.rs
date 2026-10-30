@@ -7,7 +7,7 @@
 use bytes::Bytes;
 use futures::TryStreamExt;
 use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
-use pigeonhole_limits::{ChatLimiter};
+use pigeonhole_limits::ChatLimiter;
 use pigeonhole_meta::{
     Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogId, LogStore, SnapshotRef, SnapshotStore,
     StoredSnapshot,

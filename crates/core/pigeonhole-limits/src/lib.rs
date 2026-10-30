@@ -397,8 +397,7 @@ impl ChatLimiter {
         self.classes
             .iter()
             .find(|(c, _)| *c == class)
-            .map(|(_, b)| b)
-            .unwrap_or_else(|| panic!("class {class} is not in this limiter's config"))
+            .map_or_else(|| panic!("class {class} is not in this limiter's config"), |(_, b)| b)
     }
 
     /// Take what `spend` names: a class's token and the bot's at once.
