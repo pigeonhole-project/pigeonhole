@@ -231,15 +231,8 @@ impl ChunkState {
             self.check_replica(chunk_id, rep)?;
         }
         blocks.sort_by_key(|b| b.block_no);
-        let rec = ChunkRec {
-            logical_size,
-            crc32,
-            refs: 1,
-            reclaiming: false,
-            created_at,
-            blocks,
-            replicas: BTreeMap::new(),
-        };
+        let rec =
+            ChunkRec { logical_size, crc32, refs: 1, reclaiming: false, created_at, blocks, replicas: BTreeMap::new() };
         self.chunks.insert(chunk_id, rec);
         self.last_chunk_id = self.last_chunk_id.max(chunk_id);
         for rep in replicas {
@@ -292,11 +285,8 @@ impl ChunkState {
 
     /// Missing is fine.
     fn drop_chunk(&mut self, id: ChunkId) {
-        let instances: Vec<String> = self
-            .chunks
-            .get(&id)
-            .map(|c| c.replicas.keys().cloned().collect())
-            .unwrap_or_default();
+        let instances: Vec<String> =
+            self.chunks.get(&id).map(|c| c.replicas.keys().cloned().collect()).unwrap_or_default();
         for instance in instances {
             self.remove_replica(id, &instance);
         }
@@ -357,10 +347,7 @@ impl ChunkRec {
                         PartLayout {
                             first_block: p.first_block,
                             block_count: p.block_count,
-                            locator: BlobLocator {
-                                key: p.sort_key.clone(),
-                                locator: p.locator.clone(),
-                            },
+                            locator: BlobLocator { key: p.sort_key.clone(), locator: p.locator.clone() },
                             blob_id: p.blob_id,
                             block_stored_lens: stored_lens
                                 .get(p.first_block as usize..end)

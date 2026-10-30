@@ -2,9 +2,9 @@
 
 use crate::backend::{bytes_stream, BoxByteStream};
 use crate::erase::DynBlobBackend;
-use crate::upload_pins::{UploadPin, UploadPins};
 use crate::part_packer::{EncodedBlock, PartPacker, PartUploaded};
 use crate::typed::{BlobId, BlobLocator, CostHint, OpKind};
+use crate::upload_pins::{UploadPin, UploadPins};
 use anyhow::{bail, Result};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, StreamExt};
@@ -91,26 +91,18 @@ impl CheapestFirst {
         Self {
             inflight_weight: 0.05,
             close_epsilon: 0.05,
-            inner: Mutex::new(BreakerState {
-                unhealthy: HashMap::new(),
-            }),
+            inner: Mutex::new(BreakerState { unhealthy: HashMap::new() }),
             rng: AtomicU64::new(0xC0FFEE),
         }
     }
 
     pub fn with_weights(inflight_weight: f64, close_epsilon: f64) -> Self {
-        Self {
-            inflight_weight,
-            close_epsilon,
-            ..Self::new()
-        }
+        Self { inflight_weight, close_epsilon, ..Self::new() }
     }
 
     fn tick() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64)
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
     }
 
     fn next_rand(&self) -> u64 {
@@ -175,17 +167,9 @@ impl ReplicaSelector for CheapestFirst {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        let entry = g
-            .unhealthy
-            .entry(instance.to_string())
-            .or_insert(Unhealthy {
-                failures: 0,
-                open_until: 0,
-            });
+        let entry = g.unhealthy.entry(instance.to_string()).or_insert(Unhealthy { failures: 0, open_until: 0 });
         entry.failures = entry.failures.saturating_add(1);
-        let backoff_ms = 1000u64
-            .saturating_mul(1u64 << entry.failures.min(5).saturating_sub(1))
-            .min(30_000);
+        let backoff_ms = 1000u64.saturating_mul(1u64 << entry.failures.min(5).saturating_sub(1)).min(30_000);
         entry.open_until = Self::tick().saturating_add(backoff_ms);
     }
 }
@@ -311,11 +295,7 @@ impl Replicated {
     }
 
     pub fn max_blob_size(&self) -> usize {
-        self.members
-            .iter()
-            .map(|m| m.limits().max_blob_size)
-            .min()
-            .unwrap_or(0)
+        self.members.iter().map(|m| m.limits().max_blob_size).min().unwrap_or(0)
     }
 
     /// A writer for one chunk on the least loaded shard (fewest open
@@ -347,11 +327,7 @@ impl Replicated {
     }
 
     /// Stream stored bytes for `blocks` (half-open block index range), with failover.
-    pub async fn read(
-        &self,
-        replicas: &[ReplicaLayout],
-        blocks: Range<u32>,
-    ) -> Result<BoxByteStream> {
+    pub async fn read(&self, replicas: &[ReplicaLayout], blocks: Range<u32>) -> Result<BoxByteStream> {
         self.read_with_hook(replicas, blocks, None).await
     }
 
@@ -372,10 +348,7 @@ impl Replicated {
 
         let costs: Vec<CostHint> = replicas
             .iter()
-            .map(|r| {
-                self.by_id
-                    .get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None))
-            })
+            .map(|r| self.by_id.get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None)))
             .collect();
         let order = self.selector.rank(replicas, &costs);
         if let Some(&first) = order.first() {
@@ -436,12 +409,7 @@ pub struct ChunkReplicaWriter {
 impl ChunkReplicaWriter {
     /// Sum of unfilled open-part buffers across live members (memory budget).
     pub fn open_part_bytes(&self) -> usize {
-        self.writers
-            .iter()
-            .filter(|w| !w.failed)
-            .filter_map(|w| w.packer.as_ref())
-            .map(|p| p.open_bytes())
-            .sum()
+        self.writers.iter().filter(|w| !w.failed).filter_map(|w| w.packer.as_ref()).map(|p| p.open_bytes()).sum()
     }
 
     /// Fan-out one encoded block to all live members (`Bytes` clone is refcounted).
@@ -533,24 +501,14 @@ impl ChunkReplicaWriter {
         for w in self.writers {
             if !w.failed {
                 crate::metrics::record_parts_per_chunk(&w.instance, w.parts.len());
-                ok.push(ReplicaLayout {
-                    instance: w.instance,
-                    parts: w.parts,
-                });
+                ok.push(ReplicaLayout { instance: w.instance, parts: w.parts });
             }
         }
         if ok.len() < self.write_quorum {
             // Dropping the pins makes the parts sweep orphans.
-            bail!(
-                "write quorum not met: {} successful replicas, need {}",
-                ok.len(),
-                self.write_quorum
-            );
+            bail!("write quorum not met: {} successful replicas, need {}", ok.len(), self.write_quorum);
         }
-        Ok(SealedChunk {
-            layouts: ok,
-            pins: self.pins,
-        })
+        Ok(SealedChunk { layouts: ok, pins: self.pins })
     }
 }
 
@@ -599,11 +557,7 @@ impl ReadState {
             }
 
             if self.active.is_none() && !self.open_next_part().await? {
-                bail!(
-                    "no healthy replica for blocks {}..{}",
-                    self.next_block,
-                    self.end_block
-                );
+                bail!("no healthy replica for blocks {}..{}", self.next_block, self.end_block);
             }
 
             // Buffer a whole part segment before yielding so a mid-stream failure
@@ -612,8 +566,7 @@ impl ReadState {
             let mut buf = BytesMut::new();
             let mut failed = false;
             loop {
-                let done = active.expected_len != u64::MAX
-                    && (buf.len() as u64) >= active.expected_len;
+                let done = active.expected_len != u64::MAX && (buf.len() as u64) >= active.expected_len;
                 if done {
                     break;
                 }
@@ -677,10 +630,7 @@ impl ReadState {
             let costs: Vec<CostHint> = self
                 .replicas
                 .iter()
-                .map(|r| {
-                    self.backends
-                        .get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None))
-                })
+                .map(|r| self.backends.get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None)))
                 .collect();
             self.order = self.selector.rank(&self.replicas, &costs);
             self.tried.clear();
@@ -783,13 +733,11 @@ fn plan_part_read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pigeonhole_storage_api::{NotFound, Unavailable};
     use crate::erase::{erase, SharedBackend};
-    use crate::typed::{
-        CostHint, InstanceInfo, InstanceRole, OpKind, BlobBackend,
-    };
+    use crate::typed::{BlobBackend, CostHint, InstanceInfo, InstanceRole, OpKind};
     use crate::{collect_stream, slice_range};
     use async_trait::async_trait;
+    use pigeonhole_storage_api::{NotFound, Unavailable};
     use pigeonhole_types::BackendLimits;
     use std::sync::atomic::AtomicU32;
     use std::sync::Mutex as StdMutex;
@@ -823,11 +771,7 @@ mod tests {
                     location: format!("memory:{id}"),
                     role: InstanceRole::ReadWrite,
                 },
-                limits: BackendLimits {
-                    max_blob_size,
-                    supports_range: RangeSupport::BestEffort,
-                    can_list: false,
-                },
+                limits: BackendLimits { max_blob_size, supports_range: RangeSupport::BestEffort, can_list: false },
                 next: AtomicU64::new(1),
                 data: StdMutex::new(HashMap::new()),
                 fail_get_after: StdMutex::new(None),
@@ -844,8 +788,7 @@ mod tests {
         }
 
         fn set_cost_wait(self: &Arc<Self>, secs: f64) {
-            self.cost_wait
-                .store((secs * 1000.0) as u64, Ordering::Relaxed);
+            self.cost_wait.store((secs * 1000.0) as u64, Ordering::Relaxed);
         }
     }
 
@@ -890,13 +833,8 @@ mod tests {
             if self.unavailable.load(Ordering::Relaxed) {
                 return Err(Unavailable("get".into()).into());
             }
-            let data = self
-                .data
-                .lock()
-                .unwrap()
-                .get(&id.key)
-                .cloned()
-                .ok_or_else(|| NotFound(format!("blob {}", id.key)))?;
+            let data =
+                self.data.lock().unwrap().get(&id.key).cloned().ok_or_else(|| NotFound(format!("blob {}", id.key)))?;
             let sliced = slice_range(data, range)?;
             let n = self.get_count.fetch_add(1, Ordering::Relaxed) + 1;
             let fail = *self.fail_get_after.lock().unwrap();
@@ -904,10 +842,7 @@ mod tests {
                 if n == after_get {
                     let n = after_bytes.min(sliced.len());
                     let head = sliced.slice(0..n);
-                    return Ok(Box::pin(stream::iter([
-                        Ok(head),
-                        Err(Unavailable("mid-stream break".into()).into()),
-                    ])));
+                    return Ok(Box::pin(stream::iter([Ok(head), Err(Unavailable("mid-stream break".into()).into())])));
                 }
             }
             Ok(bytes_stream(sliced))
@@ -920,8 +855,14 @@ mod tests {
             Ok(())
         }
         async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
-            let mut keys: Vec<u64> =
-                self.data.lock().unwrap().keys().copied().filter(|&k| k <= upto && after.is_none_or(|a| k > a)).collect();
+            let mut keys: Vec<u64> = self
+                .data
+                .lock()
+                .unwrap()
+                .keys()
+                .copied()
+                .filter(|&k| k <= upto && after.is_none_or(|a| k > a))
+                .collect();
             keys.sort_unstable();
             keys.truncate(limit);
             Ok(keys)
@@ -929,17 +870,10 @@ mod tests {
     }
 
     fn block(fill: u8, n: usize) -> EncodedBlock {
-        EncodedBlock {
-            stored: Bytes::from(vec![fill; n]),
-            logical_len: n as u32,
-            codec: "raw".into(),
-        }
+        EncodedBlock { stored: Bytes::from(vec![fill; n]), logical_len: n as u32, codec: "raw".into() }
     }
 
-    async fn write_blocks(
-        rep: &Replicated,
-        blocks: &[EncodedBlock],
-    ) -> Result<Vec<ReplicaLayout>> {
+    async fn write_blocks(rep: &Replicated, blocks: &[EncodedBlock]) -> Result<Vec<ReplicaLayout>> {
         let mut w = rep.chunk_writer();
         for b in blocks {
             w.push(b.clone()).await?;
@@ -952,18 +886,9 @@ mod tests {
         const MIB: usize = 1024 * 1024;
         let a = MockMem::new("a-19", 19 * MIB);
         let b = MockMem::new("b-10", 10 * MIB);
-        let rep = Replicated::new(
-            vec![a.erase(), b.erase()],
-            2,
-            Arc::new(CheapestFirst::new()),
-        )
-        .unwrap();
+        let rep = Replicated::new(vec![a.erase(), b.erase()], 2, Arc::new(CheapestFirst::new())).unwrap();
 
-        let blocks = vec![
-            block(1, 6 * MIB),
-            block(2, 6 * MIB),
-            block(3, 6 * MIB),
-        ];
+        let blocks = vec![block(1, 6 * MIB), block(2, 6 * MIB), block(3, 6 * MIB)];
         let layouts = write_blocks(&rep, &blocks).await.unwrap();
         assert_eq!(layouts.len(), 2);
         let la = layouts.iter().find(|l| l.instance == "a-19").unwrap();
@@ -973,14 +898,10 @@ mod tests {
 
         let expect: Bytes = blocks.iter().flat_map(|b| b.stored.iter().copied()).collect();
         for layout in &layouts {
-            let got = collect_stream(rep.read(std::slice::from_ref(layout), 0..3).await.unwrap())
-                .await
-                .unwrap();
+            let got = collect_stream(rep.read(std::slice::from_ref(layout), 0..3).await.unwrap()).await.unwrap();
             assert_eq!(got, expect, "mismatch on {}", layout.instance);
         }
-        let got_both = collect_stream(rep.read(&layouts, 0..3).await.unwrap())
-            .await
-            .unwrap();
+        let got_both = collect_stream(rep.read(&layouts, 0..3).await.unwrap()).await.unwrap();
         assert_eq!(got_both, expect);
     }
 
@@ -1024,20 +945,13 @@ mod tests {
     async fn unavailable_replica_failover() {
         let a = MockMem::new("a", 1024);
         let b = MockMem::new("b", 1024);
-        let rep = Replicated::new(
-            vec![a.erase(), b.erase()],
-            2,
-            Arc::new(CheapestFirst::new()),
-        )
-        .unwrap();
+        let rep = Replicated::new(vec![a.erase(), b.erase()], 2, Arc::new(CheapestFirst::new())).unwrap();
         let blocks = vec![block(9, 100), block(8, 100)];
         let layouts = write_blocks(&rep, &blocks).await.unwrap();
         a.unavailable.store(true, Ordering::Relaxed);
 
         let expect: Bytes = blocks.iter().flat_map(|b| b.stored.iter().copied()).collect();
-        let got = collect_stream(rep.read(&layouts, 0..2).await.unwrap())
-            .await
-            .unwrap();
+        let got = collect_stream(rep.read(&layouts, 0..2).await.unwrap()).await.unwrap();
         assert_eq!(got, expect);
     }
 
@@ -1047,21 +961,14 @@ mod tests {
         let b = MockMem::new("b", 10_000);
         a.set_cost_wait(0.0);
         b.set_cost_wait(10.0); // prefer a
-        let rep = Replicated::new(
-            vec![a.erase(), b.erase()],
-            2,
-            Arc::new(CheapestFirst::new()),
-        )
-        .unwrap();
+        let rep = Replicated::new(vec![a.erase(), b.erase()], 2, Arc::new(CheapestFirst::new())).unwrap();
         let blocks = vec![block(1, 500), block(2, 500)];
         let layouts = write_blocks(&rep, &blocks).await.unwrap();
 
         *a.fail_get_after.lock().unwrap() = Some((1, 100));
 
         let expect: Bytes = blocks.iter().flat_map(|b| b.stored.iter().copied()).collect();
-        let got = collect_stream(rep.read(&layouts, 0..2).await.unwrap())
-            .await
-            .unwrap();
+        let got = collect_stream(rep.read(&layouts, 0..2).await.unwrap()).await.unwrap();
         assert_eq!(got, expect);
     }
 
@@ -1090,18 +997,10 @@ mod tests {
         let a = MockMem::new("a", 10_000);
         let b = MockMem::new("b", 10_000);
         b.unavailable.store(true, Ordering::Relaxed);
-        let rep = Replicated::new(
-            vec![a.erase(), b.erase()],
-            2,
-            Arc::new(CheapestFirst::new()),
-        )
-        .unwrap();
+        let rep = Replicated::new(vec![a.erase(), b.erase()], 2, Arc::new(CheapestFirst::new())).unwrap();
         let mut w = rep.chunk_writer();
         w.push(block(1, 100)).await.unwrap();
         let err = w.finish().await.unwrap_err();
-        assert!(
-            err.to_string().contains("write quorum"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("write quorum"), "{err}");
     }
 }

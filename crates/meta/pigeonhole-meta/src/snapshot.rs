@@ -12,10 +12,10 @@
 use crate::{LogId, Position};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use bytes::Bytes;
 use pigeonhole_storage_api::{collect_stream, BlobBackend, Chain};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Version of the stored envelope ([`StoredSnapshot`] on disk / in a chat).
 pub const SNAPSHOT_STORE_FORMAT: u32 = 1;

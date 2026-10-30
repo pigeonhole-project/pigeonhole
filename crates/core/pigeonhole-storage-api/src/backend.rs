@@ -22,9 +22,7 @@ impl OrderedKey for u64 {
         self.to_be_bytes().to_vec()
     }
     fn from_bytes(b: &[u8]) -> Result<Self> {
-        let arr: [u8; 8] = b
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("u64 key: expected 8 bytes"))?;
+        let arr: [u8; 8] = b.try_into().map_err(|_| anyhow::anyhow!("u64 key: expected 8 bytes"))?;
         Ok(u64::from_be_bytes(arr))
     }
 }
@@ -36,9 +34,7 @@ impl OrderedKey for i64 {
         u.to_be_bytes().to_vec()
     }
     fn from_bytes(b: &[u8]) -> Result<Self> {
-        let arr: [u8; 8] = b
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("i64 key: expected 8 bytes"))?;
+        let arr: [u8; 8] = b.try_into().map_err(|_| anyhow::anyhow!("i64 key: expected 8 bytes"))?;
         let u = u64::from_be_bytes(arr) ^ (1u64 << 63);
         Ok(u as i64)
     }
@@ -99,11 +95,7 @@ pub struct CostHint {
 
 impl CostHint {
     pub fn free() -> Self {
-        Self {
-            wait_secs: 0.0,
-            latency_ewma_secs: 0.0,
-            inflight: 0,
-        }
+        Self { wait_secs: 0.0, latency_ewma_secs: 0.0, inflight: 0 }
     }
 
     pub fn score(&self, inflight_weight: f64) -> f64 {
@@ -188,16 +180,10 @@ impl<B: BlobBackend> BlobBackend for std::sync::Arc<B> {
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
         (**self).delete(keys).await
     }
-    async fn candidates(
-        &self,
-        after: Option<Self::Key>,
-        upto: Self::Key,
-        limit: usize,
-    ) -> Result<Vec<Self::Key>> {
+    async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
         (**self).candidates(after, upto, limit).await
     }
 }
-
 
 #[cfg(test)]
 mod blob_id_tests {
@@ -220,14 +206,11 @@ mod tests {
 
     #[test]
     fn i64_keys_preserve_order() {
-        let mut vals = [ -3i64, 0, 1, -1, i64::MIN, i64::MAX, 42];
+        let mut vals = [-3i64, 0, 1, -1, i64::MIN, i64::MAX, 42];
         let mut encoded: Vec<_> = vals.iter().map(|v| (*v, v.to_bytes())).collect();
         encoded.sort_by(|a, b| a.1.cmp(&b.1));
         vals.sort();
-        let decoded: Vec<i64> = encoded
-            .iter()
-            .map(|(_, b)| i64::from_bytes(b).unwrap())
-            .collect();
+        let decoded: Vec<i64> = encoded.iter().map(|(_, b)| i64::from_bytes(b).unwrap()).collect();
         assert_eq!(decoded, vals.to_vec());
     }
 

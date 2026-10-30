@@ -99,10 +99,7 @@ where
     assert!(matches!(b.claim(1).await, Err(LogError::Fenced { current: 1 })));
     assert_eq!(b.claim(2).await.unwrap().position, 1, "acknowledged entries are ≤ the head");
     assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Fenced { current: 2 })));
-    assert!(matches!(
-        a.rebase(1, base(1), 1).await,
-        Err(LogError::Fenced { current: 2 })
-    ));
+    assert!(matches!(a.rebase(1, base(1), 1).await, Err(LogError::Fenced { current: 2 })));
     let head = b.append(2, &[entry(2)]).await.unwrap();
     assert_eq!(head, 2);
     let d = b.discover().await.unwrap().unwrap();
@@ -160,7 +157,11 @@ where
     let again = open().await;
     let d = again.discover().await.unwrap().unwrap();
     assert_eq!((d.base, d.older), (Some(base(5)), vec![base(4)]));
-    assert_eq!(read_all(again.as_ref(), 4, d.head).await.unwrap(), vec![(5, entry(5)), (6, entry(6))], "from an older base");
+    assert_eq!(
+        read_all(again.as_ref(), 4, d.head).await.unwrap(),
+        vec![(5, entry(5)), (6, entry(6))],
+        "from an older base"
+    );
     assert!(matches!(read_all(again.as_ref(), 2, d.head).await, Err(LogError::Lost(_))), "behind the kept bases");
 
     // Keeping fewer drops the rest at once.

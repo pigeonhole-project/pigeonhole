@@ -1,10 +1,8 @@
 //! The Discord blob backend on a fake channel.
 
 use bytes::Bytes;
-use pigeonhole_storage_api::{
-    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole,
-};
 use pigeonhole_limits::{ChatLimiter, Rate};
+use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
 use pigeonhole_storage_discord::fake::FakeDiscord;
 use pigeonhole_storage_discord::{DiscordBlobStore, DiscordId};
 use std::sync::Arc;
@@ -69,8 +67,15 @@ async fn small_blobs_are_text_messages() {
     assert_eq!(collect_stream(other.get(&id, None).await.unwrap()).await.unwrap(), small);
     assert_eq!(collect_stream(other.get(&id, Some(10..20)).await.unwrap()).await.unwrap(), small.slice(10..20));
     let after = channel.calls();
-    assert_eq!((after.get_message, after.download), (before.get_message, before.download), "the listing brought the bytes");
-    assert_eq!(collect_stream(other.get(&big, Some(100..200)).await.unwrap()).await.unwrap(), pattern(5_000).slice(100..200));
+    assert_eq!(
+        (after.get_message, after.download),
+        (before.get_message, before.download),
+        "the listing brought the bytes"
+    );
+    assert_eq!(
+        collect_stream(other.get(&big, Some(100..200)).await.unwrap()).await.unwrap(),
+        pattern(5_000).slice(100..200)
+    );
 }
 
 #[tokio::test]

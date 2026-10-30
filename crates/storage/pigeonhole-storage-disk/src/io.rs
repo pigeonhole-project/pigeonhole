@@ -127,10 +127,15 @@ impl DirLock for StdLock {
 #[allow(unsafe_code)]
 fn punch(file: &File, off: u64, len: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    let arg = libc::fpunchhole_t { fp_flags: 0, reserved: 0, fp_offset: off as libc::off_t, fp_length: len as libc::off_t };
+    let arg =
+        libc::fpunchhole_t { fp_flags: 0, reserved: 0, fp_offset: off as libc::off_t, fp_length: len as libc::off_t };
     // SAFETY: a valid descriptor and a pointer to a live fpunchhole_t.
     let r = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &arg) };
-    if r == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if r == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -146,7 +151,11 @@ fn punch(file: &File, off: u64, len: u64) -> io::Result<()> {
             len as libc::off_t,
         )
     };
-    if r == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if r == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Without hole punching the space stays until the whole segment dies.
@@ -194,13 +203,7 @@ struct SimData {
 impl SimFs {
     /// A disk whose sync takes `sync_cost` of virtual time.
     pub fn new(sync_cost: Duration) -> Self {
-        Self {
-            inner: Arc::new(SimInner {
-                state: Mutex::default(),
-                sync_cost,
-                cost: Mutex::new(Duration::ZERO),
-            }),
-        }
+        Self { inner: Arc::new(SimInner { state: Mutex::default(), sync_cost, cost: Mutex::new(Duration::ZERO) }) }
     }
 
     /// Power loss: every file falls back to what was synced; a file whose

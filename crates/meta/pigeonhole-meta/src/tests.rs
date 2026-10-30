@@ -120,7 +120,6 @@ async fn eventually(what: &str, f: impl Fn() -> bool) {
     }
 }
 
-
 #[tokio::test]
 async fn commit_and_reject_both_consume_a_position() {
     let dir = tempfile::tempdir().unwrap();
@@ -543,7 +542,9 @@ async fn a_boot_falls_back_to_an_older_base_when_the_newest_snapshot_is_unreadab
         let snapshots =
             Arc::new(Unreadable { inner: Arc::new(BlobSnapshotStore::new(snap_chat)), bad: Mutex::default() });
         let opts = MetaOptions { snapshot_every: Some(5), keep_snapshots: keep, ..MetaOptions::default() };
-        let open = || MetaStore::open(Arc::new(ChainLogStore::new(log_chat.clone())), snapshots.clone(), counter(), opts.clone());
+        let open = || {
+            MetaStore::open(Arc::new(ChainLogStore::new(log_chat.clone())), snapshots.clone(), counter(), opts.clone())
+        };
         let a = open().await.unwrap();
         for i in 0..23u64 {
             a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
@@ -573,9 +574,7 @@ async fn a_local_log_restores_from_snapshots_in_a_blob_store() {
     let chat = Arc::new(MemoryBlobStore::new());
     let snapshots: Arc<dyn SnapshotStore> = Arc::new(crate::BlobSnapshotStore::new(chat.clone()));
     let opts = MetaOptions { snapshot_every: Some(10), snapshots_outlive_log: true, ..MetaOptions::default() };
-    let a = MetaStore::open(log_of(dir.path()), snapshots.clone(), counter(), opts)
-        .await
-        .unwrap();
+    let a = MetaStore::open(log_of(dir.path()), snapshots.clone(), counter(), opts).await.unwrap();
     for i in 0..35u64 {
         a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
     }
@@ -614,7 +613,6 @@ async fn an_idle_tablet_snapshots_by_time() {
     assert_eq!(snapshot_count(dir.path()).await, 1);
 }
 
-
 /// Latency of the tablet over a disk and a memory log (`--ignored --nocapture`).
 #[tokio::test]
 #[ignore]
@@ -637,13 +635,25 @@ async fn timing_probe() {
         }
         let seq = t.elapsed();
         let t = std::time::Instant::now();
-        let tasks: Vec<_> = (1000..1200u64).map(|i| { let s = store.clone(); tokio::spawn(async move { s.propose::<Counter>(op(i, 1)).await }) }).collect();
-        for t in tasks { t.await.unwrap().unwrap().unwrap(); }
+        let tasks: Vec<_> = (1000..1200u64)
+            .map(|i| {
+                let s = store.clone();
+                tokio::spawn(async move { s.propose::<Counter>(op(i, 1)).await })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap().unwrap().unwrap();
+        }
         let par = t.elapsed();
         let t = std::time::Instant::now();
-        for _ in 0..50 { store.confirm_active().await.unwrap(); }
+        for _ in 0..50 {
+            store.confirm_active().await.unwrap();
+        }
         let conf = t.elapsed();
-        println!("{kind}: 200 sequential {seq:?} ({:?}/op), 200 concurrent {par:?}, 50 confirm_active {conf:?}", seq / 200);
+        println!(
+            "{kind}: 200 sequential {seq:?} ({:?}/op), 200 concurrent {par:?}, 50 confirm_active {conf:?}",
+            seq / 200
+        );
     }
 }
 

@@ -1,16 +1,18 @@
 //! [`BlobBackend`] over one channel.
 
-use crate::channel::{windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, ReadVia, IDS_PER_CALL, WINDOW};
+use crate::channel::{
+    windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, ReadVia, IDS_PER_CALL, WINDOW,
+};
+use crate::limits::{DELETE, READ, SEND};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use lru::LruCache;
+use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_api::{
     bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
 };
-use crate::limits::{DELETE, READ, SEND};
-use pigeonhole_limits::ChatLimiter;
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -44,8 +46,12 @@ impl Located {
     /// What message `msg` holds, if it is a blob.
     pub(crate) fn of(msg: &ChannelMessage) -> Option<Self> {
         match msg {
-            ChannelMessage::Document { size, file, .. } => Some(Located::Doc { size: *size, files: vec![file.clone()] }),
-            ChannelMessage::Text { text } => pigeonhole_storage_api::text::decode(text).map(|(_, data)| Located::Inline(data)),
+            ChannelMessage::Document { size, file, .. } => {
+                Some(Located::Doc { size: *size, files: vec![file.clone()] })
+            }
+            ChannelMessage::Text { text } => {
+                pigeonhole_storage_api::text::decode(text).map(|(_, data)| Located::Inline(data))
+            }
             _ => None,
         }
     }
@@ -151,7 +157,8 @@ impl<C: ChannelApi> Reader<C> {
         let mut cache = self.locations.lock().unwrap();
         let located = match (cache.get(&message_id), located) {
             (Some(Located::Doc { files: held, .. }), Located::Doc { size, files }) => {
-                let mut all: Vec<FileLocation> = held.iter().filter(|h| files.iter().all(|f| f.bot != h.bot)).cloned().collect();
+                let mut all: Vec<FileLocation> =
+                    held.iter().filter(|h| files.iter().all(|f| f.bot != h.bot)).cloned().collect();
                 all.extend(files);
                 Located::Doc { size, files: all }
             }
@@ -176,9 +183,11 @@ impl<C: ChannelApi> Reader<C> {
     async fn pick(&self, message_id: i64, files: &[FileLocation]) -> Result<FileLocation> {
         let holders: Vec<usize> = files.iter().map(|f| f.bot).collect();
         match self.channel.read_via(&holders) {
-            ReadVia::Holder(bot) => {
-                Ok(files.iter().find(|f| f.bot == bot).cloned().context("the channel picked a bot holding no location")?)
-            }
+            ReadVia::Holder(bot) => Ok(files
+                .iter()
+                .find(|f| f.bot == bot)
+                .cloned()
+                .context("the channel picked a bot holding no location")?),
             ReadVia::Locate => self.relocate(message_id).await,
         }
     }
@@ -224,7 +233,14 @@ impl<C: ChannelApi> Reader<C> {
 
     /// Bytes `[skip, skip + take)` of the window at `offset`, with a fresh
     /// file reference if the cached one expired.
-    async fn window(&self, message_id: i64, file: FileLocation, offset: u64, skip: usize, take: usize) -> Result<Bytes> {
+    async fn window(
+        &self,
+        message_id: i64,
+        file: FileLocation,
+        offset: u64,
+        skip: usize,
+        take: usize,
+    ) -> Result<Bytes> {
         let _permit = self.limiter.acquire_download().await;
         let bytes = match self.channel.get_file(&file, offset, WINDOW).await {
             Err(e) if e.is::<FileReferenceExpired>() => {
@@ -347,4 +363,3 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
         Ok(out)
     }
 }
-

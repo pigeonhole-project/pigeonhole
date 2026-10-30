@@ -32,7 +32,9 @@ async fn a_pool_of_two_bots_sends_twice_as_fast() {
     let t0 = Instant::now();
     let mut ids = Vec::new();
     for i in 0..sends {
-        ids.push(pooled.send(&format!("pooled {i}"), None, &format!("p{i}-{}", t0.elapsed().as_nanos())).await.unwrap().id);
+        ids.push(
+            pooled.send(&format!("pooled {i}"), None, &format!("p{i}-{}", t0.elapsed().as_nanos())).await.unwrap().id,
+        );
     }
     let secs = t0.elapsed().as_secs_f64();
     println!("pool of 2: {sends} sends in {secs:.1} s = {:.1}/min", sends as f64 * 60.0 / secs);

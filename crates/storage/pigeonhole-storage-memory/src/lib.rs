@@ -1,13 +1,13 @@
 //! In-memory [`BlobBackend`] for tests and `memory = true`.
 
-use pigeonhole_storage_api::{
-    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole,
-    Linked, NotFound, OpKind, Unavailable,
-};
-use pigeonhole_limits::StoreLimiter;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use pigeonhole_limits::StoreLimiter;
+use pigeonhole_storage_api::{
+    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked,
+    NotFound, OpKind, Unavailable,
+};
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -87,7 +87,8 @@ impl MemoryBlobStore {
 
     /// At most `rate_per_sec` operations a second (`burst` at once).
     pub fn with_rate(mut self, rate_per_sec: f64, burst: f64) -> Self {
-        self.limiter = Arc::new(StoreLimiter::new(&self.instance.id).with_rate(pigeonhole_limits::Rate::new(rate_per_sec, burst)));
+        self.limiter =
+            Arc::new(StoreLimiter::new(&self.instance.id).with_rate(pigeonhole_limits::Rate::new(rate_per_sec, burst)));
         self
     }
 
@@ -124,17 +125,11 @@ impl MemoryBlobStore {
     }
 
     pub fn unavailable_flag(&self) -> Arc<AtomicBool> {
-        self.unavailable
-            .clone()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
+        self.unavailable.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
     }
 
     fn check_available(&self) -> Result<()> {
-        if self
-            .unavailable
-            .as_ref()
-            .is_some_and(|f| f.load(Ordering::Relaxed))
-        {
+        if self.unavailable.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
             return Err(Unavailable(self.instance.id.clone()).into());
         }
         Ok(())
@@ -155,14 +150,7 @@ impl MemoryBlobStore {
     }
 
     pub fn message_keys(&self) -> Vec<u64> {
-        let mut keys: Vec<u64> = self
-            .messages
-            .lock()
-            .unwrap()
-            .keys()
-            .copied()
-            .map(|m| m as u64)
-            .collect();
+        let mut keys: Vec<u64> = self.messages.lock().unwrap().keys().copied().map(|m| m as u64).collect();
         keys.sort_unstable();
         keys
     }
@@ -215,25 +203,15 @@ impl BlobBackend for MemoryBlobStore {
             bail!("refusing empty blob upload (Telegram rejects empty documents)");
         }
         if data.len() > self.limits.max_blob_size {
-            bail!(
-                "blob size {} exceeds backend max {}",
-                data.len(),
-                self.limits.max_blob_size
-            );
+            bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
         }
         let file_id = format!("mem-{}", self.next_fid.fetch_add(1, Ordering::Relaxed));
         let message_id = self.next_msg.fetch_add(1, Ordering::Relaxed);
         self.files.lock().unwrap().insert(file_id.clone(), data);
-        self.messages
-            .lock()
-            .unwrap()
-            .insert(message_id, file_id.clone());
+        self.messages.lock().unwrap().insert(message_id, file_id.clone());
         self.names.lock().unwrap().insert(message_id, name.to_string());
         tracing::debug!(store = %self.instance.id, message_id = message_id, name, bytes = self.files.lock().unwrap().get(&file_id).map_or(0, |d| d.len()), "stored");
-        Ok(MemoryId {
-            file_id,
-            message_id: message_id as u64,
-        })
+        Ok(MemoryId { file_id, message_id: message_id as u64 })
     }
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
@@ -267,20 +245,11 @@ impl BlobBackend for MemoryBlobStore {
         Ok(())
     }
 
-    async fn candidates(
-        &self,
-        after: Option<Self::Key>,
-        upto: Self::Key,
-        limit: usize,
-    ) -> Result<Vec<Self::Key>> {
+    async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
         let _op = self.limiter.op().await;
         let messages = self.messages.lock().unwrap();
-        let mut keys: Vec<u64> = messages
-            .keys()
-            .copied()
-            .map(|m| m as u64)
-            .filter(|&k| k <= upto && after.is_none_or(|a| k > a))
-            .collect();
+        let mut keys: Vec<u64> =
+            messages.keys().copied().map(|m| m as u64).filter(|&k| k <= upto && after.is_none_or(|a| k > a)).collect();
         keys.sort_unstable();
         keys.truncate(limit);
         Ok(keys)
@@ -347,16 +316,15 @@ mod tests {
     #[tokio::test]
     async fn memory_put_get_delete() {
         let store = MemoryBlobStore::new();
-        let id = BlobBackend::put(&store, Bytes::from_static(b"hello"), "t.bin")
-            .await
-            .unwrap();
-        let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
-            .await
-            .unwrap();
+        let id = BlobBackend::put(&store, Bytes::from_static(b"hello"), "t.bin").await.unwrap();
+        let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap()).await.unwrap();
         assert_eq!(got.as_ref(), b"hello");
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
         let gone = BlobBackend::get(&store, &id, None).await;
-        assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound);
+        assert_eq!(
+            pigeonhole_storage_api::Failure::of(&gone.err().unwrap()),
+            pigeonhole_storage_api::Failure::NotFound
+        );
         // Repeat delete is ok.
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
     }
@@ -415,32 +383,20 @@ mod tests {
     #[tokio::test]
     async fn memory_range_get() {
         let store = MemoryBlobStore::new();
-        let id = BlobBackend::put(&store, Bytes::from_static(b"abcdefgh"), "t.bin")
-            .await
-            .unwrap();
-        let got = collect_stream(BlobBackend::get(&store, &id, Some(2..5)).await.unwrap())
-            .await
-            .unwrap();
+        let id = BlobBackend::put(&store, Bytes::from_static(b"abcdefgh"), "t.bin").await.unwrap();
+        let got = collect_stream(BlobBackend::get(&store, &id, Some(2..5)).await.unwrap()).await.unwrap();
         assert_eq!(got.as_ref(), b"cde");
     }
 
     #[tokio::test]
     async fn typed_backend_put_get_sweep() {
         let store = MemoryBlobStore::new();
-        let id = BlobBackend::put(&store, Bytes::from_static(b"typed"), "t.bin")
-            .await
-            .unwrap();
-        let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap())
-            .await
-            .unwrap();
+        let id = BlobBackend::put(&store, Bytes::from_static(b"typed"), "t.bin").await.unwrap();
+        let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap()).await.unwrap();
         assert_eq!(got.as_ref(), b"typed");
-        let keys = BlobBackend::candidates(&store, None, u64::MAX, 10)
-            .await
-            .unwrap();
+        let keys = BlobBackend::candidates(&store, None, u64::MAX, 10).await.unwrap();
         assert!(keys.contains(&id.message_id));
-        BlobBackend::delete(&store, &[id.message_id])
-            .await
-            .unwrap();
+        BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
         assert!(BlobBackend::get(&store, &id, None).await.is_err());
     }
 }

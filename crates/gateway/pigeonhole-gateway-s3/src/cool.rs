@@ -160,7 +160,10 @@ mod tests {
             min_inline: Duration::from_secs(30),
             batch: 64,
         };
-        assert_eq!(picked(&candidates(&s, now, &p)), [("a", CoolReason::Budget), ("b", CoolReason::Budget), ("c", CoolReason::Budget)]);
+        assert_eq!(
+            picked(&candidates(&s, now, &p)),
+            [("a", CoolReason::Budget), ("b", CoolReason::Budget), ("c", CoolReason::Budget)]
+        );
         let p = CoolPolicy { low_watermark: 1.0, ..p };
         assert_eq!(picked(&candidates(&s, now, &p)), [("a", CoolReason::Budget), ("b", CoolReason::Budget)]);
         let p = CoolPolicy { batch: 1, ..p };

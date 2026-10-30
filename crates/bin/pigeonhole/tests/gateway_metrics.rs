@@ -21,7 +21,11 @@ async fn fake_s3(req: Request) -> Response {
     Response::builder().status(StatusCode::OK).header(header::CONTENT_LENGTH, 1000).body(body).unwrap()
 }
 
-fn counter(snapshot: &[(metrics_util::CompositeKey, Option<metrics::Unit>, Option<metrics::SharedString>, DebugValue)], name: &str, op: &str) -> u64 {
+fn counter(
+    snapshot: &[(metrics_util::CompositeKey, Option<metrics::Unit>, Option<metrics::SharedString>, DebugValue)],
+    name: &str,
+    op: &str,
+) -> u64 {
     snapshot
         .iter()
         .filter(|(k, ..)| k.kind() == MetricKind::Counter && k.key().name() == name)
@@ -44,7 +48,8 @@ fn head_sends_no_bytes_and_ops_are_labelled() {
                 .route("/{*key}", any(fake_s3))
                 .layer(axum::middleware::from_fn(|req, next| track_gateway("s3", req, next)));
             for method in [Method::HEAD, Method::GET, Method::PUT] {
-                let req = Request::builder().method(method.clone()).uri("/b/k").body(Body::from(vec![1u8; 300])).unwrap();
+                let req =
+                    Request::builder().method(method.clone()).uri("/b/k").body(Body::from(vec![1u8; 300])).unwrap();
                 let resp = app.clone().oneshot(req).await.unwrap();
                 axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             }
@@ -58,7 +63,9 @@ fn head_sends_no_bytes_and_ops_are_labelled() {
     let ops: Vec<String> = snapshot
         .iter()
         .filter(|(k, ..)| k.key().name() == "pigeonhole_gateway_request_duration_seconds")
-        .flat_map(|(k, ..)| k.key().labels().filter(|l| l.key() == "op").map(|l| l.value().to_owned()).collect::<Vec<_>>())
+        .flat_map(|(k, ..)| {
+            k.key().labels().filter(|l| l.key() == "op").map(|l| l.value().to_owned()).collect::<Vec<_>>()
+        })
         .collect();
     assert!(ops.contains(&"HeadObject".to_string()) && ops.contains(&"GetObject".to_string()), "{ops:?}");
 }
@@ -91,7 +98,8 @@ fn abandoned_requests_count_as_cancelled() {
         .into_iter()
         .filter(|(k, ..)| k.key().name() == "pigeonhole_gateway_request_duration_seconds")
         .map(|(k, ..)| {
-            let label = |n: &str| k.key().labels().find(|l| l.key() == n).map(|l| l.value().to_owned()).unwrap_or_default();
+            let label =
+                |n: &str| k.key().labels().find(|l| l.key() == n).map(|l| l.value().to_owned()).unwrap_or_default();
             (label("op"), label("outcome"))
         })
         .collect();

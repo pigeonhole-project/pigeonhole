@@ -1,0 +1,3 @@
+# Lines are long here on purpose: one statement, one line, where it fits.
+max_width = 120
+use_small_heuristics = "Max"

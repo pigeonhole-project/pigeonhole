@@ -141,20 +141,12 @@ mod tests {
             CostHint::free()
         }
         async fn put(&self, data: Bytes, _name: &str) -> Result<Self::Id> {
-            let key = self
-                .next
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let key = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.data.lock().unwrap().insert(key, data);
             Ok(TinyId { key })
         }
         async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
-            let data = self
-                .data
-                .lock()
-                .unwrap()
-                .get(&id.key)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing"))?;
+            let data = self.data.lock().unwrap().get(&id.key).cloned().ok_or_else(|| anyhow::anyhow!("missing"))?;
             let sliced = crate::slice_range(data, range)?;
             Ok(crate::bytes_stream(sliced))
         }
@@ -166,32 +158,20 @@ mod tests {
             Ok(())
         }
 
-        async fn candidates(
-            &self,
-            after: Option<Self::Key>,
-            upto: Self::Key,
-            limit: usize,
-        ) -> Result<Vec<Self::Key>> {
+        async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
             let g = self.data.lock().unwrap();
-            let mut keys: Vec<u64> = g
-                .keys()
-                .copied()
-                .filter(|&k| k <= upto && after.is_none_or(|a| k > a))
-                .collect();
+            let mut keys: Vec<u64> = g.keys().copied().filter(|&k| k <= upto && after.is_none_or(|a| k > a)).collect();
             keys.sort_unstable();
             keys.truncate(limit);
             Ok(keys)
         }
-    
     }
 
     #[tokio::test]
     async fn erased_roundtrip() {
         let backend: SharedBackend = Arc::new(erase(TinyMem::new()));
         let id = backend.put(Bytes::from_static(b"hi"), "hi.bin").await.unwrap();
-        let got = collect_stream(backend.get(&id, None).await.unwrap())
-            .await
-            .unwrap();
+        let got = collect_stream(backend.get(&id, None).await.unwrap()).await.unwrap();
         assert_eq!(got.as_ref(), b"hi");
         let upto = u64::MAX.to_bytes();
         let keys = backend.candidates(None, &upto, 10).await.unwrap();

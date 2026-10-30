@@ -68,7 +68,9 @@ fn held_by(member: usize, file: FileLocation) -> FileLocation {
 fn read_by(member: usize, msgs: Vec<ChannelMessage>) -> Vec<ChannelMessage> {
     msgs.into_iter()
         .map(|m| match m {
-            ChannelMessage::Document { name, size, file } => ChannelMessage::Document { name, size, file: held_by(member, file) },
+            ChannelMessage::Document { name, size, file } => {
+                ChannelMessage::Document { name, size, file: held_by(member, file) }
+            }
             other => other,
         })
         .collect()
@@ -112,15 +114,11 @@ impl<C: ChannelApi> ChannelApi for PooledChannel<C> {
 
     /// Through the bot whose location `file` is: no other can use it.
     async fn get_file(&self, file: &FileLocation, offset: u64, limit: u64) -> Result<Bytes> {
-        self.pool
-            .run_on(file.bot, CALL_DEADLINE, rate_limited, |m| self.members[m].get_file(file, offset, limit))
-            .await
+        self.pool.run_on(file.bot, CALL_DEADLINE, rate_limited, |m| self.members[m].get_file(file, offset, limit)).await
     }
 
     async fn delete_messages(&self, ids: &[i64]) -> Result<()> {
-        self.pool
-            .run(Spend::Class(DELETE), CALL_DEADLINE, rate_limited, |m| self.members[m].delete_messages(ids))
-            .await
+        self.pool.run(Spend::Class(DELETE), CALL_DEADLINE, rate_limited, |m| self.members[m].delete_messages(ids)).await
     }
 
     /// The holder whose download budget (its bot's) is ready soonest, unless
@@ -285,7 +283,11 @@ mod tests {
         assert_eq!(b.sends.load(Ordering::SeqCst), 1, "the flood moved the put to b");
         assert_eq!(holders(&store, id.message_id), vec![1], "b's location, from its send");
         assert_eq!(get(&store, &id).await, data);
-        assert_eq!((a.reads.load(Ordering::SeqCst), b.reads.load(Ordering::SeqCst)), (0, 0), "read after write without getMessages");
+        assert_eq!(
+            (a.reads.load(Ordering::SeqCst), b.reads.load(Ordering::SeqCst)),
+            (0, 0),
+            "read after write without getMessages"
+        );
     }
 
     #[tokio::test(start_paused = true)]

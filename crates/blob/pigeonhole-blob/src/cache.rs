@@ -15,11 +15,6 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            l1_bytes: 128 * 1024 * 1024,
-            l2_bytes: Some(256 * 1024 * 1024),
-            write_through: true,
-        }
+        Self { enabled: true, l1_bytes: 128 * 1024 * 1024, l2_bytes: Some(256 * 1024 * 1024), write_through: true }
     }
 }

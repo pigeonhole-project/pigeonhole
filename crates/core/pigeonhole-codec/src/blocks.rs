@@ -54,10 +54,7 @@ impl std::fmt::Debug for CompletedChunk {
             .field("payload_len", &self.payload.len())
             .field("logical_size", &self.logical_size)
             .field("blocks", &self.blocks.len())
-            .field(
-                "permits",
-                &self.permits.iter().map(|p| p.bytes()).sum::<usize>(),
-            )
+            .field("permits", &self.permits.iter().map(|p| p.bytes()).sum::<usize>())
             .finish()
     }
 }
@@ -98,9 +95,7 @@ impl Drop for BudgetPermit {
 
 impl std::fmt::Debug for BudgetPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BudgetPermit")
-            .field("bytes", &self.n)
-            .finish()
+        f.debug_struct("BudgetPermit").field("bytes", &self.n).finish()
     }
 }
 
@@ -117,10 +112,7 @@ pub struct ByteBudget {
 impl ByteBudget {
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1024);
-        Self {
-            sem: Arc::new(Semaphore::new(capacity)),
-            capacity,
-        }
+        Self { sem: Arc::new(Semaphore::new(capacity)), capacity }
     }
 
     pub fn capacity(&self) -> usize {
@@ -134,29 +126,17 @@ impl ByteBudget {
     pub async fn acquire(&self, n: usize) -> Result<BudgetPermit> {
         let n = n.max(1);
         if n > self.capacity {
-            bail!(
-                "ingest acquire {n} exceeds budget capacity {}",
-                self.capacity
-            );
+            bail!("ingest acquire {n} exceeds budget capacity {}", self.capacity);
         }
         let t0 = std::time::Instant::now();
-        let permit = self
-            .sem
-            .clone()
-            .acquire_many_owned(n as u32)
-            .await
-            .context("ingest memory budget closed")?;
+        let permit = self.sem.clone().acquire_many_owned(n as u32).await.context("ingest memory budget closed")?;
         let waited = t0.elapsed();
         if !waited.is_zero() {
-            metrics::histogram!("pigeonhole_ingest_budget_wait_seconds")
-                .record(waited.as_secs_f64());
+            metrics::histogram!("pigeonhole_ingest_budget_wait_seconds").record(waited.as_secs_f64());
         }
         // Manage accounting ourselves so we can release_excess on short frames.
         permit.forget();
-        Ok(BudgetPermit {
-            sem: self.sem.clone(),
-            n,
-        })
+        Ok(BudgetPermit { sem: self.sem.clone(), n })
     }
 }
 
@@ -292,9 +272,7 @@ impl BlockWriter {
         let mut sealed = Vec::new();
         let would_stored = self.chunk_stored.len() + payload.len();
         let would_logical = self.chunk_logical + logical_len;
-        if !self.chunk_stored.is_empty()
-            && (would_stored > self.max_stored || would_logical > self.max_logical)
-        {
+        if !self.chunk_stored.is_empty() && (would_stored > self.max_stored || would_logical > self.max_logical) {
             if let Some(c) = self.seal_chunk() {
                 sealed.push(c);
             }
@@ -303,11 +281,7 @@ impl BlockWriter {
         // Single frame larger than max_stored: still emit (should not happen for
         // block_size << max_stored); if it does, seal as its own chunk.
         if self.chunk_stored.is_empty() && payload.len() > self.max_stored {
-            bail!(
-                "encoded frame {} exceeds max_stored {}",
-                payload.len(),
-                self.max_stored
-            );
+            bail!("encoded frame {} exceeds max_stored {}", payload.len(), self.max_stored);
         }
 
         let block_no = self.blocks.len() as i64;
@@ -338,12 +312,7 @@ impl BlockWriter {
         let blocks = std::mem::take(&mut self.blocks);
         let permits = std::mem::take(&mut self.chunk_permits);
         self.chunk_logical = 0;
-        Some(CompletedChunk {
-            payload,
-            logical_size,
-            blocks,
-            permits,
-        })
+        Some(CompletedChunk { payload, logical_size, blocks, permits })
     }
 
     async fn acquire_block_budget(&mut self) -> Result<()> {
@@ -434,12 +403,7 @@ fn gunzip_capped(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
 }
 
 /// Decode a byte range `[from, to)` within one `frames` chunk document.
-pub fn decode_blocks_range(
-    stored: &[u8],
-    blocks: &[BlockRecord],
-    from: usize,
-    to: usize,
-) -> Result<Bytes> {
+pub fn decode_blocks_range(stored: &[u8], blocks: &[BlockRecord], from: usize, to: usize) -> Result<Bytes> {
     if from > to {
         bail!("invalid frame range {from}..{to}");
     }
@@ -460,19 +424,11 @@ pub fn decode_blocks_range(
         let slen = fr.stored_len as usize;
         let end = soff.checked_add(slen).context("frame stored range")?;
         if end > stored.len() {
-            bail!(
-                "frame stored range {}..{} outside blob {}",
-                soff,
-                end,
-                stored.len()
-            );
+            bail!("frame stored range {}..{} outside blob {}", soff, end, stored.len());
         }
         let decoded = decode_block(&stored[soff..end], fr.block_codec(), flen.max(1))?;
         if decoded.len() != flen {
-            bail!(
-                "frame logical length mismatch: index {flen}, decoded {}",
-                decoded.len()
-            );
+            bail!("frame logical length mismatch: index {flen}, decoded {}", decoded.len());
         }
         let local_from = from.saturating_sub(frame_start).min(flen);
         let local_to = to.saturating_sub(frame_start).min(flen);
@@ -481,11 +437,7 @@ pub fn decode_blocks_range(
         }
     }
     if out.len() != to - from {
-        bail!(
-            "frames range decode produced {} bytes, expected {}",
-            out.len(),
-            to - from
-        );
+        bail!("frames range decode produced {} bytes, expected {}", out.len(), to - from);
     }
     Ok(Bytes::from(out))
 }
@@ -499,14 +451,7 @@ mod tests {
         let calls = Arc::new(AtomicU64::new(0));
         let frame = 64 * 1024;
         let max_stored = 256 * 1024;
-        let mut w = BlockWriter::new(
-            frame,
-            max_stored,
-            8 * 1024 * 1024,
-            ChunkCodec::Zstd,
-            None,
-            calls.clone(),
-        );
+        let mut w = BlockWriter::new(frame, max_stored, 8 * 1024 * 1024, ChunkCodec::Zstd, None, calls.clone());
         let n = 512 * 1024;
         let data = vec![0u8; n];
         let (mut chunks, consumed) = w.push(&data).await.unwrap();
@@ -517,9 +462,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed) as usize, expected_calls);
         let mut out = Vec::new();
         for c in &chunks {
-            out.extend_from_slice(
-                &decode_blocks_range(&c.payload, &c.blocks, 0, c.logical_size as usize).unwrap(),
-            );
+            out.extend_from_slice(&decode_blocks_range(&c.payload, &c.blocks, 0, c.logical_size as usize).unwrap());
         }
         assert_eq!(out, data);
         assert!(chunks.iter().all(|c| c.payload.len() <= max_stored));
@@ -560,14 +503,7 @@ mod tests {
     async fn budget_push_returns_early_so_caller_can_free_permits() {
         let budget = ByteBudget::new(64 * 1024);
         let calls = Arc::new(AtomicU64::new(0));
-        let mut w = BlockWriter::new(
-            16 * 1024,
-            32 * 1024,
-            1024 * 1024,
-            ChunkCodec::Raw,
-            Some(budget.clone()),
-            calls,
-        );
+        let mut w = BlockWriter::new(16 * 1024, 32 * 1024, 1024 * 1024, ChunkCodec::Raw, Some(budget.clone()), calls);
         let data = vec![7u8; 96 * 1024];
         let mut offset = 0;
         while offset < data.len() {
@@ -586,14 +522,7 @@ mod tests {
     async fn budget_returns_on_writer_drop_mid_stream() {
         let budget = ByteBudget::new(32 * 1024);
         let calls = Arc::new(AtomicU64::new(0));
-        let mut w = BlockWriter::new(
-            8 * 1024,
-            16 * 1024,
-            1024 * 1024,
-            ChunkCodec::Raw,
-            Some(budget.clone()),
-            calls,
-        );
+        let mut w = BlockWriter::new(8 * 1024, 16 * 1024, 1024 * 1024, ChunkCodec::Raw, Some(budget.clone()), calls);
         let (sealed, _) = w.push(&[1u8; 24 * 1024]).await.unwrap();
         drop(sealed);
         // Writer may still hold an open block/chunk.
@@ -607,14 +536,7 @@ mod tests {
         let frame = 16 * 1024;
         let budget = ByteBudget::new(2 * frame);
         let calls = Arc::new(AtomicU64::new(0));
-        let mut w = BlockWriter::new(
-            frame,
-            64 * 1024,
-            1024 * 1024,
-            ChunkCodec::Raw,
-            Some(budget.clone()),
-            calls,
-        );
+        let mut w = BlockWriter::new(frame, 64 * 1024, 1024 * 1024, ChunkCodec::Raw, Some(budget.clone()), calls);
         let n = frame + 100;
         let data = vec![9u8; n];
         let mut offset = 0;
@@ -641,14 +563,7 @@ mod tests {
             let budget = budget.clone();
             joins.push(tokio::spawn(async move {
                 let calls = Arc::new(AtomicU64::new(0));
-                let mut w = BlockWriter::new(
-                    frame,
-                    256 * 1024,
-                    8 * 1024 * 1024,
-                    ChunkCodec::Raw,
-                    Some(budget),
-                    calls,
-                );
+                let mut w = BlockWriter::new(frame, 256 * 1024, 8 * 1024 * 1024, ChunkCodec::Raw, Some(budget), calls);
                 let n = 8 * 1024 * 1024;
                 let piece = 256 * 1024;
                 let mut offset = 0usize;
@@ -672,10 +587,7 @@ mod tests {
             }
         })
         .await;
-        assert!(
-            result.is_ok(),
-            "64 parallel 8 MiB writers under 4*block_size budget timed out"
-        );
+        assert!(result.is_ok(), "64 parallel 8 MiB writers under 4*block_size budget timed out");
         assert_eq!(budget.available_permits(), budget.capacity());
     }
 }

@@ -156,10 +156,10 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
     /// What `p`'s thread names, if it has one (also after `p` is gone).
     async fn link_of(&self, p: u64) -> Result<Option<Linked<DiscordId>>> {
         let name = self.api.thread_name(p).await?;
-        Ok(name.as_deref().and_then(parse_thread).map(|(id, label)| Linked {
-            id: DiscordId { message_id: id },
-            label: label.to_string(),
-        }))
+        Ok(name
+            .as_deref()
+            .and_then(parse_thread)
+            .map(|(id, label)| Linked { id: DiscordId { message_id: id }, label: label.to_string() }))
     }
 }
 
@@ -189,7 +189,8 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
                 Ok(After::Won(DiscordId { message_id: b }))
             }
             ThreadStart::Taken => {
-                let winner = self.link_of(from).await?.with_context(|| format!("message {from} has an unreadable link"))?;
+                let winner =
+                    self.link_of(from).await?.with_context(|| format!("message {from} has an unreadable link"))?;
                 tracing::debug!(%store, label, from, message_id = b, winner = winner.id.message_id, winner_label = %winner.label, "lost the link (thread taken)");
                 Ok(After::Lost(winner))
             }

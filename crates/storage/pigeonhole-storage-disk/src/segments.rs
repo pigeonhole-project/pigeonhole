@@ -24,8 +24,8 @@
 //! over the data; a segment whose records are all dead is removed.
 
 use crate::io::{DirLock, Fs, FsFile};
-use pigeonhole_storage_api::NotFound;
 use anyhow::{anyhow, bail, Context, Result};
+use pigeonhole_storage_api::NotFound;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -285,7 +285,8 @@ impl Locked<'_> {
             self.next.entry(c.prev).or_insert(key);
             self.tail = Some(key);
         }
-        self.records.insert(key, Rec { data_len: data.len() as u64, label_len: label.len() as u16, dead: false, chain });
+        self.records
+            .insert(key, Rec { data_len: data.len() as u64, label_len: label.len() as u16, dead: false, chain });
         Ok(key)
     }
 

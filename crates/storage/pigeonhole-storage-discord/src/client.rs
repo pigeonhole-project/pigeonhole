@@ -2,12 +2,12 @@
 //! (one channel, a [`DiscordApi`]).
 
 use crate::api::{CdnStale, DcAttachment, DcMessage, DiscordApi, ThreadStart, PAGE};
+use crate::limits::{DELETE, READ, SEND};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_storage_api::{RateLimited, Unavailable};
-use crate::limits::{DELETE, READ, SEND};
 use pigeonhole_limits::{Call, ChatLimiter, Class, Failed, Level, Retry, Spend, Verdict};
+use pigeonhole_storage_api::{RateLimited, Unavailable};
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -91,8 +91,14 @@ const DELETE_THREAD: Call = api("delete thread", DELETE);
 enum AttemptFailed {
     Network(reqwest::Error),
     /// A 429: wait this long; `global` limits are the bot's.
-    RateLimited { wait: Duration, global: bool },
-    Server { status: u16, text: String },
+    RateLimited {
+        wait: Duration,
+        global: bool,
+    },
+    Server {
+        status: u16,
+        text: String,
+    },
 }
 
 impl std::fmt::Display for AttemptFailed {
@@ -297,11 +303,11 @@ fn message(v: serde_json::Value) -> Result<DcMessage> {
         id: m.id.parse().context("message id")?,
         kind: m.kind,
         content: m.content,
-        attachment: m
-            .attachments
-            .into_iter()
-            .next()
-            .map(|a| DcAttachment { filename: a.filename, size: a.size, url: a.url }),
+        attachment: m.attachments.into_iter().next().map(|a| DcAttachment {
+            filename: a.filename,
+            size: a.size,
+            url: a.url,
+        }),
         thread: m.thread.map(|t| t.name),
     })
 }
@@ -389,8 +395,7 @@ impl DiscordApi for DiscordChannel {
 
     async fn delete_messages(&self, ids: &[u64]) -> Result<()> {
         let now = unix_now_ms();
-        let (mut young, mut old): (Vec<u64>, Vec<u64>) =
-            ids.iter().partition(|&&id| snowflake_bulk_deletable(id, now));
+        let (mut young, mut old): (Vec<u64>, Vec<u64>) = ids.iter().partition(|&&id| snowflake_bulk_deletable(id, now));
         young.sort_unstable();
         young.dedup();
         old.sort_unstable();
@@ -403,9 +408,8 @@ impl DiscordApi for DiscordChannel {
             let body = serde_json::json!({ "messages": chunk.iter().map(|id| id.to_string()).collect::<Vec<_>>() });
             let path = self.path("messages/bulk-delete");
             let c = &self.client;
-            let a = c
-                .request(&self.limiter, &self.retry, &BULK_DELETE, || c.http.post(c.url(&path)).json(&body))
-                .await?;
+            let a =
+                c.request(&self.limiter, &self.retry, &BULK_DELETE, || c.http.post(c.url(&path)).json(&body)).await?;
             if !(200..300).contains(&a.status) {
                 debug!(status = a.status, "bulk delete refused; one by one");
                 for &id in chunk {
@@ -426,9 +430,7 @@ impl DiscordApi for DiscordChannel {
         // Thread creation has a budget of its own, shared by the bot's channels.
         let pacer = crate::pacer::threads_of(&c.app_id());
         pacer.wait().await;
-        let a = c
-            .request(&self.limiter, &self.retry, &START_THREAD, || c.http.post(c.url(&path)).json(&body))
-            .await?;
+        let a = c.request(&self.limiter, &self.retry, &START_THREAD, || c.http.post(c.url(&path)).json(&body)).await?;
         pacer.observe(a.remaining, a.reset_after);
         match (a.status, code(&a.body)) {
             (200..=299, _) => Ok(ThreadStart::Created),
@@ -453,9 +455,8 @@ impl DiscordApi for DiscordChannel {
         let path = format!("channels/{message_id}");
         let body = serde_json::json!({ "archived": true });
         let c = &self.client;
-        let a = c
-            .request(&self.limiter, &self.retry, &ARCHIVE_THREAD, || c.http.patch(c.url(&path)).json(&body))
-            .await?;
+        let a =
+            c.request(&self.limiter, &self.retry, &ARCHIVE_THREAD, || c.http.patch(c.url(&path)).json(&body)).await?;
         match a.status {
             200..=299 => Ok(()),
             s => bail!("archive thread {message_id}: {s} {}", a.body),

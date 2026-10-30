@@ -103,7 +103,11 @@ async fn deletes_free_space_and_drop_dead_segments() {
 
     let reopened = small(dir.path(), 64 << 10);
     let gone = reopened.get(&ids[2], None).await;
-    assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound, "dead after reopen");
+    assert_eq!(
+        pigeonhole_storage_api::Failure::of(&gone.err().unwrap()),
+        pigeonhole_storage_api::Failure::NotFound,
+        "dead after reopen"
+    );
     assert_eq!(reopened.candidates(None, u64::MAX, 100).await.unwrap(), vec![ids[3].key, ids[4].key, ids[5].key]);
 }
 

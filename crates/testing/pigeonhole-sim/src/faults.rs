@@ -136,7 +136,15 @@ impl<B> Faulty<B> {
     }
 
     pub fn with_seed(inner: Arc<B>, plan: FaultPlan, seed: u64) -> Self {
-        Self { inner, plan, seed, counters: Default::default(), quiet: AtomicBool::new(false), log: Mutex::default(), damaged: Mutex::default() }
+        Self {
+            inner,
+            plan,
+            seed,
+            counters: Default::default(),
+            quiet: AtomicBool::new(false),
+            log: Mutex::default(),
+            damaged: Mutex::default(),
+        }
     }
 
     pub fn inner(&self) -> &Arc<B> {
@@ -305,7 +313,8 @@ impl<B: Chain> Chain for Faulty<B> {
                 Err(anyhow!("injected: put_after applied, then failed"))
             }
             Draw::Fault(Fault::LandLate) => {
-                let (inner, prev, label, late_by) = (self.inner.clone(), prev.cloned(), label.to_string(), self.plan.late_by);
+                let (inner, prev, label, late_by) =
+                    (self.inner.clone(), prev.cloned(), label.to_string(), self.plan.late_by);
                 tokio::spawn(async move {
                     tokio::time::sleep(late_by).await;
                     let _ = inner.put_after(prev.as_ref(), &label, data).await;

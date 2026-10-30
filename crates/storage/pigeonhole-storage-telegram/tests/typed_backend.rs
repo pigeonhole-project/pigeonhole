@@ -1,10 +1,8 @@
 //! The MTProto blob backend on a fake channel.
 
 use bytes::Bytes;
-use pigeonhole_storage_api::{
-    collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole,
-};
 use pigeonhole_limits::{ChatLimiter, Rate};
+use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
 use pigeonhole_storage_telegram::fake::FakeChannel;
 use pigeonhole_storage_telegram::{TelegramBlobStore, TelegramId, WINDOW};
 use std::sync::Arc;

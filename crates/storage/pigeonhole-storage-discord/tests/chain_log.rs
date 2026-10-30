@@ -2,13 +2,11 @@
 //! [`Chain`]: threads as compare-and-set), on a fake channel.
 
 use futures::TryStreamExt;
-use pigeonhole_storage_api::{After, Chain, InstanceInfo, InstanceRole};
 use pigeonhole_limits::{ChatLimiter, Rate};
 use pigeonhole_meta::log::conformance;
 use pigeonhole_meta::snapshot::conformance as snapshot_conformance;
-use pigeonhole_meta::{
-    Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogStore, SnapshotRef, SnapshotStore,
-};
+use pigeonhole_meta::{Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogStore, SnapshotRef, SnapshotStore};
+use pigeonhole_storage_api::{After, Chain, InstanceInfo, InstanceRole};
 use pigeonhole_storage_discord::fake::FakeDiscord;
 use pigeonhole_storage_discord::DiscordBlobStore;
 use std::sync::Arc;

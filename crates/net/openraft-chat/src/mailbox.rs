@@ -137,13 +137,7 @@ impl Mailbox for FakeMailbox {
             bail!("node {} cannot reach node {}'s outbox", self.viewer, self.owner);
         }
         let outbox = &s.outboxes[&self.owner];
-        Ok(outbox
-            .iter()
-            .enumerate()
-            .skip(after as usize)
-            .take(limit)
-            .map(|(i, f)| (i as u64 + 1, f.clone()))
-            .collect())
+        Ok(outbox.iter().enumerate().skip(after as usize).take(limit).map(|(i, f)| (i as u64 + 1, f.clone())).collect())
     }
 
     async fn head(&self) -> Result<u64> {

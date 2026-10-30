@@ -2,12 +2,12 @@
 
 use bytes::Bytes;
 use futures::StreamExt;
+use http::Extensions;
+use http::{HeaderMap, Method, Uri};
 use pigeonhole::config::Config;
 use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
 use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
-use http::{HeaderMap, Method, Uri};
-use http::Extensions;
 use s3s::dto::*;
 use s3s::{S3ErrorCode, S3Request, S3Response, S3};
 use std::sync::Arc;
@@ -26,11 +26,7 @@ fn req<T>(input: T) -> S3Request<T> {
     }
 }
 
-async fn setup_with_mem() -> (
-    pigeonhole::service::S3Gateway,
-    Arc<MemoryBlobStore>,
-    tempfile::TempDir,
-) {
+async fn setup_with_mem() -> (pigeonhole::service::S3Gateway, Arc<MemoryBlobStore>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let idx_url = dir.path().join("s3.log");
     let blob_url = dir.path().join("blob.log");
@@ -45,9 +41,7 @@ async fn setup_with_mem() -> (
     let store_mem = MemoryBlobStore::new();
     // We cannot share Arc into ChunkStore::open which takes ownership.
     // Expose counts via chunk metadata instead in updated tests.
-    let store = Arc::new(
-        ChunkStore::open(db, store_mem, opts).await.unwrap(),
-    );
+    let store = Arc::new(ChunkStore::open(db, store_mem, opts).await.unwrap());
     let s3 = build_s3_gateway(cfg.s3_options(), index, store);
     (s3, mem, dir)
 }
@@ -66,12 +60,7 @@ async fn collect_body(body: Option<StreamingBlob>) -> Vec<u8> {
 #[tokio::test]
 async fn empty_object_put_get() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let put = s3
         .put_object(req(PutObjectInput {
@@ -86,11 +75,7 @@ async fn empty_object_put_get() {
     assert!(put.e_tag.is_some());
 
     let got = s3
-        .get_object(req(GetObjectInput {
-            bucket: "demo".into(),
-            key: "dir/".into(),
-            ..Default::default()
-        }))
+        .get_object(req(GetObjectInput { bucket: "demo".into(), key: "dir/".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -103,12 +88,7 @@ async fn empty_object_put_get() {
 #[tokio::test]
 async fn put_get_roundtrip_and_range() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let data = Bytes::from(vec![7u8; 100_000]);
     s3.put_object(req(PutObjectInput {
@@ -121,11 +101,7 @@ async fn put_get_roundtrip_and_range() {
     .unwrap();
 
     let got = s3
-        .get_object(req(GetObjectInput {
-            bucket: "demo".into(),
-            key: "big.bin".into(),
-            ..Default::default()
-        }))
+        .get_object(req(GetObjectInput { bucket: "demo".into(), key: "big.bin".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -135,10 +111,7 @@ async fn put_get_roundtrip_and_range() {
         .get_object(req(GetObjectInput {
             bucket: "demo".into(),
             key: "big.bin".into(),
-            range: Some(Range::Int {
-                first: 10,
-                last: Some(19),
-            }),
+            range: Some(Range::Int { first: 10, last: Some(19) }),
             ..Default::default()
         }))
         .await
@@ -151,12 +124,7 @@ async fn put_get_roundtrip_and_range() {
 #[tokio::test]
 async fn compressible_object_roundtrip_and_snapshot() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let data = Bytes::from(vec![b'z'; 200_000]);
     s3.put_object(req(PutObjectInput {
@@ -168,24 +136,12 @@ async fn compressible_object_roundtrip_and_snapshot() {
     .await
     .unwrap();
 
-    let extents = s3
-        .index
-        .get_extents("demo", "zeros.bin")
-        .await
-        .unwrap()
-        .unwrap();
+    let extents = s3.index.get_extents("demo", "zeros.bin").await.unwrap().unwrap();
     assert!(!extents.is_empty());
-    assert_eq!(
-        extents.iter().map(|e| e.len).sum::<i64>(),
-        data.len() as i64
-    );
+    assert_eq!(extents.iter().map(|e| e.len).sum::<i64>(), data.len() as i64);
 
     let got = s3
-        .get_object(req(GetObjectInput {
-            bucket: "demo".into(),
-            key: "zeros.bin".into(),
-            ..Default::default()
-        }))
+        .get_object(req(GetObjectInput { bucket: "demo".into(), key: "zeros.bin".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -198,12 +154,7 @@ async fn compressible_object_roundtrip_and_snapshot() {
 #[tokio::test]
 async fn content_md5_mismatch_rejected() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let err = s3
         .put_object(req(PutObjectInput {
@@ -221,12 +172,7 @@ async fn content_md5_mismatch_rejected() {
 #[tokio::test]
 async fn content_md5_invalid_short_is_invalid_digest() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let err = s3
         .put_object(req(PutObjectInput {
@@ -244,12 +190,7 @@ async fn content_md5_invalid_short_is_invalid_digest() {
 #[tokio::test]
 async fn get_bucket_location_and_list_v1() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),
         key: "a.txt".into(),
@@ -260,21 +201,14 @@ async fn get_bucket_location_and_list_v1() {
     .unwrap();
 
     let loc = s3
-        .get_bucket_location(req(GetBucketLocationInput {
-            bucket: "demo".into(),
-            ..Default::default()
-        }))
+        .get_bucket_location(req(GetBucketLocationInput { bucket: "demo".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
     assert!(loc.location_constraint.is_none());
 
     let listed = s3
-        .list_objects(req(ListObjectsInput {
-            bucket: "demo".into(),
-            max_keys: Some(5000),
-            ..Default::default()
-        }))
+        .list_objects(req(ListObjectsInput { bucket: "demo".into(), max_keys: Some(5000), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -285,12 +219,7 @@ async fn get_bucket_location_and_list_v1() {
 #[tokio::test]
 async fn list_parts_and_multipart_uploads() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let created = s3
         .create_multipart_upload(req(CreateMultipartUploadInput {
@@ -327,16 +256,10 @@ async fn list_parts_and_multipart_uploads() {
         .unwrap()
         .output;
     assert_eq!(parts.parts.as_ref().unwrap().len(), 1);
-    assert_eq!(
-        parts.parts.as_ref().unwrap()[0].e_tag.as_ref().unwrap(),
-        part.e_tag.as_ref().unwrap()
-    );
+    assert_eq!(parts.parts.as_ref().unwrap()[0].e_tag.as_ref().unwrap(), part.e_tag.as_ref().unwrap());
 
     let uploads = s3
-        .list_multipart_uploads(req(ListMultipartUploadsInput {
-            bucket: "demo".into(),
-            ..Default::default()
-        }))
+        .list_multipart_uploads(req(ListMultipartUploadsInput { bucket: "demo".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -346,12 +269,7 @@ async fn list_parts_and_multipart_uploads() {
 #[tokio::test]
 async fn object_tagging_roundtrip() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),
         key: "t.txt".into(),
@@ -374,11 +292,7 @@ async fn object_tagging_roundtrip() {
     assert_eq!(got.tag_set.len(), 2);
 
     let head = s3
-        .head_object(req(HeadObjectInput {
-            bucket: "demo".into(),
-            key: "t.txt".into(),
-            ..Default::default()
-        }))
+        .head_object(req(HeadObjectInput { bucket: "demo".into(), key: "t.txt".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -406,29 +320,17 @@ async fn object_tagging_roundtrip() {
 #[tokio::test]
 async fn upload_part_copy_range() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),
         key: "src.bin".into(),
-        body: Some(StreamingBlob::from_bytes(Bytes::from_static(
-            b"0123456789abcdef",
-        ))),
+        body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"0123456789abcdef"))),
         ..Default::default()
     }))
     .await
     .unwrap();
 
-    let src_ext = s3
-        .index
-        .get_extents("demo", "src.bin")
-        .await
-        .unwrap()
-        .unwrap();
+    let src_ext = s3.index.get_extents("demo", "src.bin").await.unwrap().unwrap();
     let src_chunk = src_ext[0].chunk;
 
     let created = s3
@@ -447,40 +349,23 @@ async fn upload_part_copy_range() {
         .key("dst.bin".into())
         .upload_id(upload_id.clone())
         .part_number(1)
-        .copy_source(CopySource::Bucket {
-            bucket: "demo".into(),
-            key: "src.bin".into(),
-            version_id: None,
-        })
+        .copy_source(CopySource::Bucket { bucket: "demo".into(), key: "src.bin".into(), version_id: None })
         .copy_source_range(Some("bytes=0-3".into()))
         .build()
         .unwrap();
     let copied = s3.upload_part_copy(req(copy_input)).await.unwrap().output;
     // Extent slice reuses the same chunk (retain); no re-ingest.
-    let part_ext = s3
-        .index
-        .get_multipart_part_extents(&upload_id, 1)
-        .await
-        .unwrap()
-        .unwrap();
+    let part_ext = s3.index.get_multipart_part_extents(&upload_id, 1).await.unwrap().unwrap();
     assert_eq!(part_ext[0].chunk, src_chunk);
     assert_eq!(part_ext[0].len, 4);
-    let part_etag = copied
-        .copy_part_result
-        .as_ref()
-        .and_then(|r| r.e_tag.clone())
-        .unwrap();
+    let part_etag = copied.copy_part_result.as_ref().and_then(|r| r.e_tag.clone()).unwrap();
 
     s3.complete_multipart_upload(req(CompleteMultipartUploadInput {
         bucket: "demo".into(),
         key: "dst.bin".into(),
         upload_id,
         multipart_upload: Some(CompletedMultipartUpload {
-            parts: Some(vec![CompletedPart {
-                e_tag: Some(part_etag),
-                part_number: Some(1),
-                ..Default::default()
-            }]),
+            parts: Some(vec![CompletedPart { e_tag: Some(part_etag), part_number: Some(1), ..Default::default() }]),
         }),
         ..Default::default()
     }))
@@ -488,11 +373,7 @@ async fn upload_part_copy_range() {
     .unwrap();
 
     let got = s3
-        .get_object(req(GetObjectInput {
-            bucket: "demo".into(),
-            key: "dst.bin".into(),
-            ..Default::default()
-        }))
+        .get_object(req(GetObjectInput { bucket: "demo".into(), key: "dst.bin".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -502,12 +383,7 @@ async fn upload_part_copy_range() {
 #[tokio::test]
 async fn upload_part_copy_whole_object_reuses_chunks() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     let body = Bytes::from_static(b"whole-object-shallow-copy");
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),
@@ -517,12 +393,7 @@ async fn upload_part_copy_whole_object_reuses_chunks() {
     }))
     .await
     .unwrap();
-    let src_ext = s3
-        .index
-        .get_extents("demo", "src.bin")
-        .await
-        .unwrap()
-        .unwrap();
+    let src_ext = s3.index.get_extents("demo", "src.bin").await.unwrap().unwrap();
     let src_ids: Vec<_> = src_ext.iter().map(|e| e.chunk).collect();
 
     let created = s3
@@ -541,38 +412,21 @@ async fn upload_part_copy_whole_object_reuses_chunks() {
         .key("dst.bin".into())
         .upload_id(upload_id.clone())
         .part_number(1)
-        .copy_source(CopySource::Bucket {
-            bucket: "demo".into(),
-            key: "src.bin".into(),
-            version_id: None,
-        })
+        .copy_source(CopySource::Bucket { bucket: "demo".into(), key: "src.bin".into(), version_id: None })
         .build()
         .unwrap();
     let copied = s3.upload_part_copy(req(copy_input)).await.unwrap().output;
-    let part_ext = s3
-        .index
-        .get_multipart_part_extents(&upload_id, 1)
-        .await
-        .unwrap()
-        .unwrap();
+    let part_ext = s3.index.get_multipart_part_extents(&upload_id, 1).await.unwrap().unwrap();
     let part_ids: Vec<_> = part_ext.iter().map(|e| e.chunk).collect();
     assert_eq!(part_ids, src_ids, "whole-object copy must reuse chunk ids");
-    let part_etag = copied
-        .copy_part_result
-        .as_ref()
-        .and_then(|r| r.e_tag.clone())
-        .unwrap();
+    let part_etag = copied.copy_part_result.as_ref().and_then(|r| r.e_tag.clone()).unwrap();
 
     s3.complete_multipart_upload(req(CompleteMultipartUploadInput {
         bucket: "demo".into(),
         key: "dst.bin".into(),
         upload_id,
         multipart_upload: Some(CompletedMultipartUpload {
-            parts: Some(vec![CompletedPart {
-                e_tag: Some(part_etag),
-                part_number: Some(1),
-                ..Default::default()
-            }]),
+            parts: Some(vec![CompletedPart { e_tag: Some(part_etag), part_number: Some(1), ..Default::default() }]),
         }),
         ..Default::default()
     }))
@@ -580,11 +434,7 @@ async fn upload_part_copy_whole_object_reuses_chunks() {
     .unwrap();
 
     let got = s3
-        .get_object(req(GetObjectInput {
-            bucket: "demo".into(),
-            key: "dst.bin".into(),
-            ..Default::default()
-        }))
+        .get_object(req(GetObjectInput { bucket: "demo".into(), key: "dst.bin".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -594,12 +444,7 @@ async fn upload_part_copy_whole_object_reuses_chunks() {
 #[tokio::test]
 async fn list_object_versions_as_null_current() {
     let (s3, _mem, _dir) = setup_with_mem().await;
-    s3.create_bucket(req(CreateBucketInput {
-        bucket: "demo".into(),
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),
         key: "a.txt".into(),
@@ -610,10 +455,7 @@ async fn list_object_versions_as_null_current() {
     .unwrap();
 
     let out = s3
-        .list_object_versions(req(ListObjectVersionsInput {
-            bucket: "demo".into(),
-            ..Default::default()
-        }))
+        .list_object_versions(req(ListObjectVersionsInput { bucket: "demo".into(), ..Default::default() }))
         .await
         .unwrap()
         .output;
@@ -629,9 +471,7 @@ async fn list_object_versions_as_null_current() {
 async fn delete_everything_releases_every_object_chunk() {
     let (s3, _mem, _dir) = setup_with_mem().await;
     for bucket in ["a", "b"] {
-        s3.create_bucket(req(CreateBucketInput { bucket: bucket.into(), ..Default::default() }))
-            .await
-            .unwrap();
+        s3.create_bucket(req(CreateBucketInput { bucket: bucket.into(), ..Default::default() })).await.unwrap();
         for key in ["x", "y"] {
             s3.put_object(req(PutObjectInput {
                 bucket: bucket.into(),
@@ -657,7 +497,9 @@ async fn delete_everything_releases_every_object_chunk() {
 }
 
 /// One tablet for the index and the chunk store, as in the binary.
-async fn setup_one_tablet(chunk_size: usize) -> (pigeonhole::service::S3Gateway, Arc<pigeonhole_meta::MetaStore>, tempfile::TempDir) {
+async fn setup_one_tablet(
+    chunk_size: usize,
+) -> (pigeonhole::service::S3Gateway, Arc<pigeonhole_meta::MetaStore>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::for_test(dir.path());
     cfg.chunk_size = chunk_size;
@@ -758,7 +600,11 @@ async fn conditional_writes_follow_the_table() {
 
     // Multipart: checked at Complete against the object as it is then.
     let upload = s3
-        .create_multipart_upload(req(CreateMultipartUploadInput { bucket: "b".into(), key: "k".into(), ..Default::default() }))
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "b".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
         .await
         .unwrap()
         .output
@@ -815,7 +661,8 @@ async fn conditional_writes_follow_the_table() {
 
     // If-Match: * (any object) and If-None-Match: <etag> (not that one), as
     // s3-tests' test_put_object_if_match has them.
-    let star = |key: &str, body: &str| PutObjectInput { if_match: Some(ETagCondition::Any), ..put(key, body, None, false) };
+    let star =
+        |key: &str, body: &str| PutObjectInput { if_match: Some(ETagCondition::Any), ..put(key, body, None, false) };
     let not = |key: &str, body: &str, e: &str| PutObjectInput {
         if_none_match: Some(ETagCondition::ETag(ETag::Strong(e.into()))),
         ..put(key, body, None, false)
@@ -912,7 +759,10 @@ async fn small_objects_are_inline_large_ones_chunked() {
     let r = Range::Int { first: 10, last: Some(19) };
     assert_eq!(get_all(&s3, "small", Some(r)).await, vec![7u8; 10]);
     let put = s3.put_object(req(put_len("small", &small, true))).await.unwrap();
-    let head = s3.head_object(req(HeadObjectInput { bucket: "b".into(), key: "small".into(), ..Default::default() })).await.unwrap();
+    let head = s3
+        .head_object(req(HeadObjectInput { bucket: "b".into(), key: "small".into(), ..Default::default() }))
+        .await
+        .unwrap();
     // md5 of 1024 × 0x07, as AWS would give.
     assert_eq!(put.output.e_tag.unwrap().value(), "254a7725306413d2a8e39ad05ffa018a");
     assert_eq!(head.output.e_tag.unwrap().value(), "254a7725306413d2a8e39ad05ffa018a");
@@ -949,7 +799,11 @@ async fn copies_from_an_inline_object() {
 
     // A part copied from an inline source, then completed.
     let upload = s3
-        .create_multipart_upload(req(CreateMultipartUploadInput { bucket: "b".into(), key: "mp".into(), ..Default::default() }))
+        .create_multipart_upload(req(CreateMultipartUploadInput {
+            bucket: "b".into(),
+            key: "mp".into(),
+            ..Default::default()
+        }))
         .await
         .unwrap()
         .output
@@ -1006,7 +860,8 @@ async fn the_cooler_moves_inline_objects_out_and_reads_do_not_notice() {
         s3.put_object(req(put_len(&format!("k{i}"), format!("value {i}").as_bytes(), true))).await.unwrap();
     }
     assert_eq!(s3.index.stats().inline_objects, 5);
-    let none = pigeonhole::service::CoolPolicy { min_inline: std::time::Duration::from_secs(3600), ..Default::default() };
+    let none =
+        pigeonhole::service::CoolPolicy { min_inline: std::time::Duration::from_secs(3600), ..Default::default() };
     assert_eq!(s3.cool_pass(&none).await.unwrap(), pigeonhole::service::CoolStats::default(), "all too fresh");
 
     let now = pigeonhole::service::CoolPolicy {
@@ -1040,7 +895,9 @@ async fn the_cooler_never_loses_a_rewrite_or_leaks_a_chunk() {
                 for k in 0..keys {
                     let key = format!("k{k}");
                     if (round + k) % 7 == 0 {
-                        let _ = s3.delete_object(req(DeleteObjectInput { bucket: "b".into(), key, ..Default::default() })).await;
+                        let _ = s3
+                            .delete_object(req(DeleteObjectInput { bucket: "b".into(), key, ..Default::default() }))
+                            .await;
                     } else {
                         let v = format!("round {round} key {k}");
                         s3.put_object(req(put_len(&key, v.as_bytes(), true))).await.unwrap();
@@ -1080,7 +937,11 @@ async fn the_cooler_never_loses_a_rewrite_or_leaks_a_chunk() {
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while s3.store.db().stats().live as usize != chunked {
-        assert!(tokio::time::Instant::now() < deadline, "live chunks {} != referenced {chunked}", s3.store.db().stats().live);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "live chunks {} != referenced {chunked}",
+            s3.store.db().stats().live
+        );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
@@ -1103,6 +964,9 @@ async fn a_copy_follows_the_current_threshold() {
     assert!(s3.index.get_extents("b", "src").await.unwrap().unwrap().is_empty(), "the source stays inline");
     assert!(!s3.index.get_extents("b", "dst").await.unwrap().unwrap().is_empty(), "the copy is chunked");
     assert_eq!(get_all(&s3, "dst", None).await, b"0123456789");
-    let (src, dst) = (s3.index.get_object("b", "src").await.unwrap().unwrap(), s3.index.get_object("b", "dst").await.unwrap().unwrap());
+    let (src, dst) = (
+        s3.index.get_object("b", "src").await.unwrap().unwrap(),
+        s3.index.get_object("b", "dst").await.unwrap().unwrap(),
+    );
     assert_eq!(src.etag, dst.etag);
 }

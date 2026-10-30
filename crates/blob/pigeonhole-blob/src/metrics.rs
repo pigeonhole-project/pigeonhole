@@ -4,7 +4,7 @@
 //! Prometheus recorder behind feature `metrics-prometheus`.
 
 use crate::erase::{DynBlobBackend, SharedBackend};
-use crate::typed::{CostHint, InstanceInfo, OpKind, BlobLocator};
+use crate::typed::{BlobLocator, CostHint, InstanceInfo, OpKind};
 use crate::BoxByteStream;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -180,8 +180,7 @@ pub fn record_compression_ratio(stored: usize, logical: usize) {
     if logical == 0 {
         return;
     }
-    metrics::histogram!("pigeonhole_compression_ratio")
-        .record(stored as f64 / logical as f64);
+    metrics::histogram!("pigeonhole_compression_ratio").record(stored as f64 / logical as f64);
 }
 
 pub fn record_ingest_budget_wait(d: Duration) {

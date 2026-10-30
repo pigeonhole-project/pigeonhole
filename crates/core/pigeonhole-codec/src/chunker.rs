@@ -90,9 +90,7 @@ pub fn validate_chunk_size(n: usize) -> Result<()> {
         bail!("chunk.size must be >= 1");
     }
     if n > MAX_CHUNK_SIZE {
-        bail!(
-            "chunk.size={n} exceeds Telegram getFile limit (max {MAX_CHUNK_SIZE} bytes, < 20 MiB)"
-        );
+        bail!("chunk.size={n} exceeds Telegram getFile limit (max {MAX_CHUNK_SIZE} bytes, < 20 MiB)");
     }
     Ok(())
 }

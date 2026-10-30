@@ -94,9 +94,8 @@ async fn check<C: Chain>(chain: Arc<C>, quiesce: impl FnOnce(), floor: &AtomicU6
 async fn run<C: Chain>(store: Arc<Faulty<C>>) {
     let floor = Arc::new(AtomicU64::new(0));
     let acks = Arc::new(Mutex::new(Acks::default()));
-    let tasks: Vec<_> = (0..WRITERS)
-        .map(|id| tokio::spawn(writer(id, store.clone(), floor.clone(), acks.clone())))
-        .collect();
+    let tasks: Vec<_> =
+        (0..WRITERS).map(|id| tokio::spawn(writer(id, store.clone(), floor.clone(), acks.clone()))).collect();
     for t in tasks {
         t.await.unwrap();
     }

@@ -123,28 +123,17 @@ impl PartPacker {
         let instance = self.backend.instance().id.clone();
         let pin = self.pins.pin(&instance);
         let blob_id = BlobId::random();
-        let locator = self
-            .backend
-            .put(payload, &blob_id.name())
-            .await
-            .with_context(|| {
-                format!(
-                    "part put failed for instance {} (blocks {}..{})",
-                    self.backend.instance().id,
-                    first_block,
-                    first_block + block_count
-                )
-            })?;
+        let locator = self.backend.put(payload, &blob_id.name()).await.with_context(|| {
+            format!(
+                "part put failed for instance {} (blocks {}..{})",
+                self.backend.instance().id,
+                first_block,
+                first_block + block_count
+            )
+        })?;
 
         self.pins.returned(&instance, &locator.key);
-        Ok(PartUploaded {
-            first_block,
-            block_count,
-            locator,
-            blob_id,
-            block_stored_lens: lenses,
-            pin,
-        })
+        Ok(PartUploaded { first_block, block_count, locator, blob_id, block_stored_lens: lenses, pin })
     }
 }
 
@@ -163,7 +152,7 @@ fn concat_bytes(parts: Vec<Bytes>, total: usize) -> Bytes {
 mod tests {
     use super::*;
     use crate::erase::{erase, SharedBackend};
-    use crate::typed::{CostHint, InstanceInfo, InstanceRole, OpKind, BlobBackend};
+    use crate::typed::{BlobBackend, CostHint, InstanceInfo, InstanceRole, OpKind};
     use crate::{bytes_stream, collect_stream, slice_range, BoxByteStream};
     use async_trait::async_trait;
     use pigeonhole_types::{BackendLimits, ByteRange};
@@ -223,20 +212,12 @@ mod tests {
             if data.len() > self.limits.max_blob_size {
                 bail!("oversize");
             }
-            let key = self
-                .next
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let key = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.data.lock().unwrap().insert(key, data);
             Ok(Id { key })
         }
         async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
-            let data = self
-                .data
-                .lock()
-                .unwrap()
-                .get(&id.key)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing"))?;
+            let data = self.data.lock().unwrap().get(&id.key).cloned().ok_or_else(|| anyhow::anyhow!("missing"))?;
             Ok(bytes_stream(slice_range(data, range)?))
         }
         async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
@@ -247,8 +228,14 @@ mod tests {
             Ok(())
         }
         async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
-            let mut keys: Vec<u64> =
-                self.data.lock().unwrap().keys().copied().filter(|&k| k <= upto && after.is_none_or(|a| k > a)).collect();
+            let mut keys: Vec<u64> = self
+                .data
+                .lock()
+                .unwrap()
+                .keys()
+                .copied()
+                .filter(|&k| k <= upto && after.is_none_or(|a| k > a))
+                .collect();
             keys.sort_unstable();
             keys.truncate(limit);
             Ok(keys)
@@ -256,11 +243,7 @@ mod tests {
     }
 
     fn block(n: usize) -> EncodedBlock {
-        EncodedBlock {
-            stored: Bytes::from(vec![7u8; n]),
-            logical_len: n as u32,
-            codec: "raw".into(),
-        }
+        EncodedBlock { stored: Bytes::from(vec![7u8; n]), logical_len: n as u32, codec: "raw".into() }
     }
 
     #[tokio::test]
@@ -276,9 +259,7 @@ mod tests {
         let last = p.finish().await.unwrap().expect("last");
         assert_eq!(last.first_block, 2);
         assert_eq!(last.block_count, 1);
-        let got = collect_stream(backend.get(&last.locator, None).await.unwrap())
-            .await
-            .unwrap();
+        let got = collect_stream(backend.get(&last.locator, None).await.unwrap()).await.unwrap();
         assert_eq!(got.len(), 40);
     }
 
@@ -287,9 +268,6 @@ mod tests {
         let backend: SharedBackend = Arc::new(erase(LimMem::new("a", 50)));
         let mut p = PartPacker::new(backend, UploadPins::shared());
         let err = p.push(block(51)).await.unwrap_err();
-        assert!(
-            err.to_string().contains("configuration error"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("configuration error"), "{err}");
     }
 }

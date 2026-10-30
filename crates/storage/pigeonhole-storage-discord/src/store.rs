@@ -1,17 +1,17 @@
 //! [`BlobBackend`] over one channel.
 
+use crate::api::CONTENT_MAX_CHARS;
 use crate::api::{CdnStale, DcMessage, DiscordApi, PAGE};
+use crate::limits::{DELETE, READ, SEND};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lru::LruCache;
-use crate::api::CONTENT_MAX_CHARS;
+use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_api::text;
 use pigeonhole_storage_api::{
     bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
 };
-use crate::limits::{DELETE, READ, SEND};
-use pigeonhole_limits::ChatLimiter;
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
@@ -181,7 +181,9 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
                 return Ok(l.clone());
             }
         }
-        let Some(m) = self.api.get_message(id).await? else { return Err(NotFound(format!("blob message {id}")).into()) };
+        let Some(m) = self.api.get_message(id).await? else {
+            return Err(NotFound(format!("blob message {id}")).into());
+        };
         let l = Located::of(&m).with_context(|| format!("message {id} is not a blob"))?;
         self.locations.lock().unwrap().put(id, l.clone());
         Ok(l)
@@ -299,4 +301,3 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
         Ok(out)
     }
 }
-

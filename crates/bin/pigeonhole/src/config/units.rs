@@ -61,14 +61,9 @@ pub(crate) fn parse_size(text: &str) -> Result<u64, String> {
     let unit = s[number..].trim_start();
     if !unit.is_empty() {
         match unit.parse::<Unit>() {
-            Ok(
-                Unit::KiloByte
-                | Unit::MegaByte
-                | Unit::GigaByte
-                | Unit::TeraByte
-                | Unit::PetaByte
-                | Unit::ExaByte,
-            ) => return Err(format!("{text:?}: decimal units are refused, write KiB, MiB, GiB")),
+            Ok(Unit::KiloByte | Unit::MegaByte | Unit::GigaByte | Unit::TeraByte | Unit::PetaByte | Unit::ExaByte) => {
+                return Err(format!("{text:?}: decimal units are refused, write KiB, MiB, GiB"))
+            }
             Ok(_) => {}
             Err(_) => return Err(format!("{text:?}: unknown unit (B, KiB, MiB, GiB, TiB)")),
         }

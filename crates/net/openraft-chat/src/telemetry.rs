@@ -30,7 +30,12 @@ pub const METRICS: &[MetricInfo] = &[
         "Frames this node posted into its outbox (outcome: ok, error)",
     ),
     m("openraft_chat_post_seconds", MetricKind::Histogram, &["outcome"], "Time one post into the outbox took"),
-    m("openraft_chat_envelopes_per_frame", MetricKind::Histogram, &[], "Envelopes (requests and responses) coalesced in one posted frame"),
+    m(
+        "openraft_chat_envelopes_per_frame",
+        MetricKind::Histogram,
+        &[],
+        "Envelopes (requests and responses) coalesced in one posted frame",
+    ),
     m(
         "openraft_chat_call_seconds",
         MetricKind::Histogram,
@@ -44,7 +49,12 @@ pub const METRICS: &[MetricInfo] = &[
         "Frames read from a peer's outbox (outcome: ok, duplicate, bad_frame, foreign)",
     ),
     m("openraft_chat_read_errors_total", MetricKind::Counter, &["peer"], "Failed reads of a peer's outbox"),
-    m("openraft_chat_requests_served_total", MetricKind::Counter, &["peer", "rpc"], "Requests from a peer handed to this node's Raft"),
+    m(
+        "openraft_chat_requests_served_total",
+        MetricKind::Counter,
+        &["peer", "rpc"],
+        "Requests from a peer handed to this node's Raft",
+    ),
 ];
 
 fn outcome(ok: bool) -> &'static str {

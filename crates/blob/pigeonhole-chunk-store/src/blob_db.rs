@@ -34,8 +34,7 @@ impl std::error::Error for ChunkGone {}
 
 /// True when `err` (or a cause) is [`ChunkGone`].
 pub fn is_chunk_gone(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<ChunkGone>().is_some()
-        || err.chain().any(|c| c.downcast_ref::<ChunkGone>().is_some())
+    err.downcast_ref::<ChunkGone>().is_some() || err.chain().any(|c| c.downcast_ref::<ChunkGone>().is_some())
 }
 
 /// Logical byte range within a chunk (`offset`/`len` are logical bytes).
@@ -215,12 +214,7 @@ impl BlobDb {
     }
 
     pub async fn list_instance_fingerprints(&self) -> Result<Vec<(String, String)>> {
-        Ok(self.read(|s| {
-            s.instances
-                .iter()
-                .map(|(id, i)| (id.clone(), i.fingerprint.clone()))
-                .collect()
-        }))
+        Ok(self.read(|s| s.instances.iter().map(|(id, i)| (id.clone(), i.fingerprint.clone())).collect()))
     }
 
     /// `read-write` / `read-only` / `retired`, or `None` if never configured.
@@ -283,10 +277,7 @@ impl BlobDb {
         if ids.is_empty() {
             return Ok(());
         }
-        match self
-            .propose(ChunkCommand::Retain { chunk_ids: ids.to_vec() })
-            .await?
-        {
+        match self.propose(ChunkCommand::Retain { chunk_ids: ids.to_vec() }).await? {
             Ok(()) => Ok(()),
             Err(ChunkReject::ChunkGone(chunk_id)) => {
                 pigeonhole_blob::record_chunk_gone();
@@ -301,10 +292,7 @@ impl BlobDb {
         if ids.is_empty() {
             return Ok(());
         }
-        match self
-            .propose(ChunkCommand::Release { chunk_ids: ids.to_vec() })
-            .await?
-        {
+        match self.propose(ChunkCommand::Release { chunk_ids: ids.to_vec() }).await? {
             Ok(()) => Ok(()),
             Err(ChunkReject::DoubleRelease(id)) => {
                 pigeonhole_blob::record_double_release();
@@ -338,11 +326,7 @@ impl BlobDb {
         Ok(self.local.lock().unwrap().sweep_cursor.get(instance_id).cloned())
     }
 
-    pub async fn set_sweep_cursor(
-        &self,
-        instance_id: &str,
-        after: Option<&[u8]>,
-    ) -> Result<()> {
+    pub async fn set_sweep_cursor(&self, instance_id: &str, after: Option<&[u8]>) -> Result<()> {
         let mut local = self.local.lock().unwrap();
         match after {
             Some(k) => local.sweep_cursor.insert(instance_id.to_string(), k.to_vec()),
@@ -400,29 +384,16 @@ impl BlobDb {
     /// Which of `keys` are parts of a chunk in the state on this instance, live
     /// or not: those are reclaim's to delete (it respects read pins), never the
     /// orphan sweep's. Used by the sweeper per batch (never cache across batches).
-    pub async fn owned_part_keys_among(
-        &self,
-        instance_id: &str,
-        keys: &[Vec<u8>],
-    ) -> Result<HashSet<Vec<u8>>> {
+    pub async fn owned_part_keys_among(&self, instance_id: &str, keys: &[Vec<u8>]) -> Result<HashSet<Vec<u8>>> {
         Ok(self.read(|s| {
-            keys.iter()
-                .filter(|k| s.by_key.contains_key(&(instance_id.to_string(), (*k).clone())))
-                .cloned()
-                .collect()
+            keys.iter().filter(|k| s.by_key.contains_key(&(instance_id.to_string(), (*k).clone()))).cloned().collect()
         }))
     }
 
     /// Chunk ids ready for reclaim: `refs = 0` and still live, plus crash leftovers
     /// already marked reclaiming.
     pub async fn list_zero_ref_chunks(&self) -> Result<Vec<ChunkId>> {
-        Ok(self.read(|s| {
-            s.chunks
-                .iter()
-                .filter(|(_, c)| c.refs == 0 || c.reclaiming)
-                .map(|(&id, _)| id)
-                .collect()
-        }))
+        Ok(self.read(|s| s.chunks.iter().filter(|(_, c)| c.refs == 0 || c.reclaiming).map(|(&id, _)| id).collect()))
     }
 
     /// Atomically mark a zero-ref live chunk as reclaiming. Returns false if another
@@ -431,10 +402,7 @@ impl BlobDb {
         if self.local.lock().unwrap().reclaim_gates.contains_key(&chunk_id) {
             return Ok(true);
         }
-        match self
-            .propose(ChunkCommand::BeginReclaim { chunk_id })
-            .await?
-        {
+        match self.propose(ChunkCommand::BeginReclaim { chunk_id }).await? {
             Ok(()) => {
                 let at = self.meta.applied_position();
                 self.local.lock().unwrap().reclaim_gates.insert(chunk_id, at);
@@ -459,8 +427,7 @@ impl BlobDb {
 
     /// Forget the chunk (after its backend parts are deleted).
     pub async fn delete_chunk_metadata(&self, chunk_id: ChunkId) -> Result<()> {
-        self.propose_infallible(ChunkCommand::DropChunk { chunk_id })
-            .await?;
+        self.propose_infallible(ChunkCommand::DropChunk { chunk_id }).await?;
         let mut local = self.local.lock().unwrap();
         local.repair_queue.retain(|(id, _), _| *id != chunk_id);
         local.reclaim_gates.remove(&chunk_id);
@@ -482,11 +449,7 @@ impl BlobDb {
 
     /// Remove a completed / cancelled repair job.
     pub async fn dequeue_repair(&self, chunk_id: ChunkId, instance_id: &str) -> Result<()> {
-        self.local
-            .lock()
-            .unwrap()
-            .repair_queue
-            .remove(&(chunk_id, instance_id.to_string()));
+        self.local.lock().unwrap().repair_queue.remove(&(chunk_id, instance_id.to_string()));
         Ok(())
     }
 
@@ -528,13 +491,8 @@ impl BlobDb {
     }
 
     /// Replace all parts for one instance replica.
-    pub async fn commit_instance_replica(
-        &self,
-        chunk_id: ChunkId,
-        layout: &ReplicaLayout,
-    ) -> Result<()> {
-        self.propose_infallible(ChunkCommand::AddReplica { chunk_id, replica: Replica::from(layout) })
-        .await
+    pub async fn commit_instance_replica(&self, chunk_id: ChunkId, layout: &ReplicaLayout) -> Result<()> {
+        self.propose_infallible(ChunkCommand::AddReplica { chunk_id, replica: Replica::from(layout) }).await
     }
 
     /// Pending repair queue depth (tests / metrics).
@@ -570,24 +528,13 @@ mod tests {
             parts: vec![PartLayout {
                 first_block: 0,
                 block_count: 0,
-                locator: BlobLocator {
-                    key: vec![0, 0, 0, 1],
-                    locator: b"loc".to_vec(),
-                },
+                locator: BlobLocator { key: vec![0, 0, 0, 1], locator: b"loc".to_vec() },
                 blob_id: BlobId(0),
                 block_stored_lens: vec![],
             }],
         }];
         // Direct part insert via commit of empty blocks + one part.
-        let id2 = db
-            .commit_chunk(
-                32,
-                1,
-                &[],
-                &layouts,
-            )
-            .await
-            .unwrap();
+        let id2 = db.commit_chunk(32, 1, &[], &layouts).await.unwrap();
         let _ = chunk_id;
         db.retain(&[id2]).await.unwrap();
         db.release(&[id2]).await.unwrap();
@@ -634,10 +581,7 @@ mod tests {
                     parts: vec![PartLayout {
                         first_block: 0,
                         block_count: 1,
-                        locator: BlobLocator {
-                            key: vec![0, 0, 0, 0, 0, 0, 0, 1],
-                            locator: b"{}".to_vec(),
-                        },
+                        locator: BlobLocator { key: vec![0, 0, 0, 0, 0, 0, 0, 1], locator: b"{}".to_vec() },
                         blob_id: BlobId(0),
                         block_stored_lens: vec![8],
                     }],
@@ -660,10 +604,7 @@ mod tests {
                     parts: vec![PartLayout {
                         first_block: 0,
                         block_count: 1,
-                        locator: BlobLocator {
-                            key: vec![0, 0, 0, 0, 0, 0, 0, 2],
-                            locator: b"{}".to_vec(),
-                        },
+                        locator: BlobLocator { key: vec![0, 0, 0, 0, 0, 0, 0, 2], locator: b"{}".to_vec() },
                         blob_id: BlobId(0),
                         block_stored_lens: vec![4],
                     }],
@@ -703,10 +644,7 @@ mod tests {
                         parts: vec![PartLayout {
                             first_block: 0,
                             block_count: 1,
-                            locator: BlobLocator {
-                                key: vec![0, 0, 0, 0, 0, 0, 0, key],
-                                locator: b"{}".to_vec(),
-                            },
+                            locator: BlobLocator { key: vec![0, 0, 0, 0, 0, 0, 0, key], locator: b"{}".to_vec() },
                             blob_id: BlobId(0),
                             block_stored_lens: vec![8],
                         }],
@@ -729,7 +667,9 @@ mod tests {
         db.release(&[new]).await.unwrap();
         assert!(db.try_begin_reclaim(new).await.unwrap());
         db.delete_chunk_metadata(new).await.unwrap();
-        let replayed = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
+        let replayed = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
         let after = replayed.insert_chunk(8, 1).await.unwrap();
         assert!(after > new, "chunk id {new} reused as {after} after replay");
     }
@@ -737,7 +677,9 @@ mod tests {
     #[tokio::test]
     async fn decoded_state_rebuilds_the_key_index() {
         let dir = tempfile::tempdir().unwrap();
-        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
         db.sync_instances(&[InstanceInfo {
             id: "mem".into(),
             kind: "memory",
@@ -787,10 +729,7 @@ mod tests {
                     parts: vec![PartLayout {
                         first_block: 0,
                         block_count: 0,
-                        locator: BlobLocator {
-                            key: vec![1],
-                            locator: b"{}".to_vec(),
-                        },
+                        locator: BlobLocator { key: vec![1], locator: b"{}".to_vec() },
                         blob_id: BlobId(0),
                         block_stored_lens: vec![],
                     }],
@@ -800,9 +739,6 @@ mod tests {
             .unwrap();
         db.release(&[id]).await.unwrap();
         let err = db.release(&[id]).await.unwrap_err();
-        assert!(
-            err.to_string().contains("double release"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("double release"), "{err}");
     }
 }

@@ -1,10 +1,8 @@
 //! Typed blob backend model: the traits live in `pigeonhole-storage-api`;
 //! here only the type-erased stored identity.
 
-pub use pigeonhole_storage_api::{
-    BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
-};
 use anyhow::{bail, Result};
+pub use pigeonhole_storage_api::{BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey};
 use serde::{Deserialize, Serialize};
 
 /// Type-erased stored identity: order key + the typed id in postcard.
@@ -30,4 +28,3 @@ pub fn load_id<B: BlobBackend>(stored: &BlobLocator) -> Result<B::Id> {
     }
     Ok(id)
 }
-

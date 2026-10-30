@@ -3,8 +3,7 @@
 use crate::blob_db::{BlobDb, ChunkId, StoredBlock};
 use anyhow::{bail, Context, Result};
 use pigeonhole_blob::{
-    collect_stream, EncodedBlock, OpKind, PartLayout, PartPacker, ReplicaLayout, Replicated,
-    SharedBackend,
+    collect_stream, EncodedBlock, OpKind, PartLayout, PartPacker, ReplicaLayout, Replicated, SharedBackend,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,11 +56,7 @@ pub struct Repairer {
 
 impl Repairer {
     pub fn new(db: BlobDb, replicated: Arc<Replicated>, config: RepairConfig) -> Self {
-        Self {
-            db,
-            replicated,
-            config,
-        }
+        Self { db, replicated, config }
     }
 
     pub fn config(&self) -> &RepairConfig {
@@ -118,11 +113,7 @@ impl Repairer {
         if self.config.scrub {
             stats.scrub_enqueued = self.scrub_enqueue().await?;
         }
-        let jobs = self
-            .db
-            .take_repair_jobs(self.config.batch_size)
-            .await
-            .context("take repair jobs")?;
+        let jobs = self.db.take_repair_jobs(self.config.batch_size).await.context("take repair jobs")?;
         for (chunk_id, instance_id) in jobs {
             match self.repair_one(chunk_id, &instance_id).await {
                 Ok(RepairOutcome::Repaired) => stats.repaired += 1,
@@ -202,10 +193,7 @@ impl Repairer {
             }
         }
 
-        let sources: Vec<ReplicaLayout> = layouts
-            .into_iter()
-            .filter(|l| l.instance != instance_id)
-            .collect();
+        let sources: Vec<ReplicaLayout> = layouts.into_iter().filter(|l| l.instance != instance_id).collect();
         if sources.is_empty() {
             bail!("repair chunk {chunk_id}: no source replica for {instance_id}");
         }
@@ -215,11 +203,7 @@ impl Repairer {
             .find_map(|s| self.replicated.member(&s.instance).cloned())
             .context("repair: source member missing from placement")?;
 
-        if !within_cost_budget(
-            source_backend.as_ref(),
-            target.as_ref(),
-            self.config.max_cost_wait_secs,
-        ) {
+        if !within_cost_budget(source_backend.as_ref(), target.as_ref(), self.config.max_cost_wait_secs) {
             return Ok(RepairOutcome::DeferredBudget);
         }
 
@@ -245,14 +229,8 @@ impl Repairer {
             bail!("repair chunk {chunk_id}: produced no parts for {instance_id}");
         }
 
-        let layout = ReplicaLayout {
-            instance: instance_id.to_string(),
-            parts,
-        };
-        self.db
-            .commit_instance_replica(chunk_id, &layout)
-            .await
-            .context("commit repaired replica")?;
+        let layout = ReplicaLayout { instance: instance_id.to_string(), parts };
+        self.db.commit_instance_replica(chunk_id, &layout).await.context("commit repaired replica")?;
         self.db.dequeue_repair(chunk_id, instance_id).await?;
         drop(pins);
         debug!(
@@ -299,40 +277,19 @@ async fn read_encoded_blocks(
 ) -> Result<Vec<EncodedBlock>> {
     if blocks.is_empty() {
         // Raw single-part chunk (no chunk_blocks rows).
-        let raw = collect_stream(
-            replicated
-                .read(sources, 0..1)
-                .await
-                .context("repair read raw")?,
-        )
-        .await?;
-        return Ok(vec![EncodedBlock {
-            stored: raw.clone(),
-            logical_len: raw.len() as u32,
-            codec: "raw".into(),
-        }]);
+        let raw = collect_stream(replicated.read(sources, 0..1).await.context("repair read raw")?).await?;
+        return Ok(vec![EncodedBlock { stored: raw.clone(), logical_len: raw.len() as u32, codec: "raw".into() }]);
     }
 
     let end = blocks.len() as u32;
-    let blob = collect_stream(
-        replicated
-            .read(sources, 0..end)
-            .await
-            .context("repair read blocks")?,
-    )
-    .await?;
+    let blob = collect_stream(replicated.read(sources, 0..end).await.context("repair read blocks")?).await?;
 
     let mut out = Vec::with_capacity(blocks.len());
     let mut off = 0usize;
     for b in blocks {
         let len = b.stored_len.max(0) as usize;
         if off + len > blob.len() {
-            bail!(
-                "repair: truncated stored payload at block {} (need {} have {})",
-                b.block_no,
-                off + len,
-                blob.len()
-            );
+            bail!("repair: truncated stored payload at block {} (need {} have {})", b.block_no, off + len, blob.len());
         }
         let stored = blob.slice(off..off + len);
         off += len;
@@ -340,17 +297,10 @@ async fn read_encoded_blocks(
             // Never copy a damaged block onto another member.
             bail!("repair: block {} fails its checksum on the source", b.block_no);
         }
-        out.push(EncodedBlock {
-            stored,
-            logical_len: b.logical_len.max(0) as u32,
-            codec: b.codec.clone(),
-        });
+        out.push(EncodedBlock { stored, logical_len: b.logical_len.max(0) as u32, codec: b.codec.clone() });
     }
     if off != blob.len() {
-        bail!(
-            "repair: stored payload length mismatch (consumed {off}, got {})",
-            blob.len()
-        );
+        bail!("repair: stored payload length mismatch (consumed {off}, got {})", blob.len());
     }
     Ok(out)
 }
@@ -403,14 +353,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
-        let rep = Arc::new(
-            Replicated::new(members, write_quorum, Arc::new(CheapestFirst::new())).unwrap(),
-        );
+        let rep = Arc::new(Replicated::new(members, write_quorum, Arc::new(CheapestFirst::new())).unwrap());
         let mut opts = IngestOptions::new(chunk_size, ChunkCodec::Raw);
         opts.block_size = block_size;
-        let layer = ChunkStore::open_replicated(db, rep.clone(), opts)
-            .await
-            .unwrap();
+        let layer = ChunkStore::open_replicated(db, rep.clone(), opts).await.unwrap();
         (dir, layer, rep)
     }
 
@@ -421,13 +367,8 @@ mod tests {
 
         let n = 18 * MIB;
         let body = Bytes::from((0..n).map(|i| (i % 251) as u8).collect::<Vec<_>>());
-        let ingested = layer
-            .ingest_and_commit(
-                stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]),
-                None,
-            )
-            .await
-            .unwrap();
+        let ingested =
+            layer.ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(body.clone())]), None).await.unwrap();
         assert_eq!(ingested.extents.len(), 1);
         let chunk_id = ingested.extents[0].chunk;
 
@@ -444,35 +385,16 @@ mod tests {
         })
         .with_instance_id("b-10");
         let b: SharedBackend = Arc::new(erase(b_store));
-        let rep2 = Arc::new(
-            Replicated::new(
-                vec![a, b.clone()],
-                1,
-                Arc::new(CheapestFirst::new()),
-            )
-            .unwrap(),
-        );
+        let rep2 = Arc::new(Replicated::new(vec![a, b.clone()], 1, Arc::new(CheapestFirst::new())).unwrap());
         // Sync new instance into blob.db.
         layer
             .db()
-            .sync_instances(
-                &rep2
-                    .members()
-                    .iter()
-                    .map(|m| m.instance().clone())
-                    .collect::<Vec<_>>(),
-            )
+            .sync_instances(&rep2.members().iter().map(|m| m.instance().clone()).collect::<Vec<_>>())
             .await
             .unwrap();
 
-        let repairer = Repairer::new(
-            layer.db().clone(),
-            rep2.clone(),
-            RepairConfig {
-                scrub: false,
-                ..RepairConfig::default()
-            },
-        );
+        let repairer =
+            Repairer::new(layer.db().clone(), rep2.clone(), RepairConfig { scrub: false, ..RepairConfig::default() });
         let enq = repairer.enqueue_instance_backfill("b-10").await.unwrap();
         assert_eq!(enq, 1);
 
@@ -481,29 +403,16 @@ mod tests {
 
         let after = layer.db().get_replica_layouts(chunk_id).await.unwrap();
         assert_eq!(after.len(), 2);
-        let parts_b = after
-            .iter()
-            .find(|l| l.instance == "b-10")
-            .unwrap()
-            .parts
-            .len();
+        let parts_b = after.iter().find(|l| l.instance == "b-10").unwrap().parts.len();
         // 6 MiB blocks into 10 MiB parts → more parts than 19 MiB packing.
-        assert!(
-            parts_b > parts_a,
-            "expected different packing: a={parts_a} b={parts_b}"
-        );
+        assert!(parts_b > parts_a, "expected different packing: a={parts_a} b={parts_b}");
 
         let mut opts2 = IngestOptions::new(32 * MIB, ChunkCodec::Raw);
         opts2.block_size = 6 * MIB;
-        let layer2 = ChunkStore::open_replicated(layer.db().clone(), rep2, opts2)
-            .await
-            .unwrap();
+        let layer2 = ChunkStore::open_replicated(layer.db().clone(), rep2, opts2).await.unwrap();
 
         for layout in &after {
-            let got = layer2
-                .read_from_replicas(chunk_id, 0, n, std::slice::from_ref(layout))
-                .await
-                .unwrap();
+            let got = layer2.read_from_replicas(chunk_id, 0, n, std::slice::from_ref(layout)).await.unwrap();
             assert_eq!(got, body, "replica {}", layout.instance);
         }
         let _ = rep;
@@ -513,19 +422,23 @@ mod tests {
     async fn repair_stays_inside_a_chunks_shard() {
         let (a1, a2, b) = (lim("a1", 4 * MIB), lim("a2", 4 * MIB), lim("b", 4 * MIB));
         let dir = tempfile::tempdir().unwrap();
-        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await).await.unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
         let shards = |a: Vec<SharedBackend>| {
             Arc::new(Replicated::sharded(vec![(a, 1), (vec![b.clone()], 1)], Arc::new(CheapestFirst::new())).unwrap())
         };
-        let layer = ChunkStore::open_replicated(db.clone(), shards(vec![a1.clone()]), IngestOptions::new(MIB, ChunkCodec::Raw))
-            .await
-            .unwrap();
+        let layer =
+            ChunkStore::open_replicated(db.clone(), shards(vec![a1.clone()]), IngestOptions::new(MIB, ChunkCodec::Raw))
+                .await
+                .unwrap();
         let on_a = layer.put_small(Bytes::from_static(b"first")).await.unwrap();
         let on_b = layer.put_small(Bytes::from_static(b"second")).await.unwrap();
         let where_is = |id| {
             let db = db.clone();
             async move {
-                let mut ids: Vec<_> = db.get_replica_layouts(id).await.unwrap().into_iter().map(|l| l.instance).collect();
+                let mut ids: Vec<_> =
+                    db.get_replica_layouts(id).await.unwrap().into_iter().map(|l| l.instance).collect();
                 ids.sort();
                 ids
             }
@@ -549,22 +462,15 @@ mod tests {
 
     #[tokio::test]
     async fn lost_part_is_repaired() {
-        let a: SharedBackend = Arc::new(erase(
-            MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("a"),
-        ));
-        let b: SharedBackend = Arc::new(erase(
-            MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("b"),
-        ));
+        let a: SharedBackend =
+            Arc::new(erase(MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("a")));
+        let b: SharedBackend =
+            Arc::new(erase(MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("b")));
         let (_dir, layer, rep) = open_layer(vec![a.clone(), b], 2, 8 * MIB, MIB).await;
 
         let data = Bytes::from(vec![7u8; 3 * MIB]);
-        let ingested = layer
-            .ingest_and_commit(
-                stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]),
-                None,
-            )
-            .await
-            .unwrap();
+        let ingested =
+            layer.ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None).await.unwrap();
         let chunk_id = ingested.extents[0].chunk;
         let layouts = layer.db().get_replica_layouts(chunk_id).await.unwrap();
         assert_eq!(layouts.len(), 2);
@@ -575,23 +481,14 @@ mod tests {
 
         // Probe fails → enqueue + repair.
         layer.db().enqueue_repair(chunk_id, "a").await.unwrap();
-        let repairer = Repairer::new(
-            layer.db().clone(),
-            rep.clone(),
-            RepairConfig {
-                scrub: false,
-                ..RepairConfig::default()
-            },
-        );
+        let repairer =
+            Repairer::new(layer.db().clone(), rep.clone(), RepairConfig { scrub: false, ..RepairConfig::default() });
         let stats = repairer.repair_once().await.unwrap();
         assert_eq!(stats.repaired, 1);
 
         let fixed = layer.db().get_replica_layouts(chunk_id).await.unwrap();
         let a_layout = fixed.iter().find(|l| l.instance == "a").unwrap();
-        let got = layer
-            .read_from_replicas(chunk_id, 0, data.len(), std::slice::from_ref(a_layout))
-            .await
-            .unwrap();
+        let got = layer.read_from_replicas(chunk_id, 0, data.len(), std::slice::from_ref(a_layout)).await.unwrap();
         assert_eq!(got, data);
     }
 }

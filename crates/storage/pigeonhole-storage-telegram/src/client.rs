@@ -10,6 +10,7 @@
 //! of them may be retried. Only the login runs outside it.
 
 use crate::channel::{ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, WINDOW};
+use crate::limits::{DELETE, READ, SEND};
 use crate::session::FileSession;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -17,9 +18,8 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use grammers_mtsender::{ConnectionParams, InvocationError, NoRetries, SenderPool, SenderPoolHandle};
 use grammers_tl_types::{self as tl, enums, functions, types};
-use pigeonhole_storage_api::{RateLimited, Unavailable};
-use crate::limits::{DELETE, READ, SEND};
 use pigeonhole_limits::{Call, ChatLimiter, Failed, Level, Retry, Spend, Verdict};
+use pigeonhole_storage_api::{RateLimited, Unavailable};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,10 +63,7 @@ impl std::fmt::Debug for MtprotoConfig {
 
 /// The bot id: the token's prefix before `:`.
 pub fn bot_id_of(token: &str) -> Result<i64> {
-    token
-        .split_once(':')
-        .and_then(|(id, _)| id.parse().ok())
-        .context("bot token must look like <bot id>:<secret>")
+    token.split_once(':').and_then(|(id, _)| id.parse().ok()).context("bot token must look like <bot id>:<secret>")
 }
 
 /// Which sender pool (connection) a call uses: the log's and the snapshots'
@@ -289,9 +286,8 @@ impl TelegramMtproto {
     pub async fn channel(&self, chat_id: i64, lane: Lane, limiter: Arc<ChatLimiter>) -> Result<MtprotoChannel> {
         let channel_id = channel_id_of(chat_id)?;
         // A bot may name a channel it is in with access_hash 0.
-        let request = functions::channels::GetChannels {
-            id: vec![types::InputChannel { channel_id, access_hash: 0 }.into()],
-        };
+        let request =
+            functions::channels::GetChannels { id: vec![types::InputChannel { channel_id, access_hash: 0 }.into()] };
         let chats = self
             .invoke(lane, None, Some(limiter.as_ref()), &RETRY, &request)
             .await
@@ -358,10 +354,9 @@ budgeted! {
 
 fn classify(e: &InvocationError) -> Verdict {
     match e {
-        InvocationError::Rpc(rpc) if rpc.code == 420 || rpc.name.ends_with("_WAIT") => Verdict::Wait {
-            after: Duration::from_secs(rpc.value.unwrap_or(1).max(1) as u64),
-            level: None,
-        },
+        InvocationError::Rpc(rpc) if rpc.code == 420 || rpc.name.ends_with("_WAIT") => {
+            Verdict::Wait { after: Duration::from_secs(rpc.value.unwrap_or(1).max(1) as u64), level: None }
+        }
         InvocationError::Rpc(rpc) if rpc.code >= 500 || rpc.code == -503 || rpc.name == "AUTH_KEY_UNREGISTERED" => {
             Verdict::Transient
         }
@@ -509,7 +504,13 @@ fn channel_message(m: enums::Message) -> (i64, ChannelMessage) {
                 enums::DocumentAttribute::Filename(f) => Some(f.file_name.clone()),
                 _ => None,
             });
-            let file = FileLocation { id: d.id, access_hash: d.access_hash, file_reference: d.file_reference, dc_id: d.dc_id, bot: 0 };
+            let file = FileLocation {
+                id: d.id,
+                access_hash: d.access_hash,
+                file_reference: d.file_reference,
+                dc_id: d.dc_id,
+                bot: 0,
+            };
             let msg = ChannelMessage::Document { name: name.unwrap_or_default(), size: d.size.max(0) as u64, file };
             (m.id as i64, msg)
         }
@@ -671,7 +672,9 @@ impl ChannelApi for MtprotoChannel {
             let answer = self.invoke(Some(dc), &request).await;
             match answer {
                 Ok(enums::upload::File::File(f)) => return Ok(Bytes::from(f.bytes)),
-                Ok(enums::upload::File::CdnRedirect(_)) => bail!("getFile redirected to a CDN despite cdn_supported = false"),
+                Ok(enums::upload::File::CdnRedirect(_)) => {
+                    bail!("getFile redirected to a CDN despite cdn_supported = false")
+                }
                 Err(e) => match migrate_dc(&e) {
                     Some(to) => dc = to,
                     None => return Err(e),
@@ -720,7 +723,9 @@ mod tests {
         assert!(channel_id_of(12345).is_err(), "a private chat");
         assert_eq!(bot_id_of("123456:ABC").unwrap(), 123456);
 
-        assert!(matches!(classify(&rpc(420, "FLOOD_WAIT_7")), Verdict::Wait { after, .. } if after == Duration::from_secs(7)));
+        assert!(
+            matches!(classify(&rpc(420, "FLOOD_WAIT_7")), Verdict::Wait { after, .. } if after == Duration::from_secs(7))
+        );
         assert_eq!(classify(&rpc(500, "INTERDC_2_CALL_ERROR")), Verdict::Transient);
         assert_eq!(classify(&rpc(400, "CHANNEL_INVALID")), Verdict::Fatal);
         assert_eq!(classify(&InvocationError::Dropped("x")), Verdict::Transient);
@@ -738,7 +743,13 @@ mod tests {
         let call = <functions::messages::SendMessage as Budgeted>::CALL;
         let v = metered(&call, Some(&limiter), &RETRY, || {
             let n = tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move { if n < 2 { Err(rpc(420, "FLOOD_WAIT_5")) } else { Ok(9) } }
+            async move {
+                if n < 2 {
+                    Err(rpc(420, "FLOOD_WAIT_5"))
+                } else {
+                    Ok(9)
+                }
+            }
         })
         .await
         .unwrap();
@@ -746,7 +757,8 @@ mod tests {
         assert!(t0.elapsed() >= Duration::from_secs(10), "two flood waits of 5 s");
 
         // A wait past CALL_DEADLINE ends the call.
-        let err = metered(&call, None, &RETRY, || async { Err::<(), _>(rpc(420, "FLOOD_WAIT_400")) }).await.unwrap_err();
+        let err =
+            metered(&call, None, &RETRY, || async { Err::<(), _>(rpc(420, "FLOOD_WAIT_400")) }).await.unwrap_err();
         assert!(err.is::<RateLimited>(), "{err:#}");
     }
 }

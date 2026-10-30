@@ -1,0 +1,3 @@
+# Formatting-only commits: `git blame` skips them
+# (git config blame.ignoreRevsFile .git-blame-ignore-revs; GitHub reads it as is).
+15edffd57adebed11ed7c7f2131a37e7eef7f53b

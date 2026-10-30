@@ -4,9 +4,9 @@
 //! Deletes only what it posted.
 
 use bytes::Bytes;
-use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
 use pigeonhole_limits::ChatLimiter;
-use pigeonhole_storage_telegram::{ChannelApi, Lane, TelegramBlobStore, MtprotoConfig, TelegramMtproto};
+use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
+use pigeonhole_storage_telegram::{ChannelApi, Lane, MtprotoConfig, TelegramBlobStore, TelegramMtproto};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -77,7 +77,10 @@ async fn list() {
         session: root.join(".cache/tgm-live.session"),
     };
     let tg = TelegramMtproto::connect(&cfg).await.unwrap();
-    let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()))).await.unwrap();
+    let channel = tg
+        .channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits())))
+        .await
+        .unwrap();
     let mut lo = 1;
     while lo <= to {
         let ids: Vec<i64> = (lo..=to.min(lo + 99)).collect();
@@ -119,7 +122,11 @@ async fn a_sent_message_is_visible_at_once() {
     let r = reader.channel(chat_id, Lane::Meta, limiter()).await.unwrap();
     let mut posted = Vec::new();
     for k in 0..8 {
-        let id = w.send_document("visibility-probe.bin", Bytes::from_static(b"x"), k + uuid_like()).await.unwrap().message_id;
+        let id = w
+            .send_document("visibility-probe.bin", Bytes::from_static(b"x"), k + uuid_like())
+            .await
+            .unwrap()
+            .message_id;
         posted.push(id);
         let seen = r.get_messages(&[id]).await.unwrap();
         assert!(
@@ -154,7 +161,10 @@ async fn clean() {
         session: root.join(".cache/tgm-live.session"),
     };
     let tg = TelegramMtproto::connect(&cfg).await.unwrap();
-    let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()))).await.unwrap();
+    let channel = tg
+        .channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits())))
+        .await
+        .unwrap();
     let mut lo = 1;
     let mut deleted = 0;
     while lo <= to {
@@ -259,10 +269,13 @@ async fn chain_names_survive_as_documents() {
     let big = Bytes::from(vec![7u8; 9_000]);
     let After::Won(id) = store.put_after(None, "live-doc-1", big).await.unwrap() else { panic!("a fresh chain") };
     let names = channel.get_messages(&[id.message_id]).await.unwrap();
-    println!("document name as stored: {:?}", names.first().map(|m| match m {
-        pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => name.clone(),
-        other => format!("{other:?}"),
-    }));
+    println!(
+        "document name as stored: {:?}",
+        names.first().map(|m| match m {
+            pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => name.clone(),
+            other => format!("{other:?}"),
+        })
+    );
     let fresh = TelegramBlobStore::new(channel.clone(), limiter, info);
     let tail = fresh.tail().await.unwrap();
     // Delete everything this test posted (the member and the probes).
@@ -273,8 +286,12 @@ async fn chain_names_survive_as_documents() {
         .iter()
         .zip(channel.get_messages(&ids).await.unwrap())
         .filter(|(_, m)| match m {
-            pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => name.starts_with("live-doc-") || name == "chain-probe.bin",
-            pigeonhole_storage_telegram::ChannelMessage::Text { text } => pigeonhole_storage_api::text::name_of(text) == Some("chain-probe.bin"),
+            pigeonhole_storage_telegram::ChannelMessage::Document { name, .. } => {
+                name.starts_with("live-doc-") || name == "chain-probe.bin"
+            }
+            pigeonhole_storage_telegram::ChannelMessage::Text { text } => {
+                pigeonhole_storage_api::text::name_of(text) == Some("chain-probe.bin")
+            }
             _ => false,
         })
         .map(|(id, _)| *id)
@@ -308,8 +325,12 @@ async fn bench_window() {
     let recorded = std::fs::read_to_string(&marks).unwrap_or_default();
     for var in vars {
         let chat_id: i64 = env(var).parse().unwrap();
-        let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()))).await.unwrap();
-        let marker = channel.send_text(&format!("pigeonhole bench marker ({mode})"), uuid_like()).await.unwrap().message_id;
+        let channel = tg
+            .channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits())))
+            .await
+            .unwrap();
+        let marker =
+            channel.send_text(&format!("pigeonhole bench marker ({mode})"), uuid_like()).await.unwrap().message_id;
         match mode.as_str() {
             "mark" => {
                 println!("{var}: from {marker}");
@@ -327,7 +348,9 @@ async fn bench_window() {
                     let present: Vec<i64> = ids
                         .iter()
                         .zip(channel.get_messages(&ids).await.unwrap())
-                        .filter(|(id, m)| !matches!(m, pigeonhole_storage_telegram::ChannelMessage::Empty) && **id != 208)
+                        .filter(|(id, m)| {
+                            !matches!(m, pigeonhole_storage_telegram::ChannelMessage::Empty) && **id != 208
+                        })
                         .map(|(id, _)| *id)
                         .collect();
                     if !present.is_empty() {
@@ -368,7 +391,8 @@ async fn second_bot_sees_first_bots_posts() {
     };
     let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
     let limiter = || Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()));
-    let (second, mut updates) = TelegramMtproto::connect_with_updates(&login("TG_BOT_TOKEN_2", "tgm-live-2.session")).await.unwrap();
+    let (second, mut updates) =
+        TelegramMtproto::connect_with_updates(&login("TG_BOT_TOKEN_2", "tgm-live-2.session")).await.unwrap();
     let first = TelegramMtproto::connect(&login("TG_BOT_TOKEN", "tgm-live.session")).await.unwrap();
     let theirs = second.channel(chat_id, Lane::Meta, limiter()).await.unwrap();
     let mine = first.channel(chat_id, Lane::Meta, limiter()).await.unwrap();

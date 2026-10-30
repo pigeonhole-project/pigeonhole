@@ -21,10 +21,7 @@ fn test_app(headers: Duration, idle: Duration) -> Router {
                         return None;
                     }
                     sleep(Duration::from_millis(400)).await;
-                    Some((
-                        Ok::<_, Infallible>(bytes::Bytes::from_static(b"x")),
-                        i + 1,
-                    ))
+                    Some((Ok::<_, Infallible>(bytes::Bytes::from_static(b"x")), i + 1))
                 });
                 Body::from_stream(s)
             }),
@@ -62,30 +59,20 @@ fn test_app(headers: Duration, idle: Duration) -> Router {
 async fn slow_response_body_survives_past_idle_window() {
     // Idle 800ms; drip a byte every 400ms → must complete (~3.2s wall clock).
     let app = test_app(Duration::from_secs(5), Duration::from_millis(800));
-    let req = axum::http::Request::builder()
-        .uri("/slow-body")
-        .body(Body::empty())
-        .unwrap();
+    let req = axum::http::Request::builder().uri("/slow-body").body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("slow body should finish");
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("slow body should finish");
     assert_eq!(bytes.len(), 8, "expected all 8 dripped bytes");
 }
 
 #[tokio::test]
 async fn stalled_response_body_is_cut_off() {
     let app = test_app(Duration::from_secs(5), Duration::from_millis(200));
-    let req = axum::http::Request::builder()
-        .uri("/hang-body")
-        .body(Body::empty())
-        .unwrap();
+    let req = axum::http::Request::builder().uri("/hang-body").body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let err = to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect_err("idle timeout should fail the body");
+    let err = to_bytes(resp.into_body(), usize::MAX).await.expect_err("idle timeout should fail the body");
     let _ = err;
 }
 
@@ -97,16 +84,9 @@ async fn slow_request_body_survives_past_idle_window() {
             return None;
         }
         sleep(Duration::from_millis(400)).await;
-        Some((
-            Ok::<_, Infallible>(bytes::Bytes::from_static(b"y")),
-            i + 1,
-        ))
+        Some((Ok::<_, Infallible>(bytes::Bytes::from_static(b"y")), i + 1))
     });
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri("/echo")
-        .body(Body::from_stream(s))
-        .unwrap();
+    let req = axum::http::Request::builder().method("POST").uri("/echo").body(Body::from_stream(s)).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -116,10 +96,7 @@ async fn slow_request_body_survives_past_idle_window() {
 #[tokio::test]
 async fn headers_timeout_after_empty_body() {
     let app = test_app(Duration::from_millis(100), Duration::from_secs(5));
-    let req = axum::http::Request::builder()
-        .uri("/hang-headers")
-        .body(Body::empty())
-        .unwrap();
+    let req = axum::http::Request::builder().uri("/hang-headers").body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
 }

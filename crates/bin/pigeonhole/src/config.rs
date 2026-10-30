@@ -1,16 +1,16 @@
+use crate::instances::InstanceKind;
 use crate::instances::{memory_instance, InstanceConfig, TelegramLogin};
 use crate::stores::{FileReplicas, FileShards, FileStore, Store, Topology};
+use anyhow::{bail, Context, Result};
+use pigeonhole_blob::CacheConfig;
 use pigeonhole_chunk_store::{
     RepairConfig, SweepConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, DEFAULT_SWEEP_INTERVAL,
     REPAIR_BATCH_SIZE, SWEEP_BATCH_SIZE,
 };
-use crate::instances::InstanceKind;
-use pigeonhole_blob::CacheConfig;
-use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, LimiterRegistry, Rate};
-use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_codec::ByteBudget;
+use pigeonhole_codec::{self as chunker, ChunkCodec};
 use pigeonhole_gateway_s3::{CoolPolicy, S3Options};
-use anyhow::{bail, Context, Result};
+use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, LimiterRegistry, Rate};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
@@ -302,10 +302,8 @@ impl Config {
     /// `.env`: [`Self::load`] reads that first). Tests call this, so they
     /// never pick up a developer's real `.env`.
     pub fn load_from_path(path: &Path) -> Result<Self> {
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("read config {}", path.display()))?;
-        let file: FileConfig = toml::from_str(&text)
-            .with_context(|| format!("parse TOML {}", path.display()))?;
+        let text = fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+        let file: FileConfig = toml::from_str(&text).with_context(|| format!("parse TOML {}", path.display()))?;
         Self::from_file(file, path.to_path_buf())
     }
 
@@ -376,7 +374,11 @@ impl Config {
 
     /// `limits` that never bind (in-process tests).
     fn test_limits(limits: ChatLimiterConfig) -> ChatLimiterConfig {
-        ChatLimiterConfig { upload_concurrency: 8, download_concurrency: 8, ..limits.with_all(Rate::new(1000.0, 100.0)) }
+        ChatLimiterConfig {
+            upload_concurrency: 8,
+            download_concurrency: 8,
+            ..limits.with_all(Rate::new(1000.0, 100.0))
+        }
     }
 
     /// Defaults for in-process tests; metadata files go under `dir`.
@@ -395,10 +397,7 @@ impl Config {
             limiters: Arc::new(LimiterRegistry::new(Self::test_limits(pigeonhole_storage_telegram::limits()))),
             discord: Self::test_limits(discord_limits()),
             discord_limiters: Arc::new(LimiterRegistry::new(Self::test_limits(discord_limits()))),
-            cache: CacheConfig {
-                enabled: false,
-                ..CacheConfig::default()
-            },
+            cache: CacheConfig { enabled: false, ..CacheConfig::default() },
             bytestream: BytestreamSettings::default(),
             http: HttpSettings::default(),
             instances: vec![memory_instance("mem")],
@@ -438,12 +437,7 @@ impl Config {
 
     /// Primary blob store (first member of `[chunk] store`).
     pub fn primary_instance(&self) -> Result<&InstanceConfig> {
-        let id = self
-            .placement
-            .shards
-            .first()
-            .and_then(|s| s.group.first())
-            .context("no blob store")?;
+        let id = self.placement.shards.first().and_then(|s| s.group.first()).context("no blob store")?;
         self.instances
             .iter()
             .find(|i| i.info.id == *id)
@@ -642,14 +636,8 @@ struct FileMetrics {
 
 impl FileMetrics {
     fn into_settings(self) -> MetricsSettings {
-        let listen_addr = self
-            .listen_addr
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        MetricsSettings {
-            enabled: self.enabled,
-            listen_addr,
-        }
+        let listen_addr = self.listen_addr.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        MetricsSettings { enabled: self.enabled, listen_addr }
     }
 }
 
@@ -717,19 +705,13 @@ struct FileSweep {
 
 impl Default for FileSweep {
     fn default() -> Self {
-        Self {
-            interval: DEFAULT_SWEEP_INTERVAL,
-            batch_size: SWEEP_BATCH_SIZE,
-        }
+        Self { interval: DEFAULT_SWEEP_INTERVAL, batch_size: SWEEP_BATCH_SIZE }
     }
 }
 
 impl FileSweep {
     fn into_sweep_config(self) -> SweepConfig {
-        SweepConfig {
-            batch_size: self.batch_size.max(1),
-            interval: self.interval.max(Duration::from_secs(1)),
-        }
+        SweepConfig { batch_size: self.batch_size.max(1), interval: self.interval.max(Duration::from_secs(1)) }
     }
 }
 
@@ -767,10 +749,7 @@ impl FileRepair {
 }
 
 /// `block_size` (+ margin) must fit under every blob store's max_blob_size.
-pub fn check_block_size_against_instances(
-    block_size: usize,
-    instances: &[InstanceConfig],
-) -> Result<()> {
+pub fn check_block_size_against_instances(block_size: usize, instances: &[InstanceConfig]) -> Result<()> {
     if instances.is_empty() {
         return Ok(());
     }
@@ -780,23 +759,17 @@ pub fn check_block_size_against_instances(
             InstanceKind::Memory => 20 * 1024 * 1024 - 1,
             InstanceKind::LocalDisk => pigeonhole_types::BackendLimits::local_disk().max_blob_size,
             InstanceKind::Telegram => pigeonhole_types::BackendLimits::telegram().max_blob_size,
-            InstanceKind::Discord => {
-                pigeonhole_types::BackendLimits::discord(inst.max_blob_size).max_blob_size
-            }
+            InstanceKind::Discord => pigeonhole_types::BackendLimits::discord(inst.max_blob_size).max_blob_size,
         };
         min_max = min_max.min(max);
     }
     if block_size >= min_max {
-        bail!(
-            "chunk.block_size ({block_size}) must be < min(max_blob_size) of configured instances ({min_max})"
-        );
+        bail!("chunk.block_size ({block_size}) must be < min(max_blob_size) of configured instances ({min_max})");
     }
     // Incompressible blocks store raw `block_size`; keep a small header margin.
     let need = block_size.saturating_add(64);
     if need >= min_max {
-        bail!(
-            "chunk.block_size ({block_size}) with block margin exceeds min(max_blob_size) ({min_max})"
-        );
+        bail!("chunk.block_size ({block_size}) with block margin exceeds min(max_blob_size) ({min_max})");
     }
     Ok(())
 }
@@ -917,19 +890,13 @@ struct FileChunk {
 
 impl Default for FileChunk {
     fn default() -> Self {
-        Self {
-            store: None,
-            size: chunker::DEFAULT_CHUNK_SIZE,
-            codec: ChunkCodec::Zstd,
-            block_size: None,
-        }
+        Self { store: None, size: chunker::DEFAULT_CHUNK_SIZE, codec: ChunkCodec::Zstd, block_size: None }
     }
 }
 
 impl FileChunk {
     fn resolve_block_size(&self) -> usize {
-        self.block_size
-            .map_or(chunker::DEFAULT_BLOCK_SIZE, |b| b.max(1024))
+        self.block_size.map_or(chunker::DEFAULT_BLOCK_SIZE, |b| b.max(1024))
     }
 }
 
@@ -942,9 +909,7 @@ struct FileIngest {
 
 impl Default for FileIngest {
     fn default() -> Self {
-        Self {
-            memory_budget: chunker::DEFAULT_INGEST_MEMORY_BUDGET,
-        }
+        Self { memory_budget: chunker::DEFAULT_INGEST_MEMORY_BUDGET }
     }
 }
 
@@ -957,7 +922,12 @@ fn discord_limits() -> ChatLimiterConfig {
     }
     #[cfg(not(feature = "discord"))]
     {
-        ChatLimiterConfig { bot: Rate::new(40.0, 50.0), classes: Vec::new(), upload_concurrency: 2, download_concurrency: 8 }
+        ChatLimiterConfig {
+            bot: Rate::new(40.0, 50.0),
+            classes: Vec::new(),
+            upload_concurrency: 2,
+            download_concurrency: 8,
+        }
     }
 }
 
@@ -985,7 +955,10 @@ struct FileRate {
 impl FileLimits {
     fn into_limiter_config(self, section: &str, d: ChatLimiterConfig) -> Result<ChatLimiterConfig> {
         let names = || {
-            std::iter::once("bot".to_string()).chain(d.classes.iter().map(|(c, _)| c.to_string())).collect::<Vec<_>>().join(", ")
+            std::iter::once("bot".to_string())
+                .chain(d.classes.iter().map(|(c, _)| c.to_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         let mut c = d.clone();
         for (name, value) in self.rates {
@@ -1089,7 +1062,11 @@ rate_per_sec = 20.0
         assert_eq!(cfg.tg.rate(Class("send")), Some(Rate::new(1.0, 2.0)));
         assert_eq!(cfg.tg.rate(Class("read")), Some(Rate::new(20.0, 5.0)), "an unset burst keeps the default");
         assert_eq!(cfg.tg.upload_concurrency, 4);
-        assert_eq!(cfg.discord.rate(Class("send")), discord_limits().rate(Class("send")), "[discord] keeps its own defaults");
+        assert_eq!(
+            cfg.discord.rate(Class("send")),
+            discord_limits().rate(Class("send")),
+            "[discord] keeps its own defaults"
+        );
         for (bad, want) in [
             ("[telegram]\nsend_rate_per_sec = 0.3\n", "unknown field `send_rate_per_sec`"),
             ("[telegram.get_file]\nrate_per_sec = 1.0\n", "telegram has no such rate (bot, send, read, delete)"),
@@ -1125,8 +1102,11 @@ rate_per_sec = 20.0
         assert!(cfg.meta.snapshots_outlive_log());
 
         // One dir for both: the default layout.
-        let cfg = load_mem(&format!("[meta]\nlog = \"disk\"\nsnapshot = \"disk\"\n{}", &dirs[..dirs.find("[[store]]\nid = \"backup\"").unwrap()]))
-            .unwrap();
+        let cfg = load_mem(&format!(
+            "[meta]\nlog = \"disk\"\nsnapshot = \"disk\"\n{}",
+            &dirs[..dirs.find("[[store]]\nid = \"backup\"").unwrap()]
+        ))
+        .unwrap();
         assert!(!cfg.meta.snapshots_outlive_log());
 
         for bad in [
@@ -1150,22 +1130,23 @@ rate_per_sec = 20.0
         assert!(matches!(&cfg.meta.log, LogSettings::Telegram { chat_id, .. } if chat_id == "-100"));
         assert!(matches!(&cfg.meta.snapshot, SnapshotSettings::Telegram { chat_id, .. } if chat_id == "-101"));
 
-        let err = load(&format!(
-            "[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n[chunk]\nstore = \"tg-log\"\n{stores}"
-        ))
-        .unwrap_err();
+        let err =
+            load(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n[chunk]\nstore = \"tg-log\"\n{stores}"))
+                .unwrap_err();
         assert!(format!("{err:#}").contains("one purpose"), "{err:#}");
         let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-log\"\n{stores}")).unwrap_err();
         assert!(format!("{err:#}").contains("one purpose"), "{err:#}");
-        let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n{stores}{}", tg_store("again", -100)))
-            .unwrap_err();
+        let err =
+            load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n{stores}{}", tg_store("again", -100)))
+                .unwrap_err();
         assert!(format!("{err:#}").contains("same place"), "{err:#}");
 
         let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\n{}", tg_store("tg-log", -100))).unwrap_err();
         assert!(format!("{err:#}").contains("snapshot is required"), "{err:#}");
         let disk = "[[store]]\nid = \"disk\"\nkind = \"local_disk\"\npath = \"/x\"\n";
-        let err = load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"disk\"\n{}{disk}", tg_store("tg-log", -100)))
-            .unwrap_err();
+        let err =
+            load_mem(&format!("[meta]\nlog = \"tg-log\"\nsnapshot = \"disk\"\n{}{disk}", tg_store("tg-log", -100)))
+                .unwrap_err();
         assert!(format!("{err:#}").contains("cannot start from snapshots on this host"), "{err:#}");
     }
 
@@ -1182,7 +1163,8 @@ rate_per_sec = 20.0
         set_env("PH_TEST_TGM_API_ID", "12345");
         set_env("PH_TEST_TGM_API_HASH", "hash");
         let stores = format!("{}{}{}", tgm_store("log", -1001), tgm_store("snap", -1002), tgm_store("blobs", -1003));
-        let cfg = load(&format!("[meta]\nlog = \"log\"\nsnapshot = \"snap\"\n[chunk]\nstore = \"blobs\"\n{stores}")).unwrap();
+        let cfg =
+            load(&format!("[meta]\nlog = \"log\"\nsnapshot = \"snap\"\n[chunk]\nstore = \"blobs\"\n{stores}")).unwrap();
         let login = TelegramLogin {
             bot_token: "42:secret".into(),
             api_id: 12345,
@@ -1190,14 +1172,18 @@ rate_per_sec = 20.0
             session: "pigeonhole-tg-42.session".into(),
         };
         assert_eq!(cfg.meta.log, LogSettings::Telegram { chat_id: "-1001".into(), logins: vec![login.clone()] });
-        assert_eq!(cfg.meta.snapshot, SnapshotSettings::Telegram { chat_id: "-1002".into(), logins: vec![login.clone()] });
+        assert_eq!(
+            cfg.meta.snapshot,
+            SnapshotSettings::Telegram { chat_id: "-1002".into(), logins: vec![login.clone()] }
+        );
         let inst = cfg.primary_instance().unwrap();
         assert_eq!((inst.kind, inst.info.fingerprint.as_str()), (InstanceKind::Telegram, "tg:42:-1003"));
         assert_eq!(inst.info.location, "tg:chat:-1003", "the same place as a Bot API store of that chat");
         assert_eq!(inst.telegram, vec![login]);
         assert!(!format!("{:?}", inst.telegram).contains("secret"));
 
-        let err = load_mem(&format!("[meta]\nlog = \"log\"\nsnapshot = \"log\"\n{}", tgm_store("log", -1001))).unwrap_err();
+        let err =
+            load_mem(&format!("[meta]\nlog = \"log\"\nsnapshot = \"log\"\n{}", tgm_store("log", -1001))).unwrap_err();
         assert!(format!("{err:#}").contains("one purpose"), "{err:#}");
         let err = load_mem("[[store]]\nid = \"x\"\nkind = \"memory\"\nsession = \"s\"\n").unwrap_err();
         assert!(format!("{err:#}").contains("unknown field `session`"), "{err:#}");
@@ -1291,10 +1277,7 @@ rate_per_sec = 20.0
         let stores = "[[store]]\nid = \"a\"\nkind = \"memory\"\n[[store]]\nid = \"b\"\nkind = \"memory\"\n";
         let group = |q: usize| format!("[[replicas]]\nid = \"ab\"\nmembers = [\"a\", \"b\"]\nwrite_quorum = {q}\n");
         let cfg = load(&format!("[chunk]\nstore = \"ab\"\n{stores}{}", group(2))).unwrap();
-        assert_eq!(
-            cfg.placement.shards,
-            vec![ShardPlacement { group: vec!["a".into(), "b".into()], write_quorum: 2 }]
-        );
+        assert_eq!(cfg.placement.shards, vec![ShardPlacement { group: vec!["a".into(), "b".into()], write_quorum: 2 }]);
         assert_eq!(cfg.instances.len(), 2);
 
         let err = load(&format!("[chunk]\nstore = \"ab\"\n{stores}{}", group(3))).unwrap_err();
@@ -1374,7 +1357,12 @@ rate_per_sec = 20.0
 
     #[test]
     fn rejects_unknown_keys() {
-        for stale in ["database_url = \"sqlite:x.db\"\n", "memory = true\n", "chat_id = \"-1001\"\n", "[telegram]\nrate_per_sec = 1.0\n"] {
+        for stale in [
+            "database_url = \"sqlite:x.db\"\n",
+            "memory = true\n",
+            "chat_id = \"-1001\"\n",
+            "[telegram]\nrate_per_sec = 1.0\n",
+        ] {
             let err = load_mem(stale).unwrap_err();
             assert!(format!("{err:#}").contains("unknown field"), "{stale:?} accepted");
         }
@@ -1391,7 +1379,11 @@ rate_per_sec = 20.0
         let cfg = load_mem("[log]\nlevel = \"debug\"\nformat = \"json\"\nslow_request = \"250ms\"\n").unwrap();
         assert_eq!(
             cfg.log,
-            LoggingSettings { level: "debug".into(), format: LogFormat::Json, slow_request: Duration::from_millis(250) }
+            LoggingSettings {
+                level: "debug".into(),
+                format: LogFormat::Json,
+                slow_request: Duration::from_millis(250)
+            }
         );
         assert!(load_mem("[log]\nformat = \"xml\"\n").is_err());
         assert!(load_mem("[log]\nlevels = \"debug\"\n").is_err(), "unknown keys are refused");
@@ -1450,10 +1442,15 @@ max_batch_total_size = "8 MiB"
         assert_eq!(cfg.sweep.interval, Duration::from_secs(90));
         assert_eq!(cfg.repair.max_cost_wait_secs, 0.5);
         assert_eq!((cfg.http.request_timeout, cfg.http.headers_timeout), (Duration::from_secs(120), None));
-        assert_eq!((cfg.bytestream.gc_ttl, cfg.bytestream.max_batch_total_size), (Some(Duration::from_secs(7 * 86400)), 8 << 20));
+        assert_eq!(
+            (cfg.bytestream.gc_ttl, cfg.bytestream.max_batch_total_size),
+            (Some(Duration::from_secs(7 * 86400)), 8 << 20)
+        );
 
         // Decimal units are not what anyone means by them here.
-        for bad in ["[chunk]\nsize = \"10MB\"\n", "[cache]\nl1_size = \"128 KB\"\n", "[ingest]\nmemory_budget = \"1g\"\n"] {
+        for bad in
+            ["[chunk]\nsize = \"10MB\"\n", "[cache]\nl1_size = \"128 KB\"\n", "[ingest]\nmemory_budget = \"1g\"\n"]
+        {
             let err = format!("{:#}", load_mem(bad).unwrap_err());
             assert!(err.contains("decimal units are refused"), "{bad:?}: {err}");
         }
@@ -1479,7 +1476,11 @@ max_batch_total_size = "8 MiB"
             let err = format!("{:#}", load_mem(bad).unwrap_err());
             assert!(err.contains("write \"off\""), "{bad:?}: {err}");
         }
-        for bad in ["[sweep]\ninterval = \"off\"\n", "[cache]\nl1_size = \"off\"\n", "[meta]\nsnapshot_every_entries = \"never\"\n"] {
+        for bad in [
+            "[sweep]\ninterval = \"off\"\n",
+            "[cache]\nl1_size = \"off\"\n",
+            "[meta]\nsnapshot_every_entries = \"never\"\n",
+        ] {
             assert!(load_mem(bad).is_err(), "{bad:?} accepted");
         }
     }

@@ -4,9 +4,9 @@
 
 use openraft::async_runtime::TokioOneShotSender;
 use openraft::{AsyncRuntime, OptionalSend, TokioInstant};
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::future::Future;
 use std::time::Duration;
 
 #[derive(Debug, Default, PartialEq, Eq)]

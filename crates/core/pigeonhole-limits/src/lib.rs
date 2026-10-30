@@ -154,13 +154,7 @@ impl BucketState {
     fn new(rate: Rate) -> Self {
         let rate_per_sec = rate.per_sec.max(0.01);
         let capacity = rate.burst.max(1.0);
-        Self {
-            tokens: capacity,
-            last_refill: Instant::now(),
-            cool_down_until: None,
-            rate_per_sec,
-            capacity,
-        }
+        Self { tokens: capacity, last_refill: Instant::now(), cool_down_until: None, rate_per_sec, capacity }
     }
 
     fn refill(&mut self, now: Instant) {
@@ -199,11 +193,7 @@ impl BucketState {
             return Duration::ZERO;
         }
         let need = 1.0 - self.tokens;
-        let secs = if self.rate_per_sec > 0.0 {
-            need / self.rate_per_sec
-        } else {
-            1.0
-        };
+        let secs = if self.rate_per_sec > 0.0 { need / self.rate_per_sec } else { 1.0 };
         Duration::from_secs_f64(secs.max(0.001))
     }
 
@@ -240,10 +230,7 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 
 impl TokenBucket {
     fn new(rate: Rate) -> Self {
-        Self {
-            state: Mutex::new(BucketState::new(rate)),
-            waiting: AtomicUsize::new(0),
-        }
+        Self { state: Mutex::new(BucketState::new(rate)), waiting: AtomicUsize::new(0) }
     }
 
     /// Nobody waits and there is spare budget (see [`BucketState::spare`]).
@@ -423,18 +410,12 @@ impl ChatLimiter {
     }
 
     pub async fn acquire_upload(&self) -> SemaphorePermit<'_> {
-        self.upload_sem
-            .acquire()
-            .await
-            .expect("upload semaphore closed")
+        self.upload_sem.acquire().await.expect("upload semaphore closed")
     }
 
     /// Cap parallel CDN downloads (not an API token).
     pub async fn acquire_download(&self) -> SemaphorePermit<'_> {
-        self.download_sem
-            .acquire()
-            .await
-            .expect("download semaphore closed")
+        self.download_sem.acquire().await.expect("download semaphore closed")
     }
 
     /// Background work: wait until `class` and the bot's have spare tokens
@@ -611,12 +592,22 @@ mod tests {
     }
 
     fn fast_send() -> ChatLimiter {
-        ChatLimiter::new(ChatLimiterConfig { upload_concurrency: 4, download_concurrency: 4, ..cfg().with(SEND, Rate::new(100.0, 2.0)).with(GET_FILE, Rate::new(1000.0, 100.0)).with(DELETE, Rate::new(1000.0, 100.0)) })
+        ChatLimiter::new(ChatLimiterConfig {
+            upload_concurrency: 4,
+            download_concurrency: 4,
+            ..cfg()
+                .with(SEND, Rate::new(100.0, 2.0))
+                .with(GET_FILE, Rate::new(1000.0, 100.0))
+                .with(DELETE, Rate::new(1000.0, 100.0))
+        })
     }
 
     #[tokio::test]
     async fn chats_share_their_bot_and_nothing_else() {
-        let reg = LimiterRegistry::new(ChatLimiterConfig { bot: Rate::new(0.01, 2.0), ..cfg().with(SEND, Rate::new(0.01, 1.0)) });
+        let reg = LimiterRegistry::new(ChatLimiterConfig {
+            bot: Rate::new(0.01, 2.0),
+            ..cfg().with(SEND, Rate::new(0.01, 1.0))
+        });
         let (a, b, a_again) = (reg.chat("bot1", "-1"), reg.chat("bot1", "-2"), reg.chat("bot1", "-1"));
         assert!(Arc::ptr_eq(&a, &a_again), "one limiter per chat");
         assert!(Arc::ptr_eq(a.bot(), b.bot()), "one bot limiter per bot");
@@ -644,7 +635,10 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_for_the_bot_holds_no_chat_token() {
-        let lim = Arc::new(ChatLimiter::new(ChatLimiterConfig { bot: Rate::new(10.0, 1.0), ..cfg().with(SEND, Rate::new(0.01, 1.0)) }));
+        let lim = Arc::new(ChatLimiter::new(ChatLimiterConfig {
+            bot: Rate::new(10.0, 1.0),
+            ..cfg().with(SEND, Rate::new(0.01, 1.0))
+        }));
         lim.acquire(Spend::Class(INFO)).await; // the bot's only token
         let send = {
             let lim = lim.clone();
@@ -659,7 +653,10 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_for_the_chat_holds_no_bot_token() {
-        let reg = LimiterRegistry::new(ChatLimiterConfig { bot: Rate::new(0.01, 2.0), ..cfg().with(SEND, Rate::new(10.0, 1.0)) });
+        let reg = LimiterRegistry::new(ChatLimiterConfig {
+            bot: Rate::new(0.01, 2.0),
+            ..cfg().with(SEND, Rate::new(10.0, 1.0))
+        });
         let (a, b) = (reg.chat("bot", "-1"), reg.chat("bot", "-2"));
         a.acquire(Spend::Class(SEND)).await; // a's send token, and one of the bot's two
         let again = {

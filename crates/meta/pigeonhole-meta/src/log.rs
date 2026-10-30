@@ -49,12 +49,10 @@ impl Batch {
 
     /// `Lost` for a batch of another [`LOG_FORMAT`] or one that does not parse.
     pub fn decode(data: &[u8]) -> LogResult<Self> {
-        let (format, _) = postcard::take_from_bytes::<u32>(data)
-            .map_err(|e| LogError::Lost(format!("batch header: {e}")))?;
+        let (format, _) =
+            postcard::take_from_bytes::<u32>(data).map_err(|e| LogError::Lost(format!("batch header: {e}")))?;
         if format != LOG_FORMAT {
-            return Err(LogError::Lost(format!(
-                "batch in log format {format}, this binary reads {LOG_FORMAT}"
-            )));
+            return Err(LogError::Lost(format!("batch in log format {format}, this binary reads {LOG_FORMAT}")));
         }
         postcard::from_bytes(data).map_err(|e| LogError::Lost(format!("batch: {e}")))
     }

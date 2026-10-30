@@ -1,12 +1,12 @@
 use crate::cas_index::{CasEntry, CasIndex};
 use crate::commands::CasReply;
-use pigeonhole_meta::Proposal;
 use crate::digest::{digest_hash_hex, verify_sha256};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use pigeonhole_chunk_store::{ChunkStore, IngestOptions};
 use pigeonhole_codec::{ChunkCodec, DEFAULT_CHUNK_SIZE};
+use pigeonhole_meta::Proposal;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -21,29 +21,16 @@ pub struct CasStore {
 
 impl CasStore {
     pub fn new(cas: CasIndex, store: Arc<ChunkStore>) -> Self {
-        Self {
-            cas,
-            store,
-            chunk_size: DEFAULT_CHUNK_SIZE,
-        }
+        Self { cas, store, chunk_size: DEFAULT_CHUNK_SIZE }
     }
 
-    pub async fn find_missing(
-        &self,
-        digests: &[crate::reapi::Digest],
-    ) -> Result<Vec<crate::reapi::Digest>> {
+    pub async fn find_missing(&self, digests: &[crate::reapi::Digest]) -> Result<Vec<crate::reapi::Digest>> {
         let mut pairs = Vec::with_capacity(digests.len());
         for d in digests {
             pairs.push((digest_hash_hex(d)?, d.size_bytes));
         }
         let missing = self.cas.find_missing(&pairs).await?;
-        Ok(missing
-            .into_iter()
-            .map(|(hash, size)| crate::reapi::Digest {
-                hash,
-                size_bytes: size,
-            })
-            .collect())
+        Ok(missing.into_iter().map(|(hash, size)| crate::reapi::Digest { hash, size_bytes: size }).collect())
     }
 
     pub async fn get_bytes(&self, hash_hex: &str, size: i64) -> Result<Option<Bytes>> {
@@ -73,16 +60,10 @@ impl CasStore {
         if from as i64 > size {
             anyhow::bail!("read offset out of range");
         }
-        let to = if limit > 0 {
-            (from as i64 + limit).min(size) as u64
-        } else {
-            size as u64
-        };
+        let to = if limit > 0 { (from as i64 + limit).min(size) as u64 } else { size as u64 };
         let _ = self.cas.touch(hash_hex, size).await;
         if from == to {
-            return Ok(Some(Box::pin(futures::stream::once(async {
-                Ok(Bytes::new())
-            }))));
+            return Ok(Some(Box::pin(futures::stream::once(async { Ok(Bytes::new()) }))));
         }
 
         let store = self.store.clone();
@@ -194,11 +175,7 @@ mod tests {
         let db = BlobDb::open(pigeonhole_testkit::tablet(&blob_url, BlobDb::register).await).await.unwrap();
         let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
         opts.block_size = 64 * 1024;
-        let store = Arc::new(
-            ChunkStore::open(db, MemoryBlobStore::new(), opts)
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
         (CasStore::new(cas, store), dir)
     }
 
@@ -216,13 +193,7 @@ mod tests {
         cas.put_bytes(&hash, size, payload.clone()).await.unwrap();
         let entry = cas.cas.get(&hash, size).await.unwrap().unwrap();
         assert!(!entry.extents.is_empty());
-        let meta = cas
-            .store
-            .db()
-            .chunk_meta(entry.extents[0].chunk)
-            .await
-            .unwrap()
-            .unwrap();
+        let meta = cas.store.db().chunk_meta(entry.extents[0].chunk).await.unwrap().unwrap();
         assert_eq!(meta.2, 1, "duplicate write must not add a ref");
     }
 }

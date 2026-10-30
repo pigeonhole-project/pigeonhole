@@ -63,8 +63,13 @@ impl Body {
 /// order of variants needs a new [`S3State::VERSION`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum S3Command {
-    CreateBucket { name: String, created_at: String },
-    DeleteBucket { name: String },
+    CreateBucket {
+        name: String,
+        created_at: String,
+    },
+    DeleteBucket {
+        name: String,
+    },
     /// Insert or replace an object with its tags (user metadata and tags of
     /// the old version go).
     PutObject {
@@ -80,9 +85,17 @@ pub enum S3Command {
         mtime: String,
         expect: Option<Expect>,
     },
-    DeleteObject { bucket: String, key: String, expect: Option<Expect> },
+    DeleteObject {
+        bucket: String,
+        key: String,
+        expect: Option<Expect>,
+    },
     /// Replace an object's tags (empty = delete them).
-    PutObjectTags { bucket: String, key: String, tags: Pairs },
+    PutObjectTags {
+        bucket: String,
+        key: String,
+        tags: Pairs,
+    },
     CreateUpload {
         upload_id: String,
         bucket: String,
@@ -93,7 +106,13 @@ pub enum S3Command {
         checksum_algorithm: Option<String>,
         initiated_at: String,
     },
-    PutPart { upload_id: String, part_number: i64, etag: String, size: i64, extents: Vec<Extent> },
+    PutPart {
+        upload_id: String,
+        part_number: i64,
+        etag: String,
+        size: i64,
+        extents: Vec<Extent>,
+    },
     /// Assemble the object from parts; part extents move to the object (no release).
     CompleteUpload {
         upload_id: String,
@@ -103,11 +122,18 @@ pub enum S3Command {
         mtime: String,
         expect: Option<Expect>,
     },
-    AbortUpload { upload_id: String },
+    AbortUpload {
+        upload_id: String,
+    },
     /// Move an inline object out to chunks (the cooler); its bytes, ETag and
     /// everything else stay. Rejected if the object is no longer the inline
     /// one with `etag`: a rewrite or delete always wins over cooling.
-    Cool { bucket: String, key: String, etag: String, extents: Vec<Extent> },
+    Cool {
+        bucket: String,
+        key: String,
+        etag: String,
+        extents: Vec<Extent>,
+    },
 }
 
 /// Deterministic failure of an [`S3Command`].
@@ -430,7 +456,8 @@ mod tests {
     fn command_encoding_is_pinned() {
         let cmd = S3Command::DeleteObject { bucket: "b".into(), key: "k".into(), expect: None };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k', 0]);
-        let cmd = S3Command::DeleteObject { bucket: "b".into(), key: "k".into(), expect: Some(Expect::ETag("e".into())) };
+        let cmd =
+            S3Command::DeleteObject { bucket: "b".into(), key: "k".into(), expect: Some(Expect::ETag("e".into())) };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k', 1, 1, 1, b'e']);
         let cmd = S3Command::CreateBucket { name: "b".into(), created_at: "t".into() };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [0, 1, b'b', 1, b't']);
@@ -556,7 +583,10 @@ mod tests {
         assert_eq!(s.apply(cool("gone", "1", 12)).unwrap(), Err(S3Reject::NoSuchKey));
 
         // Delete drops the count; a replay (decode + rebuild) recounts it.
-        assert_eq!(s.apply(S3Command::DeleteObject { bucket: "b".into(), key: "b".into(), expect: None }).unwrap(), Ok(vec![]));
+        assert_eq!(
+            s.apply(S3Command::DeleteObject { bucket: "b".into(), key: "b".into(), expect: None }).unwrap(),
+            Ok(vec![])
+        );
         assert_eq!(s.inline_bytes, 0);
         s.apply(put("d", "1", Body::Inline(b"0123456789".to_vec()))).unwrap().unwrap();
         let replayed: S3State = pigeonhole_meta::decode_state(&pigeonhole_meta::encode_state(&s)).unwrap();

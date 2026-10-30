@@ -101,9 +101,7 @@ impl<C: DiscordApi> DiscordApi for PooledDiscord<C> {
     }
 
     async fn delete_thread(&self, message_id: u64) -> Result<()> {
-        self.pool
-            .run(Spend::Class(DELETE), DEADLINE, rate_limited, |m| self.members[m].delete_thread(message_id))
-            .await
+        self.pool.run(Spend::Class(DELETE), DEADLINE, rate_limited, |m| self.members[m].delete_thread(message_id)).await
     }
 
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes> {
@@ -176,7 +174,15 @@ mod tests {
         let (a_sends, b_sends) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let bot = |name: &str, floods: u32, sends: &Arc<AtomicU32>| {
             let limiter = reg.chat(name, "7");
-            (Bot { channel: channel.clone(), limiter: limiter.clone(), floods: AtomicU32::new(floods), sends: sends.clone() }, limiter)
+            (
+                Bot {
+                    channel: channel.clone(),
+                    limiter: limiter.clone(),
+                    floods: AtomicU32::new(floods),
+                    sends: sends.clone(),
+                },
+                limiter,
+            )
         };
         let pooled = PooledDiscord::new("7", vec![bot("a", 1, &a_sends), bot("b", 0, &b_sends)]);
         let t0 = tokio::time::Instant::now();

@@ -2,14 +2,13 @@
 //! (`[[replicas]]`) and parts (`[[shards]]`). `[meta] log` / `snapshot` and
 //! `[chunk] store` refer to them by id.
 
-use crate::instances::{
-    discord_app_id_from_token, discord_fingerprint, discord_location, local_disk_location,
-    memory_fingerprint, memory_location, telegram_location, telegram_fingerprint,
-    InstanceConfig, TelegramLogin,
-};
 use crate::config::{PlacementConfig, ShardPlacement};
-use anyhow::{bail, Context, Result};
 use crate::instances::InstanceKind;
+use crate::instances::{
+    discord_app_id_from_token, discord_fingerprint, discord_location, local_disk_location, memory_fingerprint,
+    memory_location, telegram_fingerprint, telegram_location, InstanceConfig, TelegramLogin,
+};
+use anyhow::{bail, Context, Result};
 use pigeonhole_blob::{InstanceInfo, InstanceRole};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -83,7 +82,8 @@ impl FileStore {
                     .map(|env| {
                         let bot_token = token(&id, env)?;
                         let bot_id = bot_token.split(':').next().unwrap_or_default();
-                        let session = session.clone().unwrap_or_else(|| format!("pigeonhole-tg-{bot_id}.session").into());
+                        let session =
+                            session.clone().unwrap_or_else(|| format!("pigeonhole-tg-{bot_id}.session").into());
                         Ok(TelegramLogin { bot_token, api_id, api_hash: api_hash.clone(), session })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -147,10 +147,21 @@ pub(crate) struct FileShards {
 /// A resolved `[[store]]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Store {
-    LocalDisk { path: PathBuf },
+    LocalDisk {
+        path: PathBuf,
+    },
     /// `logins`: the primary first.
-    Telegram { chat_id: String, bot_token_envs: Vec<String>, logins: Vec<TelegramLogin> },
-    Discord { channel_id: String, bot_token_envs: Vec<String>, bot_tokens: Vec<String>, max_blob_size: Option<usize> },
+    Telegram {
+        chat_id: String,
+        bot_token_envs: Vec<String>,
+        logins: Vec<TelegramLogin>,
+    },
+    Discord {
+        channel_id: String,
+        bot_token_envs: Vec<String>,
+        bot_tokens: Vec<String>,
+        max_blob_size: Option<usize>,
+    },
     Memory,
 }
 
@@ -249,13 +260,7 @@ impl Topology {
             check_members("[[shards]]", &id, &g.members)?;
             sharded.insert(id, g);
         }
-        Ok(Self {
-            stores: by_id,
-            replicas: groups,
-            shards: sharded,
-            used: HashMap::new(),
-            used_groups: HashSet::new(),
-        })
+        Ok(Self { stores: by_id, replicas: groups, shards: sharded, used: HashMap::new(), used_groups: HashSet::new() })
     }
 
     /// Take store `id` for `purpose` (see [`Store::may_share`]).
@@ -388,7 +393,13 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
     };
     Ok(InstanceConfig {
         kind,
-        info: InstanceInfo { id: id.to_string(), kind: kind.as_str(), fingerprint, location, role: InstanceRole::ReadWrite },
+        info: InstanceInfo {
+            id: id.to_string(),
+            kind: kind.as_str(),
+            fingerprint,
+            location,
+            role: InstanceRole::ReadWrite,
+        },
         bot_token_envs,
         bot_tokens,
         scope_id,

@@ -52,9 +52,8 @@ impl FileSession {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("open {}", lock_path.display()))?;
-        lock.try_lock().map_err(|_| {
-            anyhow::anyhow!("MTProto session {} is in use by another process", path.display())
-        })?;
+        lock.try_lock()
+            .map_err(|_| anyhow::anyhow!("MTProto session {} is in use by another process", path.display()))?;
 
         let mut data = SessionData::default();
         match fs::read(path) {
@@ -150,7 +149,11 @@ impl Session for FileSession {
                 let old = d.dc_options.insert(dc_option.id, dc_option.clone());
                 old.map(|o| o.auth_key) != Some(dc_option.auth_key)
             };
-            if key_changed { self.save() } else { Ok(()) }
+            if key_changed {
+                self.save()
+            } else {
+                Ok(())
+            }
         })
     }
 

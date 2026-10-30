@@ -133,7 +133,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Class, ChatLimiterConfig, Rate};
+    use crate::{ChatLimiterConfig, Class, Rate};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const SEND: Class = Class("send");
@@ -185,16 +185,23 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         let v = run(Some(&lim), &CALL, &RETRY, classify, || {
             let n = tries.fetch_add(1, Ordering::SeqCst);
-            async move { if n == 0 { Err(E::Flood(5)) } else { Ok(9) } }
+            async move {
+                if n == 0 {
+                    Err(E::Flood(5))
+                } else {
+                    Ok(9)
+                }
+            }
         })
         .await
         .unwrap();
         assert_eq!((v, tries.load(Ordering::SeqCst)), (9, 2));
         assert!(t0.elapsed() >= Duration::from_secs(5), "the retry waited for the cooled send bucket");
-        let failed = run(Some(&lim), &Call { what: "again", ..CALL }, &Retry { attempts: 1, ..RETRY }, classify, || async {
-            Err::<(), _>(E::Flood(5))
-        })
-        .await;
+        let failed =
+            run(Some(&lim), &Call { what: "again", ..CALL }, &Retry { attempts: 1, ..RETRY }, classify, || async {
+                Err::<(), _>(E::Flood(5))
+            })
+            .await;
         assert!(matches!(failed, Err(Failed::RateLimited { .. })));
         assert!(lim.peek_wait(SEND) > Duration::from_secs(3), "the call's level is its class");
         assert_eq!(lim.peek_wait(DELETE), Duration::ZERO, "and only it");
@@ -248,7 +255,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_call_of_no_class_still_takes_the_bots_token() {
-        let lim = ChatLimiter::new(ChatLimiterConfig { bot: Rate::new(0.001, 1.0), ..limits(Rate::new(1000.0, 1000.0)) });
+        let lim =
+            ChatLimiter::new(ChatLimiterConfig { bot: Rate::new(0.001, 1.0), ..limits(Rate::new(1000.0, 1000.0)) });
         let bot_only = Call { spend: Spend::Bot, cools: Some(Level::Bot), ..CALL };
         run(Some(&lim), &bot_only, &RETRY, classify, || async { Ok::<_, E>(()) }).await.unwrap();
         assert!(lim.peek_wait(SEND) > Duration::from_secs(50), "the bot's only token is gone");

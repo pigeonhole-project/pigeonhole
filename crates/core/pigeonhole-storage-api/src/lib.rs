@@ -12,10 +12,8 @@ mod error;
 mod stream;
 pub mod text;
 
-pub use backend::{
-    BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
-};
-pub use error::{Failure, NotFound, RateLimited, Unavailable};
+pub use backend::{BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey};
 pub use chain::{After, Chain, LeaseChain, Linked, MakeAfter, PUT_AFTER_TAIL_ATTEMPTS};
+pub use error::{Failure, NotFound, RateLimited, Unavailable};
 pub use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 pub use stream::{bytes_stream, collect_stream, slice_range, BoxByteStream};
