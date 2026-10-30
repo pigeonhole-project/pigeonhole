@@ -229,7 +229,7 @@ comments. Sections:
 | `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
 | `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every` (`0` / `"0s"` = never), `keep_snapshots` (the newest snapshots kept with the log between them; default 2) |
+| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every` (`"off"` = never), `keep_snapshots` (the newest snapshots kept with the log between them; default 2) |
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
 | `[telegram]` | Rate limits on two levels: per bot (`bot_rate_per_sec`) and per channel (send / getFile / delete / info budgets); a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency |
@@ -242,8 +242,9 @@ comments. Sections:
 
 Sizes are bytes or binary-unit strings (`"19 MiB"`, `"512 KiB"`; decimal
 `KB` / `MB` / `GB` are refused), durations humantime strings (`"45s"`,
-`"10m"`, `"7d"`). Unknown keys are rejected, so a stale config fails at
-startup instead of being half-applied.
+`"10m"`, `"7d"`); a knob that can be switched off takes `"off"`. Unknown
+keys are rejected, so a stale config fails at startup instead of being
+half-applied.
 
 ## Logs and traces
 

@@ -545,12 +545,13 @@ struct FileMeta {
     log: Option<String>,
     /// `[[store]]` id of the snapshots; unset = the log's store if it is a `dir`.
     snapshot: Option<String>,
+    #[serde(deserialize_with = "units::count_or_off")]
     snapshot_every_entries: u64,
-    #[serde(with = "humantime_serde")]
+    #[serde(deserialize_with = "units::duration_or_off")]
     snapshot_every: Duration,
     keep_snapshots: usize,
-    /// A Discord log's lease; zero = a thread per batch.
-    #[serde(with = "humantime_serde")]
+    /// A Discord log's lease; `"off"` = a thread per batch.
+    #[serde(deserialize_with = "units::duration_or_off")]
     lease: Duration,
 }
 
@@ -757,7 +758,7 @@ pub fn check_block_size_against_instances(
 struct FileHttp {
     #[serde(with = "humantime_serde")]
     request_timeout: Duration,
-    #[serde(with = "humantime_serde")]
+    #[serde(deserialize_with = "units::opt_duration_or_off")]
     headers_timeout: Option<Duration>,
     max_concurrent_requests: usize,
     max_headers: usize,
@@ -780,7 +781,7 @@ impl FileHttp {
         let idle = self.request_timeout.max(Duration::from_secs(1));
         HttpSettings {
             request_timeout: idle,
-            // Absent key → same as idle; explicit "0s" disables headers timeout.
+            // Absent key → same as idle; "off" disables headers timeout.
             headers_timeout: self.headers_timeout.unwrap_or(idle),
             max_concurrent_requests: self.max_concurrent_requests.max(1),
             max_headers: self.max_headers.max(16),
@@ -796,7 +797,7 @@ struct FileBytestream {
     instance_name: String,
     #[serde(deserialize_with = "units::size")]
     max_batch_total_size: usize,
-    #[serde(with = "humantime_serde")]
+    #[serde(deserialize_with = "units::duration_or_off")]
     gc_ttl: Duration,
 }
 
@@ -831,7 +832,7 @@ struct FileCache {
     enabled: bool,
     #[serde(deserialize_with = "units::size")]
     l1_size: usize,
-    #[serde(deserialize_with = "units::size")]
+    #[serde(deserialize_with = "units::size_or_off")]
     l2_size: usize,
     write_through: bool,
 }
@@ -1028,7 +1029,7 @@ upload_concurrency = 4
                     [[store]]\nid = \"backup\"\nkind = \"local_disk\"\npath = \"/backup\"\n";
         let cfg = load_mem(&format!(
             "[meta]\nlog = \"disk\"\nsnapshot = \"backup\"\n\
-             snapshot_every_entries = 0\nsnapshot_every = \"1m\"\nkeep_snapshots = 3\nlease = \"0s\"\n{dirs}"
+             snapshot_every_entries = \"off\"\nsnapshot_every = \"1m\"\nkeep_snapshots = 3\nlease = \"off\"\n{dirs}"
         ))
         .unwrap();
         assert_eq!(cfg.meta.keep_snapshots, 3);
@@ -1296,14 +1297,14 @@ block_size = "512 KiB"
 memory_budget = "64MiB"
 [cache]
 l1_size = "32 MiB"
-l2_size = 0
+l2_size = "off"
 [sweep]
 interval = "1m 30s"
 [repair]
 max_cost_wait = "500ms"
 [http]
 request_timeout = "2m"
-headers_timeout = "0s"
+headers_timeout = "off"
 [bytestream]
 gc_ttl = "7d"
 max_batch_total_size = "8 MiB"
@@ -1329,6 +1330,24 @@ max_batch_total_size = "8 MiB"
         // Durations want a unit.
         assert!(load_mem("[sweep]\ninterval = 60\n").is_err());
         assert!(load_mem("[meta]\nlease = \"45\"\n").is_err());
+
+        // What can be off says so; zero is refused there.
+        let cfg = load_mem("[meta]\nsnapshot_every = \"off\"\n[bytestream]\ngc_ttl = \"off\"\n").unwrap();
+        assert_eq!((cfg.meta.snapshot_interval, cfg.bytestream.gc_ttl), (Duration::ZERO, Duration::ZERO));
+        for bad in [
+            "[meta]\nsnapshot_every_entries = 0\n",
+            "[meta]\nsnapshot_every = \"0s\"\n",
+            "[meta]\nlease = \"0ms\"\n",
+            "[http]\nheaders_timeout = \"0s\"\n",
+            "[bytestream]\ngc_ttl = \"0s\"\n",
+            "[cache]\nl2_size = 0\n",
+        ] {
+            let err = format!("{:#}", load_mem(bad).unwrap_err());
+            assert!(err.contains("write \"off\""), "{bad:?}: {err}");
+        }
+        for bad in ["[sweep]\ninterval = \"off\"\n", "[cache]\nl1_size = \"off\"\n", "[meta]\nsnapshot_every_entries = \"never\"\n"] {
+            assert!(load_mem(bad).is_err(), "{bad:?} accepted");
+        }
     }
 
     #[test]

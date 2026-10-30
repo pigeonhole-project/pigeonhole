@@ -10,7 +10,7 @@ region = "us-east-1"
 
 # Sizes are bytes or strings with a binary unit ("1 MiB", "512 KiB"); decimal
 # units (KB, MB, GB, k, m) are refused. Durations are strings ("45s", "10m",
-# "7d", "1m 30s"; "0s" where zero means off).
+# "7d", "1m 30s"). What can be switched off takes "off" (zero is refused there).
 
 # Stores: where bytes live. kind = local_disk (path) | memory | telegram
 # (chat_id) | discord (channel_id). Every kind holds blobs; the log and
@@ -76,11 +76,11 @@ snapshot = "meta"             # default: the log's store if it is local_disk / m
 # A local_disk log with snapshots in a channel or on another disk survives
 # losing the log's disk: `pigeonhole restore --lossy` starts a new log from
 # the newest snapshot.
-snapshot_every_entries = 10000     # snapshot all states, drop the log behind it; 0 = never
-snapshot_every = "10m"             # and this often if anything changed; "0s" = never
+snapshot_every_entries = 10000     # snapshot all states, drop the log behind it; "off" = never
+snapshot_every = "10m"             # and this often if anything changed; "off" = never
 keep_snapshots = 2                 # newest snapshots kept, with the log between them (a boot
                                    # falls back to an older one if the newest is damaged)
-# lease = "45s"                    # a discord log's lease (docs/discord-lease.md); "0s" = off
+# lease = "45s"                    # a discord log's lease (docs/discord-lease.md), or "off"
 
 [chunk]
 store = "tg-main"             # a blob store or a [[replicas]] group
@@ -129,7 +129,7 @@ download_concurrency = 8
 # (stored, compressed blocks), then the backend. Raw chunks are not cached.
 enabled = true
 l1_size = "128 MiB"
-l2_size = "256 MiB"           # 0 = no L2
+l2_size = "256 MiB"           # "off" = no L2
 # Chunks written put their stored blocks into L2 (read-after-write is free).
 write_through = true
 
@@ -140,7 +140,7 @@ enabled = false
 listen_addr = "127.0.0.1:8980"
 instance_name = "pigeonhole"
 max_batch_total_size = "4 MiB"
-# "0s" disables TTL GC for CAS entries.
+# "off" disables TTL GC for CAS entries.
 gc_ttl = "7d"
 
 [sweep]
@@ -166,7 +166,7 @@ scrub = true
 # Large streaming PUT/GET may run longer than this while bytes keep flowing.
 request_timeout = "5m"
 # Time to produce response headers after the request body is fully received.
-# Defaults to request_timeout when omitted; "0s" disables.
+# Defaults to request_timeout when omitted; "off" disables.
 headers_timeout = "5m"
 # Cap concurrent in-flight HTTP requests (tower ConcurrencyLimitLayer).
 max_concurrent_requests = 256

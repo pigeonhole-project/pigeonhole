@@ -206,7 +206,7 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
   - `list_after`: list newer blobs by label.
 
   Other stores keep the link-per-batch log.
-  `[meta] lease = "0s"` turns the lease off for Discord too.
+  `[meta] lease = "off"` turns the lease off for Discord too.
 - **Renewals run in the background and stay outside the log.** In the first
   live run a renewal waited for the thread pacer (~7 s with the post) in
   front of an append. The next batch then missed the deadline and the handle

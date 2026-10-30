@@ -310,7 +310,7 @@ no longer kept by the tablet.
 
 log = "meta"                        # a [[store]] id: local_disk | memory | telegram
 snapshot = "meta"                   # default: the log's store if local_disk / memory
-snapshot_every_entries = 10000      # 0 = never
+snapshot_every_entries = 10000      # "off" = never
 snapshot_every = "10m"             # also by time if anything changed
 
 [[store]]

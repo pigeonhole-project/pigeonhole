@@ -3,14 +3,49 @@
 //! their one-letter forms `k`, `m`, `g`) are refused: `"20MB"` is 20·10⁶
 //! bytes, under Telegram's 20 MiB by 5%, and nobody means that by it.
 //! Durations are humantime strings (`"45s"`, `"10m"`, `"7d"`).
+//!
+//! A knob that can be switched off takes `"off"`, and refuses zero: a zero
+//! timeout or interval reads as "at once" as much as "never".
 
 use bytesize::{ByteSize, Unit};
-use serde::de::{self, Deserializer, Visitor};
+use humantime_serde::re::humantime;
+use serde::de::{self, Deserialize, Deserializer, Visitor};
 use std::fmt;
+use std::time::Duration;
+
+/// What switches a knob off.
+pub(crate) const OFF: &str = "off";
 
 /// `#[serde(deserialize_with)]` for a size in bytes.
 pub(crate) fn size<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
-    d.deserialize_any(SizeVisitor)
+    d.deserialize_any(SizeVisitor { off: false })
+}
+
+/// A size or `"off"` (0).
+pub(crate) fn size_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    d.deserialize_any(SizeVisitor { off: true })
+}
+
+/// A count or `"off"` (0).
+pub(crate) fn count_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    d.deserialize_any(CountVisitor)
+}
+
+/// A duration or `"off"` (zero).
+pub(crate) fn duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+    let text = String::deserialize(d)?;
+    if text.trim() == OFF {
+        return Ok(Duration::ZERO);
+    }
+    match humantime::parse_duration(&text).map_err(|e| de::Error::custom(format!("{text:?}: {e}")))? {
+        Duration::ZERO => Err(de::Error::custom(format!("{text:?}: zero is ambiguous here, write \"{OFF}\""))),
+        d => Ok(d),
+    }
+}
+
+/// [`duration_or_off`] of an optional field (with `#[serde(default)]`).
+pub(crate) fn opt_duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+    duration_or_off(d).map(Some)
 }
 
 /// [`size`] of an optional field (with `#[serde(default)]`).
@@ -40,25 +75,70 @@ pub(crate) fn parse_size(text: &str) -> Result<u64, String> {
     s.parse::<ByteSize>().map(|b| b.as_u64()).map_err(|e| format!("{text:?}: {e}"))
 }
 
-struct SizeVisitor;
+fn zero_is_off<E: de::Error>() -> E {
+    E::custom(format!("zero is ambiguous here, write \"{OFF}\""))
+}
+
+struct SizeVisitor {
+    /// Takes `"off"` and refuses 0.
+    off: bool,
+}
 
 impl<'de> Visitor<'de> for SizeVisitor {
     type Value = usize;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("a size: bytes, or a string like \"1 MiB\"")
+        f.write_str("a size: bytes, or a string like \"1 MiB\"")?;
+        if self.off {
+            write!(f, ", or \"{OFF}\"")?;
+        }
+        Ok(())
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<usize, E> {
+        if self.off && v == 0 {
+            return Err(zero_is_off());
+        }
         usize::try_from(v).map_err(E::custom)
     }
 
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<usize, E> {
-        usize::try_from(v).map_err(|_| E::custom(format!("size {v} is negative")))
+        self.visit_u64(u64::try_from(v).map_err(|_| E::custom(format!("size {v} is negative")))?)
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<usize, E> {
+        if self.off && v.trim() == OFF {
+            return Ok(0);
+        }
         self.visit_u64(parse_size(v).map_err(E::custom)?)
+    }
+}
+
+struct CountVisitor;
+
+impl<'de> Visitor<'de> for CountVisitor {
+    type Value = u64;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "a positive number, or \"{OFF}\"")
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+        match v {
+            0 => Err(zero_is_off()),
+            v => Ok(v),
+        }
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+        self.visit_u64(u64::try_from(v).map_err(|_| E::custom(format!("{v} is negative")))?)
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+        match v.trim() {
+            OFF => Ok(0),
+            _ => Err(E::invalid_value(de::Unexpected::Str(v), &self)),
+        }
     }
 }
 
