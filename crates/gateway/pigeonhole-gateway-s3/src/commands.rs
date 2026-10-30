@@ -186,13 +186,7 @@ impl StateMachine for S3State {
 
     fn apply(&mut self, command: S3Command) -> Result<Outcome<Self>> {
         Ok(match command {
-            S3Command::CreateBucket { name, created_at } => {
-                if self.buckets.contains_key(&name) {
-                    return Ok(Err(S3Reject::BucketExists));
-                }
-                self.buckets.insert(name, BucketRec { created_at });
-                ok()
-            }
+            S3Command::CreateBucket { name, created_at } => self.create_bucket(name, created_at),
             S3Command::DeleteBucket { name } => self.delete_bucket(&name),
             S3Command::PutObject {
                 bucket,
@@ -207,12 +201,6 @@ impl StateMachine for S3State {
                 mtime,
                 expect,
             } => {
-                if !self.buckets.contains_key(&bucket) {
-                    return Ok(Err(S3Reject::BucketNotFound));
-                }
-                if let Err(reject) = self.check(&bucket, &key, expect.as_ref()) {
-                    return Ok(Err(reject));
-                }
                 let rec = ObjectRec {
                     etag,
                     size,
@@ -223,17 +211,9 @@ impl StateMachine for S3State {
                     user_meta: user_meta.into_iter().collect(),
                     tags: tags.into_iter().collect(),
                 };
-                released(self.write_object(bucket, key, rec))
+                self.put_object(bucket, key, rec, expect.as_ref())
             }
-            S3Command::DeleteObject { bucket, key, expect } => {
-                if let Err(reject) = self.check(&bucket, &key, expect.as_ref()) {
-                    return Ok(Err(reject));
-                }
-                match self.remove_object(bucket, key) {
-                    Some(o) => released(chunk_ids(o.body.extents())),
-                    None => Err(S3Reject::NoSuchKey),
-                }
-            }
+            S3Command::DeleteObject { bucket, key, expect } => self.delete_object(bucket, key, expect.as_ref()),
             S3Command::PutObjectTags { bucket, key, tags } => match self.objects.get_mut(&(bucket, key)) {
                 Some(o) => {
                     o.tags = tags.into_iter().collect();
@@ -251,12 +231,6 @@ impl StateMachine for S3State {
                 checksum_algorithm,
                 initiated_at,
             } => {
-                if !self.buckets.contains_key(&bucket) {
-                    return Ok(Err(S3Reject::BucketNotFound));
-                }
-                if self.uploads.contains_key(&upload_id) {
-                    bail!("upload id {upload_id} reused");
-                }
                 let rec = UploadRec {
                     bucket,
                     key,
@@ -267,8 +241,7 @@ impl StateMachine for S3State {
                     initiated_at,
                     parts: BTreeMap::new(),
                 };
-                self.uploads.insert(upload_id, rec);
-                ok()
+                self.create_upload(upload_id, rec)?
             }
             S3Command::PutPart { upload_id, part_number, etag, size, extents } => {
                 let Some(upload) = self.uploads.get_mut(&upload_id) else {
@@ -286,18 +259,7 @@ impl StateMachine for S3State {
                 };
                 released(upload.parts.values().flat_map(|p| chunk_ids(&p.extents)).collect())
             }
-            S3Command::Cool { bucket, key, etag, extents } => {
-                if let Err(reject) = self.check(&bucket, &key, Some(&Expect::ETag(etag))) {
-                    return Ok(Err(reject));
-                }
-                let o = self.objects.get_mut(&(bucket, key)).expect("checked above");
-                let Body::Inline(bytes) = &o.body else {
-                    return Ok(Err(S3Reject::PreconditionFailed));
-                };
-                self.inline_bytes -= bytes.len() as u64;
-                o.body = Body::Chunks(extents);
-                ok()
-            }
+            S3Command::Cool { bucket, key, etag, extents } => self.cool(bucket, key, etag, extents),
         })
     }
 
@@ -319,6 +281,56 @@ impl S3State {
             (Some(Expect::ETag(_) | Expect::Present), None) => Err(S3Reject::NoSuchKey),
             (Some(_), Some(_)) => Err(S3Reject::PreconditionFailed),
         }
+    }
+
+    fn create_bucket(&mut self, name: String, created_at: String) -> Applied {
+        if self.buckets.contains_key(&name) {
+            return Err(S3Reject::BucketExists);
+        }
+        self.buckets.insert(name, BucketRec { created_at });
+        ok()
+    }
+
+    /// Write `rec` under `(bucket, key)` if that holds what `expect` says.
+    fn put_object(&mut self, bucket: String, key: String, rec: ObjectRec, expect: Option<&Expect>) -> Applied {
+        if !self.buckets.contains_key(&bucket) {
+            return Err(S3Reject::BucketNotFound);
+        }
+        self.check(&bucket, &key, expect)?;
+        released(self.write_object(bucket, key, rec))
+    }
+
+    fn delete_object(&mut self, bucket: String, key: String, expect: Option<&Expect>) -> Applied {
+        self.check(&bucket, &key, expect)?;
+        match self.remove_object(bucket, key) {
+            Some(o) => released(chunk_ids(o.body.extents())),
+            None => Err(S3Reject::NoSuchKey),
+        }
+    }
+
+    /// A reused upload id is a bug of ours, not a refusal.
+    fn create_upload(&mut self, upload_id: String, rec: UploadRec) -> Result<Applied> {
+        if !self.buckets.contains_key(&rec.bucket) {
+            return Ok(Err(S3Reject::BucketNotFound));
+        }
+        if self.uploads.contains_key(&upload_id) {
+            bail!("upload id {upload_id} reused");
+        }
+        self.uploads.insert(upload_id, rec);
+        Ok(ok())
+    }
+
+    /// Move an inline object out to `extents`, unless it changed (no longer
+    /// `etag`, or not inline any more).
+    fn cool(&mut self, bucket: String, key: String, etag: String, extents: Vec<Extent>) -> Applied {
+        self.check(&bucket, &key, Some(&Expect::ETag(etag)))?;
+        let o = self.objects.get_mut(&(bucket, key)).expect("checked above");
+        let Body::Inline(bytes) = &o.body else {
+            return Err(S3Reject::PreconditionFailed);
+        };
+        self.inline_bytes -= bytes.len() as u64;
+        o.body = Body::Chunks(extents);
+        ok()
     }
 
     /// Refuses a bucket with objects; its unfinished uploads go with it.
