@@ -131,6 +131,26 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_meta_boot_seconds` | gauge |  | Time the last boot took: claim, load the snapshot, replay the log |
 | `pigeonhole_meta_boot_replayed_entries` | gauge |  | Entries the last boot replayed on top of its snapshot |
 | `pigeonhole_meta_snapshot_fallbacks_total` | counter |  | Boots that could not load the newest base's snapshot and started from an older one the log keeps |
+| `pigeonhole_meta_raft_node` | gauge |  | This node's Raft id |
+| `pigeonhole_meta_raft_state` | gauge | `state` | 1 for the node's Raft role (leader, follower, candidate, learner, shutdown), 0 for the others |
+| `pigeonhole_meta_raft_term` | gauge |  | The node's current Raft term |
+| `pigeonhole_meta_raft_leader` | gauge |  | The leader's node id as this node knows it, -1 if none |
+| `pigeonhole_meta_raft_last_log_index` | gauge |  | Index of the last entry in this node's log |
+| `pigeonhole_meta_raft_last_applied_index` | gauge |  | Index of the last entry this node applied |
+| `pigeonhole_meta_raft_replication_lag` | gauge | `peer` | On the leader: entries a peer's log is behind the leader's (NaN on a follower) |
+| `pigeonhole_meta_raft_quorum_ack_age_seconds` | gauge |  | On the leader: time since a quorum last acknowledged it (NaN on a follower); grows when the leader is cut off |
+
+### openraft-chat
+
+| Metric | Kind | Labels | Meaning |
+|---|---|---|---|
+| `openraft_chat_posts_total` | counter | `outcome` | Frames this node posted into its outbox (outcome: ok, error) |
+| `openraft_chat_post_seconds` | histogram | `outcome` | Time one post into the outbox took |
+| `openraft_chat_envelopes_per_frame` | histogram |  | Envelopes (requests and responses) coalesced in one posted frame |
+| `openraft_chat_call_seconds` | histogram | `peer`, `rpc`, `outcome` | A request's round trip, from queued to its response (outcome: ok, timeout) |
+| `openraft_chat_frames_received_total` | counter | `peer`, `outcome` | Frames read from a peer's outbox (outcome: ok, duplicate, bad_frame, foreign) |
+| `openraft_chat_read_errors_total` | counter | `peer` | Failed reads of a peer's outbox |
+| `openraft_chat_requests_served_total` | counter | `peer`, `rpc` | Requests from a peer handed to this node's Raft |
 
 ### pigeonhole (binary)
 

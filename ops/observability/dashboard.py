@@ -184,6 +184,44 @@ place([
     stat("Stopped", "pigeonhole_meta_stopped", "short", warn_at(1, 1)),
 ], 8)
 
+row("Cluster (Raft)")
+CALLS = "openraft_chat_call_seconds"
+place([
+    stat("Leader", "max(pigeonhole_meta_raft_leader)", decimals=0),
+    stat("Term", "max(pigeonhole_meta_raft_term)", decimals=0),
+    stat("Leaders", 'sum(pigeonhole_meta_raft_state{state="leader"})', "short", warn_at(2, 2), decimals=0),
+    stat("Quorum ack age", "max(pigeonhole_meta_raft_quorum_ack_age_seconds)", "s", warn_at(1, 5)),
+], 4)
+place([
+    ts("Role per node", [('pigeonhole_meta_raft_state == 1', "{{instance}}: {{state}}")],
+       desc="A node's Raft role; an election shows as a candidate blip, a split brain as two leaders"),
+    ts("Term", [("pigeonhole_meta_raft_term", "{{instance}}")],
+       desc="Every step up is an election; steady terms mean a stable leader"),
+    ts("Replication lag (on the leader)", [("pigeonhole_meta_raft_replication_lag", "to {{peer}}")],
+       desc="Entries a follower is behind the leader's log; it grows while a follower is cut off"),
+    ts("Quorum ack age (on the leader)", [("pigeonhole_meta_raft_quorum_ack_age_seconds", "{{instance}}")], "s",
+       desc="Time since a quorum last acknowledged the leader; near the heartbeat when healthy"),
+    ts("Unapplied entries", [("pigeonhole_meta_raft_last_log_index - pigeonhole_meta_raft_last_applied_index",
+                              "{{instance}}")],
+       desc="Entries in a node's log it has not applied yet"),
+], 8)
+place([
+    ts("Raft calls /s", [(f"sum by (rpc, outcome) (rate({CALLS}_count{R}))", "{{rpc}} {{outcome}}")], "ops",
+       stack=True, desc="Requests this node sent over the chat, by their fate; timeouts are lost or late frames"),
+    ts("Raft call p50 / p99", [(q(0.5, CALLS, "rpc", '{outcome="ok"}'), "{{rpc}} p50"),
+                               (q(0.99, CALLS, "rpc", '{outcome="ok"}'), "{{rpc}} p99")], "s",
+       desc="Round trip over the chat: a tick to post, the peer's read (push or poll), its tick to answer"),
+    ts("Posts /s", [(f"sum by (outcome) (rate(openraft_chat_posts_total{R}))", "{{outcome}}"),
+                    (ratio(f"rate(openraft_chat_envelopes_per_frame_sum{R})",
+                           f"rate(openraft_chat_envelopes_per_frame_count{R})"), "envelopes per frame")], "ops",
+       desc="One frame per tick at most; envelopes per frame show the coalescing"),
+    ts("Frames received /s", [(f"sum by (peer, outcome) (rate(openraft_chat_frames_received_total{R}))",
+                               "from {{peer}}: {{outcome}}"),
+                              (f"sum by (peer) (rate(openraft_chat_read_errors_total{R}))", "from {{peer}}: read error")],
+       "ops", desc="duplicate: a frame seen twice; bad_frame / foreign: another key or cluster"),
+    ts("Post p99", [(q(0.99, "openraft_chat_post_seconds"), "p99")], "s"),
+], 8)
+
 row("Contents")
 place([
     ts("Objects / uploads", [("pigeonhole_s3_objects", "objects"), ("pigeonhole_s3_uploads", "uploads in progress"),

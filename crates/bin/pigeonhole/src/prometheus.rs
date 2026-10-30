@@ -40,6 +40,8 @@ pub fn install_recorder() -> anyhow::Result<&'static PrometheusHandle> {
         .map_err(buckets)?
         .set_buckets_for_metric(Matcher::Suffix("_per_entry".into()), COUNT_BUCKETS)
         .map_err(buckets)?
+        .set_buckets_for_metric(Matcher::Suffix("_per_frame".into()), COUNT_BUCKETS)
+        .map_err(buckets)?
         .install_recorder()
         .map_err(|e| anyhow::anyhow!("install prometheus recorder: {e}"))?;
     for docs in crate::metric_docs() {

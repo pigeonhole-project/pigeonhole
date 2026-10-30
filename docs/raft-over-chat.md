@@ -268,6 +268,18 @@ this in batches on spare budget (`wait_idle`), as the log collection does.
 Telegram deletes up to 100 ids per call, Discord bulk-deletes messages
 younger than 14 days.
 
+## Observability
+
+The tablet records openraft's own metrics (`Raft::metrics()`) as gauges on
+every `record_gauges`: the node's role, term, the leader it knows, its last
+log and applied indexes, and on the leader each peer's replication lag and
+the time since a quorum last acknowledged it. openraft-chat records its side
+through the `metrics` facade: posts and their time, envelopes per frame,
+every call's round trip by RPC and outcome (ok, timeout), frames read by
+outcome (ok, duplicate, bad_frame, foreign) and read errors. Names and
+labels: [metrics.md](metrics.md); the Grafana dashboard has a Cluster (Raft)
+row of them.
+
 ## Configuration (pigeonhole)
 
 ```toml

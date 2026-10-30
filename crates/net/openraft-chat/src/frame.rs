@@ -56,6 +56,15 @@ impl<C: RaftTypeConfig> Body<C> {
     pub fn is_request(&self) -> bool {
         matches!(self, Body::AppendEntries(_) | Body::Vote(_) | Body::InstallSnapshot(_))
     }
+
+    /// The RPC a request or a response belongs to.
+    pub fn rpc(&self) -> &'static str {
+        match self {
+            Body::AppendEntries(_) | Body::Appended(_) => "append_entries",
+            Body::Vote(_) | Body::Voted(_) => "vote",
+            Body::InstallSnapshot(_) | Body::Installed(_) => "install_snapshot",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]

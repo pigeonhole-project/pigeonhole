@@ -829,9 +829,10 @@ impl MetaStore {
         self.shared.applied.load(Ordering::SeqCst)
     }
 
-    /// Set the position / generation / stopped gauges (call it periodically).
+    /// Set the position / generation / stopped and Raft gauges (call it periodically).
     pub fn record_gauges(&self) {
         telemetry::record_positions(self.applied_position(), self.base_position(), self.gen, self.is_stopped());
+        telemetry::record_raft(&self.raft.metrics().borrow());
     }
 }
 

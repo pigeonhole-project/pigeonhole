@@ -1,5 +1,7 @@
 //! The tablet's metrics (the [`metrics`] facade: no-op without a recorder).
 
+use crate::raft::NodeId;
+use openraft::{BasicNode, RaftMetrics, ServerState};
 use pigeonhole_types::MetricDoc;
 use std::time::Duration;
 
@@ -58,6 +60,26 @@ pub const METRICS: &[MetricDoc] = &[
         "pigeonhole_meta_snapshot_fallbacks_total",
         &[],
         "Boots that could not load the newest base's snapshot and started from an older one the log keeps",
+    ),
+    MetricDoc::gauge("pigeonhole_meta_raft_node", &[], "This node's Raft id"),
+    MetricDoc::gauge(
+        "pigeonhole_meta_raft_state",
+        &["state"],
+        "1 for the node's Raft role (leader, follower, candidate, learner, shutdown), 0 for the others",
+    ),
+    MetricDoc::gauge("pigeonhole_meta_raft_term", &[], "The node's current Raft term"),
+    MetricDoc::gauge("pigeonhole_meta_raft_leader", &[], "The leader's node id as this node knows it, -1 if none"),
+    MetricDoc::gauge("pigeonhole_meta_raft_last_log_index", &[], "Index of the last entry in this node's log"),
+    MetricDoc::gauge("pigeonhole_meta_raft_last_applied_index", &[], "Index of the last entry this node applied"),
+    MetricDoc::gauge(
+        "pigeonhole_meta_raft_replication_lag",
+        &["peer"],
+        "On the leader: entries a peer's log is behind the leader's (NaN on a follower)",
+    ),
+    MetricDoc::gauge(
+        "pigeonhole_meta_raft_quorum_ack_age_seconds",
+        &[],
+        "On the leader: time since a quorum last acknowledged it (NaN on a follower); grows when the leader is cut off",
     ),
 ];
 
@@ -128,6 +150,38 @@ pub(crate) fn record_positions(applied: u64, base: u64, generation: u64, stopped
     metrics::gauge!("pigeonhole_meta_base_position").set(base as f64);
     metrics::gauge!("pigeonhole_meta_generation").set(generation as f64);
     metrics::gauge!("pigeonhole_meta_stopped").set(if stopped { 1.0 } else { 0.0 });
+}
+
+const RAFT_STATES: [(ServerState, &str); 5] = [
+    (ServerState::Leader, "leader"),
+    (ServerState::Follower, "follower"),
+    (ServerState::Candidate, "candidate"),
+    (ServerState::Learner, "learner"),
+    (ServerState::Shutdown, "shutdown"),
+];
+
+pub(crate) fn record_raft(m: &RaftMetrics<NodeId, BasicNode>) {
+    metrics::gauge!("pigeonhole_meta_raft_node").set(m.id as f64);
+    for (state, name) in RAFT_STATES {
+        metrics::gauge!("pigeonhole_meta_raft_state", "state" => name).set(if m.state == state { 1.0 } else { 0.0 });
+    }
+    metrics::gauge!("pigeonhole_meta_raft_term").set(m.current_term as f64);
+    metrics::gauge!("pigeonhole_meta_raft_leader").set(m.current_leader.map_or(-1.0, |l| l as f64));
+    let last = m.last_log_index.map_or(-1.0, |i| i as f64);
+    metrics::gauge!("pigeonhole_meta_raft_last_log_index").set(last);
+    metrics::gauge!("pigeonhole_meta_raft_last_applied_index").set(m.last_applied.map_or(-1.0, |l| l.index as f64));
+    let ack = m.millis_since_quorum_ack.map_or(f64::NAN, |ms| ms as f64 / 1000.0);
+    metrics::gauge!("pigeonhole_meta_raft_quorum_ack_age_seconds").set(ack);
+    // Every voter but this node gets a value, so a former leader's lags go
+    // NaN rather than freeze.
+    for peer in m.membership_config.membership().voter_ids().filter(|p| *p != m.id) {
+        let matched = m.replication.as_ref().map(|r| r.get(&peer).map(|l| l.map_or(-1.0, |l| l.index as f64)));
+        let lag = match matched {
+            Some(Some(matched)) => last - matched,
+            _ => f64::NAN,
+        };
+        metrics::gauge!("pigeonhole_meta_raft_replication_lag", "peer" => peer.to_string()).set(lag);
+    }
 }
 
 pub(crate) fn record_log_write(op: &'static str, ok: bool, d: Duration) {
