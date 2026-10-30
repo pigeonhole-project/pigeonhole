@@ -87,9 +87,8 @@ pub struct Config {
 /// `[inline]` (docs/inline-objects.md).
 #[derive(Clone, Debug, PartialEq)]
 pub struct InlineSettings {
-    /// Objects up to this size are stored inline; 0 = never
-    /// (`max_object_size`).
-    pub max_object_bytes: usize,
+    /// Objects up to this size are stored inline; `None`: never.
+    pub max_object_size: Option<usize>,
     /// When the cooler moves inline objects out.
     pub cool: CoolPolicy,
     /// Pause between cooler passes.
@@ -99,7 +98,7 @@ pub struct InlineSettings {
 impl InlineSettings {
     /// Nothing inline (tests that count chunks).
     pub fn off() -> Self {
-        Self { max_object_bytes: 0, cool: CoolPolicy::default(), cool_every: Duration::from_secs(60) }
+        Self { max_object_size: None, cool: CoolPolicy::default(), cool_every: Duration::from_secs(60) }
     }
 }
 
@@ -441,7 +440,7 @@ impl Config {
             chunk_codec: self.chunk_codec,
             block_size: self.block_size,
             ingest_budget: self.ingest_budget.clone(),
-            inline_max_bytes: self.inline.max_object_bytes,
+            inline_max: self.inline.max_object_size,
         }
     }
 
@@ -691,13 +690,13 @@ impl FileMetrics {
 struct FileInline {
     /// `"off"` = never inline.
     #[serde(deserialize_with = "units::size_or_off")]
-    max_object_size: usize,
+    max_object_size: Option<usize>,
     #[serde(deserialize_with = "units::size")]
     budget: usize,
     low_watermark: f64,
     /// `"off"` = only by budget.
     #[serde(deserialize_with = "units::duration_or_off")]
-    cool_after: Duration,
+    cool_after: Option<Duration>,
     #[serde(with = "humantime_serde")]
     min_inline: Duration,
     #[serde(with = "humantime_serde")]
@@ -709,10 +708,10 @@ impl Default for FileInline {
     fn default() -> Self {
         let p = CoolPolicy::default();
         Self {
-            max_object_size: 1024,
+            max_object_size: Some(1024),
             budget: p.budget_bytes as usize,
             low_watermark: p.low_watermark,
-            cool_after: p.cool_after.unwrap_or_default(),
+            cool_after: p.cool_after,
             min_inline: p.min_inline,
             cool_every: Duration::from_secs(60),
             cool_batch: p.batch,
@@ -726,11 +725,11 @@ impl FileInline {
             bail!("inline.low_watermark must be within 0..=1");
         }
         Ok(InlineSettings {
-            max_object_bytes: self.max_object_size,
+            max_object_size: self.max_object_size,
             cool: CoolPolicy {
                 budget_bytes: self.budget as u64,
                 low_watermark: self.low_watermark,
-                cool_after: (!self.cool_after.is_zero()).then_some(self.cool_after),
+                cool_after: self.cool_after,
                 min_inline: self.min_inline,
                 batch: self.cool_batch.max(1),
             },
@@ -1304,10 +1303,10 @@ upload_concurrency = 4
     #[test]
     fn inline_takes_units_and_defaults() {
         let cfg = load_mem("").unwrap();
-        assert_eq!(cfg.inline.max_object_bytes, 1024);
+        assert_eq!(cfg.inline.max_object_size, Some(1024));
         assert_eq!(cfg.inline.cool.cool_after, Some(Duration::from_secs(600)));
         let cfg = load_mem("[inline]\nmax_object_size = \"4 KiB\"\nbudget = \"1 MiB\"\ncool_after = \"off\"\nmin_inline = \"5s\"\ncool_every = \"2m\"\n").unwrap();
-        assert_eq!(cfg.inline.max_object_bytes, 4096);
+        assert_eq!(cfg.inline.max_object_size, Some(4096));
         assert_eq!(cfg.inline.cool.budget_bytes, 1 << 20);
         assert_eq!(cfg.inline.cool.cool_after, None, "off: only by budget");
         assert_eq!(cfg.inline.cool.min_inline, Duration::from_secs(5));
@@ -1316,7 +1315,7 @@ upload_concurrency = 4
         assert!(load_mem("[inline]\nlow_watermark = 1.5\n").is_err());
         assert!(load_mem("[inline]\ncool_after = \"0s\"\n").is_err(), "zero is ambiguous: write off");
         let cfg = load_mem("[inline]\nmax_object_size = \"off\"\n").unwrap();
-        assert_eq!(cfg.inline.max_object_bytes, 0);
+        assert_eq!(cfg.inline.max_object_size, None);
     }
 
     #[test]

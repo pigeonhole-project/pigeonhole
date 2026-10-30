@@ -67,7 +67,7 @@ pub fn spawn_cooler(cfg: &Config, gateway: S3Gateway) {
         }
     });
     info!(
-        max_object_bytes = cfg.inline.max_object_bytes,
+        max_object_size = ?cfg.inline.max_object_size,
         budget_bytes = cfg.inline.cool.budget_bytes,
         every_secs = every.as_secs(),
         "cooler background task started"
@@ -76,7 +76,7 @@ pub fn spawn_cooler(cfg: &Config, gateway: S3Gateway) {
 
 /// The cooler's policy: as configured, or, with inlining off, everything out.
 fn cooler_policy(inline: &InlineSettings) -> CoolPolicy {
-    if inline.max_object_bytes > 0 {
+    if inline.max_object_size.is_some() {
         return inline.cool.clone();
     }
     CoolPolicy { cool_after: Some(Duration::ZERO), min_inline: Duration::ZERO, ..inline.cool.clone() }
@@ -91,7 +91,7 @@ mod tests {
         let mut inline = InlineSettings::off();
         let p = cooler_policy(&inline);
         assert_eq!((p.cool_after, p.min_inline), (Some(Duration::ZERO), Duration::ZERO));
-        inline.max_object_bytes = 1024;
+        inline.max_object_size = Some(1024);
         assert_eq!(cooler_policy(&inline), inline.cool);
     }
 }

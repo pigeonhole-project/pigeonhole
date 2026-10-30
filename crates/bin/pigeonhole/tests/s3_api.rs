@@ -858,7 +858,7 @@ async fn setup_inline() -> (pigeonhole::service::S3Gateway, Arc<pigeonhole_meta:
     let db = BlobDb::open(meta.clone()).await.unwrap();
     let opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
     let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
-    let s3opts = pigeonhole::service::S3Options { inline_max_bytes: 1024, ..cfg.s3_options() };
+    let s3opts = pigeonhole::service::S3Options { inline_max: Some(1024), ..cfg.s3_options() };
     let s3 = build_s3_gateway(s3opts, index, store);
     s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
     (s3, meta, dir)
@@ -1083,7 +1083,7 @@ async fn a_copy_follows_the_current_threshold() {
     let (s3, _meta, _dir) = setup_inline().await;
     s3.put_object(req(put_len("src", b"0123456789", true))).await.unwrap();
     let mut off = s3.clone();
-    off.opts.inline_max_bytes = 0;
+    off.opts.inline_max = None;
     let copy = CopyObjectInput::builder()
         .bucket("b".into())
         .key("dst".into())

@@ -49,8 +49,8 @@ pub struct S3Options {
     /// Process-wide ingest buffer budget (shared across PUTs).
     pub ingest_budget: Option<ByteBudget>,
     /// Objects up to this size are stored inline in the metadata
-    /// (docs/inline-objects.md); 0 = never.
-    pub inline_max_bytes: usize,
+    /// (docs/inline-objects.md); `None`: never.
+    pub inline_max: Option<usize>,
 }
 
 impl S3Options {
@@ -62,7 +62,7 @@ impl S3Options {
             chunk_codec: ChunkCodec::Zstd,
             block_size: chunker::DEFAULT_BLOCK_SIZE,
             ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
-            inline_max_bytes: 0,
+            inline_max: None,
         }
     }
 }
@@ -736,12 +736,13 @@ impl S3 for S3Gateway {
         };
         let mut stream = checksums.wrap(stream);
 
-        // A body of at most `inline_max_bytes` stays in the metadata
+        // A body of at most `inline_max` stays in the metadata
         // (docs/inline-objects.md): read up to one byte more to know.
         let mut head = Vec::new();
         let mut inline = false;
-        let max = self.opts.inline_max_bytes as u64;
-        if max > 0 && input.content_length.is_none_or(|n| (n as u64) <= max) {
+        if let Some(max) = self.opts.inline_max.map(|m| m as u64)
+            .filter(|&max| input.content_length.is_none_or(|n| (n as u64) <= max))
+        {
             let mut read = 0u64;
             loop {
                 match stream.next().await {
@@ -1079,7 +1080,7 @@ impl S3 for S3Gateway {
         // An inline source too large for inlining now (it is off, or the
         // threshold was lowered) is stored at the destination as new chunks.
         if let Body::Inline(bytes) = &src.body {
-            if bytes.len() > self.opts.inline_max_bytes {
+            if self.opts.inline_max.is_none_or(|max| bytes.len() > max) {
                 let data = Bytes::copy_from_slice(bytes);
                 let ingested = self
                     .store
