@@ -1,0 +1,24 @@
+[package]
+name = "openraft-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "openraft's network over chat channels: Raft nodes talk by posting into channels and reading them"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+hmac = { workspace = true }
+openraft = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

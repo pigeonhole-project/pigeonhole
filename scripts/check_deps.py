@@ -13,6 +13,8 @@ ROLE = {
     "pigeonhole-codec": "codec",
     "pigeonhole-storage-api": "storage-api",
     "pigeonhole-limits": "limits",
+    # Standalone: no pigeonhole crate at all (docs/raft-over-chat.md).
+    "openraft-chat": "standalone",
     "pigeonhole-meta": "meta",
     "pigeonhole-blob": "blob",
     "pigeonhole-chunk-store": "chunk-store",
@@ -119,6 +121,10 @@ def main() -> int:
                     errors.append(
                         f"{name} (chunk-store) must not depend on {dep['name']}"
                     )
+
+        elif role == "standalone":
+            for dep_name in dep_names:
+                errors.append(f"{name} (standalone) → {dep_name}: it depends on no workspace crate")
 
         elif role in ("blob", "codec", "limits", "meta", "storage-api", "types") and strict:
             allowed = {
