@@ -1,11 +1,13 @@
 //! The MTProto client: one bot login per process, sender pools ("lanes")
 //! sharing its session, and [`MtprotoChannel`], the [`ChannelApi`] over it.
 //!
-//! grammers' own flood-wait sleeping is off ([`NoRetries`]): a
-//! `FLOOD_WAIT_X` becomes [`RateLimited`], cools the [`ChatLimiter`] bucket
-//! of that call and is waited out here, like every other transient failure.
+//! grammers' own flood-wait sleeping is off ([`NoRetries`]). Every request
+//! goes through [`TelegramMtproto::invoke`], so through the limiter
+//! ([`pigeonhole_limits::run`]): it takes the request's tokens, a
+//! `FLOOD_WAIT_X` cools the buckets the request names ([`Budgeted`]) and is
+//! waited out, like every other transient failure, within [`CALL_BUDGET`].
 //! Every call we make is idempotent (a send carries its `random_id`), so all
-//! of them are retried within [`CALL_BUDGET`].
+//! of them may be retried. Only the login runs outside it.
 
 use crate::channel::{ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, WINDOW};
 use crate::session::FileSession;
@@ -16,16 +18,22 @@ use futures::{StreamExt, TryStreamExt};
 use grammers_mtsender::{ConnectionParams, InvocationError, NoRetries, SenderPool, SenderPoolHandle};
 use grammers_tl_types::{self as tl, enums, functions, types};
 use pigeonhole_storage_api::{RateLimited, Unavailable};
-use pigeonhole_limits::ChatLimiter;
+use pigeonhole_limits::{Call, ChatLimiter, Failed, LimitBudget, Penalty, Retry, Verdict};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// How long one call keeps retrying flood waits and network errors.
 pub const CALL_BUDGET: Duration = Duration::from_secs(300);
+const RETRY: Retry = Retry {
+    budget: CALL_BUDGET,
+    attempts: u32::MAX,
+    backoff: Duration::from_millis(500),
+    max_backoff: Duration::from_secs(16),
+};
 /// Upload parts of one file in flight.
 const PARTS_IN_FLIGHT: usize = 4;
 /// Upload part size (the most Telegram takes).
@@ -134,8 +142,7 @@ impl TelegramMtproto {
                 }
             });
         }
-        let request = functions::updates::GetState {};
-        retry_call("updates.getState", CALL_BUDGET, None, || this.home(Lane::Meta, &request)).await?;
+        this.invoke(Lane::Meta, None, None, &functions::updates::GetState {}).await?;
         Ok((this, merged))
     }
 
@@ -217,6 +224,24 @@ impl TelegramMtproto {
         }
     }
 
+    /// `request` in the home DC (or `dc`), metered by `limiter`, retried
+    /// until it succeeds or fails for good.
+    async fn invoke<R: Budgeted>(
+        &self,
+        lane: Lane,
+        dc: Option<i32>,
+        limiter: Option<&ChatLimiter>,
+        request: &R,
+    ) -> Result<R::Return> {
+        metered(&R::CALL, limiter, || async move {
+            match dc {
+                Some(dc) => self.in_dc(lane, dc, request).await,
+                None => self.home(lane, request).await,
+            }
+        })
+        .await
+    }
+
     /// One attempt in the home DC.
     async fn home<R: tl::RemoteCall>(&self, lane: Lane, request: &R) -> Result<R::Return, InvocationError> {
         use grammers_session::Session as _;
@@ -261,7 +286,8 @@ impl TelegramMtproto {
         let request = functions::channels::GetChannels {
             id: vec![types::InputChannel { channel_id, access_hash: 0 }.into()],
         };
-        let chats = retry_call("channels.getChannels", CALL_BUDGET, None, || self.home(lane, &request))
+        let chats = self
+            .invoke(lane, None, None, &request)
             .await
             .with_context(|| format!("chat {chat_id}: is the bot a member of this channel?"))?;
         let channel = chats
@@ -297,78 +323,65 @@ pub fn channel_id_of(chat_id: i64) -> Result<i64> {
     Ok(PREFIX - chat_id)
 }
 
-/// How a failed attempt is handled.
-enum Failure {
-    /// Rate limited for this long (the call was not applied).
-    Flood(Duration),
-    /// Worth another attempt after a backoff.
-    Transient,
-    /// Hand the error up as is.
-    Fatal,
+/// What a request spends and which buckets its `FLOOD_WAIT` cools. A
+/// request without it cannot be sent ([`TelegramMtproto::invoke`]).
+trait Budgeted: tl::RemoteCall {
+    const CALL: Call;
 }
 
-fn classify(e: &InvocationError) -> Failure {
+macro_rules! budgeted {
+    ($($request:ty => $what:literal, $budget:expr, $penalty:expr;)*) => {
+        $(impl Budgeted for $request {
+            const CALL: Call = Call { service: "telegram", what: $what, budget: $budget, penalty: $penalty };
+        })*
+    };
+}
+
+budgeted! {
+    functions::updates::GetState => "updates.getState", None, Penalty::None;
+    functions::channels::GetChannels => "channels.getChannels", None, Penalty::None;
+    functions::channels::GetMessages => "channels.getMessages", Some(LimitBudget::Info), Penalty::Class(LimitBudget::Info);
+    functions::messages::SendMedia => "messages.sendMedia", Some(LimitBudget::Send), Penalty::Class(LimitBudget::Send);
+    functions::messages::SendMessage => "messages.sendMessage", Some(LimitBudget::Send), Penalty::Class(LimitBudget::Send);
+    functions::channels::DeleteMessages => "channels.deleteMessages", Some(LimitBudget::Delete), Penalty::Class(LimitBudget::Delete);
+    // Not tied to a chat: a flood wait holds the whole bot.
+    functions::upload::GetFile => "upload.getFile", None, Penalty::Bot;
+    functions::upload::SaveFilePart => "upload.saveFilePart", None, Penalty::Bot;
+    functions::upload::SaveBigFilePart => "upload.saveBigFilePart", None, Penalty::Bot;
+}
+
+fn classify(e: &InvocationError) -> Verdict {
     match e {
-        InvocationError::Rpc(rpc) if rpc.code == 420 || rpc.name.ends_with("_WAIT") => {
-            Failure::Flood(Duration::from_secs(rpc.value.unwrap_or(1).max(1) as u64))
-        }
+        InvocationError::Rpc(rpc) if rpc.code == 420 || rpc.name.ends_with("_WAIT") => Verdict::Wait {
+            after: Duration::from_secs(rpc.value.unwrap_or(1).max(1) as u64),
+            whole_bot: false,
+        },
         InvocationError::Rpc(rpc) if rpc.code >= 500 || rpc.code == -503 || rpc.name == "AUTH_KEY_UNREGISTERED" => {
-            Failure::Transient
+            Verdict::Transient
         }
-        InvocationError::Rpc(_) | InvocationError::InvalidDc => Failure::Fatal,
+        InvocationError::Rpc(_) | InvocationError::InvalidDc => Verdict::Fatal,
         InvocationError::Io(_)
         | InvocationError::Dropped(_)
         | InvocationError::Transport(_)
         | InvocationError::Deserialize(_)
         | InvocationError::Authentication(_)
-        | InvocationError::Session(_) => Failure::Transient,
+        | InvocationError::Session(_) => Verdict::Transient,
     }
 }
 
-/// Run `call` until it succeeds or fails for good, waiting out flood waits
-/// (and cooling `penalize`'s bucket) and retrying transient failures within
-/// `budget`. A flood wait that does not fit is [`RateLimited`].
-async fn retry_call<T, Fut>(
-    what: &'static str,
-    budget: Duration,
-    penalize: Option<&(dyn Fn(Duration) + Sync)>,
-    mut call: impl FnMut() -> Fut,
-) -> Result<T>
+/// `attempt` through the limiter; a failure for good as our error types: a
+/// flood wait that does not fit is [`RateLimited`].
+async fn metered<T, Fut>(call: &Call, limiter: Option<&ChatLimiter>, attempt: impl FnMut() -> Fut) -> Result<T>
 where
     Fut: std::future::Future<Output = Result<T, InvocationError>>,
 {
-    let deadline = tokio::time::Instant::now() + budget;
-    let mut backoff = Duration::from_millis(500);
-    loop {
-        let err = match call().await {
-            Ok(v) => return Ok(v),
-            Err(e) => e,
-        };
-        let wait = match classify(&err) {
-            Failure::Flood(wait) => {
-                pigeonhole_limits::record_throttle("telegram", what, wait);
-                if let Some(penalize) = penalize {
-                    penalize(wait);
-                }
-                if tokio::time::Instant::now() + wait >= deadline {
-                    return Err(anyhow::Error::new(RateLimited { method: what, retry_after: wait }));
-                }
-                wait
-            }
-            Failure::Transient => {
-                let wait = backoff;
-                backoff = (backoff * 2).min(Duration::from_secs(16));
-                if tokio::time::Instant::now() + wait >= deadline {
-                    return Err(anyhow::Error::new(Unavailable(what.to_string()))
-                        .context(format!("{what}: {err} (still failing after {budget:?})")));
-                }
-                wait
-            }
-            Failure::Fatal => return Err(map_fatal(what, err)),
-        };
-        warn!(what, ?wait, error = %err, "MTProto call failed; retrying");
-        tokio::time::sleep(wait).await;
-    }
+    let what = call.what;
+    pigeonhole_limits::run(limiter, call, &RETRY, classify, attempt).await.map_err(|f| match f {
+        Failed::RateLimited { retry_after, .. } => anyhow::Error::new(RateLimited { method: what, retry_after }),
+        Failed::Unavailable { last, after } => anyhow::Error::new(Unavailable(what.to_string()))
+            .context(format!("{what}: {last} (still failing after {after:?})")),
+        Failed::Fatal(err) => map_fatal(what, err),
+    })
 }
 
 fn map_fatal(what: &'static str, err: InvocationError) -> anyhow::Error {
@@ -406,17 +419,19 @@ impl MtprotoChannel {
         Self { lane, ..self.clone() }
     }
 
+    /// `request` on this channel's lane, metered by its limiter.
+    async fn invoke<R: Budgeted>(&self, dc: Option<i32>, request: &R) -> Result<R::Return> {
+        self.client.invoke(self.lane, dc, Some(&self.limiter), request).await
+    }
+
     /// Upload `data` as one file; returns what `sendMedia` takes.
     async fn upload(&self, name: &str, data: &Bytes) -> Result<enums::InputFile> {
         let file_id = random_i64();
         let parts = data.len().div_ceil(PART);
         let big = data.len() > BIG_FILE;
-        let bot = self.limiter.bot().clone();
-        let penalize = move |d: Duration| bot.penalize(d);
         futures::stream::iter(0..parts)
             .map(|k| {
                 let bytes = data[k * PART..((k + 1) * PART).min(data.len())].to_vec();
-                let penalize = &penalize;
                 async move {
                     let ok = if big {
                         let request = functions::upload::SaveBigFilePart {
@@ -425,16 +440,10 @@ impl MtprotoChannel {
                             file_total_parts: parts as i32,
                             bytes,
                         };
-                        retry_call("upload.saveBigFilePart", CALL_BUDGET, Some(penalize), || {
-                            self.client.home(self.lane, &request)
-                        })
-                        .await?
+                        self.invoke(None, &request).await?
                     } else {
                         let request = functions::upload::SaveFilePart { file_id, file_part: k as i32, bytes };
-                        retry_call("upload.saveFilePart", CALL_BUDGET, Some(penalize), || {
-                            self.client.home(self.lane, &request)
-                        })
-                        .await?
+                        self.invoke(None, &request).await?
                     };
                     if !ok {
                         bail!("upload part {k} of {name} refused");
@@ -531,13 +540,7 @@ impl ChannelApi for MtprotoChannel {
             channel: self.input_channel(),
             id: ids.iter().map(|&id| types::InputMessageId { id: id as i32 }.into()).collect(),
         };
-        let limiter = self.limiter.clone();
-        let penalize = move |d: Duration| limiter.penalize_info(d);
-        let answer = retry_call("channels.getMessages", CALL_BUDGET, Some(&penalize), || async {
-            self.limiter.acquire_info().await;
-            self.client.home(self.lane, &request).await
-        })
-        .await?;
+        let answer = self.invoke(None, &request).await?;
         let messages = match answer {
             enums::messages::Messages::Messages(m) => m.messages,
             enums::messages::Messages::Slice(m) => m.messages,
@@ -591,15 +594,9 @@ impl ChannelApi for MtprotoChannel {
             allow_paid_stars: None,
             suggested_post: None,
         };
-        let limiter = self.limiter.clone();
-        let penalize = move |d: Duration| limiter.penalize_send(d);
         // Repeats carry the same random_id: Telegram returns the message a
         // lost answer was about instead of posting another.
-        let updates = retry_call("messages.sendMedia", CALL_BUDGET, Some(&penalize), || async {
-            self.limiter.acquire_send().await;
-            self.client.home(self.lane, &request).await
-        })
-        .await?;
+        let updates = self.invoke(None, &request).await?;
         sent_message(updates, random_id)
     }
 
@@ -628,13 +625,7 @@ impl ChannelApi for MtprotoChannel {
             suggested_post: None,
             rich_message: None,
         };
-        let limiter = self.limiter.clone();
-        let penalize = move |d: Duration| limiter.penalize_send(d);
-        let updates = retry_call("messages.sendMessage", CALL_BUDGET, Some(&penalize), || async {
-            self.limiter.acquire_send().await;
-            self.client.home(self.lane, &request).await
-        })
-        .await?;
+        let updates = self.invoke(None, &request).await?;
         sent_message(updates, random_id)
     }
 
@@ -655,15 +646,10 @@ impl ChannelApi for MtprotoChannel {
             offset: offset as i64,
             limit: limit as i32,
         };
-        let bot = self.limiter.bot().clone();
-        let penalize = move |d: Duration| bot.penalize(d);
         let mut dc = file.dc_id;
         // A migration answer names the DC that serves the file.
         for _ in 0..3 {
-            let answer = retry_call("upload.getFile", CALL_BUDGET, Some(&penalize), || {
-                self.client.in_dc(self.lane, dc, &request)
-            })
-            .await;
+            let answer = self.invoke(Some(dc), &request).await;
             match answer {
                 Ok(enums::upload::File::File(f)) => return Ok(Bytes::from(f.bytes)),
                 Ok(enums::upload::File::CdnRedirect(_)) => bail!("getFile redirected to a CDN despite cdn_supported = false"),
@@ -687,13 +673,7 @@ impl ChannelApi for MtprotoChannel {
             channel: self.input_channel(),
             id: ids.iter().map(|&id| id as i32).collect(),
         };
-        let limiter = self.limiter.clone();
-        let penalize = move |d: Duration| limiter.penalize_delete(d);
-        retry_call("channels.deleteMessages", CALL_BUDGET, Some(&penalize), || async {
-            self.limiter.acquire_delete().await;
-            self.client.home(self.lane, &request).await
-        })
-        .await?;
+        self.invoke(None, &request).await?;
         Ok(())
     }
 }
@@ -721,10 +701,10 @@ mod tests {
         assert!(channel_id_of(12345).is_err(), "a private chat");
         assert_eq!(bot_id_of("123456:ABC").unwrap(), 123456);
 
-        assert!(matches!(classify(&rpc(420, "FLOOD_WAIT_7")), Failure::Flood(d) if d == Duration::from_secs(7)));
-        assert!(matches!(classify(&rpc(500, "INTERDC_2_CALL_ERROR")), Failure::Transient));
-        assert!(matches!(classify(&rpc(400, "CHANNEL_INVALID")), Failure::Fatal));
-        assert!(matches!(classify(&InvocationError::Dropped("x")), Failure::Transient));
+        assert!(matches!(classify(&rpc(420, "FLOOD_WAIT_7")), Verdict::Wait { after, .. } if after == Duration::from_secs(7)));
+        assert_eq!(classify(&rpc(500, "INTERDC_2_CALL_ERROR")), Verdict::Transient);
+        assert_eq!(classify(&rpc(400, "CHANNEL_INVALID")), Verdict::Fatal);
+        assert_eq!(classify(&InvocationError::Dropped("x")), Verdict::Transient);
         let e = map_fatal("upload.getFile", rpc(400, "FILE_REFERENCE_EXPIRED"));
         assert!(e.is::<FileReferenceExpired>());
         let e = map_fatal("upload.getFile", rpc(303, "FILE_MIGRATE_4"));
@@ -734,20 +714,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn flood_waits_are_waited_out_until_the_budget_runs_out() {
         let tries = std::sync::atomic::AtomicU32::new(0);
-        let penalized = std::sync::Mutex::new(Vec::new());
-        let penalize = |d: Duration| penalized.lock().unwrap().push(d);
-        let v = retry_call("x", Duration::from_secs(60), Some(&penalize), || {
+        let limiter = ChatLimiter::new(pigeonhole_limits::ChatLimiterConfig::default());
+        let t0 = tokio::time::Instant::now();
+        let call = <functions::messages::SendMessage as Budgeted>::CALL;
+        let v = metered(&call, Some(&limiter), || {
             let n = tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move { if n < 2 { Err(rpc(420, "FLOOD_WAIT_5")) } else { Ok(9) } }
         })
         .await
         .unwrap();
         assert_eq!(v, 9);
-        assert_eq!(*penalized.lock().unwrap(), vec![Duration::from_secs(5); 2]);
+        assert!(t0.elapsed() >= Duration::from_secs(10), "two flood waits of 5 s");
 
-        let err = retry_call("y", Duration::from_secs(10), None, || async { Err::<(), _>(rpc(420, "FLOOD_WAIT_30")) })
-            .await
-            .unwrap_err();
+        // A wait past CALL_BUDGET ends the call.
+        let err = metered(&call, None, || async { Err::<(), _>(rpc(420, "FLOOD_WAIT_400")) }).await.unwrap_err();
         assert!(err.is::<RateLimited>(), "{err:#}");
     }
 }

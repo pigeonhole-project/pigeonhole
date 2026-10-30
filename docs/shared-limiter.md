@@ -311,8 +311,13 @@ until the round trip (~0.3–0.5 s per send) is what is left.
 1. ✅ **Spike**: per bot on both services (§ Spike findings).
 2. ✅ Plans taken at once in `pigeonhole-limits` (`take_all`), behind
    today's `ChatLimiter` API (one bot per store).
-3. `Limiter::run` and `classify` for Telegram and Discord; `Budgeted` for
-   the MTProto requests; the hand-wired `acquire_*` / `penalize_*` go.
+3. ✅ `pigeonhole_limits::run` (a `Call`, a `Retry`, the service's
+   `classify` → `Verdict`) for Telegram and Discord; `Budgeted` for the
+   MTProto requests, so `TelegramMtproto::invoke` is the only way out
+   besides the login; the hand-wired `acquire_*` / `penalize_*` are gone.
+   A Discord 429 with `global: true` now cools the whole bot. The buckets
+   run on the runtime's clock (`tokio::time::Instant`), so the simulation
+   and paused tests see them too.
 4. Pools and `bot_token_envs`; sticky tickets.
 5. Egress, the Discord `Pacer` as a window bucket, `observe` from headers.
 6. Bench: log entries per second with 1, 2, 4 bots against

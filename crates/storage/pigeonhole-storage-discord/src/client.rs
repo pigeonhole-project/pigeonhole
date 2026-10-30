@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_storage_api::{RateLimited, Unavailable};
-use pigeonhole_limits::ChatLimiter;
+use pigeonhole_limits::{Call, ChatLimiter, Failed, LimitBudget, Penalty, Retry, Verdict};
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -23,8 +23,14 @@ const BULK_DELETE_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const BULK_DELETE_AGE_SLACK: Duration = Duration::from_secs(60);
 /// `flags`: no link previews.
 const SUPPRESS_EMBEDS: u64 = 1 << 2;
-/// Attempts per request (network errors and 429s).
-const ATTEMPTS: u32 = 6;
+/// Attempts per request (network errors, 5xx and 429s); a 429's wait is
+/// always waited out, however long.
+const RETRY: Retry = Retry {
+    budget: Duration::from_secs(3600),
+    attempts: 6,
+    backoff: Duration::from_millis(200),
+    max_backoff: Duration::from_millis(6400),
+};
 
 /// Milliseconds since Unix epoch encoded in a Discord snowflake.
 pub fn snowflake_timestamp_ms(id: u64) -> u64 {
@@ -104,6 +110,45 @@ fn retry_after(headers: &HeaderMap, body: &serde_json::Value) -> f64 {
         .max(0.1)
 }
 
+/// What a request spends: sends, deletes and reads have a bucket per
+/// channel; a read's 429 holds the whole bot, as `getFile`'s does on
+/// Telegram. CDN downloads are not API calls.
+fn call_of(budget: RateBudget, what: &'static str) -> Call {
+    let (budget, penalty) = match budget {
+        RateBudget::Send => (Some(LimitBudget::Send), Penalty::Class(LimitBudget::Send)),
+        RateBudget::Delete => (Some(LimitBudget::Delete), Penalty::Class(LimitBudget::Delete)),
+        RateBudget::Read => (Some(LimitBudget::GetFile), Penalty::ClassAndBot(LimitBudget::GetFile)),
+        RateBudget::Download => (None, Penalty::None),
+    };
+    Call { service: "discord", what, budget, penalty }
+}
+
+/// Why one attempt failed.
+#[derive(Debug)]
+enum AttemptFailed {
+    Network(reqwest::Error),
+    /// A 429: wait this long; `global` limits are the bot's.
+    RateLimited { wait: Duration, global: bool },
+    Server { status: u16, text: String },
+}
+
+impl std::fmt::Display for AttemptFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttemptFailed::Network(e) => write!(f, "{e}"),
+            AttemptFailed::RateLimited { wait, global } => write!(f, "429, retry after {wait:?} (global: {global})"),
+            AttemptFailed::Server { status, text } => write!(f, "{status} {text}"),
+        }
+    }
+}
+
+fn classify(e: &AttemptFailed) -> Verdict {
+    match e {
+        AttemptFailed::RateLimited { wait, global } => Verdict::Wait { after: *wait, whole_bot: *global },
+        AttemptFailed::Network(_) | AttemptFailed::Server { .. } => Verdict::Transient,
+    }
+}
+
 /// One bot's HTTP client, shared by its channels.
 #[derive(Clone)]
 pub struct DiscordClient {
@@ -157,8 +202,9 @@ impl DiscordClient {
         format!("{}/{}", self.api_base.trim_end_matches('/'), path.trim_start_matches('/'))
     }
 
-    /// Send `build()` until it is not a 429, a 5xx or a network error; if
-    /// every attempt was one of the latter two, the store is [`Unavailable`].
+    /// Send `build()` through the limiter until it is not a 429, a 5xx or a
+    /// network error; if every attempt was one of the latter two, the store
+    /// is [`Unavailable`].
     async fn request(
         &self,
         limiter: &ChatLimiter,
@@ -166,24 +212,9 @@ impl DiscordClient {
         what: &'static str,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<Answer> {
-        let mut last = None;
-        for attempt in 0..ATTEMPTS {
-            match budget {
-                RateBudget::Send => limiter.acquire_send().await,
-                RateBudget::Delete => limiter.acquire_delete().await,
-                RateBudget::Read => limiter.acquire_get_file().await,
-                RateBudget::Download => {}
-            }
-            let resp = match build().send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let wait = Duration::from_millis(200 * 2u64.pow(attempt));
-                    debug!(what, attempt, ?wait, error = %e, "discord http retry");
-                    last = Some(anyhow::Error::from(e).context(Unavailable(what.to_string())));
-                    tokio::time::sleep(wait).await;
-                    continue;
-                }
-            };
+        let call = call_of(budget, what);
+        let answer = pigeonhole_limits::run(Some(limiter), &call, &RETRY, classify, || async {
+            let resp = build().send().await.map_err(AttemptFailed::Network)?;
             let status = resp.status().as_u16();
             let headers = resp.headers().clone();
             self.route_limits.lock().unwrap().observe(budget, &headers);
@@ -191,31 +222,23 @@ impl DiscordClient {
             let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
             if status == 429 {
                 let wait = Duration::from_secs_f64(retry_after(&headers, &body));
-                debug!(what, attempt, ?wait, "discord 429");
-                match budget {
-                    RateBudget::Send => limiter.penalize_send(wait),
-                    RateBudget::Delete => limiter.penalize_delete(wait),
-                    RateBudget::Read => limiter.penalize_get_file(wait),
-                    RateBudget::Download => {}
-                }
-                pigeonhole_limits::record_throttle("discord", what, wait);
-                tokio::time::sleep(wait).await;
-                last = Some(RateLimited { method: what, retry_after: wait }.into());
-                continue;
+                let global = body.get("global").and_then(|g| g.as_bool()).unwrap_or(false);
+                return Err(AttemptFailed::RateLimited { wait, global });
             }
             if status >= 500 {
-                let wait = Duration::from_millis(200 * 2u64.pow(attempt));
-                debug!(what, attempt, status, ?wait, "discord server error; retry");
-                last = Some(anyhow!("{what}: {status} {text}").context(Unavailable(what.to_string())));
-                tokio::time::sleep(wait).await;
-                continue;
+                return Err(AttemptFailed::Server { status, text });
             }
             let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
             let remaining = header("x-ratelimit-remaining").and_then(|s| s.parse().ok());
             let reset_after = header("x-ratelimit-reset-after").and_then(|s| s.parse().ok());
-            return Ok(Answer { status, body, remaining, reset_after });
-        }
-        Err(last.unwrap_or_else(|| anyhow!("{what}: failed")))
+            Ok(Answer { status, body, remaining, reset_after })
+        })
+        .await;
+        answer.map_err(|f| match f {
+            Failed::RateLimited { retry_after, .. } => RateLimited { method: what, retry_after }.into(),
+            Failed::Unavailable { last, .. } => anyhow!("{what}: {last}").context(Unavailable(what.to_string())),
+            Failed::Fatal(last) => anyhow!("{what}: {last}"),
+        })
     }
 
     /// Fail fast unless the bot sees `channel_id` as a text channel and can

@@ -25,8 +25,14 @@ use pigeonhole_types::MetricDoc;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
+// The runtime's clock: simulated under madsim and in paused tests, so that
+// a bucket's refill and the sleeps waiting for it agree.
+use tokio::time::Instant;
+
+mod run;
+pub use run::{run, Call, Failed, Penalty, Retry, Verdict};
 use tracing::debug;
 
 /// The metrics this crate records.
@@ -381,46 +387,27 @@ impl ChatLimiter {
         record_limiter_wait(&self.chat, name, waited);
     }
 
-    /// `sendDocument` / `sendMessage` / pin / unpin.
-    pub async fn acquire_send(&self) {
-        self.take(&self.send, "send").await;
+    /// A token of `budget` (and one of the bot's).
+    pub async fn acquire(&self, budget: LimitBudget) {
+        let name = match budget {
+            LimitBudget::Send => "send",
+            LimitBudget::GetFile => "get_file",
+            LimitBudget::Delete => "delete",
+            LimitBudget::Info => "info",
+        };
+        self.take(self.bucket(budget), name).await;
     }
 
-    /// `getChat`, `setChatDescription`.
-    pub async fn acquire_info(&self) {
-        self.take(&self.info, "info").await;
-    }
-
-    pub fn penalize_info(&self, retry_after: Duration) {
-        cool_down(&self.chat, "info", retry_after);
-        self.info.penalize(retry_after);
-    }
-
-    pub fn penalize_send(&self, retry_after: Duration) {
-        cool_down(&self.chat, "send", retry_after);
-        self.send.penalize(retry_after);
-    }
-
-    /// `getFile` only (not the CDN byte stream).
-    pub async fn acquire_get_file(&self) {
-        self.take(&self.get_file, "get_file").await;
-    }
-
-    /// `getFile` is not tied to a chat: its 429 holds the whole bot.
-    pub fn penalize_get_file(&self, retry_after: Duration) {
-        cool_down(&self.chat, "getFile", retry_after);
-        self.get_file.penalize(retry_after);
-        self.bot.penalize(retry_after);
-    }
-
-    /// `deleteMessage`.
-    pub async fn acquire_delete(&self) {
-        self.take(&self.delete, "delete").await;
-    }
-
-    pub fn penalize_delete(&self, retry_after: Duration) {
-        cool_down(&self.chat, "delete", retry_after);
-        self.delete.penalize(retry_after);
+    /// Cool `budget`'s bucket in this chat only.
+    pub fn penalize_budget(&self, budget: LimitBudget, retry_after: Duration) {
+        let name = match budget {
+            LimitBudget::Send => "send",
+            LimitBudget::GetFile => "getFile",
+            LimitBudget::Delete => "delete",
+            LimitBudget::Info => "info",
+        };
+        cool_down(&self.chat, name, retry_after);
+        self.bucket(budget).penalize(retry_after);
     }
 
     pub async fn acquire_upload(&self) -> SemaphorePermit<'_> {
@@ -619,10 +606,10 @@ mod tests {
         assert!(Arc::ptr_eq(a.bot(), b.bot()), "one bot limiter per bot");
         assert!(!Arc::ptr_eq(a.bot(), reg.chat("bot2", "-1").bot()));
 
-        a.acquire_send().await;
+        a.acquire(LimitBudget::Send).await;
         assert!(a.peek_wait(LimitBudget::Send) > Duration::from_secs(1), "chat a's send bucket is empty");
         assert_eq!(b.peek_wait(LimitBudget::Send), Duration::ZERO, "chat b's is not");
-        b.acquire_send().await;
+        b.acquire(LimitBudget::Send).await;
         // Two calls took the bot's burst of 2: every chat of the bot now waits.
         assert!(reg.chat("bot1", "-3").peek_wait(LimitBudget::Info) > Duration::from_secs(1));
         assert_eq!(reg.chat("bot2", "-3").peek_wait(LimitBudget::Info), Duration::ZERO);
@@ -632,10 +619,10 @@ mod tests {
     async fn a_get_file_429_holds_the_bot_a_send_429_only_the_chat() {
         let reg = LimiterRegistry::new(ChatLimiterConfig::default());
         let (a, b) = (reg.chat("bot", "-1"), reg.chat("bot", "-2"));
-        a.penalize_send(Duration::from_secs(20));
+        a.penalize_budget(LimitBudget::Send, Duration::from_secs(20));
         assert!(a.peek_wait(LimitBudget::Send) > Duration::from_secs(10));
         assert_eq!(b.peek_wait(LimitBudget::Send), Duration::ZERO);
-        a.penalize_get_file(Duration::from_secs(20));
+        a.cool(Penalty::ClassAndBot(LimitBudget::GetFile), false, Duration::from_secs(20));
         assert!(b.peek_wait(LimitBudget::Delete) > Duration::from_secs(10), "getFile is not chat-scoped");
     }
 
@@ -648,10 +635,10 @@ mod tests {
             send_burst: 1.0,
             ..ChatLimiterConfig::default()
         }));
-        lim.acquire_info().await; // the bot's only token
+        lim.acquire(LimitBudget::Info).await; // the bot's only token
         let send = {
             let lim = lim.clone();
-            tokio::spawn(async move { lim.acquire_send().await })
+            tokio::spawn(async move { lim.acquire(LimitBudget::Send).await })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!send.is_finished(), "the send waits for the bot");
@@ -670,15 +657,15 @@ mod tests {
             ..ChatLimiterConfig::default()
         });
         let (a, b) = (reg.chat("bot", "-1"), reg.chat("bot", "-2"));
-        a.acquire_send().await; // a's send token, and one of the bot's two
+        a.acquire(LimitBudget::Send).await; // a's send token, and one of the bot's two
         let again = {
             let a = a.clone();
-            tokio::spawn(async move { a.acquire_send().await })
+            tokio::spawn(async move { a.acquire(LimitBudget::Send).await })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!again.is_finished(), "a's second send waits for its chat");
         let t0 = Instant::now();
-        b.acquire_send().await;
+        b.acquire(LimitBudget::Send).await;
         assert!(t0.elapsed() < Duration::from_millis(50), "the bot's last token went to chat b");
         again.abort();
     }
@@ -692,19 +679,19 @@ mod tests {
             get_file_burst: 100.0,
             ..ChatLimiterConfig::default()
         });
-        lim.acquire_send().await;
+        lim.acquire(LimitBudget::Send).await;
         // getFile still has tokens even though send is exhausted.
         let t0 = Instant::now();
-        lim.acquire_get_file().await;
+        lim.acquire(LimitBudget::GetFile).await;
         assert!(t0.elapsed() < Duration::from_millis(50));
     }
 
     #[tokio::test]
     async fn penalize_send_does_not_block_get_file() {
         let lim = Arc::new(fast_send());
-        lim.penalize_send(Duration::from_millis(200));
+        lim.penalize_budget(LimitBudget::Send, Duration::from_millis(200));
         let t0 = Instant::now();
-        lim.acquire_get_file().await;
+        lim.acquire(LimitBudget::GetFile).await;
         assert!(t0.elapsed() < Duration::from_millis(50));
     }
 
@@ -736,7 +723,7 @@ mod tests {
             ..ChatLimiterConfig::default()
         });
         assert_eq!(lim.peek_wait(LimitBudget::Send), Duration::ZERO);
-        lim.acquire_send().await;
+        lim.acquire(LimitBudget::Send).await;
         let peeked = lim.peek_wait(LimitBudget::Send);
         assert!(peeked > Duration::from_millis(50));
         // Second peek must not change the estimate (no capture).
@@ -753,13 +740,13 @@ mod tests {
             ..ChatLimiterConfig::default()
         }));
         l.wait_idle(LimitBudget::Delete).await; // a fresh budget is idle
-        l.acquire_delete().await;
-        l.acquire_delete().await;
+        l.acquire(LimitBudget::Delete).await;
+        l.acquire(LimitBudget::Delete).await;
         let order = Arc::new(Mutex::new(Vec::new()));
         let fg = {
             let (l, order) = (l.clone(), order.clone());
             tokio::spawn(async move {
-                l.acquire_delete().await; // waits ~50 ms for a token
+                l.acquire(LimitBudget::Delete).await; // waits ~50 ms for a token
                 order.lock().unwrap().push("foreground");
             })
         };
