@@ -1,10 +1,10 @@
 //! Binary-only: long-running tasks spawned by `serve` (sweep, repair, cool).
 
 use crate::runtime::Runtime;
-use pigeonhole::config::Config;
+use pigeonhole::config::{Config, InlineSettings};
 use pigeonhole_chunk_store::{Repairer, Sweeper};
-use pigeonhole_gateway_s3::S3Gateway;
-use std::time::Instant;
+use pigeonhole_gateway_s3::{CoolPolicy, S3Gateway};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 pub fn spawn_background_tasks(cfg: &Config, rt: &Runtime) {
@@ -39,13 +39,12 @@ pub fn spawn_background_tasks(cfg: &Config, rt: &Runtime) {
     );
 }
 
-/// The cooler (docs/inline-objects.md): every `[inline] cool_every_secs`,
-/// move the inline objects that went cold, or are over budget, out to chunks.
+/// The cooler (docs/inline-objects.md): every `[inline] cool_every`, move
+/// the inline objects that went cold, or are over budget, out to chunks.
+/// With inlining off it still runs, moving out every inline object a
+/// previous run left, `cool_batch` per pass.
 pub fn spawn_cooler(cfg: &Config, gateway: S3Gateway) {
-    if cfg.inline.max_object_bytes == 0 {
-        return;
-    }
-    let (policy, every) = (cfg.inline.cool.clone(), cfg.inline.cool_every);
+    let (policy, every) = (cooler_policy(&cfg.inline), cfg.inline.cool_every);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(every).await;
@@ -73,4 +72,26 @@ pub fn spawn_cooler(cfg: &Config, gateway: S3Gateway) {
         every_secs = every.as_secs(),
         "cooler background task started"
     );
+}
+
+/// The cooler's policy: as configured, or, with inlining off, everything out.
+fn cooler_policy(inline: &InlineSettings) -> CoolPolicy {
+    if inline.max_object_bytes > 0 {
+        return inline.cool.clone();
+    }
+    CoolPolicy { cool_after: Some(Duration::ZERO), min_inline: Duration::ZERO, ..inline.cool.clone() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_inlining_off_the_cooler_moves_everything_out() {
+        let mut inline = InlineSettings::off();
+        let p = cooler_policy(&inline);
+        assert_eq!((p.cool_after, p.min_inline), (Some(Duration::ZERO), Duration::ZERO));
+        inline.max_object_bytes = 1024;
+        assert_eq!(cooler_policy(&inline), inline.cool);
+    }
 }
