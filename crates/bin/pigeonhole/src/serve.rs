@@ -42,7 +42,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
             listen_addr: cfg.bytestream.listen_addr.clone(),
             instance_name: cfg.bytestream.instance_name.clone(),
             max_batch_total_size_bytes: cfg.bytestream.max_batch_total_size as i64,
-            gc_ttl_secs: cfg.bytestream.gc_ttl.as_secs(),
+            gc_ttl: cfg.bytestream.gc_ttl,
             ..Default::default()
         };
         let cas = CasIndex::open(rt.meta.clone())

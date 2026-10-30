@@ -47,7 +47,7 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
         #[cfg(feature = "discord")]
         LogSettings::Discord { channel_id, bot_token, max_blob_size } => {
             info!(channel_id = %channel_id, "metadata log in a Discord channel");
-            let lease = (!cfg.meta.lease.is_zero()).then(|| pigeonhole_meta::Lease::new(cfg.meta.lease));
+            let lease = cfg.meta.lease.map(pigeonhole_meta::Lease::new);
             meta_discord(cfg, channel_id, bot_token, *max_blob_size, "log", |s| {
                 let log = ChainLogStore::new(s);
                 Arc::new(match lease {
@@ -247,7 +247,7 @@ async fn build_member(inst: &InstanceConfig, limiter: &Arc<ChatLimiter>) -> anyh
 fn with_optional_caches(layer: ChunkStore, cfg: &Config) -> ChunkStore {
     if cfg.cache.enabled {
         let l1 = Arc::new(BlockCache::new("l1", cfg.cache.l1_bytes));
-        let l2 = (cfg.cache.l2_bytes > 0).then(|| Arc::new(BlockCache::new("l2", cfg.cache.l2_bytes)));
+        let l2 = cfg.cache.l2_bytes.map(|bytes| Arc::new(BlockCache::new("l2", bytes)));
         layer.with_caches(Some(l1), l2, cfg.cache.write_through)
     } else {
         layer

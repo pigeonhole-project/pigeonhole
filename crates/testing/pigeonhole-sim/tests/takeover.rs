@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 async fn tablet(log: &Arc<MemoryBlobStore>, snaps: &Arc<MemoryBlobStore>) -> Arc<MetaStore> {
-    let opts = MetaOptions { snapshot_every: 7, ..MetaOptions::default() };
+    let opts = MetaOptions { snapshot_every: Some(7), ..MetaOptions::default() };
     MetaStore::open(
         Arc::new(ChainLogStore::new(log.clone())),
         Arc::new(BlobSnapshotStore::new(snaps.clone())),

@@ -23,7 +23,7 @@ use tower_http::timeout::{RequestBodyTimeoutLayer, ResponseBodyTimeoutLayer};
 /// Apply headers-after-body timeout + idle body timeouts + concurrency limit.
 pub fn with_http_timeouts(
     router: Router,
-    headers_timeout: Duration,
+    headers_timeout: Option<Duration>,
     body_idle_timeout: Duration,
     max_concurrent: usize,
 ) -> Router {
@@ -42,10 +42,10 @@ pub fn with_http_timeouts(
         }))
 }
 
-async fn headers_after_body_timeout(timeout: Duration, req: Request, next: Next) -> Response {
-    if timeout.is_zero() {
+async fn headers_after_body_timeout(timeout: Option<Duration>, req: Request, next: Next) -> Response {
+    let Some(timeout) = timeout else {
         return next.run(req).await;
-    }
+    };
 
     let (parts, body) = req.into_parts();
     let (eof_tx, eof_rx) = oneshot::channel();

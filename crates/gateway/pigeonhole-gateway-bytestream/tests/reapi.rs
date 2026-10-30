@@ -40,7 +40,7 @@ async fn test_harness() -> (
     let cfg = BytestreamConfig {
         enabled: true,
         instance_name: "pigeonhole".into(),
-        gc_ttl_secs: 0,
+        gc_ttl: None,
         ..Default::default()
     };
     let (addr, _handle) = serve_ephemeral(cfg, cas, store).await.unwrap();

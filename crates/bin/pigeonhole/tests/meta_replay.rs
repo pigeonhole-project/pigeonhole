@@ -31,7 +31,7 @@ fn req<T>(input: T) -> S3Request<T> {
     }
 }
 
-async fn tablet(dir: &Path, snapshot_every: u64) -> Arc<MetaStore> {
+async fn tablet(dir: &Path, snapshot_every: Option<u64>) -> Arc<MetaStore> {
     let (log, snapshots) = pigeonhole_testkit::disk_meta(dir);
     MetaStore::open(
         log,
@@ -50,15 +50,15 @@ fn replicated_state(meta: &MetaStore) -> (Vec<u8>, Vec<u8>) {
 
 #[tokio::test]
 async fn replay_rebuilds_chunk_and_s3_state() {
-    rebuild(0).await;
+    rebuild(None).await;
 }
 
 #[tokio::test]
 async fn snapshot_and_tail_rebuild_chunk_and_s3_state() {
-    rebuild(7).await;
+    rebuild(Some(7)).await;
 }
 
-async fn rebuild(snapshot_every: u64) {
+async fn rebuild(snapshot_every: Option<u64>) {
     let dir = tempfile::tempdir().unwrap();
     let meta = tablet(dir.path(), snapshot_every).await;
     let cfg = Config::for_test(dir.path());
@@ -100,14 +100,14 @@ async fn rebuild(snapshot_every: u64) {
     let position = meta.applied_position();
     assert!(position > 20, "every metadata change went through the log");
     // Snapshots are stored in the background.
-    while snapshot_every > 0 && meta.base_position() == 0 {
+    while snapshot_every.is_some() && meta.base_position() == 0 {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     drop(s3);
 
     let replayed = tablet(dir.path(), snapshot_every).await;
     let snapshot = pigeonhole_testkit::disk_meta(dir.path()).0.discover().await.unwrap().unwrap().base;
-    assert_eq!(snapshot.is_some(), snapshot_every > 0);
+    assert_eq!(snapshot.is_some(), snapshot_every.is_some());
     assert_eq!(replayed.applied_position(), position);
     assert_eq!(replicated_state(&replayed), before);
     let (chunk, s3) = &before;

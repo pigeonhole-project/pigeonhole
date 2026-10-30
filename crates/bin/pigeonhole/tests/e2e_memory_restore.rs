@@ -115,8 +115,8 @@ async fn s3s2_get(s3: &pigeonhole::S3Gateway) -> Vec<u8> {
 async fn open_snapshotting(dir: &Path, mem: Arc<MemoryBlobStore>) -> (pigeonhole::S3Gateway, Arc<MetaStore>) {
     let (log, snapshots) = pigeonhole_testkit::disk_meta(dir);
     let opts = MetaOptions {
-        snapshot_every: 1,
-        snapshot_interval: std::time::Duration::from_millis(10),
+        snapshot_every: Some(1),
+        snapshot_interval: Some(std::time::Duration::from_millis(10)),
         snapshots_outlive_log: true,
         ..MetaOptions::default()
     };
