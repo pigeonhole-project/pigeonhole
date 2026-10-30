@@ -5,6 +5,7 @@
 #   ./scripts/bench.sh discord telegram     # BENCH_MINUTES=15 per backend
 #   BENCH_MINUTES=1 ./scripts/bench.sh disk # a dry run
 #   BENCH_PHASES=blob_put,cold_get,ranged_get ./scripts/bench.sh discord   # some phases only
+#   BENCH_BOTS=2 ./scripts/bench.sh telegram   # each chat store through two bots (a run labelled telegram-2bots)
 #
 # Per backend: a fresh server from scripts/metrics-demo.sh (no block cache,
 # no demo traffic; Prometheus and Grafana come up too, so the run can be
@@ -18,6 +19,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/.cache/bench"
 MINUTES="${BENCH_MINUTES:-15}"
+BOTS="${BENCH_BOTS:-1}"
 mkdir -p "$OUT"
 if [[ -f "$ROOT/.env" ]]; then
   set -a
@@ -50,7 +52,9 @@ after() {
 runs=()
 for backend in "$@"; do
   echo "##### $backend"
-  export METRICS_DEMO_BACKEND="$backend" METRICS_DEMO_CACHE=off NO_LOAD=1
+  label="$backend"
+  [[ "$BOTS" == 1 || "$backend" == disk ]] || label+="-${BOTS}bots"
+  export METRICS_DEMO_BACKEND="$backend" METRICS_DEMO_CACHE=off NO_LOAD=1 METRICS_DEMO_BOTS="$BOTS"
   "$ROOT/scripts/metrics-demo.sh" down >/dev/null
   # A fresh tablet each time (a chat log starts empty once its channel is).
   state="$ROOT/.cache/metrics-demo"
@@ -59,12 +63,12 @@ for backend in "$@"; do
   before "$backend"
   "$ROOT/scripts/metrics-demo.sh" up | grep -E "running|dashboard"
   status=0
-  uv run -q --with boto3 "$ROOT/scripts/bench-backends.py" run --label "$backend" --minutes "$MINUTES" \
-    ${BENCH_PHASES:+--phases "$BENCH_PHASES"} --out "$OUT/$backend.json" || status=$?
+  uv run -q --with boto3 "$ROOT/scripts/bench-backends.py" run --label "$label" --minutes "$MINUTES" \
+    ${BENCH_PHASES:+--phases "$BENCH_PHASES"} --out "$OUT/$label.json" || status=$?
   "$ROOT/scripts/metrics-demo.sh" down
   after "$backend"
   [[ $status -eq 0 ]] || { echo "benchmark on $backend failed ($status)" >&2; exit "$status"; }
-  runs+=("$OUT/$backend.json")
+  runs+=("$OUT/$label.json")
 done
 
 uv run -q --with boto3 "$ROOT/scripts/bench-backends.py" report "${runs[@]}" >"$OUT/report.md"
