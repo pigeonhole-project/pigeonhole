@@ -4,7 +4,7 @@ use bytes::Bytes;
 use pigeonhole_storage_api::{
     collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole,
 };
-use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
+use pigeonhole_limits::{ChatLimiter, Rate};
 use pigeonhole_storage_discord::fake::FakeDiscord;
 use pigeonhole_storage_discord::{DiscordBlobStore, DiscordId};
 use std::sync::Arc;
@@ -12,14 +12,7 @@ use std::sync::Arc;
 type Store = DiscordBlobStore<FakeDiscord>;
 
 fn limiter() -> Arc<ChatLimiter> {
-    Arc::new(ChatLimiter::new(ChatLimiterConfig {
-        bot_rate_per_sec: 1000.0,
-        send_rate_per_sec: 1000.0,
-        info_rate_per_sec: 1000.0,
-        get_file_rate_per_sec: 1000.0,
-        delete_rate_per_sec: 1000.0,
-        ..ChatLimiterConfig::default()
-    }))
+    Arc::new(ChatLimiter::new(pigeonhole_storage_discord::limits().with_all(Rate::new(1000.0, 100.0))))
 }
 
 /// A store (as a new process would open it) on `channel`.

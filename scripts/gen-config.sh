@@ -40,7 +40,7 @@ case "$INSTANCE" in
 id = \"tgm\"
 kind = \"telegram\"
 chat_id = ${CONFIG_SCOPE_ID}
-bot_token_env = \"${CONFIG_BOT_TOKEN_ENV:-BOT_TOKEN}\""
+bot_token_envs = [\"${CONFIG_BOT_TOKEN_ENV:-BOT_TOKEN}\"]"
     if [[ -n "${CONFIG_SESSION:-}" ]]; then
       INSTANCE_BLOCK+=$'\n'"session = \"${CONFIG_SESSION}\""
     fi
@@ -85,13 +85,13 @@ block_size = "1 MiB"
 memory_budget = "256 MiB"
 
 [telegram]
-send_rate_per_sec = 0.5
-send_burst = 3.0
-get_file_rate_per_sec = 15.0
-get_file_burst = 30.0
-delete_rate_per_sec = 1.0
-delete_burst = 5.0
 upload_concurrency = 2
 download_concurrency = 8
+[telegram.send]
+rate_per_sec = 0.5
+burst = 3.0
+[telegram.delete]
+rate_per_sec = 1.0
+burst = 5.0
 ${EXTRA_BG}
 EOF

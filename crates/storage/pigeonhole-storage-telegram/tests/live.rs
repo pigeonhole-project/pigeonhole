@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
-use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig};
+use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_telegram::{ChannelApi, Lane, TelegramBlobStore, MtprotoConfig, TelegramMtproto};
 use std::path::Path;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ async fn blob_store_against_a_live_channel() {
     let t = Instant::now();
     let tg = TelegramMtproto::connect(&cfg).await.unwrap();
     println!("connected as bot {} in {:?}", tg.bot_id(), t.elapsed());
-    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()));
     let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
     let info = InstanceInfo {
         id: "live".into(),
@@ -77,7 +77,7 @@ async fn list() {
         session: root.join(".cache/tgm-live.session"),
     };
     let tg = TelegramMtproto::connect(&cfg).await.unwrap();
-    let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(ChatLimiterConfig::default()))).await.unwrap();
+    let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()))).await.unwrap();
     let mut lo = 1;
     while lo <= to {
         let ids: Vec<i64> = (lo..=to.min(lo + 99)).collect();
@@ -112,7 +112,7 @@ async fn a_sent_message_is_visible_at_once() {
         bot_token: env("TG_BOT_TOKEN"),
         session: root.join(".cache").join(session),
     };
-    let limiter = || Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let limiter = || Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()));
     let writer = TelegramMtproto::connect(&login("tgm-live.session")).await.unwrap();
     let reader = TelegramMtproto::connect(&login("tgm-live2.session")).await.unwrap();
     let w = writer.channel(chat_id, Lane::Meta, limiter()).await.unwrap();
@@ -154,7 +154,7 @@ async fn clean() {
         session: root.join(".cache/tgm-live.session"),
     };
     let tg = TelegramMtproto::connect(&cfg).await.unwrap();
-    let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(ChatLimiterConfig::default()))).await.unwrap();
+    let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()))).await.unwrap();
     let mut lo = 1;
     let mut deleted = 0;
     while lo <= to {
@@ -199,7 +199,7 @@ async fn inline_blobs_against_a_live_channel() {
         session: root.join(".cache/tgm-live.session"),
     };
     let tg = TelegramMtproto::connect(&cfg).await.unwrap();
-    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()));
     let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
     let info = InstanceInfo {
         id: "live".into(),
@@ -246,7 +246,7 @@ async fn chain_names_survive_as_documents() {
         session: root.join(".cache/tgm-live.session"),
     };
     let tg = TelegramMtproto::connect(&cfg).await.unwrap();
-    let limiter = Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()));
     let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
     let info = InstanceInfo {
         id: "live".into(),
@@ -308,7 +308,7 @@ async fn bench_window() {
     let recorded = std::fs::read_to_string(&marks).unwrap_or_default();
     for var in vars {
         let chat_id: i64 = env(var).parse().unwrap();
-        let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(ChatLimiterConfig::default()))).await.unwrap();
+        let channel = tg.channel(chat_id, Lane::Meta, Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()))).await.unwrap();
         let marker = channel.send_text(&format!("pigeonhole bench marker ({mode})"), uuid_like()).await.unwrap().message_id;
         match mode.as_str() {
             "mark" => {
@@ -367,7 +367,7 @@ async fn second_bot_sees_first_bots_posts() {
         session: root.join(format!(".cache/{session}")),
     };
     let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
-    let limiter = || Arc::new(ChatLimiter::new(ChatLimiterConfig::default()));
+    let limiter = || Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()));
     let (second, mut updates) = TelegramMtproto::connect_with_updates(&login("TG_BOT_TOKEN_2", "tgm-live-2.session")).await.unwrap();
     let first = TelegramMtproto::connect(&login("TG_BOT_TOKEN", "tgm-live.session")).await.unwrap();
     let theirs = second.channel(chat_id, Lane::Meta, limiter()).await.unwrap();

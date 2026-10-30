@@ -224,7 +224,7 @@ impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
         let mut hi = below.message_id - 1;
         while hi >= 1 {
             // Background work: only on spare budget, never ahead of appends.
-            self.limiter.wait_idle(pigeonhole_limits::LimitBudget::Delete).await;
+            self.limiter.wait_idle(crate::limits::DELETE).await;
             let lo = (hi - IDS_PER_CALL as i64 + 1).max(1);
             let mut view = View::new();
             self.page(&mut view, lo, hi).await?;

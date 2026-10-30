@@ -103,6 +103,9 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 |---|---|---|---|
 | `pigeonhole_backend_throttle_wait_seconds` | histogram | `service`, `method` | Waits a chat service asked for (429 retry-after / FLOOD_WAIT), also the ones waited out inside a call |
 | `pigeonhole_limiter_wait_seconds` | histogram | `chat`, `op` | Time waiting for our own rate-limit buckets of a chat / channel (waits > 0 only) |
+| `pigeonhole_limiter_retry_wait_seconds` | histogram | `service`, `method` | From a rate limit to the next attempt of that call on the same bot (the wait plus the tokens after it) |
+| `pigeonhole_pool_calls_total` | counter | `chat`, `member` | Operations a pool of bots ran, by the member (0 = the primary) they ran on |
+| `pigeonhole_pool_moves_total` | counter | `chat` | Operations a pool moved to another bot after a rate limit (it was not applied) |
 
 ### pigeonhole-meta
 

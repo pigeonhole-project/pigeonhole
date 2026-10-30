@@ -33,10 +33,13 @@ path = "pigeonhole-meta"
 id = "tg-main"
 kind = "telegram"
 chat_id = -1001234567890
-# bot_token_env = "BOT_TOKEN"
+# Several bots (each an admin of the channel) multiply its sends a minute;
+# the first is the primary: it reads, and names the store
+# (docs/shared-limiter.md).
+# bot_token_envs = ["BOT_TOKEN", "BOT_TOKEN_2"]   # default ["BOT_TOKEN"]
 # api_id_env = "TG_API_ID"
 # api_hash_env = "TG_API_HASH"
-# session = "pigeonhole-tg-<bot id>.session"
+# session = "pigeonhole-tg-<bot id>.session"   # with one bot only
 
 # [[store]]
 # id = "dc-backup"
@@ -110,31 +113,36 @@ cool_batch = 64
 memory_budget = "256 MiB"
 
 [telegram]
-# Telegram budgets on two levels. Bot: every call of one token, across all its
-# chats (Telegram: ~30/s). Chat: per chat and per kind of call, each call also
-# taking a bot token. A FLOOD_WAIT freezes the bucket it hit for its wait (a
-# getFile or upload one the whole bot).
-bot_rate_per_sec = 25.0
-bot_burst = 30.0
-# Sends: ~20 messages a minute in a channel or group, so 18.
-send_rate_per_sec = 0.3
-send_burst = 3.0
-# getMessages (reads by id: the log's fence checks, listing for the sweeper).
-info_rate_per_sec = 2.0
-info_burst = 5.0
-get_file_rate_per_sec = 15.0
-get_file_burst = 30.0
-delete_rate_per_sec = 1.0
-delete_burst = 5.0
+# Telegram budgets on two levels (docs/shared-limiter.md). Bot: every call of
+# one token, across all its chats (Telegram: ~30/s). Class: per chat and per
+# kind of call, each call also taking a bot token. A FLOOD_WAIT freezes the
+# bucket it hit for its wait (a getFile or upload one: the whole bot), and
+# the bucket starts empty after it.
 upload_concurrency = 2
 download_concurrency = 8
+[telegram.bot]
+rate_per_sec = 25.0
+burst = 30.0
+[telegram.send]
+# ~20 messages a minute per bot in a channel, so 18.
+rate_per_sec = 0.3
+burst = 3.0
+[telegram.read]
+# getMessages (reads by id: the log's fence checks, listing for the sweeper).
+rate_per_sec = 2.0
+burst = 5.0
+[telegram.delete]
+rate_per_sec = 1.0
+burst = 5.0
 
 [discord]
-# The same knobs as [telegram], for Discord channels; defaults: ~5 messages
-# per 5 s per channel (send 1.0, burst 5; a log entry is a message and a
-# thread), reads 5/s, the bot 40/s.
-# send_rate_per_sec = 1.0
-# send_burst = 5.0
+# The same tables as [telegram] (bot, send, read, delete), for Discord
+# channels; defaults: ~5 messages per 5 s per bot in a channel (send 1.0,
+# burst 5), reads 5/s, the bot 40/s. A 429 cools its class in the channel;
+# one marked global, the whole bot.
+# [discord.send]
+# rate_per_sec = 1.0
+# burst = 5.0
 
 [cache]
 # In-memory block caches: a read looks in L1 (decoded blocks), then L2

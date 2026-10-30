@@ -62,7 +62,7 @@ Rejected alternatives:
 id = "tgm-main"
 kind = "telegram_mtproto"
 chat_id = -1001234567890
-# bot_token_env = "BOT_TOKEN"      # default
+# bot_token_envs = ["BOT_TOKEN"]   # default; several bots: docs/shared-limiter.md
 # api_id_env = "TG_API_ID"         # my.telegram.org, in .env
 # api_hash_env = "TG_API_HASH"
 # session = "pigeonhole-tg.session" # MTProto auth key cache; secret, 0600

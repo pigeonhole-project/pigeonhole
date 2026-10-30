@@ -11,13 +11,17 @@
 mod chain;
 mod channel;
 mod client;
+pub mod limits;
+mod pool;
 pub mod fake;
 mod session;
 mod store;
 
 pub use chain::ChainOptions;
-pub use channel::{windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, TEXT_MAX_CHARS, WINDOW};
-pub use client::{bot_id_of, channel_id_of, Lane, MtprotoChannel, MtprotoConfig, TelegramMtproto, UpdatesRx, CALL_BUDGET};
+pub use limits::limits;
+pub use pool::PooledChannel;
+pub use channel::{windows, ChannelApi, ChannelMessage, FileLocation, ReadVia, FileReferenceExpired, Sent, IDS_PER_CALL, TEXT_MAX_CHARS, WINDOW};
+pub use client::{bot_id_of, channel_id_of, Lane, MtprotoChannel, MtprotoConfig, TelegramMtproto, UpdatesRx, CALL_DEADLINE};
 pub use pigeonhole_storage_api::BlobBackend;
 pub use session::FileSession;
 pub use store::{blob_random_id, TelegramBlobStore, TelegramId};

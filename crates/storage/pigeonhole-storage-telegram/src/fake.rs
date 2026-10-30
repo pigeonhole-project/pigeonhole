@@ -143,7 +143,7 @@ impl FakeChannel {
     }
 
     fn location(&self, g: &Inner, id: i64) -> FileLocation {
-        FileLocation { id, access_hash: self.id, file_reference: vec![g.reference_epoch], dc_id: 2 }
+        FileLocation { id, access_hash: self.id, file_reference: vec![g.reference_epoch], dc_id: 2, bot: 0 }
     }
 }
 

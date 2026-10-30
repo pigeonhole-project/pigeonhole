@@ -32,16 +32,17 @@ impl InstanceKind {
 pub struct InstanceConfig {
     pub kind: InstanceKind,
     pub info: InstanceInfo,
-    /// Env var name holding the bot/app token (never the secret itself).
-    pub bot_token_env: String,
-    /// Resolved token (from env); empty for memory.
-    pub bot_token: String,
+    /// Env var names holding the bots' tokens (never the secrets), the
+    /// primary first; empty for memory and local_disk.
+    pub bot_token_envs: Vec<String>,
+    /// Resolved tokens (from env), as `bot_token_envs`.
+    pub bot_tokens: Vec<String>,
     /// Telegram chat id, Discord channel id or local_disk path (string form).
     pub scope_id: String,
     /// Per-message size limit override (Discord); `None` = backend default.
     pub max_blob_size: Option<usize>,
-    /// `telegram`: how the bot logs in.
-    pub telegram: Option<TelegramLogin>,
+    /// `telegram`: how each bot logs in, as `bot_tokens`.
+    pub telegram: Vec<TelegramLogin>,
 }
 
 /// A Telegram bot logged in over MTProto, resolved from `[[store]]` and the
@@ -119,11 +120,11 @@ pub fn memory_instance(id: &str) -> InstanceConfig {
             location: memory_location(id),
             role: InstanceRole::ReadWrite,
         },
-        bot_token_env: String::new(),
-        bot_token: String::new(),
+        bot_token_envs: Vec::new(),
+        bot_tokens: Vec::new(),
         scope_id: "local".into(),
         max_blob_size: None,
-        telegram: None,
+        telegram: Vec::new(),
     }
 }
 
@@ -195,11 +196,11 @@ mod tests {
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,
             },
-            bot_token_env: "T".into(),
-            bot_token: "1:x".into(),
+            bot_token_envs: vec!["T".into()],
+            bot_tokens: vec!["1:x".into()],
             scope_id: "-100".into(),
             max_blob_size: None,
-            telegram: None,
+            telegram: Vec::new(),
         };
         let mut b = a.clone();
         b.info.id = "b".into();
@@ -217,11 +218,11 @@ mod tests {
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,
             },
-            bot_token_env: "T".into(),
-            bot_token: "1:x".into(),
+            bot_token_envs: vec!["T".into()],
+            bot_tokens: vec!["1:x".into()],
             scope_id: "-100".into(),
             max_blob_size: None,
-            telegram: None,
+            telegram: Vec::new(),
         };
         let mut b = a.clone();
         b.info.id = "ro".into();
@@ -241,11 +242,11 @@ mod tests {
                 location: "tg:chat:-100".into(),
                 role: InstanceRole::ReadWrite,
             },
-            bot_token_env: "T".into(),
-            bot_token: "1:x".into(),
+            bot_token_envs: vec!["T".into()],
+            bot_tokens: vec!["1:x".into()],
             scope_id: "-100".into(),
             max_blob_size: None,
-            telegram: None,
+            telegram: Vec::new(),
         };
         let err = check_fingerprints(
             &[cfg],

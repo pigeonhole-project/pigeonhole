@@ -143,7 +143,9 @@ channel_id = 123456789012345678
 store = "dc"
 ```
 
-Secret: `DISCORD_BOT_TOKEN` in `.env` (or the env var named by `bot_token_env`).
+Secret: `DISCORD_BOT_TOKEN` in `.env` (or the env vars named by
+`bot_token_envs`: several bots in one channel multiply its budget, see
+docs/shared-limiter.md).
 The bot needs to view the (text) channel, send messages, attach files, read
 history and manage messages (delete); a channel holding the log or snapshots
 also needs create public threads and manage threads. Blobs up to ~3.6 KiB go
@@ -166,13 +168,13 @@ combined into `[[replicas]]` groups, and `[meta] log` / `snapshot` and
 [[store]]
 id = "tg-main"
 kind = "telegram"
-bot_token_env = "BOT_TOKEN"
+bot_token_envs = ["BOT_TOKEN"]    # more bots, more sends a minute
 chat_id = -1001234567890
 
 [[store]]
 id = "dc-backup"
 kind = "discord"
-bot_token_env = "DISCORD_BOT_TOKEN"
+bot_token_envs = ["DISCORD_BOT_TOKEN"]
 channel_id = 123456789012345678
 
 [[replicas]]
@@ -225,14 +227,14 @@ comments. Sections:
 
 | TOML | Meaning |
 |---|---|
-| `[[store]]` | Where bytes live: id, kind (`local_disk` + `path` / `memory` / `telegram` + `chat_id` / `discord` + `channel_id`), secret env names (`bot_token_env`; telegram also `api_id_env`, `api_hash_env`), telegram `session`, discord `max_blob_size`. Every kind holds blobs; the log and snapshots go to `local_disk`, `memory`, `telegram` or `discord` |
+| `[[store]]` | Where bytes live: id, kind (`local_disk` + `path` / `memory` / `telegram` + `chat_id` / `discord` + `channel_id`), secret env names (`bot_token_envs`, the bots of a chat, the first the primary; telegram also `api_id_env`, `api_hash_env`), telegram `session`, discord `max_blob_size`. Every kind holds blobs; the log and snapshots go to `local_disk`, `memory`, `telegram` or `discord` |
 | `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
 | `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
 | `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every` (`"off"` = never), `keep_snapshots` (the newest snapshots kept with the log between them; default 2) |
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
 | `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
-| `[telegram]` | Rate limits on two levels: per bot (`bot_rate_per_sec`) and per channel (send / getFile / delete / info budgets); a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency |
+| `[telegram]` | Rate limits on two levels: per bot (`[telegram.bot]`) and per channel and class of call (`[telegram.send]`, `read`, `delete`), each `rate_per_sec` / `burst`; a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency. `[discord]` takes the same tables |
 | `[cache]` | In-memory block caches: L1 decoded, L2 stored (compressed) blocks |
 | `[sweep]` | Garbage collector: `interval`, `batch_size` |
 | `[repair]` | Replica repair/backfill: interval, batch, cost limit, `scrub` |

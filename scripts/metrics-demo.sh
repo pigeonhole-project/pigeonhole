@@ -7,6 +7,7 @@
 #                                      # blobs, log and snapshots in the Discord channels
 #                                      # DISCORD_{BLOBS,LOG,SNAP}_CHANNEL_ID of .env, gentler traffic
 #   METRICS_DEMO_BACKEND=telegram …    # the same in TG_{BLOBS,LOG,SNAP}_CHAT_ID (MTProto, TG_BOT_TOKEN)
+#   METRICS_DEMO_BOTS=2 …                # each chat store through two bots (…_TOKEN_2)
 #   LOAD_CLIENTS=8 LOAD_PAUSE=0 …      # traffic shape (scripts/metrics-load.sh)
 #   METRICS_DEMO_CACHE=off …           # no block cache (every read goes to the backend)
 #   ./scripts/metrics-demo.sh check    # every dashboard query answers; every metric is documented
@@ -20,6 +21,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BACKEND="${METRICS_DEMO_BACKEND:-disk}"
+# Bots per chat store (1 or 2: TG_BOT_TOKEN_2 / DISCORD_BOT_TOKEN_2), docs/shared-limiter.md.
+BOTS="${METRICS_DEMO_BOTS:-1}"
 case "$BACKEND" in
   disk) STATE="${METRICS_DEMO_DIR:-$ROOT/.cache/metrics-demo}" ;;
   discord) STATE="${METRICS_DEMO_DIR:-$ROOT/.cache/metrics-demo-discord}" ;;
@@ -130,7 +133,11 @@ EOF
 # one purpose). The sweeper deletes every blob of ours in the blobs channel
 # this tablet does not know.
 write_discord_config() {
-  local id
+  local id bots='["DISCORD_BOT_TOKEN"]'
+  if [[ "$BOTS" == 2 ]]; then
+    bots='["DISCORD_BOT_TOKEN", "DISCORD_BOT_TOKEN_2"]'
+    [[ -n "${DISCORD_BOT_TOKEN_2:-}" ]] || { echo "DISCORD_BOT_TOKEN_2 is not set (.env)" >&2; exit 1; }
+  fi
   for id in DISCORD_BOT_TOKEN DISCORD_BLOBS_CHANNEL_ID DISCORD_LOG_CHANNEL_ID DISCORD_SNAP_CHANNEL_ID; do
     [[ -n "${!id:-}" ]] || { echo "$id is not set (.env)" >&2; exit 1; }
   done
@@ -143,16 +150,19 @@ region = "us-east-1"
 id = "dc-blobs"
 kind = "discord"
 channel_id = $DISCORD_BLOBS_CHANNEL_ID
+bot_token_envs = $bots
 
 [[store]]
 id = "dc-log"
 kind = "discord"
 channel_id = $DISCORD_LOG_CHANNEL_ID
+bot_token_envs = $bots
 
 [[store]]
 id = "dc-snap"
 kind = "discord"
 channel_id = $DISCORD_SNAP_CHANNEL_ID
+bot_token_envs = $bots
 
 [meta]
 log = "dc-log"
@@ -180,7 +190,13 @@ EOF
 # As write_discord_config, over MTProto as a bot (the session file caches
 # the login).
 write_telegram_config() {
-  local id
+  local id bots='["TG_BOT_TOKEN"]' session="session = \"$STATE/tg.session\""
+  if [[ "$BOTS" == 2 ]]; then
+    # A session file per bot, by default in the working directory.
+    bots='["TG_BOT_TOKEN", "TG_BOT_TOKEN_2"]'
+    session=""
+    [[ -n "${TG_BOT_TOKEN_2:-}" ]] || { echo "TG_BOT_TOKEN_2 is not set (.env)" >&2; exit 1; }
+  fi
   for id in TG_BOT_TOKEN TG_API_ID TG_API_HASH TG_BLOBS_CHAT_ID TG_LOG_CHAT_ID TG_SNAP_CHAT_ID; do
     [[ -n "${!id:-}" ]] || { echo "$id is not set (.env)" >&2; exit 1; }
   done
@@ -198,10 +214,10 @@ EOF
 id = "$1"
 kind = "telegram"
 chat_id = $2
-bot_token_env = "TG_BOT_TOKEN"
+bot_token_envs = $bots
 api_id_env = "TG_API_ID"
 api_hash_env = "TG_API_HASH"
-session = "$STATE/tg.session"
+$session
 EOF
   done
   cat >>"$STATE/pigeonhole.toml" <<EOF

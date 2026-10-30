@@ -21,6 +21,20 @@ pub struct FileLocation {
     pub access_hash: i64,
     pub file_reference: Vec<u8>,
     pub dc_id: i32,
+    /// The bot whose location this is (a member of a pooled channel; 0 for
+    /// a channel of one bot): only it can download with it, another gets
+    /// `FILE_REFERENCE_EXPIRED` (docs/shared-limiter.md).
+    pub bot: usize,
+}
+
+/// How to download a document whose locations some bots hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadVia {
+    /// With the location of this bot.
+    Holder(usize),
+    /// Read the message again first: a bot without a location is free
+    /// sooner than every holder, and gets its own.
+    Locate,
 }
 
 /// A channel message as far as we care.
@@ -86,6 +100,38 @@ pub trait ChannelApi: Send + Sync + 'static {
 
     /// Delete messages (at most [`IDS_PER_CALL`]); missing ids are fine.
     async fn delete_messages(&self, ids: &[i64]) -> Result<()>;
+
+    /// Of the bots holding a location of a document (`holders`, not empty),
+    /// the one to download with, or [`ReadVia::Locate`]. A channel of one
+    /// bot always has its location.
+    fn read_via(&self, holders: &[usize]) -> ReadVia {
+        ReadVia::Holder(holders[0])
+    }
+}
+
+#[async_trait]
+impl<C: ChannelApi + ?Sized> ChannelApi for std::sync::Arc<C> {
+    fn channel_id(&self) -> i64 {
+        (**self).channel_id()
+    }
+    async fn get_messages(&self, ids: &[i64]) -> Result<Vec<ChannelMessage>> {
+        (**self).get_messages(ids).await
+    }
+    async fn send_document(&self, name: &str, data: Bytes, random_id: i64) -> Result<Sent> {
+        (**self).send_document(name, data, random_id).await
+    }
+    async fn send_text(&self, text: &str, random_id: i64) -> Result<Sent> {
+        (**self).send_text(text, random_id).await
+    }
+    async fn get_file(&self, file: &FileLocation, offset: u64, limit: u64) -> Result<Bytes> {
+        (**self).get_file(file, offset, limit).await
+    }
+    async fn delete_messages(&self, ids: &[i64]) -> Result<()> {
+        (**self).delete_messages(ids).await
+    }
+    fn read_via(&self, holders: &[usize]) -> ReadVia {
+        (**self).read_via(holders)
+    }
 }
 
 /// `[start, end)` cut into the windows `get_file` takes: aligned to
