@@ -148,6 +148,18 @@ last. Every retry of it takes the same account's plan again
 A new operation (a new `random_id`, the next batch) gets a new ticket and
 may land on another account: this is where the pool spreads load.
 
+**One exception: a rate limit moves.** A `FLOOD_WAIT` or a 429
+(`Verdict::Wait`) guarantees the call was not applied. So when another
+account of the pool would be ready sooner than the wait, the operation takes
+a new ticket there, with a new `random_id` / nonce, and the first account's
+bucket stays cooled. Telegram gives a bot a 35–40 s wait every ~18 sends,
+and the log is written one entry after another: without moving, an entry
+would wait that out while another bot is free, and a pool would not give
+×N. A lost answer, a 5xx or a network error (`Verdict::Transient`) never
+moves: the outcome is unknown, and only the same account with the same
+`random_id` deduplicates. A read with per-account handles resolves the
+message again on the new account. (Decided with the user, 2026-10-30.)
+
 ### Penalties
 
 The service says what a failure means (`classify` → `Verdict`). A rate limit
@@ -164,8 +176,8 @@ The service says what a failure means (`classify` → `Verdict`). A rate limit
 A penalty freezes the bucket until the wait is over, and the bucket starts
 empty then: a full burst right after a 35 s `FLOOD_WAIT` is what earns the
 next one. Every call whose plan has that bucket waits it out, the ticket's
-own retry too: retries are sticky (§ Sticky retries), even when another bot
-is free.
+own retry too, unless the operation moves to another account (§ Sticky
+retries).
 
 ### Fairness
 
@@ -317,7 +329,8 @@ until the round trip (~0.3–0.5 s per send) is what is left.
    call takes its bot's token; a cooled bucket starts empty; a Discord
    429 cools its route's class, the bot only when `global`; one `Call` per
    Discord endpoint; config tables per rate.
-4. Pools and `bot_token_envs`; tickets; the retry-wait metric.
+4. Pools and `bot_token_envs`; tickets; a rate limit moves to a free
+   account; the retry-wait metric.
 5. Bench: log entries per second with 1, 2, 4 bots against
    [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md).
 6. Only as far as the bench shows a need: the Discord `Pacer` as a kind of
@@ -332,11 +345,5 @@ until the round trip (~0.3–0.5 s per send) is what is left.
 - **More bots.** Two bots doubled the rate. Does it keep scaling at 4–8
   bots from one IP, or does a per-address limit appear (§ Levels and
   buckets: not in the model until seen)?
-- **Rerouting a flood wait.** A `FLOOD_WAIT` or a 429 guarantees the call
-  was not applied, so moving that operation to another bot with a new
-  `random_id` / nonce would be safe, unlike a retry after a lost answer.
-  Telegram gives a bot a 35–40 s wait every ~18 sends, and the log is
-  written one entry after another: without moving, an entry waits that out
-  while another bot is free. Not decided yet: retries are sticky.
 - **Bandwidth.** Is the ~2.7 MiB/s upload per stream capped per bot,
   per connection or per address?
