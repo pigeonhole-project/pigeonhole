@@ -161,7 +161,10 @@ impl S3Gateway {
         outcomes.take(slot).map_err(Self::map_err)
     }
 
+    /// An internal error: answered as `InternalError` with its text, and
+    /// logged with it (the request log has the status only).
     fn map_err(e: impl std::fmt::Display) -> s3s::S3Error {
+        tracing::warn!(error = %e, "internal error");
         s3_error!(InternalError, "{}", e)
     }
 
