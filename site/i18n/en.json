@@ -1,7 +1,6 @@
 {
   "title": "pigeonhole — S3 storage that keeps its bytes in chat messages",
   "meta_desc": "An educational storage system in Rust: an S3 gateway that cuts objects into chunks and posts them to Telegram and Discord channels, with a metadata log that lives there too.",
-
   "nav.home_href": "index.html",
   "nav.how": "How it works",
   "nav.features": "Features",
@@ -10,13 +9,11 @@
   "nav.lang_href": "ru/index.html",
   "nav.lang_code": "ru",
   "nav.theme": "Switch theme",
-
   "hero.kicker": "An educational storage system · Rust",
   "hero.title": "S3 storage that keeps its bytes in chat messages",
   "hero.lede": "pigeonhole speaks the S3 API, cuts objects into chunks and posts them as files to Telegram and Discord channels — or to a local disk. Its own metadata is a log of commands, and that log can live in a channel too.",
   "hero.cta_demo": "Watch it work",
   "hero.cta_code": "Source on GitHub",
-
   "replay.terminal": "terminal",
   "replay.tg_sub": "Telegram-style channel · in memory",
   "replay.dc_sub": "Discord-style channel · in memory",
@@ -26,13 +23,18 @@
   "replay.pause": "❚❚ Pause",
   "replay.restart": "Restart",
   "replay.note": "A real recording, not an animation drawn by hand: <code>site/record.py</code> ran the pigeonhole binary with JSON logs on and the AWS CLI against it, and this page plays the log back. The two channels are in-memory stores standing in for Telegram and Discord — everything above the store is the same code. The chunk size is lowered to 4 MiB so small files make several chunks (the default is 19 MiB). Played at human speed; the real time is next to each line.",
-
   "js.play": "▶ Play",
   "js.pause": "❚❚ Pause",
   "js.recorded": "recorded at {commit}, {date}",
   "js.position": "position {n}",
-  "js.commands": {"one": "{n} command", "other": "{n} commands"},
-  "js.chunks": {"one": "{n} chunk", "other": "{n} chunks"},
+  "js.commands": {
+    "one": "{n} command",
+    "other": "{n} commands"
+  },
+  "js.chunks": {
+    "one": "{n} chunk",
+    "other": "{n} chunks"
+  },
   "js.msg": "msg {n}",
   "js.say.CreateBucket": "Bucket <b>{bucket}</b> created: no upload, one entry in the metadata log.",
   "js.say.PutObject": "<b>{key}</b> ({size}) became {chunks}, each posted to <em>both</em> channels; one log entry records the chunks and the object together.",
@@ -40,7 +42,6 @@
   "js.say.CopyObject": "<b>{key}</b> is a copy, and nothing was uploaded: the new object points at the same {chunks}, their refcount goes up. Only the log grows.",
   "js.say.ls": "The listing comes from memory: the state the log was replayed into. No channel is read.",
   "js.say.end": "That's it: two objects' worth of chunks in two channels, and a log that can rebuild everything from scratch.",
-
   "how.title": "How it works",
   "how.sub": "Four ideas carry the whole thing.",
   "how.1.t": "Cut",
@@ -51,7 +52,6 @@
   "how.3.d": "Every S3 operation is one entry in a command log; on boot the state is rebuilt from a snapshot and the log after it. The log can live on disk or in a channel, fenced by message order.",
   "how.4.t": "Heal",
   "how.4.d": "Copies share chunks by refcount. A repair task re-replicates chunks that lost a copy, and a sweeper deletes posts that nothing points to.",
-
   "feat.title": "What it can do",
   "feat.s3.t": "S3 API",
   "feat.s3.d": "Buckets, objects, multipart uploads, Range reads, shallow CopyObject, tagging, user metadata and conditional writes (<code>If-Match</code>, <code>If-None-Match</code>). Works with the AWS CLI, boto3 and rclone.",
@@ -69,7 +69,6 @@
   "feat.obs.d": "Prometheus metrics and Grafana dashboards for stores, the limiter, the log and Raft; structured logs with a span per request, store call and commit.",
   "feat.sim.t": "Tested the hard way",
   "feat.sim.d": "Fault injection in every store, deterministic simulation with madsim, conformance suites per store kind, s3-tests, and CI that caps function complexity.",
-
   "ontop.title": "Real software on top",
   "ontop.sub": "S3 with conditional writes is enough for programs that coordinate through S3. They run on a Telegram channel without knowing it.",
   "ontop.etcd.t": "etcd",
@@ -78,7 +77,6 @@
   "ontop.sqlite.d": "Litestream streams a SQLite database into pigeonhole; it is deleted, restored, and restored as of a moment in the past.",
   "ontop.cond.t": "Ten writers, one winner",
   "ontop.cond.d": "Conditional writes decided in the log: ten writers race for one key with curl, exactly one wins.",
-
   "num.title": "In numbers",
   "num.rust": "lines of Rust",
   "num.crates": "crates",
@@ -86,7 +84,6 @@
   "num.commits": "commits",
   "num.days": "days with commits",
   "num.docs": "design documents",
-
   "more.title": "Coming to this site",
   "more.soon": "soon",
   "more.demos.t": "Demos",
@@ -97,7 +94,38 @@
   "more.built.d": "The repository as infographics: growth by layer, the crate graph, where the code lives, and who was at the keyboard.",
   "more.article.t": "The article",
   "more.article.d": "The story behind it, with this site as the illustrations.",
-
   "foot.warn": "An educational project, not a file host. Using a messenger as general-purpose storage may break the Telegram and Discord terms of service; keep real runs to small test data in a private channel you own.",
-  "foot.license": "MIT licensed · <a href=\"https://github.com/pigeonhole-project/pigeonhole\">github.com/pigeonhole-project/pigeonhole</a>"
+  "foot.license": "MIT licensed · <a href=\"https://github.com/pigeonhole-project/pigeonhole\">github.com/pigeonhole-project/pigeonhole</a>",
+  "nav.home": "Home",
+  "nav.try": "Try it",
+  "nav.try_href": "try.html",
+  "nav.try_lang_href": "ru/try.html",
+  "try.kicker": "Live · WebAssembly",
+  "try.title": "pigeonhole, running in your browser",
+  "try.lede": "Not a recording. The Rust code of the server — the metadata tablet on openraft, chunking and zstd, the replica group, the S3 handlers — is compiled to WebAssembly and runs in a Web Worker on this page. Its two channels are in memory: nothing leaves your browser.",
+  "try.lede_plain": "pigeonhole's Rust code compiled to WebAssembly, running in your browser.",
+  "try.pick": "Upload a file…",
+  "try.sample_random": "7 MiB of random bytes",
+  "try.sample_text": "3 MiB of text",
+  "try.repair": "Run repair",
+  "try.sweep": "Run the sweeper",
+  "try.loading": "Loading pigeonhole (wasm, ~7 MB)…",
+  "try.console": "pigeonhole · wasm32-wasip1",
+  "try.bucket": "Bucket",
+  "try.no_objects": "Empty: upload a file.",
+  "try.note": "Built from <code>crates/web</code>: the same crates as the server, without HTTP and without network stores. The chunk size is 4 MiB here so small files make several chunks. Times are measured inside the worker.",
+  "js.try.ready": "Ready: booted in {ms} ms.",
+  "js.try.booted": "metadata tablet up (openraft, a cluster of one); bucket demo created",
+  "js.try.error": "Failed: {error}",
+  "js.try.too_big": "Up to 64 MiB, please: it all lives in this tab's memory.",
+  "js.try.read": "Read 100 KB",
+  "js.try.copy": "Copy",
+  "js.try.delete": "Delete",
+  "js.try.out.get": "{len} back; {reads} store reads",
+  "js.try.out.repair": "repaired {n}, queued {queued}",
+  "js.try.out.sweep": "deleted {n} posts",
+  "js.say.get": "Read {len} of <b>{key}</b>: {reads} reads from the channels, {fetched} fetched — only the blocks that hold the range, not the whole object.",
+  "js.say.DeleteObject": "<b>{key}</b> is gone from the bucket. Its chunks are released; the posts stay until nothing points at them, then they are deleted.",
+  "js.say.repair": "Repair pass: {n} chunks brought back to two copies. With both channels healthy there is nothing to do.",
+  "js.say.sweep": "Sweeper pass: {n} posts that no chunk points to were deleted."
 }

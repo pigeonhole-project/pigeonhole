@@ -87,6 +87,11 @@ def main() -> int:
     if args.out.exists():
         shutil.rmtree(args.out)
     shutil.copytree(SITE / "src" / "assets", args.out / "assets")
+    wasm = ROOT / "target" / "wasm32-wasip1" / "release" / "pigeonhole_web.wasm"
+    if wasm.exists():
+        shutil.copy(wasm, args.out / "assets" / "pigeonhole.wasm")
+    else:
+        print(f"warning: {wasm} missing (make web): try.html will not load", file=sys.stderr)
     pages = sorted((SITE / "src").glob("*.html"))
     for lang, prefix in LANGS.items():
         strings = json.loads((SITE / "i18n" / f"{lang}.json").read_text())
