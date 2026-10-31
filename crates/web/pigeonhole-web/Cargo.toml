@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "pigeonhole in one process on in-memory stores, for the site's in-browser demo (wasm32-wasip1)"
 
+[lib]
+# cdylib: the module the site loads (wasm32-wasip1, exports ph_open / ph_call).
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }
@@ -16,6 +20,8 @@ pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-meta = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 s3s = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

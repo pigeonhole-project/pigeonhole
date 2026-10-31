@@ -11,12 +11,17 @@ use bytes::{Bytes, BytesMut};
 use http::{Extensions, HeaderMap, Method, Uri};
 use pigeonhole_blob::{erase, CheapestFirst, InstanceInfo, InstanceRole, MetricsBackend, Replicated};
 use pigeonhole_chunk_store::{BlobDb, ChunkStore, IngestOptions};
+use pigeonhole_chunk_store::{RepairConfig, RepairStats, Repairer, SweepConfig, SweepStats, Sweeper};
 use pigeonhole_gateway_s3::{Index, S3Gateway, S3Options};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_storage_memory::MemoryBlobStore;
-use s3s::dto::{CopyObjectInput, CreateBucketInput, DeleteObjectInput, GetObjectInput, PutObjectInput, StreamingBlob};
+use s3s::dto::{CopyObjectInput, CreateBucketInput, DeleteObjectInput, GetObjectInput, ListObjectsV2Input};
+use s3s::dto::{PutObjectInput, StreamingBlob};
 use s3s::{S3Request, S3};
 use std::sync::Arc;
+
+#[cfg(target_family = "wasm")]
+mod web;
 
 /// The two blob stores, by the names the site shows.
 pub const STORES: [&str; 2] = ["telegram", "discord"];
@@ -139,6 +144,37 @@ impl Node {
         let input = DeleteObjectInput { bucket: bucket.into(), key: key.into(), ..Default::default() };
         self.s3.delete_object(req(input)).await?;
         Ok(())
+    }
+
+    /// The keys in `bucket` with their sizes.
+    pub async fn list(&self, bucket: &str) -> Result<Vec<(String, i64)>> {
+        let input = ListObjectsV2Input { bucket: bucket.into(), ..Default::default() };
+        let out = self.s3.list_objects_v2(req(input)).await?;
+        Ok(out
+            .output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .map(|o| (o.key.unwrap_or_default(), o.size.unwrap_or(0)))
+            .collect())
+    }
+
+    /// One repair pass: copy chunks that lost a replica back to full.
+    pub async fn repair(&self) -> Result<RepairStats> {
+        let repairer = Repairer::new(self.store.db().clone(), self.store.replicated().clone(), RepairConfig::default());
+        repairer.repair_once().await
+    }
+
+    /// One sweeper pass: delete posts that no chunk points to.
+    pub async fn sweep(&self) -> Result<SweepStats> {
+        let replicated = self.store.replicated();
+        let sweeper = Sweeper::new(
+            self.store.db().clone(),
+            replicated.members().to_vec(),
+            SweepConfig::default(),
+            replicated.pins().clone(),
+        );
+        sweeper.sweep_once().await
     }
 }
 
