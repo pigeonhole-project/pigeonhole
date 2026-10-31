@@ -1,7 +1,8 @@
 //! pigeonhole in one process for the site's demo (wasm32-wasip1 in a Web
 //! Worker, or natively): a `pigeonhole.toml` read by pigeonhole-config, and
 //! the stack the binary builds from it, without HTTP. Telegram and Discord
-//! stores are the real ones, on fake channels (`fake = "memory"`).
+//! stores are the real ones, on fake channels (pigeonhole-fake-channels:
+//! each a tablet of its own, in memory or under a local_disk store).
 //!
 //! The channels and memory stores live in a [`World`] that outlives the
 //! [`Node`] built over it: a new config is a restart, and the tablet replays
@@ -16,12 +17,11 @@ use pigeonhole_chunk_store::{RepairConfig, RepairStats, Repairer, SweepConfig, S
 use pigeonhole_config::instances::{check_fingerprints, InstanceConfig, InstanceKind};
 use pigeonhole_config::stores::FakeBacking;
 use pigeonhole_config::{Config, LogSettings, SnapshotSettings};
+use pigeonhole_fake_channels::{self as fake, DiscordChannel, TelegramChannel};
 use pigeonhole_gateway_s3::{Index, S3Gateway};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, LogStore, MetaOptions, MetaStore, Namespaces, SnapshotStore};
-use pigeonhole_storage_discord::fake::FakeDiscord;
 use pigeonhole_storage_discord::DiscordBlobStore;
 use pigeonhole_storage_memory::MemoryBlobStore;
-use pigeonhole_storage_telegram::fake::FakeChannel;
 use pigeonhole_storage_telegram::TelegramBlobStore;
 use s3s::dto::{CopyObjectInput, CreateBucketInput, DeleteObjectInput, GetObjectInput, ListObjectsV2Input};
 use s3s::dto::{PutObjectInput, StreamingBlob};
@@ -41,23 +41,43 @@ pub fn parse_config(text: &str) -> Result<Config> {
     Config::from_toml(text, Path::new("pigeonhole.toml"))
 }
 
-/// What a server's restart keeps: the channels and the memory stores.
+/// What a server's restart keeps in this process: the fake channels (each a
+/// tablet of its own, in memory or in a directory) and the memory stores.
 #[derive(Default)]
 pub struct World {
-    telegram: Mutex<HashMap<i64, Arc<FakeChannel>>>,
-    discord: Mutex<HashMap<u64, Arc<FakeDiscord>>>,
+    telegram: Mutex<HashMap<(i64, String), Arc<TelegramChannel>>>,
+    discord: Mutex<HashMap<(u64, String), Arc<DiscordChannel>>>,
     memory: Mutex<HashMap<String, Arc<MemoryBlobStore>>>,
 }
 
+/// The stores a fake channel's tablet keeps itself in.
+fn channel_stores(backing: &FakeBacking) -> Result<fake::Stores> {
+    match backing {
+        FakeBacking::Memory => Ok(fake::Stores::memory()),
+        FakeBacking::Dir(dir) => fake::Stores::in_dir(dir),
+        FakeBacking::Store(id) => bail!("fake = {id:?} was not resolved"),
+    }
+}
+
 impl World {
-    fn telegram(&self, chat: &str) -> Result<Arc<FakeChannel>> {
-        let id: i64 = chat.parse().with_context(|| format!("chat id {chat:?}"))?;
-        Ok(self.telegram.lock().unwrap().entry(id).or_insert_with(|| Arc::new(FakeChannel::new(id))).clone())
+    async fn telegram(&self, chat: &str, backing: &FakeBacking) -> Result<Arc<TelegramChannel>> {
+        let key = (chat.parse().with_context(|| format!("chat id {chat:?}"))?, format!("{backing:?}"));
+        if let Some(c) = self.telegram.lock().unwrap().get(&key) {
+            return Ok(c.clone());
+        }
+        let channel = Arc::new(fake::telegram(key.0, channel_stores(backing)?).await?);
+        self.telegram.lock().unwrap().insert(key, channel.clone());
+        Ok(channel)
     }
 
-    fn discord(&self, channel: &str) -> Result<Arc<FakeDiscord>> {
-        let id: u64 = channel.parse().with_context(|| format!("channel id {channel:?}"))?;
-        Ok(self.discord.lock().unwrap().entry(id).or_insert_with(|| Arc::new(FakeDiscord::new(id))).clone())
+    async fn discord(&self, channel: &str, backing: &FakeBacking) -> Result<Arc<DiscordChannel>> {
+        let key = (channel.parse().with_context(|| format!("channel id {channel:?}"))?, format!("{backing:?}"));
+        if let Some(c) = self.discord.lock().unwrap().get(&key) {
+            return Ok(c.clone());
+        }
+        let ch = Arc::new(fake::discord(key.0, channel_stores(backing)?).await?);
+        self.discord.lock().unwrap().insert(key, ch.clone());
+        Ok(ch)
     }
 
     fn memory(&self, id: &str, info: Option<&InstanceInfo>) -> Arc<MemoryBlobStore> {
@@ -74,26 +94,28 @@ impl World {
     }
 
     /// A Telegram store on fake channel `chat`.
-    fn telegram_store(
+    async fn telegram_store(
         &self,
         cfg: &Config,
         chat: &str,
+        backing: &FakeBacking,
         info: InstanceInfo,
-    ) -> Result<TelegramBlobStore<Arc<FakeChannel>>> {
+    ) -> Result<TelegramBlobStore<Arc<TelegramChannel>>> {
         let limiter = cfg.chat_limiter(InstanceKind::Telegram, "fake", chat);
-        Ok(TelegramBlobStore::new(Arc::new(self.telegram(chat)?), limiter, info))
+        Ok(TelegramBlobStore::new(Arc::new(self.telegram(chat, backing).await?), limiter, info))
     }
 
     /// A Discord store on fake channel `channel`.
-    fn discord_store(
+    async fn discord_store(
         &self,
         cfg: &Config,
         channel: &str,
+        backing: &FakeBacking,
         max_blob_size: Option<usize>,
         info: InstanceInfo,
-    ) -> Result<DiscordBlobStore<Arc<FakeDiscord>>> {
+    ) -> Result<DiscordBlobStore<Arc<DiscordChannel>>> {
         let limiter = cfg.chat_limiter(InstanceKind::Discord, "fake", channel);
-        Ok(DiscordBlobStore::new(Arc::new(self.discord(channel)?), limiter, max_blob_size, info))
+        Ok(DiscordBlobStore::new(Arc::new(self.discord(channel, backing).await?), limiter, max_blob_size, info))
     }
 }
 
@@ -133,62 +155,83 @@ fn no_real_channels() -> anyhow::Error {
     anyhow::anyhow!("real Telegram and Discord channels are not reachable from here: add `fake = \"memory\"`")
 }
 
-fn open_log(world: &World, cfg: &Config) -> Result<Arc<dyn LogStore>> {
+async fn open_log(world: &World, cfg: &Config) -> Result<Arc<dyn LogStore>> {
     Ok(match &cfg.meta.log {
         LogSettings::Memory => Arc::new(ChainLogStore::new(world.memory("meta-log", None))),
-        LogSettings::Fake { kind: InstanceKind::Telegram, scope, backing: FakeBacking::Memory } => {
-            let store = world.telegram_store(cfg, scope, meta_info(InstanceKind::Telegram, scope, "log"))?;
-            Arc::new(ChainLogStore::new(Arc::new(store)))
+        LogSettings::Fake { kind: InstanceKind::Telegram, scope, backing } => {
+            let info = meta_info(InstanceKind::Telegram, scope, "log");
+            Arc::new(ChainLogStore::new(Arc::new(world.telegram_store(cfg, scope, backing, info).await?)))
         }
-        LogSettings::Fake { kind: InstanceKind::Discord, scope, backing: FakeBacking::Memory } => {
-            let store = world.discord_store(cfg, scope, None, meta_info(InstanceKind::Discord, scope, "log"))?;
-            let log = ChainLogStore::new(Arc::new(store));
+        LogSettings::Fake { kind: InstanceKind::Discord, scope, backing } => {
+            let info = meta_info(InstanceKind::Discord, scope, "log");
+            let log = ChainLogStore::new(Arc::new(world.discord_store(cfg, scope, backing, None, info).await?));
             Arc::new(match cfg.meta.lease {
                 Some(lease) => log.with_lease(pigeonhole_meta::Lease::new(lease)),
                 None => log,
             })
         }
         LogSettings::Fake { .. } => bail!("[meta] log: a fake channel is telegram or discord"),
-        LogSettings::LocalDisk { .. } => bail!("[meta] log on local_disk: not in the browser yet"),
+        LogSettings::LocalDisk { path } => Arc::new(ChainLogStore::new(Arc::new(
+            pigeonhole_storage_disk::DiskBlobStore::open(path.join("log"))
+                .with_context(|| format!("open local log {}", path.display()))?,
+        ))),
         LogSettings::Telegram { .. } | LogSettings::Discord { .. } => return Err(no_real_channels()),
     })
 }
 
-fn open_snapshots(world: &World, cfg: &Config) -> Result<Arc<dyn SnapshotStore>> {
+async fn open_snapshots(world: &World, cfg: &Config) -> Result<Arc<dyn SnapshotStore>> {
     Ok(match &cfg.meta.snapshot {
         SnapshotSettings::Memory => Arc::new(BlobSnapshotStore::new(world.memory("meta-snapshots", None))),
-        SnapshotSettings::Fake { kind: InstanceKind::Telegram, scope, backing: FakeBacking::Memory } => {
-            let store = world.telegram_store(cfg, scope, meta_info(InstanceKind::Telegram, scope, "snapshots"))?;
-            Arc::new(BlobSnapshotStore::new(Arc::new(store)))
+        SnapshotSettings::Fake { kind: InstanceKind::Telegram, scope, backing } => {
+            let info = meta_info(InstanceKind::Telegram, scope, "snapshots");
+            Arc::new(BlobSnapshotStore::new(Arc::new(world.telegram_store(cfg, scope, backing, info).await?)))
         }
-        SnapshotSettings::Fake { kind: InstanceKind::Discord, scope, backing: FakeBacking::Memory } => {
-            let store = world.discord_store(cfg, scope, None, meta_info(InstanceKind::Discord, scope, "snapshots"))?;
-            Arc::new(BlobSnapshotStore::new(Arc::new(store)))
+        SnapshotSettings::Fake { kind: InstanceKind::Discord, scope, backing } => {
+            let info = meta_info(InstanceKind::Discord, scope, "snapshots");
+            Arc::new(BlobSnapshotStore::new(Arc::new(world.discord_store(cfg, scope, backing, None, info).await?)))
         }
         SnapshotSettings::Fake { .. } => bail!("[meta] snapshot: a fake channel is telegram or discord"),
-        SnapshotSettings::LocalDisk { .. } => bail!("[meta] snapshot on local_disk: not in the browser yet"),
+        SnapshotSettings::LocalDisk { path } => Arc::new(BlobSnapshotStore::new(Arc::new(
+            pigeonhole_storage_disk::DiskBlobStore::open(path.join("snapshots"))
+                .with_context(|| format!("open local snapshots {}", path.display()))?,
+        ))),
         SnapshotSettings::Telegram { .. } | SnapshotSettings::Discord { .. } => return Err(no_real_channels()),
     })
 }
 
 /// One blob store of the placement, as the binary's `build_member`.
-fn member(world: &World, cfg: &Config, inst: &InstanceConfig) -> Result<SharedBackend> {
+async fn member(world: &World, cfg: &Config, inst: &InstanceConfig) -> Result<SharedBackend> {
     let id = &inst.info.id;
     let store: SharedBackend = match (inst.kind, &inst.fake) {
         (InstanceKind::Memory, _) => Arc::new(erase(world.memory(id, Some(&inst.info)))),
-        (InstanceKind::Telegram, Some(FakeBacking::Memory)) => {
-            Arc::new(erase(Arc::new(world.telegram_store(cfg, &inst.scope_id, inst.info.clone())?)))
+        (InstanceKind::Telegram, Some(backing)) => {
+            Arc::new(erase(Arc::new(world.telegram_store(cfg, &inst.scope_id, backing, inst.info.clone()).await?)))
         }
-        (InstanceKind::Discord, Some(FakeBacking::Memory)) => Arc::new(erase(Arc::new(world.discord_store(
-            cfg,
-            &inst.scope_id,
-            inst.max_blob_size,
-            inst.info.clone(),
-        )?))),
-        (InstanceKind::LocalDisk, _) => bail!("store {id:?}: local_disk is not in the browser yet"),
+        (InstanceKind::Discord, Some(backing)) => Arc::new(erase(Arc::new(
+            world.discord_store(cfg, &inst.scope_id, backing, inst.max_blob_size, inst.info.clone()).await?,
+        ))),
+        (InstanceKind::LocalDisk, _) => Arc::new(erase(Arc::new(
+            pigeonhole_storage_disk::DiskBlobStore::with_instance(&inst.scope_id, inst.info.clone())
+                .with_context(|| format!("open local_disk store {}", inst.scope_id))?,
+        ))),
         (InstanceKind::Telegram | InstanceKind::Discord, None) => return Err(no_real_channels()),
     };
     Ok(MetricsBackend::wrap(store))
+}
+
+/// Stops every fake channel's tablet (a process exit).
+impl World {
+    pub async fn close(&self) -> Result<()> {
+        let tg: Vec<_> = self.telegram.lock().unwrap().drain().map(|(_, c)| c).collect();
+        let dc: Vec<_> = self.discord.lock().unwrap().drain().map(|(_, c)| c).collect();
+        for c in tg {
+            c.host().close().await?;
+        }
+        for c in dc {
+            c.host().close().await?;
+        }
+        Ok(())
+    }
 }
 
 impl Node {
@@ -202,7 +245,7 @@ impl Node {
             keep_snapshots: cfg.meta.keep_snapshots,
             ..MetaOptions::default()
         };
-        let meta = MetaStore::open(open_log(world, cfg)?, open_snapshots(world, cfg)?, namespaces, opts)
+        let meta = MetaStore::open(open_log(world, cfg).await?, open_snapshots(world, cfg).await?, namespaces, opts)
             .await
             .context("boot metadata tablet")?;
         let db = BlobDb::open(meta.clone()).await.context("open chunk metadata")?;
@@ -214,7 +257,7 @@ impl Node {
             let mut members = Vec::new();
             for id in &shard.group {
                 let inst = cfg.instances.iter().find(|i| i.info.id == *id).with_context(|| format!("store {id:?}"))?;
-                members.push(member(world, cfg, inst)?);
+                members.push(member(world, cfg, inst).await?);
             }
             shards.push((members, shard.write_quorum));
         }

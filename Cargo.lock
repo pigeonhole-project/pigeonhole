@@ -2598,6 +2598,7 @@ dependencies = [
  "flate2",
  "madsim-tokio",
  "metrics",
+ "pigeonhole-types",
  "serde",
  "tempfile",
  "tracing",
@@ -2935,6 +2936,8 @@ dependencies = [
 name = "pigeonhole-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "madsim-tokio",
  "serde",
  "serde_json",
 ]
@@ -2951,9 +2954,11 @@ dependencies = [
  "pigeonhole-blob",
  "pigeonhole-chunk-store",
  "pigeonhole-config",
+ "pigeonhole-fake-channels",
  "pigeonhole-gateway-s3",
  "pigeonhole-meta",
  "pigeonhole-storage-discord",
+ "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
  "pigeonhole-storage-telegram",
  "s3s",

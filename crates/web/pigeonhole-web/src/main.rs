@@ -65,7 +65,40 @@ fn main() -> anyhow::Result<()> {
             anyhow::ensure!(node.get("demo", key, None).await? == *want, "{key} differs after restart");
         }
         node.put("demo", "after.bin", noise(5 << 20)).await?;
-        eprintln!("smoke ok in {:?}, {} entries replayed", t0.elapsed(), node.replayed());
+        eprintln!("memory: ok in {:?}, {} entries replayed", t0.elapsed(), node.replayed());
+
+        // The channels in a local_disk store: a new process finds them as they were.
+        // WASI has no temp_dir(); the runner passes TMPDIR.
+        let tmp = std::env::var("TMPDIR").map_or_else(|_| std::env::temp_dir(), std::path::PathBuf::from);
+        let dir = tmp.join(format!(
+            "pigeonhole-web-smoke-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_disk = DEMO_CONFIG.replace("fake = \"memory\"", "fake = \"channel-data\"")
+            + &format!(
+                "\n[[store]]\nid = \"channel-data\"\nkind = \"local_disk\"\npath = {:?}\n",
+                dir.display().to_string()
+            );
+        let t1 = std::time::Instant::now();
+        {
+            let world = World::default();
+            let node = Node::open(&world, &parse_config(&on_disk)?).await?;
+            node.create_bucket("demo").await?;
+            node.put("demo", "photo.jpg", photo.clone()).await?;
+            node.put("demo", "small.bin", small.clone()).await?;
+            node.close().await?;
+            world.close().await?;
+        }
+        let world = World::default();
+        let node = Node::open(&world, &parse_config(&on_disk)?).await?;
+        anyhow::ensure!(node.get("demo", "photo.jpg", None).await? == photo, "photo differs after a new process");
+        anyhow::ensure!(node.get("demo", "small.bin", None).await? == small, "small differs after a new process");
+        eprintln!("disk: ok in {:?}, {} entries replayed", t1.elapsed(), node.replayed());
+        node.close().await?;
+        world.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("smoke ok in {:?}", t0.elapsed());
         Ok(())
     })
 }
