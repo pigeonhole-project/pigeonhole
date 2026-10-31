@@ -566,12 +566,12 @@ impl ChunkStore {
         let logical = std::mem::take(block_buf);
         let logical_len = logical.len();
         let calls = calls.clone();
-        let (stored, codec) = tokio::task::spawn_blocking(move || {
+        let (stored, codec) = pigeonhole_codec::blocking(move || {
             calls.fetch_add(1, Ordering::Relaxed);
             encode_block_bytes(&logical, codec)
         })
         .await
-        .context("spawn_blocking encode")??;
+        .context("encode")??;
         pigeonhole_blob::record_compression_ratio(stored.len(), logical_len);
         Ok(EncodedBlock { stored, logical_len: logical_len as u32, codec })
     }
