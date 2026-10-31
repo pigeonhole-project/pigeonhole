@@ -1,3 +1,8 @@
+//! The configuration: `pigeonhole.toml` and the environment, read into a
+//! [`Config`] (stores, placement, the metadata tablet, chunking, limits,
+//! caches). No I/O beyond reading the file and env, nothing that talks to a
+//! network: the binary and the site's in-browser build parse the same way.
+
 use crate::instances::InstanceKind;
 use crate::instances::{memory_instance, InstanceConfig, TelegramLogin};
 use crate::stores::{FileReplicas, FileShards, FileStore, Store, Topology};
@@ -19,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) mod units;
+pub mod instances;
+pub mod stores;
+pub mod units;
 
 /// Blob placement (`[chunk] store`): shards, each a replica group. A chunk
 /// goes to one shard and to every member of it.

@@ -32,6 +32,7 @@ openraft-chat = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true }
 pigeonhole-telegram-mtproto = { workspace = true }
+pigeonhole-config = { workspace = true }
 uuid = { workspace = true }
 lru = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
@@ -51,7 +52,7 @@ metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [features]
 default = ["discord", "metrics-prometheus"]
-discord = ["dep:pigeonhole-storage-discord", "dep:pigeonhole-discord-http"]
+discord = ["dep:pigeonhole-storage-discord", "dep:pigeonhole-discord-http", "pigeonhole-config/discord"]
 bytestream = ["dep:pigeonhole-gateway-bytestream"]
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
 

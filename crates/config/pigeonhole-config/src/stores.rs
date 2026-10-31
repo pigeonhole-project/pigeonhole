@@ -2,12 +2,12 @@
 //! (`[[replicas]]`) and parts (`[[shards]]`). `[meta] log` / `snapshot` and
 //! `[chunk] store` refer to them by id.
 
-use crate::config::{PlacementConfig, ShardPlacement};
 use crate::instances::InstanceKind;
 use crate::instances::{
     discord_app_id_from_token, discord_fingerprint, discord_location, local_disk_location, memory_fingerprint,
     memory_location, telegram_fingerprint, telegram_location, InstanceConfig, TelegramLogin,
 };
+use crate::{PlacementConfig, ShardPlacement};
 use anyhow::{bail, Context, Result};
 use pigeonhole_blob::{InstanceInfo, InstanceRole};
 use serde::Deserialize;
@@ -45,7 +45,7 @@ pub(crate) enum FileStore {
         channel_id: u64,
         /// As for telegram; default `["DISCORD_BOT_TOKEN"]`.
         bot_token_envs: Option<Vec<String>>,
-        #[serde(default, deserialize_with = "crate::config::units::opt_size")]
+        #[serde(default, deserialize_with = "crate::units::opt_size")]
         max_blob_size: Option<usize>,
     },
 }

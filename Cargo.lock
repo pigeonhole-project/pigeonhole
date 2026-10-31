@@ -2518,6 +2518,7 @@ dependencies = [
  "pigeonhole-blob",
  "pigeonhole-chunk-store",
  "pigeonhole-codec",
+ "pigeonhole-config",
  "pigeonhole-discord-http",
  "pigeonhole-gateway-bytestream",
  "pigeonhole-gateway-s3",
@@ -2601,6 +2602,29 @@ dependencies = [
  "tempfile",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "pigeonhole-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytesize",
+ "dotenvy",
+ "humantime-serde",
+ "pigeonhole-blob",
+ "pigeonhole-chunk-store",
+ "pigeonhole-codec",
+ "pigeonhole-gateway-s3",
+ "pigeonhole-limits",
+ "pigeonhole-storage-discord",
+ "pigeonhole-storage-disk",
+ "pigeonhole-storage-memory",
+ "pigeonhole-storage-telegram",
+ "pigeonhole-types",
+ "serde",
+ "tempfile",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -2887,8 +2911,6 @@ dependencies = [
 name = "pigeonhole-types"
 version = "0.1.0"
 dependencies = [
- "bytesize",
- "humantime-serde",
  "serde",
  "serde_json",
 ]

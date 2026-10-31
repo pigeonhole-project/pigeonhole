@@ -29,6 +29,8 @@ ROLE = {
     "pigeonhole-gateway-bytestream": "gateway",
     "pigeonhole-gateway-kafka": "gateway",
     "pigeonhole-gateway-webdav": "gateway",
+    # pigeonhole.toml read into a Config: what the binary and the web build share.
+    "pigeonhole-config": "config",
     "pigeonhole": "bin",
     # The in-browser build: a composition root like the binary.
     "pigeonhole-web": "bin",
@@ -122,6 +124,13 @@ def main() -> int:
                 elif not strict and dr in FORBIDDEN_SOFT["storage"]:
                     errors.append(f"{name} (storage) → {dep_name} ({dr})")
 
+        elif role == "config":
+            # Builds for wasm: no network client, nothing that runs the stack.
+            for dep_name in dep_names:
+                dr = ROLE.get(dep_name)
+                if dr in {"storage-client", "bin", "testkit"}:
+                    errors.append(f"{name} (config) → {dep_name} ({dr})")
+
         elif role == "storage-client":
             allowed = {"limits", "storage", "storage-api", "types"}
             for dep_name in dep_names:
@@ -204,6 +213,7 @@ FORBIDDEN_LEXEMES = ("file_id", "chat_id", "channel_id")
 LEXEME_ALLOW_DIR_PREFIXES = (
     "crates/storage/",
     "crates/bin/",
+    "crates/config/",
     "scripts/",
     "docs/",
     "compat/",
@@ -240,7 +250,7 @@ def scan_forbidden_lexemes() -> list[str]:
             continue
         for lex, rx in patterns.items():
             if rx.search(text):
-                found.append(f"{rel}: forbidden lexeme `{lex}` outside storage-*/bin")
+                found.append(f"{rel}: forbidden lexeme `{lex}` outside storage-*/bin/config")
                 break
     return found
 

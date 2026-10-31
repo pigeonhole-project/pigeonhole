@@ -21,6 +21,7 @@ members = [
     "crates/testing/pigeonhole-testkit",
     "crates/testing/pigeonhole-sim",
     "crates/web/pigeonhole-web",
+    "crates/config/pigeonhole-config",
 ]
 default-members = ["crates/bin/pigeonhole"]
 exclude = ["vendor"]
@@ -86,6 +87,7 @@ grammers-session = { version = "=0.11.0", default-features = false }
 grammers-tl-types = "=0.11.0"
 
 pigeonhole-meta = { path = "crates/meta/pigeonhole-meta" }
+pigeonhole-config = { path = "crates/config/pigeonhole-config" }
 openraft-chat = { path = "crates/net/openraft-chat" }
 pigeonhole-types = { path = "crates/core/pigeonhole-types" }
 pigeonhole-storage-api = { path = "crates/core/pigeonhole-storage-api" }
