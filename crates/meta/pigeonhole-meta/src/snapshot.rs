@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Version of the stored envelope ([`StoredSnapshot`] on disk / in a chat).
-pub const SNAPSHOT_STORE_FORMAT: u32 = 1;
+pub const SNAPSHOT_STORE_FORMAT: u32 = 2;
 
 /// A tablet snapshot as stored: the log it belongs to, the position it
 /// covers, and the encoded [`crate::TabletSnapshot`].
@@ -32,20 +32,37 @@ pub struct StoredSnapshot {
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     format: u32,
-    snapshot: StoredSnapshot,
+    body: Body,
 }
 
-impl StoredSnapshot {
+/// What a stored blob holds: a whole snapshot, or the list of the parts the
+/// encoded whole was cut into, for a store whose blobs are smaller.
+#[derive(Clone, Serialize, Deserialize)]
+enum Body {
+    Whole(StoredSnapshot),
+    Parts(Vec<Part>),
+}
+
+/// One part of a cut snapshot: its blob (postcard of the store's id), length
+/// and crc.
+#[derive(Clone, Serialize, Deserialize)]
+struct Part {
+    id: Vec<u8>,
+    len: u64,
+    crc: u32,
+}
+
+impl Body {
     /// `crc32 | postcard(Envelope)`: a damaged copy is detected, not misread.
-    pub fn encode(&self) -> Vec<u8> {
-        let payload = postcard::to_stdvec(&Envelope { format: SNAPSHOT_STORE_FORMAT, snapshot: self.clone() })
+    fn encode(&self) -> Vec<u8> {
+        let payload = postcard::to_stdvec(&Envelope { format: SNAPSHOT_STORE_FORMAT, body: self.clone() })
             .expect("a snapshot always encodes");
         let mut out = crc32fast::hash(&payload).to_le_bytes().to_vec();
         out.extend_from_slice(&payload);
         out
     }
 
-    pub fn decode(data: &[u8]) -> Result<Self> {
+    fn decode(data: &[u8]) -> Result<Self> {
         let (crc, payload) = data.split_at_checked(4).context("stored snapshot too short")?;
         if crc32fast::hash(payload) != u32::from_le_bytes(crc.try_into().unwrap()) {
             bail!("stored snapshot fails its checksum");
@@ -54,7 +71,22 @@ impl StoredSnapshot {
         if format != SNAPSHOT_STORE_FORMAT {
             bail!("stored snapshot in format {format}, this binary reads {SNAPSHOT_STORE_FORMAT}");
         }
-        Ok(postcard::from_bytes::<Envelope>(payload).context("decode stored snapshot")?.snapshot)
+        Ok(postcard::from_bytes::<Envelope>(payload).context("decode stored snapshot")?.body)
+    }
+}
+
+impl StoredSnapshot {
+    /// The snapshot as one blob (see [`Body`]).
+    pub fn encode(&self) -> Vec<u8> {
+        Body::Whole(self.clone()).encode()
+    }
+
+    /// A snapshot stored whole; a cut one is read through its store.
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        match Body::decode(data)? {
+            Body::Whole(s) => Ok(s),
+            Body::Parts(_) => bail!("a snapshot cut into parts, read through its store"),
+        }
     }
 }
 
@@ -73,7 +105,8 @@ pub trait SnapshotStore: Send + Sync + 'static {
     async fn remove(&self, r: &SnapshotRef) -> Result<()>;
 }
 
-/// Labels of snapshot blobs: `snapshot-<log id>-<at>.snap`.
+/// Labels of snapshot blobs: `snapshot-<log id>-<at>.snap`; of the parts of
+/// a cut one, `snappart-<log id>-<at>-<n>.bin` (not found as the newest).
 const SNAPSHOT_PREFIX: &str = "snapshot-";
 
 /// Snapshots as blobs of a [`Chain`] store: no order or fence is needed (a
@@ -81,6 +114,11 @@ const SNAPSHOT_PREFIX: &str = "snapshot-";
 /// restore asks which one is newest ([`Chain::newest_loose`]: by listing
 /// where the store can, else by the chain). The ref is the blob
 /// id (postcard, hex) and its crc, so a replaced blob is detected.
+///
+/// A snapshot larger than the store's blobs (`max_blob_size`: Discord's
+/// 20 MiB) is cut: its parts are put as plain blobs first, then the blob
+/// the ref names lists them with their crcs. A failed put leaves its parts
+/// behind, as a failed whole put leaves its blob.
 pub struct BlobSnapshotStore<C> {
     chain: Arc<C>,
 }
@@ -119,12 +157,65 @@ impl<C: Chain> BlobSnapshotStore<C> {
     async fn download(&self, id: &C::Id) -> Result<Vec<u8>> {
         Ok(collect_stream(self.chain.get(id, None).await?).await?.to_vec())
     }
+
+    /// The snapshot a stored blob holds, its parts read and checked.
+    async fn read(&self, data: &[u8]) -> Result<StoredSnapshot> {
+        match Body::decode(data)? {
+            Body::Whole(s) => Ok(s),
+            Body::Parts(parts) => StoredSnapshot::decode(&self.join(&parts).await?),
+        }
+    }
+
+    /// The parts' bytes in order, each checked against the list.
+    async fn join(&self, parts: &[Part]) -> Result<Vec<u8>> {
+        let mut whole = Vec::with_capacity(parts.iter().map(|p| p.len as usize).sum());
+        for (n, p) in parts.iter().enumerate() {
+            let data = self.download(&Self::part_id(p)?).await.with_context(|| format!("download part {n}"))?;
+            if data.len() as u64 != p.len || crc32fast::hash(&data) != p.crc {
+                bail!("snapshot part {n} changed");
+            }
+            whole.extend_from_slice(&data);
+        }
+        Ok(whole)
+    }
+
+    fn part_id(p: &Part) -> Result<C::Id> {
+        postcard::from_bytes(&p.id).context("a snapshot part is not a blob id")
+    }
+
+    /// The blob for `snapshot`: whole if the store takes it, else the list
+    /// of the parts it is cut into (put first). The list must fit in one blob:
+    /// ~15 bytes a part, so 20 MiB lists over a million of them.
+    async fn cut(&self, snapshot: &StoredSnapshot) -> Result<Vec<u8>> {
+        let whole = snapshot.encode();
+        let max = self.chain.limits().max_blob_size.max(1);
+        if whole.len() <= max {
+            return Ok(whole);
+        }
+        let list = Body::Parts(self.put_parts(snapshot, &whole, max).await?).encode();
+        if list.len() > max {
+            bail!("the list of a snapshot's parts takes {} bytes, over the store's {max}", list.len());
+        }
+        Ok(list)
+    }
+
+    async fn put_parts(&self, snapshot: &StoredSnapshot, whole: &[u8], max: usize) -> Result<Vec<Part>> {
+        let mut parts = Vec::with_capacity(whole.len().div_ceil(max));
+        for (n, piece) in whole.chunks(max).enumerate() {
+            let label = format!("snappart-{}-{}-{n}.bin", snapshot.log_id, snapshot.at);
+            let id =
+                self.chain.put(Bytes::copy_from_slice(piece), &label).await.with_context(|| format!("put {label}"))?;
+            let id = postcard::to_stdvec(&id).expect("a blob id encodes");
+            parts.push(Part { id, len: piece.len() as u64, crc: crc32fast::hash(piece) });
+        }
+        Ok(parts)
+    }
 }
 
 #[async_trait]
 impl<C: Chain> SnapshotStore for BlobSnapshotStore<C> {
     async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
-        let data = Bytes::from(snapshot.encode());
+        let data = Bytes::from(self.cut(snapshot).await?);
         let crc = crc32fast::hash(&data);
         let label = format!("{SNAPSHOT_PREFIX}{}-{}.snap", snapshot.log_id, snapshot.at);
         let id = self.chain.put_loose(&label, data).await?;
@@ -137,19 +228,24 @@ impl<C: Chain> SnapshotStore for BlobSnapshotStore<C> {
         if crc32fast::hash(&data) != crc {
             bail!("snapshot blob {:?} changed", r.0);
         }
-        StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {:?}", r.0))
+        self.read(&data).await.with_context(|| format!("decode snapshot {:?}", r.0))
     }
 
     /// The most recently stored snapshot.
     async fn newest(&self) -> Result<Option<StoredSnapshot>> {
         let Some(tail) = self.chain.newest_loose(SNAPSHOT_PREFIX).await? else { return Ok(None) };
         let data = self.download(&tail.id).await.with_context(|| format!("download snapshot {:?}", tail.label))?;
-        Ok(Some(StoredSnapshot::decode(&data).with_context(|| format!("decode snapshot {:?}", tail.label))?))
+        Ok(Some(self.read(&data).await.with_context(|| format!("decode snapshot {:?}", tail.label))?))
     }
 
+    /// A cut snapshot's parts go with it, if its list can still be read.
     async fn remove(&self, r: &SnapshotRef) -> Result<()> {
         let (id, _) = Self::parse(r)?;
-        self.chain.delete(&[C::key(&id)]).await
+        let mut keys = vec![C::key(&id)];
+        if let Ok(Body::Parts(parts)) = self.download(&id).await.and_then(|d| Body::decode(&d)) {
+            keys.extend(parts.iter().filter_map(|p| Self::part_id(p).ok()).map(|id| C::key(&id)));
+        }
+        self.chain.delete(&keys).await
     }
 }
 
@@ -214,6 +310,50 @@ mod tests {
             async move { Arc::new(BlobSnapshotStore::new(mem)) as Arc<dyn SnapshotStore> }
         })
         .await;
+    }
+
+    fn small_blobs(max_blob_size: usize) -> pigeonhole_storage_memory::MemoryBlobStore {
+        pigeonhole_storage_memory::MemoryBlobStore::with_limits(pigeonhole_types::BackendLimits {
+            max_blob_size,
+            ..pigeonhole_types::BackendLimits::memory()
+        })
+    }
+
+    /// Discord's case: a snapshot over the store's blob size goes up in
+    /// parts, reads back whole, and leaves nothing behind once removed.
+    #[tokio::test]
+    async fn a_snapshot_over_the_blob_size_is_cut_and_removed_whole() {
+        let mem = Arc::new(small_blobs(1000));
+        let store = BlobSnapshotStore::new(mem.clone());
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let snap = StoredSnapshot { log_id: LogId(5), at: 9, data };
+        let r = store.put(&snap).await.unwrap();
+        assert_eq!(mem.message_keys().len(), 11 + 1, "eleven parts and a list");
+        assert_eq!(store.get(&r).await.unwrap(), snap);
+        assert_eq!(store.newest().await.unwrap().as_ref(), Some(&snap));
+        store.remove(&r).await.unwrap();
+        assert!(mem.message_keys().is_empty(), "left behind {:?}", mem.message_keys());
+    }
+
+    /// Blobs too small to hold the list of a snapshot's parts.
+    #[tokio::test]
+    async fn blobs_too_small_for_the_list_are_refused() {
+        let store = BlobSnapshotStore::new(Arc::new(small_blobs(16)));
+        let err = store.put(&StoredSnapshot { log_id: LogId(1), at: 1, data: vec![0; 100] }).await.unwrap_err();
+        assert!(format!("{err:#}").contains("the list of a snapshot's parts"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_part_is_an_error_not_a_snapshot() {
+        let mem = Arc::new(small_blobs(1000));
+        let store = BlobSnapshotStore::new(mem.clone());
+        let r = store.put(&StoredSnapshot { log_id: LogId(5), at: 9, data: vec![3; 5000] }).await.unwrap();
+        let head = BlobSnapshotStore::<pigeonhole_storage_memory::MemoryBlobStore>::blob_id(&r).unwrap();
+        let head = pigeonhole_storage_memory::MemoryBlobStore::key(&head);
+        let part = *mem.message_keys().iter().find(|&&k| k != head).unwrap();
+        mem.delete(&[part]).await.unwrap();
+        let err = store.get(&r).await.unwrap_err();
+        assert!(format!("{err:#}").contains("part"), "{err:#}");
     }
 
     #[tokio::test]

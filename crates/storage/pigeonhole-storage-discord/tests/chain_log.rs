@@ -14,6 +14,11 @@ use std::sync::Arc;
 type Store = DiscordBlobStore<FakeDiscord>;
 
 fn channel_store(channel: &Arc<FakeDiscord>) -> Arc<Store> {
+    channel_store_of(channel, None)
+}
+
+/// `max_blob_size`: the attachment limit (20 MiB unless set).
+fn channel_store_of(channel: &Arc<FakeDiscord>, max_blob_size: Option<usize>) -> Arc<Store> {
     let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_discord::limits().with_all(Rate::new(1000.0, 100.0))));
     let info = InstanceInfo {
         id: "log".into(),
@@ -22,7 +27,7 @@ fn channel_store(channel: &Arc<FakeDiscord>) -> Arc<Store> {
         location: "dc:channel:77".into(),
         role: InstanceRole::ReadWrite,
     };
-    Arc::new(DiscordBlobStore::new(channel.clone(), limiter, None, info))
+    Arc::new(DiscordBlobStore::new(channel.clone(), limiter, max_blob_size, info))
 }
 
 fn store(channel: &Arc<FakeDiscord>) -> Arc<ChainLogStore<Store>> {
@@ -239,6 +244,25 @@ async fn snapshots_are_plain_messages_found_by_listing() {
     assert_eq!(fresh.newest().await.unwrap(), Some(snap(1, 20)));
     fresh.remove(&second).await.unwrap();
     assert_eq!(fresh.newest().await.unwrap(), Some(snap(1, 10)));
+}
+
+/// A snapshot over the attachment limit goes up in parts, each a plain
+/// message; listing finds its list (not a part) as the newest, it reads back
+/// whole, and removing it empties the channel.
+#[tokio::test]
+async fn a_snapshot_over_the_attachment_limit_goes_up_in_parts() {
+    let channel = Arc::new(FakeDiscord::new(81));
+    let snaps = BlobSnapshotStore::new(channel_store_of(&channel, Some(4096)));
+    let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let snap = pigeonhole_meta::StoredSnapshot { log_id: pigeonhole_meta::LogId(1), at: 30, data };
+    let r = snaps.put(&snap).await.unwrap();
+    assert!(channel.message_ids().len() > 10, "in parts: {} messages", channel.message_ids().len());
+    assert!(channel.thread_ids().is_empty(), "parts start no threads: {:?}", channel.thread_ids());
+    let fresh = BlobSnapshotStore::new(channel_store_of(&channel, Some(4096)));
+    assert_eq!(fresh.newest().await.unwrap().as_ref(), Some(&snap));
+    assert_eq!(fresh.get(&r).await.unwrap(), snap);
+    fresh.remove(&r).await.unwrap();
+    assert!(channel.message_ids().is_empty(), "left behind: {:?}", channel.message_ids());
 }
 
 // A lease log (docs/discord-lease.md): only lease records take a thread.
