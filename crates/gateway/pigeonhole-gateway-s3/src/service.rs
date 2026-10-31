@@ -605,7 +605,10 @@ impl S3 for S3Gateway {
 
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         match self.index.delete_bucket(&req.input.bucket).await.map_err(Self::map_err)? {
-            DeleteBucketResult::Deleted => Ok(S3Response::new(DeleteBucketOutput::default())),
+            DeleteBucketResult::Deleted => {
+                info!(bucket = %req.input.bucket, "DeleteBucket ok");
+                Ok(S3Response::new(DeleteBucketOutput::default()))
+            }
             DeleteBucketResult::NotFound => Err(s3_error!(NoSuchBucket)),
             DeleteBucketResult::NotEmpty => Err(s3_error!(BucketNotEmpty)),
         }
@@ -873,6 +876,7 @@ impl S3 for S3Gateway {
         let input = req.input;
         let expect = expect_of(input.if_match, None)?;
         if let Some(ids) = self.index.delete_object(&input.bucket, &input.key, expect).await.map_err(Self::write_err)? {
+            info!(bucket = %input.bucket, key = %input.key, released = ids.len(), "DeleteObject ok");
             self.release_later(ids);
         }
         Ok(S3Response::new(DeleteObjectOutput::default()))
@@ -958,6 +962,8 @@ impl S3 for S3Gateway {
                 return Err(Self::write_err(e));
             }
         };
+        info!(from = %format_args!("{src_bucket}/{src_key}"), bucket = %input.bucket, key = %input.key,
+              extents = extents.len(), "CopyObject ok");
         Ok(S3Response::new(copy_object_output(&dst)))
     }
 

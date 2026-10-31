@@ -33,7 +33,7 @@ slow_request = "5s"                     # slower requests are logged at info
 |---|---|---|
 | `error` | The process cannot go on as it was | the tablet stopped (failed log write, failed commit) |
 | `warn` | Something failed and was handled, or needs a look | a 5xx answer; a store call failed (a replica inside a write that met its quorum shows only here); a sweep or repair pass failed; removing an old snapshot failed; log collection failed; the tablet was fenced by a newer generation |
-| `info` | What a person running it wants to see | config loaded, the log claimed (generation, log id, head, base), the tablet ready (position, entries replayed, time), a snapshot stored (position, bytes, time), the log rebased; a slow request; a rate-limit wait of 5 s or more; each S3 write that changed something (`PutObject ok`, `CreateBucket ok`) |
+| `info` | What a person running it wants to see | config loaded, the log claimed (generation, log id, head, base), the tablet ready (position, entries replayed, time), a snapshot stored (position, bytes, time), the log rebased; a slow request; a rate-limit wait of 5 s or more; each S3 write that changed something (`PutObject ok`, `CopyObject ok`, `DeleteObject ok`, `CreateBucket ok`, `DeleteBucket ok`) |
 | `debug` | Every step, to follow one request or one store | each request (status, time), each store call, what a store posted / read / deleted (name, bytes, message id or disk key, text or attachment), every chain step (linked, lost the link and to whom, found the tail, pruned), each commit (entries, proposals, position, time) and which position a proposal landed at |
 
 ## Spans
