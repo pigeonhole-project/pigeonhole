@@ -3,6 +3,9 @@
 //! fact, landing late and rate limiting. Operations may fail; what may never
 //! happen: a GET that returns a damaged body, a live part deleted, garbage
 //! left once faults stop, a restart that loses an object.
+//!
+//! And the cooler racing rewrites and deletes of the inline objects it moves
+//! out: no rewrite lost, no chunk left that nothing points at.
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -72,11 +75,13 @@ struct Node {
     backends: Vec<SharedBackend>,
 }
 
-/// Every chunk goes to every member; one success is enough.
+/// Every chunk goes to every member; one success is enough. `inline_max`:
+/// objects up to it stay in the metadata (docs/inline-objects.md).
 async fn open_node(
     log: &Arc<MemoryBlobStore>,
     snaps: &Arc<MemoryBlobStore>,
     members: &[Arc<Faulty<MemoryBlobStore>>],
+    inline_max: Option<usize>,
 ) -> Node {
     let meta = MetaStore::open(
         Arc::new(ChainLogStore::new(log.clone())),
@@ -86,7 +91,7 @@ async fn open_node(
     )
     .await
     .unwrap();
-    let s3_opts = S3Options { chunk_size: 16 * 1024, block_size: 4 * 1024, ..S3Options::for_test() };
+    let s3_opts = S3Options { chunk_size: 16 * 1024, block_size: 4 * 1024, inline_max, ..S3Options::for_test() };
     let mut opts = IngestOptions::new(s3_opts.chunk_size, s3_opts.chunk_codec);
     opts.block_size = s3_opts.block_size;
     let backends: Vec<SharedBackend> = members.iter().map(|m| Arc::new(erase(m.clone())) as SharedBackend).collect();
@@ -179,7 +184,7 @@ async fn read_all(s3: &S3Gateway) -> BTreeMap<String, Vec<u8>> {
 
 async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) {
     let (log, snaps) = (Arc::new(MemoryBlobStore::new()), Arc::new(MemoryBlobStore::new()));
-    let node = open_node(&log, &snaps, &members).await;
+    let node = open_node(&log, &snaps, &members, None).await;
     node.s3.create_bucket(req(CreateBucketInput { bucket: BUCKET.into(), ..Default::default() })).await.unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -239,7 +244,7 @@ async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) {
     // A restart replays the log and reads the same objects.
     drop(sw);
     drop(node);
-    let again = open_node(&log, &snaps, &members).await;
+    let again = open_node(&log, &snaps, &members, None).await;
     assert_eq!(read_all(&again.s3).await, live, "replay lost or changed objects");
 }
 
@@ -261,4 +266,115 @@ async fn a_damaged_replica_is_read_around() {
     run(members.clone()).await;
     let served = members[0].faults().iter().filter(|(_, f)| matches!(f, Fault::Corrupt)).count();
     assert!(served > 0, "no damaged copy was ever read");
+}
+
+/// Which write a body is (the seed in its header), for messages.
+fn which(body: Option<&[u8]>) -> String {
+    match body {
+        None => "nothing".into(),
+        Some(d) if intact(d) => format!("write {:#x}", u64::from_le_bytes(d[..8].try_into().unwrap())),
+        Some(d) => format!("{} damaged bytes", d.len()),
+    }
+}
+
+/// A writer that owns `keys`, so the last write of each is known: rewrites
+/// and deletes, small enough to stay inline. Returns what each key holds.
+async fn inline_writer(s3: Arc<S3Gateway>, id: u64, keys: Vec<String>) -> BTreeMap<String, Option<Bytes>> {
+    let mut last: BTreeMap<String, Option<Bytes>> = keys.iter().map(|k| (k.clone(), None)).collect();
+    for op in 0..OPS {
+        tokio::time::sleep(random_ms(5)).await;
+        let k = &keys[(random_u64() % keys.len() as u64) as usize];
+        if random_u64().is_multiple_of(4) {
+            let input = DeleteObjectInput { bucket: BUCKET.into(), key: k.clone(), ..Default::default() };
+            s3.delete_object(req(input)).await.unwrap();
+            last.insert(k.clone(), None);
+        } else {
+            let body = payload(id << 32 | op, HEADER + (random_u64() % 500) as usize);
+            let input = PutObjectInput {
+                bucket: BUCKET.into(),
+                key: k.clone(),
+                content_length: Some(body.len() as i64),
+                body: Some(StreamingBlob::from_bytes(body.clone())),
+                ..Default::default()
+            };
+            s3.put_object(req(input)).await.unwrap();
+            last.insert(k.clone(), Some(body));
+        }
+    }
+    last
+}
+
+/// The cooler moves an inline object out in two steps: it uploads the bytes
+/// as a chunk, then commits `Cool` naming the version it picked. A rewrite or
+/// a delete in between must win (`Cool` rejected, its chunk released), and
+/// stores that answer late stretch that window: the seed decides where it
+/// falls. Checked: the race did happen (some moves rejected), a pass once
+/// the writes stop moves out all that is left, every key holds its last
+/// write, and every live chunk is pointed at.
+#[tokio::test]
+async fn the_cooler_never_loses_a_rewrite_or_leaks_a_chunk() {
+    let slow = FaultPlan { delay: 0.5, max_delay: Duration::from_millis(30), ..FaultPlan::none() };
+    let members = vec![member("a", slow)];
+    let (log, snaps) = (Arc::new(MemoryBlobStore::new()), Arc::new(MemoryBlobStore::new()));
+    let node = open_node(&log, &snaps, &members, Some(1024)).await;
+    node.s3.create_bucket(req(CreateBucketInput { bucket: BUCKET.into(), ..Default::default() })).await.unwrap();
+    let s3 = Arc::new(node.s3);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let policy = pigeonhole_gateway_s3::CoolPolicy {
+        cool_after: Some(Duration::ZERO),
+        min_inline: Duration::ZERO,
+        batch: usize::MAX,
+        ..Default::default()
+    };
+    let cooler = {
+        let (s3, stop, policy) = (s3.clone(), stop.clone(), policy.clone());
+        tokio::spawn(async move {
+            let mut rejected = 0;
+            while !stop.load(Ordering::SeqCst) {
+                rejected += s3.cool_pass(&policy).await.unwrap().rejected;
+                tokio::time::sleep(random_ms(5)).await;
+            }
+            rejected
+        })
+    };
+    let writers: Vec<_> = (0..WORKERS)
+        .map(|id| {
+            let keys = (0..KEYS).map(|k| format!("w{id}k{k}")).collect();
+            tokio::spawn(inline_writer(s3.clone(), id, keys))
+        })
+        .collect();
+    let mut last = BTreeMap::new();
+    for w in writers {
+        last.extend(w.await.unwrap());
+    }
+    stop.store(true, Ordering::SeqCst);
+    assert!(cooler.await.unwrap() > 0, "no move was ever rejected: the race did not happen");
+    let quiet = s3.cool_pass(&policy).await.unwrap();
+    assert_eq!(quiet.rejected, 0, "nothing writes any more");
+
+    let mut referenced = BTreeSet::new();
+    for (k, want) in &last {
+        let got = get(&s3, k).await.unwrap();
+        assert!(
+            got.as_deref() == want.as_deref(),
+            "{k} holds {}, but its last was {}",
+            which(got.as_deref()),
+            which(want.as_deref())
+        );
+        let extents = s3.index.get_extents(BUCKET, k).await.unwrap().unwrap_or_default();
+        assert_eq!(extents.is_empty(), want.is_none(), "{k}: still inline after a quiet pass");
+        referenced.extend(extents.iter().map(|e| e.chunk));
+    }
+    // A rejected move releases its chunk once its commit is answered.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while s3.store.db().stats().live as usize != referenced.len() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "live chunks {} != referenced {}",
+            s3.store.db().stats().live,
+            referenced.len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
