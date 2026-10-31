@@ -13,7 +13,7 @@ Read those first.
   `./scripts/check-deps.sh --strict` green. Commit freely, **ask before push**.
 - `cargo test --workspace` runs `sweep_stress` once; run it repeatedly
   (`for i in $(seq 1 10); do cargo test -q -p pigeonhole --test sweep_stress || break; done`)
-  at the end of a step or before a push, not after every commit (~50 s a run).
+  at the end of a step or before a push, not after every commit (~10 s a run).
 - After S3-visible changes also run `make compat-s3s-e2e` (STS failure is
   expected), `make compat-s3s-boto3`, `make compat-memory`.
 - Docs, comments and commit messages are in English only.
@@ -63,8 +63,9 @@ Known gaps:
 
 - With the `local_disk` log, disk loss loses metadata unless `[meta] snapshot`
   lives elsewhere (and restore from it is lossy); the `telegram` log avoids it.
-- fsync per log batch: `sweep_stress` ~50 s on macOS (`F_FULLFSYNC`) vs ~7 s
-  without; plain `fsync` (what SQLite does on macOS) is an option.
+- On macOS the disk store syncs with a plain `fsync`, as SQLite does: a
+  power cut (not a crash) can lose the last writes. `F_FULLFSYNC` made
+  `sweep_stress` ~40 s against ~10 s; Linux keeps `fdatasync`.
 - Traces stay in the log: no export to Jaeger / Tempo yet (step 7e).
 - Discord: a snapshot over 20 MiB is refused (no splitting yet).
 
@@ -328,5 +329,4 @@ block in the codec.
 ## Open questions
 
 - Default batch window per LogStore kind (`local`: 0, no extra wait).
-- Plain `fsync` instead of `F_FULLFSYNC` for the local log on macOS.
 - A converter for old logs / snapshots when a `VERSION` changes, if ever needed.
