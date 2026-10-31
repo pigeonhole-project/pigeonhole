@@ -1,0 +1,220 @@
+{
+ "label": "telegram-2bots",
+ "started": "2026-10-31T00:48:03Z",
+ "phases": [
+  {
+   "name": "small_put",
+   "desc": "sequential 4 KiB PUTs: one blob + one log entry each",
+   "client": {
+    "ops": 60,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 103.22850462503266,
+    "p50_s": 2.875065291998908,
+    "p95_s": 3.2315775000024587,
+    "max_s": 6.560616375005338,
+    "mean_s": 1.7204662410348344,
+    "ops_per_s": 0.5812348073620176,
+    "mb_per_s": 0.0022704484662578813
+   },
+   "server": {
+    "proposals": 60.0,
+    "log_entries": 60.0,
+    "propose_mean_s": 1.3995262957833332,
+    "queue_wait_mean_s": 2.632981666666666e-05,
+    "commit_mean_s": 1.3994506527999997,
+    "log_append_mean_s": 1.3992125652166663,
+    "bytes_to_backend": 245760.0,
+    "bytes_from_backend": 0,
+    "throttle_wait_s": 9.0,
+    "throttles": 2.0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 92.410636081,
+    "calls": {
+     "tg-blobs put ok": {
+      "count": 60.0,
+      "mean_s": 0.31645728053333333
+     }
+    },
+    "proposals_per_entry": 1.0
+   }
+  },
+  {
+   "name": "blob_put",
+   "desc": "PUT 4\u00d71, 3\u00d78, 2\u00d732 MiB, incompressible, one at a time",
+   "client": {
+    "ops": 9,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 37.15011020901147,
+    "p50_s": 2.9219614589819685,
+    "p95_s": 13.071464042004663,
+    "max_s": 13.071464042004663,
+    "mean_s": 4.069136505002259,
+    "ops_per_s": 0.24226038494542276,
+    "mb_per_s": 2.4764394905532106
+   },
+   "server": {
+    "proposals": 9.0,
+    "log_entries": 9.0,
+    "propose_mean_s": 0.1081566945555576,
+    "queue_wait_mean_s": 2.9101999999999987e-05,
+    "commit_mean_s": 0.10807787500000011,
+    "log_append_mean_s": 0.10784031022222172,
+    "bytes_to_backend": 96468992.0,
+    "bytes_from_backend": 0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 0.7544757539999917,
+    "calls": {
+     "tg-blobs put ok": {
+      "count": 11.0,
+      "mean_s": 3.1968487652727267
+     }
+    },
+    "proposals_per_entry": 1.0
+   }
+  },
+  {
+   "name": "cold_get",
+   "desc": "GET those objects back whole (no cache)",
+   "client": {
+    "ops": 9,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 12.224599583016243,
+    "p50_s": 0.9506303339730948,
+    "p95_s": 4.317274749977514,
+    "max_s": 4.317274749977514,
+    "mean_s": 1.3582800787731282,
+    "ops_per_s": 0.7362204331423492,
+    "mb_per_s": 7.525808872121792
+   },
+   "server": {
+    "proposals": 0,
+    "log_entries": 0,
+    "propose_mean_s": null,
+    "queue_wait_mean_s": null,
+    "commit_mean_s": null,
+    "log_append_mean_s": null,
+    "bytes_to_backend": 0,
+    "bytes_from_backend": 96468992.0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 0.00016166900000000003,
+    "calls": {
+     "tg-blobs get ok": {
+      "count": 92.0,
+      "mean_s": 0.09907001401086957
+     }
+    }
+   }
+  },
+  {
+   "name": "ranged_get",
+   "desc": "six 1 MiB ranged GETs inside a 32 MiB object",
+   "client": {
+    "ops": 6,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 1.0625299999956042,
+    "p50_s": 0.13699008303228766,
+    "p95_s": 0.3713366669835523,
+    "max_s": 0.3713366669835523,
+    "mean_s": 0.1770798335201107,
+    "ops_per_s": 5.64689938168788,
+    "mb_per_s": 5.64689938168788
+   },
+   "server": {
+    "proposals": 0,
+    "log_entries": 0,
+    "propose_mean_s": null,
+    "queue_wait_mean_s": null,
+    "commit_mean_s": null,
+    "log_append_mean_s": null,
+    "bytes_to_backend": 0,
+    "bytes_from_backend": 6291456.0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 8.789999999999948e-06,
+    "calls": {
+     "tg-blobs get ok": {
+      "count": 6.0,
+      "mean_s": 0.13843329149999986
+     }
+    }
+   }
+  },
+  {
+   "name": "small_put_x8",
+   "desc": "4 KiB PUTs from 8 clients at once (group commit)",
+   "client": {
+    "ops": 115,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 197.0012931249803,
+    "p50_s": 12.398387083027046,
+    "p95_s": 24.514132332988083,
+    "max_s": 41.000358624965884,
+    "mean_s": 13.168366781129684,
+    "ops_per_s": 0.583752513375851,
+    "mb_per_s": 0.002280283255374418
+   },
+   "server": {
+    "proposals": 115.0,
+    "log_entries": 113.0,
+    "propose_mean_s": 0.09362099455652217,
+    "queue_wait_mean_s": 0.005048792730434785,
+    "commit_mean_s": 0.08869639344247773,
+    "log_append_mean_s": 0.08847023311504416,
+    "bytes_to_backend": 471040.0,
+    "bytes_from_backend": 0,
+    "throttle_wait_s": 16.0,
+    "throttles": 3.0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 430.81101491299995,
+    "calls": {
+     "tg-blobs put ok": {
+      "count": 115.0,
+      "mean_s": 13.069899844208692
+     }
+    },
+    "proposals_per_entry": 1.0176991150442478
+   }
+  },
+  {
+   "name": "metadata",
+   "desc": "HEAD + LIST, answered from the tablet's memory",
+   "client": {
+    "ops": 100,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 0.0904310829937458,
+    "p50_s": 0.0006904169567860663,
+    "p95_s": 0.0021716250339522958,
+    "max_s": 0.004520791000686586,
+    "mean_s": 0.0009033978614024818,
+    "ops_per_s": 1105.8144687586675,
+    "mb_per_s": null
+   },
+   "server": {
+    "proposals": 0,
+    "log_entries": 0,
+    "propose_mean_s": null,
+    "queue_wait_mean_s": null,
+    "commit_mean_s": null,
+    "log_append_mean_s": null,
+    "bytes_to_backend": 0,
+    "bytes_from_backend": 0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 0,
+    "calls": {}
+   }
+  }
+ ]
+}

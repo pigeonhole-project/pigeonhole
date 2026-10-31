@@ -1,0 +1,220 @@
+{
+ "label": "discord-2bots",
+ "started": "2026-10-31T00:54:28Z",
+ "phases": [
+  {
+   "name": "small_put",
+   "desc": "sequential 4 KiB PUTs: one blob + one log entry each",
+   "client": {
+    "ops": 60,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 52.71342866704799,
+    "p50_s": 0.832780290977098,
+    "p95_s": 1.4315270420047455,
+    "max_s": 1.9284731250372715,
+    "mean_s": 0.8785477194023164,
+    "ops_per_s": 1.1382298878522192,
+    "mb_per_s": 0.004446210499422731
+   },
+   "server": {
+    "proposals": 60.0,
+    "log_entries": 60.0,
+    "propose_mean_s": 0.34698055883333334,
+    "queue_wait_mean_s": 1.968593333333333e-05,
+    "commit_mean_s": 0.34690734868333334,
+    "log_append_mean_s": 0.34669520138333326,
+    "bytes_to_backend": 245760.0,
+    "bytes_from_backend": 0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 0.000269257,
+    "calls": {
+     "dc-blobs put ok": {
+      "count": 60.0,
+      "mean_s": 0.5272234971833334
+     }
+    },
+    "proposals_per_entry": 1.0
+   }
+  },
+  {
+   "name": "blob_put",
+   "desc": "PUT 4\u00d71, 3\u00d78, 2\u00d732 MiB, incompressible, one at a time",
+   "client": {
+    "ops": 9,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 52.981568125018384,
+    "p50_s": 4.546032749989536,
+    "p95_s": 16.192678040999454,
+    "max_s": 16.192678040999454,
+    "mean_s": 5.837861898102953,
+    "ops_per_s": 0.16987039679088164,
+    "mb_per_s": 1.7364529449734567
+   },
+   "server": {
+    "proposals": 9.0,
+    "log_entries": 9.0,
+    "propose_mean_s": 0.3689732544444446,
+    "queue_wait_mean_s": 2.027788888888892e-05,
+    "commit_mean_s": 0.3689135693333338,
+    "log_append_mean_s": 0.3687312962222226,
+    "bytes_to_backend": 96468992.0,
+    "bytes_from_backend": 0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 2.9582000000000016e-05,
+    "calls": {
+     "dc-blobs put ok": {
+      "count": 11.0,
+      "mean_s": 4.4312199619090915
+     }
+    },
+    "proposals_per_entry": 1.0
+   }
+  },
+  {
+   "name": "cold_get",
+   "desc": "GET those objects back whole (no cache)",
+   "client": {
+    "ops": 9,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 11.108020374958869,
+    "p50_s": 0.7691895419848152,
+    "p95_s": 3.7818917910335585,
+    "max_s": 3.7818917910335585,
+    "mean_s": 1.2342175185589843,
+    "ops_per_s": 0.8102253773578737,
+    "mb_per_s": 8.282303857436043
+   },
+   "server": {
+    "proposals": 0,
+    "log_entries": 0,
+    "propose_mean_s": null,
+    "queue_wait_mean_s": null,
+    "commit_mean_s": null,
+    "log_append_mean_s": null,
+    "bytes_to_backend": 0,
+    "bytes_from_backend": 96468992.0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 3.7500000000000064e-07,
+    "calls": {
+     "dc-blobs get ok": {
+      "count": 92.0,
+      "mean_s": 0.11715347320652174
+     }
+    }
+   }
+  },
+  {
+   "name": "ranged_get",
+   "desc": "six 1 MiB ranged GETs inside a 32 MiB object",
+   "client": {
+    "ops": 6,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 0.43879166699480265,
+    "p50_s": 0.07005866698455065,
+    "p95_s": 0.08402408298570663,
+    "max_s": 0.08402408298570663,
+    "mean_s": 0.07312556932447478,
+    "ops_per_s": 13.673915097551449,
+    "mb_per_s": 13.673915097551449
+   },
+   "server": {
+    "proposals": 0,
+    "log_entries": 0,
+    "propose_mean_s": null,
+    "queue_wait_mean_s": null,
+    "commit_mean_s": null,
+    "log_append_mean_s": null,
+    "bytes_to_backend": 0,
+    "bytes_from_backend": 6291456.0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 0,
+    "calls": {
+     "dc-blobs get ok": {
+      "count": 6.0,
+      "mean_s": 0.0700117846666668
+     }
+    }
+   }
+  },
+  {
+   "name": "small_put_x8",
+   "desc": "4 KiB PUTs from 8 clients at once (group commit)",
+   "client": {
+    "ops": 368,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 183.91543458396336,
+    "p50_s": 3.0106960829580203,
+    "p95_s": 9.20074304199079,
+    "max_s": 16.95697250001831,
+    "mean_s": 3.9444891162970834,
+    "ops_per_s": 2.0009196119534822,
+    "mb_per_s": 0.00781609223419329
+   },
+   "server": {
+    "proposals": 368.0,
+    "log_entries": 335.0,
+    "propose_mean_s": 0.5083813274347828,
+    "queue_wait_mean_s": 0.13335847984782614,
+    "commit_mean_s": 0.3714737792238806,
+    "log_append_mean_s": 0.3700989460208956,
+    "bytes_to_backend": 1507328.0,
+    "bytes_from_backend": 0,
+    "throttle_wait_s": 0.6,
+    "throttles": 2.0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 280.32469323900006,
+    "calls": {
+     "dc-blobs put ok": {
+      "count": 368.0,
+      "mean_s": 3.431066911326086
+     }
+    },
+    "proposals_per_entry": 1.0985074626865672
+   }
+  },
+  {
+   "name": "metadata",
+   "desc": "HEAD + LIST, answered from the tablet's memory",
+   "client": {
+    "ops": 100,
+    "errors": 0,
+    "error_samples": [],
+    "wall_s": 0.09255183400819078,
+    "p50_s": 0.0007169579621404409,
+    "p95_s": 0.0017306249937973917,
+    "max_s": 0.006511415995191783,
+    "mean_s": 0.0009245649410877377,
+    "ops_per_s": 1080.4756174918161,
+    "mb_per_s": null
+   },
+   "server": {
+    "proposals": 0,
+    "log_entries": 0,
+    "propose_mean_s": null,
+    "queue_wait_mean_s": null,
+    "commit_mean_s": null,
+    "log_append_mean_s": null,
+    "bytes_to_backend": 0,
+    "bytes_from_backend": 0,
+    "throttle_wait_s": 0,
+    "throttles": 0,
+    "rate_limited_calls": 0,
+    "limiter_wait_s": 2.0082000000000002e-05,
+    "calls": {}
+   }
+  }
+ ]
+}
