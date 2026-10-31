@@ -17,7 +17,7 @@ use pigeonhole_blob::{
 use pigeonhole_codec::{decode_block_slice, encode_block_bytes, ByteBudget, ChunkCodec, DEFAULT_LOGICAL_CHUNK_SIZE};
 use pigeonhole_meta::{Outcomes, Prepared, Proposal, Slot};
 use pigeonhole_types::ByteRange;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -587,13 +587,25 @@ impl ChunkStore {
         Ok(())
     }
 
-    async fn seal_open_chunk(&self, open: &mut OpenChunk, pending: &mut PendingChunks) -> Result<Extent> {
-        let blocks = std::mem::take(&mut open.blocks);
-        let stored = std::mem::take(&mut open.stored);
-        let logical = open.logical;
-        open.logical = 0;
+    /// Seal the open chunk: its upload finishes in the background (the
+    /// writer's last part goes out now), and a new chunk opens.
+    fn start_seal(&self, open: &mut OpenChunk) -> Sealing {
         let writer = std::mem::replace(&mut open.writer, self.replicated.chunk_writer());
-        let sealed = writer.finish().await.context("replicated finish chunk")?;
+        let upload = AbortOnDrop(Some(tokio::spawn(writer.finish())));
+        let sealing = Sealing {
+            upload,
+            blocks: std::mem::take(&mut open.blocks),
+            stored: std::mem::take(&mut open.stored),
+            logical: open.logical,
+        };
+        open.logical = 0;
+        sealing
+    }
+
+    /// Wait for a sealed chunk's upload; the chunk joins `pending`.
+    async fn complete_seal(&self, sealing: Sealing, pending: &mut PendingChunks) -> Result<Extent> {
+        let Sealing { upload, blocks, stored, logical } = sealing;
+        let sealed = upload.join().await?.context("replicated finish chunk")?;
         // CRC over stored concatenation is not the object CRC; use logical stream CRC
         // at ingest level. Per-chunk crc32: hash of block stored bytes.
         let mut h = crc32fast::Hasher::new();
@@ -617,6 +629,40 @@ impl ChunkStore {
     }
 }
 
+/// Sealed chunks uploading in the background while the body is read on:
+/// a server that stopped reading for a whole chunk's upload lost clients
+/// whose send timeout is shorter (boto3's is its connect timeout, 10 s in
+/// our bench), and uploaded one chunk at a time.
+const SEALING_IN_FLIGHT: usize = 2;
+
+/// A sealed chunk whose upload may still run.
+struct Sealing {
+    upload: AbortOnDrop<Result<pigeonhole_blob::SealedChunk>>,
+    blocks: Vec<StoredBlock>,
+    stored: Vec<Bytes>,
+    logical: i64,
+}
+
+/// A task aborted when its handle drops: an ingest given up (an error, a
+/// client gone) stops its uploads; what went up is an orphan the sweeper
+/// collects (it was never pinned past the upload).
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    async fn join(mut self) -> Result<T> {
+        let handle = self.0.take().expect("joined once");
+        handle.await.context("chunk upload task")
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 /// Cuts a stream into blocks and the blocks into chunks as the bytes come,
 /// within the memory budget.
 struct BlockFeeder<'a> {
@@ -630,6 +676,8 @@ struct BlockFeeder<'a> {
     block: Vec<u8>,
     permit: Option<pigeonhole_codec::BudgetPermit>,
     open: OpenChunk,
+    /// Sealed, uploading, in the order they were sealed.
+    sealing: VecDeque<Sealing>,
     extents: Vec<Extent>,
     pending: PendingChunks,
 }
@@ -648,6 +696,7 @@ impl<'a> BlockFeeder<'a> {
             block: Vec::with_capacity(block_size),
             permit: None,
             open: OpenChunk::new(store.replicated.chunk_writer()),
+            sealing: VecDeque::new(),
             extents: Vec::new(),
             pending: PendingChunks::default(),
         }
@@ -689,8 +738,21 @@ impl<'a> BlockFeeder<'a> {
         Ok(())
     }
 
+    /// Seal the open chunk, its upload in the background; with too many
+    /// uploading, wait for the oldest first.
     async fn seal(&mut self) -> Result<()> {
-        let extent = self.store.seal_open_chunk(&mut self.open, &mut self.pending).await?;
+        let sealing = self.store.start_seal(&mut self.open);
+        self.sealing.push_back(sealing);
+        while self.sealing.len() > SEALING_IN_FLIGHT {
+            self.complete_oldest().await?;
+        }
+        Ok(())
+    }
+
+    /// The oldest sealed chunk uploaded: its extent, in order.
+    async fn complete_oldest(&mut self) -> Result<()> {
+        let sealing = self.sealing.pop_front().expect("a chunk sealing");
+        let extent = self.store.complete_seal(sealing, &mut self.pending).await?;
         self.extents.push(extent);
         Ok(())
     }
@@ -702,6 +764,9 @@ impl<'a> BlockFeeder<'a> {
         }
         if self.open.logical > 0 || !self.open.blocks.is_empty() {
             self.seal().await?;
+        }
+        while !self.sealing.is_empty() {
+            self.complete_oldest().await?;
         }
         Ok((self.extents, self.pending))
     }
@@ -965,6 +1030,84 @@ mod tests {
                 assert!(got.is_err(), "nothing cached, the backend is down");
             }
         }
+    }
+
+    /// A blob store whose puts wait for the test to open them.
+    struct Gated {
+        inner: MemoryBlobStore,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobBackend for Gated {
+        type Id = <MemoryBlobStore as BlobBackend>::Id;
+        type Key = <MemoryBlobStore as BlobBackend>::Key;
+        fn instance(&self) -> &pigeonhole_blob::InstanceInfo {
+            self.inner.instance()
+        }
+        fn limits(&self) -> &BackendLimits {
+            self.inner.limits()
+        }
+        fn key(id: &Self::Id) -> Self::Key {
+            MemoryBlobStore::key(id)
+        }
+        fn cost(&self, op: pigeonhole_blob::OpKind, id: Option<&Self::Id>) -> pigeonhole_blob::CostHint {
+            self.inner.cost(op, id)
+        }
+        async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
+            self.gate.acquire().await?.forget();
+            self.inner.put(data, name).await
+        }
+        async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<pigeonhole_blob::BoxByteStream> {
+            self.inner.get(id, range).await
+        }
+        async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
+            self.inner.delete(keys).await
+        }
+        async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
+            self.inner.candidates(after, upto, limit).await
+        }
+    }
+
+    /// The body is read on while sealed chunks upload, up to
+    /// SEALING_IN_FLIGHT of them; the extents keep the body's order.
+    #[tokio::test]
+    async fn the_body_is_read_on_while_chunks_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
+        opts.block_size = 64 * 1024;
+        let layer =
+            ChunkStore::open(db, Gated { inner: MemoryBlobStore::new(), gate: gate.clone() }, opts).await.unwrap();
+        let chunks = 6usize;
+        let pieces: Vec<Bytes> = (0..chunks).map(|i| Bytes::from(vec![i as u8; 64 * 1024])).collect();
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = {
+            let (pieces, read) = (pieces.clone(), read.clone());
+            stream::iter(pieces).map(move |p| {
+                read.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, anyhow::Error>(p)
+            })
+        };
+        let layer = Arc::new(layer);
+        let ingest = {
+            let layer = layer.clone();
+            tokio::spawn(async move { layer.ingest_and_commit(body, None).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // With no upload done: SEALING_IN_FLIGHT chunks sealed and uploading,
+        // one more sealed waits for the oldest. Before, reading stopped at
+        // the first chunk's upload.
+        assert_eq!(read.load(Ordering::SeqCst), SEALING_IN_FLIGHT + 1, "read on past the first chunk");
+        assert!(!ingest.is_finished());
+        gate.add_permits(1000);
+        let ingested = ingest.await.unwrap().unwrap();
+        assert_eq!(read.load(Ordering::SeqCst), chunks);
+        let all: Vec<u8> = pieces.iter().flat_map(|p| p.iter().copied()).collect();
+        assert_eq!(layer.read(&ingested.extents, None).await.unwrap(), Bytes::from(all), "in the body's order");
     }
 
     /// Object larger than the ingest budget must still complete (budget covers
