@@ -182,7 +182,8 @@ async fn read_all(s3: &S3Gateway) -> BTreeMap<String, Vec<u8>> {
     live
 }
 
-async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) {
+/// The node reopened from the log at the end, faults stopped.
+async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) -> Node {
     let (log, snaps) = (Arc::new(MemoryBlobStore::new()), Arc::new(MemoryBlobStore::new()));
     let node = open_node(&log, &snaps, &members, None).await;
     node.s3.create_bucket(req(CreateBucketInput { bucket: BUCKET.into(), ..Default::default() })).await.unwrap();
@@ -246,6 +247,7 @@ async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) {
     drop(node);
     let again = open_node(&log, &snaps, &members, None).await;
     assert_eq!(read_all(&again.s3).await, live, "replay lost or changed objects");
+    again
 }
 
 fn member(id: &str, plan: FaultPlan) -> Arc<Faulty<MemoryBlobStore>> {
@@ -258,12 +260,36 @@ async fn s3_under_store_faults_keeps_objects_whole_and_reclaims_garbage() {
 }
 
 /// One member also returns damaged copies of a third of its blobs: reads
-/// must notice (the block checksums) and read the other member.
+/// must notice (the block checksums) and read the other member. Which copy
+/// a read tries first is the selector's coin, so at the end one object has
+/// its copy on `a` damaged on purpose: read from `a` alone it is refused,
+/// never served, and a GET reads around it.
 #[tokio::test]
 async fn a_damaged_replica_is_read_around() {
     let damaged = FaultPlan { corrupt: 0.3, ..FaultPlan::mild() };
     let members = vec![member("a", damaged), member("b", FaultPlan::none())];
-    run(members.clone()).await;
+    let node = run(members.clone()).await;
+
+    // Written with faults stopped: on both members.
+    let body = payload(u64::MAX - 1, 40_000);
+    let input = PutObjectInput {
+        bucket: BUCKET.into(),
+        key: "damaged".into(),
+        body: Some(StreamingBlob::from_bytes(body.clone())),
+        ..Default::default()
+    };
+    node.s3.put_object(req(input)).await.unwrap();
+    let extents = node.s3.index.get_extents(BUCKET, "damaged").await.unwrap().unwrap();
+    for ext in &extents {
+        let layouts = node.store.db().get_replica_layouts(ext.chunk).await.unwrap();
+        let on_a = layouts.iter().find(|l| l.instance == "a").expect("a copy on a");
+        for part in &on_a.parts {
+            members[0].damage(&pigeonhole_blob::load_id::<MemoryBlobStore>(&part.locator).unwrap());
+        }
+        let alone = node.store.read_from_replicas(ext.chunk, 0, ext.len as usize, std::slice::from_ref(on_a)).await;
+        assert!(alone.is_err(), "chunk {}: a damaged copy was served", ext.chunk);
+    }
+    assert_eq!(get(&node.s3, "damaged").await.unwrap().as_deref(), Some(&body[..]), "not read around the damage");
     let served = members[0].faults().iter().filter(|(_, f)| matches!(f, Fault::Corrupt)).count();
     assert!(served > 0, "no damaged copy was ever read");
 }
