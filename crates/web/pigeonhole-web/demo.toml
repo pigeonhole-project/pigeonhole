@@ -1,0 +1,62 @@
+# pigeonhole.toml of the site's demo. It is read by pigeonhole-config, as a
+# server reads its file; the only difference is `fake`: the Telegram and
+# Discord stores run on fake channels in this tab instead of the services.
+
+# Two channels hold the chunks, every chunk in both.
+[[store]]
+id = "telegram"
+kind = "telegram"
+chat_id = -1001000000001
+fake = "memory"
+
+[[store]]
+id = "discord"
+kind = "discord"
+channel_id = 1000000000000000001
+fake = "memory"
+
+[[replicas]]
+id = "channels"
+members = ["telegram", "discord"]
+write_quorum = 2
+
+# The metadata log and its snapshots: two more channels.
+[[store]]
+id = "tg-log"
+kind = "telegram"
+chat_id = -1001000000002
+fake = "memory"
+
+[[store]]
+id = "tg-snapshots"
+kind = "telegram"
+chat_id = -1001000000003
+fake = "memory"
+
+[meta]
+log = "tg-log"
+snapshot = "tg-snapshots"
+snapshot_every_entries = 50
+
+[chunk]
+store = "channels"
+size = "4 MiB"          # 19 MiB on a server; small here, so a small file makes several chunks
+block_size = "1 MiB"
+codec = "zstd"          # raw | gzip | zstd
+
+# Objects up to this size live in the metadata log itself: no post at all.
+[inline]
+max_object_size = "1 KiB"
+
+[cache]
+enabled = false         # on: reads served from memory stop going to the channels
+
+# Telegram lets a bot post about 20 messages a minute in a channel, Discord
+# about 5 per 5 s. The demo is less patient; lower these to watch the limiter.
+[telegram.send]
+rate_per_sec = 20.0
+burst = 20.0
+
+[discord.send]
+rate_per_sec = 20.0
+burst = 20.0

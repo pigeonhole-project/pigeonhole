@@ -1,10 +1,11 @@
-//! Smoke run: the demo's stack, a few S3 calls, every event as a JSON line.
+//! Smoke run: the demo's config and stack, a few S3 calls, a restart on
+//! another config; every event as a JSON line on stdout.
 //!
-//!     cargo build --release --target wasm32-wasip1 -p pigeonhole-web
-//!     node crates/web/run-wasi.mjs target/wasm32-wasip1/release/pigeonhole-web.wasm
+//!     make web-smoke     # under Node's WASI
+//!     cargo run -p pigeonhole-web
 
 use bytes::Bytes;
-use pigeonhole_web::{Node, Options};
+use pigeonhole_web::{parse_config, Node, World, DEMO_CONFIG};
 
 fn noise(len: usize) -> Bytes {
     // xorshift: random-looking bytes without a dependency.
@@ -24,25 +25,47 @@ fn main() -> anyhow::Result<()> {
         .json()
         .with_current_span(true)
         .with_span_list(true)
-        .with_env_filter("warn,pigeonhole_meta=debug,pigeonhole_storage_memory=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info")
+        .with_env_filter(
+            "warn,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
+             pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug",
+        )
         .with_writer(std::io::stdout)
         .init();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
         let t0 = std::time::Instant::now();
-        let node = Node::open(&Options::default()).await?;
+        let world = World::default();
+        let node = Node::open(&world, &parse_config(DEMO_CONFIG)?).await?;
         node.create_bucket("demo").await?;
         let photo = noise(7 << 20);
         node.put("demo", "photo.jpg", photo.clone()).await?;
         let text = Bytes::from("pigeonhole keeps its bytes in chat messages. ".repeat(70_000));
         node.put("demo", "notes.md", text.clone()).await?;
+        // Inline (in the log), a text message in both channels, Telegram text only.
+        let tiny = Bytes::from_static(b"tiny");
+        let small = noise(3000);
+        let medium = noise(6000);
+        node.put("demo", "tiny.txt", tiny.clone()).await?;
+        node.put("demo", "small.bin", small.clone()).await?;
+        node.put("demo", "medium.bin", medium.clone()).await?;
         let part = node.get("demo", "photo.jpg", Some((5_000_000, 5_100_000))).await?;
         anyhow::ensure!(part == photo.slice(5_000_000..=5_100_000), "range read differs");
         anyhow::ensure!(node.get("demo", "notes.md", None).await? == text, "text read differs");
         node.copy("demo", "photo.jpg", "photo-copy.jpg").await?;
         node.delete("demo", "photo.jpg").await?;
-        anyhow::ensure!(node.get("demo", "photo-copy.jpg", None).await? == photo, "copy differs");
-        eprintln!("smoke ok in {:?}", t0.elapsed());
+
+        // A restart on another config: the log is replayed, the objects stay.
+        node.close().await?;
+        let cfg =
+            DEMO_CONFIG.replace("codec = \"zstd\"", "codec = \"gzip\"").replace("size = \"4 MiB\"", "size = \"2 MiB\"");
+        let node = Node::open(&world, &parse_config(&cfg)?).await?;
+        anyhow::ensure!(node.replayed() > 0, "nothing replayed");
+        anyhow::ensure!(node.get("demo", "photo-copy.jpg", None).await? == photo, "copy differs after restart");
+        for (key, want) in [("tiny.txt", &tiny), ("small.bin", &small), ("medium.bin", &medium)] {
+            anyhow::ensure!(node.get("demo", key, None).await? == *want, "{key} differs after restart");
+        }
+        node.put("demo", "after.bin", noise(5 << 20)).await?;
+        eprintln!("smoke ok in {:?}, {} entries replayed", t0.elapsed(), node.replayed());
         Ok(())
     })
 }

@@ -4,7 +4,7 @@
 //! `len` bytes of body; the answer is one JSON line on stdout, after the log
 //! events the call produced (JSON lines too, the server's format).
 
-use crate::{Node, Options};
+use crate::{parse_config, Node, World, DEMO_CONFIG};
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -15,7 +15,9 @@ use std::rc::Rc;
 thread_local! {
     static RT: tokio::runtime::Runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    static WORLD: Rc<World> = Rc::new(World::default());
     static NODE: RefCell<Option<Rc<Node>>> = const { RefCell::new(None) };
+    static CONFIG: RefCell<String> = RefCell::new(DEMO_CONFIG.to_string());
 }
 
 #[derive(Deserialize)]
@@ -29,6 +31,9 @@ struct Request {
     to: String,
     #[serde(default)]
     range: Option<(u64, u64)>,
+    /// `pigeonhole.toml` for `open` / `restart`.
+    #[serde(default)]
+    config: Option<String>,
     #[serde(default)]
     len: usize,
 }
@@ -43,48 +48,7 @@ fn answer(v: &Value) {
     let _ = out.flush();
 }
 
-/// Boots the node: tracing to stdout, the tablet, the stores, bucket `demo`.
-#[allow(unsafe_code)] // `no_mangle` only: exported to JS, no unsafe code.
-#[no_mangle]
-pub extern "C" fn ph_open() -> i32 {
-    tracing_subscriber::fmt()
-        .json()
-        .with_current_span(true)
-        .with_span_list(true)
-        .with_env_filter(
-            "warn,pigeonhole_meta=debug,pigeonhole_storage_memory=debug,pigeonhole_blob=debug,\
-             pigeonhole_gateway_s3=info,pigeonhole_chunk_store=debug",
-        )
-        .with_writer(std::io::stdout)
-        .init();
-    let opened = RT.with(|rt| {
-        rt.block_on(async {
-            let node = Node::open(&Options::default()).await?;
-            node.create_bucket("demo").await?;
-            anyhow::Ok(node)
-        })
-    });
-    match opened {
-        Ok(node) => {
-            NODE.with(|n| *n.borrow_mut() = Some(Rc::new(node)));
-            answer(&json!({ "ok": true }));
-            0
-        }
-        Err(e) => {
-            answer(&json!({ "error": format!("{e:#}") }));
-            1
-        }
-    }
-}
-
-/// Runs one request read from stdin.
-#[allow(unsafe_code)] // `no_mangle` only: exported to JS, no unsafe code.
-#[no_mangle]
-pub extern "C" fn ph_call() -> i32 {
-    let result = read_request().and_then(|(r, body)| {
-        let node = NODE.with(|n| n.borrow().clone()).ok_or_else(|| anyhow::anyhow!("ph_open first"))?;
-        RT.with(|rt| rt.block_on(run(&node, r, body)))
-    });
+fn reply(result: anyhow::Result<Value>) -> i32 {
     match result {
         Ok(v) => {
             answer(&v);
@@ -97,6 +61,30 @@ pub extern "C" fn ph_call() -> i32 {
     }
 }
 
+/// Sets up tracing to stdout; the node starts with the first `open` call.
+#[allow(unsafe_code)] // `no_mangle` only: exported to JS, no unsafe code.
+#[no_mangle]
+pub extern "C" fn ph_open() -> i32 {
+    tracing_subscriber::fmt()
+        .json()
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_env_filter(
+            "warn,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
+             pigeonhole_chunk_store=debug,pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug",
+        )
+        .with_writer(std::io::stdout)
+        .init();
+    reply(Ok(json!({ "config": DEMO_CONFIG })))
+}
+
+/// Runs one request read from stdin.
+#[allow(unsafe_code)] // `no_mangle` only: exported to JS, no unsafe code.
+#[no_mangle]
+pub extern "C" fn ph_call() -> i32 {
+    reply(read_request().and_then(|(r, body)| RT.with(|rt| rt.block_on(run(r, body)))))
+}
+
 fn read_request() -> anyhow::Result<(Request, Bytes)> {
     let mut stdin = std::io::stdin().lock();
     let mut line = String::new();
@@ -107,7 +95,48 @@ fn read_request() -> anyhow::Result<(Request, Bytes)> {
     Ok((req, Bytes::from(body)))
 }
 
-async fn run(node: &Node, r: Request, body: Bytes) -> anyhow::Result<Value> {
+/// (Re)starts the node on `text`; the old one keeps running if this fails.
+async fn start(text: String) -> anyhow::Result<Value> {
+    let cfg = parse_config(&text)?;
+    let world = WORLD.with(Rc::clone);
+    let old = NODE.with(|n| n.borrow_mut().take());
+    if let Some(old) = &old {
+        old.close().await?;
+    }
+    let node = match Node::open(&world, &cfg).await {
+        Ok(node) => node,
+        Err(e) => {
+            // Back on the config that ran: its tablet claims the log again.
+            if old.is_some() {
+                let previous = CONFIG.with(|c| c.borrow().clone());
+                let node = Node::open(&world, &parse_config(&previous)?).await?;
+                NODE.with(|n| *n.borrow_mut() = Some(Rc::new(node)));
+            }
+            return Err(e);
+        }
+    };
+    let replayed = node.replayed();
+    if node.list("demo").await.is_err() {
+        node.create_bucket("demo").await?;
+    }
+    NODE.with(|n| *n.borrow_mut() = Some(Rc::new(node)));
+    CONFIG.with(|c| *c.borrow_mut() = text);
+    // Which channel pane each store is drawn in.
+    let stores: Vec<Value> =
+        cfg.instances.iter().map(|i| json!({ "id": i.info.id, "kind": i.kind.as_str() })).collect();
+    Ok(json!({ "replayed": replayed, "restarted": old.is_some(), "stores": stores }))
+}
+
+async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
+    match r.op.as_str() {
+        "open" | "restart" => {
+            let text = r.config.unwrap_or_else(|| CONFIG.with(|c| c.borrow().clone()));
+            return start(text).await;
+        }
+        "config" => return Ok(json!({ "config": CONFIG.with(|c| c.borrow().clone()) })),
+        _ => {}
+    }
+    let node = NODE.with(|n| n.borrow().clone()).ok_or_else(|| anyhow::anyhow!("no node: open first"))?;
     Ok(match r.op.as_str() {
         "put" => {
             node.put(&r.bucket, &r.key, body).await?;
