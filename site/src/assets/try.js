@@ -6,7 +6,7 @@
   const stage = makeStage(root);
   const status = document.getElementById("status");
   const rows = document.getElementById("obj-rows");
-  const buttons = [...document.querySelectorAll(".toolbar button, .toolbar input")];
+  const buttons = [...document.querySelectorAll(".toolbar button, .toolbar input, .config-actions button")];
   const worker = new Worker(window.ASSETS + "web-worker.js");
   const waiting = new Map();
   let nextId = 1, busy = Promise.resolve(), t0 = performance.now();
@@ -19,12 +19,46 @@
     waiting.delete(data.id);
     if (done) done(data);
   };
-  waiting.set(0, data => {
+  // The module is up (ph_open): show its config, then boot the node on it.
+  const editor = document.getElementById("config-text");
+  const configError = document.getElementById("config-error");
+  let demoConfig = "";
+  waiting.set(0, async data => {
     if (data.reply?.error) { status.textContent = t("try.error", {error: data.reply.error}); return; }
+    demoConfig = data.reply.config;
+    editor.value = demoConfig;
+    const booted = await call({op: "open"});
+    if (booted.reply?.error) { status.textContent = t("try.error", {error: booted.reply.error}); return; }
+    stage.setStores(booted.reply.stores);
     status.textContent = t("try.ready", {ms: Math.round(performance.now() - t0)});
-    stage.termLine("out", t("try.booted"), `${Math.round(data.ms)} ms`);
-    showSteps(toSteps(data.events), true);
+    stage.termLine("out", t("try.booted"), `${Math.round(booted.ms)} ms`);
+    await showSteps(toSteps(booted.events), true);
+    await refresh();
     setBusy(false);
+  });
+
+  // A new pigeonhole.toml is a restart: the tablet replays its log.
+  async function restart() {
+    configError.textContent = "";
+    setBusy(true);
+    stage.termLine("cmd", t("try.restart_cmd"), null);
+    const data = await call({op: "restart", config: editor.value});
+    if (data.reply?.error) {
+      configError.textContent = data.reply.error;
+      stage.termLine("out err", t("try.config_refused"), `${Math.round(data.ms)} ms`);
+    } else {
+      stage.setStores(data.reply.stores);
+      await showSteps(toSteps(data.events), true);
+      stage.termLine("out", t("try.out.restart", {n: data.reply.replayed}), `${Math.round(data.ms)} ms`);
+      stage.narrate(t("say.restart", {n: data.reply.replayed}));
+      await refresh();
+    }
+    setBusy(false);
+  }
+  document.getElementById("config-apply").addEventListener("click", restart);
+  document.getElementById("config-reset").addEventListener("click", () => { editor.value = demoConfig; configError.textContent = ""; });
+  editor.addEventListener("keydown", ev => {
+    if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") { ev.preventDefault(); restart(); }
   });
 
   // One call at a time: the module is single-threaded.
@@ -40,10 +74,7 @@
 
   const fast = ms => new Promise(r => setTimeout(r, ms / 2));
   async function showSteps(steps, quiet) {
-    for (const e of steps) {
-      if (e.type === "blob" && e.op === "delete") { stage.strike(e.store, e.msg); continue; }
-      await stage.draw(e, quiet ? () => Promise.resolve() : fast);
-    }
+    for (const e of steps) await stage.draw(e, quiet ? () => Promise.resolve() : fast);
   }
 
   async function op(label, request, body) {

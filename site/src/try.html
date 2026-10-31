@@ -60,6 +60,19 @@
     </div>
   </div>
   <p class="stage-note">{{try.note}}</p>
+
+  <div class="card config" id="config">
+    <div class="config-h">
+      <h3><code>pigeonhole.toml</code></h3>
+      <p class="note">{{try.config_note}}</p>
+    </div>
+    <textarea id="config-text" spellcheck="false" autocomplete="off" aria-label="pigeonhole.toml"></textarea>
+    <div class="config-actions">
+      <button class="btn primary" type="button" id="config-apply">{{try.apply}}</button>
+      <button class="btn" type="button" id="config-reset">{{try.reset}}</button>
+      <span class="config-error" id="config-error" role="alert"></span>
+    </div>
+  </div>
 </section>
 
 <footer>
