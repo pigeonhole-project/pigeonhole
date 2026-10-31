@@ -139,17 +139,22 @@ impl FileStore {
         }
         let backing = match fake.as_str() {
             "memory" => FakeBacking::Memory,
-            other => bail!("[[store]] {id}: fake = {other:?}: only \"memory\" for now"),
+            store => FakeBacking::Store(store.to_string()),
         };
         Ok(Some(Store::Fake { kind, scope, backing }))
     }
 }
 
-/// Where a fake channel keeps its messages.
+/// Where a fake channel keeps its messages (its tablet: log, snapshots,
+/// documents).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FakeBacking {
     /// Process memory: gone with the process.
     Memory,
+    /// A directory of its own (`<store path>/<kind>-<scope>`): kept.
+    Dir(PathBuf),
+    /// `fake = "<store id>"` before the stores are resolved; never in a Config.
+    Store(String),
 }
 
 /// The env vars of a store's bots: `default` if unset, never none.
@@ -319,7 +324,35 @@ impl Topology {
             check_members("[[shards]]", &id, &g.members)?;
             sharded.insert(id, g);
         }
-        Ok(Self { stores: by_id, replicas: groups, shards: sharded, used: HashMap::new(), used_groups: HashSet::new() })
+        let mut topology = Self {
+            stores: by_id,
+            replicas: groups,
+            shards: sharded,
+            used: HashMap::new(),
+            used_groups: HashSet::new(),
+        };
+        topology.resolve_fakes()?;
+        Ok(topology)
+    }
+
+    /// `fake = "<store id>"`: the channel's own directory in that local_disk
+    /// store (or memory, for a memory store), which then serves fake channels only.
+    fn resolve_fakes(&mut self) -> Result<()> {
+        let mut ids: Vec<String> = self.stores.keys().cloned().collect();
+        ids.sort();
+        for id in ids {
+            let Some(Store::Fake { kind, scope, backing: FakeBacking::Store(under) }) = self.stores.get(&id).cloned()
+            else {
+                continue;
+            };
+            let backing = match self.take(&under, "fake channels").with_context(|| format!("[[store]] {id}: fake"))? {
+                Store::LocalDisk { path } => FakeBacking::Dir(path.join(format!("{}-{scope}", kind.as_str()))),
+                Store::Memory => FakeBacking::Memory,
+                _ => bail!("[[store]] {id}: fake = {under:?}: a local_disk or memory store keeps a fake channel"),
+            };
+            self.stores.insert(id, Store::Fake { kind, scope, backing });
+        }
+        Ok(())
     }
 
     /// Take store `id` for `purpose` (see [`Store::may_share`]).

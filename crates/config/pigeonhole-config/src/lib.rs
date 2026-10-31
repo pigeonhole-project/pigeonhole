@@ -1488,6 +1488,29 @@ fake = "memory"
 
     #[cfg(feature = "fake")]
     #[test]
+    fn fake_channels_live_in_a_local_disk_store_each_in_its_directory() {
+        let text = FAKE_CHANNELS.replace("fake = \"memory\"", "fake = \"channels\"")
+            + "[[store]]\nid = \"channels\"\nkind = \"local_disk\"\npath = \"demo-data\"\n";
+        let cfg = Config::from_toml(&text, Path::new("demo.toml")).unwrap();
+        let tg = cfg.instances.iter().find(|i| i.info.id == "tg").unwrap();
+        assert_eq!(tg.fake, Some(stores::FakeBacking::Dir("demo-data/telegram--1001".into())));
+        let dc = cfg.instances.iter().find(|i| i.info.id == "dc").unwrap();
+        assert_eq!(dc.fake, Some(stores::FakeBacking::Dir("demo-data/discord-77".into())));
+        assert!(
+            matches!(&cfg.meta.log, LogSettings::Fake { backing: stores::FakeBacking::Dir(d), .. } if d.ends_with("telegram--1002"))
+        );
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn a_store_under_fake_channels_serves_nothing_else() {
+        let text = FAKE_CHANNELS.replacen("fake = \"memory\"", "fake = \"dc\"", 1);
+        let err = format!("{:#}", Config::from_toml(&text, Path::new("demo.toml")).unwrap_err());
+        assert!(err.contains("used for both") || err.contains("a local_disk or memory store"), "{err}");
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
     fn a_fake_channel_has_no_bots() {
         let text = FAKE_CHANNELS.replacen("fake = \"memory\"", "fake = \"memory\"\nbot_token_envs = [\"X\"]", 1);
         let err = format!("{:#}", Config::from_toml(&text, Path::new("demo.toml")).unwrap_err());
