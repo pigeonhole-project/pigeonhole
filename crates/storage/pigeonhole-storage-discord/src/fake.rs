@@ -186,7 +186,12 @@ impl DiscordApi for FakeDiscord {
         if nonce.len() > 25 {
             bail!("50035: nonce must be 25 or fewer characters long");
         }
+        let text_only = file.is_none();
         let (answer, delay) = self.post(content, file, nonce)?;
+        if text_only {
+            let preview: String = content.lines().nth(1).unwrap_or(content).chars().take(24).collect();
+            tracing::debug!(message_id = answer.id, chars = content.chars().count(), %preview, "fake channel: text");
+        }
         if let Some(after) = delay {
             tokio::time::sleep(after).await;
         }

@@ -221,6 +221,7 @@ impl ChannelApi for FakeChannel {
         let id = g.top;
         g.messages.insert(id, Stored::Text(text.to_string()));
         g.by_random_id.insert(random_id, id);
+        tracing::debug!(message_id = id, chars = text.chars().count(), preview = %preview(text), "fake channel: text");
         if g.hide_next.as_ref().is_some_and(|(prefix, _)| text.starts_with(prefix.as_str())) {
             let (_, reads) = g.hide_next.take().unwrap();
             g.hidden.insert(id, reads);
@@ -264,4 +265,10 @@ impl ChannelApi for FakeChannel {
         }
         Ok(())
     }
+}
+
+/// The start of a text message's payload (after the `name len` line), for
+/// the demo's view of the channel.
+fn preview(text: &str) -> String {
+    text.lines().nth(1).unwrap_or(text).chars().take(24).collect()
 }
