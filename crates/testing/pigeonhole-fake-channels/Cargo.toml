@@ -1,0 +1,31 @@
+[package]
+name = "pigeonhole-fake-channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fake Telegram and Discord channels kept by a metadata tablet: a log and snapshots on a store"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-meta = { workspace = true }
+pigeonhole-storage-api = { workspace = true, features = ["fake"] }
+pigeonhole-storage-discord = { workspace = true, features = ["fake"] }
+pigeonhole-storage-disk = { workspace = true }
+pigeonhole-storage-memory = { workspace = true }
+pigeonhole-storage-telegram = { workspace = true, features = ["fake"] }
+pigeonhole-types = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pigeonhole-limits = { workspace = true }
+pigeonhole-testkit = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

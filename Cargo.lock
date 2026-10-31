@@ -2650,6 +2650,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "pigeonhole-fake-channels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "madsim-tokio",
+ "pigeonhole-blob",
+ "pigeonhole-limits",
+ "pigeonhole-meta",
+ "pigeonhole-storage-api",
+ "pigeonhole-storage-discord",
+ "pigeonhole-storage-disk",
+ "pigeonhole-storage-memory",
+ "pigeonhole-storage-telegram",
+ "pigeonhole-testkit",
+ "pigeonhole-types",
+ "postcard",
+ "serde",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "pigeonhole-gateway-bytestream"
 version = "0.1.0"
 dependencies = [

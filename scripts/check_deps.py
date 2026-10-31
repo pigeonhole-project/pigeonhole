@@ -36,6 +36,8 @@ ROLE = {
     "pigeonhole-web": "bin",
     "pigeonhole-testkit": "testkit",
     "pigeonhole-sim": "testkit",
+    # Fake channels kept by a tablet: the demo and the fake-channel build.
+    "pigeonhole-fake-channels": "testkit",
 }
 
 FORBIDDEN_SOFT = {
@@ -47,7 +49,7 @@ CHUNK_STORE_FORBIDDEN_CRATES = {"s3s", "tonic", "axum"}
 
 # The stores' in-memory channels (feature `fake`) never get into a default
 # build: only these packages turn the feature on outside dev-dependencies.
-FAKE_ALLOWED = {"pigeonhole-web"}
+FAKE_ALLOWED = {"pigeonhole-web", "pigeonhole-fake-channels"}
 
 
 def fake_errors(pkg: dict) -> list[str]:
