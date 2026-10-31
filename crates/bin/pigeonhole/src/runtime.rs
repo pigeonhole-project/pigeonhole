@@ -137,8 +137,8 @@ async fn discord_channel(
     bot_tokens: &[String],
     channel_id: &str,
     chain: bool,
-) -> anyhow::Result<(pigeonhole_storage_discord::PooledDiscord, String)> {
-    use pigeonhole_storage_discord::{DiscordClient, PooledDiscord};
+) -> anyhow::Result<(pigeonhole_discord_http::PooledDiscord, String)> {
+    use pigeonhole_discord_http::{DiscordClient, PooledDiscord};
     let id: u64 = channel_id.parse().with_context(|| format!("channel id {channel_id:?}"))?;
     let mut members = Vec::new();
     for token in bot_tokens {
@@ -160,9 +160,7 @@ async fn meta_discord<T: ?Sized>(
     bot_tokens: &[String],
     max_blob_size: Option<usize>,
     purpose: &str,
-    wrap: impl FnOnce(
-        Arc<pigeonhole_storage_discord::DiscordBlobStore<pigeonhole_storage_discord::PooledDiscord>>,
-    ) -> Arc<T>,
+    wrap: impl FnOnce(Arc<pigeonhole_storage_discord::DiscordBlobStore<pigeonhole_discord_http::PooledDiscord>>) -> Arc<T>,
 ) -> anyhow::Result<Arc<T>> {
     use pigeonhole_storage_discord::{discord_fingerprint, discord_location, DiscordBlobStore};
     let (channel, app_id) =

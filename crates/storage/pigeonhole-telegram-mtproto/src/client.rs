@@ -9,8 +9,6 @@
 //! Every call we make is idempotent (a send carries its `random_id`), so all
 //! of them may be retried. Only the login runs outside it.
 
-use crate::channel::{ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, WINDOW};
-use crate::limits::{DELETE, READ, SEND};
 use crate::session::FileSession;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -20,6 +18,10 @@ use grammers_mtsender::{ConnectionParams, InvocationError, NoRetries, SenderPool
 use grammers_tl_types::{self as tl, enums, functions, types};
 use pigeonhole_limits::{Call, ChatLimiter, Failed, Level, Retry, Spend, Verdict};
 use pigeonhole_storage_api::{RateLimited, Unavailable};
+use pigeonhole_storage_telegram::limits::{DELETE, READ, SEND};
+use pigeonhole_storage_telegram::{
+    ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, WINDOW,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -821,7 +823,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn flood_waits_are_waited_out_until_the_budget_runs_out() {
         let tries = std::sync::atomic::AtomicU32::new(0);
-        let limiter = ChatLimiter::new(crate::limits());
+        let limiter = ChatLimiter::new(pigeonhole_storage_telegram::limits());
         let t0 = tokio::time::Instant::now();
         let call = <functions::messages::SendMessage as Budgeted>::CALL;
         let v = metered(&call, Some(&limiter), &RETRY, || {
@@ -871,7 +873,7 @@ mod abandoned_send_live {
             session: root.join(".cache/tgm-live.session"),
         };
         let tg = TelegramMtproto::connect(&cfg).await.unwrap();
-        let limiter = Arc::new(ChatLimiter::new(crate::limits()));
+        let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()));
         let ch = tg.channel(env("TG_BLOBS_CHAT_ID").parse().unwrap(), Lane::Blobs, limiter).await.unwrap();
 
         let probe_name = format!("abandoned-{}.bin", random_i64().unsigned_abs());

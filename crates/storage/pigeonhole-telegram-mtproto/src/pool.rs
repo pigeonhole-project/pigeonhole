@@ -12,15 +12,15 @@
 //! [`ChannelApi::read_via`] picks the holder ready soonest, or has a freer
 //! bot read the message and get its own.
 
-use crate::channel::{ChannelApi, ChannelMessage, FileLocation, ReadVia, Sent};
 use crate::client::CALL_DEADLINE;
-use crate::limits::{DELETE, READ, SEND};
 use crate::MtprotoChannel;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_limits::{ChatLimiter, Pool, Spend};
 use pigeonhole_storage_api::RateLimited;
+use pigeonhole_storage_telegram::limits::{DELETE, READ, SEND};
+use pigeonhole_storage_telegram::{ChannelApi, ChannelMessage, FileLocation, ReadVia, Sent};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,8 +144,8 @@ impl<C: ChannelApi> ChannelApi for PooledChannel<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake::FakeChannel;
     use pigeonhole_limits::{Level, LimiterRegistry, Rate};
+    use pigeonhole_storage_telegram::fake::FakeChannel;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// One bot's view of a shared channel: its first `floods` sends answer
@@ -197,7 +197,7 @@ mod tests {
         /// `FILE_REFERENCE_EXPIRED`).
         async fn get_file(&self, file: &FileLocation, offset: u64, limit: u64) -> Result<Bytes> {
             if file.bot != self.index {
-                return Err(crate::FileReferenceExpired.into());
+                return Err(pigeonhole_storage_telegram::FileReferenceExpired.into());
             }
             self.limiter.acquire(Spend::Bot).await;
             self.channel.get_file(file, offset, limit).await
@@ -208,7 +208,7 @@ mod tests {
     }
 
     fn pool_of(floods: [u32; 2]) -> (PooledChannel<Arc<Bot>>, [Arc<Bot>; 2]) {
-        let reg = LimiterRegistry::new(crate::limits().with(SEND, Rate::new(100.0, 10.0)));
+        let reg = LimiterRegistry::new(pigeonhole_storage_telegram::limits().with(SEND, Rate::new(100.0, 10.0)));
         let channel = Arc::new(FakeChannel::new(7));
         let bot = |index: usize, floods: u32| {
             Arc::new(Bot {
@@ -248,32 +248,30 @@ mod tests {
         assert_eq!(a.sends.load(Ordering::SeqCst) + b.sends.load(Ordering::SeqCst), 1);
     }
 
-    fn store_on(pooled: PooledChannel<Arc<Bot>>) -> crate::TelegramBlobStore<PooledChannel<Arc<Bot>>> {
+    fn store_on(
+        pooled: PooledChannel<Arc<Bot>>,
+    ) -> pigeonhole_storage_telegram::TelegramBlobStore<PooledChannel<Arc<Bot>>> {
         let info = pigeonhole_storage_api::InstanceInfo {
             id: "tg".into(),
-            kind: crate::KIND,
+            kind: pigeonhole_storage_telegram::KIND,
             fingerprint: "tg:1:7".into(),
             location: "tg:chat:7".into(),
             role: pigeonhole_storage_api::InstanceRole::ReadWrite,
         };
         let limiter = pooled.limiter().clone();
-        crate::TelegramBlobStore::new(Arc::new(pooled), limiter, info).with_inline(false)
+        pigeonhole_storage_telegram::TelegramBlobStore::new(Arc::new(pooled), limiter, info).with_inline(false)
     }
 
-    async fn get(store: &crate::TelegramBlobStore<PooledChannel<Arc<Bot>>>, id: &crate::TelegramId) -> Bytes {
+    async fn get(
+        store: &pigeonhole_storage_telegram::TelegramBlobStore<PooledChannel<Arc<Bot>>>,
+        id: &pigeonhole_storage_telegram::TelegramId,
+    ) -> Bytes {
         use pigeonhole_storage_api::BlobBackend;
         pigeonhole_storage_api::collect_stream(store.get(id, None).await.unwrap()).await.unwrap()
     }
 
-    fn holders(store: &crate::TelegramBlobStore<PooledChannel<Arc<Bot>>>, id: i64) -> Vec<usize> {
-        match store.reader.locations.lock().unwrap().peek(&id) {
-            Some(crate::store::Located::Doc { files, .. }) => {
-                let mut bots: Vec<usize> = files.iter().map(|f| f.bot).collect();
-                bots.sort();
-                bots
-            }
-            _ => Vec::new(),
-        }
+    fn holders(store: &pigeonhole_storage_telegram::TelegramBlobStore<PooledChannel<Arc<Bot>>>, id: i64) -> Vec<usize> {
+        store.document_holders(id)
     }
 
     #[tokio::test(start_paused = true)]

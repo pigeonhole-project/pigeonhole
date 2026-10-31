@@ -6,13 +6,14 @@
 
 use bytes::Bytes;
 use futures::TryStreamExt;
+use pigeonhole_discord_http::{DiscordChannel, DiscordClient};
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_meta::{
     Base, BlobSnapshotStore, ChainLogStore, Entry, LogError, LogId, LogStore, SnapshotRef, SnapshotStore,
     StoredSnapshot,
 };
 use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
-use pigeonhole_storage_discord::{DiscordApi, DiscordBlobStore, DiscordChannel, DiscordClient, PAGE};
+use pigeonhole_storage_discord::{DiscordApi, DiscordBlobStore, PAGE};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;

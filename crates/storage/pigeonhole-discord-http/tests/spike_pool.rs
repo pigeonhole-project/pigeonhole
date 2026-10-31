@@ -4,7 +4,8 @@
 //! with `DISCORD_BOT_TOKEN`, `DISCORD_BOT_TOKEN_2` in `.env`. Deletes what
 //! it posted.
 
-use pigeonhole_storage_discord::{DiscordApi, DiscordClient, PooledDiscord};
+use pigeonhole_discord_http::{DiscordClient, PooledDiscord};
+use pigeonhole_storage_discord::DiscordApi;
 use std::path::Path;
 use std::time::Instant;
 

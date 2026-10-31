@@ -9,7 +9,8 @@
 
 use bytes::Bytes;
 use pigeonhole_limits::{ChatLimiter, ChatLimiterConfig, Rate};
-use pigeonhole_storage_telegram::{ChannelApi, ChannelMessage, Lane, MtprotoChannel, MtprotoConfig, TelegramMtproto};
+use pigeonhole_storage_telegram::{ChannelApi, ChannelMessage};
+use pigeonhole_telegram_mtproto::{Lane, MtprotoChannel, MtprotoConfig, TelegramMtproto};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -175,7 +176,7 @@ async fn handles_across_bots() {
 #[tokio::test]
 #[ignore = "needs two Telegram bots, admins of a test channel"]
 async fn a_pool_of_two_bots_sends_twice_as_fast() {
-    use pigeonhole_storage_telegram::PooledChannel;
+    use pigeonhole_telegram_mtproto::PooledChannel;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     dotenvy::from_path(root.join(".env")).ok();
     let _ = tracing_subscriber::fmt()
@@ -216,7 +217,8 @@ async fn a_pool_of_two_bots_sends_twice_as_fast() {
 #[ignore = "needs two Telegram bots, admins of a test channel"]
 async fn a_pooled_store_reads_with_each_bots_own_locations() {
     use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
-    use pigeonhole_storage_telegram::{PooledChannel, TelegramBlobStore};
+    use pigeonhole_storage_telegram::TelegramBlobStore;
+    use pigeonhole_telegram_mtproto::PooledChannel;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     dotenvy::from_path(root.join(".env")).ok();
     let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
@@ -268,7 +270,8 @@ async fn a_pooled_store_reads_with_each_bots_own_locations() {
 #[ignore = "needs two Telegram bots, admins of a test channel"]
 async fn ranged_reads_one_bot_against_two() {
     use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
-    use pigeonhole_storage_telegram::{PooledChannel, TelegramBlobStore};
+    use pigeonhole_storage_telegram::TelegramBlobStore;
+    use pigeonhole_telegram_mtproto::PooledChannel;
     use pigeonhole_types::ByteRange;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     dotenvy::from_path(root.join(".env")).ok();

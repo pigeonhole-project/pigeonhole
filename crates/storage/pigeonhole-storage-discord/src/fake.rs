@@ -47,7 +47,7 @@ impl Inner {
     /// A snowflake: the time now, above every id so far.
     fn next_id(&mut self) -> u64 {
         let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        self.top = (self.top + 1).max((ms - crate::client::DISCORD_EPOCH_MS) << 22);
+        self.top = (self.top + 1).max((ms - crate::snowflake::DISCORD_EPOCH_MS) << 22);
         self.top
     }
 }

@@ -8,14 +8,14 @@
 //! what another posted. CDN downloads are not API calls: the primary (the
 //! first bot) makes them.
 
-use crate::api::{DcMessage, DiscordApi, ThreadStart};
 use crate::client::DiscordChannel;
-use crate::limits::{DELETE, READ, SEND};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_limits::{ChatLimiter, Pool, Spend};
 use pigeonhole_storage_api::RateLimited;
+use pigeonhole_storage_discord::limits::{DELETE, READ, SEND};
+use pigeonhole_storage_discord::{DcMessage, DiscordApi, ThreadStart};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,8 +115,8 @@ impl<C: DiscordApi> DiscordApi for PooledDiscord<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake::FakeDiscord;
     use pigeonhole_limits::{Level, LimiterRegistry, Rate};
+    use pigeonhole_storage_discord::fake::FakeDiscord;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// One bot's view of a shared channel: its first `floods` sends answer
@@ -172,7 +172,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_429_moves_the_send_to_the_other_bot_and_reads_see_it() {
-        let reg = LimiterRegistry::new(crate::limits().with(SEND, Rate::new(100.0, 10.0)));
+        let reg = LimiterRegistry::new(pigeonhole_storage_discord::limits().with(SEND, Rate::new(100.0, 10.0)));
         let channel = Arc::new(FakeDiscord::new(7));
         let (a_sends, b_sends) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let bot = |name: &str, floods: u32, sends: &Arc<AtomicU32>| {

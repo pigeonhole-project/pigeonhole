@@ -1,13 +1,14 @@
 //! Discord over HTTP: [`DiscordClient`] (one bot) and [`DiscordChannel`]
 //! (one channel, a [`DiscordApi`]).
 
-use crate::api::{CdnStale, DcAttachment, DcMessage, DiscordApi, ThreadStart, PAGE};
-use crate::limits::{DELETE, READ, SEND};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_limits::{Call, ChatLimiter, Class, Failed, Level, Retry, Spend, Verdict};
 use pigeonhole_storage_api::{RateLimited, Unavailable};
+use pigeonhole_storage_discord::limits::{DELETE, READ, SEND};
+use pigeonhole_storage_discord::snowflake_bulk_deletable;
+use pigeonhole_storage_discord::{CdnStale, DcAttachment, DcMessage, DiscordApi, ThreadStart, PAGE};
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -16,12 +17,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
-/// Discord snowflake epoch (2015-01-01T00:00:00.000Z), milliseconds.
-pub const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
-/// Bulk-delete only accepts messages younger than 14 days (API error 50034).
-const BULK_DELETE_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
-/// Safety margin so we do not race the 14-day cutoff.
-const BULK_DELETE_AGE_SLACK: Duration = Duration::from_secs(60);
 /// `flags`: no link previews.
 const SUPPRESS_EMBEDS: u64 = 1 << 2;
 /// Attempts per request (network errors, 5xx and 429s); a 429's wait is
@@ -36,17 +31,6 @@ const RETRY: Retry = Retry {
 /// A member of a [`PooledDiscord`](crate::PooledDiscord): a 429 ends the
 /// call at once, so that the pool may move it to another bot.
 const RETRY_IN_POOL: Retry = Retry { give_way: true, ..RETRY };
-
-/// Milliseconds since Unix epoch encoded in a Discord snowflake.
-pub fn snowflake_timestamp_ms(id: u64) -> u64 {
-    (id >> 22) + DISCORD_EPOCH_MS
-}
-
-/// Whether Discord's bulk-delete endpoint will accept this message id by age.
-pub fn snowflake_bulk_deletable(id: u64, unix_now_ms: u64) -> bool {
-    let age_ms = unix_now_ms.saturating_sub(snowflake_timestamp_ms(id));
-    age_ms < BULK_DELETE_MAX_AGE.saturating_sub(BULK_DELETE_AGE_SLACK).as_millis() as u64
-}
 
 fn unix_now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
@@ -508,7 +492,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_read_429_cools_its_channel_and_the_bot_only_when_global() {
-        let reg = pigeonhole_limits::LimiterRegistry::new(crate::limits());
+        let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_storage_discord::limits());
         let call = GET_MESSAGE;
         let once = Retry { attempts: 1, ..RETRY };
         for global in [false, true] {
@@ -528,15 +512,6 @@ mod tests {
     fn app_id_from_token_prefix() {
         let dc = DiscordClient::new("1234567890.abc.def".into()).unwrap();
         assert_eq!(dc.app_id(), "1234567890");
-    }
-
-    #[test]
-    fn bulk_deletable_by_snowflake_age() {
-        let now_ms = DISCORD_EPOCH_MS + 30 * 24 * 60 * 60 * 1000;
-        let young_id = (now_ms - 2 * 24 * 60 * 60 * 1000 - DISCORD_EPOCH_MS) << 22;
-        let old_id = (now_ms - 20 * 24 * 60 * 60 * 1000 - DISCORD_EPOCH_MS) << 22;
-        assert!(snowflake_bulk_deletable(young_id, now_ms));
-        assert!(!snowflake_bulk_deletable(old_id, now_ms));
     }
 
     #[test]
