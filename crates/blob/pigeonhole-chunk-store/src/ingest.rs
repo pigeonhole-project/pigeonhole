@@ -1,7 +1,7 @@
 //! Ingest options shared by [`crate::ChunkStore`].
 //!
 //! Compressing policies (`zstd` / `gzip`) pack data as independent fixed-size
-//! blocks ([`pigeonhole_codec::BlockWriter`]) so each block is compressed once.
+//! blocks so each block is compressed once.
 
 use pigeonhole_codec::{self as chunker, ByteBudget, ChunkCodec};
 use std::sync::atomic::AtomicU64;

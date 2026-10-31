@@ -8,8 +8,6 @@ pub const MAX_CHUNK_SIZE: usize = 20 * 1024 * 1024 - 1;
 /// Default max **stored** (on-wire) chunk size.
 pub const DEFAULT_CHUNK_SIZE: usize = 19 * 1024 * 1024;
 const _: () = assert!(DEFAULT_CHUNK_SIZE <= MAX_CHUNK_SIZE);
-/// Probe window before committing to compression for a chunk.
-pub const COMPRESS_PROBE_BYTES: usize = 128 * 1024;
 /// Leave headroom under `chunk.size` so a final encode block fits.
 pub const COMPRESS_SIZE_MARGIN: usize = 256 * 1024;
 /// Cap uncompressed bytes buffered / decoded per chunk.
@@ -93,19 +91,6 @@ pub fn validate_chunk_size(n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Target compressed/raw fill size: stay under `chunk_size` with a safety margin.
-pub fn fill_target(chunk_size: usize) -> usize {
-    let capped = chunk_size.clamp(1024, MAX_CHUNK_SIZE);
-    let margin = COMPRESS_SIZE_MARGIN.min(capped / 8).max(256);
-    capped.saturating_sub(margin).max(1024).min(capped)
-}
-
-/// Max logical (uncompressed) bytes held for one chunk before a forced flush.
-pub fn max_logical_bytes(chunk_size: usize) -> usize {
-    let stored = chunk_size.clamp(1, MAX_CHUNK_SIZE);
-    MAX_LOGICAL_CHUNK.max(stored)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,12 +112,5 @@ mod tests {
         assert_eq!(ChunkCodec::parse("zstd").unwrap(), ChunkCodec::Zstd);
         assert_eq!(ChunkCodec::parse("none").unwrap(), ChunkCodec::Raw);
         assert!(ChunkCodec::parse("lz4").is_err());
-    }
-
-    #[test]
-    fn max_logical_defaults_to_256_mib() {
-        assert_eq!(max_logical_bytes(DEFAULT_CHUNK_SIZE), MAX_LOGICAL_CHUNK);
-        assert_eq!(max_logical_bytes(1024), MAX_LOGICAL_CHUNK);
-        assert_eq!(MAX_LOGICAL_CHUNK, 256 * 1024 * 1024);
     }
 }
