@@ -87,8 +87,11 @@ keep_snapshots = 2                 # newest snapshots kept, with the log between
 
 [chunk]
 store = "tg-main"             # a blob store or a [[replicas]] group
-# Max on-wire document size. With codec zstd/gzip, independent 1 MiB blocks are
-# packed until this size (or 256 MiB logical) is reached.
+# Most stored (on-wire) bytes in a chunk, up to 256 MiB. With codec zstd/gzip,
+# independent 1 MiB blocks are packed until this size (or 256 MiB logical) is
+# reached. A chunk is one message on a store that takes it (Telegram: 256 MiB,
+# Discord: 20 MiB or its max_blob_size), several on one that does not. Larger
+# chunks, fewer messages; ingest.memory_budget must hold size + block_size.
 size = "19 MiB"
 # Encoding policy for new uploads: "raw" | "gzip" | "zstd" (default zstd).
 # Compressing policies store chunks as codec "blocks" (see chunk_blocks table).
@@ -109,7 +112,11 @@ cool_every = "1m"
 cool_batch = 64
 
 [ingest]
-# Process-wide cap on ingest buffers across concurrent PUTs (default 256 MiB).
+# Process-wide cap on chunks being filled or uploaded, across concurrent PUTs
+# (default 256 MiB). A chunk reserves chunk.size + block_size when it opens
+# (less for a body of known length) and returns it once uploaded; a PUT that
+# finds the budget spent waits, it never sends a chunk half full. Must be at
+# least chunk.size + block_size.
 memory_budget = "256 MiB"
 
 [telegram]

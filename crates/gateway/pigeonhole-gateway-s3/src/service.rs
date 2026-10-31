@@ -79,10 +79,13 @@ impl S3Gateway {
         Self { opts, index, store }
     }
 
-    fn ingest_options(&self) -> IngestOptions {
+    /// `size`: the body's length when known, so its chunks reserve no more
+    /// of the ingest budget than it needs.
+    fn ingest_options(&self, size: Option<i64>) -> IngestOptions {
         let mut opts = IngestOptions::new(self.opts.chunk_size, self.opts.chunk_codec);
         opts.block_size = self.opts.block_size;
         opts.memory_budget = self.opts.ingest_budget.clone();
+        opts.size_hint = size.and_then(|n| u64::try_from(n).ok());
         opts
     }
 
@@ -133,7 +136,8 @@ impl S3Gateway {
         let mut stats = CoolStats::default();
         for c in self.index.cool_candidates(chrono::Utc::now(), policy) {
             let data = Bytes::from(c.bytes.clone());
-            let ingested = self.store.ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options())).await?;
+            let opts = self.ingest_options(Some(data.len() as i64));
+            let ingested = self.store.ingest(futures::stream::iter([Ok(data)]), Some(opts)).await?;
             let cool = self.index.prepare_cool(&c, &ingested.extents);
             let outcome = self
                 .commit_with(ingested.chunks, cool)
@@ -233,7 +237,8 @@ impl S3Gateway {
 
     /// Store `data` as new chunks (not committed yet).
     async fn ingest_bytes(&self, data: Bytes) -> S3Result<Ingested> {
-        self.store.ingest(futures::stream::iter([Ok(data)]), Some(self.ingest_options())).await.map_err(Self::map_err)
+        let opts = self.ingest_options(Some(data.len() as i64));
+        self.store.ingest(futures::stream::iter([Ok(data)]), Some(opts)).await.map_err(Self::map_err)
     }
 
     /// Commit `command` with the chunks of `extents` (`chunks`: those not
@@ -289,7 +294,8 @@ impl S3Gateway {
             }
         }
         let stream = futures::stream::iter(head.into_iter().map(Ok)).chain(stream);
-        let ingested = self.store.ingest(stream, Some(self.ingest_options())).await.map_err(Self::map_err)?;
+        let opts = self.ingest_options(content_length);
+        let ingested = self.store.ingest(stream, Some(opts)).await.map_err(Self::map_err)?;
         Ok(TakenBody {
             body: Body::Chunks(ingested.extents),
             size: ingested.size,
@@ -1024,7 +1030,8 @@ impl S3 for S3Gateway {
         )?;
 
         let stream = checksums.wrap(body_stream(input.body.take()));
-        let ingested = self.store.ingest(stream, Some(self.ingest_options())).await.map_err(Self::map_err)?;
+        let opts = self.ingest_options(input.content_length);
+        let ingested = self.store.ingest(stream, Some(opts)).await.map_err(Self::map_err)?;
         if let Some(exp) = expected_md5 {
             verify_content_md5_digest(exp, &ingested.md5)?;
         }

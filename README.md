@@ -21,8 +21,8 @@ a Bazel/Buck2 remote cache (REAPI v2) gateway is optional. Bytes are stored as
 documents/attachments in Telegram (MTProto, logged in as a bot) or Discord
 channels, in files on a local disk, or in memory.
 
-Objects are split into **chunks** (default on-wire ≤ 19 MiB, hard cap
-`< 20 MiB`). Chunk encoding is `raw` | `gzip` | `zstd`
+Objects are split into **chunks** (`chunk.size`: default ≤ 19 MiB on the
+wire, up to 256 MiB). Chunk encoding is `raw` | `gzip` | `zstd`
 (default `zstd`): compressing policies pack independent 1 MiB **blocks** into
 backend messages so each block is compressed once and Range reads only touch
 the blocks they need. Chunks are refcounted, so `CopyObject` shares the
@@ -233,7 +233,7 @@ comments. Sections:
 | `listen_addr`, `region` | S3 bind address, SigV4 region |
 | `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every` (`"off"` = never), `keep_snapshots` (the newest snapshots kept with the log between them; default 2) |
 | `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
-| `[ingest]` | `memory_budget`: cap on ingest buffers across concurrent PUTs |
+| `[ingest]` | `memory_budget`: cap on chunks being filled or uploaded across concurrent PUTs (≥ `chunk.size` + `block_size`) |
 | `[telegram]` | Rate limits on two levels: per bot (`[telegram.bot]`) and per channel and class of call (`[telegram.send]`, `read`, `delete`), each `rate_per_sec` / `burst`; a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency. `[discord]` takes the same tables |
 | `[cache]` | In-memory block caches: L1 decoded, L2 stored (compressed) blocks |
 | `[sweep]` | Garbage collector: `interval`, `batch_size` |

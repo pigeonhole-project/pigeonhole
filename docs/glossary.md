@@ -9,7 +9,7 @@ Terms used in code, comments, and docs (Stage B onward).
 | **Shard** | One member of `[[shards]]` (a store or replica group); a chunk lives in exactly one shard | — | config | `Replicated` |
 | **Blob** | One message in one instance; address is `BlobLocator` | ≤ instance `max_blob_size` | immutable | blob storage (stateless) |
 | **Block** | Chunk slice; unit of compression and Range | ~1 MiB logical | immutable | codec + chunk-store metadata |
-| **Chunk** | Logical immutable storage unit: `ChunkId`, size, CRC, refcount; independent of backend limits | config, e.g. 64 MiB | immutable (`refs` / replica set may change) | chunk store |
+| **Chunk** | Logical immutable storage unit: `ChunkId`, size, CRC, refcount; independent of backend limits | ≤ `chunk.size` stored (19 MiB), ≤ 256 MiB logical | immutable (`refs` / replica set may change) | chunk store |
 | **Replica** | Copy of a chunk on one instance = 1..N blobs (**parts**); part boundaries only on block edges | — | created whole or absent | chunk store |
 | **Extent** | `(chunk, offset, len)` — logical byte range in a chunk | ≤ chunk | immutable | chunk-store type; held by gateways |
 | **Extent list** | Ordered extents = object bytes | any | replaced as a whole | gateways |

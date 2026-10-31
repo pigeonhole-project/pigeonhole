@@ -51,7 +51,7 @@ pub struct Config {
     pub access_key: String,
     pub secret_key: String,
     pub region: String,
-    /// Max on-wire chunk size in bytes (`< 20 MiB`).
+    /// Most stored (on-wire) bytes in a chunk, up to 256 MiB.
     pub chunk_size: usize,
     pub chunk_codec: ChunkCodec,
     /// Independent block size for `blocks` packing.
@@ -322,11 +322,10 @@ impl Config {
             bail!("chunk.block_size exceeds MAX_LOGICAL_CHUNK");
         }
         let memory_budget = file.ingest.memory_budget;
-        if memory_budget < block_size.saturating_mul(2) {
-            bail!(
-                "ingest.memory_budget ({memory_budget}) must be >= 2 * chunk.block_size ({})",
-                block_size.saturating_mul(2)
-            );
+        // A chunk reserves its stored bytes and the block being filled.
+        let one_chunk = chunk_size.saturating_add(block_size);
+        if memory_budget < one_chunk {
+            bail!("ingest.memory_budget ({memory_budget}) must be >= chunk.size + chunk.block_size ({one_chunk})");
         }
         let ingest_budget = Some(ByteBudget::new(memory_budget));
 
@@ -756,7 +755,7 @@ pub fn check_block_size_against_instances(block_size: usize, instances: &[Instan
     let mut min_max = usize::MAX;
     for inst in instances {
         let max = match inst.kind {
-            InstanceKind::Memory => 20 * 1024 * 1024 - 1,
+            InstanceKind::Memory => pigeonhole_types::BackendLimits::memory().max_blob_size,
             InstanceKind::LocalDisk => pigeonhole_types::BackendLimits::local_disk().max_blob_size,
             InstanceKind::Telegram => pigeonhole_types::BackendLimits::telegram().max_blob_size,
             InstanceKind::Discord => pigeonhole_types::BackendLimits::discord(inst.max_blob_size).max_blob_size,
@@ -1485,9 +1484,20 @@ max_batch_total_size = "8 MiB"
         }
     }
 
+    /// `chunk.size` is not held under Telegram's old 20 MiB getFile cap:
+    /// anything up to a chunk's 256 MiB logical bound.
     #[test]
-    fn rejects_memory_budget_below_two_blocks() {
-        let err = load_mem("[chunk]\nblock_size = \"1 MiB\"\n[ingest]\nmemory_budget = \"1 MiB\"\n").unwrap_err();
+    fn chunk_size_goes_up_to_256_mib() {
+        let cfg = load_mem("[chunk]\nsize = \"64 MiB\"\n").unwrap();
+        assert_eq!(cfg.chunk_size, 64 << 20);
+        let err = load_mem("[chunk]\nsize = \"257 MiB\"\n[ingest]\nmemory_budget = \"1 GiB\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("chunk.size"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_memory_budget_below_one_chunk() {
+        let err = load_mem("[chunk]\nsize = \"4 MiB\"\nblock_size = \"1 MiB\"\n[ingest]\nmemory_budget = \"4 MiB\"\n")
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("ingest.memory_budget"), "unexpected error: {msg}");
     }
