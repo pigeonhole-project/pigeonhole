@@ -21,8 +21,8 @@ a Bazel/Buck2 remote cache (REAPI v2) gateway is optional. Bytes are stored as
 documents/attachments in Telegram (MTProto, logged in as a bot) or Discord
 channels, in files on a local disk, or in memory.
 
-Objects are split into **chunks** (default on-wire ≤ 19 MiB, hard cap
-`< 20 MiB`). Chunk encoding is `raw` | `gzip` | `zstd`
+Objects are split into **chunks** (`chunk.size`: default ≤ 19 MiB on the
+wire, up to 256 MiB). Chunk encoding is `raw` | `gzip` | `zstd`
 (default `zstd`): compressing policies pack independent 1 MiB **blocks** into
 backend messages so each block is compressed once and Range reads only touch
 the blocks they need. Chunks are refcounted, so `CopyObject` shares the

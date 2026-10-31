@@ -1,16 +1,14 @@
-//! Telegram getFile is limited to 20 MiB; on-wire chunk payloads must stay below that.
+//! Chunk sizes and codecs.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-/// Hard ceiling: stored payload must be downloadable via getFile (< 20 MiB).
-pub const MAX_CHUNK_SIZE: usize = 20 * 1024 * 1024 - 1;
-/// Default max **stored** (on-wire) chunk size.
+/// Default `chunk.size`: most stored (on-wire) bytes in a chunk. Under
+/// Discord's 20 MiB attachments, so a chunk is one message there too.
 pub const DEFAULT_CHUNK_SIZE: usize = 19 * 1024 * 1024;
-const _: () = assert!(DEFAULT_CHUNK_SIZE <= MAX_CHUNK_SIZE);
 /// Leave headroom under `chunk.size` so a final encode block fits.
 pub const COMPRESS_SIZE_MARGIN: usize = 256 * 1024;
-/// Cap uncompressed bytes buffered / decoded per chunk.
+/// Most logical bytes in a chunk, and so the largest `chunk.size`.
 pub const MAX_LOGICAL_CHUNK: usize = 256 * 1024 * 1024;
 /// Default independent block size for `blocks` codec packing.
 pub const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
@@ -81,12 +79,13 @@ impl std::fmt::Display for ChunkCodec {
     }
 }
 
+/// A store whose messages are smaller takes a chunk in several, not an error.
 pub fn validate_chunk_size(n: usize) -> Result<()> {
     if n == 0 {
         bail!("chunk.size must be >= 1");
     }
-    if n > MAX_CHUNK_SIZE {
-        bail!("chunk.size={n} exceeds Telegram getFile limit (max {MAX_CHUNK_SIZE} bytes, < 20 MiB)");
+    if n > MAX_LOGICAL_CHUNK {
+        bail!("chunk.size={n} exceeds the largest chunk ({MAX_LOGICAL_CHUNK} bytes, 256 MiB)");
     }
     Ok(())
 }
@@ -101,8 +100,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_20_mib() {
-        assert!(validate_chunk_size(20 * 1024 * 1024).is_err());
+    fn takes_up_to_256_mib() {
+        validate_chunk_size(MAX_LOGICAL_CHUNK).unwrap();
+        assert!(validate_chunk_size(MAX_LOGICAL_CHUNK + 1).is_err());
     }
 
     #[test]

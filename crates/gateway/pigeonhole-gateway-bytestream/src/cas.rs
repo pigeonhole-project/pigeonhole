@@ -4,8 +4,7 @@ use crate::digest::{digest_hash_hex, verify_sha256};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
-use pigeonhole_chunk_store::{ChunkStore, IngestOptions};
-use pigeonhole_codec::{ChunkCodec, DEFAULT_CHUNK_SIZE};
+use pigeonhole_chunk_store::ChunkStore;
 use pigeonhole_meta::Proposal;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -16,12 +15,11 @@ use tokio_stream::wrappers::ReceiverStream;
 pub struct CasStore {
     pub cas: CasIndex,
     pub store: Arc<ChunkStore>,
-    pub chunk_size: usize,
 }
 
 impl CasStore {
     pub fn new(cas: CasIndex, store: Arc<ChunkStore>) -> Self {
-        Self { cas, store, chunk_size: DEFAULT_CHUNK_SIZE }
+        Self { cas, store }
     }
 
     pub async fn find_missing(&self, digests: &[crate::reapi::Digest]) -> Result<Vec<crate::reapi::Digest>> {
@@ -125,8 +123,8 @@ impl CasStore {
             return Ok(());
         }
 
-        let mut opts = IngestOptions::new(self.chunk_size, ChunkCodec::Zstd);
-        opts.block_size = 1024 * 1024;
+        // The store's `[chunk]` and `[ingest]` settings.
+        let mut opts = self.store.ingest_options();
         opts.size_hint = u64::try_from(size).ok();
         let mut ingested = self.store.ingest(stream, Some(opts)).await.context("CAS ingest")?;
         if ingested.size != size {
@@ -165,6 +163,7 @@ impl CasStore {
 mod tests {
     use super::*;
     use pigeonhole_chunk_store::{BlobDb, IngestOptions};
+    use pigeonhole_codec::ChunkCodec;
     use pigeonhole_storage_memory::MemoryBlobStore;
     use sha2::{Digest as _, Sha256};
 

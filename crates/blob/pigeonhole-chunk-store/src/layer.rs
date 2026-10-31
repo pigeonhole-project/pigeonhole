@@ -137,6 +137,17 @@ impl ChunkStore {
         let infos: Vec<_> = replicated.members().iter().map(|m| m.instance().clone()).collect();
         db.sync_instances(&infos).await?;
         check_block_fits_members(opts.block_size, replicated.as_ref())?;
+        for m in replicated.members() {
+            let max = m.limits().max_blob_size;
+            if opts.chunk_size > max {
+                tracing::warn!(
+                    instance = %m.instance().id,
+                    chunk_size = opts.chunk_size,
+                    max_blob_size = max,
+                    "chunk.size is over this store's message size: a chunk takes several messages there"
+                );
+            }
+        }
         // Uncommitted parts at or below the highest committed key are a dead
         // writer's garbage: start the sweep horizon there.
         for info in &infos {
@@ -259,13 +270,17 @@ impl ChunkStore {
     where
         S: futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
     {
-        let opts = opts.unwrap_or_else(|| {
-            let mut o = IngestOptions::new(self.chunk_size, self.codec);
-            o.block_size = self.block_size;
-            o.memory_budget = self.memory_budget.clone();
-            o
-        });
+        let opts = opts.unwrap_or_else(|| self.ingest_options());
         self.ingest_blocks(&mut stream, opts).await
+    }
+
+    /// The options the store was opened with (`[chunk]`, `[ingest]`), for a
+    /// caller to add what it knows of a body, such as its length.
+    pub fn ingest_options(&self) -> IngestOptions {
+        let mut o = IngestOptions::new(self.chunk_size, self.codec);
+        o.block_size = self.block_size;
+        o.memory_budget = self.memory_budget.clone();
+        o
     }
 
     /// [`Self::ingest`] and commit the chunks at once (one entry), for
