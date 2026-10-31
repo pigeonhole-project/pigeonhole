@@ -2336,8 +2336,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openraft"
 version = "0.9.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a97014fb78acb77be3a40ac2da305f6dd3a6b243f3a908ace87d29b3972eaafd"
 dependencies = [
  "anyerror",
  "byte-unit",
@@ -2844,6 +2842,25 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pigeonhole-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "http",
+ "madsim-tokio",
+ "pigeonhole-blob",
+ "pigeonhole-chunk-store",
+ "pigeonhole-gateway-s3",
+ "pigeonhole-meta",
+ "pigeonhole-storage-memory",
+ "s3s",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

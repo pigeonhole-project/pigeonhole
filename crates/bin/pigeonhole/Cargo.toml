@@ -37,7 +37,7 @@ pigeonhole-storage-memory = { workspace = true }
 pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-discord = { workspace = true, optional = true }
 pigeonhole-gateway-bytestream = { workspace = true, optional = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 http-body = { workspace = true }
