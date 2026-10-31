@@ -27,6 +27,8 @@ ROLE = {
     "pigeonhole-gateway-kafka": "gateway",
     "pigeonhole-gateway-webdav": "gateway",
     "pigeonhole": "bin",
+    # The in-browser build: a composition root like the binary.
+    "pigeonhole-web": "bin",
     "pigeonhole-testkit": "testkit",
     "pigeonhole-sim": "testkit",
 }

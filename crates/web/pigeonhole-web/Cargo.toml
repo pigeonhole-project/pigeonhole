@@ -1,0 +1,24 @@
+[package]
+name = "pigeonhole-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pigeonhole in one process on in-memory stores, for the site's in-browser demo (wasm32-wasip1)"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-chunk-store = { workspace = true }
+pigeonhole-gateway-s3 = { workspace = true }
+pigeonhole-meta = { workspace = true }
+pigeonhole-storage-memory = { workspace = true }
+s3s = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
