@@ -34,7 +34,7 @@ pub struct DcAttachment {
 }
 
 /// What starting a thread from a message did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThreadStart {
     Created,
     /// The message already has a thread (code 160004).

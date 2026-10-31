@@ -8,7 +8,7 @@ description = "Discord storage backend for pigeonhole: blobs, and a chain over t
 [features]
 # The in-memory channel (`fake`): tests, the site's demo and the opt-in
 # fake-channel build. Never in a default build (scripts/check_deps.py).
-fake = []
+fake = ["pigeonhole-storage-api/fake"]
 
 [dependencies]
 anyhow = { workspace = true }
