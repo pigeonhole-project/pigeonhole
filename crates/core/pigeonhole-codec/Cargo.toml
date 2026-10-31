@@ -6,6 +6,7 @@ license.workspace = true
 description = "Chunk codecs and frame packing for pigeonhole"
 
 [dependencies]
+pigeonhole-types = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }

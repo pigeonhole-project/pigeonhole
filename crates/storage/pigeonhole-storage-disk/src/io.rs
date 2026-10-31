@@ -140,11 +140,20 @@ impl FsFile for StdFile {
 struct StdLock(File);
 
 impl DirLock for StdLock {
+    #[cfg(not(target_os = "wasi"))]
     fn lock(&self) -> io::Result<()> {
         self.0.lock()
     }
 
+    // WASI has no file locks. The host keeps processes apart there: the
+    // site's worker holds its files' OPFS handles, which are exclusive.
+    #[cfg(target_os = "wasi")]
+    fn lock(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     fn unlock(&self) {
+        #[cfg(not(target_os = "wasi"))]
         let _ = self.0.unlock();
     }
 }
