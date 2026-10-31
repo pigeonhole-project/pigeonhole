@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -95,12 +96,32 @@ impl FsFile for StdFile {
         Ok(self.0.metadata()?.len())
     }
 
+    #[cfg(unix)]
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         self.0.read_exact_at(buf, offset)
     }
 
+    #[cfg(unix)]
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         self.0.write_all_at(buf, offset)
+    }
+
+    // WASI's positional calls are unstable in std (`wasi_ext`); there is one
+    // thread there, so a seek and a read cannot interleave with another.
+    #[cfg(not(unix))]
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = &self.0;
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(buf)
+    }
+
+    #[cfg(not(unix))]
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = &self.0;
+        f.seek(SeekFrom::Start(offset))?;
+        f.write_all(buf)
     }
 
     fn sync(&self) -> io::Result<()> {
