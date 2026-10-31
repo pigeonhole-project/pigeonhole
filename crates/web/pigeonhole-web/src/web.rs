@@ -17,7 +17,14 @@ thread_local! {
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     static WORLD: Rc<World> = Rc::new(World::default());
     static NODE: RefCell<Option<Rc<Node>>> = const { RefCell::new(None) };
-    static CONFIG: RefCell<String> = RefCell::new(DEMO_CONFIG.to_string());
+    static CONFIG: RefCell<String> = RefCell::new(saved_config().unwrap_or_else(|| DEMO_CONFIG.to_string()));
+}
+
+/// Where the last config that booted is kept (the page's OPFS, as `/data`).
+const SAVED_CONFIG: &str = "/data/pigeonhole.toml";
+
+fn saved_config() -> Option<String> {
+    std::fs::read_to_string(SAVED_CONFIG).ok()
 }
 
 #[derive(Deserialize)]
@@ -75,7 +82,10 @@ pub extern "C" fn ph_open() -> i32 {
         )
         .with_writer(std::io::stdout)
         .init();
-    reply(Ok(json!({ "config": DEMO_CONFIG })))
+    let saved = saved_config();
+    reply(Ok(
+        json!({ "config": saved.clone().unwrap_or_else(|| DEMO_CONFIG.to_string()), "demo": DEMO_CONFIG, "saved": saved.is_some() }),
+    ))
 }
 
 /// Runs one request read from stdin.
@@ -120,6 +130,8 @@ async fn start(text: String) -> anyhow::Result<Value> {
         node.create_bucket("demo").await?;
     }
     NODE.with(|n| *n.borrow_mut() = Some(Rc::new(node)));
+    // Kept for the next page load; nowhere to keep it without a file system.
+    let _ = std::fs::write(SAVED_CONFIG, &text);
     CONFIG.with(|c| *c.borrow_mut() = text);
     // Which channel pane each store is drawn in.
     let stores: Vec<Value> =

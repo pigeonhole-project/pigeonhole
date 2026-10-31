@@ -115,7 +115,7 @@
   "try.no_objects": "Empty: upload a file.",
   "try.note": "Built from <code>crates/web</code>: the server's crates, read from the same <code>pigeonhole.toml</code> (below). Fake channels stand in for the services (<code>fake = \"memory\"</code>, a build with the <code>fake</code> feature). Times are measured inside the worker.",
   "js.try.ready": "Ready: booted in {ms} ms.",
-  "js.try.booted": "metadata tablet up (openraft, a cluster of one); bucket demo created",
+  "js.try.booted": "metadata tablet up (openraft, a cluster of one)",
   "js.try.error": "Failed: {error}",
   "js.try.too_big": "Up to 64 MiB, please: it all lives in this tab's memory.",
   "js.try.read": "Read 100 KB",
@@ -137,5 +137,12 @@
   "js.try.out.restart": "{n} log entries replayed",
   "js.say.PutObjectInline": "<b>{key}</b> ({size}) is small enough to live in the metadata log itself: no post in any channel (<code>[inline] max_object_size</code>).",
   "js.say.PutObjectText": "<b>{key}</b> ({size}) became {chunks} of {stored}: small enough for a text message, so the channels got text, not a file — 15 bits a character, as CJK ideographs.",
-  "js.say.restart": "Restarted on the new config: the tablet claimed the log, loaded its snapshot and replayed {n} entries. The objects stay as they were; new ones follow the new rules."
+  "js.say.restart": "Restarted on the new config: the tablet claimed the log, loaded its snapshot and replayed {n} entries. The objects stay as they were; new ones follow the new rules.",
+  "try.erase": "Erase everything",
+  "js.try.erase_confirm": "Erase the channels, the log and the objects kept in this browser? The demo starts from scratch.",
+  "js.try.kept": "Kept in this browser: a reload finds it all.",
+  "js.try.not_kept": "In memory only: a reload starts over.",
+  "js.try.welcome_back": "found your last visit's channels: {n} log entries replayed",
+  "js.say.welcome_back": "Welcome back. Nothing here was kept by the page: the node booted from its channels on this browser's disk, claimed the log's next generation and replayed {n} entries — as a server does after a restart.",
+  "js.try.no_objects": "Empty: upload a file."
 }

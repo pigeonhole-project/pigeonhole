@@ -25,13 +25,18 @@
   let demoConfig = "";
   waiting.set(0, async data => {
     if (data.reply?.error) { status.textContent = t("try.error", {error: data.reply.error}); return; }
-    demoConfig = data.reply.config;
-    editor.value = demoConfig;
+    demoConfig = data.reply.demo;
+    editor.value = data.reply.config;
     const booted = await call({op: "open"});
     if (booted.reply?.error) { status.textContent = t("try.error", {error: booted.reply.error}); return; }
     stage.setStores(booted.reply.stores);
-    status.textContent = t("try.ready", {ms: Math.round(performance.now() - t0)});
+    const where = t(data.reply.persistent ? "try.kept" : "try.not_kept");
+    status.textContent = `${t("try.ready", {ms: Math.round(performance.now() - t0)})} ${where}`;
     stage.termLine("out", t("try.booted"), `${Math.round(booted.ms)} ms`);
+    if (data.reply.saved) {
+      stage.termLine("out", t("try.welcome_back", {n: booted.reply.replayed}), null);
+      stage.narrate(t("say.welcome_back", {n: booted.reply.replayed}));
+    }
     await showSteps(toSteps(booted.events), true);
     await refresh();
     setBusy(false);
@@ -57,6 +62,12 @@
   }
   document.getElementById("config-apply").addEventListener("click", restart);
   document.getElementById("config-reset").addEventListener("click", () => { editor.value = demoConfig; configError.textContent = ""; });
+  document.getElementById("erase").addEventListener("click", async () => {
+    if (!confirm(t("try.erase_confirm"))) return;
+    setBusy(true);
+    await call({op: "reset"});
+    location.reload();
+  });
   editor.addEventListener("keydown", ev => {
     if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") { ev.preventDefault(); restart(); }
   });

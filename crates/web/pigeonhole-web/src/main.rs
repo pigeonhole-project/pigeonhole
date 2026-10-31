@@ -34,8 +34,19 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
         let t0 = std::time::Instant::now();
+        // The demo keeps its channels in /data/channels: here in memory first,
+        // then in a temp dir (WASI has no temp_dir(); the runner passes TMPDIR).
+        let in_memory = DEMO_CONFIG
+            .replace("fake = \"channel-data\"", "fake = \"memory\"")
+            .replace("[[store]]\nid = \"channel-data\"\nkind = \"local_disk\"\npath = \"/data/channels\"\n", "");
+        let tmp = std::env::var("TMPDIR").map_or_else(|_| std::env::temp_dir(), std::path::PathBuf::from);
+        let dir = tmp.join(format!(
+            "pigeonhole-web-smoke-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
+        ));
+        let on_disk = DEMO_CONFIG.replace("\"/data/channels\"", &format!("{:?}", dir.display().to_string()));
         let world = World::default();
-        let node = Node::open(&world, &parse_config(DEMO_CONFIG)?).await?;
+        let node = Node::open(&world, &parse_config(&in_memory)?).await?;
         node.create_bucket("demo").await?;
         let photo = noise(7 << 20);
         node.put("demo", "photo.jpg", photo.clone()).await?;
@@ -57,7 +68,7 @@ fn main() -> anyhow::Result<()> {
         // A restart on another config: the log is replayed, the objects stay.
         node.close().await?;
         let cfg =
-            DEMO_CONFIG.replace("codec = \"zstd\"", "codec = \"gzip\"").replace("size = \"4 MiB\"", "size = \"2 MiB\"");
+            in_memory.replace("codec = \"zstd\"", "codec = \"gzip\"").replace("size = \"4 MiB\"", "size = \"2 MiB\"");
         let node = Node::open(&world, &parse_config(&cfg)?).await?;
         anyhow::ensure!(node.replayed() > 0, "nothing replayed");
         anyhow::ensure!(node.get("demo", "photo-copy.jpg", None).await? == photo, "copy differs after restart");
@@ -68,18 +79,7 @@ fn main() -> anyhow::Result<()> {
         eprintln!("memory: ok in {:?}, {} entries replayed", t0.elapsed(), node.replayed());
 
         // The channels in a local_disk store: a new process finds them as they were.
-        // WASI has no temp_dir(); the runner passes TMPDIR.
-        let tmp = std::env::var("TMPDIR").map_or_else(|_| std::env::temp_dir(), std::path::PathBuf::from);
-        let dir = tmp.join(format!(
-            "pigeonhole-web-smoke-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
-        ));
         let _ = std::fs::remove_dir_all(&dir);
-        let on_disk = DEMO_CONFIG.replace("fake = \"memory\"", "fake = \"channel-data\"")
-            + &format!(
-                "\n[[store]]\nid = \"channel-data\"\nkind = \"local_disk\"\npath = {:?}\n",
-                dir.display().to_string()
-            );
         let t1 = std::time::Instant::now();
         {
             let world = World::default();

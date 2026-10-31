@@ -1,19 +1,22 @@
 # pigeonhole.toml of the site's demo. It is read by pigeonhole-config, as a
 # server reads its file; the only difference is `fake`: the Telegram and
-# Discord stores run on fake channels in this tab instead of the services.
+# Discord stores run on fake channels instead of the services. Each fake
+# channel is a tablet of its own (a log, snapshots, documents) kept in the
+# local_disk store `channel-data`: the browser's disk for this site (OPFS),
+# so a reload finds everything where it was.
 
 # Two channels hold the chunks, every chunk in both.
 [[store]]
 id = "telegram"
 kind = "telegram"
 chat_id = -1001000000001
-fake = "memory"
+fake = "channel-data"
 
 [[store]]
 id = "discord"
 kind = "discord"
 channel_id = 1000000000000000001
-fake = "memory"
+fake = "channel-data"
 
 [[replicas]]
 id = "channels"
@@ -25,13 +28,19 @@ write_quorum = 2
 id = "tg-log"
 kind = "telegram"
 chat_id = -1001000000002
-fake = "memory"
+fake = "channel-data"
 
 [[store]]
 id = "tg-snapshots"
 kind = "telegram"
 chat_id = -1001000000003
-fake = "memory"
+fake = "channel-data"
+
+# Where the fake channels keep themselves.
+[[store]]
+id = "channel-data"
+kind = "local_disk"
+path = "/data/channels"
 
 [meta]
 log = "tg-log"
