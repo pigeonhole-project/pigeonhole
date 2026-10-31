@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
         .with_span_list(true)
         .with_env_filter(
             "warn,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
-             pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug",
+             pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug,pigeonhole_fake_channels=debug",
         )
         .with_writer(std::io::stdout)
         .init();

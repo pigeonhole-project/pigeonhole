@@ -11,6 +11,8 @@ function toSteps(lines) {
   for (const line of lines) {
     const f = line.fields || {}, msg = f.message || "";
     const spans = Object.fromEntries((line.spans || []).map(s => [s.name, s]));
+    // A fake channel's own tablet (its log and commits): not the node's.
+    if (spans.fake_channel) continue;
     let e = null;
     if (msg === "fake channel: text") {
       preview = f.preview;
