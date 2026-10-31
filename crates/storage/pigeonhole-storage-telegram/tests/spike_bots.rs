@@ -260,3 +260,79 @@ async fn a_pooled_store_reads_with_each_bots_own_locations() {
     println!("4 documents through a pool of 2: read back after write and through a fresh store");
     store.delete(&ids.iter().map(|i| i.message_id).collect::<Vec<_>>()).await.unwrap();
 }
+
+/// Ranged reads of one 32 MiB document: a store over the primary alone and
+/// a store over both bots, taking turns, `SPIKE_ROUNDS` (default 30) 1 MiB
+/// reads each at random offsets, caches warm. Prints p50 / p95 / mean.
+#[tokio::test]
+#[ignore = "needs two Telegram bots, admins of a test channel"]
+async fn ranged_reads_one_bot_against_two() {
+    use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
+    use pigeonhole_storage_telegram::{PooledChannel, TelegramBlobStore};
+    use pigeonhole_types::ByteRange;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
+    let rounds: usize = std::env::var("SPIKE_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_storage_telegram::limits());
+    let mut channels = Vec::new();
+    for (n, var) in [(1, "TG_BOT_TOKEN"), (2, "TG_BOT_TOKEN_2")] {
+        let cfg = MtprotoConfig {
+            api_id: env("TG_API_ID").parse().unwrap(),
+            api_hash: env("TG_API_HASH"),
+            bot_token: env(var),
+            session: root.join(format!(".cache/spike-tg-{n}.session")),
+        };
+        let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+        let limiter = reg.chat(&tg.bot_id().to_string(), &chat_id.to_string());
+        channels.push(tg.channel(chat_id, Lane::Blobs, limiter).await.unwrap());
+    }
+    let info = |id: &str| InstanceInfo {
+        id: id.into(),
+        kind: pigeonhole_storage_telegram::KIND,
+        fingerprint: format!("tg:{id}"),
+        location: format!("tg:chat:{chat_id}"),
+        role: InstanceRole::ReadWrite,
+    };
+    let store_of = |members: Vec<MtprotoChannel>, id: &str| {
+        let pooled = Arc::new(PooledChannel::of(members));
+        TelegramBlobStore::new(pooled.clone(), pooled.limiter().clone(), info(id)).with_inline(false)
+    };
+    let one = store_of(vec![channels[0].clone()], "one");
+    let two = store_of(channels.clone(), "two");
+    let size = 32 * 1024 * 1024u64;
+    let data = Bytes::from((0..size as usize).map(|i| (i % 241) as u8).collect::<Vec<_>>());
+    let id = one.put(data.clone(), &BlobId::random().name()).await.unwrap();
+    let mut times = [Vec::new(), Vec::new()];
+    let mut seed = 0x9e3779b97f4a7c15u64;
+    for round in 0..=rounds {
+        for (k, store) in [&one, &two].into_iter().enumerate() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let start = seed % (size - (1 << 20));
+            let end = start + (1 << 20);
+            let range = ByteRange { start, end };
+            let t = Instant::now();
+            let got = collect_stream(store.get(&id, Some(range)).await.unwrap()).await.unwrap();
+            let took = t.elapsed();
+            assert!(got == data.slice(start as usize..end as usize));
+            if round > 0 {
+                times[k].push(took.as_secs_f64() * 1000.0);
+            }
+        }
+    }
+    for (k, label) in ["one bot ", "two bots"].into_iter().enumerate() {
+        let t = &mut times[k];
+        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = t.iter().sum::<f64>() / t.len() as f64;
+        println!(
+            "{label}: p50 {:.0} ms, p95 {:.0} ms, mean {:.0} ms ({} reads)",
+            t[t.len() / 2],
+            t[t.len() * 95 / 100],
+            mean,
+            t.len()
+        );
+    }
+    one.delete(&[id.message_id]).await.unwrap();
+}

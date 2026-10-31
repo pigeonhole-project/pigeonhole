@@ -345,10 +345,42 @@ until the round trip (~0.3–0.5 s per send) is what is left.
    sender's location, so a read after write needs no `getMessages` on any
    bot. Live: documents posted through both bots read back after write and
    through a fresh store, no `FILE_REFERENCE_EXPIRED`.
-5. Bench: log entries per second with 1, 2, 4 bots against
-   [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md).
+5. ✅ Bench, 1 and 2 bots (§ Bench).
 6. Only as far as the bench shows a need: the Discord `Pacer` as a kind of
    bucket, `observe` from headers, priority for retries after a penalty.
+
+## Bench (2026-10-31)
+
+`BENCH_BOTS=2 ./scripts/bench.sh telegram discord` (the workload of
+[bench-discord-vs-telegram.md](bench-discord-vs-telegram.md), default
+limits), one machine on AC power under `caffeinate` (a run on battery was
+spoiled by macOS Maintenance Sleep: 15-minute gaps, then timeouts, and a
+Discord lease running out). Raw data: [bench/2026-10-31-pool](bench/2026-10-31-pool/);
+Telegram's one-bot numbers are those of 2026-10-29 (a one-bot run on
+2026-10-30 matched them on writes: 0.30 PUT/s, p50 3.33 s).
+
+| | Telegram 1 bot | Telegram 2 bots | Discord 1 bot | Discord 2 bots |
+|---|---|---|---|---|
+| Small PUT, one client | 0.31 PUT/s | **0.58** | 0.94 | 1.14 |
+| Small PUT, 8 clients | 0.30 PUT/s, p50 23.5 s | **0.58**, p50 12.4 s | 1.01, p50 7.7 s | **2.00**, p50 3.0 s |
+| Large PUT | 2.74 MiB/s | 2.48 | 1.63 | 1.74 |
+| Cold GET | 5.61 MiB/s | 7.53 | 7.10 | 8.28 |
+| 1 MiB ranged GET | 8.66/s | 5.65 | 11.8 | 13.7 |
+
+- **Writes bound by a bot's budget nearly double**: both small-PUT phases
+  on Telegram (20 messages a minute per bot), 8 clients on Discord.
+- **Discord, one client, only ×1.2**: there a PUT waits on round trips
+  (the blob's send and the log's, ~0.8 s), not on the 1/s budget.
+- **Large PUTs** are bound by the link, not by limits.
+- **Ranged GETs on Telegram are not slower**: the bench's six reads were
+  noise. Measured apart (`spike_bots.rs` `ranged_reads_one_bot_against_two`,
+  1 MiB at random offsets of a 32 MiB document, warm caches, taking
+  turns): p50 174 vs 172 ms over 60 reads each, p95 1207 ms with one bot vs
+  497 ms with two (reads spread over the bots' budgets).
+- **32 MiB PUTs over Telegram answered 500 on a slow link**
+  (`UploadStreamError: error reading a body from connection`, the client's
+  connection gone ~15 s into the first chunk's upload), on main as often as
+  with the pool (4 vs 4 in interleaved runs): not the pool's, open.
 
 ## Open questions
 
