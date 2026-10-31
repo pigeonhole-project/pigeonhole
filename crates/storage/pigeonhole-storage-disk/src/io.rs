@@ -74,7 +74,12 @@ impl Fs for StdFs {
     }
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
-        File::open(dir)?.sync_all()
+        let dir = File::open(dir)?;
+        if cfg!(target_os = "macos") {
+            sync(&dir)
+        } else {
+            dir.sync_all()
+        }
     }
 
     fn dir_lock(&self, dir: &Path) -> io::Result<Arc<dyn DirLock>> {
@@ -99,7 +104,7 @@ impl FsFile for StdFile {
     }
 
     fn sync(&self) -> io::Result<()> {
-        self.0.sync_data()
+        sync(&self.0)
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
@@ -121,6 +126,28 @@ impl DirLock for StdLock {
     fn unlock(&self) {
         let _ = self.0.unlock();
     }
+}
+
+/// On macOS a plain `fsync(2)`, as SQLite does by default: the data reaches
+/// the drive, but its cache is not flushed. std's `sync_data` there is
+/// `F_FULLFSYNC`, which flushes the cache too and costs ~5 ms per call
+/// (`sweep_stress` 7x slower); a power cut can then lose the last writes, not
+/// a crash of the process. Linux keeps `fdatasync`.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn sync(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a valid descriptor.
+    if unsafe { libc::fsync(file.as_raw_fd()) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync(file: &File) -> io::Result<()> {
+    file.sync_data()
 }
 
 #[cfg(target_os = "macos")]
