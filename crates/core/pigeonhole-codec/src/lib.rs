@@ -10,7 +10,6 @@ pub use blocks::{
 };
 pub use chunker::{
     fill_target, max_logical_bytes, validate_chunk_size, ChunkCodec, COMPRESS_PROBE_BYTES, COMPRESS_SIZE_MARGIN,
-    DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_INGEST_MEMORY_BUDGET, DEFAULT_LOGICAL_CHUNK_SIZE, MAX_CHUNK_SIZE,
-    MAX_LOGICAL_CHUNK,
+    DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, DEFAULT_INGEST_MEMORY_BUDGET, MAX_CHUNK_SIZE, MAX_LOGICAL_CHUNK,
 };
 pub use types::{codec_from_sql, codec_to_sql};

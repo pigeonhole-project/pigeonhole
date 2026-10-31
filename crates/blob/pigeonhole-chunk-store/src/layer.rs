@@ -14,7 +14,7 @@ use md5::{Digest, Md5};
 use pigeonhole_blob::{
     collect_stream, erase, BlobBackend, CheapestFirst, EncodedBlock, ReplicaLayout, Replicated, SharedBackend,
 };
-use pigeonhole_codec::{decode_block_slice, encode_block_bytes, ByteBudget, ChunkCodec, DEFAULT_LOGICAL_CHUNK_SIZE};
+use pigeonhole_codec::{decode_block_slice, encode_block_bytes, ByteBudget, ChunkCodec, DEFAULT_CHUNK_SIZE};
 use pigeonhole_meta::{Outcomes, Prepared, Proposal, Slot};
 use pigeonhole_types::ByteRange;
 use std::collections::{BTreeMap, VecDeque};
@@ -540,33 +540,36 @@ impl ChunkStore {
         Ok(Ingested { extents, size: total, md5, crc32, checksums, chunks: pending })
     }
 
-    async fn encode_push_block(
+    /// Compress one block; its permit shrinks to the block's logical bytes.
+    async fn encode_block(
         &self,
-        open: &mut OpenChunk,
         block_buf: &mut Vec<u8>,
         block_permit: &mut Option<pigeonhole_codec::BudgetPermit>,
         codec: ChunkCodec,
         calls: &Arc<AtomicU64>,
-    ) -> Result<()> {
+    ) -> Result<EncodedBlock> {
         let logical = std::mem::take(block_buf);
         let logical_len = logical.len();
         if let Some(p) = block_permit.as_mut() {
             p.release_excess(p.bytes().saturating_sub(logical_len));
         }
-        let policy = codec;
         let calls = calls.clone();
-        let (stored, stored_codec) = tokio::task::spawn_blocking(move || {
+        let (stored, codec) = tokio::task::spawn_blocking(move || {
             calls.fetch_add(1, Ordering::Relaxed);
-            encode_block_bytes(&logical, policy)
+            encode_block_bytes(&logical, codec)
         })
         .await
         .context("spawn_blocking encode")??;
         pigeonhole_blob::record_compression_ratio(stored.len(), logical_len);
+        Ok(EncodedBlock { stored, logical_len: logical_len as u32, codec })
+    }
 
+    async fn push_encoded(&self, open: &mut OpenChunk, block: EncodedBlock) -> Result<()> {
+        let EncodedBlock { stored, logical_len, codec } = block;
         let block_no = open.blocks.len() as i64;
         let logical_off = open.logical;
         open.writer
-            .push(EncodedBlock { stored: stored.clone(), logical_len: logical_len as u32, codec: stored_codec.clone() })
+            .push(EncodedBlock { stored: stored.clone(), logical_len, codec: codec.clone() })
             .await
             .context("replicated push block")?;
 
@@ -578,12 +581,11 @@ impl ChunkStore {
             logical_off,
             logical_len: logical_len as i64,
             stored_len: stored.len() as i64,
-            codec: stored_codec,
+            codec,
             crc32: crc32fast::hash(&stored),
         });
         open.logical += logical_len as i64;
-        // Release block permit after push (open parts live inside packers).
-        let _ = block_permit.take();
+        open.stored_len += stored.len();
         Ok(())
     }
 
@@ -599,6 +601,7 @@ impl ChunkStore {
             logical: open.logical,
         };
         open.logical = 0;
+        open.stored_len = 0;
         sealing
     }
 
@@ -664,9 +667,13 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 /// Cuts a stream into blocks and the blocks into chunks as the bytes come,
-/// within the memory budget.
+/// within the memory budget. A chunk is closed by its stored bytes, so a
+/// compressible stream fills each message: messages are the scarce resource.
 struct BlockFeeder<'a> {
     store: &'a ChunkStore,
+    /// Most stored (encoded) bytes in a chunk: `chunk.size`.
+    chunk_stored: usize,
+    /// Most logical bytes in a chunk, however well they compress.
     chunk_logical: i64,
     block_size: usize,
     codec: ChunkCodec,
@@ -684,11 +691,12 @@ struct BlockFeeder<'a> {
 
 impl<'a> BlockFeeder<'a> {
     fn new(store: &'a ChunkStore, opts: IngestOptions) -> Self {
-        let chunk_logical = opts.chunk_size.clamp(1024, pigeonhole_codec::MAX_LOGICAL_CHUNK);
-        let block_size = opts.block_size.max(1024).min(chunk_logical);
+        let chunk_stored = opts.chunk_size.clamp(1024, pigeonhole_codec::MAX_LOGICAL_CHUNK);
+        let block_size = opts.block_size.max(1024).min(chunk_stored);
         Self {
             store,
-            chunk_logical: chunk_logical as i64,
+            chunk_stored,
+            chunk_logical: pigeonhole_codec::MAX_LOGICAL_CHUNK as i64,
             block_size,
             codec: opts.codec,
             calls: opts.compress_calls.unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
@@ -729,10 +737,14 @@ impl<'a> BlockFeeder<'a> {
     }
 
     async fn push_block(&mut self) -> Result<()> {
-        self.store
-            .encode_push_block(&mut self.open, &mut self.block, &mut self.permit, self.codec, &self.calls)
-            .await?;
-        if self.open.logical >= self.chunk_logical {
+        let block = self.store.encode_block(&mut self.block, &mut self.permit, self.codec, &self.calls).await?;
+        if !self.open.blocks.is_empty() && self.open.stored_len + block.stored.len() > self.chunk_stored {
+            self.seal().await?;
+        }
+        self.store.push_encoded(&mut self.open, block).await?;
+        // Pushed: the block's bytes live in the packers now.
+        self.permit = None;
+        if self.open.stored_len >= self.chunk_stored || self.open.logical >= self.chunk_logical {
             self.seal().await?;
         }
         Ok(())
@@ -778,11 +790,12 @@ struct OpenChunk {
     /// The blocks' stored bytes, kept for L2 when it is written through.
     stored: Vec<Bytes>,
     logical: i64,
+    stored_len: usize,
 }
 
 impl OpenChunk {
     fn new(writer: pigeonhole_blob::ChunkReplicaWriter) -> Self {
-        Self { writer, blocks: Vec::new(), stored: Vec::new(), logical: 0 }
+        Self { writer, blocks: Vec::new(), stored: Vec::new(), logical: 0, stored_len: 0 }
     }
 }
 
@@ -801,9 +814,9 @@ pub fn check_block_fits_members(block_size: usize, replicated: &Replicated) -> R
     Ok(())
 }
 
-/// Build default ingest options for the layer (logical chunk size).
+/// Build default ingest options for the layer.
 pub fn default_layer_opts() -> IngestOptions {
-    IngestOptions::new(DEFAULT_LOGICAL_CHUNK_SIZE, ChunkCodec::Zstd)
+    IngestOptions::new(DEFAULT_CHUNK_SIZE, ChunkCodec::Zstd)
 }
 
 /// Test helper: open a memory-backed layer over a local log in `log_dir`.
@@ -825,6 +838,18 @@ mod tests {
     use pigeonhole_blob::{erase, CheapestFirst};
     use pigeonhole_storage_memory::MemoryBlobStore;
     use pigeonhole_types::BackendLimits;
+
+    /// Bytes zstd cannot shrink (xorshift).
+    fn noise(n: usize) -> Bytes {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        };
+        Bytes::from((0..n).map(|_| next()).collect::<Vec<u8>>())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_ingests_do_not_collide_sort_keys() {
@@ -853,7 +878,8 @@ mod tests {
     async fn an_ingest_commits_its_chunks_in_one_entry_or_not_at_all() {
         let dir = tempfile::tempdir().unwrap();
         let layer = open_memory_chunk_store(dir.path().join("blob.log")).await.unwrap();
-        let body = Bytes::from(vec![3u8; 200_000]);
+        // Noise: a body that compresses would fit one chunk.
+        let body = noise(200_000);
         let before = layer.meta().applied_position();
 
         // Uploaded, not committed: nothing in the state, nothing readable.
@@ -1001,6 +1027,44 @@ mod tests {
         flag.store(true, Ordering::Relaxed);
         let got = layer.read(&ingested.extents, None).await.unwrap();
         assert_eq!(got, data);
+    }
+
+    /// `chunk.size` caps a chunk's stored bytes, not its logical ones: a
+    /// body that compresses goes up in as few messages as its stored size
+    /// needs, one that does not is cut at `chunk.size` on the wire.
+    #[tokio::test]
+    async fn chunks_are_cut_by_stored_bytes() {
+        const MIB: usize = 1024 * 1024;
+        async fn parts_per_chunk(layer: &ChunkStore, data: &Bytes) -> Vec<(usize, i64)> {
+            let ingested =
+                layer.ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None).await.unwrap();
+            assert_eq!(layer.read(&ingested.extents, None).await.unwrap(), *data);
+            let mut out = Vec::new();
+            for ext in &ingested.extents {
+                let layouts = layer.db().get_replica_layouts(ext.chunk).await.unwrap();
+                let stored: u64 = layouts[0].parts.iter().flat_map(|p| &p.block_stored_lens).map(|&l| l as u64).sum();
+                assert!(stored <= MIB as u64, "chunk stored {stored} over chunk.size");
+                out.push((layouts[0].parts.len(), ext.len));
+            }
+            out
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let mut opts = IngestOptions::new(MIB, ChunkCodec::Zstd);
+        opts.block_size = 64 * 1024;
+        let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap();
+
+        // 8 MiB that compress far below 1 MiB: one chunk, one message.
+        let text = Bytes::from((0..8 * MIB).map(|i| b"pigeonhole "[i % 11]).collect::<Vec<u8>>());
+        assert_eq!(parts_per_chunk(&layer, &text).await, vec![(1, 8 * MIB as i64)]);
+
+        // 3 MiB of noise stays raw: three full messages, each its own chunk.
+        let noise = noise(3 * MIB);
+        let chunks = parts_per_chunk(&layer, &noise).await;
+        assert!(chunks.iter().all(|&(parts, _)| parts == 1), "{chunks:?}");
+        assert_eq!(chunks.len(), 3, "{chunks:?}");
     }
 
     /// Written through, L2 holds every block: reads need no backend. Without

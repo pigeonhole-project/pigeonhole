@@ -22,6 +22,7 @@ impl IngestHasher for () {
 
 #[derive(Clone)]
 pub struct IngestOptions {
+    /// Most stored (encoded) bytes in a chunk; 256 MiB logical at most.
     pub chunk_size: usize,
     pub codec: ChunkCodec,
     pub block_size: usize,
