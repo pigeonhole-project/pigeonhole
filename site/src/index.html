@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="{{@lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}}</title>
+<meta name="description" content="{{meta_desc}}">
+<link rel="stylesheet" href="{{@root}}assets/site.css">
+</head>
+<body>
+<nav class="top">
+  <a class="brand" href="{{@root}}{{nav.home_href}}"><span class="bird">🐦</span> pigeonhole</a>
+  <div class="links">
+    <a href="#how">{{nav.how}}</a>
+    <a href="#features">{{nav.features}}</a>
+    <a href="#site">{{nav.more}}</a>
+    <a href="https://github.com/pigeonhole-project/pigeonhole">GitHub</a>
+    <a class="lang" href="{{nav.lang_href}}" hreflang="{{nav.lang_code}}">{{nav.lang}}</a>
+    <button class="theme" id="theme" type="button" aria-label="{{nav.theme}}">◐</button>
+  </div>
+</nav>
+
+<header class="hero">
+  <p class="kicker">{{hero.kicker}}</p>
+  <h1>{{hero.title}}</h1>
+  <p class="lede">{{hero.lede}}</p>
+  <div class="ctas">
+    <a class="btn primary" href="#stage">{{hero.cta_demo}}</a>
+    <a class="btn" href="https://github.com/pigeonhole-project/pigeonhole">{{hero.cta_code}}</a>
+  </div>
+</header>
+
+<section class="stage-wrap" id="stage">
+  <div class="stage" id="replay">
+    <div class="pane term">
+      <div class="pane-h"><span class="dots"><i></i><i></i><i></i></span>{{replay.terminal}}</div>
+      <div class="term-body" data-role="term"></div>
+    </div>
+    <div class="pane chat tg">
+      <div class="pane-h"><span class="avatar">P</span><div><b>pigeonhole-blobs</b><small>{{replay.tg_sub}}</small></div></div>
+      <div class="msgs" data-role="telegram"><p class="empty">{{replay.empty}}</p></div>
+    </div>
+    <div class="pane chat dc">
+      <div class="pane-h"><span class="hash">#</span><div><b>pigeonhole-blobs</b><small>{{replay.dc_sub}}</small></div></div>
+      <div class="msgs" data-role="discord"><p class="empty">{{replay.empty}}</p></div>
+    </div>
+    <div class="pane log">
+      <div class="pane-h">{{replay.log}} <small>{{replay.log_sub}}</small></div>
+      <div class="log-body" data-role="log"></div>
+    </div>
+    <div class="narration" data-role="say" aria-live="polite"></div>
+    <div class="controls">
+      <button type="button" data-act="play">{{replay.pause}}</button>
+      <button type="button" data-act="restart">↺ {{replay.restart}}</button>
+      <button type="button" data-act="speed">1×</button>
+      <span class="meta" data-role="meta"></span>
+    </div>
+  </div>
+  <p class="stage-note">{{replay.note}}</p>
+</section>
+
+<section id="how">
+  <h2>{{how.title}}</h2>
+  <p class="sub">{{how.sub}}</p>
+  <div class="steps4">
+    <div class="card"><span class="n">1</span><h3>{{how.1.t}}</h3><p>{{how.1.d}}</p></div>
+    <div class="card"><span class="n">2</span><h3>{{how.2.t}}</h3><p>{{how.2.d}}</p></div>
+    <div class="card"><span class="n">3</span><h3>{{how.3.t}}</h3><p>{{how.3.d}}</p></div>
+    <div class="card"><span class="n">4</span><h3>{{how.4.t}}</h3><p>{{how.4.d}}</p></div>
+  </div>
+</section>
+
+<section id="features">
+  <h2>{{feat.title}}</h2>
+  <div class="feats">
+    <div class="card"><h3>{{feat.s3.t}}</h3><p>{{feat.s3.d}}</p></div>
+    <div class="card"><h3>{{feat.stores.t}}</h3><p>{{feat.stores.d}}</p></div>
+    <div class="card"><h3>{{feat.groups.t}}</h3><p>{{feat.groups.d}}</p></div>
+    <div class="card"><h3>{{feat.log.t}}</h3><p>{{feat.log.d}}</p></div>
+    <div class="card"><h3>{{feat.heal.t}}</h3><p>{{feat.heal.d}}</p></div>
+    <div class="card"><h3>{{feat.raft.t}}</h3><p>{{feat.raft.d}}</p></div>
+    <div class="card"><h3>{{feat.obs.t}}</h3><p>{{feat.obs.d}}</p></div>
+    <div class="card"><h3>{{feat.sim.t}}</h3><p>{{feat.sim.d}}</p></div>
+  </div>
+</section>
+
+<section id="ontop">
+  <h2>{{ontop.title}}</h2>
+  <p class="sub">{{ontop.sub}}</p>
+  <div class="feats three">
+    <div class="card"><h3>{{ontop.etcd.t}}</h3><p>{{ontop.etcd.d}}</p><code>./demos/etcd-on-telegram/run.sh</code></div>
+    <div class="card"><h3>{{ontop.sqlite.t}}</h3><p>{{ontop.sqlite.d}}</p><code>./demos/sqlite-on-telegram/run.sh</code></div>
+    <div class="card"><h3>{{ontop.cond.t}}</h3><p>{{ontop.cond.d}}</p><code>./demos/conditional-writes/run.sh</code></div>
+  </div>
+</section>
+
+<section id="numbers">
+  <h2>{{num.title}}</h2>
+  <div class="tiles">
+    <div class="tile"><div class="v">{{@stat:rust}}</div><div class="l">{{num.rust}}</div></div>
+    <div class="tile"><div class="v">{{@stat:crates}}</div><div class="l">{{num.crates}}</div></div>
+    <div class="tile"><div class="v">{{@stat:tests}}</div><div class="l">{{num.tests}}</div></div>
+    <div class="tile"><div class="v">{{@stat:commits}}</div><div class="l">{{num.commits}}</div></div>
+    <div class="tile"><div class="v">{{@stat:days}}</div><div class="l">{{num.days}}</div></div>
+    <div class="tile"><div class="v">{{@stat:docs}}</div><div class="l">{{num.docs}}</div></div>
+  </div>
+</section>
+
+<section id="site">
+  <h2>{{more.title}}</h2>
+  <div class="feats">
+    <div class="card soon"><span class="badge">{{more.soon}}</span><h3>{{more.demos.t}}</h3><p>{{more.demos.d}}</p></div>
+    <div class="card soon"><span class="badge">{{more.soon}}</span><h3>{{more.inside.t}}</h3><p>{{more.inside.d}}</p></div>
+    <div class="card soon"><span class="badge">{{more.soon}}</span><h3>{{more.built.t}}</h3><p>{{more.built.d}}</p></div>
+    <div class="card soon"><span class="badge">{{more.soon}}</span><h3>{{more.article.t}}</h3><p>{{more.article.d}}</p></div>
+  </div>
+</section>
+
+<footer>
+  <p class="warn">⚠️ {{foot.warn}}</p>
+  <p>{{foot.license}}</p>
+</footer>
+
+<script>
+window.I18N = {{@js}};
+window.LANG = "{{@lang}}";
+window.TRACE = {{@trace:hero}};
+</script>
+<script src="{{@root}}assets/site.js"></script>
+<script src="{{@root}}assets/replay.js"></script>
+</body>
+</html>

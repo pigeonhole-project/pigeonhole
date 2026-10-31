@@ -1,0 +1,215 @@
+{
+ "name": "hero",
+ "recorded": "2026-10-31T01:16:05+00:00",
+ "commit": "b62c80f",
+ "config": {
+  "chunk": "4 MiB",
+  "cache": "true"
+ },
+ "steps": [
+  {
+   "t": 0.0,
+   "type": "cmd",
+   "text": "aws s3 mb s3://demo"
+  },
+  {
+   "t": 227.7,
+   "type": "log",
+   "first": 4,
+   "last": 4,
+   "bytes": 98
+  },
+  {
+   "t": 228.1,
+   "type": "commit",
+   "position": 4,
+   "entries": 1
+  },
+  {
+   "t": 228.6,
+   "type": "s3",
+   "op": "CreateBucket",
+   "bucket": "demo"
+  },
+  {
+   "t": 266.7,
+   "type": "out",
+   "text": "make_bucket: demo"
+  },
+  {
+   "t": 571.7,
+   "type": "cmd",
+   "text": "aws s3 cp photo.jpg s3://demo/"
+  },
+  {
+   "t": 818.5,
+   "type": "blob",
+   "store": "telegram",
+   "op": "put",
+   "bytes": 4194304,
+   "msg": 1,
+   "name": "ph-5e9a0ef4d5f941389ff3eacb1d2192ca.bin"
+  },
+  {
+   "t": 818.9,
+   "type": "blob",
+   "store": "discord",
+   "op": "put",
+   "bytes": 4194304,
+   "msg": 1,
+   "name": "ph-c36dbc8322ff45cb8db2d98195a6915f.bin"
+  },
+  {
+   "t": 825.9,
+   "type": "blob",
+   "store": "telegram",
+   "op": "put",
+   "bytes": 3145728,
+   "msg": 2,
+   "name": "ph-1a8f01a2ee6e456db9c149972b42e0b3.bin"
+  },
+  {
+   "t": 826.2,
+   "type": "blob",
+   "store": "discord",
+   "op": "put",
+   "bytes": 3145728,
+   "msg": 2,
+   "name": "ph-fb83cbd4e4a2421a983e17cd8f51632e.bin"
+  },
+  {
+   "t": 826.3,
+   "type": "log",
+   "first": 5,
+   "last": 5,
+   "bytes": 652
+  },
+  {
+   "t": 826.4,
+   "type": "commit",
+   "position": 5,
+   "entries": 3
+  },
+  {
+   "t": 826.4,
+   "type": "s3",
+   "op": "PutObject",
+   "bucket": "demo",
+   "key": "photo.jpg",
+   "size": 7340032,
+   "extents": 2,
+   "inline": false
+  },
+  {
+   "t": 869.9,
+   "type": "out",
+   "text": "upload: ./photo.jpg to s3://demo/photo.jpg"
+  },
+  {
+   "t": 1172.7,
+   "type": "cmd",
+   "text": "aws s3 cp notes.md s3://demo/"
+  },
+  {
+   "t": 1416.3,
+   "type": "blob",
+   "store": "telegram",
+   "op": "put",
+   "bytes": 352172,
+   "msg": 3,
+   "name": "ph-d602131c8cec43f68163884b6e0d62bb.bin"
+  },
+  {
+   "t": 1416.3,
+   "type": "blob",
+   "store": "discord",
+   "op": "put",
+   "bytes": 352172,
+   "msg": 3,
+   "name": "ph-da292850ca074b0f8f1e7808726adde9.bin"
+  },
+  {
+   "t": 1416.4,
+   "type": "log",
+   "first": 6,
+   "last": 6,
+   "bytes": 435
+  },
+  {
+   "t": 1416.5,
+   "type": "commit",
+   "position": 6,
+   "entries": 2
+  },
+  {
+   "t": 1416.5,
+   "type": "s3",
+   "op": "PutObject",
+   "bucket": "demo",
+   "key": "notes.md",
+   "size": 3163709,
+   "extents": 1,
+   "inline": false
+  },
+  {
+   "t": 1461.5,
+   "type": "out",
+   "text": "upload: ./notes.md to s3://demo/notes.md"
+  },
+  {
+   "t": 1766.6,
+   "type": "cmd",
+   "text": "aws s3 cp s3://demo/photo.jpg s3://demo/photo-copy.jpg"
+  },
+  {
+   "t": 2000.2,
+   "type": "log",
+   "first": 7,
+   "last": 7,
+   "bytes": 66
+  },
+  {
+   "t": 2000.2,
+   "type": "commit",
+   "position": 7,
+   "entries": 1
+  },
+  {
+   "t": 2000.2,
+   "type": "log",
+   "first": 8,
+   "last": 8,
+   "bytes": 211
+  },
+  {
+   "t": 2000.3,
+   "type": "commit",
+   "position": 8,
+   "entries": 1
+  },
+  {
+   "t": 2000.3,
+   "type": "s3",
+   "op": "CopyObject",
+   "from": "demo/photo.jpg",
+   "bucket": "demo",
+   "key": "photo-copy.jpg",
+   "extents": 2
+  },
+  {
+   "t": 2038.1,
+   "type": "out",
+   "text": "copy: s3://demo/photo.jpg to s3://demo/photo-copy.jpg"
+  },
+  {
+   "t": 2341.6,
+   "type": "cmd",
+   "text": "aws s3 ls s3://demo/"
+  },
+  {
+   "t": 2604.9,
+   "type": "out",
+   "text": "2026-10-31 02:16:04    3163709 notes.md\n2026-10-31 02:16:05    7340032 photo-copy.jpg\n2026-10-31 02:16:03    7340032 photo.jpg"
+  }
+ ]
+}
