@@ -322,11 +322,10 @@ impl Config {
             bail!("chunk.block_size exceeds MAX_LOGICAL_CHUNK");
         }
         let memory_budget = file.ingest.memory_budget;
-        if memory_budget < block_size.saturating_mul(2) {
-            bail!(
-                "ingest.memory_budget ({memory_budget}) must be >= 2 * chunk.block_size ({})",
-                block_size.saturating_mul(2)
-            );
+        // A chunk reserves its stored bytes and the block being filled.
+        let one_chunk = chunk_size.saturating_add(block_size);
+        if memory_budget < one_chunk {
+            bail!("ingest.memory_budget ({memory_budget}) must be >= chunk.size + chunk.block_size ({one_chunk})");
         }
         let ingest_budget = Some(ByteBudget::new(memory_budget));
 
@@ -1486,8 +1485,9 @@ max_batch_total_size = "8 MiB"
     }
 
     #[test]
-    fn rejects_memory_budget_below_two_blocks() {
-        let err = load_mem("[chunk]\nblock_size = \"1 MiB\"\n[ingest]\nmemory_budget = \"1 MiB\"\n").unwrap_err();
+    fn rejects_memory_budget_below_one_chunk() {
+        let err = load_mem("[chunk]\nsize = \"4 MiB\"\nblock_size = \"1 MiB\"\n[ingest]\nmemory_budget = \"4 MiB\"\n")
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("ingest.memory_budget"), "unexpected error: {msg}");
     }

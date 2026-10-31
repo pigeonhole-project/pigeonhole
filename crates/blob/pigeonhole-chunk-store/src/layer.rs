@@ -540,19 +540,16 @@ impl ChunkStore {
         Ok(Ingested { extents, size: total, md5, crc32, checksums, chunks: pending })
     }
 
-    /// Compress one block; its permit shrinks to the block's logical bytes.
+    /// Compress one block (never larger than it was: a block that does not
+    /// shrink is stored raw).
     async fn encode_block(
         &self,
         block_buf: &mut Vec<u8>,
-        block_permit: &mut Option<pigeonhole_codec::BudgetPermit>,
         codec: ChunkCodec,
         calls: &Arc<AtomicU64>,
     ) -> Result<EncodedBlock> {
         let logical = std::mem::take(block_buf);
         let logical_len = logical.len();
-        if let Some(p) = block_permit.as_mut() {
-            p.release_excess(p.bytes().saturating_sub(logical_len));
-        }
         let calls = calls.clone();
         let (stored, codec) = tokio::task::spawn_blocking(move || {
             calls.fetch_add(1, Ordering::Relaxed);
@@ -591,9 +588,19 @@ impl ChunkStore {
 
     /// Seal the open chunk: its upload finishes in the background (the
     /// writer's last part goes out now), and a new chunk opens.
+    /// Its reservation shrinks to the stored bytes and is returned when the
+    /// upload ends.
     fn start_seal(&self, open: &mut OpenChunk) -> Sealing {
         let writer = std::mem::replace(&mut open.writer, self.replicated.chunk_writer());
-        let upload = AbortOnDrop(Some(tokio::spawn(writer.finish())));
+        let mut permit = open.permit.take();
+        if let Some(p) = permit.as_mut() {
+            p.release_excess(p.bytes().saturating_sub(open.stored_len));
+        }
+        let upload = AbortOnDrop(Some(tokio::spawn(async move {
+            let sealed = writer.finish().await;
+            drop(permit);
+            sealed
+        })));
         let sealing = Sealing {
             upload,
             blocks: std::mem::take(&mut open.blocks),
@@ -669,6 +676,13 @@ impl<T> Drop for AbortOnDrop<T> {
 /// Cuts a stream into blocks and the blocks into chunks as the bytes come,
 /// within the memory budget. A chunk is closed by its stored bytes, so a
 /// compressible stream fills each message: messages are the scarce resource.
+///
+/// The budget is taken a chunk at a time: a chunk opens with a reservation
+/// for all it can hold (its stored bytes and the block being filled), so it
+/// never waits for memory half full and is never cut short for want of it.
+/// A feeder waits only holding chunks that are uploading, which return
+/// theirs without needing more: no deadlock. Outside the budget: the encoded
+/// block that opens a chunk while its reservation is awaited.
 struct BlockFeeder<'a> {
     store: &'a ChunkStore,
     /// Most stored (encoded) bytes in a chunk: `chunk.size`.
@@ -679,9 +693,11 @@ struct BlockFeeder<'a> {
     codec: ChunkCodec,
     calls: Arc<AtomicU64>,
     budget: Option<ByteBudget>,
-    /// The block being filled, and the memory it holds.
+    size_hint: Option<u64>,
+    /// Logical bytes in chunks already sealed.
+    sealed_logical: u64,
+    /// The block being filled.
     block: Vec<u8>,
-    permit: Option<pigeonhole_codec::BudgetPermit>,
     open: OpenChunk,
     /// Sealed, uploading, in the order they were sealed.
     sealing: VecDeque<Sealing>,
@@ -701,8 +717,9 @@ impl<'a> BlockFeeder<'a> {
             codec: opts.codec,
             calls: opts.compress_calls.unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
             budget: opts.memory_budget,
+            size_hint: opts.size_hint,
+            sealed_logical: 0,
             block: Vec::with_capacity(block_size),
-            permit: None,
             open: OpenChunk::new(store.replicated.chunk_writer()),
             sealing: VecDeque::new(),
             extents: Vec::new(),
@@ -712,9 +729,7 @@ impl<'a> BlockFeeder<'a> {
 
     async fn feed(&mut self, mut rest: &[u8]) -> Result<()> {
         while !rest.is_empty() {
-            if self.block.is_empty() {
-                self.reserve_block().await?;
-            }
+            self.reserve_chunk().await?;
             let take = (self.block_size - self.block.len()).min(rest.len());
             self.block.extend_from_slice(&rest[..take]);
             rest = &rest[take..];
@@ -725,25 +740,27 @@ impl<'a> BlockFeeder<'a> {
         Ok(())
     }
 
-    /// Memory for the next block. Under pressure the open chunk is sealed
-    /// first, so its parts can upload and free theirs.
-    async fn reserve_block(&mut self) -> Result<()> {
-        let Some(budget) = self.budget.clone() else { return Ok(()) };
-        if budget.available_permits() < self.block_size && self.open.logical > 0 {
-            self.seal().await?;
+    /// The open chunk's reservation, unless it has one: all the chunk can
+    /// hold, or what is left of a body of known length.
+    async fn reserve_chunk(&mut self) -> Result<()> {
+        let Some(budget) = &self.budget else { return Ok(()) };
+        if self.open.permit.is_some() {
+            return Ok(());
         }
-        self.permit = Some(budget.acquire(self.block_size).await?);
+        let full = (self.chunk_stored + self.block_size) as u64;
+        let left = self.size_hint.map_or(full, |n| n.saturating_sub(self.sealed_logical));
+        let n = full.min(left).min(budget.capacity() as u64) as usize;
+        self.open.permit = Some(budget.acquire(n).await?);
         Ok(())
     }
 
     async fn push_block(&mut self) -> Result<()> {
-        let block = self.store.encode_block(&mut self.block, &mut self.permit, self.codec, &self.calls).await?;
+        let block = self.store.encode_block(&mut self.block, self.codec, &self.calls).await?;
         if !self.open.blocks.is_empty() && self.open.stored_len + block.stored.len() > self.chunk_stored {
             self.seal().await?;
+            self.reserve_chunk().await?;
         }
         self.store.push_encoded(&mut self.open, block).await?;
-        // Pushed: the block's bytes live in the packers now.
-        self.permit = None;
         if self.open.stored_len >= self.chunk_stored || self.open.logical >= self.chunk_logical {
             self.seal().await?;
         }
@@ -753,6 +770,7 @@ impl<'a> BlockFeeder<'a> {
     /// Seal the open chunk, its upload in the background; with too many
     /// uploading, wait for the oldest first.
     async fn seal(&mut self) -> Result<()> {
+        self.sealed_logical += self.open.logical as u64;
         let sealing = self.store.start_seal(&mut self.open);
         self.sealing.push_back(sealing);
         while self.sealing.len() > SEALING_IN_FLIGHT {
@@ -791,11 +809,13 @@ struct OpenChunk {
     stored: Vec<Bytes>,
     logical: i64,
     stored_len: usize,
+    /// Its share of the ingest budget (see [`BlockFeeder`]).
+    permit: Option<pigeonhole_codec::BudgetPermit>,
 }
 
 impl OpenChunk {
     fn new(writer: pigeonhole_blob::ChunkReplicaWriter) -> Self {
-        Self { writer, blocks: Vec::new(), stored: Vec::new(), logical: 0, stored_len: 0 }
+        Self { writer, blocks: Vec::new(), stored: Vec::new(), logical: 0, stored_len: 0, permit: None }
     }
 }
 
@@ -1233,8 +1253,8 @@ mod tests {
         assert_eq!(budget.available_permits(), budget.capacity());
     }
 
-    /// 64 parallel 8 MiB PUTs sharing a budget of only `4 * block_size` must
-    /// finish (whole-frame acquire prevents fragment deadlock).
+    /// 64 parallel 8 MiB PUTs sharing a budget smaller than one chunk's
+    /// reservation must finish: a chunk takes it whole, so none waits holding a part.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn parallel_puts_whole_frame_budget_no_deadlock() {
         let frame = 512 * 1024;
@@ -1270,6 +1290,80 @@ mod tests {
         .await;
         assert!(result.is_ok(), "64 parallel 8 MiB PUTs under 4*block_size budget timed out");
         assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
+    /// A tight shared budget makes PUTs wait for it, not cut their chunks
+    /// short: every chunk but a body's last fills `chunk.size`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tight_budget_does_not_underfill_chunks() {
+        const KIB: usize = 1024;
+        // One chunk's reservation: before, the PUTs' blocks used it up and
+        // each cut its chunk short to "free" memory it did not hold.
+        let budget = ByteBudget::new(1024 * KIB + 256 * KIB);
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let mut opts = IngestOptions::new(1024 * KIB, ChunkCodec::Zstd);
+        opts.block_size = 256 * KIB;
+        opts.memory_budget = Some(budget.clone());
+        let layer = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
+        let mut joins = Vec::new();
+        for _ in 0..16 {
+            let layer = layer.clone();
+            let body = noise(2 * 1024 * KIB + 100 * KIB);
+            joins.push(tokio::spawn(async move {
+                let pieces: Vec<_> = body.chunks(64 * KIB).map(Bytes::copy_from_slice).collect();
+                // A client's body comes in pieces with waits between them.
+                let body = stream::iter(pieces).then(|p| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    Ok::<_, anyhow::Error>(p)
+                });
+                layer.ingest_and_commit(Box::pin(body), None).await.unwrap()
+            }));
+        }
+        for j in joins {
+            let ingested = j.await.unwrap();
+            let (last, full) = ingested.extents.split_last().unwrap();
+            for ext in full {
+                let layouts = layer.db().get_replica_layouts(ext.chunk).await.unwrap();
+                let stored: u32 = layouts[0].parts.iter().flat_map(|p| &p.block_stored_lens).sum();
+                assert_eq!(stored as usize, 1024 * KIB, "chunk {} cut short", ext.chunk);
+            }
+            assert_eq!(last.len as usize, 100 * KIB);
+        }
+        assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
+    /// A body of known length reserves what it has, not a whole chunk.
+    #[tokio::test]
+    async fn a_size_hint_bounds_the_reservation() {
+        const KIB: usize = 1024;
+        let budget = ByteBudget::new(4 * 1024 * KIB);
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let mut opts = IngestOptions::new(1024 * KIB, ChunkCodec::Zstd);
+        opts.block_size = 64 * KIB;
+        opts.memory_budget = Some(budget.clone());
+        let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts.clone()).await.unwrap();
+        for (hint, held) in [(None, 1024 * KIB + 64 * KIB), (Some(200 * KIB as u64), 200 * KIB)] {
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let data = noise(200 * KIB);
+            let body = {
+                let (budget, seen) = (budget.clone(), seen.clone());
+                stream::iter(data.chunks(50 * KIB).map(Bytes::copy_from_slice)).map(move |p| {
+                    seen.fetch_max(budget.capacity() - budget.available_permits(), Ordering::SeqCst);
+                    Ok::<_, anyhow::Error>(p)
+                })
+            };
+            let mut o = opts.clone();
+            o.size_hint = hint;
+            layer.ingest_and_commit(body, Some(o)).await.unwrap();
+            assert_eq!(seen.load(Ordering::SeqCst), held, "hint {hint:?}");
+            assert_eq!(budget.available_permits(), budget.capacity());
+        }
     }
 
     #[tokio::test]

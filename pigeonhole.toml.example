@@ -109,7 +109,11 @@ cool_every = "1m"
 cool_batch = 64
 
 [ingest]
-# Process-wide cap on ingest buffers across concurrent PUTs (default 256 MiB).
+# Process-wide cap on chunks being filled or uploaded, across concurrent PUTs
+# (default 256 MiB). A chunk reserves chunk.size + block_size when it opens
+# (less for a body of known length) and returns it once uploaded; a PUT that
+# finds the budget spent waits, it never sends a chunk half full. Must be at
+# least chunk.size + block_size.
 memory_budget = "256 MiB"
 
 [telegram]

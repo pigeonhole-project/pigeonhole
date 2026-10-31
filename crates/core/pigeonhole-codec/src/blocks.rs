@@ -101,8 +101,8 @@ impl std::fmt::Debug for BudgetPermit {
 
 /// Process-wide byte budget for ingest buffers (Semaphore permits = bytes).
 ///
-/// Permits are taken for a whole frame at a time; sealed chunks carry their
-/// permits until uploaded and dropped.
+/// The chunk store takes a whole chunk's share at once and holds it until
+/// the chunk is uploaded; [`BlockWriter`] takes a whole frame at a time.
 #[derive(Clone, Debug)]
 pub struct ByteBudget {
     sem: Arc<Semaphore>,

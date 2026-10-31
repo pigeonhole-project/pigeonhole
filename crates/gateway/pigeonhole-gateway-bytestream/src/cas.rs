@@ -127,6 +127,7 @@ impl CasStore {
 
         let mut opts = IngestOptions::new(self.chunk_size, ChunkCodec::Zstd);
         opts.block_size = 1024 * 1024;
+        opts.size_hint = u64::try_from(size).ok();
         let mut ingested = self.store.ingest(stream, Some(opts)).await.context("CAS ingest")?;
         if ingested.size != size {
             // Nothing committed: the parts are orphans for the sweeper.
