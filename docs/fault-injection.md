@@ -166,7 +166,9 @@ What was built differs from the plan above in a few places:
 - Scenarios (`crates/testing/pigeonhole-sim/tests`): the log model check
   (memory and simulated disk, mild and harsh plans), a takeover under load, a
   power failure with a torn write, `sweep_stress` over S3 under faults with a
-  restart, and the same with two replicas, one of them damaged.
+  restart, the same with two replicas, one of them damaged, and the cooler
+  racing rewrites and deletes of the inline objects it moves out over a
+  slow store (docs/inline-objects.md § The cooler).
 
 Left for later: outages, slow visibility, cancellation, lost blobs; the
 tablet over faulty log and snapshot stores; snapshots and restore under
