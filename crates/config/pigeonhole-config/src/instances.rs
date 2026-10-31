@@ -43,6 +43,8 @@ pub struct InstanceConfig {
     pub max_blob_size: Option<usize>,
     /// `telegram`: how each bot logs in, as `bot_tokens`.
     pub telegram: Vec<TelegramLogin>,
+    /// A fake channel stands in for the service (builds with feature `fake`).
+    pub fake: Option<crate::stores::FakeBacking>,
 }
 
 /// A Telegram bot logged in over MTProto, resolved from `[[store]]` and the
@@ -124,6 +126,7 @@ pub fn memory_instance(id: &str) -> InstanceConfig {
         scope_id: "local".into(),
         max_blob_size: None,
         telegram: Vec::new(),
+        fake: None,
     }
 }
 
@@ -194,6 +197,7 @@ mod tests {
             scope_id: "-100".into(),
             max_blob_size: None,
             telegram: Vec::new(),
+            fake: None,
         };
         let mut b = a.clone();
         b.info.id = "b".into();
@@ -216,6 +220,7 @@ mod tests {
             scope_id: "-100".into(),
             max_blob_size: None,
             telegram: Vec::new(),
+            fake: None,
         };
         let mut b = a.clone();
         b.info.id = "ro".into();
@@ -240,6 +245,7 @@ mod tests {
             scope_id: "-100".into(),
             max_blob_size: None,
             telegram: Vec::new(),
+            fake: None,
         };
         let err = check_fingerprints(&[cfg], &[("tg-main".into(), "tg:9:-100".into())]).unwrap_err();
         assert!(err.to_string().contains("fingerprint mismatch"));

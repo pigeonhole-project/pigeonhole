@@ -26,6 +26,7 @@ pub struct Runtime {
 /// The configured metadata log (`[meta] log`).
 pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
     Ok(match &cfg.meta.log {
+        LogSettings::Fake { .. } => anyhow::bail!("[meta] log is a fake channel: this build has no fake channels"),
         LogSettings::Memory => {
             warn!("metadata log in memory: everything is gone when the process exits");
             Arc::new(ChainLogStore::new(Arc::new(MemoryBlobStore::new())))
@@ -60,6 +61,9 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
 /// The configured snapshot store (`[meta] snapshot`).
 pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStore>> {
     Ok(match &cfg.meta.snapshot {
+        SnapshotSettings::Fake { .. } => {
+            anyhow::bail!("[meta] snapshot is a fake channel: this build has no fake channels")
+        }
         SnapshotSettings::LocalDisk { path } => Arc::new(BlobSnapshotStore::new(Arc::new(
             DiskBlobStore::open(path.join("snapshots"))
                 .with_context(|| format!("open local snapshots {}", path.display()))?,
@@ -231,6 +235,9 @@ async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {
 /// One blob store as a placement member.
 async fn build_member(cfg: &Config, inst: &InstanceConfig) -> anyhow::Result<SharedBackend> {
     let id = &inst.info.id;
+    if inst.fake.is_some() {
+        anyhow::bail!("store {id:?} is a fake channel: this build has no fake channels");
+    }
     Ok(match inst.kind {
         InstanceKind::Memory => {
             warn!("memory instance {id}: in-process MemoryBlobStore (data does not survive the process)");

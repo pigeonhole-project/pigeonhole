@@ -39,6 +39,8 @@ pub(crate) enum FileStore {
         /// The MTProto session file of a store with one bot; default
         /// `pigeonhole-tg-<bot id>.session`, one per bot, shared by its stores.
         session: Option<PathBuf>,
+        /// A fake channel instead of Telegram (builds with feature `fake`).
+        fake: Option<String>,
     },
     Discord {
         id: String,
@@ -47,6 +49,8 @@ pub(crate) enum FileStore {
         bot_token_envs: Option<Vec<String>>,
         #[serde(default, deserialize_with = "crate::units::opt_size")]
         max_blob_size: Option<usize>,
+        /// A fake channel instead of Discord (builds with feature `fake`).
+        fake: Option<String>,
     },
 }
 
@@ -63,6 +67,9 @@ impl FileStore {
     /// The store, with its secrets read from the environment.
     fn resolve(self) -> Result<Store> {
         let id = self.id().to_string();
+        if let Some(fake) = self.fake_channel(&id)? {
+            return Ok(fake);
+        }
         Ok(match self {
             FileStore::LocalDisk { path, .. } => Store::LocalDisk { path },
             FileStore::Memory { .. } => Store::Memory,
@@ -98,6 +105,51 @@ impl FileStore {
             }
         })
     }
+}
+
+impl FileStore {
+    /// A telegram or discord store with `fake`: a channel without the
+    /// service, no bots and no secrets.
+    fn fake_channel(&self, id: &str) -> Result<Option<Store>> {
+        let (kind, scope, fake, bots) = match self {
+            FileStore::Telegram {
+                chat_id,
+                fake: Some(fake),
+                bot_token_envs,
+                api_id_env,
+                api_hash_env,
+                session,
+                ..
+            } => (
+                InstanceKind::Telegram,
+                chat_id.to_string(),
+                fake,
+                bot_token_envs.is_some() || api_id_env.is_some() || api_hash_env.is_some() || session.is_some(),
+            ),
+            FileStore::Discord { channel_id, fake: Some(fake), bot_token_envs, .. } => {
+                (InstanceKind::Discord, channel_id.to_string(), fake, bot_token_envs.is_some())
+            }
+            _ => return Ok(None),
+        };
+        if !cfg!(feature = "fake") {
+            bail!("[[store]] {id}: `fake` channels are only in builds with the `fake` feature");
+        }
+        if bots {
+            bail!("[[store]] {id}: a fake channel has no bots: drop bot_token_envs, api_id_env, api_hash_env, session");
+        }
+        let backing = match fake.as_str() {
+            "memory" => FakeBacking::Memory,
+            other => bail!("[[store]] {id}: fake = {other:?}: only \"memory\" for now"),
+        };
+        Ok(Some(Store::Fake { kind, scope, backing }))
+    }
+}
+
+/// Where a fake channel keeps its messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FakeBacking {
+    /// Process memory: gone with the process.
+    Memory,
 }
 
 /// The env vars of a store's bots: `default` if unset, never none.
@@ -163,6 +215,12 @@ pub enum Store {
         max_blob_size: Option<usize>,
     },
     Memory,
+    /// A telegram or discord store on a fake channel (`fake = …`).
+    Fake {
+        kind: InstanceKind,
+        scope: String,
+        backing: FakeBacking,
+    },
 }
 
 impl Store {
@@ -173,6 +231,7 @@ impl Store {
             Store::Discord { channel_id, .. } => Some(discord_location(channel_id)),
             Store::LocalDisk { path } => Some(local_disk_location(path)),
             Store::Memory => None,
+            Store::Fake { kind, scope, .. } => Some(fake_location(*kind, scope)),
         }
     }
 
@@ -390,6 +449,16 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
             local_disk_location(path),
             None,
         ),
+        // Marked `fake:` so that a real binary never takes its chunks for its own.
+        Store::Fake { kind, scope, .. } => (
+            *kind,
+            Vec::new(),
+            Vec::new(),
+            scope.clone(),
+            fake_location(*kind, scope),
+            fake_location(*kind, scope),
+            None,
+        ),
     };
     Ok(InstanceConfig {
         kind,
@@ -405,5 +474,14 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
         scope_id,
         max_blob_size,
         telegram,
+        fake: match store {
+            Store::Fake { backing, .. } => Some(backing.clone()),
+            _ => None,
+        },
     })
+}
+
+/// Fingerprint and location of a fake channel.
+fn fake_location(kind: InstanceKind, scope: &str) -> String {
+    format!("fake:{}:{scope}", kind.as_str())
 }

@@ -188,6 +188,8 @@ pub enum SnapshotSettings {
     Telegram { chat_id: String, logins: Vec<TelegramLogin> },
     /// A dedicated Discord channel (a chain over threads; docs/discord-log.md).
     Discord { channel_id: String, bot_tokens: Vec<String>, max_blob_size: Option<usize> },
+    /// A fake telegram or discord channel (builds with feature `fake`).
+    Fake { kind: InstanceKind, scope: String, backing: crate::stores::FakeBacking },
 }
 
 /// Where the command log lives (`[meta] log`).
@@ -202,12 +204,14 @@ pub enum LogSettings {
     Telegram { chat_id: String, logins: Vec<TelegramLogin> },
     /// A dedicated Discord channel, fenced by threads (docs/discord-log.md).
     Discord { channel_id: String, bot_tokens: Vec<String>, max_blob_size: Option<usize> },
+    /// A fake telegram or discord channel (builds with feature `fake`).
+    Fake { kind: InstanceKind, scope: String, backing: crate::stores::FakeBacking },
 }
 
 impl LogSettings {
     /// The log lives off this host (a chat), so its snapshots must too.
     fn off_host(&self) -> bool {
-        matches!(self, LogSettings::Telegram { .. } | LogSettings::Discord { .. })
+        matches!(self, LogSettings::Telegram { .. } | LogSettings::Discord { .. } | LogSettings::Fake { .. })
     }
 }
 
@@ -233,8 +237,10 @@ impl MetaSettings {
             (LogSettings::LocalDisk { .. }, SnapshotSettings::Telegram { .. } | SnapshotSettings::Discord { .. }) => {
                 true
             }
-            (LogSettings::LocalDisk { .. }, SnapshotSettings::Memory) => false,
+            // A fake channel in memory is gone with the process.
+            (LogSettings::LocalDisk { .. }, SnapshotSettings::Memory | SnapshotSettings::Fake { .. }) => false,
             (LogSettings::Telegram { .. } | LogSettings::Discord { .. } | LogSettings::Memory, _) => false,
+            (LogSettings::Fake { .. }, _) => false,
         }
     }
 }
@@ -310,7 +316,13 @@ impl Config {
     /// never pick up a developer's real `.env`.
     pub fn load_from_path(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
-        let file: FileConfig = toml::from_str(&text).with_context(|| format!("parse TOML {}", path.display()))?;
+        Self::from_toml(&text, path)
+    }
+
+    /// The config in `text`, as if read from `path` (relative paths and
+    /// messages name it); secrets from the environment as it is.
+    pub fn from_toml(text: &str, path: &Path) -> Result<Self> {
+        let file: FileConfig = toml::from_str(text).with_context(|| format!("parse TOML {}", path.display()))?;
         Self::from_file(file, path.to_path_buf())
     }
 
@@ -592,6 +604,9 @@ impl FileMeta {
                 bot_tokens: bot_tokens.clone(),
                 max_blob_size: *max_blob_size,
             },
+            Store::Fake { kind, scope, backing } => {
+                LogSettings::Fake { kind: *kind, scope: scope.clone(), backing: backing.clone() }
+            }
         };
         let snapshot_store = match &self.snapshot {
             Some(id) => topology.meta_store(id, "[meta] snapshot")?,
@@ -605,6 +620,7 @@ impl FileMeta {
             Store::Discord { channel_id, bot_tokens, max_blob_size, .. } => {
                 SnapshotSettings::Discord { channel_id, bot_tokens, max_blob_size }
             }
+            Store::Fake { kind, scope, backing } => SnapshotSettings::Fake { kind, scope, backing },
         };
         match (&log, &snapshot) {
             (log, SnapshotSettings::LocalDisk { .. } | SnapshotSettings::Memory) if log.off_host() => bail!(
@@ -1416,6 +1432,66 @@ max_blob_size = "8 MiB"
         assert_eq!(inst.kind, InstanceKind::Discord);
         assert_eq!(inst.scope_id, "123456789");
         assert_eq!(inst.max_blob_size, Some(8388608));
+    }
+
+    const FAKE_CHANNELS: &str = r#"
+[meta]
+log = "tg-log"
+snapshot = "tg-snap"
+[chunk]
+store = "both"
+[[replicas]]
+id = "both"
+members = ["tg", "dc"]
+write_quorum = 2
+[[store]]
+id = "tg"
+kind = "telegram"
+chat_id = -1001
+fake = "memory"
+[[store]]
+id = "dc"
+kind = "discord"
+channel_id = 77
+fake = "memory"
+[[store]]
+id = "tg-log"
+kind = "telegram"
+chat_id = -1002
+fake = "memory"
+[[store]]
+id = "tg-snap"
+kind = "telegram"
+chat_id = -1003
+fake = "memory"
+"#;
+
+    #[cfg(not(feature = "fake"))]
+    #[test]
+    fn fake_channels_are_refused_without_the_feature() {
+        let err = format!("{:#}", load(FAKE_CHANNELS).unwrap_err());
+        assert!(err.contains("only in builds with the `fake` feature"), "{err}");
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn fake_channels_need_no_secrets_and_are_marked() {
+        let cfg = Config::from_toml(FAKE_CHANNELS, Path::new("demo.toml")).unwrap();
+        let tg = cfg.instances.iter().find(|i| i.info.id == "tg").unwrap();
+        assert_eq!((tg.kind, tg.scope_id.as_str()), (InstanceKind::Telegram, "-1001"));
+        assert_eq!(tg.info.fingerprint, "fake:telegram:-1001");
+        assert!(tg.telegram.is_empty() && tg.bot_tokens.is_empty());
+        assert_eq!(tg.fake, Some(stores::FakeBacking::Memory));
+        assert!(matches!(cfg.meta.log, LogSettings::Fake { kind: InstanceKind::Telegram, .. }));
+        assert!(matches!(cfg.meta.snapshot, SnapshotSettings::Fake { .. }));
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn a_fake_channel_has_no_bots() {
+        let text = FAKE_CHANNELS.replacen("fake = \"memory\"", "fake = \"memory\"\nbot_token_envs = [\"X\"]", 1);
+        let err = format!("{:#}", Config::from_toml(&text, Path::new("demo.toml")).unwrap_err());
+        assert!(err.contains("a fake channel has no bots"), "{err}");
     }
 
     #[test]
