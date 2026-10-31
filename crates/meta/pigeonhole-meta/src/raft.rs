@@ -34,6 +34,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch};
+use tracing::Instrument;
 
 openraft::declare_raft_types!(
     /// The tablet's Raft types: a batch of commands in, their encoded
@@ -195,7 +196,7 @@ impl LogAdapter {
             shared,
             tx,
         };
-        tokio::spawn(this.clone().write_loop(gen, snapshots, keep, rx));
+        tokio::spawn(this.clone().write_loop(gen, snapshots, keep, rx).in_current_span());
         this
     }
 
