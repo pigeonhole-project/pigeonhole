@@ -9,6 +9,8 @@
 mod backend;
 mod chain;
 mod error;
+#[cfg(feature = "fake")]
+pub mod fake;
 mod stream;
 pub mod text;
 
