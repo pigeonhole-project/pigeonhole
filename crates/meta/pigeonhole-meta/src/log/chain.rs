@@ -244,11 +244,14 @@ struct State<Id> {
     owner: Option<Owner<Id>>,
     /// What the last `discover` found (reads by a handle that did not claim).
     seen: Option<(LogId, Tip<Id>)>,
+    /// The chain's tail as last read (by `discover`, or a claim fenced by
+    /// it): the next claim puts after it without looking for it again.
+    tail: Option<Id>,
 }
 
 impl<Id> Default for State<Id> {
     fn default() -> Self {
-        Self { owner: None, seen: None }
+        Self { owner: None, seen: None, tail: None }
     }
 }
 
@@ -697,7 +700,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         }
         // What `make` decided, for the last call (it may run more than once).
         enum Made<Id> {
-            Fenced(u64),
+            Fenced(u64, Id),
             Claim { log_id: LogId, position: Position, doc: Box<ChainDoc<Id>>, crc: u32 },
         }
         let made: Mutex<Option<Made<C::Id>>> = Mutex::new(None);
@@ -710,8 +713,8 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
                     (doc.log_id, Tip::of(&doc, at), doc.gen)
                 }
             };
-            if tail_gen >= gen {
-                *made.lock().unwrap() = Some(Made::Fenced(tail_gen));
+            if let Some((id, _)) = tail.filter(|_| tail_gen >= gen) {
+                *made.lock().unwrap() = Some(Made::Fenced(tail_gen, id.clone()));
                 return Ok(None);
             }
             let doc = ChainDoc {
@@ -732,9 +735,13 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             Ok(Some(Bytes::from(bytes)))
         };
         let sent = Instant::now();
-        let won = self.chain.put_after_tail(&label(Kind::Claim, gen), &make).await?;
+        let hint = self.state.lock().unwrap().tail.take();
+        let won = self.chain.put_after_tail(hint.as_ref(), &label(Kind::Claim, gen), &make).await?;
         match (won, made.into_inner().unwrap()) {
-            (None, Some(Made::Fenced(current))) => Err(LogError::Fenced { current }),
+            (None, Some(Made::Fenced(current, tail))) => {
+                self.state.lock().unwrap().tail = Some(tail);
+                Err(LogError::Fenced { current })
+            }
             (Some(id), Some(Made::Claim { log_id, position, doc, crc })) => {
                 let held = self.lease.as_ref().map(|_| (id.clone(), sent));
                 let tip = Tip::of(&doc, Prev { id, crc });
@@ -833,7 +840,11 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             vote: tip.vote.clone(),
             gen: doc.gen,
         };
-        self.state.lock().unwrap().seen = Some((doc.log_id, tip));
+        let mut state = self.state.lock().unwrap();
+        state.seen = Some((doc.log_id, tip));
+        // A lease log's claim reads the tail its own way (after the lease).
+        state.tail = self.lease.is_none().then_some(tail.id);
+        drop(state);
         Ok(Some(found))
     }
 

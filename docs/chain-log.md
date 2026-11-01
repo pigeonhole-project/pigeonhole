@@ -106,7 +106,12 @@ chain, and the tail is the newest winner.
   → read the winner's meta: a claim or batch of a generation ≥ `g` →
   `Fenced { current }`; else retry from the new tail. `Won` → every older
   writer's next `put_after` names a `prev` that already has a successor, and
-  loses. The head is the last batch before the claim.
+  loses. The head is the last batch before the claim. `T` is the tail the
+  handle's `discover` just read (or a fenced claim read), not looked up
+  again: on Telegram, one probe per boot instead of two; a stale `T` loses
+  and the claim reads the tail. A boot needs no `confirm` after it: Raft
+  serves nothing before it applied its leader's first entry, linked after
+  the claim.
 - **append(g, entries)**: `put_after(head, Batch)`; `Won` → committed, new
   head; `Lost { winner }` → `Fenced { current: winner's gen }`.
 - **truncate(g, from)** and **save_vote(g, vote)**: a batch with `first = from`

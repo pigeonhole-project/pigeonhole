@@ -635,7 +635,9 @@ impl MetaStore {
                 .await
                 .map_err(|e| self.stopped_by(e))
                 .context("boot the tablet")?;
-            return self.confirm_active().await.context("boot the tablet");
+            // Leading proves the generation too: Raft serves no read before
+            // it applied its leader's first entry, linked after our claim.
+            return self.confirm_leading().await.context("boot the tablet");
         }
         self.raft
             .wait(Some(opts.election_timeout.1 * 20))
@@ -757,6 +759,21 @@ impl MetaStore {
     /// since. `Err` = fenced or stopped. Call it right before a side effect
     /// the log cannot undo, such as deleting backend blobs.
     pub async fn confirm_active(&self) -> Result<()> {
+        self.confirm_leading().await?;
+        match self.log.confirm(self.gen).await {
+            Ok(()) => Ok(()),
+            Err(LogError::Fenced { current }) => {
+                let stop = Stop::Fenced { current };
+                self.shared.stop.send_replace(Some(stop.clone()));
+                Err(stop.into())
+            }
+            Err(e) => Err(anyhow::Error::new(e).context("confirm the log's generation")),
+        }
+    }
+
+    /// Raft confirms the tablet leads and has applied everything. Not the
+    /// log: a newer claim since this node's last write goes unseen.
+    async fn confirm_leading(&self) -> Result<()> {
         if let Some(stop) = self.stop.borrow().clone() {
             return Err(stop.into());
         }
@@ -772,15 +789,7 @@ impl MetaStore {
             }
             Err(e) => return Err(self.stopped_by(e)),
         }
-        match self.log.confirm(self.gen).await {
-            Ok(()) => Ok(()),
-            Err(LogError::Fenced { current }) => {
-                let stop = Stop::Fenced { current };
-                self.shared.stop.send_replace(Some(stop.clone()));
-                Err(stop.into())
-            }
-            Err(e) => Err(anyhow::Error::new(e).context("confirm the log's generation")),
-        }
+        Ok(())
     }
 
     /// Whether the tablet has stopped (fenced or failed).

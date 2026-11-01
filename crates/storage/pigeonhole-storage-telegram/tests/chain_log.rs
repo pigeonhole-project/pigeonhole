@@ -264,3 +264,52 @@ async fn snapshots_after_the_last_post_no_probes() {
     let fresh = BlobSnapshotStore::new(channel_store(&channel));
     assert_eq!(fresh.newest().await.unwrap(), Some(snap(5)));
 }
+
+fn probes(channel: &FakeChannel) -> usize {
+    channel.names().iter().filter(|(_, n)| n.starts_with("chain-probe.bin")).count()
+}
+
+/// A boot learns the top once: the claim goes after the tail `discover`
+/// found, without a probe of its own. (The first claim of a log looks for
+/// the tail itself: nothing found is no hint.)
+#[tokio::test]
+async fn a_boot_posts_one_probe() {
+    let channel = Arc::new(FakeChannel::new(77));
+    for gen in 1..=3 {
+        let before = probes(&channel);
+        let a = store(&channel);
+        let known = a.discover().await.unwrap().map_or(0, |d| d.gen);
+        assert_eq!(known, gen - 1);
+        a.claim(gen).await.unwrap();
+        a.append(gen, &[entry(gen)]).await.unwrap();
+        let expected = if gen == 1 { 2 } else { 1 };
+        assert_eq!(probes(&channel), before + expected, "boot {gen}: {:?}", channel.names());
+    }
+    assert_eq!(history(store(&channel).as_ref()).await, vec![1, 2, 3]);
+}
+
+/// Another claim between `discover` and the claim: the claim loses after
+/// the stale tail, reads the tail again, is fenced, and the next generation
+/// goes after that tail with no further probe.
+#[tokio::test]
+async fn a_claim_after_a_stale_tail_is_fenced_and_the_next_goes_on() {
+    let channel = Arc::new(FakeChannel::new(77));
+    let first = store(&channel);
+    first.claim(1).await.unwrap();
+    first.append(1, &[entry(1)]).await.unwrap();
+
+    let a = store(&channel);
+    assert_eq!(a.discover().await.unwrap().unwrap().gen, 1);
+    let b = store(&channel);
+    b.discover().await.unwrap();
+    b.claim(2).await.unwrap();
+    b.append(2, &[entry(2)]).await.unwrap();
+
+    assert!(matches!(a.claim(2).await, Err(LogError::Fenced { current: 2 })));
+    let before = probes(&channel);
+    assert_eq!(a.claim(3).await.unwrap().position, 2);
+    assert_eq!(probes(&channel), before, "after the tail the fenced claim read: {:?}", channel.names());
+    a.append(3, &[entry(3)]).await.unwrap();
+    assert!(matches!(b.append(2, &[entry(99)]).await, Err(LogError::Fenced { current: 3 })));
+    assert_eq!(history(store(&channel).as_ref()).await, vec![1, 2, 3]);
+}
