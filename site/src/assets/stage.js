@@ -1,5 +1,5 @@
 // The stage: a terminal, two channels, the metadata log and a sentence.
-// Used by replay.js (a recorded trace) and try.js (pigeonhole live in wasm).
+// Used by replay.js (a recorded trace).
 
 // Server log lines (tracing JSON) → stage steps; a recording (site/record.py)
 // and a live run look alike. Posts come from the Telegram / Discord stores'
