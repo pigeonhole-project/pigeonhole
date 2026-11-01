@@ -34,7 +34,7 @@ pub struct DcAttachment {
 }
 
 /// What starting a thread from a message did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThreadStart {
     Created,
     /// The message already has a thread (code 160004).
@@ -95,4 +95,39 @@ pub trait DiscordApi: Send + Sync + 'static {
     /// Bytes `[start, end)` of an attachment (all of it for `None`);
     /// [`CdnStale`] when the URL expired.
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes>;
+}
+
+/// One channel shared by several stores (a pool member, a restart).
+#[async_trait]
+impl<A: DiscordApi + ?Sized> DiscordApi for std::sync::Arc<A> {
+    fn channel_id(&self) -> u64 {
+        (**self).channel_id()
+    }
+    async fn send(&self, content: &str, file: Option<(&str, Bytes)>, nonce: &str) -> Result<DcMessage> {
+        (**self).send(content, file, nonce).await
+    }
+    async fn get_message(&self, id: u64) -> Result<Option<DcMessage>> {
+        (**self).get_message(id).await
+    }
+    async fn list(&self, before: Option<u64>, after: Option<u64>, limit: usize) -> Result<Vec<DcMessage>> {
+        (**self).list(before, after, limit).await
+    }
+    async fn delete_messages(&self, ids: &[u64]) -> Result<()> {
+        (**self).delete_messages(ids).await
+    }
+    async fn start_thread(&self, message_id: u64, name: &str) -> Result<ThreadStart> {
+        (**self).start_thread(message_id, name).await
+    }
+    async fn thread_name(&self, message_id: u64) -> Result<Option<String>> {
+        (**self).thread_name(message_id).await
+    }
+    async fn archive_thread(&self, message_id: u64) -> Result<()> {
+        (**self).archive_thread(message_id).await
+    }
+    async fn delete_thread(&self, message_id: u64) -> Result<()> {
+        (**self).delete_thread(message_id).await
+    }
+    async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes> {
+        (**self).download(url, range).await
+    }
 }

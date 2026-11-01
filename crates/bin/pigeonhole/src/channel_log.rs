@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context};
 use pigeonhole::instances::TelegramLogin;
-use pigeonhole_storage_telegram::{MtprotoConfig, TelegramMtproto};
+use pigeonhole_telegram_mtproto::{MtprotoConfig, TelegramMtproto};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 static CLIENTS: OnceLock<tokio::sync::Mutex<HashMap<i64, (PathBuf, TelegramMtproto)>>> = OnceLock::new();
 
 pub async fn client(login: &TelegramLogin) -> anyhow::Result<TelegramMtproto> {
-    let bot_id = pigeonhole_storage_telegram::bot_id_of(&login.bot_token)?;
+    let bot_id = pigeonhole_telegram_mtproto::bot_id_of(&login.bot_token)?;
     let mut clients = CLIENTS.get_or_init(Default::default).lock().await;
     if let Some((session, client)) = clients.get(&bot_id) {
         if *session != login.session {

@@ -20,15 +20,24 @@ ROLE = {
     "pigeonhole-chunk-store": "chunk-store",
     "pigeonhole-storage-telegram": "storage",
     "pigeonhole-storage-discord": "storage",
+    # The network clients a store runs on (its ChannelApi / DiscordApi).
+    "pigeonhole-telegram-mtproto": "storage-client",
+    "pigeonhole-discord-http": "storage-client",
     "pigeonhole-storage-memory": "storage",
     "pigeonhole-storage-disk": "storage",
     "pigeonhole-gateway-s3": "gateway",
     "pigeonhole-gateway-bytestream": "gateway",
     "pigeonhole-gateway-kafka": "gateway",
     "pigeonhole-gateway-webdav": "gateway",
+    # pigeonhole.toml read into a Config: what the binary and the web build share.
+    "pigeonhole-config": "config",
     "pigeonhole": "bin",
+    # The in-browser build: a composition root like the binary.
+    "pigeonhole-web": "bin",
     "pigeonhole-testkit": "testkit",
     "pigeonhole-sim": "testkit",
+    # Fake channels kept by a tablet: the demo and the fake-channel build.
+    "pigeonhole-fake-channels": "testkit",
 }
 
 FORBIDDEN_SOFT = {
@@ -37,6 +46,33 @@ FORBIDDEN_SOFT = {
 }
 
 CHUNK_STORE_FORBIDDEN_CRATES = {"s3s", "tonic", "axum"}
+
+# The stores' in-memory channels (feature `fake`) never get into a default
+# build: only these packages turn the feature on outside dev-dependencies.
+FAKE_ALLOWED = {"pigeonhole-web", "pigeonhole-fake-channels"}
+
+
+def fake_errors(pkg: dict) -> list[str]:
+    """`fake` in a normal dependency or in the default features."""
+    name, errors = pkg["name"], []
+    if name in FAKE_ALLOWED:
+        return errors
+    for dep in pkg.get("dependencies", []):
+        if dep.get("kind") in ("dev", "build"):
+            continue
+        if "fake" in dep.get("features", []):
+            errors.append(f"{name} → {dep['name']} with feature `fake` (allowed only in {sorted(FAKE_ALLOWED)})")
+    features = pkg.get("features", {})
+    seen, todo = set(), list(features.get("default", []))
+    while todo:
+        f = todo.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        if f == "fake" or f.endswith("/fake"):
+            errors.append(f"{name}: default features turn on `{f}`")
+        todo.extend(features.get(f, []))
+    return errors
 
 
 def main() -> int:
@@ -64,6 +100,7 @@ def main() -> int:
                 f"{name}: unknown workspace package (add a role in check_deps.py)"
             )
             continue
+        errors.extend(fake_errors(pkg))
         if role in ("bin", "testkit"):
             continue
 
@@ -88,6 +125,20 @@ def main() -> int:
                     )
                 elif not strict and dr in FORBIDDEN_SOFT["storage"]:
                     errors.append(f"{name} (storage) → {dep_name} ({dr})")
+
+        elif role == "config":
+            # Builds for wasm: no network client, nothing that runs the stack.
+            for dep_name in dep_names:
+                dr = ROLE.get(dep_name)
+                if dr in {"storage-client", "bin", "testkit"}:
+                    errors.append(f"{name} (config) → {dep_name} ({dr})")
+
+        elif role == "storage-client":
+            allowed = {"limits", "storage", "storage-api", "types"}
+            for dep_name in dep_names:
+                dr = ROLE.get(dep_name)
+                if dr is not None and dr not in allowed:
+                    errors.append(f"{name} (storage-client) → {dep_name} ({dr}); allowed: {sorted(allowed)}")
 
         elif role == "gateway":
             if strict:
@@ -164,6 +215,7 @@ FORBIDDEN_LEXEMES = ("file_id", "chat_id", "channel_id")
 LEXEME_ALLOW_DIR_PREFIXES = (
     "crates/storage/",
     "crates/bin/",
+    "crates/config/",
     "scripts/",
     "docs/",
     "compat/",
@@ -200,7 +252,7 @@ def scan_forbidden_lexemes() -> list[str]:
             continue
         for lex, rx in patterns.items():
             if rx.search(text):
-                found.append(f"{rel}: forbidden lexeme `{lex}` outside storage-*/bin")
+                found.append(f"{rel}: forbidden lexeme `{lex}` outside storage-*/bin/config")
                 break
     return found
 

@@ -293,7 +293,7 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
 impl<A: DiscordApi> LeaseChain for DiscordBlobStore<A> {
     /// A snowflake's millisecond timestamp.
     fn stamp_ms(&self, id: &DiscordId) -> u64 {
-        crate::client::snowflake_timestamp_ms(id.message_id)
+        crate::snowflake::snowflake_timestamp_ms(id.message_id)
     }
 
     /// Named like a member (`<label>~<prev>.bin`), so pruned like one, but

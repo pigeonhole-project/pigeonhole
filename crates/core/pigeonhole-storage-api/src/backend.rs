@@ -106,8 +106,42 @@ impl CostHint {
 /// Our own identity of a blob, chosen before it is uploaded and sent as its
 /// file name (`ph-<32 hex>.bin`): it tells our blobs from anything else in a
 /// chat or channel, and ties a backend message to the part that holds it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// Binary formats (the log, snapshots: postcard) keep the number; readable
+/// ones (JSON) the file name, since a u128 does not fit a JSON number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlobId(pub u128);
+
+impl Serialize for BlobId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&self.name())
+        } else {
+            s.serialize_newtype_struct("BlobId", &self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BlobId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        if d.is_human_readable() {
+            let name = String::deserialize(d)?;
+            BlobId::from_name(&name).ok_or_else(|| serde::de::Error::custom(format!("not a blob name: {name:?}")))
+        } else {
+            struct Id;
+            impl<'de> serde::de::Visitor<'de> for Id {
+                type Value = BlobId;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a blob id")
+                }
+                fn visit_newtype_struct<D: serde::Deserializer<'de>>(self, d: D) -> Result<BlobId, D::Error> {
+                    u128::deserialize(d).map(BlobId)
+                }
+            }
+            d.deserialize_newtype_struct("BlobId", Id)
+        }
+    }
+}
 
 impl BlobId {
     pub fn random() -> Self {
@@ -197,6 +231,17 @@ mod blob_id_tests {
         for foreign in ["blob.bin", "ph-zz.bin", "ph-0123.bin", "photo.jpg"] {
             assert_eq!(BlobId::from_name(foreign), None, "{foreign}");
         }
+    }
+
+    /// Logs and snapshots already hold blob ids as postcard u128s: the bytes stay.
+    #[test]
+    fn postcard_keeps_the_number_json_takes_the_name() {
+        let id = BlobId(u128::MAX - 7);
+        assert_eq!(postcard::to_stdvec(&id).unwrap(), postcard::to_stdvec(&id.0).unwrap());
+        assert_eq!(postcard::from_bytes::<BlobId>(&postcard::to_stdvec(&id.0).unwrap()).unwrap(), id);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{}\"", id.name()));
+        assert_eq!(serde_json::from_str::<BlobId>(&json).unwrap(), id);
     }
 }
 

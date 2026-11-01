@@ -183,3 +183,52 @@ h1 { font-size: clamp(34px, 5.4vw, 60px); line-height: 1.05; letter-spacing: -0.
 
 footer { margin-top: 96px; padding-bottom: 56px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--ring); padding-top: 24px; }
 footer .warn { max-width: 820px; }
+
+/* try.html */
+.hero.small { padding-top: 48px; }
+.hero.small h1 { font-size: clamp(30px, 4.4vw, 46px); }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.toolbar .btn { padding: 8px 14px; font-size: 14px; cursor: pointer; font-family: inherit; }
+.toolbar .btn:disabled, .mini:disabled { opacity: .5; cursor: progress; }
+.toolbar .sep { width: 1px; height: 26px; background: var(--ring); margin: 0 4px; }
+.toolbar .status { margin-left: auto; color: var(--muted); font-size: 13px; }
+.file-btn { cursor: pointer; }
+.stage.live { grid-template-areas: "term tg dc" "log log log" "say say say" "obj obj obj"; }
+@media (max-width: 920px) { .stage.live { grid-template-areas: "term term" "tg dc" "log log" "say say" "obj obj"; } }
+@media (max-width: 560px) { .stage.live { grid-template-areas: "term" "tg" "dc" "log" "say" "obj"; } }
+.objects { grid-area: obj; border: 1px solid var(--ring); border-radius: 12px; padding: 8px 12px; }
+.obj-h { font-size: 13px; font-weight: 600; color: var(--ink-2); margin-bottom: 4px; }
+.objects table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.objects td { padding: 6px 4px; border-top: 1px solid var(--grid); }
+.objects td.key { font-family: ui-monospace, Menlo, monospace; }
+.objects td.n { text-align: right; color: var(--ink-2); font-variant-numeric: tabular-nums; width: 90px; }
+.objects td.acts { text-align: right; width: 330px; }
+.objects .muted { color: var(--muted); }
+.mini { border: 1px solid var(--ring); background: var(--surface); color: var(--ink-2); border-radius: 7px; padding: 3px 9px; margin-left: 6px; cursor: pointer; font: inherit; font-size: 12px; }
+.term-body .err { color: var(--log); }
+.gone { opacity: .35; filter: grayscale(1); text-decoration: line-through; }
+
+/* text messages: the payload as the channel shows it */
+.ttext {
+  font-size: 13px; line-height: 1.35; word-break: break-all; max-height: 3.2em; overflow: hidden;
+  /* CJK Extension B (U+20000…): the payload's alphabet */
+  font-family: system-ui, "PingFang SC", "Hiragino Sans", "Songti SC", "Noto Sans CJK SC", "Noto Serif CJK SC",
+    "SimSun-ExtB", "MingLiU-ExtB", sans-serif;
+}
+.tg .bubble.text { display: block; max-width: 92%; }
+.dc .post .ttext { margin-top: 2px; color: var(--dc-ink); }
+
+/* the config editor */
+.config { margin-top: 18px; }
+.config-h { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.config-h h3 { margin: 0; }
+.config-h .note { margin: 0; color: var(--muted); font-size: 13px; }
+#config-text {
+  width: 100%; min-height: 420px; margin-top: 10px; padding: 12px 14px; resize: vertical;
+  font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; tab-size: 2;
+  background: var(--term-bg); color: var(--term-ink); border: 1px solid var(--ring); border-radius: 10px;
+}
+.config-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+.config-actions .btn { padding: 8px 14px; font-size: 14px; cursor: pointer; font-family: inherit; }
+.config-error { color: var(--log); font-size: 13px; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
+.btn.danger { color: var(--log); }

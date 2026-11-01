@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::watch;
+use tracing::Instrument;
 
 pub mod log;
 pub mod raft;
@@ -507,9 +508,12 @@ impl Drop for MetaStore {
             t.abort();
         }
         let raft = self.raft.clone();
-        tokio::spawn(async move {
-            let _ = raft.shutdown().await;
-        });
+        tokio::spawn(
+            async move {
+                let _ = raft.shutdown().await;
+            }
+            .in_current_span(),
+        );
     }
 }
 
@@ -591,7 +595,7 @@ impl MetaStore {
             raft.initialize(nodes).await.context("initialize the cluster")?;
         }
         let (queue, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(batcher(raft.clone(), shared.clone(), rx));
+        tokio::spawn(batcher(raft.clone(), shared.clone(), rx).in_current_span());
         let store = Self {
             states,
             gen,
@@ -884,16 +888,19 @@ async fn claim_log(log: &dyn LogStore, snapshots: &dyn SnapshotStore) -> Result<
 /// Whatever stops the tablet (a newer generation, a failed append, a failed
 /// commit), say so once, with the reason.
 fn report_stop(mut stop: watch::Receiver<Option<Stop>>, gen: u64) {
-    tokio::spawn(async move {
-        if let Ok(stop) = stop.wait_for(Option::is_some).await {
-            match stop.clone().expect("waited for a stop") {
-                Stop::Fenced { current } => {
-                    tracing::warn!(generation = gen, current, "tablet stopped: a newer generation claimed the log");
+    tokio::spawn(
+        async move {
+            if let Ok(stop) = stop.wait_for(Option::is_some).await {
+                match stop.clone().expect("waited for a stop") {
+                    Stop::Fenced { current } => {
+                        tracing::warn!(generation = gen, current, "tablet stopped: a newer generation claimed the log");
+                    }
+                    Stop::Failed(why) => tracing::error!(generation = gen, reason = %why, "tablet stopped"),
                 }
-                Stop::Failed(why) => tracing::error!(generation = gen, reason = %why, "tablet stopped"),
             }
         }
-    });
+        .in_current_span(),
+    );
 }
 
 /// Restore the states from the newest base, or else from the newest older
@@ -978,31 +985,34 @@ fn raft_config(opts: &MetaOptions) -> Result<openraft::Config> {
 /// Ask for a snapshot every `every` while something was applied since the
 /// last one.
 fn spawn_snapshot_ticker(raft: raft::Raft, shared: Arc<raft::Shared>, every: Duration) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(every);
-        tick.tick().await;
-        // The metrics show a snapshot only once it is built: while one
-        // asked for is being built, asking again builds a copy. Ask
-        // again only once the metrics moved (or after a while).
-        let mut pending: Option<(Position, u32)> = None;
-        loop {
+    tokio::spawn(
+        async move {
+            let mut tick = tokio::time::interval(every);
             tick.tick().await;
-            let snapshotted = raft.metrics().borrow().snapshot.as_ref().map_or(0, raft::position);
-            if let Some((at, ticks)) = pending {
-                if snapshotted == at && ticks < 20 {
-                    pending = Some((at, ticks + 1));
-                    continue;
+            // The metrics show a snapshot only once it is built: while one
+            // asked for is being built, asking again builds a copy. Ask
+            // again only once the metrics moved (or after a while).
+            let mut pending: Option<(Position, u32)> = None;
+            loop {
+                tick.tick().await;
+                let snapshotted = raft.metrics().borrow().snapshot.as_ref().map_or(0, raft::position);
+                if let Some((at, ticks)) = pending {
+                    if snapshotted == at && ticks < 20 {
+                        pending = Some((at, ticks + 1));
+                        continue;
+                    }
+                    pending = None;
                 }
-                pending = None;
-            }
-            if shared.applied.load(Ordering::SeqCst) > snapshotted {
-                pending = Some((snapshotted, 0));
-                if raft.trigger().snapshot().await.is_err() {
-                    return;
+                if shared.applied.load(Ordering::SeqCst) > snapshotted {
+                    pending = Some((snapshotted, 0));
+                    if raft.trigger().snapshot().await.is_err() {
+                        return;
+                    }
                 }
             }
         }
-    })
+        .in_current_span(),
+    )
 }
 
 /// Start a new log from the newest stored snapshot (after the log is lost):

@@ -10,3 +10,6 @@ pub use chunker::{
     DEFAULT_INGEST_MEMORY_BUDGET, MAX_LOGICAL_CHUNK,
 };
 pub use types::{codec_from_sql, codec_to_sql};
+
+/// Runs CPU-bound `f` (compression) off the async workers; see [`pigeonhole_types::blocking`].
+pub use pigeonhole_types::blocking;

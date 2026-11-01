@@ -11,22 +11,29 @@ pub mod state_metrics;
 pub use pigeonhole_blob as storage;
 pub use pigeonhole_codec as chunker;
 pub use pigeonhole_codec::blocks;
-pub mod config;
-pub mod instances;
-mod stores;
+pub use pigeonhole_config as config;
+pub use pigeonhole_config::instances;
 pub use pigeonhole_gateway_s3 as service;
 pub use pigeonhole_gateway_s3::index;
 pub use pigeonhole_gateway_s3::{build_s3_gateway, build_s3_service, S3OpSlot};
 pub use pigeonhole_storage_memory as memory;
-pub use pigeonhole_storage_telegram as telegram;
+/// The Telegram store and the MTProto client it runs on.
+pub mod telegram {
+    pub use pigeonhole_storage_telegram::*;
+    pub use pigeonhole_telegram_mtproto::*;
+}
 
 pub use config::Config;
 pub use pigeonhole_blob::DeleteOutcome;
 pub use pigeonhole_chunk_store::{BlobDb, ChunkStore, IngestOptions};
 pub use pigeonhole_gateway_s3::{Index, S3Gateway};
 pub use pigeonhole_limits::ChatLimiter;
+/// The Discord store and the HTTP client it runs on.
 #[cfg(feature = "discord")]
-pub use pigeonhole_storage_discord as discord;
+pub mod discord {
+    pub use pigeonhole_discord_http::*;
+    pub use pigeonhole_storage_discord::*;
+}
 pub use pigeonhole_storage_memory::{MemoryBackend, MemoryBlobStore};
 pub use pigeonhole_types::{BackendId, BackendLimits, BlobKey, RangeSupport};
 

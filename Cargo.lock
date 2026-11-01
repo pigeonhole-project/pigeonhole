@@ -2336,8 +2336,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openraft"
 version = "0.9.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a97014fb78acb77be3a40ac2da305f6dd3a6b243f3a908ace87d29b3972eaafd"
 dependencies = [
  "anyerror",
  "byte-unit",
@@ -2520,6 +2518,8 @@ dependencies = [
  "pigeonhole-blob",
  "pigeonhole-chunk-store",
  "pigeonhole-codec",
+ "pigeonhole-config",
+ "pigeonhole-discord-http",
  "pigeonhole-gateway-bytestream",
  "pigeonhole-gateway-s3",
  "pigeonhole-limits",
@@ -2528,6 +2528,7 @@ dependencies = [
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
  "pigeonhole-storage-telegram",
+ "pigeonhole-telegram-mtproto",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "pin-project-lite",
@@ -2597,10 +2598,80 @@ dependencies = [
  "flate2",
  "madsim-tokio",
  "metrics",
+ "pigeonhole-types",
  "serde",
  "tempfile",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "pigeonhole-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytesize",
+ "dotenvy",
+ "humantime-serde",
+ "pigeonhole-blob",
+ "pigeonhole-chunk-store",
+ "pigeonhole-codec",
+ "pigeonhole-gateway-s3",
+ "pigeonhole-limits",
+ "pigeonhole-storage-discord",
+ "pigeonhole-storage-disk",
+ "pigeonhole-storage-memory",
+ "pigeonhole-storage-telegram",
+ "pigeonhole-types",
+ "serde",
+ "tempfile",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "pigeonhole-discord-http"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "dotenvy",
+ "futures",
+ "madsim-tokio",
+ "pigeonhole-limits",
+ "pigeonhole-meta",
+ "pigeonhole-storage-api",
+ "pigeonhole-storage-discord",
+ "pigeonhole-testkit",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "pigeonhole-fake-channels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "madsim-tokio",
+ "pigeonhole-blob",
+ "pigeonhole-limits",
+ "pigeonhole-meta",
+ "pigeonhole-storage-api",
+ "pigeonhole-storage-discord",
+ "pigeonhole-storage-disk",
+ "pigeonhole-storage-memory",
+ "pigeonhole-storage-telegram",
+ "pigeonhole-testkit",
+ "pigeonhole-types",
+ "postcard",
+ "serde",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -2734,7 +2805,9 @@ dependencies = [
  "bytes",
  "futures",
  "pigeonhole-types",
+ "postcard",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -2752,9 +2825,9 @@ dependencies = [
  "pigeonhole-limits",
  "pigeonhole-meta",
  "pigeonhole-storage-api",
+ "pigeonhole-storage-discord",
  "pigeonhole-testkit",
  "pigeonhole-types",
- "reqwest",
  "serde",
  "serde_json",
  "tracing",
@@ -2806,20 +2879,43 @@ dependencies = [
  "bytes",
  "dotenvy",
  "futures",
- "grammers-mtsender",
- "grammers-session",
- "grammers-tl-types",
- "hex",
  "lru",
  "madsim-tokio",
  "pigeonhole-limits",
  "pigeonhole-meta",
  "pigeonhole-storage-api",
+ "pigeonhole-storage-telegram",
+ "pigeonhole-testkit",
+ "pigeonhole-types",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "pigeonhole-telegram-mtproto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "dotenvy",
+ "futures",
+ "grammers-mtsender",
+ "grammers-session",
+ "grammers-tl-types",
+ "hex",
+ "madsim-tokio",
+ "pigeonhole-limits",
+ "pigeonhole-storage-api",
+ "pigeonhole-storage-telegram",
  "pigeonhole-testkit",
  "pigeonhole-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -2842,8 +2938,39 @@ dependencies = [
 name = "pigeonhole-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "madsim-tokio",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pigeonhole-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "http",
+ "madsim-tokio",
+ "openraft",
+ "pigeonhole-blob",
+ "pigeonhole-chunk-store",
+ "pigeonhole-config",
+ "pigeonhole-fake-channels",
+ "pigeonhole-gateway-s3",
+ "pigeonhole-meta",
+ "pigeonhole-storage-api",
+ "pigeonhole-storage-discord",
+ "pigeonhole-storage-disk",
+ "pigeonhole-storage-memory",
+ "pigeonhole-storage-telegram",
+ "postcard",
+ "s3s",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

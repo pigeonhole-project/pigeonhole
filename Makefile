@@ -1,4 +1,4 @@
-.PHONY: sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint
+.PHONY: web web-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint
 
 run:
 	cargo run --release
@@ -9,6 +9,20 @@ run-discord:
 
 smoke:
 	./scripts/smoke.sh
+
+# The in-browser build (crates/web). zstd's C objects need an archiver that
+# knows wasm: llvm-ar from `rustup component add llvm-tools`.
+WASM_AR = $(shell rustc --print sysroot)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar
+web:
+	AR_wasm32_wasip1=$(WASM_AR) cargo build --release --target wasm32-wasip1 -p pigeonhole-web
+
+# The smoke under Node's WASI, then under the site's own shim (its file pool
+# on buffers), then a page load and a reload on one pool.
+web-smoke: web
+	node --no-warnings crates/web/run-wasi.mjs target/wasm32-wasip1/release/pigeonhole-web.wasm >/dev/null
+	node --no-warnings crates/web/run-shim.mjs smoke target/wasm32-wasip1/release/pigeonhole-web.wasm 2>&1 | grep -q "smoke ok"
+	node --no-warnings crates/web/run-shim.mjs reload target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep "reload"
+	node --no-warnings crates/web/run-shim.mjs snapshot target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep 'base {"at":50'
 
 # Curated ceph/s3-tests (see compat/known-good.txt)
 compat:

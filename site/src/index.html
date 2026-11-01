@@ -6,6 +6,7 @@
 <title>{{title}}</title>
 <meta name="description" content="{{meta_desc}}">
 <link rel="stylesheet" href="{{@root}}assets/site.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐦</text></svg>">
 </head>
 <body>
 <nav class="top">
@@ -14,6 +15,7 @@
     <a href="#how">{{nav.how}}</a>
     <a href="#features">{{nav.features}}</a>
     <a href="#site">{{nav.more}}</a>
+    <a href="{{@root}}{{nav.try_href}}"><b>{{nav.try}}</b></a>
     <a href="https://github.com/pigeonhole-project/pigeonhole">GitHub</a>
     <a class="lang" href="{{nav.lang_href}}" hreflang="{{nav.lang_code}}">{{nav.lang}}</a>
     <button class="theme" id="theme" type="button" aria-label="{{nav.theme}}">◐</button>
@@ -26,6 +28,7 @@
   <p class="lede">{{hero.lede}}</p>
   <div class="ctas">
     <a class="btn primary" href="#stage">{{hero.cta_demo}}</a>
+    <a class="btn" href="{{@root}}{{nav.try_href}}">{{nav.try}} →</a>
     <a class="btn" href="https://github.com/pigeonhole-project/pigeonhole">{{hero.cta_code}}</a>
   </div>
 </header>
@@ -127,6 +130,7 @@ window.LANG = "{{@lang}}";
 window.TRACE = {{@trace:hero}};
 </script>
 <script src="{{@root}}assets/site.js"></script>
+<script src="{{@root}}assets/stage.js"></script>
 <script src="{{@root}}assets/replay.js"></script>
 </body>
 </html>

@@ -17,6 +17,7 @@ Pages are templates in site/src with placeholders:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -56,6 +57,19 @@ def fmt_stat(n: int, lang: str) -> str:
     return s.replace(",", " " if lang == "ru" else ",")
 
 
+ASSETS_VERSION = ""
+
+
+def assets_version() -> str:
+    """A hash of every asset and the wasm, for the assets' URLs."""
+    h = hashlib.sha256()
+    wasm = ROOT / "target" / "wasm32-wasip1" / "release" / "pigeonhole_web.wasm"
+    for f in sorted((SITE / "src" / "assets").iterdir()) + [wasm]:
+        if f.is_file():
+            h.update(f.name.encode() + f.read_bytes())
+    return h.hexdigest()[:10]
+
+
 def render(tpl: str, lang: str, prefix: str, strings: dict, st: dict) -> str:
     root = "../" * prefix.count("/")
 
@@ -75,7 +89,10 @@ def render(tpl: str, lang: str, prefix: str, strings: dict, st: dict) -> str:
             raise SystemExit(f"{lang}: no string {key!r}")
         return strings[key]
 
-    return re.sub(r"\{\{\s*([@\w.:-]+)\s*\}\}", sub, tpl)
+    html = re.sub(r"\{\{\s*([@\w.:-]+)\s*\}\}", sub, tpl)
+    # Scripts and styles carry the assets' version: a browser never mixes a
+    # cached old worker with a new page.
+    return re.sub(r'(assets/[\w.-]+\.(?:js|css))"', rf'\1?v={ASSETS_VERSION}"', html)
 
 
 def main() -> int:
@@ -83,10 +100,17 @@ def main() -> int:
     ap.add_argument("-o", "--out", type=Path, default=ROOT / "target" / "site")
     args = ap.parse_args()
 
+    global ASSETS_VERSION
+    ASSETS_VERSION = assets_version()
     st = stats()
     if args.out.exists():
         shutil.rmtree(args.out)
     shutil.copytree(SITE / "src" / "assets", args.out / "assets")
+    wasm = ROOT / "target" / "wasm32-wasip1" / "release" / "pigeonhole_web.wasm"
+    if wasm.exists():
+        shutil.copy(wasm, args.out / "assets" / "pigeonhole.wasm")
+    else:
+        print(f"warning: {wasm} missing (make web): demo.html will not load", file=sys.stderr)
     pages = sorted((SITE / "src").glob("*.html"))
     for lang, prefix in LANGS.items():
         strings = json.loads((SITE / "i18n" / f"{lang}.json").read_text())

@@ -117,3 +117,20 @@ impl BackendLimits {
         }
     }
 }
+
+/// Runs blocking `f` (compression, file I/O) off the async workers: on a
+/// blocking-pool thread, or, on wasm, which has no threads, right here.
+pub async fn blocking<F, R>(f: F) -> anyhow::Result<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    #[cfg(not(target_family = "wasm"))]
+    {
+        Ok(tokio::task::spawn_blocking(f).await?)
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        Ok(f())
+    }
+}

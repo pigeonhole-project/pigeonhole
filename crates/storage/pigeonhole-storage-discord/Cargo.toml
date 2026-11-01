@@ -5,13 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Discord storage backend for pigeonhole: blobs, and a chain over threads"
 
+[features]
+# The in-memory channel (`fake`): tests, the site's demo and the opt-in
+# fake-channel build. Never in a default build (scripts/check_deps.py).
+fake = ["pigeonhole-storage-api/fake"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-futures = { workspace = true }
 bytes = { workspace = true }
 lru = { workspace = true }
-reqwest = { workspace = true }
 pigeonhole-limits = { workspace = true }
 pigeonhole-storage-api = { workspace = true }
 pigeonhole-types = { workspace = true }
@@ -22,6 +25,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
+pigeonhole-storage-discord = { path = ".", features = ["fake"] }
 dotenvy = { workspace = true }
 tracing-subscriber = { workspace = true }
 pigeonhole-meta = { workspace = true, features = ["testsuite"] }

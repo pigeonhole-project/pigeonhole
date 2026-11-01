@@ -55,7 +55,7 @@ pub struct DiskBlobStore {
 const PRUNE_BATCH: usize = 100;
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    tokio::task::spawn_blocking(f).await.context("disk task")?
+    pigeonhole_types::blocking(f).await.context("disk task")?
 }
 
 impl DiskBlobStore {

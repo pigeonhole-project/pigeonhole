@@ -1,0 +1,38 @@
+[package]
+name = "pigeonhole-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pigeonhole in one process on in-memory stores, for the site's in-browser demo (wasm32-wasip1)"
+
+[lib]
+# cdylib: the module the site loads (wasm32-wasip1, exports ph_open / ph_call).
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+openraft = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-chunk-store = { workspace = true }
+pigeonhole-config = { workspace = true, features = ["discord", "fake"] }
+pigeonhole-fake-channels = { workspace = true }
+pigeonhole-gateway-s3 = { workspace = true }
+pigeonhole-meta = { workspace = true }
+pigeonhole-storage-api = { workspace = true, features = ["fake"] }
+pigeonhole-storage-discord = { workspace = true, features = ["fake"] }
+pigeonhole-storage-disk = { workspace = true }
+pigeonhole-storage-memory = { workspace = true }
+pigeonhole-storage-telegram = { workspace = true, features = ["fake"] }
+postcard = { workspace = true }
+s3s = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

@@ -40,6 +40,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 /// A lease instead of a link per batch (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +151,32 @@ impl<Id: Serialize + for<'de> Deserialize<'de>> ChainDoc<Id> {
         }
         postcard::from_bytes(data).map_err(|e| LogError::Lost(format!("log blob: {e}")))
     }
+}
+
+/// What one blob of a chain log holds, for tools that show a log as its
+/// store keeps it (the site's log inspector).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobSummary {
+    pub gen: u64,
+    /// The generation's claim (its batch is empty).
+    pub claim: bool,
+    /// The first position of the batch, and how many entries it holds.
+    pub first: Position,
+    pub entries: usize,
+    /// The base (snapshot) the log starts from as of this blob.
+    pub base: Option<Position>,
+}
+
+/// [`BlobSummary`] of a chain log blob whose store names blobs by `Id`.
+pub fn summarize<Id: Serialize + for<'de> Deserialize<'de>>(data: &[u8]) -> LogResult<BlobSummary> {
+    let doc = ChainDoc::<Id>::decode(data)?;
+    Ok(BlobSummary {
+        gen: doc.gen,
+        claim: doc.claim,
+        first: doc.batch.first,
+        entries: doc.batch.entries.len(),
+        base: doc.base.map(|b| b.at),
+    })
 }
 
 impl<Id> ChainDoc<Id> {
@@ -377,7 +404,8 @@ impl<C: Chain> ChainLogStore<C> {
         let task = {
             let mut renewing = self.renewing.lock().unwrap();
             if renewing.as_ref().is_none_or(|t| t.is_finished()) {
-                *renewing = Some(tokio::spawn(renew(self.chain.clone(), self.state.clone(), gen, record)));
+                *renewing =
+                    Some(tokio::spawn(renew(self.chain.clone(), self.state.clone(), gen, record).in_current_span()));
             }
             if age < lease.duration * 2 / 3 {
                 return Ok(());
@@ -465,29 +493,32 @@ impl<C: Chain> ChainLogStore<C> {
         // A lease log's newest lease record is the chain's tail: never below.
         let floor = self.state.lock().unwrap().owner.as_ref().and_then(|o| o.held.clone()).map(|(id, _)| id);
         let mut next = tip.at.clone();
-        *collecting = Some(tokio::spawn(async move {
-            let t0 = std::time::Instant::now();
-            let mut keep = next.clone();
-            let mut limit = Position::MAX;
-            while let Some(link) = next {
-                let Ok(doc) = reader.follow(&link).await else { return };
-                limit = limit.min(doc.batch.first);
-                keep = Some(link);
-                if limit <= at + 1 {
-                    break;
+        *collecting = Some(tokio::spawn(
+            async move {
+                let t0 = std::time::Instant::now();
+                let mut keep = next.clone();
+                let mut limit = Position::MAX;
+                while let Some(link) = next {
+                    let Ok(doc) = reader.follow(&link).await else { return };
+                    limit = limit.min(doc.batch.first);
+                    keep = Some(link);
+                    if limit <= at + 1 {
+                        break;
+                    }
+                    next = doc.prev;
                 }
-                next = doc.prev;
+                let Some(mut keep) = keep.map(|k| k.id) else { return };
+                if let Some(floor) = floor.filter(|f| C::key(f) < C::key(&keep)) {
+                    keep = floor;
+                }
+                let pruned = chain.prune(&keep).await;
+                if let Err(e) = &pruned {
+                    tracing::warn!(error = %format!("{e:#}"), "log collection failed; retried at the next rebase");
+                }
+                crate::telemetry::record_collect(pruned.is_ok(), t0.elapsed());
             }
-            let Some(mut keep) = keep.map(|k| k.id) else { return };
-            if let Some(floor) = floor.filter(|f| C::key(f) < C::key(&keep)) {
-                keep = floor;
-            }
-            let pruned = chain.prune(&keep).await;
-            if let Err(e) = &pruned {
-                tracing::warn!(error = %format!("{e:#}"), "log collection failed; retried at the next rebase");
-            }
-            crate::telemetry::record_collect(pruned.is_ok(), t0.elapsed());
-        }));
+            .in_current_span(),
+        ));
     }
 
     /// This handle's tip, if it holds generation `gen`.

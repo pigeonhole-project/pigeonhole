@@ -99,6 +99,20 @@ pub fn blob_random_id(channel_id: i64, name: &str) -> i64 {
 }
 
 impl<C: ChannelApi> TelegramBlobStore<C> {
+    /// The bots whose locations of document `message_id` the store holds,
+    /// sorted (the bot pool's tests).
+    #[cfg(any(test, feature = "fake"))]
+    pub fn document_holders(&self, message_id: i64) -> Vec<usize> {
+        match self.reader.locations.lock().unwrap().peek(&message_id) {
+            Some(Located::Doc { files, .. }) => {
+                let mut bots: Vec<usize> = files.iter().map(|f| f.bot).collect();
+                bots.sort_unstable();
+                bots
+            }
+            _ => Vec::new(),
+        }
+    }
+
     pub fn new(channel: Arc<C>, limiter: Arc<ChatLimiter>, instance: InstanceInfo) -> Self {
         let locations = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())));
         Self {

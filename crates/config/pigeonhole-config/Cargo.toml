@@ -1,0 +1,37 @@
+[package]
+name = "pigeonhole-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pigeonhole.toml and the environment, read into a Config"
+
+[features]
+# Discord stores in the config (their default limits).
+discord = ["dep:pigeonhole-storage-discord"]
+# `fake = …` on a telegram or discord store: a fake channel (the site's demo,
+# the fake-channel build). Off: such a config is refused.
+fake = []
+
+[dependencies]
+anyhow = { workspace = true }
+bytesize = { workspace = true }
+dotenvy = { workspace = true }
+humantime-serde = { workspace = true }
+pigeonhole-blob = { workspace = true }
+pigeonhole-chunk-store = { workspace = true }
+pigeonhole-codec = { workspace = true }
+pigeonhole-gateway-s3 = { workspace = true }
+pigeonhole-limits = { workspace = true }
+pigeonhole-storage-discord = { workspace = true, optional = true }
+pigeonhole-storage-disk = { workspace = true }
+pigeonhole-storage-memory = { workspace = true }
+pigeonhole-storage-telegram = { workspace = true }
+pigeonhole-types = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

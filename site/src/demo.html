@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="{{@lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{demo.title}} — pigeonhole</title>
+<meta name="description" content="{{try.lede_plain}}">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="{{@root}}assets/demo.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐦</text></svg>">
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="{{@root}}{{nav.home_href}}">pigeonhole</a>
+  <p class="status" id="status" role="status">{{try.loading}}</p>
+  <nav class="bar-links">
+    <a class="lang" href="{{nav.demo_lang_href}}" hreflang="{{nav.lang_code}}">{{nav.lang}}</a>
+    <button class="icon" id="theme" type="button" aria-label="{{nav.theme}}">◐</button>
+  </nav>
+</header>
+
+<main id="app">
+  <section class="loft" id="loft">
+    <div class="sky" id="sky">
+      <svg id="graph" role="img" aria-label="{{demo.graph_label}}"></svg>
+      <p class="hint" id="hint">{{demo.hint}}</p>
+    </div>
+    <aside class="panel" id="panel" hidden>
+      <header class="panel-head">
+        <button class="back" id="panel-close" type="button" aria-label="{{demo.close}}">{{demo.close}}</button>
+        <div>
+          <h2 id="panel-title"></h2>
+          <p id="panel-sub"></p>
+        </div>
+      </header>
+      <div class="panel-body" id="panel-body"></div>
+    </aside>
+  </section>
+  <p class="caption" id="caption" aria-live="polite"></p>
+</main>
+
+<template id="tpl-client">
+  <div class="drop" id="drop">
+    <p>{{demo.drop}}</p>
+    <div class="row">
+      <label class="btn primary">{{try.pick}}<input type="file" id="file" multiple hidden></label>
+      <button class="btn" type="button" data-sample="photo">{{try.sample_random}}</button>
+      <button class="btn" type="button" data-sample="text">{{try.sample_text}}</button>
+    </div>
+  </div>
+  <h3>{{demo.bucket}}</h3>
+  <table class="objects"><tbody id="objects"></tbody></table>
+</template>
+
+<template id="tpl-node">
+  <div class="counters" id="counters"></div>
+  <div class="row">
+    <button class="btn" type="button" data-act="repair">{{try.repair}}</button>
+    <button class="btn" type="button" data-act="sweep">{{try.sweep}}</button>
+  </div>
+  <h3><code>pigeonhole.toml</code></h3>
+  <textarea id="config-text" spellcheck="false" autocomplete="off" aria-label="pigeonhole.toml"></textarea>
+  <div class="row">
+    <button class="btn primary" type="button" id="config-apply">{{try.apply}}</button>
+    <button class="btn" type="button" id="config-reset">{{try.reset}}</button>
+    <button class="btn danger" type="button" id="erase">{{try.erase}}</button>
+  </div>
+  <p class="error" id="config-error" role="alert"></p>
+</template>
+
+<script>
+window.I18N = {{@js}};
+window.LANG = "{{@lang}}";
+window.ASSETS = "{{@root}}assets/";
+</script>
+<script src="{{@root}}assets/site.js"></script>
+<script src="{{@root}}assets/demo.js"></script>
+</body>
+</html>

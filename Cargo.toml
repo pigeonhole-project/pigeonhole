@@ -10,7 +10,9 @@ members = [
     "crates/blob/pigeonhole-blob",
     "crates/blob/pigeonhole-chunk-store",
     "crates/storage/pigeonhole-storage-telegram",
+    "crates/storage/pigeonhole-telegram-mtproto",
     "crates/storage/pigeonhole-storage-discord",
+    "crates/storage/pigeonhole-discord-http",
     "crates/storage/pigeonhole-storage-memory",
     "crates/storage/pigeonhole-storage-disk",
     "crates/gateway/pigeonhole-gateway-s3",
@@ -18,6 +20,9 @@ members = [
     "crates/bin/pigeonhole",
     "crates/testing/pigeonhole-testkit",
     "crates/testing/pigeonhole-sim",
+    "crates/testing/pigeonhole-fake-channels",
+    "crates/web/pigeonhole-web",
+    "crates/config/pigeonhole-config",
 ]
 default-members = ["crates/bin/pigeonhole"]
 exclude = ["vendor"]
@@ -58,7 +63,9 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 sha2 = "0.10"
 hmac = "0.12"
 tempfile = "3"
-tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
+# What tokio allows on wasm (crates/web); a crate that needs more (the
+# binary: net, signals, the multi-thread runtime) adds it.
+tokio = { version = "0.2", package = "madsim-tokio", features = ["io-util", "macros", "rt", "sync", "time"] }
 tokio-stream = "0.1"
 toml = { version = "0.8", features = ["parse"] }
 tower = { version = "0.5", features = ["limit", "timeout", "util"] }
@@ -81,6 +88,7 @@ grammers-session = { version = "=0.11.0", default-features = false }
 grammers-tl-types = "=0.11.0"
 
 pigeonhole-meta = { path = "crates/meta/pigeonhole-meta" }
+pigeonhole-config = { path = "crates/config/pigeonhole-config" }
 openraft-chat = { path = "crates/net/openraft-chat" }
 pigeonhole-types = { path = "crates/core/pigeonhole-types" }
 pigeonhole-storage-api = { path = "crates/core/pigeonhole-storage-api" }
@@ -89,16 +97,22 @@ pigeonhole-codec = { path = "crates/core/pigeonhole-codec" }
 pigeonhole-blob = { path = "crates/blob/pigeonhole-blob" }
 pigeonhole-chunk-store = { path = "crates/blob/pigeonhole-chunk-store" }
 pigeonhole-storage-telegram = { path = "crates/storage/pigeonhole-storage-telegram" }
+pigeonhole-telegram-mtproto = { path = "crates/storage/pigeonhole-telegram-mtproto" }
 pigeonhole-storage-discord = { path = "crates/storage/pigeonhole-storage-discord" }
+pigeonhole-discord-http = { path = "crates/storage/pigeonhole-discord-http" }
 pigeonhole-storage-memory = { path = "crates/storage/pigeonhole-storage-memory" }
 pigeonhole-storage-disk = { path = "crates/storage/pigeonhole-storage-disk" }
 pigeonhole-gateway-s3 = { path = "crates/gateway/pigeonhole-gateway-s3" }
 pigeonhole-gateway-bytestream = { path = "crates/gateway/pigeonhole-gateway-bytestream" }
 pigeonhole-testkit = { path = "crates/testing/pigeonhole-testkit" }
+pigeonhole-fake-channels = { path = "crates/testing/pigeonhole-fake-channels" }
 
 # A request nobody awaits any more is not sent (vendor/grammers-mtsender/VENDORED.md).
 [patch.crates-io]
 grammers-mtsender = { path = "vendor/grammers-mtsender" }
+# Without tokio's rt-multi-thread, which wasm cannot have and openraft does
+# not use (vendor/openraft/VENDORED.md).
+openraft = { path = "vendor/openraft" }
 
 # `--cfg madsim` builds the simulation (docs/simulation.md).
 [workspace.lints.rust]
