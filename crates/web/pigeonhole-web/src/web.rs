@@ -99,7 +99,8 @@ pub extern "C" fn ph_open() -> i32 {
 #[allow(unsafe_code)] // `no_mangle` only: exported to JS, no unsafe code.
 #[no_mangle]
 pub extern "C" fn ph_tick() -> i32 {
-    RT.with(|rt| rt.block_on(tokio::time::sleep(std::time::Duration::from_millis(15))));
+    // The timer is made inside the runtime: outside it, it panics.
+    RT.with(|rt| rt.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(15)).await }));
     0
 }
 

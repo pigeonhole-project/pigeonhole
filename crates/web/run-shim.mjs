@@ -45,6 +45,9 @@ if (mode === "smoke") {
   m.wasi.takeLines();
   call({ op: "open", config: await readFile(here + "pigeonhole-web/demo.toml", "utf8") });
   for (let i = 0; i < 60; i++) call({ op: "put", key: `k${i}` }, new Uint8Array(2000).fill(i));
+  // The worker ticks while idle: a tick must run (and not panic).
+  m.exports.ph_tick();
+  m.wasi.takeLines();
   const log = call({ op: "log", limit: 3 });
   const snaps = call({ op: "channels" }).channels.find(c => c.role === "snapshots");
   console.error(`head ${log.head}, base ${JSON.stringify(log.base)}, snapshot channel ${snaps.messages.map(x => x.name).join(" ")}`);
