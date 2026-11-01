@@ -2,8 +2,9 @@
 
 use crate::blob_db::{BlobDb, ChunkId, StoredBlock};
 use anyhow::{bail, Context, Result};
+use futures::StreamExt;
 use pigeonhole_blob::{
-    collect_stream, EncodedBlock, OpKind, PartLayout, PartPacker, ReplicaLayout, Replicated, SharedBackend,
+    collect_stream, EncodedBlock, OpKind, PartLayout, PartPacker, ReplicaLayout, Replicated, SharedBackend, UploadPin,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,8 @@ use tracing::{debug, info, warn};
 pub const DEFAULT_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 /// Jobs claimed per pass.
 pub const REPAIR_BATCH_SIZE: usize = 16;
+/// Jobs of a pass copied at once (the stores' limiters still pace them).
+pub const REPAIR_CONCURRENCY: usize = 4;
 /// Skip a job when `cost().wait_secs` exceeds this on source get or target put.
 pub const DEFAULT_MAX_COST_WAIT_SECS: f64 = 2.0;
 
@@ -21,6 +24,8 @@ pub const DEFAULT_MAX_COST_WAIT_SECS: f64 = 2.0;
 pub struct RepairConfig {
     pub interval: Duration,
     pub batch_size: usize,
+    /// Jobs copied at once; their replicas are committed together.
+    pub concurrency: usize,
     pub max_cost_wait_secs: f64,
     /// When true, each pass also scrubs for under-replicated chunks.
     pub scrub: bool,
@@ -31,6 +36,7 @@ impl Default for RepairConfig {
         Self {
             interval: DEFAULT_REPAIR_INTERVAL,
             batch_size: REPAIR_BATCH_SIZE,
+            concurrency: REPAIR_CONCURRENCY,
             max_cost_wait_secs: DEFAULT_MAX_COST_WAIT_SECS,
             scrub: true,
         }
@@ -107,21 +113,31 @@ impl Repairer {
         }
     }
 
-    /// Single pass: optional scrub, then process up to `batch_size` jobs.
+    /// Single pass: optional scrub, then up to `batch_size` jobs, copied
+    /// `concurrency` at a time; the copies made are committed in one entry.
     pub async fn repair_once(&self) -> Result<RepairStats> {
         let mut stats = RepairStats::default();
         if self.config.scrub {
             stats.scrub_enqueued = self.scrub_enqueue().await?;
         }
         let jobs = self.db.take_repair_jobs(self.config.batch_size).await.context("take repair jobs")?;
-        for (chunk_id, instance_id) in jobs {
-            match self.repair_one(chunk_id, &instance_id).await {
-                Ok(RepairOutcome::Repaired) => stats.repaired += 1,
-                Ok(RepairOutcome::Noop) => {
+        let copied: Vec<_> = futures::stream::iter(jobs)
+            .map(|(chunk_id, instance_id)| async move {
+                let copy = self.copy_one(chunk_id, &instance_id).await;
+                (chunk_id, instance_id, copy)
+            })
+            .buffer_unordered(self.config.concurrency.max(1))
+            .collect()
+            .await;
+        let mut ready = Vec::new();
+        for (chunk_id, instance_id, copy) in copied {
+            match copy {
+                Ok(Copied::Ready(copy)) => ready.push(copy),
+                Ok(Copied::Noop) => {
                     stats.skipped_noop += 1;
                     let _ = self.db.dequeue_repair(chunk_id, &instance_id).await;
                 }
-                Ok(RepairOutcome::DeferredBudget) => stats.skipped_budget += 1,
+                Ok(Copied::DeferredBudget) => stats.skipped_budget += 1,
                 Err(e) => {
                     stats.failed += 1;
                     warn!(
@@ -133,7 +149,46 @@ impl Repairer {
                 }
             }
         }
+        self.commit(ready, &mut stats).await;
         Ok(stats)
+    }
+
+    /// Commit the copies of a pass in one entry. A copy whose chunk went
+    /// meanwhile is dropped (its parts deleted); if the commit fails, the
+    /// jobs stay queued.
+    async fn commit(&self, ready: Vec<Ready>, stats: &mut RepairStats) {
+        if ready.is_empty() {
+            return;
+        }
+        let replicas: Vec<_> = ready.iter().map(|r| (r.chunk_id, &r.layout)).collect();
+        let added = match self.db.commit_instance_replicas(&replicas).await {
+            Ok(added) => added,
+            Err(e) => {
+                stats.failed += ready.len() as u64;
+                warn!(jobs = ready.len(), error = %e, "commit repaired replicas failed");
+                return;
+            }
+        };
+        for (r, added) in ready.into_iter().zip(added) {
+            let instance = r.layout.instance.as_str();
+            let _ = self.db.dequeue_repair(r.chunk_id, instance).await;
+            if added {
+                stats.repaired += 1;
+                debug!(chunk_id = r.chunk_id, instance, parts = r.layout.parts.len(), "repaired replica");
+            } else {
+                stats.skipped_noop += 1;
+                self.discard(&r).await;
+            }
+        }
+    }
+
+    /// Delete the parts of a copy nothing will refer to; best effort.
+    async fn discard(&self, r: &Ready) {
+        let Some(target) = self.replicated.member(&r.layout.instance) else { return };
+        let keys: Vec<Vec<u8>> = r.layout.parts.iter().map(|p| p.locator.key.clone()).collect();
+        if let Err(e) = target.delete(&keys).await {
+            debug!(chunk_id = r.chunk_id, instance = %r.layout.instance, error = %e, "repair: copy of a gone chunk stays");
+        }
     }
 
     /// Enqueue repairs for every live chunk of `instance_id`'s shard missing
@@ -193,11 +248,12 @@ impl Repairer {
         Ok(n)
     }
 
-    async fn repair_one(&self, chunk_id: ChunkId, instance_id: &str) -> Result<RepairOutcome> {
+    /// Copy `chunk_id` onto `instance_id`, uncommitted.
+    async fn copy_one(&self, chunk_id: ChunkId, instance_id: &str) -> Result<Copied> {
         let Some(target) = self.replicated.member(instance_id).cloned() else {
             // Instance left the placement group — drop the job.
             self.db.dequeue_repair(chunk_id, instance_id).await?;
-            return Ok(RepairOutcome::Noop);
+            return Ok(Copied::Noop);
         };
 
         let layouts = self.db.get_replica_layouts(chunk_id).await?;
@@ -206,7 +262,7 @@ impl Repairer {
         let peers = self.replicated.shard_peers(instance_id).unwrap_or_default();
         if !layouts.iter().any(|l| peers.iter().any(|p| p.instance().id == l.instance)) {
             self.db.dequeue_repair(chunk_id, instance_id).await?;
-            return Ok(RepairOutcome::Noop);
+            return Ok(Copied::Noop);
         }
         if layouts.iter().any(|l| l.instance == instance_id) {
             // Already present; still allow re-pack if caller deleted backend blobs
@@ -214,7 +270,7 @@ impl Repairer {
             if let Some(existing) = layouts.iter().find(|l| l.instance == instance_id) {
                 if replica_probe_ok(&target, existing).await {
                     self.db.dequeue_repair(chunk_id, instance_id).await?;
-                    return Ok(RepairOutcome::Noop);
+                    return Ok(Copied::Noop);
                 }
             }
         }
@@ -230,7 +286,7 @@ impl Repairer {
             .context("repair: source member missing from placement")?;
 
         if !within_cost_budget(source_backend.as_ref(), target.as_ref(), self.config.max_cost_wait_secs) {
-            return Ok(RepairOutcome::DeferredBudget);
+            return Ok(Copied::DeferredBudget);
         }
 
         let blocks = self.db.get_blocks(chunk_id).await?;
@@ -256,23 +312,23 @@ impl Repairer {
         }
 
         let layout = ReplicaLayout { instance: instance_id.to_string(), parts };
-        self.db.commit_instance_replica(chunk_id, &layout).await.context("commit repaired replica")?;
-        self.db.dequeue_repair(chunk_id, instance_id).await?;
-        drop(pins);
-        debug!(
-            chunk_id,
-            instance = %instance_id,
-            parts = layout.parts.len(),
-            "repaired replica"
-        );
-        Ok(RepairOutcome::Repaired)
+        Ok(Copied::Ready(Ready { chunk_id, layout, _pins: pins }))
     }
 }
 
-enum RepairOutcome {
-    Repaired,
+/// What [`Repairer::copy_one`] did.
+enum Copied {
+    Ready(Ready),
     Noop,
     DeferredBudget,
+}
+
+/// A replica copied, to commit.
+struct Ready {
+    chunk_id: ChunkId,
+    layout: ReplicaLayout,
+    /// Held until the commit: the parts are no orphans meanwhile.
+    _pins: Vec<UploadPin>,
 }
 
 fn within_cost_budget(
@@ -516,5 +572,60 @@ mod tests {
         let a_layout = fixed.iter().find(|l| l.instance == "a").unwrap();
         let got = layer.read_from_replicas(chunk_id, 0, data.len(), std::slice::from_ref(a_layout)).await.unwrap();
         assert_eq!(got, data);
+    }
+
+    /// The member set `[a]` grown to `[a, b]`, synced into the layer.
+    async fn add_b(layer: &ChunkStore, a: SharedBackend) -> Arc<Replicated> {
+        let b = lim("b", 4 * MIB);
+        let rep = Arc::new(Replicated::new(vec![a, b], 1, Arc::new(CheapestFirst::new())).unwrap());
+        let infos: Vec<_> = rep.members().iter().map(|m| m.instance().clone()).collect();
+        layer.db().sync_instances(&infos).await.unwrap();
+        rep
+    }
+
+    #[tokio::test]
+    async fn a_pass_commits_its_copies_in_one_entry() {
+        let a = lim("a", 4 * MIB);
+        let (_dir, layer, _) = open_layer(vec![a.clone()], 1, MIB, MIB).await;
+        let mut chunks = Vec::new();
+        for i in 0..6u8 {
+            chunks.push(layer.put_small(Bytes::from(vec![i; 1000])).await.unwrap());
+        }
+        let rep = add_b(&layer, a).await;
+        let repairer =
+            Repairer::new(layer.db().clone(), rep.clone(), RepairConfig { scrub: false, ..RepairConfig::default() });
+        assert_eq!(repairer.enqueue_instance_backfill("b").await.unwrap(), 6);
+
+        let before = layer.db().meta().applied_position();
+        let stats = repairer.repair_once().await.unwrap();
+        assert_eq!((stats.repaired, stats.failed), (6, 0));
+        assert_eq!(layer.db().meta().applied_position(), before + 1, "six copies, one entry");
+        assert_eq!(layer.db().repair_queue_len().await.unwrap(), 0);
+        for (i, id) in chunks.into_iter().enumerate() {
+            let layouts = layer.db().get_replica_layouts(id).await.unwrap();
+            let b = layouts.iter().find(|l| l.instance == "b").expect("a copy on b");
+            let got = collect_stream(rep.read(std::slice::from_ref(b), 0..1).await.unwrap()).await.unwrap();
+            assert_eq!(got, Bytes::from(vec![i as u8; 1000]));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_copy_of_a_dropped_chunk_is_rejected_alone() {
+        let a = lim("a", 4 * MIB);
+        let (_dir, layer, _) = open_layer(vec![a], 1, MIB, MIB).await;
+        let db = layer.db();
+        let (kept, dropped) = (
+            layer.put_small(Bytes::from_static(b"kept")).await.unwrap(),
+            layer.put_small(Bytes::from_static(b"dropped")).await.unwrap(),
+        );
+        let layout = |id| async move { db.get_replica_layouts(id).await.unwrap().remove(0) };
+        let (kept_layout, dropped_layout) = (layout(kept).await, layout(dropped).await);
+        db.delete_chunk_metadata(dropped).await.unwrap();
+
+        // Dropped while its copy was made: that one is not added, the tablet goes on.
+        let added = db.commit_instance_replicas(&[(kept, &kept_layout), (dropped, &dropped_layout)]).await.unwrap();
+        assert_eq!(added, vec![true, false]);
+        assert!(db.get_replica_layouts(dropped).await.unwrap().is_empty());
+        layer.put_small(Bytes::from_static(b"after")).await.unwrap();
     }
 }

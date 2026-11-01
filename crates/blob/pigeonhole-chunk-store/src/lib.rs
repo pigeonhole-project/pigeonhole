@@ -20,6 +20,6 @@ pub use pigeonhole_blob::{collect_stream, BoxByteStream, DeleteOutcome, UploadPi
 pub use pigeonhole_codec::{BlockRecord, ByteBudget, ChunkCodec};
 pub use repair::{
     spawn_enqueue_repair, RepairConfig, RepairStats, Repairer, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL,
-    REPAIR_BATCH_SIZE,
+    REPAIR_BATCH_SIZE, REPAIR_CONCURRENCY,
 };
 pub use sweep::{SweepConfig, SweepStats, Sweeper, DEFAULT_SWEEP_INTERVAL, SWEEP_BATCH_SIZE};

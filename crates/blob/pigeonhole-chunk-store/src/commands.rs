@@ -46,7 +46,8 @@ pub enum ChunkCommand {
 /// Deterministic failure of a [`ChunkCommand`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChunkReject {
-    /// Retain: chunk missing, refs = 0, or reclaiming.
+    /// Retain: chunk missing, refs = 0, or reclaiming. AddReplica: chunk
+    /// missing or reclaiming (dropped while its copy was made).
     ChunkGone(ChunkId),
     /// Release: refs already 0, chunk missing, or reclaiming.
     DoubleRelease(ChunkId),
@@ -294,8 +295,8 @@ impl ChunkState {
     }
 
     fn add_replica(&mut self, chunk_id: ChunkId, rep: Replica) -> Result<Applied> {
-        if !self.chunks.contains_key(&chunk_id) {
-            bail!("add_replica: chunk {chunk_id} not found");
+        if self.chunks.get(&chunk_id).is_none_or(|c| c.reclaiming) {
+            return Ok(Err(ChunkReject::ChunkGone(chunk_id)));
         }
         // Keys of the replica being replaced may be reused by the new one.
         let old = self.remove_replica(chunk_id, &rep.instance);
