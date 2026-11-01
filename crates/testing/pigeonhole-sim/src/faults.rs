@@ -342,14 +342,19 @@ impl<B: Chain> Chain for Faulty<B> {
 
     /// Faults around the store's own (atomic or not) way; no late landing
     /// (`make` borrows the caller's state).
-    async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
+    async fn put_after_tail(
+        &self,
+        hint: Option<&Self::Id>,
+        label: &str,
+        make: &MakeAfter<'_, Self::Id>,
+    ) -> Result<Option<Self::Id>> {
         let allowed = [Fault::FailBefore, Fault::FailAfter, Fault::RateLimit];
         match self.before(PUT_AFTER, "put_after_tail", &allowed).await? {
             Draw::Fault(Fault::FailAfter) => {
-                self.inner.put_after_tail(label, make).await?;
+                self.inner.put_after_tail(hint, label, make).await?;
                 Err(anyhow!("injected: put_after_tail applied, then failed"))
             }
-            _ => self.inner.put_after_tail(label, make).await,
+            _ => self.inner.put_after_tail(hint, label, make).await,
         }
     }
 }

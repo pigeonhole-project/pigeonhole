@@ -52,14 +52,27 @@ pub trait Chain: BlobBackend {
     /// Put a blob built from the current tail after it: `make` gets the
     /// tail's id and data (`None` for an empty chain) and returns the blob,
     /// or `None` to put nothing (then the result is `None`). Returns the new
-    /// blob's id once it won.
+    /// blob's id once it won. `hint`: the tail as the caller last saw it, if
+    /// it did.
     ///
-    /// The default reads the tail and puts after it, again while another
-    /// blob wins first, so it may call `make` more than once: `make` must be
-    /// pure. A store that can decide it atomically (under a lock) should, or
-    /// a busy writer wins every gap between reading the tail and the put.
-    async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
-        let mut tail = self.tail().await?.map(|t| t.id);
+    /// The default puts after `hint`, or after the tail it reads (on a
+    /// channel, a post to learn the top), again while another blob wins
+    /// first, so it may call `make` more than once: `make` must be pure. A
+    /// hint that lost is not followed but read again: the store may answer
+    /// a put after a long-gone blob with the chain's evidence, not with a
+    /// winner. A store that can decide it atomically (under a lock) should,
+    /// or a busy writer wins every gap between reading the tail and the put.
+    async fn put_after_tail(
+        &self,
+        hint: Option<&Self::Id>,
+        label: &str,
+        make: &MakeAfter<'_, Self::Id>,
+    ) -> Result<Option<Self::Id>> {
+        let mut hinted = hint.is_some();
+        let mut tail = match hint {
+            Some(h) => Some(h.clone()),
+            None => self.tail().await?.map(|t| t.id),
+        };
         // Bounded: writers appending meanwhile settle soon; a store whose
         // chain never does is a bug, and must not post copies forever.
         for _ in 0..PUT_AFTER_TAIL_ATTEMPTS {
@@ -70,6 +83,7 @@ pub trait Chain: BlobBackend {
             let Some(blob) = make(tail.as_ref().zip(data.as_deref()))? else { return Ok(None) };
             match self.put_after(tail.as_ref(), label, blob).await? {
                 After::Won(id) => return Ok(Some(id)),
+                After::Lost(_) if std::mem::take(&mut hinted) => tail = self.tail().await?.map(|t| t.id),
                 After::Lost(winner) => tail = Some(winner.id),
             }
         }
@@ -156,8 +170,13 @@ impl<C: Chain> Chain for std::sync::Arc<C> {
     async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
         (**self).newest_loose(prefix).await
     }
-    async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
-        (**self).put_after_tail(label, make).await
+    async fn put_after_tail(
+        &self,
+        hint: Option<&Self::Id>,
+        label: &str,
+        make: &MakeAfter<'_, Self::Id>,
+    ) -> Result<Option<Self::Id>> {
+        (**self).put_after_tail(hint, label, make).await
     }
 }
 

@@ -285,8 +285,14 @@ impl Chain for DiskBlobStore {
         self.locked(move |s| Ok(s.next.get(&Some(key)).map(|&n| Self::linked(s, n)))).await
     }
 
-    /// Atomic: the tail is read and the blob appended under one `flock`.
-    async fn put_after_tail(&self, label: &str, make: &MakeAfter<'_, Self::Id>) -> Result<Option<Self::Id>> {
+    /// Atomic: the tail is read and the blob appended under one `flock`
+    /// (reading it costs nothing: no hint needed).
+    async fn put_after_tail(
+        &self,
+        _hint: Option<&Self::Id>,
+        label: &str,
+        make: &MakeAfter<'_, Self::Id>,
+    ) -> Result<Option<Self::Id>> {
         let _op = self.limiter.op().await;
         let segments = self.segments.clone();
         let label = label.to_string();
