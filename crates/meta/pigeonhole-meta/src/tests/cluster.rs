@@ -327,3 +327,69 @@ mod transports {
         assert!(chat.posts_by(other) + chat.posts_by(leader) > 0, "the pair posts for the chat node");
     }
 }
+
+/// Nodes 1 and 2 on a direct network (gRPC in memory), 3 on the chat: what
+/// the in-browser demo runs, and the simulation can.
+mod direct {
+    use super::*;
+    use openraft_grpc::{Direct, Mixed};
+    use std::collections::HashSet;
+
+    const PAIR: [u64; 2] = [1, 2];
+
+    async fn node_on(direct: Direct<TypeConfig>, chat: FakeChat, id: u64, opts: MetaOptions) -> Arc<MetaStore> {
+        let via_chat: HashSet<u64> = match PAIR.contains(&id) {
+            true => MEMBERS.into_iter().filter(|m| !PAIR.contains(m)).collect(),
+            false => MEMBERS.into_iter().filter(|m| *m != id).collect(),
+        };
+        let chat_peers: HashMap<u64, Arc<dyn Mailbox>> = via_chat.iter().map(|&m| (m, chat.mailbox(id, m))).collect();
+        let chat_net = ChatNetwork::<TypeConfig>::new(id, settings(), chat.mailbox(id, id), chat_peers);
+        let serving = chat_net.clone();
+        let hub = direct.clone();
+        let serve: Serve = Box::new(move |raft| {
+            Box::pin(async move {
+                let raft = Arc::new(raft);
+                hub.serve(id, raft.clone());
+                serving.serve(raft).await;
+            })
+        });
+        let network = Mixed { a: direct.network(id), b: chat_net, via_b: via_chat };
+        let cluster = Cluster { node: id, members: MEMBERS.into(), network, serve: Some(serve) };
+        let log = Arc::new(crate::ChainLogStore::new(Arc::new(MemoryBlobStore::new())));
+        let snapshots = Arc::new(crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())));
+        MetaStore::open_in(log, snapshots, counter(), opts, cluster).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_direct_pair_and_a_chat_node_make_one_cluster() {
+        let (direct, chat) = (Direct::<TypeConfig>::new(), FakeChat::new());
+        direct.set_delay(Some(Duration::from_millis(5)));
+        let often = MetaOptions { snapshot_every: Some(4), keep_snapshots: 1, ..opts() };
+        let started =
+            futures::future::join_all(MEMBERS.map(|id| node_on(direct.clone(), chat.clone(), id, often.clone()))).await;
+        let mut nodes: HashMap<u64, Arc<MetaStore>> = MEMBERS.into_iter().zip(started).collect();
+        let leader = agreed_leader(&nodes).await;
+        nodes[&leader].propose::<Counter>(op(0, 1)).await.unwrap().unwrap();
+        eventually("all applied, the chat node too", || nodes.values().all(|n| value(n) == 1)).await;
+
+        // The chat node cut off and caught up from a snapshot over the chat.
+        chat.isolate(3, true);
+        let rest: HashMap<_, _> = nodes.iter().filter(|(&id, _)| id != 3).map(|(&id, n)| (id, n.clone())).collect();
+        let leader = agreed_leader(&rest).await;
+        let behind = nodes[&3].applied_position();
+        for i in 1..12 {
+            nodes[&leader].propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+        }
+        eventually("the log moved past the chat node", || nodes[&leader].base_position() > behind).await;
+        chat.isolate(3, false);
+        eventually("the chat node caught up", || value(&nodes[&3]) == 12).await;
+
+        // The direct pair split: the leader cut off, the other two go on.
+        direct.isolate(leader, true);
+        chat.isolate(leader, true);
+        drop(nodes.remove(&leader));
+        let new = agreed_leader(&nodes).await;
+        nodes[&new].propose::<Counter>(op(99, 1)).await.unwrap().unwrap();
+        eventually("both survivors applied it", || nodes.values().all(|n| value(n) == 13)).await;
+    }
+}

@@ -3,17 +3,22 @@ name = "openraft-grpc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "openraft's network over gRPC (frames of openraft-chat, one call each), and a network mixing two transports by peer"
+description = "openraft's networks besides the chat: gRPC (frames of openraft-chat, one call each), the same in memory, and a network mixing two by peer"
 
 [dependencies]
 anyhow = { workspace = true }
 openraft = { workspace = true }
 openraft-chat = { workspace = true }
-prost = { workspace = true }
+prost = { workspace = true, optional = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
-tonic = { workspace = true }
+tokio-stream = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 tracing = { workspace = true }
+
+[features]
+default = ["transport"]
+# gRPC over tonic (sockets): not in the in-browser build.
+transport = ["dep:prost", "dep:tokio-stream", "dep:tonic"]
 
 [dev-dependencies]
 serde = { workspace = true }
