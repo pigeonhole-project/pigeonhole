@@ -77,11 +77,22 @@ pub trait Chain: BlobBackend {
     }
 
     /// Put a blob that needs no order but "the newest of its kind"
-    /// ([`Self::newest_loose`]): snapshots. The default links it into the
-    /// chain (a store that cannot list finds the newest blob only by
-    /// following links); a store that can list should put it plainly, since
-    /// a link may cost a scarce, rate-limited call.
-    async fn put_loose(&self, label: &str, data: Bytes) -> Result<Self::Id> {
+    /// ([`Self::newest_loose`]): snapshots. `after` is the newest such blob
+    /// the caller knows of (the one it put last), if any.
+    ///
+    /// The default links it into the chain (a store that cannot list finds
+    /// the newest blob only by following links): after `after` when given,
+    /// which needs no look for the tail (on a channel, a post to learn its
+    /// top); after the tail when not, or when another blob already follows
+    /// `after`. A store that can list should put it plainly, since a link may
+    /// cost a scarce, rate-limited call.
+    async fn put_loose(&self, after: Option<&Self::Id>, label: &str, data: Bytes) -> Result<Self::Id> {
+        if let Some(prev) = after {
+            // Lost: ours is garbage, like any loser's.
+            if let After::Won(id) = self.put_after(Some(prev), label, data.clone()).await? {
+                return Ok(id);
+            }
+        }
         for _ in 0..PUT_AFTER_TAIL_ATTEMPTS {
             let tail = self.tail().await?;
             match self.put_after(tail.as_ref().map(|t| &t.id), label, data.clone()).await? {
@@ -139,8 +150,8 @@ impl<C: Chain> Chain for std::sync::Arc<C> {
     async fn prune(&self, below: &Self::Id) -> Result<()> {
         (**self).prune(below).await
     }
-    async fn put_loose(&self, label: &str, data: Bytes) -> Result<Self::Id> {
-        (**self).put_loose(label, data).await
+    async fn put_loose(&self, after: Option<&Self::Id>, label: &str, data: Bytes) -> Result<Self::Id> {
+        (**self).put_loose(after, label, data).await
     }
     async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
         (**self).newest_loose(prefix).await

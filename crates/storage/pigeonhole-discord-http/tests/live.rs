@@ -210,7 +210,7 @@ async fn snapshots_against_a_live_channel() {
     let mut last: Option<SnapshotRef> = None;
     for at in 1..=3u64 {
         let snap = StoredSnapshot { log_id: LogId(7), at, data: vec![at as u8; 5000 * at as usize] };
-        let r = store.put(&snap).await.unwrap();
+        let r = store.put(&snap, last.as_ref()).await.unwrap();
         if let Some(old) = last.replace(r) {
             store.remove(&old).await.unwrap();
         }

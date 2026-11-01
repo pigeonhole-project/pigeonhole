@@ -476,8 +476,11 @@ impl StateMachine {
         let data = snap.encode();
         let at = snap.meta.last_log_id.as_ref().map_or(0, position);
         let stored = StoredSnapshot { log_id: history, at, data: data.clone() };
+        // The newest one stored: the last kept, else the one the log starts from.
+        let after = shared.current.lock().unwrap().as_ref().map(|c| c.snapshot.clone());
+        let after = after.or_else(|| shared.base.lock().unwrap().as_ref().map(|b| b.snapshot.clone()));
         let snapshot = snapshots
-            .put(&stored)
+            .put(&stored, after.as_ref())
             .await
             .map_err(|e| StorageError::from(StorageIOError::write_snapshot(None, AnyError::error(format!("{e:#}")))))?;
         crate::telemetry::record_snapshot(data.len(), t0.elapsed());

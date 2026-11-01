@@ -97,7 +97,10 @@ pub struct SnapshotRef(pub String);
 #[async_trait]
 pub trait SnapshotStore: Send + Sync + 'static {
     /// Durably store `snapshot`; `Ok` = [`Self::get`] returns it from now on.
-    async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef>;
+    /// `after`: the newest snapshot the caller knows this store holds (the
+    /// one it put last, or its log starts from), a hint that may save the
+    /// store a look for its newest.
+    async fn put(&self, snapshot: &StoredSnapshot, after: Option<&SnapshotRef>) -> Result<SnapshotRef>;
     async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot>;
     /// The most recently stored snapshot, of any log (lossy restore only).
     async fn newest(&self) -> Result<Option<StoredSnapshot>>;
@@ -112,7 +115,8 @@ const SNAPSHOT_PREFIX: &str = "snapshot-";
 /// Snapshots as blobs of a [`Chain`] store: no order or fence is needed (a
 /// snapshot counts only while the log's base names it); only a lossy
 /// restore asks which one is newest ([`Chain::newest_loose`]: by listing
-/// where the store can, else by the chain). The ref is the blob
+/// where the store can, else by the chain, each put linked after the one
+/// before it). The ref is the blob
 /// id (postcard, hex) and its crc, so a replaced blob is detected.
 ///
 /// A snapshot larger than the store's blobs (`max_blob_size`: Discord's
@@ -214,11 +218,15 @@ impl<C: Chain> BlobSnapshotStore<C> {
 
 #[async_trait]
 impl<C: Chain> SnapshotStore for BlobSnapshotStore<C> {
-    async fn put(&self, snapshot: &StoredSnapshot) -> Result<SnapshotRef> {
+    /// Linked after `after` where the store links ([`Chain::put_loose`]):
+    /// on a channel, no post to learn its top. A ref of another kind is no
+    /// hint.
+    async fn put(&self, snapshot: &StoredSnapshot, after: Option<&SnapshotRef>) -> Result<SnapshotRef> {
         let data = Bytes::from(self.cut(snapshot).await?);
         let crc = crc32fast::hash(&data);
         let label = format!("{SNAPSHOT_PREFIX}{}-{}.snap", snapshot.log_id, snapshot.at);
-        let id = self.chain.put_loose(&label, data).await?;
+        let after = after.and_then(|r| Self::parse(r).ok()).map(|(id, _)| id);
+        let id = self.chain.put_loose(after.as_ref(), &label, data).await?;
         Ok(Self::reference(&id, crc))
     }
 
@@ -267,8 +275,8 @@ pub mod conformance {
     {
         let store = open().await;
         assert_eq!(store.newest().await.unwrap(), None, "a new store is empty");
-        let r1 = store.put(&snap(1, 10)).await.unwrap();
-        let r2 = store.put(&snap(1, 20)).await.unwrap();
+        let r1 = store.put(&snap(1, 10), None).await.unwrap();
+        let r2 = store.put(&snap(1, 20), Some(&r1)).await.unwrap();
         assert_ne!(r1, r2);
 
         let again = open().await;
@@ -276,15 +284,24 @@ pub mod conformance {
         assert_eq!(again.get(&r2).await.unwrap(), snap(1, 20));
         assert_eq!(again.newest().await.unwrap(), Some(snap(1, 20)));
 
+        // A stale hint (a newer one followed it) still makes the newest.
+        let r3 = again.put(&snap(1, 30), Some(&r1)).await.unwrap();
+        assert_eq!(again.get(&r3).await.unwrap(), snap(1, 30));
+        assert_eq!(again.newest().await.unwrap(), Some(snap(1, 30)));
+
         // A chat may keep serving a deleted message's file: only check that
         // removing one leaves the others.
         again.remove(&r1).await.unwrap();
         assert_eq!(again.get(&r2).await.unwrap(), snap(1, 20), "only that one");
+        let r4 = again.put(&snap(1, 40), Some(&r3)).await.unwrap();
+        assert_eq!(again.newest().await.unwrap(), Some(snap(1, 40)));
 
         // A restored log starts over at 0: newest means most recently stored.
-        let r3 = again.put(&snap(2, 0)).await.unwrap();
+        let r5 = again.put(&snap(2, 0), None).await.unwrap();
         assert_eq!(again.newest().await.unwrap(), Some(snap(2, 0)));
-        again.remove(&r3).await.unwrap();
+        for r in [r2, r3, r4, r5] {
+            again.remove(&r).await.unwrap();
+        }
     }
 }
 
@@ -327,7 +344,7 @@ mod tests {
         let store = BlobSnapshotStore::new(mem.clone());
         let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
         let snap = StoredSnapshot { log_id: LogId(5), at: 9, data };
-        let r = store.put(&snap).await.unwrap();
+        let r = store.put(&snap, None).await.unwrap();
         assert_eq!(mem.message_keys().len(), 11 + 1, "eleven parts and a list");
         assert_eq!(store.get(&r).await.unwrap(), snap);
         assert_eq!(store.newest().await.unwrap().as_ref(), Some(&snap));
@@ -339,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn blobs_too_small_for_the_list_are_refused() {
         let store = BlobSnapshotStore::new(Arc::new(small_blobs(16)));
-        let err = store.put(&StoredSnapshot { log_id: LogId(1), at: 1, data: vec![0; 100] }).await.unwrap_err();
+        let err = store.put(&StoredSnapshot { log_id: LogId(1), at: 1, data: vec![0; 100] }, None).await.unwrap_err();
         assert!(format!("{err:#}").contains("the list of a snapshot's parts"), "{err:#}");
     }
 
@@ -347,7 +364,7 @@ mod tests {
     async fn a_missing_part_is_an_error_not_a_snapshot() {
         let mem = Arc::new(small_blobs(1000));
         let store = BlobSnapshotStore::new(mem.clone());
-        let r = store.put(&StoredSnapshot { log_id: LogId(5), at: 9, data: vec![3; 5000] }).await.unwrap();
+        let r = store.put(&StoredSnapshot { log_id: LogId(5), at: 9, data: vec![3; 5000] }, None).await.unwrap();
         let head = BlobSnapshotStore::<pigeonhole_storage_memory::MemoryBlobStore>::blob_id(&r).unwrap();
         let head = pigeonhole_storage_memory::MemoryBlobStore::key(&head);
         let part = *mem.message_keys().iter().find(|&&k| k != head).unwrap();
@@ -361,7 +378,7 @@ mod tests {
         use pigeonhole_storage_memory::MemoryBlobStore;
         let mem = Arc::new(MemoryBlobStore::new());
         let store = BlobSnapshotStore::new(mem.clone());
-        let r = store.put(&StoredSnapshot { log_id: LogId(1), at: 1, data: vec![1] }).await.unwrap();
+        let r = store.put(&StoredSnapshot { log_id: LogId(1), at: 1, data: vec![1] }, None).await.unwrap();
         let (id, crc) = BlobSnapshotStore::<MemoryBlobStore>::parse(&r).unwrap();
         let forged = BlobSnapshotStore::<MemoryBlobStore>::reference(&id, crc ^ 1);
         assert!(format!("{:#}", store.get(&forged).await.unwrap_err()).contains("changed"));
@@ -372,8 +389,8 @@ mod tests {
     async fn a_damaged_snapshot_is_detected() {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobSnapshotStore::new(Arc::new(pigeonhole_storage_disk::DiskBlobStore::open(dir.path()).unwrap()));
-        store.put(&StoredSnapshot { log_id: LogId(7), at: 3, data: vec![1, 2, 3] }).await.unwrap();
-        let r = store.put(&StoredSnapshot { log_id: LogId(7), at: 4, data: vec![1, 2, 3] }).await.unwrap();
+        store.put(&StoredSnapshot { log_id: LogId(7), at: 3, data: vec![1, 2, 3] }, None).await.unwrap();
+        let r = store.put(&StoredSnapshot { log_id: LogId(7), at: 4, data: vec![1, 2, 3] }, None).await.unwrap();
         let seg = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().path())

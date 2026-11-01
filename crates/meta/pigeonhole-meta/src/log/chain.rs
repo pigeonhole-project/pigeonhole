@@ -311,7 +311,7 @@ impl<C: Chain> ChainLogStore<C> {
 
     /// The store's time now: the stamp of a probe blob, deleted after.
     async fn store_now(&self, l: &Leased<C::Id>) -> LogResult<u64> {
-        let probe = self.chain.put_loose("log-probe", Bytes::from_static(&[0])).await?;
+        let probe = self.chain.put_loose(None, "log-probe", Bytes::from_static(&[0])).await?;
         let now = l.store.stamp_ms(&probe);
         if let Err(e) = self.chain.delete(&[C::key(&probe)]).await {
             tracing::debug!(error = %format!("{e:#}"), "a lease probe stays");

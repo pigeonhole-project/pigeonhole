@@ -1032,7 +1032,7 @@ pub async fn restore_lossy(log: &dyn LogStore, snapshots: &dyn SnapshotStore) ->
     let (gen, head) = claim_next(log, known.map_or(0, |d| d.gen)).await?;
     let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
     let stored = StoredSnapshot { log_id: head.log_id, at: 1, data };
-    let snapshot = snapshots.put(&stored).await.context("store the restored snapshot")?;
+    let snapshot = snapshots.put(&stored, None).await.context("store the restored snapshot")?;
     log.rebase(gen, raft::base_of(&meta, snapshot), 1).await.context("start the new log from it")?;
     Ok(old_position)
 }
