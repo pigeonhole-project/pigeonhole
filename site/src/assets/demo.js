@@ -102,8 +102,9 @@
     for (const c of state.channels) {
       const app = c.kind === "telegram" ? "Telegram" : "Discord";
       const bots = c.bots > 1 ? `, ${t("demo.bots", {n: c.bots})}` : "";
-      const role = placeNote(c, app) + bots;
+      const role = placeNote(c, app) + bots + (c.down ? `, ${t("demo.down")}` : "");
       const n = node(c.store, pos[c.store], c.store, role);
+      n.g.classList.toggle("down", !!c.down);
       s("rect", {class: "shape", x: -130, y: -34, width: 260, height: 68, rx: 14}, n.g);
       s("circle", {class: "badge", cx: -106, cy: 0, r: 9, fill: c.kind === "telegram" ? "var(--tg)" : "var(--dc)"}, n.g);
       n.label(-88, 0, "start");
@@ -173,7 +174,7 @@
   // A pigeon: a dot along an edge, from the loft to a channel or back.
   const flights = [];
   let flying = Promise.resolve();
-  function fly(store, back, size) {
+  function fly(store, back, size, failed = false) {
     const path = edges[store];
     if (!path) return Promise.resolve();
     if (reduced) return Promise.resolve();
@@ -182,13 +183,14 @@
     return start.then(() => new Promise(done => {
       // A small pigeon, wings beating; bigger for bigger payloads.
       const scale = 0.9 + Math.min(1, Math.log2(1 + size / 4096) / 10);
-      const bird = s("g", {class: "flight"}, graph);
+      const bird = s("g", {class: "flight" + (failed ? " failed" : "")}, graph);
       const body = s("path", {fill: "url(#iris)", d: BIRD}, bird);
       const len = path.getTotalLength(), t0 = performance.now(), dur = 680;
       flights.push(bird);
       const step = now => {
         const k = Math.min(1, (now - t0) / dur), e = k < .5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
-        const at = len * (back ? 1 - e : e);
+        // A failed call reaches the channel and turns back.
+        const at = failed ? len * 0.92 * (1 - Math.abs(1 - 2 * e)) : len * (back ? 1 - e : e);
         const pt = path.getPointAtLength(at), ahead = path.getPointAtLength(Math.min(len, Math.max(0, at + (back ? -1 : 1))));
         const flip = ahead.x < pt.x ? -1 : 1;
         const flap = 0.55 + 0.45 * Math.abs(Math.sin((now - t0) / 55));
@@ -235,6 +237,10 @@
         if (state.open === f.store) renderPanel();
       } else if (msg === "store call" && span?.op === "get" && stores[span.instance]) {
         fly(span.instance, true, +span.bytes || 4096);
+      } else if (msg === "store call" && span?.op === "exists" && stores[span.instance]) {
+        fly(span.instance, true, 512);
+      } else if (msg === "store call failed" && stores[span?.instance]) {
+        fly(span.instance, false, 2048, true);
       } else if ((line.target || "").startsWith("pigeonhole_gateway_s3") && msg.endsWith(" ok")) {
         said.push({op: msg.slice(0, -3), ...f});
       }
@@ -287,7 +293,8 @@
     for (const c of state.channels) for (const m of c.messages) m.fresh = false;
     const data = await call(request, body);
     const said = apply(data.events);
-    if (data.reply?.error) caption(`<b>${esc(t("try.error", {error: data.reply.error}))}</b>`);
+    if (data.reply?.error && state.channels.some(c => c.down)) caption(t("say.failed_down", {error: esc(data.reply.error)}));
+    else if (data.reply?.error) caption(`<b>${esc(t("try.error", {error: data.reply.error}))}</b>`);
     else if (said.length) caption(sentence(said.at(-1)));
     await flying;
     await refreshObjects();
@@ -376,8 +383,51 @@
       const app = c.kind === "telegram" ? "Telegram" : "Discord";
       $("panel-title").textContent = c.store;
       $("panel-sub").textContent = t(`demo.channel_sub_${c.role}`, {app, scope: c.scope});
-      body.replaceChildren(feed(c));
+      body.replaceChildren(...(c.role === "data" ? [faults(c)] : []), feed(c));
     }
+  }
+
+  // Breaking a data channel: down (every call fails), cleared (its messages
+  // gone behind the node's back); check finds what is gone, repair puts it back.
+  function faults(c) {
+    const box = h("div", "faults");
+    box.append(h("p", "faults-note", t(c.down ? "demo.fault_down_note" : "demo.fault_note")));
+    const row = h("div", "row");
+    const btn = (label, cls, fn) => {
+      const b = h("button", `btn ${cls}`, label);
+      b.type = "button";
+      b.addEventListener("click", fn);
+      row.append(b);
+    };
+    const store = esc(c.store);
+    btn(t(c.down ? "demo.bring_back" : "demo.take_down"), c.down ? "primary" : "", async () => {
+      const r = await op({op: "outage", store: c.store, down: !c.down});
+      if (r && !r.error) caption(t(r.down ? "say.down" : "say.up", {store}));
+      await refreshChannels();
+    });
+    btn(t("demo.wipe"), "danger", async () => {
+      const r = await op({op: "wipe", store: c.store});
+      if (r && !r.error) caption(t("say.wiped", {store, n: r.deleted}));
+      await refreshChannels();
+    });
+    btn(t("demo.verify"), "", async () => {
+      const r = await op({op: "verify", store: c.store});
+      if (r && !r.error) caption(t(r.gone ? "say.verified" : "say.verified_ok", {store, checked: r.checked, gone: r.gone}));
+    });
+    btn(t("demo.repair"), "", async () => {
+      const r = await op({op: "repair"});
+      if (r && !r.error) caption(t("say.repair", {n: r.repaired}));
+      await refreshChannels();
+    });
+    box.append(row);
+    return box;
+  }
+
+  // The channels as they are now (a fault changes them behind the events).
+  async function refreshChannels() {
+    await loadChannels();
+    draw();
+    renderPanel();
   }
 
   // A channel as its app shows it: Telegram's channel view, Discord's text channel.

@@ -335,3 +335,12 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .booting .node, .booting .edge { opacity: 0; transition: opacity .45s ease-out, stroke-dashoffset .6s ease-out; }
 .booting .node.up, .booting .edge.up { opacity: 1; stroke-dashoffset: 0 !important; }
 @media (prefers-reduced-motion: reduce) { .booting .node, .booting .edge { transition: none; } }
+
+/* faults: a channel down, a failed call */
+.node.down .shape { stroke: var(--eye); stroke-dasharray: 6 5; }
+.node.down .role { fill: var(--eye); }
+.flight.failed path { fill: var(--eye); }
+.faults { border: 1px dashed var(--slate-2); border-radius: 12px; padding: 12px 14px; margin: 0 0 16px; }
+.faults-note { margin: 0; font-size: 14px; color: var(--wing-2); max-width: 70ch; }
+.faults .row { margin-bottom: 0; }
+.caption .err { font-family: var(--mono); font-size: 13px; color: var(--eye); }
