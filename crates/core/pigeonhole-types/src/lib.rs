@@ -5,6 +5,7 @@ use std::fmt;
 use std::ops::Range;
 
 pub mod metric_doc;
+pub mod schedule;
 pub use metric_doc::{MetricDoc, MetricKind};
 
 /// Result of deleting a backend message/attachment.

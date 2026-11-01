@@ -32,6 +32,7 @@
 //! tablet stops ([`Stop::Fenced`]) and every later `propose` fails.
 
 use anyhow::{bail, Context, Result};
+use pigeonhole_types::schedule::{Control, Schedule};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::any::Any;
@@ -500,6 +501,8 @@ pub struct MetaStore {
     queue: tokio::sync::mpsc::UnboundedSender<Pending>,
     /// The periodic snapshot task; ends with the store.
     ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Its period (`None`: only when asked).
+    snapshots: Control<Option<Duration>>,
 }
 
 impl Drop for MetaStore {
@@ -606,13 +609,14 @@ impl MetaStore {
             snapshots_outlive_log: opts.snapshots_outlive_log,
             stop,
             ticker: Mutex::new(None),
+            snapshots: Control::new(opts.snapshot_interval),
         };
         store.wait_ready(cluster.members.len(), &opts).await?;
         if fell_back {
             // So that the snapshot that failed stops being the base.
             let _ = raft.trigger().snapshot().await;
         }
-        *store.ticker.lock().unwrap() = opts.snapshot_interval.map(|every| spawn_snapshot_ticker(raft, shared, every));
+        *store.ticker.lock().unwrap() = Some(spawn_snapshot_ticker(raft, shared, store.snapshots.schedule()));
         telemetry::record_boot(store.applied_position().saturating_sub(store.base_position()), t0.elapsed());
         tracing::info!(
             generation = gen,
@@ -831,6 +835,12 @@ impl MetaStore {
         self.snapshots_outlive_log.then(|| self.base_position())
     }
 
+    /// The periodic snapshot's period (`None`: only when asked); a pass
+    /// asked for snapshots if anything was applied since the last one.
+    pub fn snapshot_schedule(&self) -> &Control<Option<Duration>> {
+        &self.snapshots
+    }
+
     /// Position of the last applied entry (0 before the first).
     pub fn applied_position(&self) -> Position {
         self.shared.applied.load(Ordering::SeqCst)
@@ -991,19 +1001,22 @@ fn raft_config(opts: &MetaOptions) -> Result<openraft::Config> {
     .context("raft config")
 }
 
-/// Ask for a snapshot every `every` while something was applied since the
-/// last one.
-fn spawn_snapshot_ticker(raft: raft::Raft, shared: Arc<raft::Shared>, every: Duration) -> tokio::task::JoinHandle<()> {
+/// Ask for a snapshot whenever `schedule` says (every its period, `None`:
+/// only when asked) while something was applied since the last one.
+fn spawn_snapshot_ticker(
+    raft: raft::Raft,
+    shared: Arc<raft::Shared>,
+    mut schedule: Schedule<Option<Duration>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(
         async move {
-            let mut tick = tokio::time::interval(every);
-            tick.tick().await;
             // The metrics show a snapshot only once it is built: while one
             // asked for is being built, asking again builds a copy. Ask
             // again only once the metrics moved (or after a while).
             let mut pending: Option<(Position, u32)> = None;
             loop {
-                tick.tick().await;
+                schedule.next(|every| *every).await;
+                schedule.done();
                 let snapshotted = raft.metrics().borrow().snapshot.as_ref().map_or(0, raft::position);
                 if let Some((at, ticks)) = pending {
                     if snapshotted == at && ticks < 20 {

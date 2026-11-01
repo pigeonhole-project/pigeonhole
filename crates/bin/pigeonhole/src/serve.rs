@@ -26,11 +26,13 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     let index = Index::open(rt.meta.clone()).await.context("open s3 index")?;
 
     let s3_gateway = build_s3_gateway(cfg.s3_options(), index.clone(), rt.store.clone());
-    spawn_background_tasks(&cfg, &rt);
-    spawn_cooler(&cfg, s3_gateway.clone());
+    spawn_background_tasks(&rt);
+    spawn_cooler(&rt, cfg.inline.max_object_size.is_some(), s3_gateway.clone());
     if cfg.metrics.enabled {
-        pigeonhole::state_metrics::spawn(rt.meta.clone(), index.clone(), rt.store.db().clone());
+        let schedule = rt.dynamic.metrics.schedule();
+        pigeonhole::state_metrics::spawn(rt.meta.clone(), index.clone(), rt.store.db().clone(), schedule);
     }
+    spawn_admin(&cfg, &rt).await?;
 
     #[cfg(feature = "bytestream")]
     spawn_bytestream(&cfg, &rt).await?;
@@ -69,7 +71,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
 #[cfg(feature = "bytestream")]
 async fn spawn_bytestream(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow::Result<()> {
     use pigeonhole_gateway_bytestream::cas_index::CasIndex;
-    use pigeonhole_gateway_bytestream::config::BytestreamConfig;
+    use pigeonhole_gateway_bytestream::config::{BytestreamConfig, Gc};
     if !cfg.bytestream.enabled {
         return Ok(());
     }
@@ -78,14 +80,33 @@ async fn spawn_bytestream(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow:
         listen_addr: cfg.bytestream.listen_addr.clone(),
         instance_name: cfg.bytestream.instance_name.clone(),
         max_batch_total_size_bytes: cfg.bytestream.max_batch_total_size as i64,
-        gc_ttl: cfg.bytestream.gc_ttl,
         ..Default::default()
     };
+    let gc = Gc { cas: rt.dynamic.cas_gc.schedule(), uploads: rt.dynamic.upload_gc.schedule() };
     let cas = CasIndex::open(rt.meta.clone()).await.context("open cas index")?;
     let bs_store = rt.store.clone();
     tokio::spawn(async move {
-        if let Err(e) = pigeonhole_gateway_bytestream::server::serve(bs_cfg, cas, bs_store).await {
+        if let Err(e) = pigeonhole_gateway_bytestream::server::serve(bs_cfg, cas, bs_store, gc).await {
             warn!(error = %e, "bytestream server exited");
+        }
+    });
+    Ok(())
+}
+
+/// The admin API (`[admin] listen_addr`, off by default): the dynamic
+/// config and passes on demand (docs/dynamic-config.md).
+async fn spawn_admin(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow::Result<()> {
+    let Some(addr) = &cfg.admin.listen_addr else { return Ok(()) };
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind admin {addr}"))?;
+    let sock = listener.local_addr()?;
+    if !sock.ip().is_loopback() {
+        tracing::warn!(%sock, "the admin API has no authentication and listens beyond this host");
+    }
+    info!(%sock, "admin API listening");
+    let app = pigeonhole::admin_http::router(rt.dynamic.clone());
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = %e, "admin API stopped");
         }
     });
     Ok(())

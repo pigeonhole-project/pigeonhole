@@ -3,6 +3,7 @@
 use pigeonhole_chunk_store::BlobDb;
 use pigeonhole_gateway_s3::Index;
 use pigeonhole_meta::MetaStore;
+use pigeonhole_types::schedule::Schedule;
 use pigeonhole_types::MetricDoc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,18 +44,14 @@ pub const METRICS: &[MetricDoc] = &[
     ),
 ];
 
-/// How often the tablet gauges are refreshed (each refresh walks the state).
-const EVERY: Duration = Duration::from_secs(5);
-
-/// Set the process gauges once and the tablet ones every [`EVERY`].
-pub fn spawn(meta: Arc<MetaStore>, index: Index, chunks: BlobDb) {
+/// Set the process gauges once, and the tablet ones now and whenever
+/// `schedule` says (`[metrics] every`; each refresh walks the state).
+pub fn spawn(meta: Arc<MetaStore>, index: Index, chunks: BlobDb, mut schedule: Schedule<Option<Duration>>) {
     metrics::gauge!("pigeonhole_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
     let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     metrics::gauge!("pigeonhole_start_time_seconds").set(started.as_secs_f64());
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(EVERY);
         loop {
-            tick.tick().await;
             meta.record_gauges();
             let s3 = index.stats();
             metrics::gauge!("pigeonhole_s3_buckets").set(s3.buckets as f64);
@@ -74,6 +71,8 @@ pub fn spawn(meta: Arc<MetaStore>, index: Index, chunks: BlobDb) {
             if meta.is_stopped() {
                 return;
             }
+            schedule.done();
+            schedule.next(|every| *every).await;
         }
     });
 }

@@ -5,7 +5,7 @@ use bytes::Bytes;
 use pigeonhole_chunk_store::{BlobDb, ChunkStore, IngestOptions};
 use pigeonhole_codec::ChunkCodec;
 use pigeonhole_gateway_bytestream::cas_index::CasIndex;
-use pigeonhole_gateway_bytestream::config::BytestreamConfig;
+use pigeonhole_gateway_bytestream::config::{BytestreamConfig, Gc};
 use pigeonhole_gateway_bytestream::digest::sha256_hex;
 use pigeonhole_gateway_bytestream::google::bytestream::byte_stream_client::ByteStreamClient;
 use pigeonhole_gateway_bytestream::google::bytestream::{ReadRequest, WriteRequest};
@@ -29,9 +29,8 @@ async fn test_harness(
     let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
     opts.block_size = 64 * 1024;
     let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
-    let cfg =
-        BytestreamConfig { enabled: true, instance_name: "pigeonhole".into(), gc_ttl: None, ..Default::default() };
-    let (addr, _handle) = serve_ephemeral(cfg, cas, store).await.unwrap();
+    let cfg = BytestreamConfig { enabled: true, instance_name: "pigeonhole".into(), ..Default::default() };
+    let (addr, _handle) = serve_ephemeral(cfg, cas, store, Gc::off()).await.unwrap();
     let uri = format!("http://{addr}");
     let channel = Channel::from_shared(uri).unwrap().connect().await.unwrap();
     const MAX_MSG: usize = 32 * 1024 * 1024;

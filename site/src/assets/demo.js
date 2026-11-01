@@ -149,9 +149,10 @@
     }
     const loft = nodes.loft;
     if (loft?.arc) {
-      const left = bg.repair.next_ms / bg.repair.every_ms;
+      // every_ms / next_ms are null while repair is off (`[repair] interval = "off"`).
+      const left = bg.repair.every_ms ? bg.repair.next_ms / bg.repair.every_ms : 1;
       loft.arc.style.strokeDashoffset = String(Math.round(100 * left));
-      loft.clockText.textContent = String(Math.ceil(bg.repair.next_ms / 1000));
+      loft.clockText.textContent = bg.repair.every_ms ? String(Math.ceil(bg.repair.next_ms / 1000)) : "–";
       loft.g.classList.toggle("queued", bg.repair.queue.length > 0);
     }
     if (state.open === "loft") renderBgPanel();
@@ -166,7 +167,7 @@
     rep.append(h("div", "bg-label", t("demo.bg_repair", {n: bg.repair.queue.length, s: sec})));
     const bar = h("div", "meter");
     const fill = h("div", "fill");
-    fill.style.width = `${100 * (1 - bg.repair.next_ms / bg.repair.every_ms)}%`;
+    fill.style.width = bg.repair.every_ms ? `${100 * (1 - bg.repair.next_ms / bg.repair.every_ms)}%` : "0%";
     bar.append(fill);
     rep.append(bar);
     const jobs = h("ol", "jobs");

@@ -22,16 +22,21 @@ pigeonhole-chunk-store = { workspace = true }
 pigeonhole-codec = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-limits = { workspace = true }
+pigeonhole-meta = { workspace = true }
 pigeonhole-storage-discord = { workspace = true, optional = true }
 pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true }
 pigeonhole-types = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true }
 toml = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+pigeonhole-testkit = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

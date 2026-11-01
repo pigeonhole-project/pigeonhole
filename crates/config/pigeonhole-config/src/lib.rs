@@ -24,9 +24,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod dynamic;
 pub mod instances;
 pub mod stores;
 pub mod units;
+
+pub use dynamic::{Cooling, DynConfig, DynamicConfig};
 
 /// Blob placement (`[chunk] store`): shards, each a replica group. A chunk
 /// goes to one shard and to every member of it.
@@ -85,11 +88,15 @@ pub struct Config {
     pub repair: RepairConfig,
     /// Prometheus scrape endpoint (`[metrics]`); off by default.
     pub metrics: MetricsSettings,
+    /// The admin API (`[admin]`); off by default.
+    pub admin: AdminSettings,
     /// What the process logs (`[log]`).
     pub log: LoggingSettings,
     /// Small objects in the metadata, and the cooler (`[inline]`).
     pub inline: InlineSettings,
     pub config_path: PathBuf,
+    /// The file as read: the base the dynamic config's overrides go on.
+    file: toml::Table,
 }
 
 /// `[inline]` (docs/inline-objects.md).
@@ -99,16 +106,21 @@ pub struct InlineSettings {
     pub max_object_size: Option<usize>,
     /// When the cooler moves inline objects out.
     pub cool: CoolPolicy,
-    /// Pause between cooler passes.
-    pub cool_every: Duration,
+    /// Pause between cooler passes; `None`: only when asked.
+    pub cool_every: Option<Duration>,
 }
 
 impl InlineSettings {
     /// Nothing inline (tests that count chunks).
     pub fn off() -> Self {
-        Self { max_object_size: None, cool: CoolPolicy::default(), cool_every: Duration::from_secs(60) }
+        Self { max_object_size: None, cool: CoolPolicy::default(), cool_every: Some(DEFAULT_COOL_EVERY) }
     }
 }
+
+/// Default `[inline] cool_every`.
+pub const DEFAULT_COOL_EVERY: Duration = Duration::from_secs(60);
+/// Default `[metrics] every`: how often the gauges of the tablet are set.
+pub const DEFAULT_METRICS_EVERY: Duration = Duration::from_secs(5);
 
 /// Default `[log] level`: our crates at `info`; openraft's per-step chatter
 /// and s3s's own error lines (a refused signature logged as ERROR) are off —
@@ -246,12 +258,36 @@ impl MetaSettings {
 }
 
 /// Optional Prometheus metrics exporter (`[metrics]`).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MetricsSettings {
     /// When false (default), no recorder / `/metrics` route is installed.
     pub enabled: bool,
     /// Optional dedicated listen address. Empty = `GET /metrics` on the main HTTP server.
     pub listen_addr: Option<String>,
+    /// How often the gauges of the tablet are set; `None`: only when asked.
+    pub every: Option<Duration>,
+}
+
+/// The admin API (`[admin]`, docs/dynamic-config.md).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminSettings {
+    /// Where it listens (`127.0.0.1:9100`); `None`: no admin API. It has no
+    /// authentication: keep it on loopback.
+    pub listen_addr: Option<String>,
+}
+
+impl AdminSettings {
+    /// `[admin]` of the config file alone (`PIGEONHOLE_CONFIG`, else
+    /// `pigeonhole.toml`): what the CLI talks to, without the stores' secrets.
+    pub fn from_config_file() -> Result<Self> {
+        let _ = dotenvy::dotenv();
+        let path = config_path_from_env();
+        let text = fs::read_to_string(&path).with_context(|| format!("read config {}", path.display()))?;
+        let mut table: toml::Table = text.parse().with_context(|| format!("parse TOML {}", path.display()))?;
+        let admin = table.remove("admin").map(|v| v.try_into()).transpose().context("[admin]")?;
+        Ok(admin.unwrap_or_default())
+    }
 }
 
 /// Axum/tower HTTP server knobs.
@@ -290,6 +326,10 @@ pub struct BytestreamSettings {
     pub max_batch_total_size: usize,
     /// `None` = no TTL GC of CAS entries.
     pub gc_ttl: Option<Duration>,
+    /// Pause between CAS GC passes; `None`: only when asked.
+    pub gc_every: Option<Duration>,
+    /// Pause between passes dropping stale incomplete uploads; `None`: only when asked.
+    pub upload_gc_every: Option<Duration>,
 }
 
 impl Default for BytestreamSettings {
@@ -300,6 +340,8 @@ impl Default for BytestreamSettings {
             instance_name: "pigeonhole".into(),
             max_batch_total_size: 4 * 1024 * 1024,
             gc_ttl: Some(Duration::from_secs(7 * 24 * 3600)),
+            gc_every: Some(Duration::from_secs(300)),
+            upload_gc_every: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -323,10 +365,11 @@ impl Config {
     /// messages name it); secrets from the environment as it is.
     pub fn from_toml(text: &str, path: &Path) -> Result<Self> {
         let file: FileConfig = toml::from_str(text).with_context(|| format!("parse TOML {}", path.display()))?;
-        Self::from_file(file, path.to_path_buf())
+        let table = text.parse().with_context(|| format!("parse TOML {}", path.display()))?;
+        Self::from_file(file, table, path.to_path_buf())
     }
 
-    fn from_file(file: FileConfig, config_path: PathBuf) -> Result<Self> {
+    fn from_file(file: FileConfig, table: toml::Table, config_path: PathBuf) -> Result<Self> {
         let access_key = env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "pigeonhole".into());
         let secret_key = env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "pigeonholesecret".into());
         if access_key.is_empty() || secret_key.is_empty() {
@@ -384,9 +427,11 @@ impl Config {
             sweep: file.sweep.into_sweep_config(),
             repair: file.repair.into_repair_config(),
             metrics: file.metrics.into_settings(),
+            admin: file.admin,
             log: file.log.into_settings(),
             inline: file.inline.into_settings()?,
             config_path,
+            file: table,
         })
     }
 
@@ -423,9 +468,11 @@ impl Config {
             sweep: SweepConfig::default(),
             repair: RepairConfig::default(),
             metrics: MetricsSettings::default(),
+            admin: AdminSettings::default(),
             log: LoggingSettings::default(),
             inline: InlineSettings::off(),
             config_path: PathBuf::from("(test)"),
+            file: toml::Table::new(),
         }
     }
 
@@ -502,6 +549,8 @@ struct FileConfig {
     #[serde(default)]
     metrics: FileMetrics,
     #[serde(default)]
+    admin: AdminSettings,
+    #[serde(default)]
     log: FileLog,
     #[serde(default)]
     inline: FileInline,
@@ -547,6 +596,7 @@ impl Default for FileConfig {
             sweep: FileSweep::default(),
             repair: FileRepair::default(),
             metrics: FileMetrics::default(),
+            admin: AdminSettings::default(),
             log: FileLog::default(),
             inline: FileInline::default(),
         }
@@ -646,19 +696,38 @@ impl FileMeta {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileMetrics {
     enabled: bool,
     /// Empty / omitted → scrape on the main listen address at `GET /metrics`.
     listen_addr: Option<String>,
+    #[serde(deserialize_with = "units::duration_or_off")]
+    every: Option<Duration>,
+}
+
+impl Default for FileMetrics {
+    fn default() -> Self {
+        Self { enabled: false, listen_addr: None, every: Some(DEFAULT_METRICS_EVERY) }
+    }
+}
+
+impl Default for MetricsSettings {
+    fn default() -> Self {
+        FileMetrics::default().into_settings()
+    }
 }
 
 impl FileMetrics {
     fn into_settings(self) -> MetricsSettings {
         let listen_addr = self.listen_addr.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        MetricsSettings { enabled: self.enabled, listen_addr }
+        MetricsSettings { enabled: self.enabled, listen_addr, every: at_least_a_second(self.every) }
     }
+}
+
+/// A loop's period, `None` (off) kept: a second at least.
+fn at_least_a_second(every: Option<Duration>) -> Option<Duration> {
+    every.map(|d| d.max(Duration::from_secs(1)))
 }
 
 /// `[inline]`: small objects in the metadata (docs/inline-objects.md).
@@ -676,8 +745,8 @@ struct FileInline {
     cool_after: Option<Duration>,
     #[serde(with = "humantime_serde")]
     min_inline: Duration,
-    #[serde(with = "humantime_serde")]
-    cool_every: Duration,
+    #[serde(deserialize_with = "units::duration_or_off")]
+    cool_every: Option<Duration>,
     cool_batch: usize,
 }
 
@@ -690,7 +759,7 @@ impl Default for FileInline {
             low_watermark: p.low_watermark,
             cool_after: p.cool_after,
             min_inline: p.min_inline,
-            cool_every: Duration::from_secs(60),
+            cool_every: Some(DEFAULT_COOL_EVERY),
             cool_batch: p.batch,
         }
     }
@@ -710,7 +779,7 @@ impl FileInline {
                 min_inline: self.min_inline,
                 batch: self.cool_batch.max(1),
             },
-            cool_every: self.cool_every.max(Duration::from_secs(1)),
+            cool_every: at_least_a_second(self.cool_every),
         })
     }
 }
@@ -718,28 +787,28 @@ impl FileInline {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileSweep {
-    #[serde(with = "humantime_serde")]
-    interval: Duration,
+    #[serde(deserialize_with = "units::duration_or_off")]
+    interval: Option<Duration>,
     batch_size: usize,
 }
 
 impl Default for FileSweep {
     fn default() -> Self {
-        Self { interval: DEFAULT_SWEEP_INTERVAL, batch_size: SWEEP_BATCH_SIZE }
+        Self { interval: Some(DEFAULT_SWEEP_INTERVAL), batch_size: SWEEP_BATCH_SIZE }
     }
 }
 
 impl FileSweep {
     fn into_sweep_config(self) -> SweepConfig {
-        SweepConfig { batch_size: self.batch_size.max(1), interval: self.interval.max(Duration::from_secs(1)) }
+        SweepConfig { batch_size: self.batch_size.max(1), interval: at_least_a_second(self.interval) }
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileRepair {
-    #[serde(with = "humantime_serde")]
-    interval: Duration,
+    #[serde(deserialize_with = "units::duration_or_off")]
+    interval: Option<Duration>,
     batch_size: usize,
     concurrency: usize,
     #[serde(with = "humantime_serde")]
@@ -750,7 +819,7 @@ struct FileRepair {
 impl Default for FileRepair {
     fn default() -> Self {
         Self {
-            interval: DEFAULT_REPAIR_INTERVAL,
+            interval: Some(DEFAULT_REPAIR_INTERVAL),
             batch_size: REPAIR_BATCH_SIZE,
             concurrency: REPAIR_CONCURRENCY,
             max_cost_wait: Duration::from_secs_f64(DEFAULT_MAX_COST_WAIT_SECS),
@@ -762,7 +831,7 @@ impl Default for FileRepair {
 impl FileRepair {
     fn into_repair_config(self) -> RepairConfig {
         RepairConfig {
-            interval: self.interval.max(Duration::from_secs(1)),
+            interval: at_least_a_second(self.interval),
             batch_size: self.batch_size.max(1),
             concurrency: self.concurrency.max(1),
             max_cost_wait_secs: self.max_cost_wait.as_secs_f64(),
@@ -843,6 +912,10 @@ struct FileBytestream {
     max_batch_total_size: usize,
     #[serde(deserialize_with = "units::duration_or_off")]
     gc_ttl: Option<Duration>,
+    #[serde(deserialize_with = "units::duration_or_off")]
+    gc_every: Option<Duration>,
+    #[serde(deserialize_with = "units::duration_or_off")]
+    upload_gc_every: Option<Duration>,
 }
 
 impl Default for FileBytestream {
@@ -854,6 +927,8 @@ impl Default for FileBytestream {
             instance_name: d.instance_name,
             max_batch_total_size: d.max_batch_total_size,
             gc_ttl: d.gc_ttl,
+            gc_every: d.gc_every,
+            upload_gc_every: d.upload_gc_every,
         }
     }
 }
@@ -866,6 +941,8 @@ impl FileBytestream {
             instance_name: self.instance_name,
             max_batch_total_size: self.max_batch_total_size.max(1024),
             gc_ttl: self.gc_ttl,
+            gc_every: at_least_a_second(self.gc_every),
+            upload_gc_every: at_least_a_second(self.upload_gc_every),
         }
     }
 }
@@ -1353,7 +1430,7 @@ rate_per_sec = 20.0
         assert_eq!(cfg.inline.cool.budget_bytes, 1 << 20);
         assert_eq!(cfg.inline.cool.cool_after, None, "off: only by budget");
         assert_eq!(cfg.inline.cool.min_inline, Duration::from_secs(5));
-        assert_eq!(cfg.inline.cool_every, Duration::from_secs(120));
+        assert_eq!(cfg.inline.cool_every, Some(Duration::from_secs(120)));
         assert!(load_mem("[inline]\nmax_object_size = \"1 KB\"\n").is_err(), "decimal units refused");
         assert!(load_mem("[inline]\nlow_watermark = 1.5\n").is_err());
         assert!(load_mem("[inline]\ncool_after = \"0s\"\n").is_err(), "zero is ambiguous: write off");
@@ -1562,7 +1639,7 @@ max_batch_total_size = "8 MiB"
         .unwrap();
         assert_eq!((cfg.chunk_size, cfg.block_size), (16 << 20, 512 << 10));
         assert_eq!((cfg.cache.l1_bytes, cfg.cache.l2_bytes), (32 << 20, None));
-        assert_eq!(cfg.sweep.interval, Duration::from_secs(90));
+        assert_eq!(cfg.sweep.interval, Some(Duration::from_secs(90)));
         assert_eq!(cfg.repair.max_cost_wait_secs, 0.5);
         assert_eq!((cfg.http.request_timeout, cfg.http.headers_timeout), (Duration::from_secs(120), None));
         assert_eq!(
@@ -1588,22 +1665,21 @@ max_batch_total_size = "8 MiB"
         // What can be off says so; zero is refused there.
         let cfg = load_mem("[meta]\nsnapshot_every = \"off\"\n[bytestream]\ngc_ttl = \"off\"\n").unwrap();
         assert_eq!((cfg.meta.snapshot_interval, cfg.bytestream.gc_ttl), (None, None));
+        let cfg = load_mem("[sweep]\ninterval = \"off\"\n[repair]\ninterval = \"off\"\n").unwrap();
+        assert_eq!((cfg.sweep.interval, cfg.repair.interval), (None, None));
         for bad in [
             "[meta]\nsnapshot_every_entries = 0\n",
             "[meta]\nsnapshot_every = \"0s\"\n",
             "[meta]\nlease = \"0ms\"\n",
             "[http]\nheaders_timeout = \"0s\"\n",
             "[bytestream]\ngc_ttl = \"0s\"\n",
+            "[sweep]\ninterval = \"0s\"\n",
             "[cache]\nl2_size = 0\n",
         ] {
             let err = format!("{:#}", load_mem(bad).unwrap_err());
             assert!(err.contains("write \"off\""), "{bad:?}: {err}");
         }
-        for bad in [
-            "[sweep]\ninterval = \"off\"\n",
-            "[cache]\nl1_size = \"off\"\n",
-            "[meta]\nsnapshot_every_entries = \"never\"\n",
-        ] {
+        for bad in ["[cache]\nl1_size = \"off\"\n", "[meta]\nsnapshot_every_entries = \"never\"\n"] {
             assert!(load_mem(bad).is_err(), "{bad:?} accepted");
         }
     }
