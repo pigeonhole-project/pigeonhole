@@ -350,9 +350,8 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 /* background work: repair jobs on the graph, the repair clock, the panel */
 .queue .job { fill: var(--eye); opacity: .85; }
 .queue .job-more { font-size: 11px; fill: var(--eye); }
-.clock-face { fill: var(--plume); stroke: var(--slate-2); stroke-width: 2; }
-.clock-arc { fill: none; stroke: var(--teal); stroke-width: 3; stroke-dasharray: 100; transition: stroke-dashoffset 1s linear; }
-.node.queued .clock-arc { stroke: var(--eye); }
+.clock-face { fill: none; stroke: var(--slate-2); stroke-width: 2.5; }
+.clock-arc { fill: none; stroke: var(--teal); stroke-width: 2.5; stroke-dasharray: 100; transition: stroke-dashoffset 1s linear; }
 .clock-text { font: 600 11px var(--mono); fill: var(--wing-2); }
 .bg-row { margin: 0 0 16px; }
 .bg-label { font-size: 14px; margin-bottom: 6px; }
@@ -380,3 +379,25 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .msg-del .ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .deletable:hover .msg-del, .msg-del:focus-visible { opacity: 1; }
 @media (hover: none) { .msg-del { opacity: .8; } }
+
+/* the node's background tasks: chips on the graph, cards in its panel */
+.chip { cursor: pointer; }
+.chip-box { fill: var(--plume); stroke: var(--slate-2); stroke-width: 1.2; }
+.chip:hover .chip-box, .chip:focus-visible .chip-box { stroke: var(--teal); }
+.chip-name { font-size: 11.5px; fill: var(--wing-2); }
+.chip-count { font: 600 11px var(--mono); fill: var(--slate); }
+.chip.busy .chip-count { fill: var(--eye); }
+.chip.busy .clock-arc { stroke: var(--eye); }
+.chip.off { opacity: .55; }
+.chip.off .chip-box { stroke-dasharray: 3 3; }
+.task { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin: 0 0 12px; }
+.task.off { border-style: dashed; }
+.task-head { display: flex; gap: 10px; align-items: center; }
+.task-every { flex: 1; color: var(--slate); font-size: 13px; }
+.task-note { margin: 6px 0 10px; font-size: 13.5px; color: var(--wing-2); max-width: 70ch; }
+.task-when { font-size: 12.5px; color: var(--slate); margin: 4px 0 8px; }
+.switch { width: 34px; height: 20px; border-radius: 10px; border: 1px solid var(--slate-2); background: var(--feather); position: relative; cursor: pointer; padding: 0; flex: none; }
+.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--slate); transition: left .15s; }
+.switch[aria-checked="true"] { background: var(--teal); border-color: var(--teal); }
+.switch[aria-checked="true"]::after { left: 16px; background: #fff; }
+.job-tile.more { border-style: dashed; }

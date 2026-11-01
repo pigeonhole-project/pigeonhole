@@ -116,13 +116,19 @@
     const loft = node("loft", pos.loft, "pigeonhole", t("demo.loft_role"));
     dovecote(loft.g);
     loft.label(0, 100);
-    // The repair clock: the arc fills up to the next background pass.
-    const clock = s("g", {class: "clock", transform: "translate(92,-96)"}, loft.g);
-    s("circle", {class: "clock-face", r: 13}, clock);
-    loft.arc = s("circle", {class: "clock-arc", r: 13, pathLength: 100, transform: "rotate(-90)"}, clock);
-    loft.clockText = s("text", {class: "clock-text", y: 4, "text-anchor": "middle"}, clock);
-    const clockTip = s("title", {}, clock);
-    clockTip.textContent = t("demo.clock_tip");
+    // The background tasks: a chip each, its clock and how much work waits.
+    loft.chips = {};
+    TASKS.forEach((task, i) => {
+      const g = s("g", {class: "chip", transform: `translate(-236,${-150 + i * 30})`, tabindex: 0, role: "button"}, loft.g);
+      s("rect", {class: "chip-box", x: 0, y: 0, width: 132, height: 24, rx: 12}, g);
+      s("circle", {class: "clock-face", cx: 13, cy: 12, r: 7}, g);
+      const arc = s("circle", {class: "clock-arc", cx: 13, cy: 12, r: 7, pathLength: 100, transform: "rotate(-90 13 12)"}, g);
+      s("text", {class: "chip-name", x: 26, y: 16}, g).textContent = t(`bg.${task}`);
+      const count = s("text", {class: "chip-count", x: 122, y: 16, "text-anchor": "end"}, g);
+      const tip = s("title", {}, g);
+      g.addEventListener("click", e => { e.stopPropagation(); openPanel("loft"); });
+      loft.chips[task] = {g, arc, count, tip};
+    });
 
     for (const c of state.channels) {
       const app = c.kind === "telegram" ? "Telegram" : "Discord";
@@ -146,13 +152,35 @@
     renderBackground();
   }
 
-  // What runs in the background, on the graph: each channel's queued
-  // repairs, the clock of the next pass; in the loft's panel, the list.
+  // ------------------------------------------------------------ background
+  // The node's background loops (dynamic config): each a queue of work and
+  // a clock to its next pass; each can be turned off, or run now.
+  const TASKS = ["repair", "sweep", "cool", "snapshot"];
+  const TASK_KEY = {repair: "repair.interval", sweep: "sweep.interval", cool: "inline.cool_every", snapshot: "meta.snapshot_every"};
+  const TASK_ON = {repair: "10s", sweep: "30s", cool: "30s", snapshot: "1m"};
+  // "1m 30s", "250ms", "off" in ms (null: off).
+  function ms(text) {
+    if (!text || text === "off") return null;
+    const unit = {ms: 1, s: 1000, m: 60000, min: 60000, h: 3600000, d: 86400000};
+    let total = 0;
+    for (const [, n, u] of String(text).matchAll(/([\d.]+)\s*(ms|min|s|m|h|d)/g)) total += +n * unit[u];
+    return total || null;
+  }
+  const taskOf = name => state.bg?.tasks.find(x => x.task === name);
+  // How much work waits: the queue's length, or entries since the snapshot.
+  function workOf(task) {
+    if (task.task === "snapshot") {
+      const sn = state.bg.snapshot;
+      return sn.every ? {n: sn.head - sn.base, of: sn.every} : {n: 0};
+    }
+    return {n: task.work.length};
+  }
+
   function renderBackground() {
     const bg = state.bg;
     if (!bg) return;
     const byChannel = {};
-    for (const j of bg.repair.queue) (byChannel[j.store] ||= []).push(j);
+    for (const j of taskOf("repair")?.work || []) (byChannel[j.store] ||= []).push(j);
     for (const c of state.channels) {
       const n = nodes[c.store];
       if (!n?.queue) continue;
@@ -164,60 +192,101 @@
       });
       if (jobs.length > 12) s("text", {class: "job-more", x: 12 * 14 + 2, y: 9}, n.queue).textContent = `+${jobs.length - 12}`;
     }
-    const loft = nodes.loft;
-    if (loft?.arc) {
-      // every_ms / next_ms are null while repair is off (`[repair] interval = "off"`).
-      const left = bg.repair.every_ms ? bg.repair.next_ms / bg.repair.every_ms : 1;
-      loft.arc.style.strokeDashoffset = String(Math.round(100 * left));
-      loft.clockText.textContent = bg.repair.every_ms ? String(Math.ceil(bg.repair.next_ms / 1000)) : "–";
-      loft.g.classList.toggle("queued", bg.repair.queue.length > 0);
+    for (const task of bg.tasks) {
+      const chip = nodes.loft?.chips?.[task.task];
+      if (!chip) continue;
+      const period = ms(task.every), w = workOf(task);
+      const left = period && task.next_in_ms != null ? Math.min(1, task.next_in_ms / period) : 1;
+      chip.arc.style.strokeDashoffset = String(Math.round(100 * left));
+      chip.count.textContent = w.of ? `${w.n}/${w.of}` : String(w.n);
+      chip.g.classList.toggle("off", !period);
+      chip.g.classList.toggle("busy", !w.of && w.n > 0);
+      chip.tip.textContent = period ? t("bg.tip", {task: t(`bg.${task.task}`), s: Math.ceil((task.next_in_ms || 0) / 1000)}) : t("bg.tip_off", {task: t(`bg.${task.task}`)});
     }
     if (state.open === "loft") renderBgPanel();
   }
 
+  // The loft's panel: a card per task.
   function renderBgPanel() {
     const box = $("bg"), bg = state.bg;
     if (!box || !bg) return;
     box.replaceChildren();
-    const rep = h("div", "bg-row");
-    const sec = Math.ceil(bg.repair.next_ms / 1000);
-    rep.append(h("div", "bg-label", t("demo.bg_repair", {n: bg.repair.queue.length, s: sec})));
-    const bar = h("div", "meter");
-    const fill = h("div", "fill");
-    fill.style.width = bg.repair.every_ms ? `${100 * (1 - bg.repair.next_ms / bg.repair.every_ms)}%` : "0%";
-    bar.append(fill);
-    rep.append(bar);
-    const jobs = h("ol", "jobs");
-    for (const j of bg.repair.queue) {
-      const c = byStore()[j.store];
-      const li = h("li", "job-tile " + (c?.kind || ""), t("demo.job", {chunk: j.chunk, store: j.store}));
-      jobs.append(li);
-    }
-    if (!bg.repair.queue.length) jobs.append(h("li", "empty", t("demo.bg_queue_empty")));
-    rep.append(jobs);
-    box.append(rep);
-    const sn = bg.snapshot;
-    if (sn.every) {
-      const row = h("div", "bg-row");
-      const done = sn.head - sn.base;
-      row.append(h("div", "bg-label", t("demo.bg_snapshot", {n: Math.max(0, sn.every - done), at: sn.base})));
-      const b = h("div", "meter");
-      const f = h("div", "fill amethyst");
-      f.style.width = `${Math.min(100, (100 * done) / sn.every)}%`;
-      b.append(f);
-      row.append(b);
-      box.append(row);
+    for (const task of TASKS.map(taskOf).filter(Boolean)) {
+      const period = ms(task.every), w = workOf(task);
+      const card = h("div", "task" + (period ? "" : " off"));
+      const head = h("div", "task-head");
+      head.append(h("b", "", t(`bg.${task.task}`)));
+      const sw = h("button", "switch");
+      sw.type = "button";
+      sw.setAttribute("role", "switch");
+      sw.setAttribute("aria-checked", String(!!period));
+      sw.setAttribute("aria-label", t("bg.on_off", {task: t(`bg.${task.task}`)}));
+      sw.addEventListener("click", () => toggleTask(task.task, !period));
+      const run = h("button", "mini", t("bg.run_now"));
+      run.type = "button";
+      run.addEventListener("click", async () => {
+        await call({op: "run_task", task: task.task});
+        caption(t("bg.asked", {task: t(`bg.${task.task}`)}));
+      });
+      head.append(sw, h("span", "task-every", period ? t("bg.every", {every: task.every}) : t("bg.off")), run);
+      card.append(head, h("p", "task-note", t(`bg.${task.task}_note`)));
+      const meter = h("div", "meter");
+      const fill = h("div", "fill");
+      fill.style.width = period && task.next_in_ms != null ? `${100 * (1 - Math.min(1, task.next_in_ms / period))}%` : "0%";
+      meter.append(fill);
+      card.append(meter, h("div", "task-when", period ? t("bg.next", {s: Math.ceil((task.next_in_ms || 0) / 1000)}) : t("bg.parked")));
+      if (task.task === "snapshot") {
+        if (w.of) {
+          const m2 = h("div", "meter");
+          const f2 = h("div", "fill amethyst");
+          f2.style.width = `${Math.min(100, (100 * w.n) / w.of)}%`;
+          m2.append(f2);
+          card.append(m2, h("div", "task-when", t("bg.entries", {n: w.n, of: w.of, at: bg.snapshot.base})));
+        }
+      } else {
+        const list = h("ol", "jobs");
+        for (const item of task.work.slice(0, 40)) list.append(h("li", "job-tile", workLabel(task.task, item)));
+        if (task.work.length > 40) list.append(h("li", "job-tile more", `+${task.work.length - 40}`));
+        if (!task.work.length) list.append(h("li", "empty", t("bg.idle")));
+        card.append(list);
+      }
+      box.append(card);
     }
   }
+  function workLabel(task, item) {
+    if (task === "repair") return t("demo.job", {chunk: item.chunk, store: item.store});
+    if (task === "sweep") return t("bg.sweep_item", {chunk: item.chunk});
+    return t("bg.cool_item", {key: item.key, size: bytes(item.size), reason: t(`bg.reason_${item.reason}`)});
+  }
 
-  // Poll the background while idle; the worker lets it run between calls.
-  setInterval(async () => {
-    if (state.busy || state.wizard || !nodes.loft) return;
+  // On: back to the file's period (or a default when the file has it off);
+  // off: an override of "off". Both are entries in the log, as on a server.
+  async function toggleTask(task, on) {
+    const key = TASK_KEY[task];
+    let r;
+    if (!on) r = await call({op: "dynamic_set", key, value: "off"});
+    else {
+      const {reply} = await call({op: "dynamic"});
+      const k = reply?.keys?.find(x => x.key === key);
+      r = k?.overridden && k.file && k.file !== "off"
+        ? await call({op: "dynamic_unset", key})
+        : await call({op: "dynamic_set", key, value: TASK_ON[task]});
+    }
+    if (r.reply?.error) caption(`<b>${esc(t("try.error", {error: r.reply.error}))}</b>`);
+    else caption(t(on ? "bg.turned_on" : "bg.turned_off", {task: t(`bg.${task}`), key: esc(key)}));
+    await pollBackground();
+  }
+
+  async function pollBackground() {
     const {reply} = await call({op: "background"});
     if (reply && !reply.error) {
       state.bg = reply;
       renderBackground();
     }
+  }
+  // Poll the background while idle; the worker lets it run between calls.
+  setInterval(() => {
+    if (!state.busy && !state.wizard && nodes.loft) pollBackground();
   }, 1000);
 
   // What a channel is for; a data channel, its place among the others.
@@ -873,14 +942,6 @@
       if (!confirm(t("try.erase_confirm"))) return;
       await call({op: "reset"});
       location.reload();
-    });
-    document.querySelector('[data-act="repair"]').addEventListener("click", async () => {
-      const r = await op({op: "repair"});
-      if (r && !r.error) caption(t("say.repair", {n: r.repaired}));
-    });
-    document.querySelector('[data-act="sweep"]').addEventListener("click", async () => {
-      const r = await op({op: "sweep"});
-      if (r && !r.error) caption(t("say.sweep", {n: r.deleted}));
     });
     if (!state.log) loadLog().then(() => { if (state.open === "loft") renderPanel(); });
   }

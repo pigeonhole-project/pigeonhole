@@ -4,7 +4,7 @@
 use crate::runtime::Runtime;
 use pigeonhole_chunk_store::{Repairer, Sweeper};
 use pigeonhole_gateway_s3::{CoolPolicy, S3Gateway};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{info, warn};
 
 pub fn spawn_background_tasks(rt: &Runtime) {
@@ -38,7 +38,7 @@ pub fn spawn_cooler(rt: &Runtime, inline_on: bool, gateway: S3Gateway) {
             if meta.is_stopped() {
                 return;
             }
-            cool_pass(&gateway, &cooler_policy(inline_on, &cooling.policy)).await;
+            cool_pass(&gateway, &cooling.policy.with_inlining(inline_on)).await;
             schedule.done();
         }
     });
@@ -70,23 +70,16 @@ async fn cool_pass(gateway: &S3Gateway, policy: &CoolPolicy) {
     }
 }
 
-/// The cooler's policy: as configured, or, with inlining off, everything out.
-fn cooler_policy(inline_on: bool, policy: &CoolPolicy) -> CoolPolicy {
-    if inline_on {
-        return policy.clone();
-    }
-    CoolPolicy { cool_after: Some(Duration::ZERO), min_inline: Duration::ZERO, ..policy.clone() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn with_inlining_off_the_cooler_moves_everything_out() {
         let policy = CoolPolicy::default();
-        let p = cooler_policy(false, &policy);
+        let p = policy.with_inlining(false);
         assert_eq!((p.cool_after, p.min_inline), (Some(Duration::ZERO), Duration::ZERO));
-        assert_eq!(cooler_policy(true, &policy), policy);
+        assert_eq!(policy.with_inlining(true), policy);
     }
 }

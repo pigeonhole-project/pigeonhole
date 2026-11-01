@@ -36,6 +36,17 @@ impl Default for CoolPolicy {
     }
 }
 
+impl CoolPolicy {
+    /// The policy a cooler runs: as configured while inlining is on; with
+    /// it off, every inline object a previous run left goes out.
+    pub fn with_inlining(&self, inline_on: bool) -> CoolPolicy {
+        if inline_on {
+            return self.clone();
+        }
+        CoolPolicy { cool_after: Some(Duration::ZERO), min_inline: Duration::ZERO, ..self.clone() }
+    }
+}
+
 /// Why an object is moved out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoolReason {
