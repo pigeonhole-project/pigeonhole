@@ -1,7 +1,8 @@
 # Raft over chat: openraft's network through Telegram and Discord channels
 
-Status: steps 1–4 and 6 done, 7 in part (2026-11-01): a cluster runs in one
-process over `FakeChat`; no chat mailbox and no `[cluster]` config yet.
+Status: steps 1–4 and 6 done, 7 in part (2026-11-01). The binary runs as a
+node of a gRPC cluster (`[cluster]`, `[[node]]`). Mixed gRPC + chat clusters
+run in tests. There is no chat mailbox yet.
 
 A transport for [openraft](https://docs.rs/openraft) whose wire is chat
 messages: Raft nodes talk by posting into channels and reading them. With it,
@@ -282,30 +283,77 @@ row of them.
 
 ## Configuration (pigeonhole)
 
+Every node runs with the same `[cluster]`, the same `[[node]]` list and the
+same blob stores. Each node has a `[meta]` log and snapshots of its own, and
+knows which node it is from `[cluster] node` or `PIGEONHOLE_NODE`.
+
 ```toml
 [cluster]
-transport = "telegram"          # "grpc" | "telegram" | "discord"
-key_env = "PH_CLUSTER_KEY"      # HMAC key
-tick = "4s"
-poll = "3s"
-heartbeat = "10s"
-election_timeout = ["45s", "90s"]
+node = 1                        # or PIGEONHOLE_NODE
+id = 7                          # frames of another cluster are dropped
+key_env = "PH_CLUSTER_KEY"      # 64 hex digits: `openssl rand -hex 32`
+# heartbeat, election_timeout_min / _max, tick, poll: set for the slowest
+# link unless given (§ Timing)
 
 [[node]]
-id = "a"
-outbox = { kind = "telegram", chat_id = -100111, bot_token_env = "TG_BOT_TOKEN_A" }
-log = "a-disk"
-snapshot = "a-disk"
+id = 1
+grpc = "10.0.0.1:7001"          # serves Raft here; the others call it here
+outbox = "raft-1"               # a telegram or discord [[store]]
 
 [[node]]
-id = "b"
-outbox = { kind = "telegram", chat_id = -100222, bot_token_env = "TG_BOT_TOKEN_B" }
-log = "b-chat"
-snapshot = "b-snap"
+id = 2
+grpc = "10.0.0.2:7001"
+outbox = "raft-2"
+
+[[node]]
+id = 3
+outbox = "raft-3"               # only channels: 1 and 2 reach it over the chat
 ```
 
-`[[node]] addr` (gRPC) and `outbox` are alternatives: a cluster uses one
-transport.
+## Transports
+
+The transport is chosen for each pair of nodes, not for the cluster.
+Between two nodes:
+
+- **gRPC**, when both have `grpc`;
+- **the chat**, when both have an `outbox`;
+- a config error otherwise.
+
+`openraft-grpc` carries the same frames as the chat: postcard, sealed with
+the cluster's key. Each call is one unary RPC holding one envelope.
+`openraft_grpc::Mixed` is the node's network factory. It hands openraft a
+gRPC client for some peers and a chat client for the others. Every node
+serves both: a gRPC server on its address, and its peers' outboxes it
+reads. Either way requests reach the same `Raft`.
+
+**Timing.** A leader's heartbeat must stay under every follower's election
+timeout, so one chat link sets the pace of the whole cluster (§ Timing):
+the defaults follow the slowest link. Commits stay fast all the same. Two
+nodes on gRPC are a quorum of three, and the chat node catches up behind
+them.
+
+**Status.** The binary boots a cluster whose links are all gRPC. A chat
+link is refused at boot: there is no Telegram or Discord mailbox yet (step
+5). Mixed clusters run in the tests over `FakeChat`.
+
+## Clients: always the leader
+
+There is no proxy between nodes. A follower answers every S3 request with
+503 `ServiceUnavailable` and names the leader in the message. Writes would
+fail there, and reads would see a state that may lag the leader's.
+`GET /_pigeonhole/leader` answers on every node: 200 on the leader, 503
+elsewhere, with `{node, leader, leading}`. A load balancer's health check
+on it sends clients to the leader. `/metrics` answers on every node.
+
+What the leader needs before it writes, it does when it takes over
+(`ChunkStore::take_over`): record the configured stores, choose or read the
+deployment's owner, mark the stores, seed the sweep's horizon. Chunk ids go
+on after the newest one the tablet applied, so a node that took over never
+hands out an id its predecessor used.
+
+`scripts/cluster-smoke.sh` (`make cluster-smoke`) runs three processes on
+localhost: a write through the leader, `kill -9` of the leader, a read and a
+write through the new one, and the old one back as a follower.
 
 ## What has to be true (checks before code)
 

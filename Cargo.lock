@@ -2379,6 +2379,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openraft-grpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "madsim-tokio",
+ "openraft",
+ "openraft-chat",
+ "prost",
+ "protoc-bin-vendored",
+ "serde",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing",
+]
+
+[[package]]
 name = "openraft-macros"
 version = "0.9.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2521,6 +2538,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "metrics-util",
  "openraft-chat",
+ "openraft-grpc",
  "pigeonhole-admin",
  "pigeonhole-blob",
  "pigeonhole-chunk-store",
@@ -2798,6 +2816,7 @@ dependencies = [
  "metrics-util",
  "openraft",
  "openraft-chat",
+ "openraft-grpc",
  "pigeonhole-storage-api",
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",

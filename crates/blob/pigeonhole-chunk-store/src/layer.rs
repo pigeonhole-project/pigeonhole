@@ -147,16 +147,13 @@ impl ChunkStore {
     /// Open with a single backend (write quorum 1).
     pub async fn open<B: BlobBackend>(db: BlobDb, backend: B, opts: IngestOptions) -> Result<Self> {
         let backend: SharedBackend = Arc::new(erase(backend));
-        let info = backend.instance().clone();
-        db.sync_instances(&[info]).await?;
         let replicated = Replicated::new(vec![backend], 1, Arc::new(CheapestFirst::new()))?;
         Self::open_replicated(db, Arc::new(replicated), opts).await
     }
 
-    /// Open with an existing placement group.
+    /// Open with an existing placement group; on the leader, take the
+    /// stores over ([`Self::take_over`]).
     pub async fn open_replicated(db: BlobDb, replicated: Arc<Replicated>, opts: IngestOptions) -> Result<Self> {
-        let infos: Vec<_> = replicated.members().iter().map(|m| m.instance().clone()).collect();
-        db.sync_instances(&infos).await?;
         check_block_fits_members(opts.block_size, replicated.as_ref())?;
         for m in replicated.members() {
             let max = m.limits().max_blob_size;
@@ -169,17 +166,7 @@ impl ChunkStore {
                 );
             }
         }
-        let owner = db.owner().await?;
-        replicated.pins().set_owner(owner);
-        check_owner(replicated.as_ref(), owner).await?;
-        // Uncommitted parts at or below the highest committed key are a dead
-        // writer's garbage: start the sweep horizon there.
-        for info in &infos {
-            if let Some(key) = db.max_part_key(&info.id) {
-                replicated.pins().seed(&info.id, &key);
-            }
-        }
-        Ok(Self {
+        let store = Self {
             db,
             replicated,
             chunk_size: opts.chunk_size.max(1024),
@@ -189,7 +176,55 @@ impl ChunkStore {
             block_cache: None,
             compressed_cache: None,
             write_through: false,
-        })
+        };
+        if store.db.is_leader() {
+            store.take_over().await?;
+        }
+        Ok(store)
+    }
+
+    /// What the leader does with the stores before it writes: record the
+    /// configured ones in the tablet, choose the deployment's owner (once)
+    /// and mark every store with it, and start the sweep's horizon at the
+    /// committed parts. Writes, so a follower does it once it leads
+    /// ([`Self::follow_leadership`]); again is harmless.
+    pub async fn take_over(&self) -> Result<()> {
+        let infos: Vec<_> = self.replicated.members().iter().map(|m| m.instance().clone()).collect();
+        self.db.sync_instances(&infos).await?;
+        let owner = self.db.owner().await?;
+        self.replicated.pins().set_owner(owner);
+        check_owner(self.replicated.as_ref(), owner).await?;
+        // Uncommitted parts at or below the highest committed key are a dead
+        // writer's garbage: start the sweep horizon there.
+        for info in &infos {
+            if let Some(key) = self.db.max_part_key(&info.id) {
+                self.replicated.pins().seed(&info.id, &key);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::take_over`] each time this node becomes the leader (retried
+    /// on every change Raft reports until it succeeds); ends once the
+    /// tablet stops.
+    pub async fn follow_leadership(self: Arc<Self>) {
+        let mut changes = self.db.meta().changes();
+        let mut taken = self.db.is_leader();
+        while changes.changed().await.is_ok() && !self.db.tablet_stopped() {
+            match (self.db.is_leader(), taken) {
+                (true, false) => match self.take_over().await {
+                    Ok(()) => {
+                        tracing::info!("leading: stores taken over");
+                        taken = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "taking the stores over failed; again on the next change");
+                    }
+                },
+                (false, true) => taken = false,
+                _ => {}
+            }
+        }
     }
 
     /// `write_through`: chunks written put their stored blocks into `l2`.

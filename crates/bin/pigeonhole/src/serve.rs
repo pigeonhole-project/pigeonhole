@@ -27,6 +27,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
 
     let s3_gateway = build_s3_gateway(cfg.s3_options(), index.clone(), rt.store.clone());
     tokio::spawn(rt.dynamic.clone().follow());
+    tokio::spawn(rt.store.clone().follow_leadership());
     spawn_background_tasks(&rt);
     spawn_cooler(&rt, cfg.inline.max_object_size.is_some(), s3_gateway.clone());
     if cfg.metrics.enabled {
@@ -50,7 +51,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     #[cfg(feature = "bytestream")]
     spawn_bytestream(&cfg, &rt).await?;
 
-    let app = s3_app(&cfg, s3_gateway, metrics_on_main);
+    let app = s3_app(&cfg, s3_gateway, rt.meta.clone(), metrics_on_main);
 
     let addr = cfg.listen_addr.clone();
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
@@ -165,7 +166,12 @@ async fn spawn_admin(
 
 /// The S3 gateway as an HTTP app: header limits, metrics, request spans
 /// and timeouts around it (and `/metrics` when served here).
-fn s3_app(cfg: &Config, s3_gateway: S3Gateway, metrics_on_main: bool) -> Router {
+fn s3_app(
+    cfg: &Config,
+    s3_gateway: S3Gateway,
+    meta: std::sync::Arc<pigeonhole_meta::MetaStore>,
+    metrics_on_main: bool,
+) -> Router {
     let max_headers = cfg.http.max_headers;
     let slow_request = cfg.log.slow_request;
     let s3_service = build_s3_service(s3_gateway, &cfg.access_key, &cfg.secret_key);
@@ -180,8 +186,13 @@ fn s3_app(cfg: &Config, s3_gateway: S3Gateway, metrics_on_main: bool) -> Router 
         let _ = metrics_on_main;
         Router::new()
     };
+    let clustered = cfg.cluster.is_some();
+    let app = app.merge(pigeonhole::leader_http::routes(meta.clone())).fallback_service(s3_service);
+    let app = match clustered {
+        true => app.layer(axum::middleware::from_fn_with_state(meta, pigeonhole::leader_http::only_on_the_leader)),
+        false => app,
+    };
     let app = app
-        .fallback_service(s3_service)
         .layer(axum::middleware::from_fn(move |req, next| {
             let max = max_headers;
             async move { limit_request_headers(max, req, next).await }

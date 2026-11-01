@@ -15,6 +15,8 @@ ROLE = {
     "pigeonhole-limits": "limits",
     # Standalone: no pigeonhole crate at all (docs/raft-over-chat.md).
     "openraft-chat": "standalone",
+    # Raft over gRPC: the chat crate's frames, still no pigeonhole crate.
+    "openraft-grpc": "raft-net",
     "pigeonhole-meta": "meta",
     "pigeonhole-blob": "blob",
     "pigeonhole-chunk-store": "chunk-store",
@@ -186,6 +188,11 @@ def main() -> int:
         elif role == "standalone":
             for dep_name in dep_names:
                 errors.append(f"{name} (standalone) → {dep_name}: it depends on no workspace crate")
+
+        elif role == "raft-net":
+            for dep_name in dep_names:
+                if ROLE.get(dep_name) != "standalone":
+                    errors.append(f"{name} (raft-net) → {dep_name}: only standalone crates (openraft-chat)")
 
         elif role in ("blob", "codec", "limits", "meta", "storage-api", "types") and strict:
             allowed = {

@@ -1,4 +1,4 @@
-.PHONY: web web-smoke lint-js test-js sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint
+.PHONY: web web-smoke lint-js test-js cluster-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint
 
 run:
 	cargo run --release
@@ -9,6 +9,11 @@ run-discord:
 
 smoke:
 	./scripts/smoke.sh
+
+# Three processes as one Raft cluster over gRPC on localhost; needs `aws`.
+cluster-smoke:
+	cargo build -p pigeonhole
+	./scripts/cluster-smoke.sh
 
 # The in-browser build (crates/web). zstd's C objects need an archiver that
 # knows wasm: llvm-ar from `rustup component add llvm-tools`. With WASI_SDK

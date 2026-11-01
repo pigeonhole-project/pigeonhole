@@ -224,3 +224,106 @@ async fn a_follower_behind_the_purged_log_catches_up_from_a_snapshot() {
     eventually("the follower caught up", || value(&nodes[&behind]) == 20).await;
     assert!(nodes[&behind].base_position() > applied_then, "from a snapshot, not entry by entry");
 }
+
+/// gRPC between nodes 1 and 2 (or all, with `chat_only` empty), the chat
+/// to the rest: each node serves both, its peers split by transport.
+#[cfg(not(madsim))]
+mod transports {
+    use super::*;
+    use openraft_grpc::{GrpcNetwork, Identity, Mixed};
+    use std::collections::HashSet;
+
+    async fn node_on(
+        chat: FakeChat,
+        id: u64,
+        addrs: &HashMap<u64, String>,
+        listener: Option<tokio::net::TcpListener>,
+        opts: MetaOptions,
+    ) -> Arc<MetaStore> {
+        let via_chat: HashSet<u64> = match addrs.contains_key(&id) {
+            true => MEMBERS.into_iter().filter(|m| *m != id && !addrs.contains_key(m)).collect(),
+            false => MEMBERS.into_iter().filter(|m| *m != id).collect(),
+        };
+        let grpc_peers: HashMap<u64, String> =
+            addrs.iter().filter(|(&m, _)| m != id && !via_chat.contains(&m)).map(|(&m, a)| (m, a.clone())).collect();
+        let chat_peers: HashMap<u64, Arc<dyn Mailbox>> = via_chat.iter().map(|&m| (m, chat.mailbox(id, m))).collect();
+        let identity = Identity { me: id, cluster: 7, key: [3; 32] };
+        let chat_net = ChatNetwork::<TypeConfig>::new(id, settings(), chat.mailbox(id, id), chat_peers);
+        let grpc_net = GrpcNetwork::<TypeConfig>::new(identity.clone(), grpc_peers);
+        let serving = chat_net.clone();
+        let serve: Serve = Box::new(move |raft| {
+            Box::pin(async move {
+                let raft = Arc::new(raft);
+                if let Some(listener) = listener {
+                    tokio::spawn(openraft_grpc::serve::<TypeConfig>(listener, identity, raft.clone()));
+                }
+                serving.serve(raft).await;
+            })
+        });
+        let network = Mixed { a: grpc_net, b: chat_net, via_b: via_chat };
+        let cluster = Cluster { node: id, members: MEMBERS.into(), network, serve: Some(serve) };
+        let log = Arc::new(crate::ChainLogStore::new(Arc::new(MemoryBlobStore::new())));
+        let snapshots = Arc::new(crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())));
+        MetaStore::open_in(log, snapshots, counter(), opts, cluster).await.unwrap()
+    }
+
+    /// The three nodes, those in `grpc` with a gRPC listener each.
+    async fn three_on(chat: &FakeChat, grpc: &[u64], opts: MetaOptions) -> HashMap<u64, Arc<MetaStore>> {
+        let mut listeners = HashMap::new();
+        let mut addrs = HashMap::new();
+        for &id in grpc {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.insert(id, l.local_addr().unwrap().to_string());
+            listeners.insert(id, l);
+        }
+        let started = futures::future::join_all(
+            MEMBERS.map(|id| node_on(chat.clone(), id, &addrs, listeners.remove(&id), opts.clone())),
+        )
+        .await;
+        MEMBERS.into_iter().zip(started).collect()
+    }
+
+    #[tokio::test]
+    async fn three_nodes_over_grpc_elect_apply_and_survive_a_killed_leader() {
+        let chat = FakeChat::new();
+        let mut nodes = three_on(&chat, &MEMBERS, opts()).await;
+        let leader = agreed_leader(&nodes).await;
+        nodes[&leader].propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
+        let follower = *MEMBERS.iter().find(|&&m| m != leader).unwrap();
+        let err = nodes[&follower].propose::<Counter>(op(2, 1)).await.unwrap_err();
+        assert!(err.downcast_ref::<NotLeader>().is_some(), "{err:#}");
+        eventually("every node applied the commit", || nodes.values().all(|n| value(n) == 1)).await;
+        assert_eq!(chat.posts_by(leader), 0, "nothing went through the chat");
+
+        drop(nodes.remove(&leader));
+        let new = agreed_leader(&nodes).await;
+        nodes[&new].propose::<Counter>(op(3, 1)).await.unwrap().unwrap();
+        eventually("both survivors applied both commits", || nodes.values().all(|n| value(n) == 2)).await;
+    }
+
+    #[tokio::test]
+    async fn two_nodes_on_grpc_and_one_on_the_chat_make_one_cluster() {
+        let chat = FakeChat::new();
+        let often = MetaOptions { snapshot_every: Some(4), keep_snapshots: 1, ..opts() };
+        let nodes = three_on(&chat, &[1, 2], often).await;
+        let leader = agreed_leader(&nodes).await;
+        nodes[&leader].propose::<Counter>(op(0, 1)).await.unwrap().unwrap();
+        eventually("all applied the first commit, the chat node too", || nodes.values().all(|n| value(n) == 1)).await;
+
+        // The chat node cut off: the gRPC pair goes on; healed, it catches up
+        // from a snapshot over the chat.
+        chat.isolate(3, true);
+        let rest: HashMap<_, _> = nodes.iter().filter(|(&id, _)| id != 3).map(|(&id, n)| (id, n.clone())).collect();
+        let leader = agreed_leader(&rest).await;
+        let applied_then = nodes[&3].applied_position();
+        for i in 1..20 {
+            nodes[&leader].propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+        }
+        eventually("the leader's log starts past the chat node", || nodes[&leader].base_position() > applied_then)
+            .await;
+        chat.isolate(3, false);
+        eventually("the chat node caught up", || value(&nodes[&3]) == 20).await;
+        let other = if leader == 1 { 2 } else { 1 };
+        assert!(chat.posts_by(other) + chat.posts_by(leader) > 0, "the pair posts for the chat node");
+    }
+}
