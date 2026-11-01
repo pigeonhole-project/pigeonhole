@@ -122,6 +122,27 @@ pub struct ChunkStore {
     write_through: bool,
 }
 
+/// Mark every writable member as `owner`'s and refuse one marked for
+/// another deployment: two deployments on one store by mistake. (Their
+/// blobs would be safe from each other's sweep, but not their budgets.)
+async fn check_owner(replicated: &Replicated, owner: pigeonhole_blob::Owner) -> Result<()> {
+    for m in replicated.members() {
+        let info = m.instance();
+        if info.role != pigeonhole_blob::InstanceRole::ReadWrite {
+            continue;
+        }
+        let marked = m.mark_owner(owner).await.with_context(|| format!("mark instance {} as ours", info.id))?;
+        if marked != owner {
+            bail!(
+                "instance {} ({}) belongs to deployment {marked}, this one is {owner}: give each deployment stores of its own",
+                info.id,
+                info.location
+            );
+        }
+    }
+    Ok(())
+}
+
 impl ChunkStore {
     /// Open with a single backend (write quorum 1).
     pub async fn open<B: BlobBackend>(db: BlobDb, backend: B, opts: IngestOptions) -> Result<Self> {
@@ -148,6 +169,9 @@ impl ChunkStore {
                 );
             }
         }
+        let owner = db.owner().await?;
+        replicated.pins().set_owner(owner);
+        check_owner(replicated.as_ref(), owner).await?;
         // Uncommitted parts at or below the highest committed key are a dead
         // writer's garbage: start the sweep horizon there.
         for info in &infos {
@@ -1163,9 +1187,74 @@ mod tests {
         async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
             self.inner.delete(keys).await
         }
-        async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
-            self.inner.candidates(after, upto, limit).await
+        async fn candidates(
+            &self,
+            owner: pigeonhole_blob::Owner,
+            after: Option<Self::Key>,
+            upto: Self::Key,
+            limit: usize,
+        ) -> Result<Vec<Self::Key>> {
+            self.inner.candidates(owner, after, upto, limit).await
         }
+    }
+
+    /// A blob store marked as another deployment's (a channel's pinned marker).
+    struct Marked(MemoryBlobStore, pigeonhole_blob::Owner);
+
+    #[async_trait::async_trait]
+    impl BlobBackend for Marked {
+        type Id = <MemoryBlobStore as BlobBackend>::Id;
+        type Key = <MemoryBlobStore as BlobBackend>::Key;
+        fn instance(&self) -> &pigeonhole_blob::InstanceInfo {
+            self.0.instance()
+        }
+        fn limits(&self) -> &BackendLimits {
+            self.0.limits()
+        }
+        fn key(id: &Self::Id) -> Self::Key {
+            MemoryBlobStore::key(id)
+        }
+        fn cost(&self, op: pigeonhole_blob::OpKind, id: Option<&Self::Id>) -> pigeonhole_blob::CostHint {
+            self.0.cost(op, id)
+        }
+        async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
+            self.0.put(data, name).await
+        }
+        async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<pigeonhole_blob::BoxByteStream> {
+            self.0.get(id, range).await
+        }
+        async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
+            self.0.delete(keys).await
+        }
+        async fn candidates(
+            &self,
+            owner: pigeonhole_blob::Owner,
+            after: Option<Self::Key>,
+            upto: Self::Key,
+            limit: usize,
+        ) -> Result<Vec<Self::Key>> {
+            self.0.candidates(owner, after, upto, limit).await
+        }
+        async fn mark_owner(&self, _owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
+            Ok(self.1)
+        }
+    }
+
+    /// A store another deployment marked is refused at open; the tablet's
+    /// own owner is kept across a reopen.
+    #[tokio::test]
+    async fn a_store_marked_for_another_deployment_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let ours = db.owner().await.unwrap();
+        assert_eq!(db.owner().await.unwrap(), ours, "chosen once");
+        let opts = || IngestOptions::new(64 * 1024, ChunkCodec::Raw);
+        assert!(ChunkStore::open(db.clone(), Marked(MemoryBlobStore::new(), ours), opts()).await.is_ok());
+        let theirs = pigeonhole_blob::Owner(ours.0 ^ 1);
+        let err = ChunkStore::open(db, Marked(MemoryBlobStore::new(), theirs), opts()).await.err().unwrap();
+        assert!(format!("{err:#}").contains(&format!("belongs to deployment {theirs}")), "{err:#}");
     }
 
     /// The body is read on while sealed chunks upload, up to

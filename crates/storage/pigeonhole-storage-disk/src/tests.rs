@@ -1,5 +1,5 @@
 use super::*;
-use pigeonhole_storage_api::collect_stream;
+use pigeonhole_storage_api::{collect_stream, BlobId};
 use std::fs;
 
 fn small(dir: &Path, segment_bytes: u64) -> DiskBlobStore {
@@ -24,10 +24,10 @@ fn segment_files(dir: &Path) -> Vec<String> {
 async fn keys_are_positions_and_keep_growing_across_reopen_and_segments() {
     let dir = tempfile::tempdir().unwrap();
     let a = small(dir.path(), 100);
-    let first = a.put(Bytes::from_static(b"one"), "x").await.unwrap();
+    let first = a.put(Bytes::from_static(b"one"), &BlobId::random().name()).await.unwrap();
     let mut last = first.clone();
     for i in 0..10u8 {
-        let id = a.put(Bytes::from(vec![i; 40]), "x").await.unwrap();
+        let id = a.put(Bytes::from(vec![i; 40]), &BlobId::random().name()).await.unwrap();
         assert!(id.key > last.key);
         last = id;
     }
@@ -35,7 +35,7 @@ async fn keys_are_positions_and_keep_growing_across_reopen_and_segments() {
     drop(a);
 
     let b = small(dir.path(), 100);
-    let next = b.put(Bytes::from_static(b"two"), "x").await.unwrap();
+    let next = b.put(Bytes::from_static(b"two"), &BlobId::random().name()).await.unwrap();
     assert!(next.key > last.key);
     assert_eq!(read(&b, &first).await, b"one");
     assert_eq!(read(&b, &last).await, vec![9; 40]);
@@ -47,8 +47,8 @@ async fn keys_are_positions_and_keep_growing_across_reopen_and_segments() {
 async fn a_torn_record_at_the_end_is_dropped_on_open() {
     let dir = tempfile::tempdir().unwrap();
     let a = small(dir.path(), 1 << 20);
-    let kept = a.put(Bytes::from_static(b"kept"), "x").await.unwrap();
-    let torn = a.put(Bytes::from(vec![5u8; 1000]), "x").await.unwrap();
+    let kept = a.put(Bytes::from_static(b"kept"), &BlobId::random().name()).await.unwrap();
+    let torn = a.put(Bytes::from(vec![5u8; 1000]), &BlobId::random().name()).await.unwrap();
     drop(a);
     let seg = dir.path().join(&segment_files(dir.path())[0]);
     let len = fs::metadata(&seg).unwrap().len();
@@ -57,7 +57,7 @@ async fn a_torn_record_at_the_end_is_dropped_on_open() {
     let b = small(dir.path(), 1 << 20);
     assert_eq!(read(&b, &kept).await, b"kept");
     assert!(b.get(&torn, None).await.is_err(), "never acknowledged");
-    let again = b.put(Bytes::from_static(b"next"), "x").await.unwrap();
+    let again = b.put(Bytes::from_static(b"next"), &BlobId::random().name()).await.unwrap();
     assert_eq!(again.key, torn.key, "the torn space is reused");
     assert_eq!(read(&small(dir.path(), 1 << 20), &again).await, b"next");
 }
@@ -66,8 +66,8 @@ async fn a_torn_record_at_the_end_is_dropped_on_open() {
 async fn a_last_record_failing_its_checksum_is_dropped_on_open() {
     let dir = tempfile::tempdir().unwrap();
     let a = small(dir.path(), 1 << 20);
-    let kept = a.put(Bytes::from_static(b"kept"), "x").await.unwrap();
-    let torn = a.put(Bytes::from(vec![5u8; 1000]), "x").await.unwrap();
+    let kept = a.put(Bytes::from_static(b"kept"), &BlobId::random().name()).await.unwrap();
+    let torn = a.put(Bytes::from(vec![5u8; 1000]), &BlobId::random().name()).await.unwrap();
     drop(a);
     let seg = dir.path().join(&segment_files(dir.path())[0]);
     let mut bytes = fs::read(&seg).unwrap();
@@ -85,7 +85,7 @@ async fn deletes_free_space_and_drop_dead_segments() {
     let store = small(dir.path(), 64 << 10);
     let mut ids = Vec::new();
     for i in 0..6u8 {
-        ids.push(store.put(Bytes::from(vec![i; 40 << 10]), "x").await.unwrap());
+        ids.push(store.put(Bytes::from(vec![i; 40 << 10]), &BlobId::random().name()).await.unwrap());
     }
     let segs = segment_files(dir.path());
     assert_eq!(segs.len(), 3, "{segs:?}");
@@ -108,7 +108,10 @@ async fn deletes_free_space_and_drop_dead_segments() {
         pigeonhole_storage_api::Failure::NotFound,
         "dead after reopen"
     );
-    assert_eq!(reopened.candidates(None, u64::MAX, 100).await.unwrap(), vec![ids[3].key, ids[4].key, ids[5].key]);
+    assert_eq!(
+        reopened.candidates(pigeonhole_storage_api::Owner(0), None, u64::MAX, 100).await.unwrap(),
+        vec![ids[3].key, ids[4].key, ids[5].key]
+    );
 }
 
 #[tokio::test]
@@ -151,7 +154,7 @@ mod sim {
     async fn what_was_acknowledged_survives_a_crash_and_a_torn_write_is_dropped() {
         let fs = SimFs::new(Duration::ZERO);
         let a = on(&fs);
-        let kept = a.put(Bytes::from_static(b"kept"), "x").await.unwrap();
+        let kept = a.put(Bytes::from_static(b"kept"), &BlobId::random().name()).await.unwrap();
         let After::Won(root) = a.put_after(None, "root", Bytes::from_static(b"r")).await.unwrap() else { panic!() };
         // A write in flight when the power goes: half of it reaches the disk.
         let seg = std::path::Path::new("/d").join("seg-0000000001");
@@ -164,7 +167,7 @@ mod sim {
         let b = on(&fs);
         assert_eq!(read(&b, &kept).await, b"kept");
         assert_eq!(b.tail().await.unwrap().map(|l| l.id), Some(root.clone()));
-        let next = b.put(Bytes::from_static(b"next"), "x").await.unwrap();
+        let next = b.put(Bytes::from_static(b"next"), &BlobId::random().name()).await.unwrap();
         assert_eq!(next.key, crate::segments::key_of(1, len), "the torn bytes were cut off");
         assert_eq!(read(&on(&fs), &next).await, b"next");
     }
@@ -173,12 +176,12 @@ mod sim {
     async fn an_unsynced_segment_is_gone_after_a_crash() {
         let fs = SimFs::new(Duration::ZERO);
         let a = on(&fs);
-        a.put(Bytes::from_static(b"one"), "x").await.unwrap();
+        a.put(Bytes::from_static(b"one"), &BlobId::random().name()).await.unwrap();
         // A segment created but never synced (the process died right after).
         crate::io::Fs::open(&fs, std::path::Path::new("/d/seg-0000000002"), true).unwrap();
         drop(a);
         fs.crash(None);
-        assert_eq!(on(&fs).candidates(None, u64::MAX, 10).await.unwrap().len(), 1);
+        assert_eq!(on(&fs).candidates(pigeonhole_storage_api::Owner(0), None, u64::MAX, 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -196,7 +199,7 @@ mod sim {
         let fs = SimFs::new(Duration::from_millis(4));
         let a = on(&fs);
         let t = tokio::time::Instant::now();
-        a.put(Bytes::from_static(b"one"), "x").await.unwrap();
+        a.put(Bytes::from_static(b"one"), &BlobId::random().name()).await.unwrap();
         assert!(t.elapsed() >= Duration::from_millis(4), "{:?}", t.elapsed());
     }
 }

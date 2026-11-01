@@ -110,8 +110,9 @@ with its token: no user account, no interactive login.
    `TG_API_ID` / `TG_API_HASH`.
 3. Create a private **channel** or **supergroup** per purpose (blobs, log,
    snapshots) and add the bot as **administrator** with the post and delete
-   messages rights. Basic groups and private chats are refused: only channels
-   number their messages per chat.
+   messages rights, and on a blob channel the right to pin messages (edit
+   messages in a channel, pin in a supergroup). Basic groups and private
+   chats are refused: only channels number their messages per chat.
 4. Set `chat_id` (`-100…`) per `[[store]]` in `pigeonhole.toml`, the secrets
    in `.env`.
 
@@ -147,8 +148,9 @@ Secret: `DISCORD_BOT_TOKEN` in `.env` (or the env vars named by
 `bot_token_envs`: several bots in one channel multiply its budget, see
 docs/shared-limiter.md).
 The bot needs to view the (text) channel, send messages, attach files, read
-history and manage messages (delete); a channel holding the log or snapshots
-also needs create public threads and manage threads. Blobs up to ~3.6 KiB go
+history and manage messages (delete; pin, on a blob channel); a channel
+holding the log or snapshots also needs create public threads and manage
+threads. Blobs up to ~3.6 KiB go
 as text messages (read with the listing), larger ones as attachments (20 MiB
 per file by default; more on boosted servers via `max_blob_size`); CDN URLs
 are cached and refreshed by fetching the message.

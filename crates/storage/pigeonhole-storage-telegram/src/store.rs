@@ -11,7 +11,7 @@ use futures::StreamExt;
 use lru::LruCache;
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind, Owner,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -93,12 +93,22 @@ impl<C> Clone for Reader<C> {
 
 /// The send's `random_id` for blob `name` in `channel`: a repeated put of one
 /// blob (a retry) posts it once.
+/// What an owner marker says to a person reading the channel.
+const OWNER_MARKER: &[u8] = b"pigeonhole: the blobs in this channel are this deployment's";
+
 pub fn blob_random_id(channel_id: i64, name: &str) -> i64 {
     let digest = Sha256::digest(format!("{channel_id}/{name}").as_bytes());
     i64::from_le_bytes(digest[..8].try_into().unwrap())
 }
 
 impl<C: ChannelApi> TelegramBlobStore<C> {
+    /// The owner the pinned message marks the channel for, if it is a marker.
+    async fn pinned_owner(&self) -> Result<Option<Owner>> {
+        let Some(id) = self.reader.channel.pinned().await? else { return Ok(None) };
+        let msgs = self.reader.read(&[id]).await?;
+        Ok(msgs.first().and_then(blob_name).and_then(Owner::from_marker))
+    }
+
     /// The bots whose locations of document `message_id` the store holds,
     /// sorted (the bot pool's tests).
     #[cfg(any(test, feature = "fake"))]
@@ -342,6 +352,22 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
         Ok(Box::pin(stream))
     }
 
+    /// The pinned owner marker if there is one, else ours, posted and pinned.
+    /// A bot learns only the latest pin: of two deployments racing on a new
+    /// channel, the last to pin keeps it and the other learns so here (a
+    /// read after its own pin) or at its next start.
+    async fn mark_owner(&self, owner: Owner) -> Result<Owner> {
+        if let Some(marked) = self.pinned_owner().await? {
+            return Ok(marked);
+        }
+        let name = owner.marker_name();
+        let channel_id = self.reader.channel.channel_id();
+        let id = self.post_blob(&name, Bytes::from_static(OWNER_MARKER), blob_random_id(channel_id, &name)).await?;
+        self.reader.channel.pin(id).await?;
+        tracing::info!(store = %self.instance.id, %owner, message_id = id, "marked the channel as this deployment's");
+        Ok(self.pinned_owner().await?.unwrap_or(owner))
+    }
+
     /// The message, read from the channel now: a text blob's bytes stay in
     /// our cache after it was deleted.
     async fn exists(&self, id: &Self::Id) -> Result<bool> {
@@ -367,10 +393,16 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
         Ok(())
     }
 
-    /// Our blobs (documents or texts named by a [`BlobId`]) with ids in `(after,
-    /// upto]`, read from the channel 100 ids at a time; nothing else in the
-    /// channel is ever a candidate.
-    async fn candidates(&self, after: Option<i64>, upto: i64, limit: usize) -> Result<Vec<i64>> {
+    /// `owner`'s blobs (documents or texts named by a [`BlobId`] of its) with
+    /// ids in `(after, upto]`, read from the channel 100 ids at a time;
+    /// nothing else in the channel is ever a candidate.
+    async fn candidates(
+        &self,
+        owner: pigeonhole_storage_api::Owner,
+        after: Option<i64>,
+        upto: i64,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
         let mut out = Vec::new();
         let mut next = after.map_or(1, |a| a.saturating_add(1)).max(1);
         while next <= upto && out.len() < limit {
@@ -379,7 +411,7 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
             let msgs = self.reader.read(&ids).await?;
             for (id, msg) in ids.into_iter().zip(msgs) {
                 if let Some(name) = blob_name(&msg) {
-                    if BlobId::from_name(name).is_some() {
+                    if BlobId::from_name(name).is_some_and(|b| b.owner() == owner) {
                         out.push(id);
                     }
                 }

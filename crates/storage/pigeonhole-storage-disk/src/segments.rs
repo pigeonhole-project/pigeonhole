@@ -25,7 +25,7 @@
 
 use crate::io::{DirLock, Fs, FsFile};
 use anyhow::{anyhow, bail, Context, Result};
-use pigeonhole_storage_api::NotFound;
+use pigeonhole_storage_api::{BlobId, NotFound, Owner};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,12 +55,19 @@ fn seg_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("seg-{seq:010}"))
 }
 
+/// The owner a record's name tells, if it names a blob.
+fn owner_of(label: &str) -> Option<Owner> {
+    BlobId::from_name(label).map(|b| b.owner())
+}
+
 /// One record as the index knows it.
 #[derive(Debug, Clone)]
 pub(crate) struct Rec {
     pub data_len: u64,
     label_len: u16,
     pub dead: bool,
+    /// The owner a blob's name tells ([`BlobId::owner`]), if it names one.
+    pub owner: Option<Owner>,
     /// Chain members only.
     pub chain: Option<ChainRec>,
 }
@@ -242,7 +249,8 @@ impl Locked<'_> {
         if !header.dead() {
             self.segs.get_mut(&split(key).0).unwrap().live += 1;
         }
-        let rec = Rec { data_len: header.data_len, label_len: header.label_len, dead: header.dead(), chain };
+        let owner = owner_of(&String::from_utf8_lossy(label));
+        let rec = Rec { data_len: header.data_len, label_len: header.label_len, dead: header.dead(), owner, chain };
         self.records.insert(key, rec);
     }
 
@@ -285,8 +293,16 @@ impl Locked<'_> {
             self.next.entry(c.prev).or_insert(key);
             self.tail = Some(key);
         }
-        self.records
-            .insert(key, Rec { data_len: data.len() as u64, label_len: label.len() as u16, dead: false, chain });
+        self.records.insert(
+            key,
+            Rec {
+                data_len: data.len() as u64,
+                label_len: label.len() as u16,
+                dead: false,
+                owner: owner_of(label),
+                chain,
+            },
+        );
         Ok(key)
     }
 

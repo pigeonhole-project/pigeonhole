@@ -106,6 +106,7 @@ impl CostHint {
 /// Our own identity of a blob, chosen before it is uploaded and sent as its
 /// file name (`ph-<32 hex>.bin`): it tells our blobs from anything else in a
 /// chat or channel, and ties a backend message to the part that holds it.
+/// Its top 32 bits are its [`Owner`] (the first 8 hex digits of the name).
 ///
 /// Binary formats (the log, snapshots: postcard) keep the number; readable
 /// ones (JSON) the file name, since a u128 does not fit a JSON number.
@@ -143,9 +144,53 @@ impl<'de> Deserialize<'de> for BlobId {
     }
 }
 
-impl BlobId {
+/// The deployment a blob belongs to: chosen at random when a deployment's
+/// metadata starts, kept in it, and put in the top bits of every [`BlobId`]
+/// it mints. A store shared by mistake between two deployments keeps them
+/// apart: each one's sweep takes only its own blobs for orphans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Owner(pub u32);
+
+impl Owner {
     pub fn random() -> Self {
-        BlobId(uuid::Uuid::new_v4().as_u128())
+        Owner((uuid::Uuid::new_v4().as_u128() >> 96) as u32)
+    }
+}
+
+impl Owner {
+    /// The name of the message that marks a store as this owner's.
+    pub fn marker_name(&self) -> String {
+        format!("owner-{self}.bin")
+    }
+
+    /// Inverse of [`Self::marker_name`].
+    pub fn from_marker(name: &str) -> Option<Self> {
+        let hex = name.strip_prefix("owner-")?.strip_suffix(".bin")?;
+        (hex.len() == 8).then(|| u32::from_str_radix(hex, 16).ok().map(Owner)).flatten()
+    }
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:08x}", self.0)
+    }
+}
+
+impl BlobId {
+    /// A new id of no deployment ([`Owner`]`(0)`): test data, and stores no
+    /// sweep looks at. A deployment's blobs take [`Self::random_of`].
+    pub fn random() -> Self {
+        Self::random_of(Owner(0))
+    }
+
+    /// A new id of `owner`'s: its bits, then 96 random ones.
+    pub fn random_of(owner: Owner) -> Self {
+        let low = uuid::Uuid::new_v4().as_u128() & ((1u128 << 96) - 1);
+        BlobId((u128::from(owner.0) << 96) | low)
+    }
+
+    pub fn owner(&self) -> Owner {
+        Owner((self.0 >> 96) as u32)
     }
 
     /// File name the blob is uploaded under.
@@ -182,9 +227,25 @@ pub trait BlobBackend: Send + Sync + 'static {
     /// Batch delete; not-found is ok.
     async fn delete(&self, keys: &[Self::Key]) -> Result<()>;
 
-    /// Up to `limit` keys of our blobs in `(after, upto]`, in order: what
-    /// the sweeper checks against the metadata.
-    async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>>;
+    /// Up to `limit` keys of `owner`'s blobs (named by a [`BlobId`] of its)
+    /// in `(after, upto]`, in order: what the sweeper checks against the
+    /// metadata. Nothing else in the store is ever a candidate.
+    async fn candidates(
+        &self,
+        owner: Owner,
+        after: Option<Self::Key>,
+        upto: Self::Key,
+        limit: usize,
+    ) -> Result<Vec<Self::Key>>;
+
+    /// Mark the store as `owner`'s unless it is marked already; the owner it
+    /// is marked for. Another one than `owner`: another deployment uses this
+    /// store (its blobs are safe from our sweep either way, see [`Owner`]).
+    /// A channel marks itself with a pinned message; the default marks
+    /// nothing (a directory or memory is one deployment's by setup).
+    async fn mark_owner(&self, owner: Owner) -> Result<Owner> {
+        Ok(owner)
+    }
 
     /// Whether blob `id` is still there, asked of the store itself (no cache
     /// of ours may answer): what a verify pass probes. `Ok(false)` only for
@@ -230,17 +291,38 @@ impl<B: BlobBackend> BlobBackend for std::sync::Arc<B> {
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
         (**self).delete(keys).await
     }
-    async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
-        (**self).candidates(after, upto, limit).await
+    async fn candidates(
+        &self,
+        owner: Owner,
+        after: Option<Self::Key>,
+        upto: Self::Key,
+        limit: usize,
+    ) -> Result<Vec<Self::Key>> {
+        (**self).candidates(owner, after, upto, limit).await
     }
     async fn exists(&self, id: &Self::Id) -> Result<bool> {
         (**self).exists(id).await
+    }
+    async fn mark_owner(&self, owner: Owner) -> Result<Owner> {
+        (**self).mark_owner(owner).await
     }
 }
 
 #[cfg(test)]
 mod blob_id_tests {
-    use super::BlobId;
+    use super::{BlobId, Owner};
+
+    #[test]
+    fn an_id_carries_its_owner_in_the_name() {
+        let owner = Owner(0xdead_beef);
+        let id = BlobId::random_of(owner);
+        assert_eq!(id.owner(), owner);
+        assert!(id.name().starts_with("ph-deadbeef"), "{}", id.name());
+        assert_ne!(BlobId::random_of(owner), id);
+        assert_eq!(owner.marker_name(), "owner-deadbeef.bin");
+        assert_eq!(Owner::from_marker(&owner.marker_name()), Some(owner));
+        assert_eq!(Owner::from_marker("owner-xyz.bin"), None);
+    }
 
     #[test]
     fn name_roundtrips_and_rejects_foreign_names() {

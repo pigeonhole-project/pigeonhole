@@ -69,6 +69,8 @@ const DELETE_MESSAGE: Call = api("delete message", DELETE);
 const BULK_DELETE: Call = api("bulk delete", DELETE);
 const ARCHIVE_THREAD: Call = api("archive thread", DELETE);
 const DELETE_THREAD: Call = api("delete thread", DELETE);
+const LIST_PINS: Call = api("list pins", READ);
+const PIN_MESSAGE: Call = api("pin message", SEND);
 
 /// Why one attempt failed.
 #[derive(Debug)]
@@ -421,6 +423,36 @@ impl DiscordApi for DiscordChannel {
             (_, Some(160004)) => Ok(ThreadStart::Taken),
             (404, _) | (_, Some(10008)) => Ok(ThreadStart::NoMessage),
             (s, _) => bail!("start thread on {message_id}: {s} {}", a.body),
+        }
+    }
+
+    /// The legacy route's answer is a list of messages; the newer one's
+    /// `{ items: [{ message, .. }] }`: either is read.
+    async fn pinned(&self) -> Result<Vec<DcMessage>> {
+        let path = self.path("pins");
+        let c = &self.client;
+        let a = c.request(&self.limiter, &self.retry, &LIST_PINS, || c.http.get(c.url(&path))).await?;
+        if a.status != 200 {
+            bail!("list pins: {} {}", a.status, a.body);
+        }
+        let items = match a.body {
+            serde_json::Value::Array(items) => items,
+            mut other => match other["items"].take() {
+                serde_json::Value::Array(items) => items.into_iter().map(|mut i| i["message"].take()).collect(),
+                _ => bail!("list pins: neither a list nor items: {other}"),
+            },
+        };
+        items.into_iter().map(message).collect()
+    }
+
+    async fn pin(&self, id: u64) -> Result<()> {
+        let path = self.path(&format!("pins/{id}"));
+        let c = &self.client;
+        let a = c.request(&self.limiter, &self.retry, &PIN_MESSAGE, || c.http.put(c.url(&path))).await?;
+        match a.status {
+            200..=299 => Ok(()),
+            403 => bail!("pin message {id}: the bot needs the Manage Messages permission: {}", a.body),
+            s => bail!("pin message {id}: {s} {}", a.body),
         }
     }
 

@@ -95,6 +95,13 @@ pub trait DiscordApi: Send + Sync + 'static {
     /// Bytes `[start, end)` of an attachment (all of it for `None`);
     /// [`CdnStale`] when the URL expired.
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes>;
+
+    /// The pinned messages (Discord keeps up to 50).
+    async fn pinned(&self) -> Result<Vec<DcMessage>>;
+
+    /// Pin message `id` (needs Manage Messages; the channel shows a system
+    /// message).
+    async fn pin(&self, id: u64) -> Result<()>;
 }
 
 /// One channel shared by several stores (a pool member, a restart).
@@ -129,5 +136,11 @@ impl<A: DiscordApi + ?Sized> DiscordApi for std::sync::Arc<A> {
     }
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes> {
         (**self).download(url, range).await
+    }
+    async fn pinned(&self) -> Result<Vec<DcMessage>> {
+        (**self).pinned().await
+    }
+    async fn pin(&self, id: u64) -> Result<()> {
+        (**self).pin(id).await
     }
 }

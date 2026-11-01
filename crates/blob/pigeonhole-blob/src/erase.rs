@@ -20,9 +20,17 @@ pub trait DynBlobBackend: Send + Sync + 'static {
     async fn get(&self, id: &BlobLocator, range: Option<ByteRange>) -> Result<BoxByteStream>;
     async fn delete(&self, keys: &[Vec<u8>]) -> Result<()>;
     /// [`BlobBackend::candidates`] over key bytes.
-    async fn candidates(&self, after: Option<&[u8]>, upto: &[u8], limit: usize) -> Result<Vec<Vec<u8>>>;
+    async fn candidates(
+        &self,
+        owner: pigeonhole_storage_api::Owner,
+        after: Option<&[u8]>,
+        upto: &[u8],
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>>;
     /// [`BlobBackend::exists`].
     async fn exists(&self, id: &BlobLocator) -> Result<bool>;
+    /// [`BlobBackend::mark_owner`].
+    async fn mark_owner(&self, owner: pigeonhole_storage_api::Owner) -> Result<pigeonhole_storage_api::Owner>;
 }
 
 /// A concrete [`BlobBackend`] as a [`DynBlobBackend`].
@@ -76,15 +84,24 @@ impl<B: BlobBackend> DynBlobBackend for Erased<B> {
         self.inner.delete(&typed).await
     }
 
-    async fn candidates(&self, after: Option<&[u8]>, upto: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+    async fn candidates(
+        &self,
+        owner: pigeonhole_storage_api::Owner,
+        after: Option<&[u8]>,
+        upto: &[u8],
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>> {
         let after = after.map(B::Key::from_bytes).transpose()?;
-        let keys = self.inner.candidates(after, B::Key::from_bytes(upto)?, limit).await?;
+        let keys = self.inner.candidates(owner, after, B::Key::from_bytes(upto)?, limit).await?;
         Ok(keys.into_iter().map(|k| k.to_bytes()).collect())
     }
 
     async fn exists(&self, id: &BlobLocator) -> Result<bool> {
         let typed: B::Id = postcard::from_bytes(&id.locator)?;
         self.inner.exists(&typed).await
+    }
+    async fn mark_owner(&self, owner: pigeonhole_storage_api::Owner) -> Result<pigeonhole_storage_api::Owner> {
+        self.inner.mark_owner(owner).await
     }
 }
 
@@ -165,7 +182,13 @@ mod tests {
             Ok(())
         }
 
-        async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
+        async fn candidates(
+            &self,
+            _owner: pigeonhole_storage_api::Owner,
+            after: Option<Self::Key>,
+            upto: Self::Key,
+            limit: usize,
+        ) -> Result<Vec<Self::Key>> {
             let g = self.data.lock().unwrap();
             let mut keys: Vec<u64> = g.keys().copied().filter(|&k| k <= upto && after.is_none_or(|a| k > a)).collect();
             keys.sort_unstable();
@@ -181,7 +204,7 @@ mod tests {
         let got = collect_stream(backend.get(&id, None).await.unwrap()).await.unwrap();
         assert_eq!(got.as_ref(), b"hi");
         let upto = u64::MAX.to_bytes();
-        let keys = backend.candidates(None, &upto, 10).await.unwrap();
+        let keys = backend.candidates(pigeonhole_storage_api::Owner(0), None, &upto, 10).await.unwrap();
         assert_eq!(keys.len(), 1);
         backend.delete(&keys).await.unwrap();
         assert!(backend.get(&id, None).await.is_err());

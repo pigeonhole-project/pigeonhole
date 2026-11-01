@@ -23,6 +23,7 @@ pub struct Calls {
     pub send_text: usize,
     pub get_file: usize,
     pub delete_messages: usize,
+    pub pin: usize,
 }
 
 /// What tests make a channel do wrong; not part of its state.
@@ -110,6 +111,16 @@ impl FakeChannel {
     /// Ids of the messages still there.
     pub fn message_ids(&self) -> Vec<i64> {
         self.host.read(TelegramChannelState::ids)
+    }
+
+    /// The pinned message.
+    pub fn pinned_now(&self) -> Option<i64> {
+        self.host.read(TelegramChannelState::pinned)
+    }
+
+    /// Someone pins message `id`.
+    pub fn pin_now(&self, id: i64) {
+        self.host.apply_now(Command::Pin { id });
     }
 }
 
@@ -237,6 +248,16 @@ impl<H: FakeHost<TelegramChannelState>> ChannelApi for FakeChannel<H> {
         if let Reply::Released { blobs } = self.host.apply(Command::Delete { ids: ids.to_vec() }).await? {
             self.host.delete_blobs(&blobs).await?;
         }
+        Ok(())
+    }
+
+    async fn pinned(&self) -> Result<Option<i64>> {
+        Ok(self.host.read(|s| s.pinned()))
+    }
+
+    async fn pin(&self, id: i64) -> Result<()> {
+        self.knobs.lock().unwrap().calls.pin += 1;
+        self.host.apply(Command::Pin { id }).await?;
         Ok(())
     }
 }

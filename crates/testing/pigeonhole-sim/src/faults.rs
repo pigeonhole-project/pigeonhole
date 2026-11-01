@@ -298,9 +298,19 @@ impl<B: BlobBackend> BlobBackend for Faulty<B> {
         }
     }
 
-    async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
+    async fn mark_owner(&self, owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
+        self.inner.mark_owner(owner).await
+    }
+
+    async fn candidates(
+        &self,
+        owner: pigeonhole_blob::Owner,
+        after: Option<Self::Key>,
+        upto: Self::Key,
+        limit: usize,
+    ) -> Result<Vec<Self::Key>> {
         self.before(LIST, "candidates", READ_FAULTS).await?;
-        self.inner.candidates(after, upto, limit).await
+        self.inner.candidates(owner, after, upto, limit).await
     }
 }
 

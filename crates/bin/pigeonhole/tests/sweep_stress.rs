@@ -282,8 +282,9 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     node.s3.create_bucket(req(CreateBucketInput { bucket: BUCKET.into(), ..Default::default() })).await.unwrap();
 
     // A dead writer's uploads: on the backend, never committed to chunk_parts.
+    let ours = node.store.replicated().pins().owner();
     for i in 0..5u64 {
-        node.backend.put(payload(0xDEAD + i, 1024), "orphan.bin").await.unwrap();
+        node.backend.put(payload(0xDEAD + i, 1024), &pigeonhole_blob::BlobId::random_of(ours).name()).await.unwrap();
     }
 
     let stop = Arc::new(AtomicBool::new(false));

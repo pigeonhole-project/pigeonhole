@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use pigeonhole_blob::{collect_stream, BlobBackend, BlobId};
+use pigeonhole_blob::{collect_stream, BlobBackend, BlobId, Owner};
 
 /// Shared suite for [`BlobBackend`].
 ///
@@ -32,23 +32,29 @@ where
     let over = Bytes::from(vec![0u8; backend.limits().max_blob_size + 1]);
     assert!(backend.put(over, &BlobId::random().name()).await.is_err());
 
-    // Monotonic keys across successive puts.
+    // Monotonic keys across successive puts; one blob of another owner.
     let mut ids = vec![id.clone(), big_id.clone()];
     for i in 0..4u8 {
         ids.push(backend.put(Bytes::from(vec![i; 32]), &BlobId::random().name()).await?);
     }
+    let other = Owner(7);
+    let theirs = backend.put(Bytes::from_static(b"another deployment's"), &BlobId::random_of(other).name()).await?;
+    ids.push(backend.put(Bytes::from_static(b"ours again"), &BlobId::random().name()).await?);
     for w in ids.windows(2) {
         assert!(B::key(&w[0]) < B::key(&w[1]), "keys must grow: {:?} then {:?}", B::key(&w[0]), B::key(&w[1]));
     }
 
     let max_key = B::key(ids.last().unwrap());
     let written: Vec<_> = ids.iter().map(B::key).collect();
+    let theirs_key = B::key(&theirs);
+    let only_theirs = backend.candidates(other, None, max_key, 100).await?;
+    assert_eq!(only_theirs, vec![theirs_key], "another owner's candidates are its blobs only");
     // Page candidates so backends with dense synthetic ranges (Telegram) still
     // reach high message ids within a reasonable limit per call.
     let mut found = Vec::new();
     let mut after = None;
     for _ in 0..256 {
-        let batch = backend.candidates(after, max_key, 100).await?;
+        let batch = backend.candidates(Owner(0), after, max_key, 100).await?;
         if batch.is_empty() {
             break;
         }
@@ -61,6 +67,7 @@ where
     for k in &written {
         assert!(found.contains(k), "candidates missing key {k:?}; got {} keys up to {:?}", found.len(), found.last());
     }
+    assert!(!found.contains(&theirs_key), "another owner's blob is never a candidate");
 
     // Delete + repeat delete (not-found = ok).
     let del_key = B::key(&id);
@@ -69,7 +76,8 @@ where
     backend.delete(&[del_key]).await?;
 
     // Cleanup remaining blobs (best-effort).
-    let rest: Vec<_> = ids.iter().skip(1).map(B::key).collect();
+    let mut rest: Vec<_> = ids.iter().skip(1).map(B::key).collect();
+    rest.push(theirs_key);
     let _ = backend.delete(&rest).await;
     Ok(())
 }

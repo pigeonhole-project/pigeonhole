@@ -30,6 +30,11 @@ fn object(i: u8) -> Bytes {
     Bytes::from((0..5000u32).map(|n| (n as u8) ^ i).collect::<Vec<u8>>())
 }
 
+/// What a data channel holds besides blobs: the pinned owner marker, and on
+/// Telegram the service message the pin posts.
+const TG_MARKER: u64 = 2;
+const DC_MARKER: u64 = 1;
+
 async fn count(world: &World, node: &Node, store: &str) -> u64 {
     let c = node.channels.iter().find(|c| c.store == store).unwrap();
     world.describe(c, 0).await.unwrap()["total"].as_u64().unwrap()
@@ -44,7 +49,7 @@ async fn a_wiped_channel_is_read_around_found_by_verify_and_repaired() {
         node.put("demo", &format!("k{i}"), object(i)).await.unwrap();
     }
     let tg = node.channels.iter().find(|c| c.store == "telegram").unwrap().clone();
-    assert_eq!(world.wipe(&tg).await.unwrap(), 3, "a chunk a message");
+    assert_eq!(world.wipe(&tg).await.unwrap() as u64, 3 + TG_MARKER, "a chunk a message, and the marker");
     assert_eq!(count(&world, &node, "telegram").await, 0);
     for i in 0..3 {
         assert_eq!(node.get("demo", &format!("k{i}"), None).await.unwrap(), object(i), "read from discord");
@@ -69,10 +74,11 @@ async fn a_channel_down_fails_a_write_of_two_and_takes_one_of_two() {
         let put = node.put("demo", "k", object(1)).await;
         assert_eq!(put.is_ok(), quorum == 1, "quorum {quorum}: {put:?}");
         world.set_down(&dc, false);
-        assert_eq!(count(&world, &node, "discord").await, 0);
+        assert_eq!(count(&world, &node, "discord").await, DC_MARKER);
         let repaired = node.repair().await.unwrap().repaired;
         // The write that counted with one copy gets its second once discord is back.
-        assert_eq!((repaired, count(&world, &node, "discord").await), if quorum == 1 { (1, 1) } else { (0, 0) });
+        let blobs = if quorum == 1 { 1 } else { 0 };
+        assert_eq!((repaired, count(&world, &node, "discord").await), (blobs, blobs + DC_MARKER));
         node.close().await.unwrap();
         world.close().await.unwrap();
     }
@@ -108,7 +114,7 @@ async fn a_read_that_finds_a_document_gone_queues_it_and_the_background_repairs_
         assert_eq!(node.repair_queue().await.unwrap(), 1, "{wiped}: the read queued the lost copy");
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(node.repair_queue().await.unwrap(), 0, "{wiped}: a background pass repaired it");
-        assert_eq!(count(&world, &node, wiped).await, 1);
+        assert_eq!(count(&world, &node, wiped).await, 1, "the marker went with the wipe");
         world.set_down(&other, true);
         assert_eq!(node.get("demo", "k", None).await.unwrap(), body, "{wiped}: read from the repaired copy");
         world.set_down(&other, false);
@@ -133,7 +139,7 @@ async fn a_deleted_text_blob_is_still_read_from_the_cache_until_verify() {
     assert_eq!(node.repair_queue().await.unwrap(), 0);
     assert_eq!(node.verify("telegram").await.unwrap(), (1, 1));
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert_eq!(count(&world, &node, "telegram").await, 1, "repaired in the background");
+    assert_eq!(count(&world, &node, "telegram").await, 1 + TG_MARKER, "repaired in the background");
     node.close().await.unwrap();
     world.close().await.unwrap();
 }

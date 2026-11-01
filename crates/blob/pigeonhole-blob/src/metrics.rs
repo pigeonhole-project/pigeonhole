@@ -389,8 +389,14 @@ impl DynBlobBackend for MetricsBackend {
         result
     }
 
-    async fn candidates(&self, after: Option<&[u8]>, upto: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
-        self.inner.candidates(after, upto, limit).await
+    async fn candidates(
+        &self,
+        owner: pigeonhole_storage_api::Owner,
+        after: Option<&[u8]>,
+        upto: &[u8],
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.inner.candidates(owner, after, upto, limit).await
     }
 
     async fn exists(&self, id: &BlobLocator) -> Result<bool> {
@@ -401,5 +407,8 @@ impl DynBlobBackend for MetricsBackend {
         log_call(&span, &result, t0.elapsed());
         record_instance_call(&instance, "exists", if result.is_ok() { "ok" } else { "error" }, t0.elapsed());
         result
+    }
+    async fn mark_owner(&self, owner: pigeonhole_storage_api::Owner) -> Result<pigeonhole_storage_api::Owner> {
+        self.inner.mark_owner(owner).await
     }
 }

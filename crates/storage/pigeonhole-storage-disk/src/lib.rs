@@ -128,6 +128,11 @@ impl DiskBlobStore {
         &self.dir
     }
 
+    /// Keys of every live record, ours or not (tests and tools).
+    pub async fn live_keys(&self) -> Result<Vec<u64>> {
+        self.locked(|s| Ok(s.records.iter().filter(|(_, r)| !r.dead).map(|(k, _)| *k).collect())).await
+    }
+
     /// Run `f` on the segments under the `flock`, caught up with other
     /// processes first.
     async fn locked<T: Send + 'static>(
@@ -238,13 +243,20 @@ impl BlobBackend for DiskBlobStore {
         Ok(())
     }
 
-    async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
+    async fn candidates(
+        &self,
+        owner: pigeonhole_storage_api::Owner,
+        after: Option<Self::Key>,
+        upto: Self::Key,
+        limit: usize,
+    ) -> Result<Vec<Self::Key>> {
         self.locked(move |s| {
             let from = after.map_or(0, |a| a.saturating_add(1));
             if from > upto {
                 return Ok(Vec::new());
             }
-            Ok(s.records.range(from..=upto).filter(|(_, r)| !r.dead).map(|(k, _)| *k).take(limit).collect())
+            let owned = |r: &segments::Rec| !r.dead && r.owner == Some(owner);
+            Ok(s.records.range(from..=upto).filter(|(_, r)| owned(r)).map(|(k, _)| *k).take(limit).collect())
         })
         .await
     }
