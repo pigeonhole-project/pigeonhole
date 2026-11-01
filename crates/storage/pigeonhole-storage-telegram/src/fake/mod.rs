@@ -3,6 +3,7 @@
 //! state ([`state`]) lives in a host: in memory for tests ([`FakeChannel::new`]),
 //! or wherever `pigeonhole-fake-channels` keeps it.
 
+pub mod bot;
 pub mod state;
 
 use crate::channel::{ChannelApi, ChannelMessage, FileLocation, Sent};

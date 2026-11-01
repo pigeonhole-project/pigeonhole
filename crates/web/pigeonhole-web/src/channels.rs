@@ -4,7 +4,7 @@
 use crate::World;
 use anyhow::Result;
 use pigeonhole_config::instances::InstanceKind;
-use pigeonhole_config::stores::FakeBacking;
+use pigeonhole_config::stores::{FakeBacking, FakeChannel};
 use pigeonhole_config::{Config, LogSettings, SnapshotSettings};
 use pigeonhole_storage_api::fake::FakeHost;
 use pigeonhole_storage_discord::fake::state::{DiscordChannelState, Message as DcMessage};
@@ -20,6 +20,21 @@ pub struct ChannelRef {
     pub kind: InstanceKind,
     pub scope: String,
     pub backing: FakeBacking,
+    /// How many bots post to it.
+    pub bots: usize,
+}
+
+impl ChannelRef {
+    fn meta(store: &str, role: &'static str, f: &FakeChannel) -> Self {
+        Self {
+            store: store.into(),
+            role,
+            kind: f.kind,
+            scope: f.scope.clone(),
+            backing: f.backing.clone(),
+            bots: f.bots,
+        }
+    }
 }
 
 /// Every fake channel `cfg` uses.
@@ -28,33 +43,22 @@ pub fn of(cfg: &Config) -> Vec<ChannelRef> {
         .instances
         .iter()
         .filter_map(|i| {
-            let backing = i.fake.clone()?;
+            let f = i.fake.clone()?;
             Some(ChannelRef {
                 store: i.info.id.clone(),
                 role: "data",
                 kind: i.kind,
-                scope: i.scope_id.clone(),
-                backing,
+                scope: f.scope,
+                backing: f.backing,
+                bots: f.bots,
             })
         })
         .collect();
-    if let LogSettings::Fake { kind, scope, backing } = &cfg.meta.log {
-        out.push(ChannelRef {
-            store: "meta-log".into(),
-            role: "log",
-            kind: *kind,
-            scope: scope.clone(),
-            backing: backing.clone(),
-        });
+    if let LogSettings::Fake(f) = &cfg.meta.log {
+        out.push(ChannelRef::meta("meta-log", "log", f));
     }
-    if let SnapshotSettings::Fake { kind, scope, backing } = &cfg.meta.snapshot {
-        out.push(ChannelRef {
-            store: "meta-snapshots".into(),
-            role: "snapshots",
-            kind: *kind,
-            scope: scope.clone(),
-            backing: backing.clone(),
-        });
+    if let SnapshotSettings::Fake(f) = &cfg.meta.snapshot {
+        out.push(ChannelRef::meta("meta-snapshots", "snapshots", f));
     }
     out
 }
@@ -152,7 +156,7 @@ impl World {
             _ => (0, Vec::new()),
         };
         Ok(
-            json!({ "store": c.store, "role": c.role, "kind": c.kind.as_str(), "scope": c.scope, "total": total, "messages": messages }),
+            json!({ "store": c.store, "role": c.role, "kind": c.kind.as_str(), "scope": c.scope, "bots": c.bots, "total": total, "messages": messages }),
         )
     }
 }

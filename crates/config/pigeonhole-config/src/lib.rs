@@ -189,7 +189,7 @@ pub enum SnapshotSettings {
     /// A dedicated Discord channel (a chain over threads; docs/discord-log.md).
     Discord { channel_id: String, bot_tokens: Vec<String>, max_blob_size: Option<usize> },
     /// A fake telegram or discord channel (builds with feature `fake`).
-    Fake { kind: InstanceKind, scope: String, backing: crate::stores::FakeBacking },
+    Fake(crate::stores::FakeChannel),
 }
 
 /// Where the command log lives (`[meta] log`).
@@ -205,13 +205,13 @@ pub enum LogSettings {
     /// A dedicated Discord channel, fenced by threads (docs/discord-log.md).
     Discord { channel_id: String, bot_tokens: Vec<String>, max_blob_size: Option<usize> },
     /// A fake telegram or discord channel (builds with feature `fake`).
-    Fake { kind: InstanceKind, scope: String, backing: crate::stores::FakeBacking },
+    Fake(crate::stores::FakeChannel),
 }
 
 impl LogSettings {
     /// The log lives off this host (a chat), so its snapshots must too.
     fn off_host(&self) -> bool {
-        matches!(self, LogSettings::Telegram { .. } | LogSettings::Discord { .. } | LogSettings::Fake { .. })
+        matches!(self, LogSettings::Telegram { .. } | LogSettings::Discord { .. } | LogSettings::Fake(_))
     }
 }
 
@@ -238,9 +238,9 @@ impl MetaSettings {
                 true
             }
             // A fake channel in memory is gone with the process.
-            (LogSettings::LocalDisk { .. }, SnapshotSettings::Memory | SnapshotSettings::Fake { .. }) => false,
+            (LogSettings::LocalDisk { .. }, SnapshotSettings::Memory | SnapshotSettings::Fake(_)) => false,
             (LogSettings::Telegram { .. } | LogSettings::Discord { .. } | LogSettings::Memory, _) => false,
-            (LogSettings::Fake { .. }, _) => false,
+            (LogSettings::Fake(_), _) => false,
         }
     }
 }
@@ -604,9 +604,7 @@ impl FileMeta {
                 bot_tokens: bot_tokens.clone(),
                 max_blob_size: *max_blob_size,
             },
-            Store::Fake { kind, scope, backing } => {
-                LogSettings::Fake { kind: *kind, scope: scope.clone(), backing: backing.clone() }
-            }
+            Store::Fake(f) => LogSettings::Fake(f.clone()),
         };
         let snapshot_store = match &self.snapshot {
             Some(id) => topology.meta_store(id, "[meta] snapshot")?,
@@ -620,7 +618,7 @@ impl FileMeta {
             Store::Discord { channel_id, bot_tokens, max_blob_size, .. } => {
                 SnapshotSettings::Discord { channel_id, bot_tokens, max_blob_size }
             }
-            Store::Fake { kind, scope, backing } => SnapshotSettings::Fake { kind, scope, backing },
+            Store::Fake(f) => SnapshotSettings::Fake(f),
         };
         match (&log, &snapshot) {
             (log, SnapshotSettings::LocalDisk { .. } | SnapshotSettings::Memory) if log.off_host() => bail!(
@@ -1481,9 +1479,10 @@ fake = "memory"
         assert_eq!((tg.kind, tg.scope_id.as_str()), (InstanceKind::Telegram, "-1001"));
         assert_eq!(tg.info.fingerprint, "fake:telegram:-1001");
         assert!(tg.telegram.is_empty() && tg.bot_tokens.is_empty());
-        assert_eq!(tg.fake, Some(stores::FakeBacking::Memory));
-        assert!(matches!(cfg.meta.log, LogSettings::Fake { kind: InstanceKind::Telegram, .. }));
-        assert!(matches!(cfg.meta.snapshot, SnapshotSettings::Fake { .. }));
+        let fake = tg.fake.as_ref().unwrap();
+        assert_eq!((&fake.backing, fake.bots), (&stores::FakeBacking::Memory, 1), "one bot unless `bots` says");
+        assert!(matches!(cfg.meta.log, LogSettings::Fake(stores::FakeChannel { kind: InstanceKind::Telegram, .. })));
+        assert!(matches!(cfg.meta.snapshot, SnapshotSettings::Fake(_)));
     }
 
     #[cfg(feature = "fake")]
@@ -1493,11 +1492,11 @@ fake = "memory"
             + "[[store]]\nid = \"channels\"\nkind = \"local_disk\"\npath = \"demo-data\"\n";
         let cfg = Config::from_toml(&text, Path::new("demo.toml")).unwrap();
         let tg = cfg.instances.iter().find(|i| i.info.id == "tg").unwrap();
-        assert_eq!(tg.fake, Some(stores::FakeBacking::Dir("demo-data/telegram--1001".into())));
+        assert_eq!(tg.fake.as_ref().unwrap().backing, stores::FakeBacking::Dir("demo-data/telegram--1001".into()));
         let dc = cfg.instances.iter().find(|i| i.info.id == "dc").unwrap();
-        assert_eq!(dc.fake, Some(stores::FakeBacking::Dir("demo-data/discord-77".into())));
+        assert_eq!(dc.fake.as_ref().unwrap().backing, stores::FakeBacking::Dir("demo-data/discord-77".into()));
         assert!(
-            matches!(&cfg.meta.log, LogSettings::Fake { backing: stores::FakeBacking::Dir(d), .. } if d.ends_with("telegram--1002"))
+            matches!(&cfg.meta.log, LogSettings::Fake(stores::FakeChannel { backing: stores::FakeBacking::Dir(d), .. }) if d.ends_with("telegram--1002"))
         );
     }
 
@@ -1514,7 +1513,21 @@ fake = "memory"
     fn a_fake_channel_has_no_bots() {
         let text = FAKE_CHANNELS.replacen("fake = \"memory\"", "fake = \"memory\"\nbot_token_envs = [\"X\"]", 1);
         let err = format!("{:#}", Config::from_toml(&text, Path::new("demo.toml")).unwrap_err());
-        assert!(err.contains("a fake channel has no bots"), "{err}");
+        assert!(err.contains("a fake channel has no real bots"), "{err}");
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn a_fake_channel_counts_its_bots_and_a_real_store_does_not() {
+        let text = FAKE_CHANNELS.replacen("fake = \"memory\"", "fake = \"memory\"\nbots = 3", 1);
+        let cfg = Config::from_toml(&text, Path::new("demo.toml")).unwrap();
+        assert_eq!(cfg.instances.iter().find(|i| i.info.id == "tg").unwrap().fake.as_ref().unwrap().bots, 3);
+        let none = FAKE_CHANNELS.replacen("fake = \"memory\"", "fake = \"memory\"\nbots = 0", 1);
+        let err = format!("{:#}", Config::from_toml(&none, Path::new("demo.toml")).unwrap_err());
+        assert!(err.contains("at least one bot"), "{err}");
+        let real = FAKE_CHANNELS.replacen("fake = \"memory\"", "bots = 2", 1);
+        let err = format!("{:#}", Config::from_toml(&real, Path::new("demo.toml")).unwrap_err());
+        assert!(err.contains("counts a fake channel's bots"), "{err}");
     }
 
     #[test]

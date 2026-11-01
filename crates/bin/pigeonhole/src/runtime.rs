@@ -26,7 +26,7 @@ pub struct Runtime {
 /// The configured metadata log (`[meta] log`).
 pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
     Ok(match &cfg.meta.log {
-        LogSettings::Fake { .. } => anyhow::bail!("[meta] log is a fake channel: this build has no fake channels"),
+        LogSettings::Fake(_) => anyhow::bail!("[meta] log is a fake channel: this build has no fake channels"),
         LogSettings::Memory => {
             warn!("metadata log in memory: everything is gone when the process exits");
             Arc::new(ChainLogStore::new(Arc::new(MemoryBlobStore::new())))
@@ -61,7 +61,7 @@ pub async fn open_log(cfg: &Config) -> anyhow::Result<Arc<dyn LogStore>> {
 /// The configured snapshot store (`[meta] snapshot`).
 pub async fn open_snapshots(cfg: &Config) -> anyhow::Result<Arc<dyn SnapshotStore>> {
     Ok(match &cfg.meta.snapshot {
-        SnapshotSettings::Fake { .. } => {
+        SnapshotSettings::Fake(_) => {
             anyhow::bail!("[meta] snapshot is a fake channel: this build has no fake channels")
         }
         SnapshotSettings::LocalDisk { path } => Arc::new(BlobSnapshotStore::new(Arc::new(
