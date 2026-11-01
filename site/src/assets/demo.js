@@ -61,21 +61,38 @@
   // A pigeon in flight, facing right: wings up from a small body, a tail.
   const BIRD = "M-9,1 Q-6,-1 -3,0 Q-1,-9 3,-11 Q2,-4 2,-1 Q6,-2 9,0 Q6,2 2,2 Q0,4 -3,3 Q-6,3 -9,1 Z";
 
+  // The channels in two groups: the data channels (blob stores, the
+  // chunks) and the node's own, the log and its snapshots.
+  const STEP = 96, GAP = 64, HEAD = 34;
   function layout() {
-    const right = state.channels;
-    const H = Math.max(480, 120 + right.length * 108);
+    const data = state.channels.filter(c => c.role === "data");
+    const meta = state.channels.filter(c => c.role !== "data");
+    const groups = [data, meta].filter(g => g.length);
+    const tall = groups.reduce((a, g) => a + HEAD + g.length * STEP, 0) + GAP * (groups.length - 1);
+    const H = Math.max(480, tall + 80);
     graph.setAttribute("viewBox", `0 0 ${W} ${H}`);
     graph.setAttribute("preserveAspectRatio", "xMidYMid meet");
     const pos = {client: [120, H / 2], loft: [440, H / 2]};
-    right.forEach((c, i) => { pos[c.store] = [790, (H / (right.length + 1)) * (i + 1)]; });
-    return {H, pos};
+    const boxes = [];
+    let y = (H - tall) / 2;
+    for (const g of groups) {
+      boxes.push({role: g[0].role === "data" ? "data" : "meta", top: y, height: HEAD + g.length * STEP});
+      g.forEach((c, i) => { pos[c.store] = [790, y + HEAD + STEP / 2 + i * STEP]; });
+      y += HEAD + g.length * STEP + GAP;
+    }
+    return {H, pos, boxes};
   }
 
   function draw() {
     graph.replaceChildren();
     nodes = {}; edges = {};
-    const {pos} = layout();
+    const {pos, boxes} = layout();
     const defs = s("defs", {}, graph);
+    // The two groups of channels, under everything else.
+    for (const b of boxes) {
+      s("rect", {class: `group ${b.role}`, x: 642, y: b.top, width: 296, height: b.height - 8, rx: 18}, graph);
+      s("text", {class: "group-label", x: 660, y: b.top + 22}, graph).textContent = t(`demo.group_${b.role}`);
+    }
     const g = s("linearGradient", {id: "iris", x1: "0", y1: "0", x2: "1", y2: "1"}, defs);
     s("stop", {offset: "0", "stop-color": "var(--teal)"}, g);
     s("stop", {offset: "1", "stop-color": "var(--amethyst)"}, g);
@@ -87,7 +104,7 @@
     };
     edges.client = s("path", {class: "edge live", d: curve([166, pos.client[1]], [345, pos.loft[1]])}, edgeLayer);
     for (const c of state.channels) {
-      edges[c.store] = s("path", {class: "edge", d: curve([535, pos.loft[1]], [660, pos[c.store][1]])}, edgeLayer);
+      edges[c.store] = s("path", {class: `edge${c.role === "data" ? "" : " meta"}`, d: curve([535, pos.loft[1]], [660, pos[c.store][1]])}, edgeLayer);
     }
 
     // You: the S3 client.
@@ -113,7 +130,7 @@
       const role = placeNote(c, app) + bots + (c.down ? `, ${t("demo.down")}` : "");
       const n = node(c.store, pos[c.store], c.store, role);
       n.g.classList.toggle("down", !!c.down);
-      s("rect", {class: "shape", x: -130, y: -34, width: 260, height: 68, rx: 14}, n.g);
+      s("rect", {class: `shape${c.role === "data" ? "" : " meta"}`, x: -130, y: -34, width: 260, height: 68, rx: 14}, n.g);
       s("circle", {class: "badge", cx: -106, cy: 0, r: 9, fill: c.kind === "telegram" ? "var(--tg)" : "var(--dc)"}, n.g);
       n.label(-88, 0, "start");
       // The channel's message count, top right.
@@ -529,11 +546,15 @@
   // A channel as its app shows it: Telegram's channel view, Discord's text channel.
   const DISCORD_EPOCH = 1420070400000n;
   const hhmm = d => d.toLocaleTimeString(window.LANG, {hour: "2-digit", minute: "2-digit"});
+  // When a message was posted: the channel says (`at`, ms); a post seen
+  // live has its Date; a Discord id carries its time anyway.
   function when(c, m) {
+    if (m.at instanceof Date) return m.at;
+    if (m.at != null) return new Date(+m.at);
     if (c.kind === "discord") {
       try { return new Date(Number((BigInt(m.id) >> 22n) + DISCORD_EPOCH)); } catch { return null; }
     }
-    return m.at || null;
+    return null;
   }
   const svgIcon = (d, cls) => {
     const sv = document.createElementNS(svgNS, "svg");
@@ -599,6 +620,7 @@
     if (!live.length) chat.append(h("p", "tg-empty", t("demo.no_messages")));
     else chat.append(h("div", "tg-day", t("demo.today")));
     for (const m of live) {
+      const line = h("div", "tg-line");
       const b = h("div", "tg-post" + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : "") + (service(m) ? " service" : ""));
       if (m.kind === "text") b.append(h("div", "tg-text cjk", payload(m)));
       else if (m.kind === "other") b.append(h("div", "tg-text", t("demo.tg_service")));
@@ -612,13 +634,14 @@
         b.append(doc);
       }
       if (m.log) b.append(h("div", "post-log", logLabel(m.log)));
-      if (c.role === "data" && !m.gone) deletable(b, c, m);
       const foot = h("div", "tg-meta");
       foot.append(svgIcon(ICON_EYE, "eye"), document.createTextNode("1"));
       const at = when(c, m);
       if (at) foot.append(document.createTextNode(` ${hhmm(at)}`));
       b.append(foot);
-      chat.append(b);
+      line.append(b);
+      if (c.role === "data" && !m.gone) deletable(line, c, m);
+      chat.append(line);
     }
     const input = h("div", "tg-input", t("demo.tg_broadcast"));
     app.append(head, chat, input);
@@ -642,6 +665,7 @@
       // Discord groups a run of messages by one author within minutes.
       const grouped = last && at && last - at > -7 * 60 * 1000;
       const row = h("div", "dc-msg" + (grouped ? " grouped" : "") + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : "") + (service(m) ? " service" : ""));
+      if (grouped && at) row.append(h("span", "dc-gutter-time", hhmm(at)));
       if (!grouped) {
         row.append(h("div", "dc-ava", "🐦"));
         const top = h("div", "dc-top");

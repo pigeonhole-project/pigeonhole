@@ -31,18 +31,23 @@ pub struct TelegramChannelState {
     reference_epoch: u8,
     /// The latest pinned message ([`Command::Pin`]).
     pinned: Option<i64>,
+    /// When each message was posted (ms since the epoch), as Telegram dates them.
+    dates: BTreeMap<i64, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     /// A send of ours; a `random_id` sent before posts nothing again.
+    /// `now_ms`: the post's date, in the command so that a replay dates it alike.
     Send {
         random_id: i64,
         message: Message,
+        now_ms: u64,
     },
     /// Someone else posts (tests).
     Post {
         message: Message,
+        now_ms: u64,
     },
     Delete {
         ids: Vec<i64>,
@@ -56,8 +61,10 @@ pub enum Command {
     },
     /// Pin message `id`: it becomes the pinned one, and a service message
     /// says so.
+    /// Pin message `id`; Telegram posts a service message about it, at `now_ms`.
     Pin {
         id: i64,
+        now_ms: u64,
     },
 }
 
@@ -77,22 +84,25 @@ pub enum Reply {
 
 impl FakeState for TelegramChannelState {
     const NAME: &'static str = "fake-telegram";
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     type Command = Command;
     type Reply = Reply;
 
     fn apply(&mut self, command: Command) -> Reply {
         match command {
-            Command::Send { random_id, message } => {
+            Command::Send { random_id, message, now_ms } => {
                 if let Some(&id) = self.by_random_id.get(&random_id) {
                     return Reply::Sent { id, fresh: false };
                 }
-                let id = self.post(message);
+                let id = self.post(message, now_ms);
                 self.by_random_id.insert(random_id, id);
                 Reply::Sent { id, fresh: true }
             }
-            Command::Post { message } => Reply::Sent { id: self.post(message), fresh: true },
+            Command::Post { message, now_ms } => Reply::Sent { id: self.post(message, now_ms), fresh: true },
             Command::Delete { ids } => {
+                for id in &ids {
+                    self.dates.remove(id);
+                }
                 if self.pinned.is_some_and(|p| ids.contains(&p)) {
                     self.pinned = None;
                 }
@@ -100,10 +110,10 @@ impl FakeState for TelegramChannelState {
                     blobs: ids.iter().filter_map(|id| self.messages.remove(id)).filter_map(blob).collect(),
                 }
             }
-            Command::Pin { id } => {
+            Command::Pin { id, now_ms } => {
                 if self.messages.contains_key(&id) {
                     self.pinned = Some(id);
-                    self.post(Message::Other);
+                    self.post(Message::Other, now_ms);
                 }
                 Reply::Done
             }
@@ -127,9 +137,10 @@ fn blob(m: Message) -> Option<Vec<u8>> {
 }
 
 impl TelegramChannelState {
-    fn post(&mut self, message: Message) -> i64 {
+    fn post(&mut self, message: Message, now_ms: u64) -> i64 {
         self.top += 1;
         self.messages.insert(self.top, message);
+        self.dates.insert(self.top, now_ms);
         self.top
     }
 
@@ -139,6 +150,11 @@ impl TelegramChannelState {
 
     pub fn message(&self, id: i64) -> Option<&Message> {
         self.messages.get(&id)
+    }
+
+    /// When message `id` was posted (ms since the epoch).
+    pub fn date_ms(&self, id: i64) -> Option<u64> {
+        self.dates.get(&id).copied()
     }
 
     /// Message `id` as `getMessages` shows it in channel `channel`.
@@ -217,4 +233,9 @@ pub fn check_window(offset: u64, limit: u64) -> Result<()> {
         bail!("LIMIT_INVALID: window {offset}+{limit} crosses a 1 MiB boundary");
     }
     Ok(())
+}
+
+/// Now, in ms since the epoch: a post's date.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }

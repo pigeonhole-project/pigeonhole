@@ -317,5 +317,7 @@
     "other": "A background repair pass wrote back {n} copies."
   },
   "demo.bg_title": "Background work",
-  "js.say.read_failed_down": "The read failed: one copy is down, and the other is gone. The read queued the lost one for repair. <span class=\"err\">{error}</span>"
+  "js.say.read_failed_down": "The read failed: one copy is down, and the other is gone. The read queued the lost one for repair. <span class=\"err\">{error}</span>",
+  "js.demo.group_data": "Chunks: the blob stores",
+  "js.demo.group_meta": "Metadata: the log and its snapshots"
 }

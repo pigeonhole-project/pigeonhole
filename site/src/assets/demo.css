@@ -280,7 +280,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .dc-empty { color: var(--dc-muted); padding: 16px; }
 .dc-day { display: flex; align-items: center; gap: 8px; color: var(--dc-muted); font-size: 12px; font-weight: 600; margin: 8px 16px; }
 .dc-day::before, .dc-day::after { content: ""; flex: 1; height: 1px; background: var(--dc-line); }
-.dc-msg { display: grid; grid-template-columns: 40px 1fr; column-gap: 16px; padding: 2px 16px 2px; margin-top: 14px; }
+.dc-msg { position: relative; display: grid; grid-template-columns: 40px 1fr; column-gap: 16px; padding: 2px 16px 2px; margin-top: 14px; }
 .dc-msg.grouped { margin-top: 0; }
 .dc-msg:hover { background: var(--dc-hover); }
 .dc-ava { grid-row: span 2; width: 40px; height: 40px; border-radius: 50%; background: #5865f2; display: grid; place-items: center; font-size: 20px; }
@@ -362,10 +362,21 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .jobs { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 10px 0 0; }
 .job-tile { font: 12px var(--mono); padding: 3px 8px; border-radius: 6px; border: 1px solid var(--eye); color: var(--eye); }
 .deletable { position: relative; }
+/* The delete button: the same place in both apps, the line's top right. */
 .msg-del {
-  position: absolute; top: 6px; right: 6px; width: 28px; height: 28px; border-radius: 8px; border: 0;
-  display: grid; place-items: center; cursor: pointer; opacity: 0; background: rgba(0,0,0,.35); color: #fff;
+  position: absolute; top: 2px; right: 8px; width: 28px; height: 28px; border-radius: 8px; border: 0;
+  display: grid; place-items: center; cursor: pointer; opacity: 0; background: rgba(0,0,0,.45); color: #fff;
 }
+.tg-line { position: relative; display: flex; flex-direction: column; align-items: flex-start; padding-right: 44px; }
+.dc-msg.deletable { padding-right: 44px; }
+.dc-gutter-time { position: absolute; left: 4px; top: 5px; width: 64px; text-align: center; white-space: nowrap; font-size: 10.5px; color: var(--dc-muted); opacity: 0; }
+.dc-msg:hover .dc-gutter-time { opacity: 1; }
+/* the graph's two groups of channels */
+.group { fill: none; stroke: var(--line); stroke-width: 1.5; }
+.group.meta { stroke-dasharray: 5 5; }
+.group-label { font-size: 13px; font-weight: 600; fill: var(--slate); }
+.edge.meta { stroke-dasharray: 4 5; }
+.node .shape.meta { fill: var(--feather); }
 .msg-del .ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .deletable:hover .msg-del, .msg-del:focus-visible { opacity: 1; }
 @media (hover: none) { .msg-del { opacity: .8; } }
