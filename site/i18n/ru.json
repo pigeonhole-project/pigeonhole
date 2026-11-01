@@ -205,7 +205,7 @@
   "js.demo.first_caption": "Это pigeonhole, работающий в вашем браузере: узел в центре, его каналы справа. Нажмите <b>Вы</b> и загрузите что-нибудь.",
   "js.demo.tg_title": "pigeonhole · {store}",
   "js.demo.tg_subs": "канал, 1 подписчик",
-  "js.demo.tg_service": "Канал создан",
+  "js.demo.channel_created": "Канал создан",
   "js.demo.tg_broadcast": "Опубликовать",
   "js.demo.dc_topic_data": "чанки объектов, файлами и текстом",
   "js.demo.dc_topic_log": "лог метаданных",
