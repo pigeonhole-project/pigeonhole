@@ -21,6 +21,8 @@ pub trait DynBlobBackend: Send + Sync + 'static {
     async fn delete(&self, keys: &[Vec<u8>]) -> Result<()>;
     /// [`BlobBackend::candidates`] over key bytes.
     async fn candidates(&self, after: Option<&[u8]>, upto: &[u8], limit: usize) -> Result<Vec<Vec<u8>>>;
+    /// [`BlobBackend::exists`].
+    async fn exists(&self, id: &BlobLocator) -> Result<bool>;
 }
 
 /// A concrete [`BlobBackend`] as a [`DynBlobBackend`].
@@ -78,6 +80,11 @@ impl<B: BlobBackend> DynBlobBackend for Erased<B> {
         let after = after.map(B::Key::from_bytes).transpose()?;
         let keys = self.inner.candidates(after, B::Key::from_bytes(upto)?, limit).await?;
         Ok(keys.into_iter().map(|k| k.to_bytes()).collect())
+    }
+
+    async fn exists(&self, id: &BlobLocator) -> Result<bool> {
+        let typed: B::Id = postcard::from_bytes(&id.locator)?;
+        self.inner.exists(&typed).await
     }
 }
 

@@ -342,6 +342,19 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
         Ok(Box::pin(stream))
     }
 
+    /// The message, read from the channel now: a text blob's bytes stay in
+    /// our cache after it was deleted.
+    async fn exists(&self, id: &Self::Id) -> Result<bool> {
+        match self.reader.locate(id.message_id, true).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.is::<NotFound>() => {
+                self.reader.locations.lock().unwrap().pop(&id.message_id);
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
         for ids in keys.chunks(IDS_PER_CALL) {
             self.reader.channel.delete_messages(ids).await?;

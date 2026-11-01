@@ -168,6 +168,7 @@ impl World {
             "kind": c.kind.as_str(),
             "scope": c.scope,
             "bots": c.bots,
+            "down": self.is_down(c),
             "place": place,
             "total": total,
             "messages": messages,

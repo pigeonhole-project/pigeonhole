@@ -185,6 +185,22 @@ pub trait BlobBackend: Send + Sync + 'static {
     /// Up to `limit` keys of our blobs in `(after, upto]`, in order: what
     /// the sweeper checks against the metadata.
     async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>>;
+
+    /// Whether blob `id` is still there, asked of the store itself (no cache
+    /// of ours may answer): what a verify pass probes. `Ok(false)` only for
+    /// a blob that is gone; a store that cannot answer is an error. The
+    /// default reads the blob.
+    async fn exists(&self, id: &Self::Id) -> Result<bool> {
+        let read = match self.get(id, None).await {
+            Ok(stream) => crate::collect_stream(stream).await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        match read {
+            Ok(()) => Ok(true),
+            Err(e) if e.is::<crate::NotFound>() => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Share one backend instance between several owners.
@@ -216,6 +232,9 @@ impl<B: BlobBackend> BlobBackend for std::sync::Arc<B> {
     }
     async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
         (**self).candidates(after, upto, limit).await
+    }
+    async fn exists(&self, id: &Self::Id) -> Result<bool> {
+        (**self).exists(id).await
     }
 }
 

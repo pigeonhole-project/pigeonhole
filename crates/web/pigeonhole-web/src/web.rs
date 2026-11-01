@@ -48,6 +48,11 @@ struct Request {
     from: Option<u64>,
     #[serde(default)]
     limit: Option<usize>,
+    /// `outage` / `wipe`: the channel's store id; `outage`: down or back.
+    #[serde(default)]
+    store: String,
+    #[serde(default)]
+    down: bool,
 }
 
 fn demo() -> String {
@@ -191,6 +196,24 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
                 out.push(world.describe(c, r.limit.unwrap_or(200)).await?);
             }
             json!({ "channels": out })
+        }
+        "outage" | "wipe" => {
+            let world = WORLD.with(Rc::clone);
+            let c = node
+                .channels
+                .iter()
+                .find(|c| c.store == r.store)
+                .ok_or_else(|| anyhow::anyhow!("no fake channel {:?}", r.store))?;
+            if r.op == "outage" {
+                world.set_down(c, r.down);
+                json!({ "down": r.down })
+            } else {
+                json!({ "deleted": world.wipe(c).await? })
+            }
+        }
+        "verify" => {
+            let (checked, gone) = node.verify(&r.store).await?;
+            json!({ "checked": checked, "gone": gone })
         }
         "repair" => {
             let s = node.repair().await?;

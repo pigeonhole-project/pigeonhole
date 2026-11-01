@@ -152,6 +152,32 @@ impl Repairer {
         Ok(n)
     }
 
+    /// Verify `instance_id`: probe each live replica it holds (its first
+    /// part) and enqueue a repair for every one that is gone. A store that
+    /// lost blobs behind our back (a cleared channel) is found without a
+    /// read happening to hit it; scrub only sees what the metadata lacks.
+    /// How many replicas it checked, and how many were gone.
+    pub async fn verify_instance(&self, instance_id: &str) -> Result<(u64, u64)> {
+        let Some(target) = self.replicated.member(instance_id).cloned() else {
+            bail!("verify: {instance_id} is not in the placement");
+        };
+        let (mut checked, mut gone) = (0u64, 0u64);
+        for chunk_id in self.db.chunks_on_instance(instance_id).await? {
+            let layouts = self.db.get_replica_layouts(chunk_id).await?;
+            let Some(layout) = layouts.iter().find(|l| l.instance == instance_id) else { continue };
+            checked += 1;
+            // A store that cannot answer fails the pass: gone is only what it says is gone.
+            let part = layout.parts.first().context("verify: a replica without parts")?;
+            if !target.exists(&part.locator).await.with_context(|| format!("verify {instance_id}"))? {
+                warn!(chunk_id, instance = instance_id, "verify: the replica is gone");
+                self.db.enqueue_repair(chunk_id, instance_id).await?;
+                gone += 1;
+            }
+        }
+        info!(instance = instance_id, checked, gone, "verified");
+        Ok((checked, gone))
+    }
+
     /// Scrub: enqueue under-replicated (chunk, member) pairs; prioritize happens at take.
     pub async fn scrub_enqueue(&self) -> Result<u64> {
         // Single-member shards have nothing to backfill; scrubbing them only
@@ -259,14 +285,13 @@ fn within_cost_budget(
     get.wait_secs <= max_wait && put.wait_secs <= max_wait
 }
 
+/// The replica's first part is in the store, asked of the store (a cache
+/// of ours could still hold a deleted text blob); any failure counts as gone.
 async fn replica_probe_ok(backend: &SharedBackend, layout: &ReplicaLayout) -> bool {
     let Some(part) = layout.parts.first() else {
         return false;
     };
-    match backend.get(&part.locator, None).await {
-        Ok(stream) => collect_stream(stream).await.is_ok(),
-        Err(_) => false,
-    }
+    backend.exists(&part.locator).await.unwrap_or(false)
 }
 
 /// Read stored block payloads from any live source replica (ChunkId unchanged).
@@ -479,10 +504,11 @@ mod tests {
         let keys: Vec<Vec<u8>> = victim.parts.iter().map(|p| p.locator.key.clone()).collect();
         a.delete(&keys).await.unwrap();
 
-        // Probe fails → enqueue + repair.
-        layer.db().enqueue_repair(chunk_id, "a").await.unwrap();
+        // Verify finds the lost replica without a read; repair puts it back.
         let repairer =
             Repairer::new(layer.db().clone(), rep.clone(), RepairConfig { scrub: false, ..RepairConfig::default() });
+        assert_eq!(repairer.verify_instance("b").await.unwrap(), (1, 0), "b is intact");
+        assert_eq!(repairer.verify_instance("a").await.unwrap(), (1, 1), "a lost its parts");
         let stats = repairer.repair_once().await.unwrap();
         assert_eq!(stats.repaired, 1);
 

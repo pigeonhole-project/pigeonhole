@@ -32,6 +32,7 @@ use s3s::dto::{PutObjectInput, StreamingBlob};
 use s3s::{S3Request, S3};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod channels;
@@ -54,6 +55,8 @@ pub struct World {
     telegram: Mutex<HashMap<(i64, String), Arc<TelegramChannel>>>,
     discord: Mutex<HashMap<(u64, String), Arc<DiscordChannel>>>,
     memory: Mutex<HashMap<String, Arc<MemoryBlobStore>>>,
+    /// Channels taken down (`kind:scope`): every bot's call fails.
+    outages: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 /// The stores a fake channel's tablet keeps itself in.
@@ -86,6 +89,47 @@ impl World {
         Ok(ch)
     }
 
+    /// The down switch of fake channel `scope`, shared by its bots.
+    fn outage(&self, kind: InstanceKind, scope: &str) -> Arc<AtomicBool> {
+        let key = format!("{}:{scope}", kind.as_str());
+        self.outages.lock().unwrap().entry(key).or_default().clone()
+    }
+
+    /// Takes channel `c` down (every call fails) or brings it back.
+    pub fn set_down(&self, c: &channels::ChannelRef, down: bool) {
+        self.outage(c.kind, &c.scope).store(down, Ordering::SeqCst);
+    }
+
+    pub fn is_down(&self, c: &channels::ChannelRef) -> bool {
+        self.outage(c.kind, &c.scope).load(Ordering::SeqCst)
+    }
+
+    /// Channel `c` loses every message (an admin cleared it); how many.
+    pub async fn wipe(&self, c: &channels::ChannelRef) -> Result<usize> {
+        use pigeonhole_storage_api::fake::FakeHost;
+        match c.kind {
+            InstanceKind::Telegram => {
+                use pigeonhole_storage_telegram::ChannelApi;
+                let ch = self.telegram(&c.scope, &c.backing).await?;
+                let ids = ch.host().read(|s: &pigeonhole_storage_telegram::fake::state::TelegramChannelState| s.ids());
+                for part in ids.chunks(100) {
+                    ch.delete_messages(part).await?;
+                }
+                Ok(ids.len())
+            }
+            InstanceKind::Discord => {
+                use pigeonhole_storage_discord::DiscordApi;
+                let ch = self.discord(&c.scope, &c.backing).await?;
+                let ids = ch.host().read(|s: &pigeonhole_storage_discord::fake::state::DiscordChannelState| s.ids());
+                for part in ids.chunks(100) {
+                    ch.delete_messages(part).await?;
+                }
+                Ok(ids.len())
+            }
+            _ => bail!("{}: not a fake channel", c.store),
+        }
+    }
+
     fn memory(&self, id: &str, info: Option<&InstanceInfo>) -> Arc<MemoryBlobStore> {
         let mut m = self.memory.lock().unwrap();
         m.entry(id.to_string())
@@ -111,7 +155,10 @@ impl World {
         let bots = (0..f.bots)
             .map(|i| {
                 let limiter = cfg.chat_limiter(InstanceKind::Telegram, &fake_bot(i), &f.scope);
-                (TelegramBot::new(channel.clone(), limiter.clone(), i), limiter)
+                (
+                    TelegramBot::new(channel.clone(), limiter.clone(), i).with_switch(self.outage(f.kind, &f.scope)),
+                    limiter,
+                )
             })
             .collect();
         let pooled = PooledChannel::new(&f.scope, bots);
@@ -131,7 +178,10 @@ impl World {
         let bots = (0..f.bots)
             .map(|i| {
                 let limiter = cfg.chat_limiter(InstanceKind::Discord, &fake_bot(i), &f.scope);
-                (DiscordBot::new(channel.clone(), limiter.clone(), i), limiter)
+                (
+                    DiscordBot::new(channel.clone(), limiter.clone(), i).with_switch(self.outage(f.kind, &f.scope)),
+                    limiter,
+                )
             })
             .collect();
         let pooled = PooledDiscord::new(&f.scope, bots);
@@ -390,6 +440,13 @@ impl Node {
     pub async fn repair(&self) -> Result<RepairStats> {
         let repairer = Repairer::new(self.store.db().clone(), self.store.replicated().clone(), RepairConfig::default());
         repairer.repair_once().await
+    }
+
+    /// Probe every copy store `id` should hold; queue a repair for each one
+    /// gone. How many it checked, and how many were gone.
+    pub async fn verify(&self, id: &str) -> Result<(u64, u64)> {
+        let repairer = Repairer::new(self.store.db().clone(), self.store.replicated().clone(), RepairConfig::default());
+        repairer.verify_instance(id).await
     }
 
     /// One sweeper pass: delete posts that no chunk points to.

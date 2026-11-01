@@ -231,6 +231,19 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
         Ok(DiscordId { message_id: m.id })
     }
 
+    /// The message, read from the channel now: a text blob's bytes stay in
+    /// our cache after it was deleted.
+    async fn exists(&self, id: &Self::Id) -> Result<bool> {
+        match self.locate(id.message_id, true).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.is::<NotFound>() => {
+                self.locations.lock().unwrap().pop(&id.message_id);
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let mid = id.message_id;
         let (url, size) = match self.locate(mid, false).await? {
