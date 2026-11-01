@@ -16,6 +16,9 @@
 
   // ------------------------------------------------------------ the worker
   const worker = new Worker(window.ASSETS + "web-worker.js");
+  // Let go of the files at once, for the next page (a reload, the other language).
+  addEventListener("pagehide", () => worker.terminate());
+  addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
   const waiting = new Map();
   let nextId = 1, queue = Promise.resolve();
   worker.onmessage = ({data}) => {

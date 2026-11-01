@@ -19,27 +19,46 @@ const enc = new TextEncoder();
 
 async function openFiles(n) {
   const handles = [];
-  for (let i = 0; i < n; i++) {
-    const fh = await dir.getFileHandle(`file-${String(opened++).padStart(5, "0")}`, {create: true});
-    handles.push(await fh.createSyncAccessHandle());
+  try {
+    for (let i = 0; i < n; i++) {
+      const fh = await dir.getFileHandle(`file-${String(opened + i).padStart(5, "0")}`, {create: true});
+      handles.push(await fh.createSyncAccessHandle());
+    }
+  } catch (e) {
+    for (const h of handles) h.close();
+    throw e;
   }
+  opened += n;
   return handles;
 }
 
+// A sync access handle is exclusive: the page just left (a reload, the
+// other language) may still hold the files for a moment. Wait for them,
+// then give up as busy (another tab); only without OPFS keep files in memory.
+const LOCK_WAIT_MS = 5000;
+
 async function openPool() {
+  let root;
   try {
-    const root = await navigator.storage.getDirectory();
+    root = await navigator.storage.getDirectory();
     dir = await root.getDirectoryHandle(POOL_DIR, {create: true});
-    let existing = 0;
-    for await (const [name] of dir.entries()) if (name.startsWith("file-")) existing++;
-    const handles = await openFiles(Math.max(existing, POOL_START));
-    persistent = true;
-    return new Pool(handles);
   } catch (e) {
-    // Another tab holds the files (sync access handles are exclusive).
-    if (e && e.name === "NoModificationAllowedError") throw new Error("busy: pigeonhole is open in another tab");
     console.warn("no OPFS, keeping files in memory:", e);
     return new Pool(Array.from({length: 256}, () => new MemoryHandle()));
+  }
+  let existing = 0;
+  for await (const [name] of dir.entries()) if (name.startsWith("file-")) existing++;
+  const deadline = performance.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      opened = 0;
+      const handles = await openFiles(Math.max(existing, POOL_START));
+      persistent = true;
+      return new Pool(handles);
+    } catch (e) {
+      if (performance.now() > deadline) throw new Error(`busy: pigeonhole is open in another tab (${e.name || e})`);
+      await new Promise(r => setTimeout(r, 100));
+    }
   }
 }
 
