@@ -695,7 +695,10 @@
   }
 
   started.then(async data => {
-    if (data.reply?.error) { $("status").textContent = t("try.error", {error: data.reply.error}); return; }
+    if (data.reply?.error) {
+      $("status").textContent = data.reply.error === "other-tab" ? t("try.other_tab") : t("try.error", {error: data.reply.error});
+      return;
+    }
     state.demo = data.reply.demo;
     state.config = data.reply.config;
     state.persistent = data.reply.persistent;

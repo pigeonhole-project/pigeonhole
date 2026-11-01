@@ -117,6 +117,7 @@
   "js.try.ready": "Ready: booted in {ms} ms.",
   "js.try.booted": "metadata tablet up (openraft, a cluster of one)",
   "js.try.error": "Failed: {error}",
+  "js.try.other_tab": "pigeonhole is open in another tab of this browser: close it, then reload this one.",
   "js.try.too_big": "Up to 64 MiB, please: it all lives in this tab's memory.",
   "js.try.read": "Read 100 KB",
   "js.try.copy": "Copy",

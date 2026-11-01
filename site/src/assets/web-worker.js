@@ -59,7 +59,7 @@ async function openPool() {
       persistent = true;
       return new Pool(handles);
     } catch (e) {
-      if (performance.now() > deadline) throw new Error(`busy: pigeonhole is open in another tab (${e.name || e})`);
+      if (performance.now() > deadline) { console.warn("the files stay locked:", e); throw new Error("other-tab"); }
       await new Promise(r => setTimeout(r, 100));
     }
   }
