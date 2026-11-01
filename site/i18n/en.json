@@ -193,5 +193,15 @@
   "js.demo.c_channels": "data channels",
   "js.demo.c_head": "log head",
   "js.demo.c_base": "last snapshot at",
-  "js.demo.first_caption": "This is pigeonhole running in your browser: the node in the middle, its channels on the right. Click <b>You</b> and upload something."
+  "js.demo.first_caption": "This is pigeonhole running in your browser: the node in the middle, its channels on the right. Click <b>You</b> and upload something.",
+  "js.demo.tg_title": "pigeonhole · {store}",
+  "js.demo.tg_subs": "channel, 1 subscriber",
+  "js.demo.tg_service": "Channel created",
+  "js.demo.tg_broadcast": "Broadcast",
+  "js.demo.dc_topic_data": "chunks of objects, as files and texts",
+  "js.demo.dc_topic_log": "the metadata log",
+  "js.demo.dc_topic_snapshots": "snapshots of the metadata",
+  "js.demo.today": "Today",
+  "js.demo.today_at": "Today at {time}",
+  "js.demo.dc_message": "Message #{store}"
 }

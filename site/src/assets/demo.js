@@ -49,6 +49,8 @@
   const graph = $("graph");
   let nodes = {}, edges = {};
   const W = 1000;
+  // A pigeon in flight, facing right: wings up from a small body, a tail.
+  const BIRD = "M-9,1 Q-6,-1 -3,0 Q-1,-9 3,-11 Q2,-4 2,-1 Q6,-2 9,0 Q6,2 2,2 Q0,4 -3,3 Q-6,3 -9,1 Z";
 
   function layout() {
     const right = state.channels;
@@ -86,10 +88,8 @@
 
     // The loft: a dovecote, the node itself.
     const loft = node("loft", pos.loft, "pigeonhole", t("demo.loft_role"));
-    s("path", {class: "shape", d: "M-95,-28 L0,-88 L95,-28 L95,62 L-95,62 Z"}, loft.g);
-    for (const x of [-45, 0, 45]) s("circle", {cx: x, cy: 8, r: 11, fill: "var(--feather)", stroke: "var(--slate)", "stroke-width": 1.5}, loft.g);
-    s("rect", {x: -70, y: 30, width: 140, height: 6, rx: 3, fill: "var(--slate-2)"}, loft.g);
-    loft.label(0, 88);
+    dovecote(loft.g);
+    loft.label(0, 100);
 
     for (const c of state.channels) {
       const app = c.kind === "telegram" ? "Telegram" : "Discord";
@@ -105,6 +105,29 @@
       tip.textContent = t("demo.messages", {n: c.messages.length});
     }
     markOpen();
+  }
+
+  // A pigeon tower: a round body narrowing upward, a cone roof with a lantern
+  // and a finial, two rows of arched entrances with perches, a plinth.
+  function dovecote(g) {
+    const line = {fill: "none", stroke: "var(--slate)", "stroke-width": 1.5, "stroke-linecap": "round"};
+    s("rect", {class: "shape", x: -78, y: 64, width: 156, height: 12, rx: 3}, g);
+    s("path", {class: "shape", d: "M-66,64 L-58,-18 L58,-18 L66,64 Z"}, g);
+    s("rect", {class: "shape", x: -70, y: -26, width: 140, height: 9, rx: 3}, g);
+    s("path", {class: "shape", d: "M-80,-26 Q-28,-64 -9,-98 L9,-98 Q28,-64 80,-26 Z"}, g);
+    s("path", {...line, d: "M-60,-38 Q0,-52 60,-38"}, g);
+    s("path", {...line, d: "M-38,-60 Q0,-72 38,-60"}, g);
+    s("rect", {class: "shape", x: -10, y: -112, width: 20, height: 15, rx: 2}, g);
+    s("path", {class: "shape", d: "M-14,-112 L0,-124 L14,-112 Z"}, g);
+    s("path", {...line, d: "M0,-124 L0,-136"}, g);
+    s("circle", {cx: 0, cy: -105, r: 3.5, fill: "var(--wing-2)"}, g);
+    // Entrances: an arch over a dark hole, a perch under it.
+    const arch = (x, y) => {
+      s("path", {d: `M${x - 10},${y + 14} L${x - 10},${y} A10,10 0 0 1 ${x + 10},${y} L${x + 10},${y + 14} Z`, fill: "var(--wing-2)", "fill-opacity": .78}, g);
+      s("path", {...line, d: `M${x - 15},${y + 18} L${x + 15},${y + 18}`}, g);
+    };
+    for (const x of [-34, 0, 34]) arch(x, -2);
+    for (const x of [-36, 0, 36]) arch(x, 34);
   }
 
   // A clickable node: a group at `p`, its name, role and a count.
@@ -137,16 +160,22 @@
     const start = flying.then(() => new Promise(r => setTimeout(r, 70)));
     flying = start;
     return start.then(() => new Promise(done => {
-      const r = 4 + Math.min(6, Math.log2(1 + size / 4096) / 2);
-      const dot = s("circle", {class: "flight", r, fill: "url(#iris)"}, graph);
-      const len = path.getTotalLength(), t0 = performance.now(), dur = 620;
-      flights.push(dot);
+      // A small pigeon, wings beating; bigger for bigger payloads.
+      const scale = 0.9 + Math.min(1, Math.log2(1 + size / 4096) / 10);
+      const bird = s("g", {class: "flight"}, graph);
+      const body = s("path", {fill: "url(#iris)", d: BIRD}, bird);
+      const len = path.getTotalLength(), t0 = performance.now(), dur = 680;
+      flights.push(bird);
       const step = now => {
         const k = Math.min(1, (now - t0) / dur), e = k < .5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
-        const pt = path.getPointAtLength(len * (back ? 1 - e : e));
-        dot.setAttribute("cx", pt.x); dot.setAttribute("cy", pt.y);
+        const at = len * (back ? 1 - e : e);
+        const pt = path.getPointAtLength(at), ahead = path.getPointAtLength(Math.min(len, Math.max(0, at + (back ? -1 : 1))));
+        const flip = ahead.x < pt.x ? -1 : 1;
+        const flap = 0.55 + 0.45 * Math.abs(Math.sin((now - t0) / 55));
+        bird.setAttribute("transform", `translate(${pt.x},${pt.y}) scale(${flip * scale},${scale})`);
+        body.setAttribute("transform", `scale(1,${flap})`);
         if (k < 1) requestAnimationFrame(step);
-        else { dot.remove(); done(); }
+        else { bird.remove(); done(); }
       };
       requestAnimationFrame(step);
     }));
@@ -170,7 +199,7 @@
       if (msg === "fake channel: text") preview = f.preview;
       else if (msg === "posted" && stores[f.store]) {
         const c = stores[f.store];
-        const m = {id: f.message_id, kind: f.kind, name: f.name, size: +f.bytes, preview: f.kind === "text" ? preview : undefined, fresh: true};
+        const m = {id: f.message_id, kind: f.kind, name: f.name, size: +f.bytes, preview: f.kind === "text" ? preview : undefined, fresh: true, at: new Date()};
         preview = null;
         c.messages.push(m);
         fly(f.store, false, m.size).then(() => { bump(f.store); refreshCount(c); if (state.open === f.store) renderPanel(); });
@@ -305,31 +334,111 @@
     }
   }
 
-  // A channel as its app shows it.
-  function feed(c) {
-    const box = h("div", `feed ${c.kind}`);
-    const live = c.messages.slice(-200);
-    if (!live.length) box.append(h("p", "empty", t("demo.no_messages")));
-    for (const m of live) {
-      const el = h("div", "msg" + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : ""));
-      const id = String(m.id).length > 8 ? `…${String(m.id).slice(-6)}` : String(m.id);
-      if (m.kind === "text") {
-        el.append(h("div", "cjk", m.preview ? `${m.preview}…` : m.name));
-        el.append(h("div", "meta", t("demo.text_meta", {name: m.name, size: bytes(m.size), id})));
-      } else if (m.kind === "other") {
-        el.append(h("div", "meta", t("demo.other_meta", {id})));
-      } else {
-        const row = h("div", "file");
-        row.append(h("div", "glyph", "⬇"));
-        const col = h("div");
-        col.append(h("div", "fname", m.name), h("div", "meta", t("demo.file_meta", {size: bytes(m.size), id})));
-        row.append(col);
-        el.append(row);
-      }
-      box.append(el);
+  // A channel as its app shows it: Telegram's channel view, Discord's text channel.
+  const DISCORD_EPOCH = 1420070400000n;
+  const hhmm = d => d.toLocaleTimeString(window.LANG, {hour: "2-digit", minute: "2-digit"});
+  function when(c, m) {
+    if (c.kind === "discord") {
+      try { return new Date(Number((BigInt(m.id) >> 22n) + DISCORD_EPOCH)); } catch { return null; }
     }
-    requestAnimationFrame(() => { box.scrollIntoView({block: "end"}); });
-    return box;
+    return m.at || null;
+  }
+  const svgIcon = (d, cls) => {
+    const sv = document.createElementNS(svgNS, "svg");
+    sv.setAttribute("viewBox", "0 0 24 24");
+    sv.setAttribute("class", cls);
+    sv.setAttribute("aria-hidden", "true");
+    const p = document.createElementNS(svgNS, "path");
+    p.setAttribute("d", d);
+    sv.append(p);
+    return sv;
+  };
+  const ICON_DOWN = "M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5M6 19h12";
+  const ICON_DOC = "M7 3h7l5 5v13H7z M14 3v5h5";
+  const ICON_EYE = "M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12zm10 3a3 3 0 100-6 3 3 0 000 6z";
+  const payload = m => (m.kind === "text" ? `${m.name} ${m.size}\n${m.preview || ""}…` : "");
+
+  function feed(c) {
+    return c.kind === "telegram" ? telegramView(c) : discordView(c);
+  }
+
+  function telegramView(c) {
+    const app = h("div", "app tg");
+    const head = h("div", "tg-head");
+    const ava = h("div", "tg-ava", "PB");
+    const who = h("div");
+    who.append(h("b", "", t("demo.tg_title", {store: c.store})), h("small", "", t("demo.tg_subs")));
+    head.append(ava, who);
+    const chat = h("div", "tg-chat");
+    const live = c.messages.slice(-200);
+    if (!live.length) chat.append(h("p", "tg-empty", t("demo.no_messages")));
+    else chat.append(h("div", "tg-day", t("demo.today")));
+    for (const m of live) {
+      const b = h("div", "tg-post" + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : ""));
+      if (m.kind === "text") b.append(h("div", "tg-text cjk", payload(m)));
+      else if (m.kind === "other") b.append(h("div", "tg-text", t("demo.tg_service")));
+      else {
+        const doc = h("div", "tg-doc");
+        const ic = h("div", "tg-doc-ic");
+        ic.append(svgIcon(ICON_DOWN, "ic"));
+        const col = h("div");
+        col.append(h("div", "tg-doc-name", m.name), h("div", "tg-doc-size", bytes(m.size)));
+        doc.append(ic, col);
+        b.append(doc);
+      }
+      const foot = h("div", "tg-meta");
+      foot.append(svgIcon(ICON_EYE, "eye"), document.createTextNode("1"));
+      const at = when(c, m);
+      if (at) foot.append(document.createTextNode(` ${hhmm(at)}`));
+      b.append(foot);
+      chat.append(b);
+    }
+    const input = h("div", "tg-input", t("demo.tg_broadcast"));
+    app.append(head, chat, input);
+    requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+    return app;
+  }
+
+  function discordView(c) {
+    const app = h("div", "app dc");
+    const head = h("div", "dc-head");
+    head.append(h("span", "dc-hash", "#"), h("b", "", c.store), h("span", "dc-topic", t(`demo.dc_topic_${c.role}`)));
+    const chat = h("div", "dc-chat");
+    const live = c.messages.slice(-200);
+    if (!live.length) chat.append(h("p", "dc-empty", t("demo.no_messages")));
+    else chat.append(h("div", "dc-day", t("demo.today")));
+    let last = null;
+    for (const m of live) {
+      const at = when(c, m);
+      // Discord groups a run of messages by one author within minutes.
+      const grouped = last && at && last - at > -7 * 60 * 1000;
+      const row = h("div", "dc-msg" + (grouped ? " grouped" : "") + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : ""));
+      if (!grouped) {
+        row.append(h("div", "dc-ava", "🐦"));
+        const top = h("div", "dc-top");
+        top.append(h("span", "dc-name", "pigeonhole"), h("span", "dc-tag", "APP"));
+        if (at) top.append(h("span", "dc-time", t("demo.today_at", {time: hhmm(at)})));
+        row.append(top);
+      }
+      const body = h("div", "dc-body");
+      if (m.kind === "text") body.append(h("div", "dc-text cjk", payload(m)));
+      else if (m.kind === "other") body.append(h("div", "dc-text", t("demo.tg_service")));
+      else {
+        const card = h("div", "dc-file");
+        card.append(svgIcon(ICON_DOC, "doc"));
+        const col = h("div");
+        col.append(h("div", "dc-file-name", m.name), h("div", "dc-file-size", bytes(m.size)));
+        card.append(col);
+        body.append(card);
+      }
+      row.append(body);
+      chat.append(row);
+      last = at;
+    }
+    const input = h("div", "dc-input", t("demo.dc_message", {store: c.store}));
+    app.append(head, chat, input);
+    requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+    return app;
   }
 
   // The log: entries, each opening into its commands.
