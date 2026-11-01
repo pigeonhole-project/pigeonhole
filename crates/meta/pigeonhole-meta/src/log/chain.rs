@@ -153,6 +153,32 @@ impl<Id: Serialize + for<'de> Deserialize<'de>> ChainDoc<Id> {
     }
 }
 
+/// What one blob of a chain log holds, for tools that show a log as its
+/// store keeps it (the site's log inspector).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobSummary {
+    pub gen: u64,
+    /// The generation's claim (its batch is empty).
+    pub claim: bool,
+    /// The first position of the batch, and how many entries it holds.
+    pub first: Position,
+    pub entries: usize,
+    /// The base (snapshot) the log starts from as of this blob.
+    pub base: Option<Position>,
+}
+
+/// [`BlobSummary`] of a chain log blob whose store names blobs by `Id`.
+pub fn summarize<Id: Serialize + for<'de> Deserialize<'de>>(data: &[u8]) -> LogResult<BlobSummary> {
+    let doc = ChainDoc::<Id>::decode(data)?;
+    Ok(BlobSummary {
+        gen: doc.gen,
+        claim: doc.claim,
+        first: doc.batch.first,
+        entries: doc.batch.entries.len(),
+        base: doc.base.map(|b| b.at),
+    })
+}
+
 impl<Id> ChainDoc<Id> {
     fn head_position(&self) -> Position {
         self.batch.first - 1 + self.batch.entries.len() as u64

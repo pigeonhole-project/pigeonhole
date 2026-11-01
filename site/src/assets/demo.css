@@ -297,3 +297,11 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .dc-file-size { color: var(--dc-muted); font-size: 12px; }
 .dc-input { margin: 0 16px 16px; padding: 11px 16px; border-radius: 8px; background: var(--dc-input); color: var(--dc-muted); font-size: 16px; }
 .tg-day { align-self: center; padding: 2px 10px; border-radius: 12px; background: rgba(0,0,0,.22); color: #fff; font-size: 13px; font-weight: 500; margin: 4px 0; }
+
+/* the log's two views */
+.tabs { display: inline-flex; gap: 2px; padding: 3px; border-radius: 10px; background: var(--feather); border: 1px solid var(--line); margin-bottom: 14px; }
+.tab { border: 0; background: none; padding: 6px 14px; border-radius: 7px; cursor: pointer; font-size: 14px; color: var(--wing-2); }
+.tab[aria-selected="true"] { background: var(--plume); color: var(--wing); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.post-log { margin-top: 4px; font-size: 12.5px; color: var(--teal); font-weight: 500; }
+.app .service { opacity: .62; }
+.log-note { color: var(--slate); font-size: 13.5px; margin: 0 0 12px; max-width: 70ch; }

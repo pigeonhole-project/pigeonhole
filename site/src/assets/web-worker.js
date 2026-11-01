@@ -14,7 +14,7 @@ const POOL_START = 64;   // files opened at start
 const POOL_LOW = 24;     // fewer free than this after a call: open POOL_MORE
 const POOL_MORE = 32;
 
-let wasi, exports, pool, dir = null, opened = 0, persistent = false;
+let wasi, exports, pool, dir = null, opened = 0, persistent = false, inFlight = false;
 const enc = new TextEncoder();
 
 async function openFiles(n) {
@@ -76,7 +76,28 @@ const ready = (async () => {
   postMessage({id: 0, ...out});
 })().catch(e => postMessage({id: 0, reply: {error: String(e.message || e)}, events: []}));
 
+// Between calls nothing runs on this thread: once a second, while idle, let
+// the node's background work go on (a snapshot being built, timers) and pass
+// on what it logged ({id: -1, events}).
+const TICK_MS = 1000;
+setInterval(() => {
+  if (inFlight || !exports?.ph_tick) return;
+  wasi.setStdin(new Uint8Array(0));
+  exports.ph_tick();
+  const events = wasi.takeLines().map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  if (events.length) postMessage({id: -1, events});
+}, TICK_MS);
+
 onmessage = async ({data}) => {
+  inFlight = true;
+  try {
+    await handle(data);
+  } finally {
+    inFlight = false;
+  }
+};
+
+async function handle(data) {
   await ready;
   const {id, body, ...request} = data;
   if (request.op === "reset") {
@@ -92,4 +113,4 @@ onmessage = async ({data}) => {
   }
   // More files for the next calls, while nothing runs.
   if (persistent && pool.free() < POOL_LOW) pool.add(await openFiles(POOL_MORE));
-};
+}

@@ -26,6 +26,28 @@ if (mode === "smoke") {
   const { wasi, exports } = await instance("/tmp", { TMPDIR: "/tmp" });
   exports._start();
   console.error(wasi.takeLines().filter(l => !l.startsWith("{")).join("\n"));
+} else if (mode === "snapshot") {
+  // The demo snapshots every 50 entries: 60 puts, then the log's base.
+  const enc = new TextEncoder();
+  const m = await instance("/data");
+  const call = (request, body = new Uint8Array(0)) => {
+    const head = enc.encode(JSON.stringify({ ...request, len: body.length }) + "\n");
+    const input = new Uint8Array(head.length + body.length);
+    input.set(head);
+    input.set(body, head.length);
+    m.wasi.setStdin(input);
+    m.exports.ph_call();
+    const reply = m.wasi.takeLines().map(l => JSON.parse(l)).find(l => "reply" in l).reply;
+    if (reply.error) throw new Error(reply.error);
+    return reply;
+  };
+  m.exports.ph_open();
+  m.wasi.takeLines();
+  call({ op: "open", config: await readFile(here + "pigeonhole-web/demo.toml", "utf8") });
+  for (let i = 0; i < 60; i++) call({ op: "put", key: `k${i}` }, new Uint8Array(2000).fill(i));
+  const log = call({ op: "log", limit: 3 });
+  const snaps = call({ op: "channels" }).channels.find(c => c.role === "snapshots");
+  console.error(`head ${log.head}, base ${JSON.stringify(log.base)}, snapshot channel ${snaps.messages.map(x => x.name).join(" ")}`);
 } else if (mode === "reload") {
   const enc = new TextEncoder();
   const call = (m, request, body = new Uint8Array(0)) => {

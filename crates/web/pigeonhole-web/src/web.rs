@@ -93,6 +93,16 @@ pub extern "C" fn ph_open() -> i32 {
     ))
 }
 
+/// Lets the node's background work run for a moment (a snapshot being
+/// built, timers): between calls nothing else runs on this thread. The
+/// worker calls it while idle; what it logged goes to stdout as usual.
+#[allow(unsafe_code)] // `no_mangle` only: exported to JS, no unsafe code.
+#[no_mangle]
+pub extern "C" fn ph_tick() -> i32 {
+    RT.with(|rt| rt.block_on(tokio::time::sleep(std::time::Duration::from_millis(15))));
+    0
+}
+
 /// Runs one request read from stdin.
 #[allow(unsafe_code)] // `no_mangle` only: exported to JS, no unsafe code.
 #[no_mangle]

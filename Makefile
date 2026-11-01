@@ -22,6 +22,7 @@ web-smoke: web
 	node --no-warnings crates/web/run-wasi.mjs target/wasm32-wasip1/release/pigeonhole-web.wasm >/dev/null
 	node --no-warnings crates/web/run-shim.mjs smoke target/wasm32-wasip1/release/pigeonhole-web.wasm 2>&1 | grep -q "smoke ok"
 	node --no-warnings crates/web/run-shim.mjs reload target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep "reload"
+	node --no-warnings crates/web/run-shim.mjs snapshot target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep 'base {"at":50'
 
 # Curated ceph/s3-tests (see compat/known-good.txt)
 compat:

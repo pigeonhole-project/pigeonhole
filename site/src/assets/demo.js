@@ -19,6 +19,7 @@
   const waiting = new Map();
   let nextId = 1, queue = Promise.resolve();
   worker.onmessage = ({data}) => {
+    if (data.id === -1) { background(data.events); return; }
     const done = waiting.get(data.id);
     waiting.delete(data.id);
     if (done) done(data);
@@ -41,9 +42,12 @@
     objects: [],
     log: null,             // {head, base, entries}
     open: null,            // the node whose panel is open
+    logView: "readable",   // the log panel: "readable" or "channel"
     busy: false,
   };
   const byStore = () => Object.fromEntries(state.channels.map(c => [c.store, c]));
+  // The open panel is the log's (it opens by the log channel's id).
+  const logOpen = () => byStore()[state.open]?.role === "log";
 
   // ------------------------------------------------------------ the graph
   const graph = $("graph");
@@ -203,6 +207,8 @@
         const m = {id: f.message_id, kind: f.kind, name: f.name, size: +f.bytes, preview: f.kind === "text" ? preview : undefined, fresh: true, at: new Date()};
         preview = null;
         c.messages.push(m);
+        const at = c.role === "snapshots" && /-(\d+)\.snap/.exec(m.name || "");
+        if (at) said.push({op: "Snapshot", at: +at[1]});
         fly(f.store, false, m.size).then(() => { bump(f.store); refreshCount(c); if (state.open === f.store) renderPanel(); });
       } else if (msg === "deleted" && stores[f.store]) {
         const ids = String(f.messages || "").match(/\d+/g) || [];
@@ -237,10 +243,23 @@
     }
     if (op.op === "CopyObject") return t("say.CopyObject", {key, chunks: t("chunks", {n: +op.extents})});
     if (op.op === "DeleteObject") return t("say.DeleteObject", {key});
+    if (op.op === "Snapshot") return t("say.snapshot", {at: op.at});
     return "";
   }
   function caption(html) {
     $("caption").innerHTML = html || "";        // our own strings; data in them is escaped
+  }
+
+  // What the node did on its own between calls (a snapshot, as a server does).
+  async function background(events) {
+    const said = apply(events);
+    const snap = said.find(x => x.op === "Snapshot");
+    if (snap) caption(t("say.snapshot", {at: snap.at}));
+    await flying;
+    if (snap && (state.open === "loft" || logOpen())) {
+      await loadLog();
+      renderPanel();
+    }
   }
 
   // ------------------------------------------------------------ calls
@@ -253,7 +272,7 @@
     else if (said.length) caption(sentence(said.at(-1)));
     await flying;
     await refreshObjects();
-    if (state.open === "log") await loadLog();
+    if (logOpen() || state.open === "loft") await loadLog();
     setBusy(false);
     return data.reply;
   }
@@ -272,9 +291,15 @@
   }
 
   async function loadLog() {
-    const {reply} = await call({op: "log", limit: 200});
+    const [{reply}, ch] = [await call({op: "log", limit: 200}), await call({op: "channels"})];
+    if (ch.reply?.channels) {
+      // Keep the live messages' flags; take the decoded log posts.
+      const fresh = byStore();
+      state.channels = ch.reply.channels.map(c => ({...c, messages: c.messages.map(m => ({...m, gone: false}))}));
+      for (const c of state.channels) if (fresh[c.store] && nodes[c.store]) refreshCount(c);
+    }
     state.log = reply;
-    if (state.open === "log") renderPanel();
+    if (logOpen()) renderPanel();
   }
 
   function setBusy(on) {
@@ -359,6 +384,16 @@
   const ICON_EYE = "M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12zm10 3a3 3 0 100-6 3 3 0 000 6z";
   const payload = m => (m.kind === "text" ? `${m.name} ${m.size}\n${m.preview || ""}…` : "");
 
+  // What a post of the log's channel is to the log.
+  function logLabel(l) {
+    if (!l) return null;
+    if (l.what === "batch" && l.first != null) {
+      return l.first === l.last ? t("demo.post_entry", {gen: l.gen, n: l.first}) : t("demo.post_batch", {gen: l.gen, first: l.first, last: l.last});
+    }
+    return t(`demo.post_${l.what}`, {gen: l.gen ?? "", label: l.label ?? ""});
+  }
+  const service = m => m.log && m.log.what !== "batch";
+
   function feed(c) {
     return c.kind === "telegram" ? telegramView(c) : discordView(c);
   }
@@ -375,7 +410,7 @@
     if (!live.length) chat.append(h("p", "tg-empty", t("demo.no_messages")));
     else chat.append(h("div", "tg-day", t("demo.today")));
     for (const m of live) {
-      const b = h("div", "tg-post" + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : ""));
+      const b = h("div", "tg-post" + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : "") + (service(m) ? " service" : ""));
       if (m.kind === "text") b.append(h("div", "tg-text cjk", payload(m)));
       else if (m.kind === "other") b.append(h("div", "tg-text", t("demo.tg_service")));
       else {
@@ -387,6 +422,7 @@
         doc.append(ic, col);
         b.append(doc);
       }
+      if (m.log) b.append(h("div", "post-log", logLabel(m.log)));
       const foot = h("div", "tg-meta");
       foot.append(svgIcon(ICON_EYE, "eye"), document.createTextNode("1"));
       const at = when(c, m);
@@ -413,7 +449,7 @@
       const at = when(c, m);
       // Discord groups a run of messages by one author within minutes.
       const grouped = last && at && last - at > -7 * 60 * 1000;
-      const row = h("div", "dc-msg" + (grouped ? " grouped" : "") + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : ""));
+      const row = h("div", "dc-msg" + (grouped ? " grouped" : "") + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : "") + (service(m) ? " service" : ""));
       if (!grouped) {
         row.append(h("div", "dc-ava", "🐦"));
         const top = h("div", "dc-top");
@@ -432,6 +468,7 @@
         card.append(col);
         body.append(card);
       }
+      if (m.log) body.append(h("div", "post-log", logLabel(m.log)));
       row.append(body);
       chat.append(row);
       last = at;
@@ -463,6 +500,30 @@
   function renderLog(body) {
     const v = state.log;
     body.replaceChildren();
+    // Two views of one log: its entries decoded, or the channel's posts.
+    const tabs = h("div", "tabs");
+    tabs.setAttribute("role", "tablist");
+    for (const view of ["readable", "channel"]) {
+      const b = h("button", "tab", t(`demo.log_view_${view}`));
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      b.setAttribute("aria-selected", String(state.logView === view));
+      b.addEventListener("click", () => { state.logView = view; renderPanel(); });
+      tabs.append(b);
+    }
+    body.append(tabs);
+    body.append(h("p", "log-note", t("demo.log_note")));
+    const logChannel = state.channels.find(x => x.role === "log");
+    if (state.logView === "channel") {
+      if (logChannel) body.append(feed(logChannel));
+      return;
+    }
+    // Position → the post holding it.
+    const postOf = new Map();
+    for (const m of logChannel?.messages || []) {
+      const l = m.log;
+      if (l?.what === "batch" && l.first != null) for (let p = l.first; p <= l.last; p++) postOf.set(p, m.id);
+    }
     if (!v) { body.append(h("p", "empty", t("try.loading"))); return; }
     const head = h("div", "log-head");
     head.append(h("span", "", t("demo.log_head", {n: v.head})));
@@ -477,7 +538,9 @@
       const what = e.kind === "commands"
         ? e.commands.map(c => `${c.namespace} ${summary(c).verb}`).join("; ")
         : t(`demo.entry_${e.kind}`);
-      btn.append(h("span", "pos", String(e.position)), h("span", "what", what), h("span", "term", t("demo.term", {n: e.term})));
+      const post = postOf.get(e.position);
+      const where = post != null ? t("demo.in_post", {id: String(post).length > 8 ? `…${String(post).slice(-6)}` : post}) : t("demo.term", {n: e.term});
+      btn.append(h("span", "pos", String(e.position)), h("span", "what", what), h("span", "term", where));
       li.append(btn);
       const cmds = h("ul", "cmds");
       cmds.hidden = true;
@@ -521,13 +584,20 @@
       for (const f of e.dataTransfer.files) if (f.size <= 64 << 20) await put(f.name, await f.arrayBuffer());
     });
     for (const b of document.querySelectorAll("[data-sample]")) b.addEventListener("click", () => {
+      // A new object each time: photo-1.jpg, photo-2.jpg… (an upload under
+      // a name already there overwrites it, as S3 does).
+      const fresh = (base, ext) => {
+        let i = 1;
+        while (state.objects.some(([k]) => k === `${base}-${i}${ext}`)) i++;
+        return `${base}-${i}${ext}`;
+      };
       if (b.dataset.sample === "photo") {
         const buf = new Uint8Array(7 << 20);
         for (let i = 0; i < buf.length; i += 65536) crypto.getRandomValues(buf.subarray(i, i + 65536));
-        put("photo.jpg", buf.buffer);
+        put(fresh("photo", ".jpg"), buf.buffer);
       } else {
         const text = t("demo.sample_text") + "\n";
-        put("notes.md", new TextEncoder().encode(text.repeat(Math.ceil((3 << 20) / text.length))).buffer);
+        put(fresh("notes", ".md"), new TextEncoder().encode(text.repeat(Math.ceil((3 << 20) / text.length))).buffer);
       }
     });
   }

@@ -203,5 +203,16 @@
   "js.demo.dc_topic_snapshots": "snapshots of the metadata",
   "js.demo.today": "Today",
   "js.demo.today_at": "Today at {time}",
-  "js.demo.dc_message": "Message #{store}"
+  "js.demo.dc_message": "Message #{store}",
+  "js.demo.log_view_readable": "Readable",
+  "js.demo.log_view_channel": "As in the channel",
+  "js.say.snapshot": "The node took a snapshot of its state at position <b>{at}</b> and posted it to the snapshots channel. A boot now loads it and replays only what came after.",
+  "js.demo.post_batch": "a batch of generation {gen}: entries {first}–{last}",
+  "js.demo.post_entry": "a batch of generation {gen}: entry {n}",
+  "js.demo.post_barrier": "generation {gen} confirms it holds the log (no entries)",
+  "js.demo.post_claim": "generation {gen} claims the log",
+  "js.demo.post_probe": "a probe: where does the channel end",
+  "js.demo.post_other": "{label}",
+  "js.demo.in_post": "post {id}",
+  "js.demo.log_note": "An entry is one change of state; a post is a message in the channel. A batch post holds one or more entries; probes and claims are how the node finds the log's end and takes it over, so the counts differ. Entries before the snapshot are folded into it."
 }
