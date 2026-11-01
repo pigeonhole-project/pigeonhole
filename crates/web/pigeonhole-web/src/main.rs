@@ -69,6 +69,14 @@ fn main() -> anyhow::Result<()> {
         if std::env::var("SMOKE_SHOW_LOG").is_ok() {
             eprintln!("{}", serde_json::to_string_pretty(&view)?);
         }
+        // What the channels hold, as a page draws them after a reload.
+        for c in &node.channels {
+            let v = world.describe(c, 50).await?;
+            anyhow::ensure!(v["messages"].as_array().is_some_and(|m| !m.is_empty()), "channel {}: empty", c.store);
+            if std::env::var("SMOKE_SHOW_LOG").is_ok() {
+                eprintln!("{} ({}): {}", c.store, c.role, v["messages"].as_array().map_or(0, Vec::len));
+            }
+        }
         node.copy("demo", "photo.jpg", "photo-copy.jpg").await?;
         node.delete("demo", "photo.jpg").await?;
 

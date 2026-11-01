@@ -201,6 +201,11 @@ impl DiscordChannelState {
         Ok(self.messages.get(&id).and_then(|m| m.file.as_ref()))
     }
 
+    /// Every message, by id.
+    pub fn messages(&self) -> impl Iterator<Item = (u64, &Message)> {
+        self.messages.iter().map(|(id, m)| (*id, m))
+    }
+
     pub fn ids(&self) -> Vec<u64> {
         self.messages.keys().copied().collect()
     }

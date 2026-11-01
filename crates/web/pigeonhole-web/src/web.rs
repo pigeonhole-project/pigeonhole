@@ -173,6 +173,14 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
         }
         "list" => json!({ "objects": node.list(&r.bucket).await? }),
         "log" => node.log_entries(r.from, r.limit.unwrap_or(200)).await?,
+        "channels" => {
+            let world = WORLD.with(Rc::clone);
+            let mut out = Vec::new();
+            for c in &node.channels {
+                out.push(world.describe(c, r.limit.unwrap_or(200)).await?);
+            }
+            json!({ "channels": out })
+        }
         "repair" => {
             let s = node.repair().await?;
             json!({ "repaired": s.repaired, "failed": s.failed, "queued": s.scrub_enqueued })

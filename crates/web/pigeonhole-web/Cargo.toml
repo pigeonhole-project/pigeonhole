@@ -21,6 +21,7 @@ pigeonhole-config = { workspace = true, features = ["discord", "fake"] }
 pigeonhole-fake-channels = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-meta = { workspace = true }
+pigeonhole-storage-api = { workspace = true, features = ["fake"] }
 pigeonhole-storage-discord = { workspace = true, features = ["fake"] }
 pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }

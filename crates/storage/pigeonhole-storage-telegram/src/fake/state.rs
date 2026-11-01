@@ -146,6 +146,11 @@ impl TelegramChannelState {
         })
     }
 
+    /// Every message, by id.
+    pub fn messages(&self) -> impl Iterator<Item = (i64, &Message)> {
+        self.messages.iter().map(|(id, m)| (*id, m))
+    }
+
     pub fn ids(&self) -> Vec<i64> {
         self.messages.keys().copied().collect()
     }

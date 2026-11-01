@@ -2960,6 +2960,7 @@ dependencies = [
  "pigeonhole-fake-channels",
  "pigeonhole-gateway-s3",
  "pigeonhole-meta",
+ "pigeonhole-storage-api",
  "pigeonhole-storage-discord",
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",

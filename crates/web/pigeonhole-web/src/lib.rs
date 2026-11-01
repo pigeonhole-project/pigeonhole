@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+pub mod channels;
 mod log_view;
 #[cfg(target_family = "wasm")]
 mod web;
@@ -121,6 +122,8 @@ impl World {
 }
 
 pub struct Node {
+    /// The fake channels the config uses, data, log and snapshots.
+    pub channels: Vec<channels::ChannelRef>,
     /// The store the node's metadata log lives in (read by the inspector).
     pub log: Arc<dyn LogStore>,
     pub meta: Arc<MetaStore>,
@@ -278,7 +281,7 @@ impl Node {
         }
         let store = Arc::new(store);
         let s3 = S3Gateway::new(cfg.s3_options(), Index::open(meta.clone()).await?, store.clone());
-        Ok(Self { log, meta, store, s3 })
+        Ok(Self { channels: channels::of(cfg), log, meta, store, s3 })
     }
 
     /// The log's entries as they lie in its store, commands decoded: the last
