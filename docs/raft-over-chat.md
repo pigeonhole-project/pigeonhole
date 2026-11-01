@@ -330,8 +330,12 @@ Between two nodes:
 - a config error otherwise.
 
 `openraft-grpc` carries the same frames as the chat: postcard, sealed with
-the cluster's key. Each call is one unary RPC holding one envelope.
-`openraft_grpc::Mixed` is the node's network factory. It hands openraft a
+the cluster's key. Each call is one unary RPC holding one envelope. The
+crate also has `Direct`, the same link in memory: a call goes straight to
+the peer's `Raft`, with an optional delay and cut-off nodes. It is for
+tests, the simulation, and the in-browser demo, where no socket opens:
+`default-features = false` drops tonic (feature `transport`) and builds
+for wasm. `openraft_grpc::Mixed` is the node's network factory. It hands openraft a
 gRPC client for some peers and a chat client for the others. Every node
 serves both: a gRPC server on its address, and its peers' outboxes it
 reads. Either way requests reach the same `Raft`.
