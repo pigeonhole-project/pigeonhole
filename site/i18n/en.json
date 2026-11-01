@@ -367,5 +367,9 @@
   "js.bg.waiting": {
     "one": "{n} job waits",
     "other": "{n} jobs wait"
+  },
+  "js.bg.entries_since": {
+    "one": "{n} entry since the last snapshot",
+    "other": "{n} entries since the last snapshot"
   }
 }

@@ -188,7 +188,7 @@
   function workOf(task) {
     if (task.task === "snapshot") {
       const sn = state.bg.snapshot;
-      return sn.every ? {n: sn.head - sn.base, of: sn.every} : {n: 0};
+      return {n: Math.max(0, sn.head - sn.base), of: sn.every || undefined};
     }
     return {n: task.work.length};
   }
@@ -219,13 +219,14 @@
       const h = Math.round(24 * lit);
       win.light.setAttribute("y", String(win.w.y + 14 - h));
       win.light.setAttribute("height", String(h));
-      const busy = !w.of && w.n > 0;
+      // Work waits: jobs in a queue; for the snapshot, entries after the last one.
+      const busy = w.n > 0;
       win.count.textContent = w.n > 99 ? "99+" : String(w.n);
       win.g.classList.toggle("off", !period);
       win.g.classList.toggle("busy", busy);
       const name = t(`bg.${task.task}`);
       const when = period ? t("bg.tip", {task: name, s: Math.ceil((task.next_in_ms || 0) / 1000)}) : t("bg.tip_off", {task: name});
-      win.tip.textContent = w.of ? `${when}; ${t("bg.entries_short", {n: w.n, of: w.of})}` : busy ? `${when}; ${t("bg.waiting", {n: w.n})}` : when;
+      win.tip.textContent = task.task === "snapshot" ? `${when}; ${t(w.of ? "bg.entries_short" : "bg.entries_since", {n: w.n, of: w.of})}` : busy ? `${when}; ${t("bg.waiting", {n: w.n})}` : when;
     }
     if (state.open === "loft") renderBgPanel();
   }
