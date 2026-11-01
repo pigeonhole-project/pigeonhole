@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package openraft_grpc;
+
+// One Raft RPC: the request and its response are each one frame of
+// openraft-chat (postcard, sealed with the cluster's key) holding one
+// envelope.
+service Raft {
+  rpc Call(Sealed) returns (Sealed);
+}
+
+message Sealed {
+  bytes frame = 1;
+}

@@ -1,0 +1,26 @@
+[package]
+name = "openraft-grpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "openraft's network over gRPC (frames of openraft-chat, one call each), and a network mixing two transports by peer"
+
+[dependencies]
+anyhow = { workspace = true }
+openraft = { workspace = true }
+openraft-chat = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true }
+tonic-build = { workspace = true }
+
+[lints]
+workspace = true
