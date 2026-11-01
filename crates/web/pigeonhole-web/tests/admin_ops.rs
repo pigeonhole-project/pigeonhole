@@ -23,7 +23,10 @@ async fn the_ui_ops_run_on_a_node() {
     assert_eq!(op(&node, r#"{"op":"buckets"}"#, b"").await["buckets"], serde_json::json!(["photos"]));
     let info = op(&node, r#"{"op":"info"}"#, b"").await;
     assert_eq!(info["buckets"], serde_json::json!(["photos"]));
-    assert_eq!(op(&node, r#"{"op":"list","bucket":"photos"}"#, b"").await["objects"], serde_json::json!([["a.txt", 5000]]));
+    assert_eq!(
+        op(&node, r#"{"op":"list","bucket":"photos"}"#, b"").await["objects"],
+        serde_json::json!([["a.txt", 5000]])
+    );
     assert_eq!(op(&node, r#"{"op":"get","bucket":"photos","key":"a.txt","range":[0,99]}"#, b"").await["len"], 100);
 
     let bg = op(&node, r#"{"op":"background"}"#, b"").await;
