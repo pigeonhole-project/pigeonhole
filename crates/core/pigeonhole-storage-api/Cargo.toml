@@ -18,5 +18,9 @@ pigeonhole-types = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+postcard = { workspace = true }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true
