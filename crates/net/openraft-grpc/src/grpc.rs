@@ -77,9 +77,12 @@ impl<C: RaftTypeConfig> GrpcClient<C> {
     async fn call(&self, body: Body<C>, ttl: Duration) -> Result<Body<C>, Failure> {
         let channel = self.channel.clone().ok_or_else(|| Failure::Unreachable("no address".into()))?;
         let id = &self.id;
+        let kind = body.kind();
         let envelopes = vec![Envelope { to: self.target.clone(), rpc: 0, body }];
         let frame = Frame { version: FRAME_VERSION, cluster: id.cluster, from: id.me.clone(), seq: 0, envelopes };
         let request = pb::Sealed { frame: seal(&frame, &id.key).to_vec() };
+        let (me, to, bytes) = (&id.me, &self.target, request.frame.len());
+        tracing::debug!(node = %me, %to, kind, reply = false, via = "grpc", bytes, "raft frame sent");
         let mut client = pb::raft_client::RaftClient::new(channel)
             .max_decoding_message_size(MAX_MESSAGE)
             .max_encoding_message_size(MAX_MESSAGE);
@@ -93,6 +96,7 @@ impl<C: RaftTypeConfig> GrpcClient<C> {
             return Err(Failure::Bad("an answer from another node or cluster".into()));
         }
         let envelope = frame.envelopes.into_iter().next().ok_or_else(|| Failure::Bad("an empty answer".into()))?;
+        tracing::debug!(node = %id.me, from = %self.target, kind, reply = true, via = "grpc", "raft frame received");
         Ok(envelope.body)
     }
 
@@ -211,6 +215,8 @@ mod server {
             let Some(env) = frame.envelopes.into_iter().next().filter(|e| e.to == id.me && e.body.is_request()) else {
                 return Err(Status::invalid_argument("not one request to this node"));
             };
+            let kind = env.body.kind();
+            tracing::debug!(node = %id.me, from = %frame.from, kind, reply = false, via = "grpc", "raft frame received");
             let body: Body<C> = match env.body {
                 Body::AppendEntries(r) => Body::Appended(self.handler.append_entries(r).await),
                 Body::Vote(r) => Body::Voted(self.handler.vote(r).await),
@@ -219,7 +225,10 @@ mod server {
             };
             let envelopes = vec![Envelope { to: frame.from, rpc: env.rpc, body }];
             let answer = Frame { version: FRAME_VERSION, cluster: id.cluster, from: id.me.clone(), seq: 0, envelopes };
-            Ok(Response::new(pb::Sealed { frame: seal(&answer, &id.key).to_vec() }))
+            let sealed = seal(&answer, &id.key).to_vec();
+            let (to, bytes) = (&answer.envelopes[0].to, sealed.len());
+            tracing::debug!(node = %id.me, %to, kind, reply = true, via = "grpc", bytes, "raft frame sent");
+            Ok(Response::new(pb::Sealed { frame: sealed }))
         }
     }
 }

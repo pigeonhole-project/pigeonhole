@@ -393,3 +393,37 @@ mod direct {
         eventually("both survivors applied it", || nodes.values().all(|n| value(n) == 13)).await;
     }
 }
+
+#[tokio::test]
+async fn each_node_sees_the_cluster_and_the_leader_sees_lags() {
+    let chat = FakeChat::new();
+    let nodes = three(&chat).await;
+    let leader = agreed_leader(&nodes).await;
+    nodes[&leader].propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
+    eventually("every node applied the commit", || nodes.values().all(|n| value(n) == 1)).await;
+    eventually("the leader knows everyone caught up", || {
+        nodes[&leader].cluster_view().nodes.iter().all(|n| n.lag == Some(0))
+    })
+    .await;
+
+    let view = nodes[&leader].cluster_view();
+    assert_eq!((view.me, view.leader), (leader, Some(leader)));
+    let roles: Vec<_> = view.nodes.iter().map(|n| (n.id, n.role)).collect();
+    let want: Vec<_> = MEMBERS.iter().map(|&id| (id, if id == leader { "leader" } else { "follower" })).collect();
+    assert_eq!(roles, want);
+
+    let follower = *MEMBERS.iter().find(|&&m| m != leader).unwrap();
+    let theirs = nodes[&follower].cluster_view();
+    assert_eq!((theirs.me, theirs.leader), (follower, Some(leader)));
+    for n in &theirs.nodes {
+        assert_eq!(n.applied.is_some(), n.id == follower, "a follower knows only its own applied");
+        assert_eq!(n.lag, None, "and no lags");
+    }
+
+    chat.isolate(follower, true);
+    nodes[&leader].propose::<Counter>(op(2, 1)).await.unwrap().unwrap();
+    eventually("the leader sees the cut-off node behind", || {
+        nodes[&leader].cluster_view().nodes.iter().any(|n| n.id == follower && n.lag.unwrap_or(0) >= 1)
+    })
+    .await;
+}

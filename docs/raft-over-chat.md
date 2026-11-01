@@ -281,6 +281,24 @@ outcome (ok, duplicate, bad_frame, foreign) and read errors. Names and
 labels: [metrics.md](metrics.md); the Grafana dashboard has a Cluster (Raft)
 row of them.
 
+**For the admin UI's graph:**
+- The admin op `cluster` (`MetaStore::cluster_view` plus the config) gives
+  `{me, leader, term, nodes, links}`.
+  - Each node is `{id, role, grpc, outbox, chat, log, snapshots, applied, lag}`.
+  - `log` and `snapshots` are known for this node only, as is `applied`.
+  - `lag` is known on the leader.
+  - `links` are `{a, b, via: grpc|chat}`.
+- `channels` lists a node's own log and snapshots with its `node`, and each
+  outbox as `outbox-<node>` (role `outbox`).
+- These log lines are stable; the graph animates them:
+  - `raft frame sent` and `raft frame received` (debug), with fields
+    `to`/`from`, `kind` (heartbeat, append, vote, snapshot), `reply`,
+    `via` (grpc, chat) and `bytes`. `Direct` logs as `grpc`.
+  - `leader changed` (info), with `term` and `leader` (absent during an
+    election).
+  - `not the leader` (info), with `op` (method and path) and `leader`:
+    a follower turning an S3 request away.
+
 ## Configuration (pigeonhole)
 
 Every node runs with the same `[cluster]`, the same `[[node]]` list and the

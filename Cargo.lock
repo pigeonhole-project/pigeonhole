@@ -2386,6 +2386,7 @@ dependencies = [
  "madsim-tokio",
  "openraft",
  "openraft-chat",
+ "postcard",
  "prost",
  "protoc-bin-vendored",
  "serde",

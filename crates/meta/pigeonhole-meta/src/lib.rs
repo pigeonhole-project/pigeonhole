@@ -51,6 +51,7 @@ pub mod raft;
 mod sim_runtime;
 pub mod snapshot;
 mod telemetry;
+mod view;
 
 pub use log::{
     Base, Batch, ChainLogStore, Discovered, Entry, EntryStream, Head, Lease, LogError, LogId, LogResult, LogStore,
@@ -58,6 +59,7 @@ pub use log::{
 };
 pub use snapshot::{BlobSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 pub use telemetry::METRICS;
+pub use view::{ClusterView, NodeView};
 
 /// A rejection that cannot happen (a namespace whose commands never fail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -618,6 +620,7 @@ impl MetaStore {
             let _ = raft.trigger().snapshot().await;
         }
         *store.ticker.lock().unwrap() = Some(spawn_snapshot_ticker(raft, shared, store.snapshots.schedule()));
+        spawn_leader_log(store.raft.metrics());
         telemetry::record_boot(store.applied_position().saturating_sub(store.base_position()), t0.elapsed());
         tracing::info!(
             generation = gen,
@@ -658,6 +661,12 @@ impl MetaStore {
     /// fail meanwhile. Work only the leader should do checks this first.
     pub fn is_leader(&self) -> bool {
         self.raft.metrics().borrow().state == openraft::ServerState::Leader
+    }
+
+    /// The cluster as this node sees it: roles, the leader, the term, and
+    /// on the leader each node's lag.
+    pub fn cluster_view(&self) -> ClusterView {
+        ClusterView::of(&self.raft.metrics().borrow(), self.applied_position())
     }
 
     /// This node's id in its cluster.
@@ -1022,6 +1031,30 @@ fn raft_config(opts: &MetaOptions) -> Result<openraft::Config> {
     }
     .validate()
     .context("raft config")
+}
+
+/// Log each change of leader as this node learns it (`None`: an election
+/// is on), until Raft stops.
+fn spawn_leader_log(mut metrics: watch::Receiver<raft::Metrics>) {
+    tokio::spawn(
+        async move {
+            let mut known = None;
+            loop {
+                let (leader, term) = {
+                    let m = metrics.borrow_and_update();
+                    (m.current_leader, m.current_term)
+                };
+                if known != Some(leader) {
+                    tracing::info!(term, leader, "leader changed");
+                    known = Some(leader);
+                }
+                if metrics.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+        .in_current_span(),
+    );
 }
 
 /// Ask for a snapshot whenever `schedule` says (every its period, `None`:

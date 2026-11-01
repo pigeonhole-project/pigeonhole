@@ -45,6 +45,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         snapshot_every: cfg.meta.snapshot_every_entries,
         channels: Some(std::sync::Arc::new(pigeonhole_admin::ListedStores(listed_stores(&cfg)))),
         config_text: std::fs::read_to_string(&cfg.config_path).ok(),
+        cluster: cfg.cluster.clone(),
     });
     spawn_admin(&cfg, &rt, admin).await?;
 
@@ -105,11 +106,21 @@ fn listed_stores(cfg: &Config) -> Vec<serde_json::Value> {
         (true, LogSettings::Memory, _) | (false, _, SnapshotSettings::Memory) => Some("memory"),
         _ => None,
     };
-    for (role, log) in [("log", true), ("snapshots", false)] {
+    // This node's own stores: under its dovecote in a cluster's graph.
+    let me = cfg.cluster.as_ref().map(|c| c.node);
+    for (store, role, log) in
+        [(pigeonhole_admin::LOG_STORE, "log", true), (pigeonhole_admin::SNAPSHOT_STORE, "snapshots", false)]
+    {
         if let Some(kind) = kind(log) {
-            out.push(
-                serde_json::json!({ "store": format!("meta-{role}"), "role": role, "kind": kind, "messages": [] }),
-            );
+            out.push(serde_json::json!({ "store": store, "role": role, "kind": kind, "node": me, "messages": [] }));
+        }
+    }
+    for node in cfg.cluster.iter().flat_map(|c| &c.nodes) {
+        if let Some(chat) = node.outbox {
+            let store = pigeonhole_admin::outbox_store(node.id);
+            out.push(serde_json::json!({
+                "store": store, "role": "outbox", "kind": "telegram", "scope": chat.to_string(), "node": node.id, "messages": [],
+            }));
         }
     }
     out
