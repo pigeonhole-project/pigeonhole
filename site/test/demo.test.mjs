@@ -131,6 +131,22 @@ test("sketch: each data channel's place; the log and snapshots last", () => {
     ],
   );
   assert.ok(chans.every(c => c.total === undefined));
+  // The wizard's sketch grows with its steps.
+  const w = setup(["telegram", "discord"], 2, {bots: 3});
+  assert.deepEqual(
+    sketch(w, "channels").map(c => [c.store, c.place, c.bots]),
+    [
+      ["tg-1", null, 1],
+      ["dc-1", null, 1],
+    ],
+  );
+  assert.equal(sketch(w, "copies")[1].place.copy, 1);
+  assert.equal(sketch(w, "copies").length, 2, "no log yet");
+  assert.deepEqual(
+    sketch(w, "meta").map(c => c.role),
+    ["data", "data", "log", "snapshots"],
+  );
+  assert.ok(sketch(w, "meta").every(c => c.bots === 1) && sketch(w, "bots").every(c => c.bots === 3));
   assert.deepEqual(divisors(4), [1, 2, 4]);
 });
 

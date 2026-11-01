@@ -1,27 +1,32 @@
 // The home page's stage: a terminal, two channels, the metadata log and a
 // sentence, drawn from a recorded trace (site/record.py). The channels are
 // the demo's chat views (demo/chat), named by the recording's stores:
-// "telegram" and "discord"; the log's entries open into their commands as
-// on the demo's log panel (demo/log-view.js).
+// "telegram" and "discord"; the log, as on the demo's log panel
+// (demo/log-view.js), in two views: its batches, opening into their
+// entries and commands, or its channel's posts.
 //
-// trace: {steps, log: the entries with their commands}; `at(t)`: the Date
-// of a step's time t (ms into the recording).
+// entries: the log's entries with their commands; logChannel: its channel
+// as the recording ended (the `channels` op's); logPosts: the ids of the
+// posts the recording puts there; `at(t)`: the Date of a step's time t (ms
+// into the recording).
 import {chatView} from "./demo/chat/index.js";
-import {entryView} from "./demo/log-view.js";
+import {entryView, logTabs} from "./demo/log-view.js";
 import {button, h} from "./lib/dom.js";
 import {bytes, t, tHtml} from "./lib/i18n.js";
 
 // Both recorded channels hold the chunks under one name, as a deployment's would.
 const CHANNEL = "blobs";
 
-export function makeStage(stage, {entries, at}) {
+export function makeStage(stage, {entries, logChannel, logPosts, at}) {
   const $ = role => stage.querySelector(`[data-role="${role}"]`);
   const term = $("term"),
     log = $("log"),
     opened = $("entry"),
     say = $("say");
   const lanes = Object.fromEntries(["telegram", "discord"].map(kind => [kind, {el: $(kind), channel: null}]));
-  let chip = null; // the log entry being committed
+  // The log's channel: the posts before the recording at first, its own as they come.
+  const logLane = {el: $("log-channel"), channel: null};
+  let view = "readable";
 
   const secs = ms => `+${(ms / 1000).toFixed(2)} s`;
   function termLine(cls, text, ts) {
@@ -64,7 +69,19 @@ export function makeStage(stage, {entries, at}) {
     drawLane(lanes[e.store]);
   }
 
-  // A log batch: a chip for its entries; clicked, they open under the row.
+  // The log in one view or the other.
+  function showLog(v) {
+    view = v;
+    $("log-tabs").replaceChildren(logTabs(view, showLog, logChannel?.kind));
+    log.hidden = view !== "readable";
+    opened.hidden = view !== "readable" || !log.querySelector('[aria-expanded="true"]');
+    logLane.el.hidden = view !== "channel";
+    // Drawn while hidden, the chat could not scroll to its newest post.
+    if (view === "channel" && logLane.channel) drawLane(logLane);
+  }
+
+  // A log batch: a chip for its entries (clicked, they open under the row),
+  // and its post in the log's channel.
   function logEntry(e) {
     const mine = entries.filter(x => x.position >= e.first && x.position <= e.last);
     const b = button("log-chip pop", null, () => {
@@ -75,13 +92,16 @@ export function makeStage(stage, {entries, at}) {
       opened.hidden = !open;
     });
     b.setAttribute("aria-expanded", "false");
-    b.append(h("b", "", t("position", {n: e.first})), h("span", "", bytes(e.bytes || 0)));
+    b.append(h("b", "", t("position", {n: e.first})), h("span", "", `${bytes(e.bytes || 0)} · ${t("commands", {n: e.commands})}`));
     log.append(b);
-    chip = b;
     log.scrollLeft = log.scrollWidth;
-  }
-  function committed(e) {
-    if (chip) chip.querySelector("span").textContent += ` · ${t("commands", {n: e.entries})}`;
+    const m = logChannel?.messages.find(x => String(x.id) === e.msg);
+    if (m) {
+      for (const x of logLane.channel.messages) x.fresh = false;
+      logLane.channel.messages.push({...m, fresh: true});
+      logLane.channel.total++;
+      drawLane(logLane);
+    }
   }
 
   // A say.* string ([key, vars]; the values are escaped), fading in.
@@ -102,8 +122,13 @@ export function makeStage(stage, {entries, at}) {
       lane.channel = {store: CHANNEL, kind, role: "data", total: 0, messages: []};
       drawLane(lane);
     }
+    if (logChannel) {
+      const before = logChannel.messages.filter(m => !logPosts.has(String(m.id)));
+      logLane.channel = {...logChannel, total: before.length, messages: before};
+      drawLane(logLane);
+    }
+    showLog(view);
     for (const f of stage.querySelectorAll(".flyer")) f.remove();
-    chip = null;
   }
 
   // Draws one step; resolves after its animation, `wait(ms)` paces it.
@@ -116,9 +141,6 @@ export function makeStage(stage, {entries, at}) {
     } else if (e.type === "log") {
       logEntry(e);
       await wait(350);
-    } else if (e.type === "commit") {
-      committed(e);
-      await wait(150);
     }
   }
 

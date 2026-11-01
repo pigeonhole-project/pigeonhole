@@ -12,11 +12,12 @@ python3 site/build.py          # → target/site (open target/site/index.html)
 - `i18n/` — the strings, one file per language. Keys starting with `js.`
   go to the page scripts (`t("key")` in `assets/site.js`).
 - `traces/` — recordings the pages play back. `record.py` makes them: it runs
-  the release binary on in-memory stores named `telegram` and `discord`
-  with JSON logs, drives it with the AWS CLI and keeps the store calls, log
-  batches, commits and S3 operations.
+  the release binary on fake Telegram and Discord channels (the demo's) with
+  JSON logs, drives it with the AWS CLI and keeps the posts, store calls, log
+  batches and S3 operations, then the log's entries and its channel (the
+  admin API's `log` and `channels` ops).
 
 ```
-cargo build --release -p pigeonhole
+cargo build --release -p pigeonhole --features fake
 python3 site/record.py         # every scenario; needs the aws CLI
 ```

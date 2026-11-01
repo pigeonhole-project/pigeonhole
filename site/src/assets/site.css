@@ -137,6 +137,11 @@ h1 { font-size: clamp(34px, 5.4vw, 60px); line-height: 1.05; letter-spacing: -0.
 .log-chip b { display: block; font-variant-numeric: tabular-nums; }
 .log-chip span { color: var(--muted); }
 .log-chip[aria-expanded="true"] { border-color: var(--log); box-shadow: 0 0 0 1px var(--log); }
+.log-body[hidden], .log-lane[hidden] { display: none; }
+.log-tabs { margin-left: auto; }
+.log-tabs .tabs { margin: 0; font-weight: 400; }
+.log-tabs .tab { padding: 3px 10px; font-size: 12px; }
+.log-lane { height: 320px; margin: 0 12px 12px; border-radius: 8px; overflow: hidden; }
 .log-open { margin: 0 12px 12px; padding: 4px 12px; background: var(--surface); border-radius: 8px; font-size: 14px; }
 
 .narration { grid-area: say; min-height: 52px; padding: 4px 6px; font-size: 16px; color: var(--ink-2); }

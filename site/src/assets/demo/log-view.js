@@ -9,16 +9,23 @@ import {chatView} from "./chat/index.js";
 
 export const VIEWS = ["readable", "channel"];
 
-export function logView(log, channel, view, onView) {
+// The two views' tabs, `view` on; onView(v): another picked. `kind`: the
+// log's store (on a local disk, its records are files, not posts).
+export function logTabs(view, onView, kind) {
   const tabs = h("div", "tabs");
   tabs.setAttribute("role", "tablist");
   for (const v of VIEWS) {
-    const b = button("tab", t(`demo.log_view_${v}`), () => onView(v));
+    const label = v === "channel" && kind === "local_disk" ? "disk" : v;
+    const b = button("tab", t(`demo.log_view_${label}`), () => onView(v));
     b.setAttribute("role", "tab");
     b.setAttribute("aria-selected", String(view === v));
     tabs.append(b);
   }
-  const out = [tabs, h("p", "log-note", t("demo.log_note"))];
+  return tabs;
+}
+
+export function logView(log, channel, view, onView) {
+  const out = [logTabs(view, onView, channel?.kind), h("p", "log-note", t("demo.log_note"))];
   if (view === "channel") {
     if (channel) out.push(chatView(channel));
   } else if (!log) {

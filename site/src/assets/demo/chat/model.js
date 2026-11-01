@@ -21,7 +21,7 @@ function postedAt(c, m) {
 }
 
 // What a post of the log's channel is to the log (m.log, decoded by the node).
-function logNote(l) {
+export function logNote(l) {
   if (!l) return null;
   if (l.what === "batch" && l.first != null) {
     return l.first === l.last ? t("demo.post_entry", {gen: l.gen, n: l.first}) : t("demo.post_batch", {gen: l.gen, first: l.first, last: l.last});

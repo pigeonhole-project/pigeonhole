@@ -6,9 +6,8 @@
 import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
 import {appOf} from "./channels.js";
-import {divisors, perMinute, sketch, tomlOf} from "./toml.js";
+import {divisors, perMinute, STEPS, sketch, tomlOf} from "./toml.js";
 
-const STEPS = ["channels", "copies", "meta", "bots", "review"];
 const MAX_CHANNELS = 4,
   MAX_BOTS = 4;
 const numbers = n => Array.from({length: n}, (_, i) => [i + 1, String(i + 1)]);
@@ -200,7 +199,7 @@ export function makeWizard(panel, on) {
     });
     nav.append(next);
     panel.body.replaceChildren(progress, ...body, nav);
-    on.sketch(sketch(setup));
+    on.sketch(sketch(setup, name));
   }
 
   return {render};

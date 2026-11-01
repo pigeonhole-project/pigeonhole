@@ -111,21 +111,30 @@ export function tomlOf(w) {
   return out.join("\n");
 }
 
-// The channels of the setup as they will be, nothing posted (no `total`).
-export function sketch(w) {
+// The wizard's steps, in order: what the setup has decided by each.
+export const STEPS = ["channels", "copies", "meta", "bots", "review"];
+
+// The channels of the setup as they will be, nothing posted (no `total`),
+// as far as the wizard has come: the data channels first, their places once
+// the copies are picked, the log and snapshots once their channels are,
+// the bots once they are counted.
+export function sketch(w, upTo = "review") {
+  const reached = step => STEPS.indexOf(upTo) >= STEPS.indexOf(step);
   const shards = w.channels.length / w.copies;
+  const bots = reached("bots") ? w.bots : 1;
   const chans = dataChannels(w).map(c => ({
     store: c.id,
     role: "data",
     kind: c.kind,
     scope: c.scope,
-    bots: w.bots,
+    bots,
     messages: [],
-    place: {shard: c.group, shards, copy: c.copy, copies: w.copies},
+    place: reached("copies") ? {shard: c.group, shards, copy: c.copy, copies: w.copies} : null,
   }));
+  if (!reached("meta")) return chans;
   for (const role of ["log", "snapshots"]) {
     const m = metaStore(w[role], role);
-    chans.push({store: m.id, role, kind: m.kind, scope: m.scope, bots: w.bots, messages: []});
+    chans.push({store: m.id, role, kind: m.kind, scope: m.scope, bots, messages: []});
   }
   return chans;
 }

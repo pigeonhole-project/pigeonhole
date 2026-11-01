@@ -44,9 +44,10 @@
     <div class="pane lane lane-tg" data-role="telegram"></div>
     <div class="pane lane lane-dc" data-role="discord"></div>
     <div class="pane log-pane">
-      <div class="pane-h">{{replay.log}} <small>{{replay.log_sub}}</small></div>
+      <div class="pane-h">{{replay.log}} <small>{{replay.log_sub}}</small><span class="log-tabs" data-role="log-tabs"></span></div>
       <div class="log-body" data-role="log"></div>
       <ul class="entries log-open" data-role="entry" hidden></ul>
+      <div class="lane log-lane" data-role="log-channel" hidden></div>
     </div>
     <div class="narration" data-role="say" aria-live="polite"></div>
     <div class="controls">

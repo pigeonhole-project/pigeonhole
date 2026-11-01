@@ -163,11 +163,12 @@ async function refreshObjects() {
   view?.setCounters?.(counters());
 }
 
-// The channels as the node has them now; the posts seen arriving stay marked.
+// The channels as the node has them now; the posts seen arriving stay
+// marked. A local disk has files, not messages.
 async function loadChannels() {
   const {reply} = await call({op: "channels"});
   const fresh = new Set(state.channels.flatMap(c => c.messages.filter(m => m.fresh).map(m => `${c.store}/${m.id}`)));
-  state.channels = (reply?.channels || []).map(c => ({...c, messages: c.messages.map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
+  state.channels = (reply?.channels || []).map(c => ({...c, messages: (c.messages || []).map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
 }
 
 // The channels anew, drawn (a fault changes them behind the events).
@@ -289,7 +290,8 @@ function renderPanel() {
       state.logView = v;
       renderPanel();
     };
-    show(t("demo.log_title"), t("demo.log_sub", {store: c?.store, app: appOf(c?.kind)}), logView(state.log, c, state.logView, setView));
+    const sub = c?.kind === "local_disk" ? "demo.log_sub_disk" : "demo.log_sub";
+    show(t("demo.log_title"), t(sub, {store: c?.store, app: appOf(c?.kind)}), logView(state.log, c, state.logView, setView));
   } else {
     const c = channel(open.store);
     if (!c) return;
