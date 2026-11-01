@@ -501,9 +501,24 @@ impl BlobDb {
         }))
     }
 
-    /// Replace all parts for one instance replica.
-    pub async fn commit_instance_replica(&self, chunk_id: ChunkId, layout: &ReplicaLayout) -> Result<()> {
-        self.propose_infallible(ChunkCommand::AddReplica { chunk_id, replica: Replica::from(layout) }).await
+    /// Replace each chunk's replica on its layout's instance, all in one
+    /// entry. Per replica: `false` when its chunk is gone or reclaiming (that
+    /// one is not added; the others are).
+    pub async fn commit_instance_replicas(&self, replicas: &[(ChunkId, &ReplicaLayout)]) -> Result<Vec<bool>> {
+        let mut proposal = Proposal::new();
+        let slots = proposal.extend(replicas.iter().map(|&(chunk_id, layout)| {
+            Prepared::<ChunkState>::new(&ChunkCommand::AddReplica { chunk_id, replica: Replica::from(layout) })
+        }));
+        let mut outcomes = self.meta.propose_all(proposal).await?;
+        let mut added = Vec::with_capacity(slots.len());
+        for slot in slots {
+            match outcomes.take(slot)? {
+                Ok(()) => added.push(true),
+                Err(ChunkReject::ChunkGone(_)) => added.push(false),
+                Err(reason) => bail!("unexpected rejection {reason:?}"),
+            }
+        }
+        Ok(added)
     }
 
     /// Pending repair queue depth (tests / metrics).

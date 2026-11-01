@@ -183,6 +183,8 @@ batch_size = 100
 interval = "30s"
 # Jobs claimed per pass (fewest-replica chunks first).
 batch_size = 16
+# Jobs of a pass copied at once; their replicas are committed in one log entry.
+concurrency = 4
 # Skip a job when source Get or target Put cost().wait_secs exceeds this.
 max_cost_wait = "2s"
 # Scrub under-replicated chunks into the repair queue each pass.

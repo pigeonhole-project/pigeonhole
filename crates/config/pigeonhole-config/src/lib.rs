@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use pigeonhole_blob::CacheConfig;
 use pigeonhole_chunk_store::{
     RepairConfig, SweepConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, DEFAULT_SWEEP_INTERVAL,
-    REPAIR_BATCH_SIZE, SWEEP_BATCH_SIZE,
+    REPAIR_BATCH_SIZE, REPAIR_CONCURRENCY, SWEEP_BATCH_SIZE,
 };
 use pigeonhole_codec::ByteBudget;
 use pigeonhole_codec::{self as chunker, ChunkCodec};
@@ -741,6 +741,7 @@ struct FileRepair {
     #[serde(with = "humantime_serde")]
     interval: Duration,
     batch_size: usize,
+    concurrency: usize,
     #[serde(with = "humantime_serde")]
     max_cost_wait: Duration,
     scrub: bool,
@@ -751,6 +752,7 @@ impl Default for FileRepair {
         Self {
             interval: DEFAULT_REPAIR_INTERVAL,
             batch_size: REPAIR_BATCH_SIZE,
+            concurrency: REPAIR_CONCURRENCY,
             max_cost_wait: Duration::from_secs_f64(DEFAULT_MAX_COST_WAIT_SECS),
             scrub: true,
         }
@@ -762,6 +764,7 @@ impl FileRepair {
         RepairConfig {
             interval: self.interval.max(Duration::from_secs(1)),
             batch_size: self.batch_size.max(1),
+            concurrency: self.concurrency.max(1),
             max_cost_wait_secs: self.max_cost_wait.as_secs_f64(),
             scrub: self.scrub,
         }
