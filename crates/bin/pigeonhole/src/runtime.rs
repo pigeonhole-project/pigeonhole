@@ -2,6 +2,7 @@
 
 use crate::channel_log;
 use anyhow::Context;
+use pigeonhole::config::cluster::ClusterSettings;
 use pigeonhole::config::Config;
 use pigeonhole::config::{DynConfig, LogSettings, SnapshotSettings};
 use pigeonhole::index::Index;
@@ -201,7 +202,11 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
         keep_snapshots: cfg.meta.keep_snapshots,
         ..MetaOptions::default()
     };
-    let meta = MetaStore::open(log.clone(), snapshots, namespaces, opts).await.context("boot metadata tablet")?;
+    let meta = match &cfg.cluster {
+        None => MetaStore::open(log.clone(), snapshots, namespaces, opts).await,
+        Some(cluster) => open_node(cluster, log.clone(), snapshots, namespaces, opts).await,
+    }
+    .context("boot metadata tablet")?;
     let blob_db = BlobDb::open(meta.clone()).await.context("open chunk metadata")?;
 
     let stored = blob_db.list_instance_fingerprints().await.context("list instance fingerprints")?;
@@ -217,6 +222,43 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     let store = Arc::new(with_optional_caches(layer, cfg));
     let dynamic = Arc::new(DynConfig::open(cfg.clone(), meta.clone()));
     Ok(Runtime { meta, store, dynamic, log })
+}
+
+/// The tablet as node `cluster.node` of its cluster: Raft over gRPC to the
+/// other nodes, served on this node's `grpc` address.
+async fn open_node(
+    cluster: &ClusterSettings,
+    log: Arc<dyn LogStore>,
+    snapshots: Arc<dyn SnapshotStore>,
+    namespaces: Namespaces,
+    opts: MetaOptions,
+) -> anyhow::Result<Arc<MetaStore>> {
+    use pigeonhole::config::cluster::Link;
+    use pigeonhole_meta::raft::TypeConfig;
+    use pigeonhole_meta::{Cluster, Serve};
+    if let Some((peer, _)) = cluster.links().into_iter().find(|(_, l)| *l == Link::Chat) {
+        anyhow::bail!("[[node]] {peer} is reached over the chat: this build has no chat mailbox yet; give both `grpc`");
+    }
+    let me = cluster.me();
+    let addr = me.grpc.as_deref().context("this [[node]] has no `grpc` address to serve Raft on")?;
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind Raft gRPC {addr}"))?;
+    let peers = cluster.nodes.iter().filter(|n| n.id != me.id).filter_map(|n| Some((n.id, n.grpc.clone()?))).collect();
+    let identity = openraft_grpc::Identity { me: me.id, cluster: cluster.id, key: cluster.key };
+    let network = openraft_grpc::GrpcNetwork::<TypeConfig>::new(identity.clone(), peers);
+    info!(node = me.id, %addr, nodes = cluster.nodes.len(), "a node of a Raft cluster over gRPC");
+    let serve: Serve = Box::new(move |raft| {
+        Box::pin(async move {
+            tokio::spawn(async move {
+                if let Err(e) = openraft_grpc::serve::<TypeConfig>(listener, identity, Arc::new(raft)).await {
+                    tracing::error!(error = %format!("{e:#}"), "Raft gRPC server stopped");
+                }
+            });
+        })
+    });
+    let members = cluster.nodes.iter().map(|n| n.id).collect();
+    let opts = MetaOptions { heartbeat: cluster.heartbeat, election_timeout: cluster.election_timeout, ..opts };
+    let cluster = Cluster { node: me.id, members, network, serve: Some(serve) };
+    MetaStore::open_in(log, snapshots, namespaces, opts, cluster).await
 }
 
 async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {

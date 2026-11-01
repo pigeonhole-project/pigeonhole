@@ -2538,6 +2538,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "metrics-util",
  "openraft-chat",
+ "openraft-grpc",
  "pigeonhole-admin",
  "pigeonhole-blob",
  "pigeonhole-chunk-store",

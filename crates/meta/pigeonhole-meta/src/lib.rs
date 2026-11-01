@@ -660,6 +660,11 @@ impl MetaStore {
         self.raft.metrics().borrow().state == openraft::ServerState::Leader
     }
 
+    /// This node's id in its cluster.
+    pub fn node(&self) -> raft::NodeId {
+        self.raft.metrics().borrow().id
+    }
+
     /// Changes on every change Raft reports (an entry applied, a new leader,
     /// a new role): how a follower sees what replication brought.
     pub fn changes(&self) -> watch::Receiver<raft::Metrics> {

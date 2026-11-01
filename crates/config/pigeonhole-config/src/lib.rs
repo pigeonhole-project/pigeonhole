@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod cluster;
 pub mod dynamic;
 pub mod instances;
 pub mod stores;
@@ -58,6 +59,8 @@ pub struct Config {
     pub listen_addr: String,
     /// Metadata tablet (`[meta]`).
     pub meta: MetaSettings,
+    /// The tablet's Raft cluster (`[cluster]`, `[[node]]`); `None`: of one.
+    pub cluster: Option<cluster::ClusterSettings>,
     pub access_key: String,
     pub secret_key: String,
     pub region: String,
@@ -405,12 +408,14 @@ impl Config {
             .as_deref()
             .context("[chunk] store is required: the [[store]] or [[replicas]] id chunks go to")?;
         let (instances, placement) = topology.blob_placement(blob_store)?;
+        let cluster = file.cluster.into_settings(file.node, &mut topology)?;
         topology.check_all_used()?;
         check_block_size_against_instances(block_size, &instances)?;
 
         Ok(Self {
             listen_addr: file.listen_addr,
             meta,
+            cluster,
             access_key,
             secret_key,
             region: file.region,
@@ -452,6 +457,7 @@ impl Config {
         Self {
             listen_addr: "127.0.0.1:0".into(),
             meta: MetaSettings::in_dir(dir),
+            cluster: None,
             access_key: "pigeonhole".into(),
             secret_key: "pigeonholesecret".into(),
             region: "us-east-1".into(),
@@ -557,6 +563,9 @@ struct FileConfig {
     log: FileLog,
     #[serde(default)]
     inline: FileInline,
+    cluster: cluster::FileCluster,
+    #[serde(default)]
+    node: Vec<cluster::FileNode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -602,6 +611,8 @@ impl Default for FileConfig {
             admin: AdminSettings::default(),
             log: FileLog::default(),
             inline: FileInline::default(),
+            cluster: cluster::FileCluster::default(),
+            node: Vec::new(),
         }
     }
 }
@@ -1725,6 +1736,56 @@ max_batch_total_size = "8 MiB"
         ];
         for (toml, want) in cases {
             let err = format!("{:#}", load_mem(toml).unwrap_err());
+            assert!(err.contains(want), "{toml:?}: want {want:?} in {err}");
+        }
+    }
+
+    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn a_cluster_of_grpc_nodes_and_one_on_the_chat() {
+        use crate::cluster::Link;
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        set_env("PH_TEST_TGM_TOKEN", "42:secret");
+        set_env("PH_TEST_TGM_API_ID", "12345");
+        set_env("PH_TEST_TGM_API_HASH", "hash");
+        let outbox = |id: &str, chat: i64| tgm_store(id, chat);
+        let toml = format!(
+            "[cluster]\nnode = 2\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n\
+             [[node]]\nid = 1\ngrpc = \"10.0.0.1:7001\"\noutbox = \"o1\"\n\
+             [[node]]\nid = 2\ngrpc = \"10.0.0.2:7001\"\noutbox = \"o2\"\n\
+             [[node]]\nid = 3\noutbox = \"o3\"\n{}{}{}",
+            outbox("o1", -1001),
+            outbox("o2", -1002),
+            outbox("o3", -1003)
+        );
+        let cfg = load_mem(&toml).unwrap();
+        let cluster = cfg.cluster.unwrap();
+        assert_eq!((cluster.node, cluster.id, cluster.key[0], cluster.key[31]), (2, 9, 0x00, 0xff));
+        assert_eq!(cluster.links(), [(1, Link::Grpc), (3, Link::Chat)].into());
+        // A Telegram link sets the pace of the whole cluster.
+        assert_eq!((cluster.heartbeat, cluster.election_timeout.0), (Duration::from_secs(10), Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn a_grpc_cluster_and_what_it_refuses() {
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        let nodes = "[[node]]\nid = 1\ngrpc = \"127.0.0.1:7001\"\n[[node]]\nid = 2\ngrpc = \"127.0.0.1:7002\"\n";
+        let base = "[cluster]\nnode = 1\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n";
+        let cluster = load_mem(&format!("{base}{nodes}")).unwrap().cluster.unwrap();
+        assert_eq!(
+            (cluster.heartbeat, cluster.election_timeout.1),
+            (Duration::from_millis(250), Duration::from_secs(3))
+        );
+        assert!(load_mem("").unwrap().cluster.is_none(), "no [[node]]: a cluster of one");
+        for (toml, want) in [
+            (format!("{base}{nodes}[[node]]\nid = 3\n"), "share no transport"),
+            (format!("[cluster]\nnode = 5\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n{nodes}"), "not a [[node]]"),
+            (format!("[cluster]\nnode = 1\nkey_env = \"PH_TEST_NO_SUCH_KEY\"\n{nodes}"), "is not set"),
+            (format!("{base}heartbeat = \"5s\"\n{nodes}"), "heartbeat < election_timeout_min"),
+            (format!("{base}{nodes}[[node]]\nid = 2\ngrpc = \"x:1\"\n"), "id 2 twice"),
+        ] {
+            let err = format!("{:#}", load_mem(&toml).unwrap_err());
             assert!(err.contains(want), "{toml:?}: want {want:?} in {err}");
         }
     }

@@ -260,6 +260,21 @@ impl BlobDb {
         }
     }
 
+    /// A chunk id no chunk has had: past every one handed out here and past
+    /// the newest the tablet applied. That one moves with replication: a
+    /// node that took over from another leader goes on after its ids.
+    fn next_chunk_id(&self) -> ChunkId {
+        let floor = self.read(|s| s.last_chunk_id) + 1;
+        let mut next = self.next_chunk_id.load(Ordering::SeqCst);
+        loop {
+            let id = next.max(floor);
+            match self.next_chunk_id.compare_exchange(next, id + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return id,
+                Err(now) => next = now,
+            }
+        }
+    }
+
     /// The `CommitChunk` of a new chunk (its id chosen now), to be proposed
     /// with other commands in one entry. Never rejected.
     pub fn prepare_commit(
@@ -269,7 +284,7 @@ impl BlobDb {
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
     ) -> (ChunkId, Prepared<ChunkState>) {
-        let chunk_id = self.next_chunk_id.fetch_add(1, Ordering::SeqCst);
+        let chunk_id = self.next_chunk_id();
         let command = ChunkCommand::CommitChunk {
             chunk_id,
             logical_size,
@@ -665,6 +680,18 @@ mod tests {
         assert!(is_chunk_gone(&err), "{err}");
         let meta = db.chunk_meta(id2).await.unwrap().unwrap();
         assert_eq!(meta.2, 1, "id2 refs must be unchanged after rolled-back retain");
+    }
+
+    #[tokio::test]
+    async fn chunk_ids_go_on_after_ones_another_node_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await;
+        // Two views opened at once: one is this node, the other stands for
+        // a leader before it whose commits reach it by replication.
+        let (this, before) = (BlobDb::open(meta.clone()).await.unwrap(), BlobDb::open(meta).await.unwrap());
+        let first = before.insert_chunk(8, 1).await.unwrap();
+        let next = this.insert_chunk(8, 1).await.unwrap();
+        assert!(next > first, "{next} after {first}");
     }
 
     #[tokio::test]
