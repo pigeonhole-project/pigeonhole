@@ -131,9 +131,11 @@ A `SnapshotStore` in a channel of its own: plain storage, no order, no fence.
 
 - `SnapshotRef` = `message_id` + crc; `get` fetches the message (fresh CDN
   URLs) and downloads; the crc catches a replaced message.
-- Snapshots above 20 MiB are split over several attachments (≤ 10 per message,
-  each ≤ 20 MiB: the limit is per file) or messages; the ref names the first,
-  which lists the rest.
+- Snapshots above the attachment limit (20 MiB, or `max_blob_size`) are cut
+  into parts, one plain message each; the message the ref names lists them
+  with their crcs (~15 bytes a part: one 20 MiB message lists a million).
+  Packing up to 10 parts per message as attachments would take fewer
+  messages; left open.
 - `newest()` (lossy restore): list the newest messages, take the first that
   decodes as a snapshot; filter by `log_id` when asked.
 
@@ -313,8 +315,8 @@ Each step ends with `cargo test --workspace` and
    generic `ChainLogStore`. Tests on a fake Discord client with racing links:
    append, fenced append, racing claims, a late straggler, an unlinked batch,
    rebase and collection (message before thread), genesis.
-4. ✅ **Snapshots**: the generic `BlobSnapshotStore` (a snapshot over 20 MiB is
-   refused; splitting is left for later).
+4. ✅ **Snapshots**: the generic `BlobSnapshotStore`; a snapshot over the
+   attachment limit is cut into parts (a message each) and a list.
 5. ✅ **Wiring**: discord for `[meta] log` / `snapshot` (an anchor instead of
    `init-log`), permission checks at startup, config example.
 6. ✅ **Live run**: `tests/live.rs` (blobs, the chain log, snapshots);
@@ -322,6 +324,8 @@ Each step ends with `cargo test --workspace` and
 
 ## Open questions
 
-- Snapshots over 20 MiB: split over several attachments or messages.
+- Parts of a cut snapshot as attachments, up to 10 per message, instead of a
+  message each: fewer messages for a rare write; needs a blob id that names
+  an attachment of a message.
 - Is the thread-creation bucket per bot or per guild? If per guild, one guild
   per log keeps its ~10 appends a minute to itself.

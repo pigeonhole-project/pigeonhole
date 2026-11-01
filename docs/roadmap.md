@@ -67,7 +67,6 @@ Known gaps:
   power cut (not a crash) can lose the last writes. `F_FULLFSYNC` made
   `sweep_stress` ~40 s against ~10 s; Linux keeps `fdatasync`.
 - Traces stay in the log: no export to Jaeger / Tempo yet (step 7e).
-- Discord: a snapshot over 20 MiB is refused (no splitting yet).
 
 ## Steps
 
