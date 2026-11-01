@@ -149,13 +149,15 @@ impl FileStore {
         if bots == 0 {
             bail!("[[store]] {id}: a fake channel needs at least one bot");
         }
-        Ok(Some(Store::Fake(FakeChannel { kind, scope, backing, bots })))
+        Ok(Some(Store::Fake(FakeChannel { id: id.to_string(), kind, scope, backing, bots })))
     }
 }
 
 /// A telegram or discord store on a fake channel (`fake = …`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FakeChannel {
+    /// Its `[[store]]` id.
+    pub id: String,
     pub kind: InstanceKind,
     /// The chat or channel id.
     pub scope: String,

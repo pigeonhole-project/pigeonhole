@@ -164,12 +164,12 @@ fn req<T>(input: T) -> S3Request<T> {
     }
 }
 
-/// The store of the log or the snapshots in a fake channel.
-fn meta_info(kind: InstanceKind, scope: &str, purpose: &str) -> InstanceInfo {
-    let location = format!("fake:{}:{scope}", kind.as_str());
+/// The store of the log or the snapshots in fake channel `f`, by its id.
+fn meta_info(f: &FakeChannel) -> InstanceInfo {
+    let location = format!("fake:{}:{}", f.kind.as_str(), f.scope);
     InstanceInfo {
-        id: format!("meta-{purpose}"),
-        kind: kind.as_str(),
+        id: f.id.clone(),
+        kind: f.kind.as_str(),
         fingerprint: location.clone(),
         location,
         role: pigeonhole_blob::InstanceRole::ReadWrite,
@@ -189,11 +189,11 @@ async fn open_log(world: &World, cfg: &Config) -> Result<Arc<dyn LogStore>> {
     Ok(match &cfg.meta.log {
         LogSettings::Memory => Arc::new(ChainLogStore::new(world.memory("meta-log", None))),
         LogSettings::Fake(f) if f.kind == InstanceKind::Telegram => {
-            let info = meta_info(InstanceKind::Telegram, &f.scope, "log");
+            let info = meta_info(f);
             Arc::new(ChainLogStore::new(Arc::new(world.telegram_store(cfg, f, info).await?)))
         }
         LogSettings::Fake(f) if f.kind == InstanceKind::Discord => {
-            let info = meta_info(InstanceKind::Discord, &f.scope, "log");
+            let info = meta_info(f);
             let log = ChainLogStore::new(Arc::new(world.discord_store(cfg, f, None, info).await?));
             Arc::new(match cfg.meta.lease {
                 Some(lease) => log.with_lease(pigeonhole_meta::Lease::new(lease)),
@@ -213,11 +213,11 @@ async fn open_snapshots(world: &World, cfg: &Config) -> Result<Arc<dyn SnapshotS
     Ok(match &cfg.meta.snapshot {
         SnapshotSettings::Memory => Arc::new(BlobSnapshotStore::new(world.memory("meta-snapshots", None))),
         SnapshotSettings::Fake(f) if f.kind == InstanceKind::Telegram => {
-            let info = meta_info(InstanceKind::Telegram, &f.scope, "snapshots");
+            let info = meta_info(f);
             Arc::new(BlobSnapshotStore::new(Arc::new(world.telegram_store(cfg, f, info).await?)))
         }
         SnapshotSettings::Fake(f) if f.kind == InstanceKind::Discord => {
-            let info = meta_info(InstanceKind::Discord, &f.scope, "snapshots");
+            let info = meta_info(f);
             Arc::new(BlobSnapshotStore::new(Arc::new(world.discord_store(cfg, f, None, info).await?)))
         }
         SnapshotSettings::Fake(_) => bail!("[meta] snapshot: a fake channel is telegram or discord"),

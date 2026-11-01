@@ -47,6 +47,7 @@
     open: null,            // the node whose panel is open
     logView: "readable",   // the log panel: "readable" or "channel"
     busy: false,
+    wizard: false,         // the first visit's setup is on screen
   };
   const byStore = () => Object.fromEntries(state.channels.map(c => [c.store, c]));
   // The open panel is the log's (it opens by the log channel's id).
@@ -100,18 +101,30 @@
 
     for (const c of state.channels) {
       const app = c.kind === "telegram" ? "Telegram" : "Discord";
-      const role = t(`demo.role_${c.role}`, {app});
+      const bots = c.bots > 1 ? `, ${t("demo.bots", {n: c.bots})}` : "";
+      const role = placeNote(c, app) + bots;
       const n = node(c.store, pos[c.store], c.store, role);
       s("rect", {class: "shape", x: -130, y: -34, width: 260, height: 68, rx: 14}, n.g);
       s("circle", {class: "badge", cx: -106, cy: 0, r: 9, fill: c.kind === "telegram" ? "var(--tg)" : "var(--dc)"}, n.g);
       n.label(-88, 0, "start");
       // The channel's message count, top right.
       n.count = s("text", {class: "count", x: 116, y: -10, "text-anchor": "end"}, n.g);
+      if (c.total == null) continue;    // a sketch: nothing posted yet
       n.count.textContent = String(c.total);
       const tip = s("title", {}, n.g);
       tip.textContent = t("demo.messages", {n: c.total});
     }
     markOpen();
+  }
+
+  // What a channel is for; a data channel, its place among the others.
+  function placeNote(c, app) {
+    const p = c.place;
+    if (c.role !== "data" || !p || (p.shards === 1 && p.copies === 1)) return t(`demo.role_${c.role}`, {app});
+    const shard = String.fromCharCode(65 + p.shard);
+    if (p.shards > 1 && p.copies > 1) return t("wiz.note_shard_copy", {app, shard, copy: p.copy + 1});
+    if (p.copies > 1) return t("wiz.note_copy", {app, copy: p.copy + 1, n: p.copies});
+    return t("wiz.note_shard", {app, shard});
   }
 
   // A pigeon tower: a round body narrowing upward, a cone roof with a lantern
@@ -317,6 +330,7 @@
 
   // ------------------------------------------------------------ panels
   function openPanel(id) {
+    if (state.wizard) return;
     state.open = id;
     $("loft").classList.add("zoomed");
     $("panel").hidden = false;
@@ -692,6 +706,313 @@
     setBusy(false);
   }
 
+  // ------------------------------------------------------------ the wizard
+  // The first visit: the setup step by step, the graph sketching it as it
+  // grows, then the pigeonhole.toml it makes. Start boots a node on it.
+  const setup = {channels: ["telegram", "discord"], copies: 2, quorum: 2, log: "telegram", snapshots: "telegram", every: 50, bots: 1, pace: "demo"};
+  const STEPS = ["channels", "copies", "meta", "bots", "review"];
+  const MAX_CHANNELS = 4, MAX_BOTS = 4;
+  let step = 0, edited = null;     // edited: the toml as the reader changed it
+  const appOf = k => (k === "telegram" ? "Telegram" : "Discord");
+  const divisors = n => Array.from({length: n}, (_, i) => i + 1).filter(d => n % d === 0);
+  // Sends a minute per bot and channel: the services' defaults, or the demo's.
+  const perMinute = (kind, pace) => (pace === "demo" ? 1200 : kind === "telegram" ? 18 : 60);
+
+  // Each data channel: its store id, chat id, which copy group it is in.
+  function dataChannels(w) {
+    const n = {telegram: 0, discord: 0};
+    return w.channels.map((kind, i) => {
+      const k = ++n[kind];
+      return {
+        id: `${kind === "telegram" ? "tg" : "dc"}-${k}`,
+        kind,
+        scope: kind === "telegram" ? `-100100000000${k}` : `100000000000000000${k}`,
+        group: Math.floor(i / w.copies),
+        copy: i % w.copies,
+      };
+    });
+  }
+  const metaStore = (kind, what) => ({
+    id: `${kind === "telegram" ? "tg" : "dc"}-${what}`,
+    kind,
+    scope: kind === "telegram" ? `-10010000001${what === "log" ? "01" : "02"}` : `10000000000000001${what === "log" ? "01" : "02"}`,
+  });
+
+  function tomlOf(w) {
+    const data = dataChannels(w), shards = w.channels.length / w.copies;
+    const store = (c, comment) => [
+      comment ? `# ${comment}` : null,
+      "[[store]]", `id = "${c.id}"`, `kind = "${c.kind}"`,
+      c.kind === "telegram" ? `chat_id = ${c.scope}` : `channel_id = ${c.scope}`,
+      'fake = "channel-data"', `bots = ${w.bots}`, "",
+    ].filter(x => x !== null);
+    const out = [...t("wiz.toml_head").split("\n").map(l => `# ${l}`), ""];
+    data.forEach((c, i) => out.push(...store(c, i === 0 ? t("wiz.toml_data") : null)));
+    let chunkStore;
+    if (w.copies === w.channels.length && w.copies > 1) {
+      out.push(`# ${t("wiz.toml_copies", {n: w.copies, q: w.quorum})}`, "[[replicas]]", 'id = "copies"',
+        `members = [${data.map(c => `"${c.id}"`).join(", ")}]`, `write_quorum = ${w.quorum}`, "");
+      chunkStore = "copies";
+    } else if (w.channels.length === 1) {
+      chunkStore = data[0].id;
+    } else {
+      const members = [];
+      if (w.copies === 1) members.push(...data.map(c => c.id));
+      else {
+        for (let g = 0; g < shards; g++) {
+          const id = `copies-${g + 1}`;
+          out.push("[[replicas]]", `id = "${id}"`, `members = [${data.filter(c => c.group === g).map(c => `"${c.id}"`).join(", ")}]`, `write_quorum = ${w.quorum}`, "");
+          members.push(id);
+        }
+      }
+      out.push(`# ${t("wiz.toml_shards", {n: shards})}`, "[[shards]]", 'id = "shards"', `members = [${members.map(m => `"${m}"`).join(", ")}]`, "");
+      chunkStore = "shards";
+    }
+    const log = metaStore(w.log, "log"), snaps = metaStore(w.snapshots, "snapshots");
+    out.push(...store(log, t("wiz.toml_meta")), ...store(snaps, null));
+    out.push(`# ${t("wiz.toml_disk")}`, "[[store]]", 'id = "channel-data"', 'kind = "local_disk"', 'path = "/data/channels"', "");
+    out.push("[meta]", `log = "${log.id}"`, `snapshot = "${snaps.id}"`, `snapshot_every_entries = ${w.every}`);
+    if (w.log === "discord") out.push(`# ${t("wiz.toml_lease")}`, 'lease = "5s"');
+    out.push("");
+    out.push("[chunk]", `store = "${chunkStore}"`, 'size = "4 MiB"', 'block_size = "1 MiB"', 'codec = "zstd"', "");
+    out.push("[inline]", 'max_object_size = "1 KiB"', "", "[cache]", "enabled = false", "");
+    if (w.pace === "demo") {
+      out.push(`# ${t("wiz.toml_fast")}`, "[telegram.send]", "rate_per_sec = 20.0", "burst = 20.0", "",
+        "[discord.send]", "rate_per_sec = 20.0", "burst = 20.0", "");
+    } else {
+      out.push(`# ${t("wiz.toml_real")}`, "");
+    }
+    return out.join("\n");
+  }
+
+  // The graph of the setup: its channels as they will be, nothing posted.
+  function sketch(w) {
+    const data = dataChannels(w), shards = w.channels.length / w.copies;
+    const chans = data.map(c => ({
+      store: c.id, role: "data", kind: c.kind, scope: c.scope, bots: w.bots, messages: [],
+      place: {shard: c.group, shards, copy: c.copy, copies: w.copies},
+    }));
+    const log = metaStore(w.log, "log"), snaps = metaStore(w.snapshots, "snapshots");
+    chans.push({store: log.id, role: "log", kind: log.kind, scope: log.scope, bots: w.bots, messages: []});
+    chans.push({store: snaps.id, role: "snapshots", kind: snaps.kind, scope: snaps.scope, bots: w.bots, messages: []});
+    return chans;
+  }
+
+  function redrawSketch() {
+    state.channels = sketch(setup);
+    draw();
+  }
+
+  // A row of choices, one of them on: radio buttons that look like a switch.
+  function choices(name, options, value, onPick) {
+    const row = h("div", "choices");
+    row.setAttribute("role", "radiogroup");
+    for (const [v, label] of options) {
+      const b = h("button", "choice", label);
+      b.type = "button";
+      b.setAttribute("role", "radio");
+      b.setAttribute("aria-checked", String(v === value));
+      b.addEventListener("click", () => { onPick(v); renderWizard(); });
+      row.append(b);
+    }
+    row.setAttribute("aria-label", name);
+    return row;
+  }
+  const field = (label, control, note) => {
+    const f = h("div", "field");
+    f.append(h("div", "field-label", label), control);
+    if (note) f.append(h("p", "field-note", note));
+    return f;
+  };
+  const kindChoices = (label, value, onPick) => choices(label, [["telegram", "Telegram"], ["discord", "Discord"]], value, onPick);
+
+  const stepBody = {
+    channels(body) {
+      body.append(h("p", "lede", t("wiz.channels_lede")));
+      setup.channels.forEach((kind, i) => {
+        const row = h("div", "chan-row");
+        row.append(h("span", "chan-n", t("wiz.channel_n", {n: i + 1})), kindChoices(t("wiz.channel_n", {n: i + 1}), kind, v => { setup.channels[i] = v; }));
+        if (setup.channels.length > 1) {
+          const x = h("button", "mini", t("wiz.remove"));
+          x.type = "button";
+          x.addEventListener("click", () => { setup.channels.splice(i, 1); fitCopies(); renderWizard(); });
+          row.append(x);
+        }
+        body.append(row);
+      });
+      if (setup.channels.length < MAX_CHANNELS) {
+        const add = h("button", "btn", t("wiz.add_channel"));
+        add.type = "button";
+        add.addEventListener("click", () => {
+          setup.channels.push(setup.channels.at(-1) === "telegram" ? "discord" : "telegram");
+          fitCopies();
+          renderWizard();
+        });
+        body.append(add);
+      }
+    },
+    copies(body) {
+      const n = setup.channels.length;
+      body.append(h("p", "lede", t("wiz.copies_lede")));
+      const opts = divisors(n).map(d => [d, String(d)]);
+      body.append(field(t("wiz.copies"), choices(t("wiz.copies"), opts, setup.copies, v => { setup.copies = v; setup.quorum = v; }), copiesNote(setup)));
+      if (setup.copies > 1) {
+        const q = Array.from({length: setup.copies}, (_, i) => [i + 1, String(i + 1)]);
+        body.append(field(t("wiz.quorum"), choices(t("wiz.quorum"), q, setup.quorum, v => { setup.quorum = v; }), t("wiz.quorum_note", {q: setup.quorum, n: setup.copies})));
+      }
+    },
+    meta(body) {
+      body.append(h("p", "lede", t("wiz.meta_lede")));
+      body.append(field(t("wiz.log"), kindChoices(t("wiz.log"), setup.log, v => { setup.log = v; }), t("wiz.log_note")));
+      body.append(field(t("wiz.snapshots"), kindChoices(t("wiz.snapshots"), setup.snapshots, v => { setup.snapshots = v; }), t("wiz.snapshots_note")));
+      const every = h("input", "num");
+      Object.assign(every, {type: "number", min: 5, max: 1000, step: 5, value: setup.every});
+      every.addEventListener("change", () => { setup.every = Math.max(5, Math.min(1000, Math.round(+every.value) || 50)); every.value = setup.every; });
+      body.append(field(t("wiz.every"), every, t("wiz.every_note")));
+    },
+    bots(body) {
+      body.append(h("p", "lede", t("wiz.bots_lede")));
+      const b = Array.from({length: MAX_BOTS}, (_, i) => [i + 1, String(i + 1)]);
+      body.append(field(t("wiz.bots"), choices(t("wiz.bots"), b, setup.bots, v => { setup.bots = v; }), t("wiz.bots_note")));
+      body.append(field(t("wiz.pace"), choices(t("wiz.pace"), [["real", t("wiz.pace_real")], ["demo", t("wiz.pace_demo")]], setup.pace, v => { setup.pace = v; }), t(`wiz.pace_${setup.pace}_note`)));
+      const kinds = [...new Set([...setup.channels, setup.log, setup.snapshots])];
+      const rows = h("ul", "rates");
+      for (const k of kinds) rows.append(h("li", "", t("wiz.rate", {app: appOf(k), n: perMinute(k, setup.pace) * setup.bots})));
+      body.append(rows);
+    },
+    review(body) {
+      body.append(h("p", "lede", t("wiz.review_lede")));
+      const text = h("textarea", "toml");
+      text.wrap = "off";
+      Object.assign(text, {spellcheck: false, value: edited ?? tomlOf(setup)});
+      text.setAttribute("aria-label", "pigeonhole.toml");
+      text.addEventListener("input", () => { edited = text.value; });
+      body.append(text, h("p", "error", ""));
+    },
+  };
+
+  function copiesNote(w) {
+    const n = w.channels.length, shards = n / w.copies;
+    if (n === 1) return t("wiz.one_channel");
+    if (w.copies === n) return t("wiz.all_copies", {n});
+    if (w.copies === 1) return t("wiz.all_shards", {n});
+    return t("wiz.mixed", {shards, copies: w.copies});
+  }
+  function fitCopies() {
+    const n = setup.channels.length;
+    if (n % setup.copies) {
+      setup.copies = Math.max(...divisors(n).filter(d => d <= setup.copies));
+      setup.quorum = setup.copies;
+    }
+  }
+
+  function renderWizard() {
+    const name = STEPS[step];
+    $("panel-title").textContent = t(`wiz.title_${name}`);
+    $("panel-sub").textContent = t("wiz.step", {n: step + 1, of: STEPS.length});
+    const body = $("panel-body");
+    body.replaceChildren();
+    const steps = h("ol", "wiz-steps");
+    STEPS.forEach((x, i) => {
+      const li = h("li", i === step ? "now" : i < step ? "done" : "", t(`wiz.short_${x}`));
+      if (i === step) li.setAttribute("aria-current", "step");
+      steps.append(li);
+    });
+    body.append(steps);
+    stepBody[name](body);
+    const nav = h("div", "row wiz-nav");
+    if (step > 0) {
+      const back = h("button", "btn", t("wiz.back"));
+      back.type = "button";
+      back.addEventListener("click", () => { step--; renderWizard(); });
+      nav.append(back);
+    }
+    const next = h("button", "btn primary", step === STEPS.length - 1 ? t("wiz.start") : t("wiz.next"));
+    next.type = "button";
+    next.addEventListener("click", () => {
+      if (step < STEPS.length - 1) { step++; if (STEPS[step] === "review") edited = null; renderWizard(); }
+      else startFromWizard(body.querySelector("textarea").value, body.querySelector(".error"), next);
+    });
+    nav.append(next);
+    body.append(nav);
+    redrawSketch();
+  }
+
+  function openWizard() {
+    state.wizard = true;
+    $("loft").classList.add("zoomed", "wizard");
+    $("panel").hidden = false;
+    $("panel-close").hidden = true;
+    renderWizard();
+    caption(t("wiz.caption"));
+  }
+
+  async function startFromWizard(text, error, button) {
+    button.disabled = true;
+    error.textContent = "";
+    const t0 = performance.now();
+    const booted = await call({op: "open", config: text});
+    const ms = performance.now() - t0;
+    if (booted.reply?.error) {
+      error.textContent = booted.reply.error;
+      button.disabled = false;
+      return;
+    }
+    state.config = text;
+    state.wizard = false;
+    $("loft").classList.remove("zoomed", "wizard");
+    $("panel").hidden = true;
+    $("panel-close").hidden = false;
+    await firstBoot(booted.reply, booted.events);
+    ready(ms);
+  }
+
+  // The first boot, as it happens: the client, the node, each channel it
+  // opens, then the posts of its start (the log's claim).
+  const pause = ms => new Promise(r => setTimeout(r, reduced ? 0 : ms));
+  async function firstBoot(reply, events) {
+    await loadChannels();
+    await refreshObjects();
+    // Empty channels: the boot's own posts fill them in, as they fly.
+    for (const c of state.channels) { c.total = 0; c.messages = []; }
+    draw();
+    graph.classList.add("booting");
+    const reveal = id => {
+      nodes[id]?.g.classList.add("up");
+      const e = edges[id];
+      if (e && !reduced) {
+        const len = e.getTotalLength();
+        e.style.strokeDasharray = `${len}`;
+        e.style.strokeDashoffset = `${len}`;
+        requestAnimationFrame(() => e.classList.add("up"));
+      } else e?.classList.add("up");
+    };
+    reveal("client");
+    caption(t("boot.client"));
+    await pause(500);
+    reveal("loft");
+    caption(t("boot.node"));
+    await pause(600);
+    for (const c of state.channels) {
+      reveal(c.store);
+      caption(t(`boot.${c.role}`, {store: esc(c.store), app: appOf(c.kind), bots: t("demo.bots", {n: c.bots || 1})}));
+      await pause(450);
+    }
+    graph.classList.remove("booting");
+    for (const e of Object.values(edges)) { e.style.strokeDasharray = ""; e.style.strokeDashoffset = ""; }
+    apply(events || []);
+    const claim = (events || []).find(l => l.fields?.message === "claimed the metadata log");
+    if (claim) caption(t("boot.claimed", {gen: claim.fields.generation, store: esc(state.channels.find(c => c.role === "log")?.store || "")}));
+    await flying;
+    await pause(1200);
+    caption(t("demo.first_caption"));
+    loadLog();
+  }
+
+  function ready(ms) {
+    $("status").textContent = `${t("try.ready", {ms: Math.round(ms)})} ${state.persistent ? t("try.kept") : t("try.not_kept")}`;
+  }
+
   // ------------------------------------------------------------ start
   async function boot(reply, events) {
     await loadChannels();
@@ -709,11 +1030,16 @@
     state.demo = data.reply.demo;
     state.config = data.reply.config;
     state.persistent = data.reply.persistent;
+    if (!data.reply.saved) {
+      $("status").textContent = t("wiz.status");
+      openWizard();
+      return;
+    }
     const t0 = performance.now();
     const booted = await call({op: "open"});
     if (booted.reply?.error) { $("status").textContent = t("try.error", {error: booted.reply.error}); return; }
     await boot(booted.reply);
     $("status").textContent = `${t("try.ready", {ms: Math.round(performance.now() - t0)})} ${state.persistent ? t("try.kept") : t("try.not_kept")}${data.reply.why ? ` (${data.reply.why})` : ""}`;
-    caption(data.reply.saved ? t("say.welcome_back", {n: booted.reply.replayed}) : t("demo.first_caption"));
+    caption(t("say.welcome_back", {n: booted.reply.replayed}));
   });
 })();
