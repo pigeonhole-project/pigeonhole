@@ -124,6 +124,30 @@ fn pool(session: &Arc<FileSession>, api_id: i32, updates: bool) -> (Pool, Option
 /// Raw MTProto updates as the connections receive them.
 pub type UpdatesRx = tokio::sync::mpsc::Receiver<grammers_session::updates::UpdatesLike>;
 
+/// The new channel posts in `update`: `(channel id, message id)` of each
+/// `updateNewChannelMessage` (the channel id without the `-100`).
+pub fn new_channel_posts(update: &grammers_session::updates::UpdatesLike) -> Vec<(i64, i64)> {
+    let grammers_session::updates::UpdatesLike::Updates(u) = update else { return Vec::new() };
+    let list: &[enums::Update] = match u {
+        enums::Updates::Updates(u) => &u.updates,
+        enums::Updates::Combined(u) => &u.updates,
+        enums::Updates::UpdateShort(u) => std::slice::from_ref(&u.update),
+        _ => return Vec::new(),
+    };
+    list.iter()
+        .filter_map(|up| match up {
+            enums::Update::NewChannelMessage(n) => match &n.message {
+                enums::Message::Message(m) => match &m.peer_id {
+                    enums::Peer::Channel(c) => Some((c.channel_id, i64::from(m.id))),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 impl TelegramMtproto {
     /// Log in as the bot of `cfg.bot_token`, reusing the session's auth key
     /// when it belongs to that bot.

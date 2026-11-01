@@ -408,7 +408,7 @@ impl Config {
             .as_deref()
             .context("[chunk] store is required: the [[store]] or [[replicas]] id chunks go to")?;
         let (instances, placement) = topology.blob_placement(blob_store)?;
-        let cluster = file.cluster.into_settings(file.node, &mut topology)?;
+        let cluster = file.cluster.into_settings(file.node)?;
         topology.check_all_used()?;
         check_block_size_against_instances(block_size, &instances)?;
 
@@ -1744,27 +1744,27 @@ max_batch_total_size = "8 MiB"
 
     #[test]
     fn a_cluster_of_grpc_nodes_and_one_on_the_chat() {
-        use crate::cluster::Link;
+        use crate::cluster::{ChatSettings, Link};
         set_env("PH_TEST_CLUSTER_KEY", KEY);
-        set_env("PH_TEST_TGM_TOKEN", "42:secret");
+        set_env("PH_TEST_RAFT_BOT_A", "51:secret");
+        set_env("PH_TEST_RAFT_BOT_B", "52:secret");
         set_env("PH_TEST_TGM_API_ID", "12345");
         set_env("PH_TEST_TGM_API_HASH", "hash");
-        let outbox = |id: &str, chat: i64| tgm_store(id, chat);
-        let toml = format!(
-            "[cluster]\nnode = 2\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n\
-             [[node]]\nid = 1\ngrpc = \"10.0.0.1:7001\"\noutbox = \"o1\"\n\
-             [[node]]\nid = 2\ngrpc = \"10.0.0.2:7001\"\noutbox = \"o2\"\n\
-             [[node]]\nid = 3\noutbox = \"o3\"\n{}{}{}",
-            outbox("o1", -1001),
-            outbox("o2", -1002),
-            outbox("o3", -1003)
-        );
-        let cfg = load_mem(&toml).unwrap();
-        let cluster = cfg.cluster.unwrap();
-        assert_eq!((cluster.node, cluster.id, cluster.key[0], cluster.key[31]), (2, 9, 0x00, 0xff));
-        assert_eq!(cluster.links(), [(1, Link::Grpc), (3, Link::Chat)].into());
-        // A Telegram link sets the pace of the whole cluster.
-        assert_eq!((cluster.heartbeat, cluster.election_timeout.0), (Duration::from_secs(10), Duration::from_secs(45)));
+        let cluster = "[cluster]\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n\
+             bot_token_envs = [\"PH_TEST_RAFT_BOT_A\", \"PH_TEST_RAFT_BOT_B\"]\n\
+             api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n";
+        let nodes = "[[node]]\nid = 1\ngrpc = \"10.0.0.1:7001\"\noutbox = -1001\n\
+             [[node]]\nid = 2\ngrpc = \"10.0.0.2:7001\"\noutbox = -1002\n\
+             [[node]]\nid = 3\noutbox = -1003\n";
+        let on = |node: u64| load_mem(&format!("{cluster}node = {node}\n{nodes}")).unwrap().cluster.unwrap();
+        let two = on(2);
+        assert_eq!((two.node, two.id, two.key[0], two.key[31]), (2, 9, 0x00, 0xff));
+        assert_eq!(two.links(), [(1, Link::Grpc), (3, Link::Chat)].into());
+        let Some(ChatSettings::Telegram { logins }) = &two.chat else { panic!("node 2 has a chat link") };
+        assert_eq!(logins.iter().map(|l| l.bot_token.as_str()).collect::<Vec<_>>(), ["51:secret", "52:secret"]);
+        // A chat link sets the pace of the whole cluster.
+        assert_eq!((two.heartbeat, two.election_timeout.0), (Duration::from_secs(10), Duration::from_secs(45)));
+        assert_eq!(on(3).links(), [(1, Link::Chat), (2, Link::Chat)].into());
     }
 
     #[test]

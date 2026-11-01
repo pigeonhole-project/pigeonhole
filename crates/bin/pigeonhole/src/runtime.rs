@@ -204,7 +204,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     };
     let meta = match &cfg.cluster {
         None => MetaStore::open(log.clone(), snapshots, namespaces, opts).await,
-        Some(cluster) => open_node(cluster, log.clone(), snapshots, namespaces, opts).await,
+        Some(cluster) => open_node(cfg, cluster, log.clone(), snapshots, namespaces, opts).await,
     }
     .context("boot metadata tablet")?;
     let blob_db = BlobDb::open(meta.clone()).await.context("open chunk metadata")?;
@@ -225,8 +225,10 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
 }
 
 /// The tablet as node `cluster.node` of its cluster: Raft over gRPC to the
-/// other nodes, served on this node's `grpc` address.
+/// nodes both have an address for, over the chat (Telegram outboxes) to the
+/// others (docs/raft-over-chat.md § Transports).
 async fn open_node(
+    cfg: &Config,
     cluster: &ClusterSettings,
     log: Arc<dyn LogStore>,
     snapshots: Arc<dyn SnapshotStore>,
@@ -236,29 +238,91 @@ async fn open_node(
     use pigeonhole::config::cluster::Link;
     use pigeonhole_meta::raft::TypeConfig;
     use pigeonhole_meta::{Cluster, Serve};
-    if let Some((peer, _)) = cluster.links().into_iter().find(|(_, l)| *l == Link::Chat) {
-        anyhow::bail!("[[node]] {peer} is reached over the chat: this build has no chat mailbox yet; give both `grpc`");
-    }
     let me = cluster.me();
-    let addr = me.grpc.as_deref().context("this [[node]] has no `grpc` address to serve Raft on")?;
-    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind Raft gRPC {addr}"))?;
-    let peers = cluster.nodes.iter().filter(|n| n.id != me.id).filter_map(|n| Some((n.id, n.grpc.clone()?))).collect();
+    let links = cluster.links();
+    let via_chat: std::collections::HashSet<u64> =
+        links.iter().filter(|(_, l)| **l == Link::Chat).map(|(id, _)| *id).collect();
+    let grpc_peers = cluster
+        .nodes
+        .iter()
+        .filter(|n| n.id != me.id && !via_chat.contains(&n.id))
+        .filter_map(|n| Some((n.id, n.grpc.clone()?)))
+        .collect();
     let identity = openraft_grpc::Identity { me: me.id, cluster: cluster.id, key: cluster.key };
-    let network = openraft_grpc::GrpcNetwork::<TypeConfig>::new(identity.clone(), peers);
-    info!(node = me.id, %addr, nodes = cluster.nodes.len(), "a node of a Raft cluster over gRPC");
+    let grpc = openraft_grpc::GrpcNetwork::<TypeConfig>::new(identity.clone(), grpc_peers);
+    let listener = match &me.grpc {
+        Some(addr) => {
+            Some(tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind Raft gRPC {addr}"))?)
+        }
+        None => None,
+    };
+    let chat = chat_network(cfg, cluster, &via_chat).await?;
+    info!(node = me.id, grpc = ?me.grpc, chat_peers = ?via_chat, nodes = cluster.nodes.len(), "a node of a Raft cluster");
+    let serving = chat.clone();
     let serve: Serve = Box::new(move |raft| {
         Box::pin(async move {
-            tokio::spawn(async move {
-                if let Err(e) = openraft_grpc::serve::<TypeConfig>(listener, identity, Arc::new(raft)).await {
-                    tracing::error!(error = %format!("{e:#}"), "Raft gRPC server stopped");
-                }
-            });
+            let raft = Arc::new(raft);
+            if let Some(listener) = listener {
+                let raft = raft.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = openraft_grpc::serve::<TypeConfig>(listener, identity, raft).await {
+                        tracing::error!(error = %format!("{e:#}"), "Raft gRPC server stopped");
+                    }
+                });
+            }
+            serving.serve(raft).await;
         })
     });
+    let network = openraft_grpc::Mixed { a: grpc, b: chat, via_b: via_chat };
     let members = cluster.nodes.iter().map(|n| n.id).collect();
     let opts = MetaOptions { heartbeat: cluster.heartbeat, election_timeout: cluster.election_timeout, ..opts };
     let cluster = Cluster { node: me.id, members, network, serve: Some(serve) };
     MetaStore::open_in(log, snapshots, namespaces, opts, cluster).await
+}
+
+/// The chat side of the node's network: its outbox and the outboxes of the
+/// peers in `peers`, each a Telegram channel read through this node's bots
+/// and woken by the posts Telegram pushes. No peers: an idle network.
+async fn chat_network(
+    cfg: &Config,
+    cluster: &ClusterSettings,
+    peers: &std::collections::HashSet<u64>,
+) -> anyhow::Result<openraft_chat::ChatNetwork<pigeonhole_meta::raft::TypeConfig>> {
+    use openraft_chat::FakeChat;
+    use pigeonhole::config::cluster::ChatSettings;
+    let settings =
+        openraft_chat::Settings { cluster: cluster.id, key: cluster.key, tick: cluster.tick, poll: cluster.poll };
+    let me = cluster.me();
+    let Some(ChatSettings::Telegram { logins }) = (!peers.is_empty()).then_some(cluster.chat.as_ref()).flatten() else {
+        let idle = FakeChat::new();
+        return Ok(openraft_chat::ChatNetwork::new(me.id, settings, idle.mailbox(me.id, me.id), Default::default()));
+    };
+    let outbox = |node: u64| -> anyhow::Result<i64> {
+        let n = cluster.nodes.iter().find(|n| n.id == node).expect("a member");
+        n.outbox.with_context(|| format!("[[node]] {node} has no outbox"))
+    };
+    let own = telegram_outbox(cfg, logins, outbox(me.id)?).await?;
+    let mut others = std::collections::HashMap::new();
+    for &peer in peers {
+        others.insert(peer, telegram_outbox(cfg, logins, outbox(peer)?).await?);
+    }
+    Ok(openraft_chat::ChatNetwork::new(me.id, settings, own, others))
+}
+
+/// Raft outbox `chat` through `logins`' bots, woken by its pushed posts.
+async fn telegram_outbox(
+    cfg: &Config,
+    logins: &[TelegramLogin],
+    chat: i64,
+) -> anyhow::Result<Arc<dyn openraft_chat::Mailbox>> {
+    use pigeonhole::raft_mailbox::TelegramMailbox;
+    let channel = telegram_channel(cfg, logins, &chat.to_string(), Lane::Meta)
+        .await
+        .with_context(|| format!("Raft outbox {chat}"))?;
+    let mailbox = Arc::new(TelegramMailbox::new(Arc::new(channel)));
+    let pushed = mailbox.clone();
+    channel_log::on_post(pigeonhole::telegram::channel_id_of(chat)?, move |id| pushed.seen(id));
+    Ok(mailbox)
 }
 
 async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {

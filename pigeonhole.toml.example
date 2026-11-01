@@ -248,3 +248,11 @@ every = "5s"                  # how often the tablet's gauges are set
 # [[node]]
 # id = 3
 # grpc = "10.0.0.3:7001"
+#
+# A node with only a Telegram channel: give each node an outbox, and the
+# nodes that talk to it the chat's bots (their tokens per host):
+# [cluster]
+# bot_token_envs = ["RAFT_BOT_TOKEN"]
+# [[node]]
+# id = 3
+# outbox = -1003333333333
