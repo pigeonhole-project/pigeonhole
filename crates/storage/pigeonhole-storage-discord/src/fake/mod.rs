@@ -2,6 +2,7 @@
 //! ([`state`]). Its state lives in a host: in memory for tests
 //! ([`FakeDiscord::new`]), or wherever `pigeonhole-fake-channels` keeps it.
 
+pub mod bot;
 pub mod state;
 
 use crate::api::{CdnStale, DcMessage, DiscordApi, ThreadStart};

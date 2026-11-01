@@ -4,7 +4,7 @@
 use crate::World;
 use anyhow::Result;
 use pigeonhole_config::instances::InstanceKind;
-use pigeonhole_config::stores::FakeBacking;
+use pigeonhole_config::stores::{FakeBacking, FakeChannel};
 use pigeonhole_config::{Config, LogSettings, SnapshotSettings};
 use pigeonhole_storage_api::fake::FakeHost;
 use pigeonhole_storage_discord::fake::state::{DiscordChannelState, Message as DcMessage};
@@ -20,6 +20,33 @@ pub struct ChannelRef {
     pub kind: InstanceKind,
     pub scope: String,
     pub backing: FakeBacking,
+    /// How many bots post to it.
+    pub bots: usize,
+    /// A data channel's place: its shard of how many, its copy of how many.
+    pub place: Option<Place>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub shard: usize,
+    pub shards: usize,
+    pub copy: usize,
+    pub copies: usize,
+}
+
+impl ChannelRef {
+    fn of(f: FakeChannel, role: &'static str) -> Self {
+        Self { store: f.id, role, kind: f.kind, scope: f.scope, backing: f.backing, bots: f.bots, place: None }
+    }
+}
+
+/// Where store `id` sits in `[chunk] store`'s placement.
+fn place(cfg: &Config, id: &str) -> Option<Place> {
+    let shards = &cfg.placement.shards;
+    shards.iter().enumerate().find_map(|(shard, s)| {
+        let copy = s.group.iter().position(|m| m == id)?;
+        Some(Place { shard, shards: shards.len(), copy, copies: s.group.len() })
+    })
 }
 
 /// Every fake channel `cfg` uses.
@@ -28,33 +55,15 @@ pub fn of(cfg: &Config) -> Vec<ChannelRef> {
         .instances
         .iter()
         .filter_map(|i| {
-            let backing = i.fake.clone()?;
-            Some(ChannelRef {
-                store: i.info.id.clone(),
-                role: "data",
-                kind: i.kind,
-                scope: i.scope_id.clone(),
-                backing,
-            })
+            let f = i.fake.clone()?;
+            Some(ChannelRef { place: place(cfg, &f.id), ..ChannelRef::of(f, "data") })
         })
         .collect();
-    if let LogSettings::Fake { kind, scope, backing } = &cfg.meta.log {
-        out.push(ChannelRef {
-            store: "meta-log".into(),
-            role: "log",
-            kind: *kind,
-            scope: scope.clone(),
-            backing: backing.clone(),
-        });
+    if let LogSettings::Fake(f) = &cfg.meta.log {
+        out.push(ChannelRef::of(f.clone(), "log"));
     }
-    if let SnapshotSettings::Fake { kind, scope, backing } = &cfg.meta.snapshot {
-        out.push(ChannelRef {
-            store: "meta-snapshots".into(),
-            role: "snapshots",
-            kind: *kind,
-            scope: scope.clone(),
-            backing: backing.clone(),
-        });
+    if let SnapshotSettings::Fake(f) = &cfg.meta.snapshot {
+        out.push(ChannelRef::of(f.clone(), "snapshots"));
     }
     out
 }
@@ -151,8 +160,18 @@ impl World {
             }
             _ => (0, Vec::new()),
         };
-        Ok(
-            json!({ "store": c.store, "role": c.role, "kind": c.kind.as_str(), "scope": c.scope, "total": total, "messages": messages }),
-        )
+        let place =
+            c.place.map(|p| json!({ "shard": p.shard, "shards": p.shards, "copy": p.copy, "copies": p.copies }));
+        Ok(json!({
+            "store": c.store,
+            "role": c.role,
+            "kind": c.kind.as_str(),
+            "scope": c.scope,
+            "bots": c.bots,
+            "down": self.is_down(c),
+            "place": place,
+            "total": total,
+            "messages": messages,
+        }))
     }
 }

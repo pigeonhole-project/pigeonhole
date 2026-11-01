@@ -47,6 +47,8 @@
     open: null,            // the node whose panel is open
     logView: "readable",   // the log panel: "readable" or "channel"
     busy: false,
+    wizard: false,         // the first visit's setup is on screen
+    bg: null,              // what runs in the background: {repair: {queue, every_ms, next_ms}, snapshot}
   };
   const byStore = () => Object.fromEntries(state.channels.map(c => [c.store, c]));
   // The open panel is the log's (it opens by the log channel's id).
@@ -97,21 +99,117 @@
     const loft = node("loft", pos.loft, "pigeonhole", t("demo.loft_role"));
     dovecote(loft.g);
     loft.label(0, 100);
+    // The repair clock: the arc fills up to the next background pass.
+    const clock = s("g", {class: "clock", transform: "translate(92,-96)"}, loft.g);
+    s("circle", {class: "clock-face", r: 13}, clock);
+    loft.arc = s("circle", {class: "clock-arc", r: 13, pathLength: 100, transform: "rotate(-90)"}, clock);
+    loft.clockText = s("text", {class: "clock-text", y: 4, "text-anchor": "middle"}, clock);
+    const clockTip = s("title", {}, clock);
+    clockTip.textContent = t("demo.clock_tip");
 
     for (const c of state.channels) {
       const app = c.kind === "telegram" ? "Telegram" : "Discord";
-      const role = t(`demo.role_${c.role}`, {app});
+      const bots = c.bots > 1 ? `, ${t("demo.bots", {n: c.bots})}` : "";
+      const role = placeNote(c, app) + bots + (c.down ? `, ${t("demo.down")}` : "");
       const n = node(c.store, pos[c.store], c.store, role);
+      n.g.classList.toggle("down", !!c.down);
       s("rect", {class: "shape", x: -130, y: -34, width: 260, height: 68, rx: 14}, n.g);
       s("circle", {class: "badge", cx: -106, cy: 0, r: 9, fill: c.kind === "telegram" ? "var(--tg)" : "var(--dc)"}, n.g);
       n.label(-88, 0, "start");
       // The channel's message count, top right.
       n.count = s("text", {class: "count", x: 116, y: -10, "text-anchor": "end"}, n.g);
+      // Repair jobs waiting for this channel: a square each, under the card.
+      n.queue = s("g", {class: "queue", transform: "translate(-118,46)"}, n.g);
+      if (c.total == null) continue;    // a sketch: nothing posted yet
       n.count.textContent = String(c.total);
       const tip = s("title", {}, n.g);
       tip.textContent = t("demo.messages", {n: c.total});
     }
     markOpen();
+    renderBackground();
+  }
+
+  // What runs in the background, on the graph: each channel's queued
+  // repairs, the clock of the next pass; in the loft's panel, the list.
+  function renderBackground() {
+    const bg = state.bg;
+    if (!bg) return;
+    const byChannel = {};
+    for (const j of bg.repair.queue) (byChannel[j.store] ||= []).push(j);
+    for (const c of state.channels) {
+      const n = nodes[c.store];
+      if (!n?.queue) continue;
+      const jobs = byChannel[c.store] || [];
+      n.queue.replaceChildren();
+      jobs.slice(0, 12).forEach((j, i) => {
+        const sq = s("rect", {class: "job", x: i * 14, y: 0, width: 10, height: 10, rx: 2}, n.queue);
+        s("title", {}, sq).textContent = t("demo.job", {chunk: j.chunk, store: c.store});
+      });
+      if (jobs.length > 12) s("text", {class: "job-more", x: 12 * 14 + 2, y: 9}, n.queue).textContent = `+${jobs.length - 12}`;
+    }
+    const loft = nodes.loft;
+    if (loft?.arc) {
+      const left = bg.repair.next_ms / bg.repair.every_ms;
+      loft.arc.style.strokeDashoffset = String(Math.round(100 * left));
+      loft.clockText.textContent = String(Math.ceil(bg.repair.next_ms / 1000));
+      loft.g.classList.toggle("queued", bg.repair.queue.length > 0);
+    }
+    if (state.open === "loft") renderBgPanel();
+  }
+
+  function renderBgPanel() {
+    const box = $("bg"), bg = state.bg;
+    if (!box || !bg) return;
+    box.replaceChildren();
+    const rep = h("div", "bg-row");
+    const sec = Math.ceil(bg.repair.next_ms / 1000);
+    rep.append(h("div", "bg-label", t("demo.bg_repair", {n: bg.repair.queue.length, s: sec})));
+    const bar = h("div", "meter");
+    const fill = h("div", "fill");
+    fill.style.width = `${100 * (1 - bg.repair.next_ms / bg.repair.every_ms)}%`;
+    bar.append(fill);
+    rep.append(bar);
+    const jobs = h("ol", "jobs");
+    for (const j of bg.repair.queue) {
+      const c = byStore()[j.store];
+      const li = h("li", "job-tile " + (c?.kind || ""), t("demo.job", {chunk: j.chunk, store: j.store}));
+      jobs.append(li);
+    }
+    if (!bg.repair.queue.length) jobs.append(h("li", "empty", t("demo.bg_queue_empty")));
+    rep.append(jobs);
+    box.append(rep);
+    const sn = bg.snapshot;
+    if (sn.every) {
+      const row = h("div", "bg-row");
+      const done = sn.head - sn.base;
+      row.append(h("div", "bg-label", t("demo.bg_snapshot", {n: Math.max(0, sn.every - done), at: sn.base})));
+      const b = h("div", "meter");
+      const f = h("div", "fill amethyst");
+      f.style.width = `${Math.min(100, (100 * done) / sn.every)}%`;
+      b.append(f);
+      row.append(b);
+      box.append(row);
+    }
+  }
+
+  // Poll the background while idle; the worker lets it run between calls.
+  setInterval(async () => {
+    if (state.busy || state.wizard || !nodes.loft) return;
+    const {reply} = await call({op: "background"});
+    if (reply && !reply.error) {
+      state.bg = reply;
+      renderBackground();
+    }
+  }, 1000);
+
+  // What a channel is for; a data channel, its place among the others.
+  function placeNote(c, app) {
+    const p = c.place;
+    if (c.role !== "data" || !p || (p.shards === 1 && p.copies === 1)) return t(`demo.role_${c.role}`, {app});
+    const shard = String.fromCharCode(65 + p.shard);
+    if (p.shards > 1 && p.copies > 1) return t("wiz.note_shard_copy", {app, shard, copy: p.copy + 1});
+    if (p.copies > 1) return t("wiz.note_copy", {app, copy: p.copy + 1, n: p.copies});
+    return t("wiz.note_shard", {app, shard});
   }
 
   // A pigeon tower: a round body narrowing upward, a cone roof with a lantern
@@ -160,7 +258,7 @@
   // A pigeon: a dot along an edge, from the loft to a channel or back.
   const flights = [];
   let flying = Promise.resolve();
-  function fly(store, back, size) {
+  function fly(store, back, size, failed = false) {
     const path = edges[store];
     if (!path) return Promise.resolve();
     if (reduced) return Promise.resolve();
@@ -169,13 +267,14 @@
     return start.then(() => new Promise(done => {
       // A small pigeon, wings beating; bigger for bigger payloads.
       const scale = 0.9 + Math.min(1, Math.log2(1 + size / 4096) / 10);
-      const bird = s("g", {class: "flight"}, graph);
+      const bird = s("g", {class: "flight" + (failed ? " failed" : "")}, graph);
       const body = s("path", {fill: "url(#iris)", d: BIRD}, bird);
       const len = path.getTotalLength(), t0 = performance.now(), dur = 680;
       flights.push(bird);
       const step = now => {
         const k = Math.min(1, (now - t0) / dur), e = k < .5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
-        const at = len * (back ? 1 - e : e);
+        // A failed call reaches the channel and turns back.
+        const at = failed ? len * 0.92 * (1 - Math.abs(1 - 2 * e)) : len * (back ? 1 - e : e);
         const pt = path.getPointAtLength(at), ahead = path.getPointAtLength(Math.min(len, Math.max(0, at + (back ? -1 : 1))));
         const flip = ahead.x < pt.x ? -1 : 1;
         const flap = 0.55 + 0.45 * Math.abs(Math.sin((now - t0) / 55));
@@ -222,6 +321,12 @@
         if (state.open === f.store) renderPanel();
       } else if (msg === "store call" && span?.op === "get" && stores[span.instance]) {
         fly(span.instance, true, +span.bytes || 4096);
+      } else if (msg === "store call" && span?.op === "exists" && stores[span.instance]) {
+        fly(span.instance, true, 512);
+      } else if (msg === "store call failed" && stores[span?.instance]) {
+        fly(span.instance, false, 2048, true);
+      } else if (msg === "repair pass" && +f.repaired > 0) {
+        said.push({op: "RepairPass", n: +f.repaired});
       } else if ((line.target || "").startsWith("pigeonhole_gateway_s3") && msg.endsWith(" ok")) {
         said.push({op: msg.slice(0, -3), ...f});
       }
@@ -250,6 +355,7 @@
     if (op.op === "CopyObject") return t("say.CopyObject", {key, chunks: t("chunks", {n: +op.extents})});
     if (op.op === "DeleteObject") return t("say.DeleteObject", {key});
     if (op.op === "Snapshot") return t("say.snapshot", {at: op.at});
+    if (op.op === "RepairPass") return t("say.repair_pass", {n: op.n});
     return "";
   }
   function caption(html) {
@@ -261,6 +367,12 @@
     const said = apply(events);
     const snap = said.find(x => x.op === "Snapshot");
     if (snap) caption(t("say.snapshot", {at: snap.at}));
+    const pass = said.find(x => x.op === "RepairPass");
+    if (pass) {
+      caption(t("say.repair_pass", {n: pass.n}));
+      await flying;
+      await refreshChannels();
+    }
     await flying;
     if (snap && (state.open === "loft" || logOpen())) {
       await loadLog();
@@ -274,7 +386,10 @@
     for (const c of state.channels) for (const m of c.messages) m.fresh = false;
     const data = await call(request, body);
     const said = apply(data.events);
-    if (data.reply?.error) caption(`<b>${esc(t("try.error", {error: data.reply.error}))}</b>`);
+    if (data.reply?.error && state.channels.some(c => c.down)) {
+      caption(t(request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: esc(data.reply.error)}));
+    }
+    else if (data.reply?.error) caption(`<b>${esc(t("try.error", {error: data.reply.error}))}</b>`);
     else if (said.length) caption(sentence(said.at(-1)));
     await flying;
     await refreshObjects();
@@ -317,6 +432,7 @@
 
   // ------------------------------------------------------------ panels
   function openPanel(id) {
+    if (state.wizard) return;
     state.open = id;
     $("loft").classList.add("zoomed");
     $("panel").hidden = false;
@@ -362,8 +478,51 @@
       const app = c.kind === "telegram" ? "Telegram" : "Discord";
       $("panel-title").textContent = c.store;
       $("panel-sub").textContent = t(`demo.channel_sub_${c.role}`, {app, scope: c.scope});
-      body.replaceChildren(feed(c));
+      body.replaceChildren(...(c.role === "data" ? [faults(c)] : []), feed(c));
     }
+  }
+
+  // Breaking a data channel: down (every call fails), cleared (its messages
+  // gone behind the node's back); check finds what is gone, repair puts it back.
+  function faults(c) {
+    const box = h("div", "faults");
+    box.append(h("p", "faults-note", t(c.down ? "demo.fault_down_note" : "demo.fault_note")));
+    const row = h("div", "row");
+    const btn = (label, cls, fn) => {
+      const b = h("button", `btn ${cls}`, label);
+      b.type = "button";
+      b.addEventListener("click", fn);
+      row.append(b);
+    };
+    const store = esc(c.store);
+    btn(t(c.down ? "demo.bring_back" : "demo.take_down"), c.down ? "primary" : "", async () => {
+      const r = await op({op: "outage", store: c.store, down: !c.down});
+      if (r && !r.error) caption(t(r.down ? "say.down" : "say.up", {store}));
+      await refreshChannels();
+    });
+    btn(t("demo.wipe"), "danger", async () => {
+      const r = await op({op: "wipe", store: c.store});
+      if (r && !r.error) caption(t("say.wiped", {store, n: r.deleted}));
+      await refreshChannels();
+    });
+    btn(t("demo.verify"), "", async () => {
+      const r = await op({op: "verify", store: c.store});
+      if (r && !r.error) caption(t(r.gone ? "say.verified" : "say.verified_ok", {store, checked: r.checked, gone: r.gone}));
+    });
+    btn(t("demo.repair"), "", async () => {
+      const r = await op({op: "repair"});
+      if (r && !r.error) caption(t("say.repair", {n: r.repaired}));
+      await refreshChannels();
+    });
+    box.append(row);
+    return box;
+  }
+
+  // The channels as they are now (a fault changes them behind the events).
+  async function refreshChannels() {
+    await loadChannels();
+    draw();
+    renderPanel();
   }
 
   // A channel as its app shows it: Telegram's channel view, Discord's text channel.
@@ -404,6 +563,27 @@
     return c.kind === "telegram" ? telegramView(c) : discordView(c);
   }
 
+  // A message anyone in the channel could delete, as in the app: a trash
+  // button on hover or focus, and the context menu (right click).
+  const ICON_TRASH = "M5 7h14M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3";
+  function deletable(el, c, m) {
+    const del = async () => {
+      if (!confirm(t("demo.delete_confirm"))) return;
+      const r = await op({op: "delete_message", store: c.store, message: String(m.id)});
+      if (r && !r.error) caption(t("say.deleted_one", {store: esc(c.store), name: esc(m.name || "")}));
+      await refreshChannels();
+    };
+    const b = h("button", "msg-del");
+    b.type = "button";
+    b.setAttribute("aria-label", t("demo.delete"));
+    b.title = t("demo.delete");
+    b.append(svgIcon(ICON_TRASH, "ic"));
+    b.addEventListener("click", del);
+    el.classList.add("deletable");
+    el.append(b);
+    el.addEventListener("contextmenu", e => { e.preventDefault(); del(); });
+  }
+
   function telegramView(c) {
     const app = h("div", "app tg");
     const head = h("div", "tg-head");
@@ -431,6 +611,7 @@
         b.append(doc);
       }
       if (m.log) b.append(h("div", "post-log", logLabel(m.log)));
+      if (c.role === "data" && !m.gone) deletable(b, c, m);
       const foot = h("div", "tg-meta");
       foot.append(svgIcon(ICON_EYE, "eye"), document.createTextNode("1"));
       const at = when(c, m);
@@ -480,6 +661,7 @@
       }
       if (m.log) body.append(h("div", "post-log", logLabel(m.log)));
       row.append(body);
+      if (c.role === "data" && !m.gone) deletable(row, c, m);
       chat.append(row);
       last = at;
     }
@@ -656,6 +838,7 @@
     counter(state.channels.filter(c => c.role === "data").length, t("demo.c_channels"));
     counter(state.log?.head ?? "…", t("demo.c_head"));
     counter(state.log?.base?.at ?? 0, t("demo.c_base"));
+    renderBgPanel();
     const editor = $("config-text");
     editor.value = state.config;
     $("config-reset").addEventListener("click", () => { editor.value = state.demo; $("config-error").textContent = ""; });
@@ -692,6 +875,314 @@
     setBusy(false);
   }
 
+  // ------------------------------------------------------------ the wizard
+  // The first visit: the setup step by step, the graph sketching it as it
+  // grows, then the pigeonhole.toml it makes. Start boots a node on it.
+  const setup = {channels: ["telegram", "discord"], copies: 2, quorum: 2, log: "telegram", snapshots: "telegram", every: 50, bots: 1, pace: "demo"};
+  const STEPS = ["channels", "copies", "meta", "bots", "review"];
+  const MAX_CHANNELS = 4, MAX_BOTS = 4;
+  let step = 0, edited = null;     // edited: the toml as the reader changed it
+  const appOf = k => (k === "telegram" ? "Telegram" : "Discord");
+  const divisors = n => Array.from({length: n}, (_, i) => i + 1).filter(d => n % d === 0);
+  // Sends a minute per bot and channel: the services' defaults, or the demo's.
+  const perMinute = (kind, pace) => (pace === "demo" ? 1200 : kind === "telegram" ? 18 : 60);
+
+  // Each data channel: its store id, chat id, which copy group it is in.
+  function dataChannels(w) {
+    const n = {telegram: 0, discord: 0};
+    return w.channels.map((kind, i) => {
+      const k = ++n[kind];
+      return {
+        id: `${kind === "telegram" ? "tg" : "dc"}-${k}`,
+        kind,
+        scope: kind === "telegram" ? `-100100000000${k}` : `100000000000000000${k}`,
+        group: Math.floor(i / w.copies),
+        copy: i % w.copies,
+      };
+    });
+  }
+  const metaStore = (kind, what) => ({
+    id: `${kind === "telegram" ? "tg" : "dc"}-${what}`,
+    kind,
+    scope: kind === "telegram" ? `-10010000001${what === "log" ? "01" : "02"}` : `10000000000000001${what === "log" ? "01" : "02"}`,
+  });
+
+  function tomlOf(w) {
+    const data = dataChannels(w), shards = w.channels.length / w.copies;
+    const store = (c, comment) => [
+      comment ? `# ${comment}` : null,
+      "[[store]]", `id = "${c.id}"`, `kind = "${c.kind}"`,
+      c.kind === "telegram" ? `chat_id = ${c.scope}` : `channel_id = ${c.scope}`,
+      'fake = "channel-data"', `bots = ${w.bots}`, "",
+    ].filter(x => x !== null);
+    const out = [...t("wiz.toml_head").split("\n").map(l => `# ${l}`), ""];
+    data.forEach((c, i) => out.push(...store(c, i === 0 ? t("wiz.toml_data") : null)));
+    let chunkStore;
+    if (w.copies === w.channels.length && w.copies > 1) {
+      out.push(`# ${t("wiz.toml_copies", {n: w.copies, q: w.quorum})}`, "[[replicas]]", 'id = "copies"',
+        `members = [${data.map(c => `"${c.id}"`).join(", ")}]`, `write_quorum = ${w.quorum}`, "");
+      chunkStore = "copies";
+    } else if (w.channels.length === 1) {
+      chunkStore = data[0].id;
+    } else {
+      const members = [];
+      if (w.copies === 1) members.push(...data.map(c => c.id));
+      else {
+        for (let g = 0; g < shards; g++) {
+          const id = `copies-${g + 1}`;
+          out.push("[[replicas]]", `id = "${id}"`, `members = [${data.filter(c => c.group === g).map(c => `"${c.id}"`).join(", ")}]`, `write_quorum = ${w.quorum}`, "");
+          members.push(id);
+        }
+      }
+      out.push(`# ${t("wiz.toml_shards", {n: shards})}`, "[[shards]]", 'id = "shards"', `members = [${members.map(m => `"${m}"`).join(", ")}]`, "");
+      chunkStore = "shards";
+    }
+    const log = metaStore(w.log, "log"), snaps = metaStore(w.snapshots, "snapshots");
+    out.push(...store(log, t("wiz.toml_meta")), ...store(snaps, null));
+    out.push(`# ${t("wiz.toml_disk")}`, "[[store]]", 'id = "channel-data"', 'kind = "local_disk"', 'path = "/data/channels"', "");
+    out.push("[meta]", `log = "${log.id}"`, `snapshot = "${snaps.id}"`, `snapshot_every_entries = ${w.every}`);
+    if (w.log === "discord") out.push(`# ${t("wiz.toml_lease")}`, 'lease = "5s"');
+    out.push("");
+    out.push("[chunk]", `store = "${chunkStore}"`, 'size = "4 MiB"', 'block_size = "1 MiB"', 'codec = "zstd"', "");
+    out.push("[inline]", 'max_object_size = "1 KiB"', "", "[cache]", "enabled = false", "");
+    out.push(`# ${t("wiz.toml_repair")}`, "[repair]", 'interval = "10s"', "");
+    if (w.pace === "demo") {
+      out.push(`# ${t("wiz.toml_fast")}`, "[telegram.send]", "rate_per_sec = 20.0", "burst = 20.0", "",
+        "[discord.send]", "rate_per_sec = 20.0", "burst = 20.0", "");
+    } else {
+      out.push(`# ${t("wiz.toml_real")}`, "");
+    }
+    return out.join("\n");
+  }
+
+  // The graph of the setup: its channels as they will be, nothing posted.
+  function sketch(w) {
+    const data = dataChannels(w), shards = w.channels.length / w.copies;
+    const chans = data.map(c => ({
+      store: c.id, role: "data", kind: c.kind, scope: c.scope, bots: w.bots, messages: [],
+      place: {shard: c.group, shards, copy: c.copy, copies: w.copies},
+    }));
+    const log = metaStore(w.log, "log"), snaps = metaStore(w.snapshots, "snapshots");
+    chans.push({store: log.id, role: "log", kind: log.kind, scope: log.scope, bots: w.bots, messages: []});
+    chans.push({store: snaps.id, role: "snapshots", kind: snaps.kind, scope: snaps.scope, bots: w.bots, messages: []});
+    return chans;
+  }
+
+  function redrawSketch() {
+    state.channels = sketch(setup);
+    draw();
+  }
+
+  // A row of choices, one of them on: radio buttons that look like a switch.
+  function choices(name, options, value, onPick) {
+    const row = h("div", "choices");
+    row.setAttribute("role", "radiogroup");
+    for (const [v, label] of options) {
+      const b = h("button", "choice", label);
+      b.type = "button";
+      b.setAttribute("role", "radio");
+      b.setAttribute("aria-checked", String(v === value));
+      b.addEventListener("click", () => { onPick(v); renderWizard(); });
+      row.append(b);
+    }
+    row.setAttribute("aria-label", name);
+    return row;
+  }
+  const field = (label, control, note) => {
+    const f = h("div", "field");
+    f.append(h("div", "field-label", label), control);
+    if (note) f.append(h("p", "field-note", note));
+    return f;
+  };
+  const kindChoices = (label, value, onPick) => choices(label, [["telegram", "Telegram"], ["discord", "Discord"]], value, onPick);
+
+  const stepBody = {
+    channels(body) {
+      body.append(h("p", "lede", t("wiz.channels_lede")));
+      setup.channels.forEach((kind, i) => {
+        const row = h("div", "chan-row");
+        row.append(h("span", "chan-n", t("wiz.channel_n", {n: i + 1})), kindChoices(t("wiz.channel_n", {n: i + 1}), kind, v => { setup.channels[i] = v; }));
+        if (setup.channels.length > 1) {
+          const x = h("button", "mini", t("wiz.remove"));
+          x.type = "button";
+          x.addEventListener("click", () => { setup.channels.splice(i, 1); fitCopies(); renderWizard(); });
+          row.append(x);
+        }
+        body.append(row);
+      });
+      if (setup.channels.length < MAX_CHANNELS) {
+        const add = h("button", "btn", t("wiz.add_channel"));
+        add.type = "button";
+        add.addEventListener("click", () => {
+          setup.channels.push(setup.channels.at(-1) === "telegram" ? "discord" : "telegram");
+          fitCopies();
+          renderWizard();
+        });
+        body.append(add);
+      }
+    },
+    copies(body) {
+      const n = setup.channels.length;
+      body.append(h("p", "lede", t("wiz.copies_lede")));
+      const opts = divisors(n).map(d => [d, String(d)]);
+      body.append(field(t("wiz.copies"), choices(t("wiz.copies"), opts, setup.copies, v => { setup.copies = v; setup.quorum = v; }), copiesNote(setup)));
+      if (setup.copies > 1) {
+        const q = Array.from({length: setup.copies}, (_, i) => [i + 1, String(i + 1)]);
+        body.append(field(t("wiz.quorum"), choices(t("wiz.quorum"), q, setup.quorum, v => { setup.quorum = v; }), t("wiz.quorum_note", {q: setup.quorum, n: setup.copies})));
+      }
+    },
+    meta(body) {
+      body.append(h("p", "lede", t("wiz.meta_lede")));
+      body.append(field(t("wiz.log"), kindChoices(t("wiz.log"), setup.log, v => { setup.log = v; }), t("wiz.log_note")));
+      body.append(field(t("wiz.snapshots"), kindChoices(t("wiz.snapshots"), setup.snapshots, v => { setup.snapshots = v; }), t("wiz.snapshots_note")));
+      const every = h("input", "num");
+      Object.assign(every, {type: "number", min: 5, max: 1000, step: 5, value: setup.every});
+      every.addEventListener("change", () => { setup.every = Math.max(5, Math.min(1000, Math.round(+every.value) || 50)); every.value = setup.every; });
+      body.append(field(t("wiz.every"), every, t("wiz.every_note")));
+    },
+    bots(body) {
+      body.append(h("p", "lede", t("wiz.bots_lede")));
+      const b = Array.from({length: MAX_BOTS}, (_, i) => [i + 1, String(i + 1)]);
+      body.append(field(t("wiz.bots"), choices(t("wiz.bots"), b, setup.bots, v => { setup.bots = v; }), t("wiz.bots_note")));
+      body.append(field(t("wiz.pace"), choices(t("wiz.pace"), [["real", t("wiz.pace_real")], ["demo", t("wiz.pace_demo")]], setup.pace, v => { setup.pace = v; }), t(`wiz.pace_${setup.pace}_note`)));
+      const kinds = [...new Set([...setup.channels, setup.log, setup.snapshots])];
+      const rows = h("ul", "rates");
+      for (const k of kinds) rows.append(h("li", "", t("wiz.rate", {app: appOf(k), n: perMinute(k, setup.pace) * setup.bots})));
+      body.append(rows);
+    },
+    review(body) {
+      body.append(h("p", "lede", t("wiz.review_lede")));
+      const text = h("textarea", "toml");
+      text.wrap = "off";
+      Object.assign(text, {spellcheck: false, value: edited ?? tomlOf(setup)});
+      text.setAttribute("aria-label", "pigeonhole.toml");
+      text.addEventListener("input", () => { edited = text.value; });
+      body.append(text, h("p", "error", ""));
+    },
+  };
+
+  function copiesNote(w) {
+    const n = w.channels.length, shards = n / w.copies;
+    if (n === 1) return t("wiz.one_channel");
+    if (w.copies === n) return t("wiz.all_copies", {n});
+    if (w.copies === 1) return t("wiz.all_shards", {n});
+    return t("wiz.mixed", {shards, copies: w.copies});
+  }
+  function fitCopies() {
+    const n = setup.channels.length;
+    if (n % setup.copies) {
+      setup.copies = Math.max(...divisors(n).filter(d => d <= setup.copies));
+      setup.quorum = setup.copies;
+    }
+  }
+
+  function renderWizard() {
+    const name = STEPS[step];
+    $("panel-title").textContent = t(`wiz.title_${name}`);
+    $("panel-sub").textContent = t("wiz.step", {n: step + 1, of: STEPS.length});
+    const body = $("panel-body");
+    body.replaceChildren();
+    const steps = h("ol", "wiz-steps");
+    STEPS.forEach((x, i) => {
+      const li = h("li", i === step ? "now" : i < step ? "done" : "", t(`wiz.short_${x}`));
+      if (i === step) li.setAttribute("aria-current", "step");
+      steps.append(li);
+    });
+    body.append(steps);
+    stepBody[name](body);
+    const nav = h("div", "row wiz-nav");
+    if (step > 0) {
+      const back = h("button", "btn", t("wiz.back"));
+      back.type = "button";
+      back.addEventListener("click", () => { step--; renderWizard(); });
+      nav.append(back);
+    }
+    const next = h("button", "btn primary", step === STEPS.length - 1 ? t("wiz.start") : t("wiz.next"));
+    next.type = "button";
+    next.addEventListener("click", () => {
+      if (step < STEPS.length - 1) { step++; if (STEPS[step] === "review") edited = null; renderWizard(); }
+      else startFromWizard(body.querySelector("textarea").value, body.querySelector(".error"), next);
+    });
+    nav.append(next);
+    body.append(nav);
+    redrawSketch();
+  }
+
+  function openWizard() {
+    state.wizard = true;
+    $("loft").classList.add("zoomed", "wizard");
+    $("panel").hidden = false;
+    $("panel-close").hidden = true;
+    renderWizard();
+    caption(t("wiz.caption"));
+  }
+
+  async function startFromWizard(text, error, button) {
+    button.disabled = true;
+    error.textContent = "";
+    const t0 = performance.now();
+    const booted = await call({op: "open", config: text});
+    const ms = performance.now() - t0;
+    if (booted.reply?.error) {
+      error.textContent = booted.reply.error;
+      button.disabled = false;
+      return;
+    }
+    state.config = text;
+    state.wizard = false;
+    $("loft").classList.remove("zoomed", "wizard");
+    $("panel").hidden = true;
+    $("panel-close").hidden = false;
+    await firstBoot(booted.reply, booted.events);
+    ready(ms);
+  }
+
+  // The first boot, as it happens: the client, the node, each channel it
+  // opens, then the posts of its start (the log's claim).
+  const pause = ms => new Promise(r => setTimeout(r, reduced ? 0 : ms));
+  async function firstBoot(reply, events) {
+    await loadChannels();
+    await refreshObjects();
+    // Empty channels: the boot's own posts fill them in, as they fly.
+    for (const c of state.channels) { c.total = 0; c.messages = []; }
+    draw();
+    graph.classList.add("booting");
+    const reveal = id => {
+      nodes[id]?.g.classList.add("up");
+      const e = edges[id];
+      if (e && !reduced) {
+        const len = e.getTotalLength();
+        e.style.strokeDasharray = `${len}`;
+        e.style.strokeDashoffset = `${len}`;
+        requestAnimationFrame(() => e.classList.add("up"));
+      } else e?.classList.add("up");
+    };
+    reveal("client");
+    caption(t("boot.client"));
+    await pause(500);
+    reveal("loft");
+    caption(t("boot.node"));
+    await pause(600);
+    for (const c of state.channels) {
+      reveal(c.store);
+      caption(t(`boot.${c.role}`, {store: esc(c.store), app: appOf(c.kind), bots: t("demo.bots", {n: c.bots || 1})}));
+      await pause(450);
+    }
+    graph.classList.remove("booting");
+    for (const e of Object.values(edges)) { e.style.strokeDasharray = ""; e.style.strokeDashoffset = ""; }
+    apply(events || []);
+    const claim = (events || []).find(l => l.fields?.message === "claimed the metadata log");
+    if (claim) caption(t("boot.claimed", {gen: claim.fields.generation, store: esc(state.channels.find(c => c.role === "log")?.store || "")}));
+    await flying;
+    await pause(1200);
+    caption(t("demo.first_caption"));
+    loadLog();
+  }
+
+  function ready(ms) {
+    $("status").textContent = `${t("try.ready", {ms: Math.round(ms)})} ${state.persistent ? t("try.kept") : t("try.not_kept")}`;
+  }
+
   // ------------------------------------------------------------ start
   async function boot(reply, events) {
     await loadChannels();
@@ -699,6 +1190,21 @@
     draw();
     apply(events || []);
     loadLog();
+  }
+
+  // The node would not start on what this browser keeps: say why, and offer
+  // the way out (the loft's panel, where "erase" is, needs a running node).
+  function bootFailed(error) {
+    $("status").textContent = t("try.error", {error});
+    caption(esc(t("demo.boot_failed")));
+    const b = h("button", "btn danger", t("try.erase"));
+    b.type = "button";
+    b.addEventListener("click", async () => {
+      if (!confirm(t("try.erase_confirm"))) return;
+      await call({op: "reset"});
+      location.reload();
+    });
+    $("caption").append(" ", b);
   }
 
   started.then(async data => {
@@ -709,11 +1215,16 @@
     state.demo = data.reply.demo;
     state.config = data.reply.config;
     state.persistent = data.reply.persistent;
+    if (!data.reply.saved) {
+      $("status").textContent = t("wiz.status");
+      openWizard();
+      return;
+    }
     const t0 = performance.now();
     const booted = await call({op: "open"});
-    if (booted.reply?.error) { $("status").textContent = t("try.error", {error: booted.reply.error}); return; }
+    if (booted.reply?.error) { bootFailed(booted.reply.error); return; }
     await boot(booted.reply);
     $("status").textContent = `${t("try.ready", {ms: Math.round(performance.now() - t0)})} ${state.persistent ? t("try.kept") : t("try.not_kept")}${data.reply.why ? ` (${data.reply.why})` : ""}`;
-    caption(data.reply.saved ? t("say.welcome_back", {n: booted.reply.replayed}) : t("demo.first_caption"));
+    caption(t("say.welcome_back", {n: booted.reply.replayed}));
   });
 })();

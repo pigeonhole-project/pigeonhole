@@ -12,6 +12,7 @@ mod chain;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
 pub mod limits;
+pub mod pool;
 mod snowflake;
 mod store;
 

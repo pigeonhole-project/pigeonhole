@@ -15,6 +15,7 @@ mod channel;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
 pub mod limits;
+pub mod pool;
 mod store;
 
 pub use chain::ChainOptions;

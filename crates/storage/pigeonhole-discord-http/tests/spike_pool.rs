@@ -4,7 +4,7 @@
 //! with `DISCORD_BOT_TOKEN`, `DISCORD_BOT_TOKEN_2` in `.env`. Deletes what
 //! it posted.
 
-use pigeonhole_discord_http::{DiscordClient, PooledDiscord};
+use pigeonhole_discord_http::DiscordClient;
 use pigeonhole_storage_discord::DiscordApi;
 use std::path::Path;
 use std::time::Instant;
@@ -29,7 +29,7 @@ async fn a_pool_of_two_bots_sends_twice_as_fast() {
             dc.channel(channel, limiter)
         })
         .collect();
-    let pooled = PooledDiscord::of(members);
+    let pooled = pigeonhole_discord_http::pooled(members);
     let t0 = Instant::now();
     let mut ids = Vec::new();
     for i in 0..sends {

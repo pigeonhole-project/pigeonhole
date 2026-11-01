@@ -57,6 +57,11 @@ codec = "zstd"          # raw | gzip | zstd
 [inline]
 max_object_size = "1 KiB"
 
+# Repair passes in the background, as on a server (there every 30 s): they
+# copy back what a read or a check found missing.
+[repair]
+interval = "10s"
+
 [cache]
 enabled = false         # on: reads served from memory stop going to the channels
 

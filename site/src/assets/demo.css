@@ -43,7 +43,9 @@
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }
+/* A full-screen app: the bar on top, the rest below; the page never scrolls. */
 body {
+  display: flex; flex-direction: column; overflow: hidden;
   margin: 0; background: var(--feather); color: var(--wing);
   font: 400 16px/1.5 var(--sans); font-stretch: 100%;
 }
@@ -66,8 +68,8 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .icon { border: 1px solid var(--line); background: none; border-radius: 50%; width: 32px; height: 32px; cursor: pointer; }
 
 /* the loft: the graph, and a panel when a node is opened */
-#app { height: calc(100% - 61px); display: flex; flex-direction: column; }
-.loft { flex: 1; display: grid; grid-template-columns: 1fr; min-height: 0; }
+#app { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.loft { flex: 1; display: grid; grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr); min-height: 0; }
 .loft.zoomed { grid-template-columns: minmax(220px, 26%) 1fr; }
 .sky { position: relative; min-height: 0; display: flex; flex-direction: column; }
 #graph { flex: 1; width: 100%; height: 100%; min-height: 320px; transition: opacity .2s; }
@@ -101,13 +103,13 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 /* the panel */
 .panel {
   border-left: 1px solid var(--line); background: var(--plume);
-  display: flex; flex-direction: column; min-height: 0;
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .panel-head { display: flex; gap: 16px; align-items: flex-start; padding: 18px 24px 12px; border-bottom: 1px solid var(--line); }
 .panel-head h2 { margin: 0; font-size: 26px; font-weight: 800; font-stretch: 125%; letter-spacing: -0.015em; line-height: 1.1; }
 .panel-head p { margin: 4px 0 0; color: var(--slate); font-size: 14px; }
 .back { border: 1px solid var(--line); background: none; border-radius: 8px; padding: 4px 10px; cursor: pointer; color: var(--wing-2); }
-.panel-body { overflow: auto; padding: 18px 24px 32px; }
+.panel-body { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px 24px 32px; }
 .panel-body h3 { font-size: 15px; margin: 24px 0 8px; font-weight: 700; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
 .btn {
@@ -190,7 +192,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .cmd pre { font: 12px/1.5 var(--mono); background: var(--feather); padding: 10px; border-radius: 8px; overflow: auto; max-height: 320px; }
 
 @media (max-width: 800px) {
-  .loft.zoomed { grid-template-columns: 1fr; grid-template-rows: 30vh 1fr; }
+  .loft.zoomed { grid-template-columns: 1fr; grid-template-rows: 30vh minmax(0, 1fr); }
   .panel { border-left: 0; border-top: 1px solid var(--line); }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -305,3 +307,65 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .post-log { margin-top: 4px; font-size: 12.5px; color: var(--teal); font-weight: 500; }
 .app .service { opacity: .62; }
 .log-note { color: var(--slate); font-size: 13.5px; margin: 0 0 12px; max-width: 70ch; }
+
+/* the wizard: the setup on the right, its sketch on the graph */
+.loft.zoomed.wizard { grid-template-columns: 1fr minmax(340px, 40%); }
+.wiz-steps { list-style: none; display: flex; gap: 4px; padding: 0; margin: 0 0 18px; counter-reset: step; flex-wrap: wrap; }
+.wiz-steps li { counter-increment: step; font-size: 13px; color: var(--slate); padding: 3px 10px 3px 4px; border-radius: 999px; }
+.wiz-steps li::before {
+  content: counter(step); display: inline-grid; place-items: center; width: 20px; height: 20px; margin-right: 6px;
+  border-radius: 50%; border: 1px solid var(--slate-2); font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.wiz-steps li.done::before { background: var(--slate-2); border-color: var(--slate-2); color: var(--plume); }
+.wiz-steps li.now { color: var(--wing); font-weight: 600; background: var(--feather); }
+.wiz-steps li.now::before { background: var(--wing); border-color: var(--wing); color: var(--feather); }
+.lede { margin: 0 0 18px; max-width: 60ch; line-height: 1.5; }
+.field { margin: 0 0 20px; }
+.field-label { font-weight: 600; font-size: 14px; margin-bottom: 8px; }
+.field-note { margin: 8px 0 0; color: var(--slate); font-size: 13.5px; line-height: 1.45; max-width: 60ch; }
+.choices { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 3px; border-radius: 10px; background: var(--feather); border: 1px solid var(--line); }
+.choice { border: 0; background: none; padding: 6px 14px; border-radius: 7px; cursor: pointer; font-size: 14px; color: var(--wing-2); min-width: 36px; }
+.choice[aria-checked="true"] { background: var(--plume); color: var(--wing); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.chan-row { display: flex; align-items: center; gap: 12px; margin: 0 0 10px; }
+.chan-n { width: 76px; color: var(--slate); font-size: 14px; }
+.num { width: 96px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--feather); font: inherit; font-size: 14px; color: inherit; }
+.rates { margin: 0 0 8px; padding-left: 18px; color: var(--wing-2); font-size: 14px; }
+.toml { width: 100%; min-height: 46vh; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--feather); color: inherit; resize: vertical; white-space: pre; overflow: auto; }
+.wiz-nav { margin-top: 22px; justify-content: flex-end; }
+
+/* the first boot: the graph appears as the node opens it */
+.booting .node, .booting .edge { opacity: 0; transition: opacity .45s ease-out, stroke-dashoffset .6s ease-out; }
+.booting .node.up, .booting .edge.up { opacity: 1; stroke-dashoffset: 0 !important; }
+@media (prefers-reduced-motion: reduce) { .booting .node, .booting .edge { transition: none; } }
+
+/* faults: a channel down, a failed call */
+.node.down .shape { stroke: var(--eye); stroke-dasharray: 6 5; }
+.node.down .role { fill: var(--eye); }
+.flight.failed path { fill: var(--eye); }
+.faults { border: 1px dashed var(--slate-2); border-radius: 12px; padding: 12px 14px; margin: 0 0 16px; }
+.faults-note { margin: 0; font-size: 14px; color: var(--wing-2); max-width: 70ch; }
+.faults .row { margin-bottom: 0; }
+.caption .err { font-family: var(--mono); font-size: 13px; color: var(--eye); }
+
+/* background work: repair jobs on the graph, the repair clock, the panel */
+.queue .job { fill: var(--eye); opacity: .85; }
+.queue .job-more { font-size: 11px; fill: var(--eye); }
+.clock-face { fill: var(--plume); stroke: var(--slate-2); stroke-width: 2; }
+.clock-arc { fill: none; stroke: var(--teal); stroke-width: 3; stroke-dasharray: 100; transition: stroke-dashoffset 1s linear; }
+.node.queued .clock-arc { stroke: var(--eye); }
+.clock-text { font: 600 11px var(--mono); fill: var(--wing-2); }
+.bg-row { margin: 0 0 16px; }
+.bg-label { font-size: 14px; margin-bottom: 6px; }
+.meter { height: 6px; border-radius: 3px; background: var(--feather); border: 1px solid var(--line); overflow: hidden; }
+.meter .fill { height: 100%; background: var(--teal); transition: width 1s linear; }
+.meter .fill.amethyst { background: var(--amethyst); }
+.jobs { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 10px 0 0; }
+.job-tile { font: 12px var(--mono); padding: 3px 8px; border-radius: 6px; border: 1px solid var(--eye); color: var(--eye); }
+.deletable { position: relative; }
+.msg-del {
+  position: absolute; top: 6px; right: 6px; width: 28px; height: 28px; border-radius: 8px; border: 0;
+  display: grid; place-items: center; cursor: pointer; opacity: 0; background: rgba(0,0,0,.35); color: #fff;
+}
+.msg-del .ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.deletable:hover .msg-del, .msg-del:focus-visible { opacity: 1; }
+@media (hover: none) { .msg-del { opacity: .8; } }

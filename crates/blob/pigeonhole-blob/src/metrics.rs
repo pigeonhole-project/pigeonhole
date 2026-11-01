@@ -392,4 +392,14 @@ impl DynBlobBackend for MetricsBackend {
     async fn candidates(&self, after: Option<&[u8]>, upto: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
         self.inner.candidates(after, upto, limit).await
     }
+
+    async fn exists(&self, id: &BlobLocator) -> Result<bool> {
+        let instance = self.inner.instance().id.clone();
+        let t0 = Instant::now();
+        let span = tracing::debug_span!("store", instance = %instance, op = "exists");
+        let result = self.inner.exists(id).instrument(span.clone()).await;
+        log_call(&span, &result, t0.elapsed());
+        record_instance_call(&instance, "exists", if result.is_ok() { "ok" } else { "error" }, t0.elapsed());
+        result
+    }
 }

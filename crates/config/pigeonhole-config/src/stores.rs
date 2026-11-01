@@ -41,6 +41,9 @@ pub(crate) enum FileStore {
         session: Option<PathBuf>,
         /// A fake channel instead of Telegram (builds with feature `fake`).
         fake: Option<String>,
+        /// How many bots post to the fake channel, each with its own budget
+        /// (`[telegram.send]` is per bot); default 1.
+        bots: Option<usize>,
     },
     Discord {
         id: String,
@@ -51,6 +54,8 @@ pub(crate) enum FileStore {
         max_blob_size: Option<usize>,
         /// A fake channel instead of Discord (builds with feature `fake`).
         fake: Option<String>,
+        /// As for telegram (`[discord.send]` is per bot).
+        bots: Option<usize>,
     },
 }
 
@@ -111,38 +116,54 @@ impl FileStore {
     /// A telegram or discord store with `fake`: a channel without the
     /// service, no bots and no secrets.
     fn fake_channel(&self, id: &str) -> Result<Option<Store>> {
-        let (kind, scope, fake, bots) = match self {
-            FileStore::Telegram {
-                chat_id,
-                fake: Some(fake),
-                bot_token_envs,
-                api_id_env,
-                api_hash_env,
-                session,
-                ..
-            } => (
+        let (kind, scope, fake, real_bots, bots) = match self {
+            FileStore::Telegram { chat_id, fake, bot_token_envs, api_id_env, api_hash_env, session, bots, .. } => (
                 InstanceKind::Telegram,
                 chat_id.to_string(),
                 fake,
                 bot_token_envs.is_some() || api_id_env.is_some() || api_hash_env.is_some() || session.is_some(),
+                bots,
             ),
-            FileStore::Discord { channel_id, fake: Some(fake), bot_token_envs, .. } => {
-                (InstanceKind::Discord, channel_id.to_string(), fake, bot_token_envs.is_some())
+            FileStore::Discord { channel_id, fake, bot_token_envs, bots, .. } => {
+                (InstanceKind::Discord, channel_id.to_string(), fake, bot_token_envs.is_some(), bots)
             }
             _ => return Ok(None),
+        };
+        let Some(fake) = fake else {
+            if bots.is_some() {
+                bail!("[[store]] {id}: `bots` counts a fake channel's bots; a real store names them in bot_token_envs");
+            }
+            return Ok(None);
         };
         if !cfg!(feature = "fake") {
             bail!("[[store]] {id}: `fake` channels are only in builds with the `fake` feature");
         }
-        if bots {
-            bail!("[[store]] {id}: a fake channel has no bots: drop bot_token_envs, api_id_env, api_hash_env, session");
+        if real_bots {
+            bail!("[[store]] {id}: a fake channel has no real bots: drop bot_token_envs, api_id_env, api_hash_env, session (`bots` counts its fake ones)");
         }
         let backing = match fake.as_str() {
             "memory" => FakeBacking::Memory,
             store => FakeBacking::Store(store.to_string()),
         };
-        Ok(Some(Store::Fake { kind, scope, backing }))
+        let bots = bots.unwrap_or(1);
+        if bots == 0 {
+            bail!("[[store]] {id}: a fake channel needs at least one bot");
+        }
+        Ok(Some(Store::Fake(FakeChannel { id: id.to_string(), kind, scope, backing, bots })))
     }
+}
+
+/// A telegram or discord store on a fake channel (`fake = …`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeChannel {
+    /// Its `[[store]]` id.
+    pub id: String,
+    pub kind: InstanceKind,
+    /// The chat or channel id.
+    pub scope: String,
+    pub backing: FakeBacking,
+    /// How many bots post to it, the primary first.
+    pub bots: usize,
 }
 
 /// Where a fake channel keeps its messages (its tablet: log, snapshots,
@@ -221,11 +242,7 @@ pub enum Store {
     },
     Memory,
     /// A telegram or discord store on a fake channel (`fake = …`).
-    Fake {
-        kind: InstanceKind,
-        scope: String,
-        backing: FakeBacking,
-    },
+    Fake(FakeChannel),
 }
 
 impl Store {
@@ -236,7 +253,7 @@ impl Store {
             Store::Discord { channel_id, .. } => Some(discord_location(channel_id)),
             Store::LocalDisk { path } => Some(local_disk_location(path)),
             Store::Memory => None,
-            Store::Fake { kind, scope, .. } => Some(fake_location(*kind, scope)),
+            Store::Fake(f) => Some(fake_location(f.kind, &f.scope)),
         }
     }
 
@@ -341,16 +358,15 @@ impl Topology {
         let mut ids: Vec<String> = self.stores.keys().cloned().collect();
         ids.sort();
         for id in ids {
-            let Some(Store::Fake { kind, scope, backing: FakeBacking::Store(under) }) = self.stores.get(&id).cloned()
-            else {
-                continue;
-            };
-            let backing = match self.take(&under, "fake channels").with_context(|| format!("[[store]] {id}: fake"))? {
+            let Some(Store::Fake(fake)) = self.stores.get(&id).cloned() else { continue };
+            let FakeBacking::Store(under) = &fake.backing else { continue };
+            let (kind, scope) = (fake.kind, &fake.scope);
+            let backing = match self.take(under, "fake channels").with_context(|| format!("[[store]] {id}: fake"))? {
                 Store::LocalDisk { path } => FakeBacking::Dir(path.join(format!("{}-{scope}", kind.as_str()))),
                 Store::Memory => FakeBacking::Memory,
                 _ => bail!("[[store]] {id}: fake = {under:?}: a local_disk or memory store keeps a fake channel"),
             };
-            self.stores.insert(id, Store::Fake { kind, scope, backing });
+            self.stores.insert(id, Store::Fake(FakeChannel { backing, ..fake }));
         }
         Ok(())
     }
@@ -483,13 +499,13 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
             None,
         ),
         // Marked `fake:` so that a real binary never takes its chunks for its own.
-        Store::Fake { kind, scope, .. } => (
-            *kind,
+        Store::Fake(f) => (
+            f.kind,
             Vec::new(),
             Vec::new(),
-            scope.clone(),
-            fake_location(*kind, scope),
-            fake_location(*kind, scope),
+            f.scope.clone(),
+            fake_location(f.kind, &f.scope),
+            fake_location(f.kind, &f.scope),
             None,
         ),
     };
@@ -508,7 +524,7 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
         max_blob_size,
         telegram,
         fake: match store {
-            Store::Fake { backing, .. } => Some(backing.clone()),
+            Store::Fake(f) => Some(f.clone()),
             _ => None,
         },
     })

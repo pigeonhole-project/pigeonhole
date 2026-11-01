@@ -1,0 +1,55 @@
+# A Discord log (leased) and a Telegram snapshot channel, data in both;
+# DIR is the test's temp dir.
+[[store]]
+id = "tg-1"
+kind = "telegram"
+chat_id = -1001000000001
+fake = "channel-data"
+bots = 2
+
+[[store]]
+id = "dc-1"
+kind = "discord"
+channel_id = 1000000000000000001
+fake = "channel-data"
+bots = 2
+
+[[replicas]]
+id = "copies"
+members = ["tg-1", "dc-1"]
+write_quorum = 2
+
+[[store]]
+id = "dc-log"
+kind = "discord"
+channel_id = 1000000000000000101
+fake = "channel-data"
+bots = 2
+
+[[store]]
+id = "tg-snapshots"
+kind = "telegram"
+chat_id = -1001000000102
+fake = "channel-data"
+bots = 2
+
+[[store]]
+id = "channel-data"
+kind = "local_disk"
+path = "DIR"
+
+[meta]
+log = "dc-log"
+snapshot = "tg-snapshots"
+snapshot_every_entries = 50
+
+[chunk]
+store = "copies"
+
+[telegram.send]
+rate_per_sec = 20.0
+burst = 20.0
+
+[discord.send]
+rate_per_sec = 20.0
+burst = 20.0

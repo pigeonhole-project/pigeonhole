@@ -15,19 +15,24 @@ use pigeonhole_blob::{erase, CheapestFirst, InstanceInfo, MetricsBackend, Replic
 use pigeonhole_chunk_store::{BlobDb, BlockCache, ChunkStore, IngestOptions};
 use pigeonhole_chunk_store::{RepairConfig, RepairStats, Repairer, SweepConfig, SweepStats, Sweeper};
 use pigeonhole_config::instances::{check_fingerprints, InstanceConfig, InstanceKind};
-use pigeonhole_config::stores::FakeBacking;
+use pigeonhole_config::stores::{FakeBacking, FakeChannel};
 use pigeonhole_config::{Config, LogSettings, SnapshotSettings};
 use pigeonhole_fake_channels::{self as fake, DiscordChannel, TelegramChannel};
 use pigeonhole_gateway_s3::{Index, S3Gateway};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, LogStore, MetaOptions, MetaStore, Namespaces, SnapshotStore};
+use pigeonhole_storage_discord::fake::bot::FakeBot as DiscordBot;
+use pigeonhole_storage_discord::pool::PooledDiscord;
 use pigeonhole_storage_discord::DiscordBlobStore;
 use pigeonhole_storage_memory::MemoryBlobStore;
+use pigeonhole_storage_telegram::fake::bot::FakeBot as TelegramBot;
+use pigeonhole_storage_telegram::pool::PooledChannel;
 use pigeonhole_storage_telegram::TelegramBlobStore;
 use s3s::dto::{CopyObjectInput, CreateBucketInput, DeleteObjectInput, GetObjectInput, ListObjectsV2Input};
 use s3s::dto::{PutObjectInput, StreamingBlob};
 use s3s::{S3Request, S3};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod channels;
@@ -50,6 +55,8 @@ pub struct World {
     telegram: Mutex<HashMap<(i64, String), Arc<TelegramChannel>>>,
     discord: Mutex<HashMap<(u64, String), Arc<DiscordChannel>>>,
     memory: Mutex<HashMap<String, Arc<MemoryBlobStore>>>,
+    /// Channels taken down (`kind:scope`): every bot's call fails.
+    outages: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 /// The stores a fake channel's tablet keeps itself in.
@@ -82,6 +89,64 @@ impl World {
         Ok(ch)
     }
 
+    /// The down switch of fake channel `scope`, shared by its bots.
+    fn outage(&self, kind: InstanceKind, scope: &str) -> Arc<AtomicBool> {
+        let key = format!("{}:{scope}", kind.as_str());
+        self.outages.lock().unwrap().entry(key).or_default().clone()
+    }
+
+    /// Takes channel `c` down (every call fails) or brings it back.
+    pub fn set_down(&self, c: &channels::ChannelRef, down: bool) {
+        self.outage(c.kind, &c.scope).store(down, Ordering::SeqCst);
+    }
+
+    pub fn is_down(&self, c: &channels::ChannelRef) -> bool {
+        self.outage(c.kind, &c.scope).load(Ordering::SeqCst)
+    }
+
+    /// Channel `c` loses message `id` (someone deleted it in the app).
+    pub async fn delete_message(&self, c: &channels::ChannelRef, id: &str) -> Result<()> {
+        match c.kind {
+            InstanceKind::Telegram => {
+                use pigeonhole_storage_telegram::ChannelApi;
+                let id = id.parse().with_context(|| format!("message id {id:?}"))?;
+                self.telegram(&c.scope, &c.backing).await?.delete_messages(&[id]).await
+            }
+            InstanceKind::Discord => {
+                use pigeonhole_storage_discord::DiscordApi;
+                let id = id.parse().with_context(|| format!("message id {id:?}"))?;
+                self.discord(&c.scope, &c.backing).await?.delete_messages(&[id]).await
+            }
+            _ => bail!("{}: not a fake channel", c.store),
+        }
+    }
+
+    /// Channel `c` loses every message (an admin cleared it); how many.
+    pub async fn wipe(&self, c: &channels::ChannelRef) -> Result<usize> {
+        use pigeonhole_storage_api::fake::FakeHost;
+        match c.kind {
+            InstanceKind::Telegram => {
+                use pigeonhole_storage_telegram::ChannelApi;
+                let ch = self.telegram(&c.scope, &c.backing).await?;
+                let ids = ch.host().read(|s: &pigeonhole_storage_telegram::fake::state::TelegramChannelState| s.ids());
+                for part in ids.chunks(100) {
+                    ch.delete_messages(part).await?;
+                }
+                Ok(ids.len())
+            }
+            InstanceKind::Discord => {
+                use pigeonhole_storage_discord::DiscordApi;
+                let ch = self.discord(&c.scope, &c.backing).await?;
+                let ids = ch.host().read(|s: &pigeonhole_storage_discord::fake::state::DiscordChannelState| s.ids());
+                for part in ids.chunks(100) {
+                    ch.delete_messages(part).await?;
+                }
+                Ok(ids.len())
+            }
+            _ => bail!("{}: not a fake channel", c.store),
+        }
+    }
+
     fn memory(&self, id: &str, info: Option<&InstanceInfo>) -> Arc<MemoryBlobStore> {
         let mut m = self.memory.lock().unwrap();
         m.entry(id.to_string())
@@ -95,29 +160,50 @@ impl World {
             .clone()
     }
 
-    /// A Telegram store on fake channel `chat`.
+    /// A Telegram store on fake channel `f`, through its bots: each with
+    /// its own budget (`[telegram.send]` is per bot and chat), as a server's.
     async fn telegram_store(
         &self,
         cfg: &Config,
-        chat: &str,
-        backing: &FakeBacking,
+        f: &FakeChannel,
         info: InstanceInfo,
-    ) -> Result<TelegramBlobStore<Arc<TelegramChannel>>> {
-        let limiter = cfg.chat_limiter(InstanceKind::Telegram, "fake", chat);
-        Ok(TelegramBlobStore::new(Arc::new(self.telegram(chat, backing).await?), limiter, info))
+    ) -> Result<TelegramBlobStore<PooledChannel<TelegramBot<TelegramChannel>>>> {
+        let channel = self.telegram(&f.scope, &f.backing).await?;
+        let bots = (0..f.bots)
+            .map(|i| {
+                let limiter = cfg.chat_limiter(InstanceKind::Telegram, &fake_bot(i), &f.scope);
+                (
+                    TelegramBot::new(channel.clone(), limiter.clone(), i).with_switch(self.outage(f.kind, &f.scope)),
+                    limiter,
+                )
+            })
+            .collect();
+        let pooled = PooledChannel::new(&f.scope, bots);
+        let limiter = pooled.limiter().clone();
+        Ok(TelegramBlobStore::new(Arc::new(pooled), limiter, info))
     }
 
-    /// A Discord store on fake channel `channel`.
+    /// A Discord store on fake channel `f`, through its bots.
     async fn discord_store(
         &self,
         cfg: &Config,
-        channel: &str,
-        backing: &FakeBacking,
+        f: &FakeChannel,
         max_blob_size: Option<usize>,
         info: InstanceInfo,
-    ) -> Result<DiscordBlobStore<Arc<DiscordChannel>>> {
-        let limiter = cfg.chat_limiter(InstanceKind::Discord, "fake", channel);
-        Ok(DiscordBlobStore::new(Arc::new(self.discord(channel, backing).await?), limiter, max_blob_size, info))
+    ) -> Result<DiscordBlobStore<PooledDiscord<DiscordBot<DiscordChannel>>>> {
+        let channel = self.discord(&f.scope, &f.backing).await?;
+        let bots = (0..f.bots)
+            .map(|i| {
+                let limiter = cfg.chat_limiter(InstanceKind::Discord, &fake_bot(i), &f.scope);
+                (
+                    DiscordBot::new(channel.clone(), limiter.clone(), i).with_switch(self.outage(f.kind, &f.scope)),
+                    limiter,
+                )
+            })
+            .collect();
+        let pooled = PooledDiscord::new(&f.scope, bots);
+        let limiter = pooled.limiter().clone();
+        Ok(DiscordBlobStore::new(Arc::new(pooled), limiter, max_blob_size, info))
     }
 }
 
@@ -129,6 +215,39 @@ pub struct Node {
     pub meta: Arc<MetaStore>,
     pub store: Arc<ChunkStore>,
     pub s3: S3Gateway,
+    /// Repair passes in the background, as the server's (`[repair] interval`).
+    repair: Background,
+    snapshot_every: Option<u64>,
+}
+
+/// A background loop: when its last pass ended, its pause, its task.
+struct Background {
+    every: std::time::Duration,
+    last: Arc<Mutex<Option<tokio::time::Instant>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Background {
+    /// Repair passes every `every`, until the tablet stops.
+    fn repair(store: &Arc<ChunkStore>, every: std::time::Duration) -> Self {
+        let last = Arc::new(Mutex::new(None));
+        let (db, replicated, done) = (store.db().clone(), store.replicated().clone(), last.clone());
+        let task = tokio::spawn(tracing::Instrument::in_current_span(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                if db.tablet_stopped() {
+                    return;
+                }
+                let repairer = Repairer::new(db.clone(), replicated.clone(), RepairConfig::default());
+                match repairer.repair_once().await {
+                    Ok(s) => tracing::info!(repaired = s.repaired, failed = s.failed, "repair pass"),
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "repair pass failed"),
+                }
+                *done.lock().unwrap() = Some(tokio::time::Instant::now());
+            }
+        }));
+        Self { every, last, task }
+    }
 }
 
 fn req<T>(input: T) -> S3Request<T> {
@@ -145,16 +264,21 @@ fn req<T>(input: T) -> S3Request<T> {
     }
 }
 
-/// The store of the log or the snapshots in a fake channel.
-fn meta_info(kind: InstanceKind, scope: &str, purpose: &str) -> InstanceInfo {
-    let location = format!("fake:{}:{scope}", kind.as_str());
+/// The store of the log or the snapshots in fake channel `f`, by its id.
+fn meta_info(f: &FakeChannel) -> InstanceInfo {
+    let location = format!("fake:{}:{}", f.kind.as_str(), f.scope);
     InstanceInfo {
-        id: format!("meta-{purpose}"),
-        kind: kind.as_str(),
+        id: f.id.clone(),
+        kind: f.kind.as_str(),
         fingerprint: location.clone(),
         location,
         role: pigeonhole_blob::InstanceRole::ReadWrite,
     }
+}
+
+/// Fake bot `i`'s name: its budget is shared by every channel it posts to.
+fn fake_bot(i: usize) -> String {
+    format!("fake-bot-{}", i + 1)
 }
 
 fn no_real_channels() -> anyhow::Error {
@@ -164,19 +288,19 @@ fn no_real_channels() -> anyhow::Error {
 async fn open_log(world: &World, cfg: &Config) -> Result<Arc<dyn LogStore>> {
     Ok(match &cfg.meta.log {
         LogSettings::Memory => Arc::new(ChainLogStore::new(world.memory("meta-log", None))),
-        LogSettings::Fake { kind: InstanceKind::Telegram, scope, backing } => {
-            let info = meta_info(InstanceKind::Telegram, scope, "log");
-            Arc::new(ChainLogStore::new(Arc::new(world.telegram_store(cfg, scope, backing, info).await?)))
+        LogSettings::Fake(f) if f.kind == InstanceKind::Telegram => {
+            let info = meta_info(f);
+            Arc::new(ChainLogStore::new(Arc::new(world.telegram_store(cfg, f, info).await?)))
         }
-        LogSettings::Fake { kind: InstanceKind::Discord, scope, backing } => {
-            let info = meta_info(InstanceKind::Discord, scope, "log");
-            let log = ChainLogStore::new(Arc::new(world.discord_store(cfg, scope, backing, None, info).await?));
+        LogSettings::Fake(f) if f.kind == InstanceKind::Discord => {
+            let info = meta_info(f);
+            let log = ChainLogStore::new(Arc::new(world.discord_store(cfg, f, None, info).await?));
             Arc::new(match cfg.meta.lease {
                 Some(lease) => log.with_lease(pigeonhole_meta::Lease::new(lease)),
                 None => log,
             })
         }
-        LogSettings::Fake { .. } => bail!("[meta] log: a fake channel is telegram or discord"),
+        LogSettings::Fake(_) => bail!("[meta] log: a fake channel is telegram or discord"),
         LogSettings::LocalDisk { path } => Arc::new(ChainLogStore::new(Arc::new(
             pigeonhole_storage_disk::DiskBlobStore::open(path.join("log"))
                 .with_context(|| format!("open local log {}", path.display()))?,
@@ -188,15 +312,15 @@ async fn open_log(world: &World, cfg: &Config) -> Result<Arc<dyn LogStore>> {
 async fn open_snapshots(world: &World, cfg: &Config) -> Result<Arc<dyn SnapshotStore>> {
     Ok(match &cfg.meta.snapshot {
         SnapshotSettings::Memory => Arc::new(BlobSnapshotStore::new(world.memory("meta-snapshots", None))),
-        SnapshotSettings::Fake { kind: InstanceKind::Telegram, scope, backing } => {
-            let info = meta_info(InstanceKind::Telegram, scope, "snapshots");
-            Arc::new(BlobSnapshotStore::new(Arc::new(world.telegram_store(cfg, scope, backing, info).await?)))
+        SnapshotSettings::Fake(f) if f.kind == InstanceKind::Telegram => {
+            let info = meta_info(f);
+            Arc::new(BlobSnapshotStore::new(Arc::new(world.telegram_store(cfg, f, info).await?)))
         }
-        SnapshotSettings::Fake { kind: InstanceKind::Discord, scope, backing } => {
-            let info = meta_info(InstanceKind::Discord, scope, "snapshots");
-            Arc::new(BlobSnapshotStore::new(Arc::new(world.discord_store(cfg, scope, backing, None, info).await?)))
+        SnapshotSettings::Fake(f) if f.kind == InstanceKind::Discord => {
+            let info = meta_info(f);
+            Arc::new(BlobSnapshotStore::new(Arc::new(world.discord_store(cfg, f, None, info).await?)))
         }
-        SnapshotSettings::Fake { .. } => bail!("[meta] snapshot: a fake channel is telegram or discord"),
+        SnapshotSettings::Fake(_) => bail!("[meta] snapshot: a fake channel is telegram or discord"),
         SnapshotSettings::LocalDisk { path } => Arc::new(BlobSnapshotStore::new(Arc::new(
             pigeonhole_storage_disk::DiskBlobStore::open(path.join("snapshots"))
                 .with_context(|| format!("open local snapshots {}", path.display()))?,
@@ -210,12 +334,12 @@ async fn member(world: &World, cfg: &Config, inst: &InstanceConfig) -> Result<Sh
     let id = &inst.info.id;
     let store: SharedBackend = match (inst.kind, &inst.fake) {
         (InstanceKind::Memory, _) => Arc::new(erase(world.memory(id, Some(&inst.info)))),
-        (InstanceKind::Telegram, Some(backing)) => {
-            Arc::new(erase(Arc::new(world.telegram_store(cfg, &inst.scope_id, backing, inst.info.clone()).await?)))
+        (InstanceKind::Telegram, Some(f)) => {
+            Arc::new(erase(Arc::new(world.telegram_store(cfg, f, inst.info.clone()).await?)))
         }
-        (InstanceKind::Discord, Some(backing)) => Arc::new(erase(Arc::new(
-            world.discord_store(cfg, &inst.scope_id, backing, inst.max_blob_size, inst.info.clone()).await?,
-        ))),
+        (InstanceKind::Discord, Some(f)) => {
+            Arc::new(erase(Arc::new(world.discord_store(cfg, f, inst.max_blob_size, inst.info.clone()).await?)))
+        }
         (InstanceKind::LocalDisk, _) => Arc::new(erase(Arc::new(
             pigeonhole_storage_disk::DiskBlobStore::with_instance(&inst.scope_id, inst.info.clone())
                 .with_context(|| format!("open local_disk store {}", inst.scope_id))?,
@@ -281,7 +405,16 @@ impl Node {
         }
         let store = Arc::new(store);
         let s3 = S3Gateway::new(cfg.s3_options(), Index::open(meta.clone()).await?, store.clone());
-        Ok(Self { channels: channels::of(cfg), log, meta, store, s3 })
+        let repair = Background::repair(&store, cfg.repair.interval);
+        Ok(Self {
+            channels: channels::of(cfg),
+            log,
+            meta,
+            store,
+            s3,
+            repair,
+            snapshot_every: cfg.meta.snapshot_every_entries,
+        })
     }
 
     /// The log's entries as they lie in its store, commands decoded: the last
@@ -292,7 +425,26 @@ impl Node {
 
     /// Stops the tablet, as a process exit would.
     pub async fn close(&self) -> Result<()> {
+        self.repair.task.abort();
         self.meta.close().await
+    }
+
+    /// What runs in the background: the repair queue and when its next pass
+    /// is due; how far the log is from its next snapshot.
+    pub async fn background(&self) -> Result<serde_json::Value> {
+        let jobs = self.store.db().repair_jobs().await;
+        let since = self.repair.last.lock().unwrap().map(|t| t.elapsed());
+        let next_ms = self.repair.every.saturating_sub(since.unwrap_or_default()).as_millis() as u64;
+        let found = self.log.discover().await?;
+        let (head, base) = found.map_or((0, 0), |d| (d.head.position, d.base.map_or(0, |b| b.at)));
+        Ok(serde_json::json!({
+            "repair": {
+                "queue": jobs.iter().map(|(chunk, store)| serde_json::json!({ "chunk": chunk, "store": store })).collect::<Vec<_>>(),
+                "every_ms": self.repair.every.as_millis() as u64,
+                "next_ms": next_ms,
+            },
+            "snapshot": { "head": head, "base": base, "every": self.snapshot_every },
+        }))
     }
 
     /// Entries the boot replayed from the log after its snapshot.
@@ -366,6 +518,18 @@ impl Node {
     pub async fn repair(&self) -> Result<RepairStats> {
         let repairer = Repairer::new(self.store.db().clone(), self.store.replicated().clone(), RepairConfig::default());
         repairer.repair_once().await
+    }
+
+    /// Repair jobs waiting.
+    pub async fn repair_queue(&self) -> Result<u64> {
+        self.store.db().repair_queue_len().await
+    }
+
+    /// Probe every copy store `id` should hold; queue a repair for each one
+    /// gone. How many it checked, and how many were gone.
+    pub async fn verify(&self, id: &str) -> Result<(u64, u64)> {
+        let repairer = Repairer::new(self.store.db().clone(), self.store.replicated().clone(), RepairConfig::default());
+        repairer.verify_instance(id).await
     }
 
     /// One sweeper pass: delete posts that no chunk points to.

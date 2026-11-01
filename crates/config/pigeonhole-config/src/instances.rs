@@ -44,7 +44,7 @@ pub struct InstanceConfig {
     /// `telegram`: how each bot logs in, as `bot_tokens`.
     pub telegram: Vec<TelegramLogin>,
     /// A fake channel stands in for the service (builds with feature `fake`).
-    pub fake: Option<crate::stores::FakeBacking>,
+    pub fake: Option<crate::stores::FakeChannel>,
 }
 
 /// A Telegram bot logged in over MTProto, resolved from `[[store]]` and the

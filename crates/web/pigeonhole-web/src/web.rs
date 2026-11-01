@@ -48,6 +48,14 @@ struct Request {
     from: Option<u64>,
     #[serde(default)]
     limit: Option<usize>,
+    /// `outage` / `wipe`: the channel's store id; `outage`: down or back.
+    #[serde(default)]
+    store: String,
+    #[serde(default)]
+    down: bool,
+    /// `delete_message`: the message's id (a string: Discord's exceed JS numbers).
+    #[serde(default)]
+    message: String,
 }
 
 fn demo() -> String {
@@ -82,7 +90,7 @@ pub extern "C" fn ph_open() -> i32 {
         .with_current_span(true)
         .with_span_list(true)
         .with_env_filter(
-            "warn,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
+            "warn,pigeonhole_web=info,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
              pigeonhole_chunk_store=debug,pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug,pigeonhole_fake_channels=debug",
         )
         .with_writer(std::io::stdout)
@@ -191,6 +199,28 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
                 out.push(world.describe(c, r.limit.unwrap_or(200)).await?);
             }
             json!({ "channels": out })
+        }
+        "background" => node.background().await?,
+        "outage" | "wipe" | "delete_message" => {
+            let world = WORLD.with(Rc::clone);
+            let c = node
+                .channels
+                .iter()
+                .find(|c| c.store == r.store)
+                .ok_or_else(|| anyhow::anyhow!("no fake channel {:?}", r.store))?;
+            if r.op == "outage" {
+                world.set_down(c, r.down);
+                json!({ "down": r.down })
+            } else if r.op == "delete_message" {
+                world.delete_message(c, &r.message).await?;
+                json!({ "deleted": 1 })
+            } else {
+                json!({ "deleted": world.wipe(c).await? })
+            }
+        }
+        "verify" => {
+            let (checked, gone) = node.verify(&r.store).await?;
+            json!({ "checked": checked, "gone": gone })
         }
         "repair" => {
             let s = node.repair().await?;
