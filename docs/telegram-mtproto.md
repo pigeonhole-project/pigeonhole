@@ -220,10 +220,12 @@ fence; a snapshot counts only while a valid rebase names it.
 
 - `SnapshotRef` = `message_id` + crc; `get` reads the message by id
   (fresh `file_reference`), the crc catches a replaced message.
-- `put` = send; `remove` = delete.
-- `newest()` (lossy restore only): learn the top by sending a probe message
-  (then delete it) and walk down to the first document that decodes as a
-  snapshot. The snapshot carries `(log_id, gen, at)`; `restore --lossy` prints
+- `put` = a chain member after the snapshot put last (the node passes it:
+  the last it kept, else the one its log starts from), so no probe is
+  posted; only with none known (a new log) or when that one already has a
+  successor, after the tail, which posts a probe. `remove` = delete.
+- `newest()` (lossy restore only): the chain's tail, found by posting a
+  probe and walking down to the newest member that won its link. The snapshot carries `(log_id, gen, at)`; `restore --lossy` prints
   it and can filter by `log_id` when a chat holds several logs' snapshots.
 - A deposed writer's snapshot is harmless (its rebase is invalid): garbage,
   removed best effort (everything no current base names).

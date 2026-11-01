@@ -245,3 +245,22 @@ async fn a_fresh_walk_reads_each_page_once() {
     assert_eq!(store(&channel).discover().await.unwrap(), None);
     assert!(channel.calls().get_messages <= 4, "{:?}", channel.calls());
 }
+
+/// Each snapshot goes after the one before it: no probe to learn the top,
+/// and a lossy restore still finds the newest by the chain.
+#[tokio::test]
+async fn snapshots_after_the_last_post_no_probes() {
+    let channel = Arc::new(FakeChannel::new(79));
+    let snaps = BlobSnapshotStore::new(channel_store(&channel));
+    let snap = |at| pigeonhole_meta::StoredSnapshot { log_id: pigeonhole_meta::LogId(1), at, data: vec![at as u8; 10] };
+    let probes = || channel.names().iter().filter(|(_, n)| n.starts_with("chain-probe.bin")).count();
+    let mut last = snaps.put(&snap(1), None).await.unwrap();
+    let first = probes();
+    for at in 2..=5 {
+        let r = snaps.put(&snap(at), Some(&last)).await.unwrap();
+        snaps.remove(&std::mem::replace(&mut last, r)).await.unwrap();
+    }
+    assert_eq!(probes(), first, "no probes after the first snapshot: {:?}", channel.names());
+    let fresh = BlobSnapshotStore::new(channel_store(&channel));
+    assert_eq!(fresh.newest().await.unwrap(), Some(snap(5)));
+}

@@ -235,8 +235,9 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
     }
 
     /// A plain message: a channel lists, so the newest is found without a
-    /// link (whose thread the pacer would hold for seconds).
-    async fn put_loose(&self, label: &str, data: Bytes) -> Result<DiscordId> {
+    /// link (whose thread the pacer would hold for seconds): `after` is not
+    /// needed.
+    async fn put_loose(&self, _after: Option<&DiscordId>, label: &str, data: Bytes) -> Result<DiscordId> {
         if label.contains(['~', ' ']) {
             bail!("a loose label may not contain '~' or spaces: {label:?}");
         }

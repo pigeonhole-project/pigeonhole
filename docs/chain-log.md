@@ -227,7 +227,8 @@ Where the code differs from the design above:
   writers putting the same name must get two messages), wins iff nothing in
   `(prev, b)` names `prev` (no read when `b == prev + 1`). `tail` and
   `successor` post a probe to learn the top (probes stay: a hole in a checked
-  range costs re-reads); `tail` walks down to the newest message that won its
+  range costs re-reads), so a snapshot (`put_loose`) goes after the one put
+  before it when the caller knows it, which needs no probe; `tail` walks down to the newest message that won its
   link. `prune` deletes our members and probes below a point, walking down
   until a page holds none of ours. Empty ids in a checked range are re-read,
   then taken as deleted (`ChainOptions`).

@@ -195,7 +195,7 @@ async fn removed_snapshots_leave_no_links_behind() {
         // Every other one too big for a text message: an attachment.
         let len = if at % 2 == 0 { 9_000 } else { 10 };
         let snap = pigeonhole_meta::StoredSnapshot { log_id: pigeonhole_meta::LogId(1), at, data: vec![at as u8; len] };
-        refs.push(store.put(&snap).await.unwrap());
+        refs.push(store.put(&snap, refs.last()).await.unwrap());
         if refs.len() > 1 {
             let old = refs.remove(0);
             store.remove(&old).await.unwrap();
@@ -237,8 +237,8 @@ async fn snapshots_are_plain_messages_found_by_listing() {
         at,
         data: vec![at as u8; 10],
     };
-    snaps.put(&snap(1, 10)).await.unwrap();
-    let second = snaps.put(&snap(1, 20)).await.unwrap();
+    let first = snaps.put(&snap(1, 10), None).await.unwrap();
+    let second = snaps.put(&snap(1, 20), Some(&first)).await.unwrap();
     assert!(channel.thread_ids().is_empty(), "snapshots start no threads: {:?}", channel.thread_ids());
     let fresh = BlobSnapshotStore::new(channel_store(&channel));
     assert_eq!(fresh.newest().await.unwrap(), Some(snap(1, 20)));
@@ -255,7 +255,7 @@ async fn a_snapshot_over_the_attachment_limit_goes_up_in_parts() {
     let snaps = BlobSnapshotStore::new(channel_store_of(&channel, Some(4096)));
     let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
     let snap = pigeonhole_meta::StoredSnapshot { log_id: pigeonhole_meta::LogId(1), at: 30, data };
-    let r = snaps.put(&snap).await.unwrap();
+    let r = snaps.put(&snap, None).await.unwrap();
     assert!(channel.message_ids().len() > 10, "in parts: {} messages", channel.message_ids().len());
     assert!(channel.thread_ids().is_empty(), "parts start no threads: {:?}", channel.thread_ids());
     let fresh = BlobSnapshotStore::new(channel_store_of(&channel, Some(4096)));

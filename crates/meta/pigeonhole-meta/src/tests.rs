@@ -414,7 +414,7 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
     };
     let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
     let stored = StoredSnapshot { log_id: head.log_id, at: head.position, data };
-    let snapshot = snaps_of(&log_dir).put(&stored).await.unwrap();
+    let snapshot = snaps_of(&log_dir).put(&stored, None).await.unwrap();
     log.rebase(2, raft::base_of(&meta, snapshot), 1).await.unwrap();
     drop(log);
 
@@ -515,8 +515,8 @@ struct Unreadable {
 
 #[async_trait::async_trait]
 impl SnapshotStore for Unreadable {
-    async fn put(&self, s: &StoredSnapshot) -> Result<SnapshotRef> {
-        self.inner.put(s).await
+    async fn put(&self, s: &StoredSnapshot, after: Option<&SnapshotRef>) -> Result<SnapshotRef> {
+        self.inner.put(s, after).await
     }
     async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
         if self.bad.lock().unwrap().as_ref() == Some(r) {
