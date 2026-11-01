@@ -70,6 +70,17 @@ warning.
   if the key has no override.
 - `POST /admin/run/{task}`: a pass now. Tasks are `sweep`, `repair`, `cool`,
   `snapshot`, `metrics`, `cas_gc`, `upload_gc`. Answers 202.
+- `POST /admin/ops`: the site's UI's ops (crates/admin, `pigeonhole-admin`):
+  a JSON line (`{"op": "list", "bucket": "photos"}`), then an upload's bytes;
+  the answer is `{"reply": …}`. The demo's node runs the same ops in the
+  browser, so the UI is one: objects, the log decoded, the background tasks
+  with their queues, the dynamic config, verify and repair.
+- `/`: that UI, when `[admin] ui_dir` names the built site
+  (`python3 site/build.py` → `target/site`). Open
+  `http://<admin address>/demo.html`: the page finds `/admin/config` beside
+  it and talks to this node instead of starting the demo. It is served from
+  the admin address itself, so no other site may call the API from a
+  browser (there are no CORS headers).
 
 The CLI talks to it. It reads only `[admin]` of the config, so it needs none
 of the stores' secrets:

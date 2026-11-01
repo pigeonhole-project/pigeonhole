@@ -12,7 +12,7 @@ async fn puts_with(bots: usize, n: usize) -> Duration {
         .replace("kind = \"local_disk\"\npath = \"/data/channels\"", "kind = \"memory\"")
         .replace("rate_per_sec = 20.0\nburst = 20.0", "rate_per_sec = 4.0\nburst = 1.0");
     let cfg = parse_config(&text).unwrap();
-    let world = World::default();
+    let world = std::sync::Arc::new(World::default());
     let node = Node::open(&world, &cfg).await.unwrap();
     node.create_bucket("demo").await.unwrap();
     let t0 = Instant::now();

@@ -42,7 +42,7 @@ async fn count(world: &World, node: &Node, store: &str) -> u64 {
 
 #[tokio::test]
 async fn a_wiped_channel_is_read_around_found_by_verify_and_repaired() {
-    let world = World::default();
+    let world = std::sync::Arc::new(World::default());
     let node = Node::open(&world, &config(2)).await.unwrap();
     node.create_bucket("demo").await.unwrap();
     for i in 0..3 {
@@ -66,7 +66,7 @@ async fn a_wiped_channel_is_read_around_found_by_verify_and_repaired() {
 #[tokio::test]
 async fn a_channel_down_fails_a_write_of_two_and_takes_one_of_two() {
     for quorum in [2, 1] {
-        let world = World::default();
+        let world = std::sync::Arc::new(World::default());
         let node = Node::open(&world, &config(quorum)).await.unwrap();
         node.create_bucket("demo").await.unwrap();
         let dc = node.channels.iter().find(|c| c.store == "discord").unwrap().clone();
@@ -85,11 +85,11 @@ async fn a_channel_down_fails_a_write_of_two_and_takes_one_of_two() {
 }
 
 /// The demo on memory, a background repair pass every second (the least).
-async fn open_with_repair() -> (World, Node) {
+async fn open_with_repair() -> (std::sync::Arc<World>, Node) {
     let text = DEMO_CONFIG
         .replace("kind = \"local_disk\"\npath = \"/data/channels\"", "kind = \"memory\"")
         .replace("[repair]\ninterval = \"10s\"", "[repair]\ninterval = \"1s\"");
-    let world = World::default();
+    let world = std::sync::Arc::new(World::default());
     let cfg = parse_config(&text).unwrap();
     let node = Node::open(&world, &cfg).await.unwrap();
     node.create_bucket("demo").await.unwrap();

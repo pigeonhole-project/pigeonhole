@@ -10,6 +10,7 @@ name = "pigeonhole"
 path = "src/main.rs"
 
 [dependencies]
+pigeonhole-admin = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }

@@ -225,3 +225,6 @@ every = "5s"                  # how often the tablet's gauges are set
 # authentication: keep it on loopback.
 [admin]
 # listen_addr = "127.0.0.1:9100"
+# The site's UI as this node's admin, at http://<listen_addr>/demo.html
+# (python3 site/build.py builds it into target/site).
+# ui_dir = "target/site"

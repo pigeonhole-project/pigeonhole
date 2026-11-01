@@ -14,21 +14,47 @@
   const esc = v => String(v).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"})[c]);
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  // ------------------------------------------------------------ the worker
-  const worker = new Worker(window.ASSETS + "web-worker.js" + (document.currentScript?.src.match(/\?v=\w+/)?.[0] || ""));
-  // Let go of the files at once, for the next page (a reload, the other language).
-  addEventListener("pagehide", () => worker.terminate());
-  addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
+  // ------------------------------------------------------------ the node
+  // The demo's node runs in a worker (wasm). Served by a real node's admin
+  // address ([admin] ui_dir), the page is its admin: the same ops, over
+  // HTTP to /admin/ops (pigeonhole-admin runs them in both).
+  const workerUrl = window.ASSETS + "web-worker.js" + (document.currentScript?.src.match(/\?v=\w+/)?.[0] || "");
+  let worker = null;
   const waiting = new Map();
   let nextId = 1, queue = Promise.resolve();
-  worker.onmessage = ({data}) => {
-    if (data.id === -1) { background(data.events); return; }
-    const done = waiting.get(data.id);
-    waiting.delete(data.id);
-    if (done) done(data);
-  };
+  const isAdmin = fetch("/admin/config", {cache: "no-store"})
+    .then(r => r.ok && (r.headers.get("content-type") || "").includes("json"))
+    .catch(() => false);
+  const started = isAdmin.then(admin => {
+    if (admin) return {id: 0, reply: {admin: true, saved: true, persistent: true}, events: []};
+    worker = new Worker(workerUrl);
+    worker.onmessage = ({data}) => {
+      if (data.id === -1) { background(data.events); return; }
+      const done = waiting.get(data.id);
+      waiting.delete(data.id);
+      if (done) done(data);
+    };
+    return new Promise(res => waiting.set(0, res));
+  });
+  // Let go of the files at once, for the next page (a reload, the other language).
+  addEventListener("pagehide", () => worker?.terminate());
+  addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
+  const enc = new TextEncoder();
+  // An op on a real node: the JSON line, then the body, as the worker reads them.
+  async function httpCall(request, body) {
+    const head = enc.encode(JSON.stringify({...request, len: body ? body.byteLength : 0}) + "\n");
+    const payload = new Uint8Array(head.length + (body ? body.byteLength : 0));
+    payload.set(head);
+    if (body) payload.set(new Uint8Array(body), head.length);
+    try {
+      const r = await fetch("/admin/ops", {method: "POST", body: payload});
+      return {reply: (await r.json()).reply, events: []};
+    } catch (e) {
+      return {reply: {error: String(e)}, events: []};
+    }
+  }
   function call(request, body) {
-    const run = queue.then(() => new Promise(res => {
+    const run = queue.then(() => started).then(() => state.admin ? httpCall(request, body) : new Promise(res => {
       const id = nextId++;
       waiting.set(id, res);
       worker.postMessage({id, ...request, body}, body ? [body] : []);
@@ -36,7 +62,6 @@
     queue = run.catch(() => {});
     return run;
   }
-  const started = new Promise(res => waiting.set(0, res));
 
   // ------------------------------------------------------------ state
   const state = {
@@ -48,11 +73,17 @@
     logView: "readable",   // the log panel: "readable" or "channel"
     busy: false,
     wizard: false,         // the first visit's setup is on screen
+    admin: false,          // the page is a real node's admin (not the demo)
+    bucket: "demo",        // the bucket the client panel shows
     bg: null,              // what runs in the background: {repair: {queue, every_ms, next_ms}, snapshot}
   };
   const byStore = () => Object.fromEntries(state.channels.map(c => [c.store, c]));
   // The open panel is the log's (it opens by the log channel's id).
   const logOpen = () => byStore()[state.open]?.role === "log";
+
+  // A store's kind as a name: the app, or what a server's own store is.
+  const appOf = k => ({telegram: "Telegram", discord: "Discord"})[k] || t(`kind.${k}`);
+  const KIND_COLOR = {telegram: "var(--tg)", discord: "var(--dc)"};
 
   // ------------------------------------------------------------ the graph
   const graph = $("graph");
@@ -131,13 +162,13 @@
     });
 
     for (const c of state.channels) {
-      const app = c.kind === "telegram" ? "Telegram" : "Discord";
+      const app = appOf(c.kind);
       const bots = c.bots > 1 ? `, ${t("demo.bots", {n: c.bots})}` : "";
       const role = placeNote(c, app) + bots + (c.down ? `, ${t("demo.down")}` : "");
       const n = node(c.store, pos[c.store], c.store, role);
       n.g.classList.toggle("down", !!c.down);
       s("rect", {class: `shape${c.role === "data" ? "" : " meta"}`, x: -130, y: -34, width: 260, height: 68, rx: 14}, n.g);
-      s("circle", {class: "badge", cx: -106, cy: 0, r: 9, fill: c.kind === "telegram" ? "var(--tg)" : "var(--dc)"}, n.g);
+      s("circle", {class: "badge", cx: -106, cy: 0, r: 9, fill: KIND_COLOR[c.kind] || "var(--slate)"}, n.g);
       n.label(-88, 0, "start");
       // The channel's message count, top right.
       n.count = s("text", {class: "count", x: 116, y: -10, "text-anchor": "end"}, n.g);
@@ -423,7 +454,7 @@
 
   function refreshCount(c) {
     const n = nodes[c.store];
-    if (!n) return;
+    if (!n || c.total == null) return;
     if (n.count) n.count.textContent = String(c.total);
   }
 
@@ -486,7 +517,7 @@
   }
 
   async function refreshObjects() {
-    const {reply} = await call({op: "list"});
+    const {reply} = await call({op: "list", bucket: state.bucket});
     state.objects = reply?.objects || [];
     const n = nodes.client;
     if (n) n.countText.textContent = `${t("demo.you")}, ${t("demo.objects", {n: state.objects.length})}`;
@@ -559,10 +590,10 @@
       wireNode();
     } else if (c?.role === "log") {
       $("panel-title").textContent = t("demo.log_title");
-      $("panel-sub").textContent = t("demo.log_sub", {store: c.store, app: c.kind === "telegram" ? "Telegram" : "Discord"});
+      $("panel-sub").textContent = t("demo.log_sub", {store: c.store, app: appOf(c.kind)});
       renderLog(body);
     } else if (c) {
-      const app = c.kind === "telegram" ? "Telegram" : "Discord";
+      const app = appOf(c.kind);
       $("panel-title").textContent = c.store;
       $("panel-sub").textContent = t(`demo.channel_sub_${c.role}`, {app, scope: c.scope});
       body.replaceChildren(...(c.role === "data" ? [faults(c)] : []), feed(c));
@@ -573,7 +604,7 @@
   // gone behind the node's back); check finds what is gone, repair puts it back.
   function faults(c) {
     const box = h("div", "faults");
-    box.append(h("p", "faults-note", t(c.down ? "demo.fault_down_note" : "demo.fault_note")));
+    box.append(h("p", "faults-note", t(state.admin ? "admin.channel_note" : c.down ? "demo.fault_down_note" : "demo.fault_note")));
     const row = h("div", "row");
     const btn = (label, cls, fn) => {
       const b = h("button", `btn ${cls}`, label);
@@ -582,12 +613,12 @@
       row.append(b);
     };
     const store = esc(c.store);
-    btn(t(c.down ? "demo.bring_back" : "demo.take_down"), c.down ? "primary" : "", async () => {
+    if (!state.admin) btn(t(c.down ? "demo.bring_back" : "demo.take_down"), c.down ? "primary" : "", async () => {
       const r = await op({op: "outage", store: c.store, down: !c.down});
       if (r && !r.error) caption(t(r.down ? "say.down" : "say.up", {store}));
       await refreshChannels();
     });
-    btn(t("demo.wipe"), "danger", async () => {
+    if (!state.admin) btn(t("demo.wipe"), "danger", async () => {
       const r = await op({op: "wipe", store: c.store});
       if (r && !r.error) caption(t("say.wiped", {store, n: r.deleted}));
       await refreshChannels();
@@ -660,6 +691,7 @@
   }
 
   function feed(c) {
+    if (!KIND_COLOR[c.kind]) return h("p", "empty", t("admin.no_view", {kind: appOf(c.kind)}));
     return c.kind === "telegram" ? telegramView(c) : discordView(c);
   }
 
@@ -888,7 +920,19 @@
   // You: uploads and the bucket.
   function wireClient() {
     const drop = $("drop");
-    const put = (name, buf) => op({op: "put", key: name}, buf);
+    if (state.admin) {
+      const sel = h("select", "bucket-pick");
+      sel.setAttribute("aria-label", t("admin.bucket"));
+      for (const b of state.buckets || []) {
+        const opt = h("option", "", b);
+        opt.value = b;
+        opt.selected = b === state.bucket;
+        sel.append(opt);
+      }
+      sel.addEventListener("change", () => { state.bucket = sel.value; refreshObjects(); });
+      drop.before(sel);
+    }
+    const put = (name, buf) => op({op: "put", bucket: state.bucket, key: name}, buf);
     $("file").addEventListener("change", async ev => {
       for (const f of ev.target.files) {
         if (f.size > 64 << 20) { caption(esc(t("try.too_big"))); continue; }
@@ -943,12 +987,12 @@
       };
       btn(t("try.read"), () => {
         const len = Math.min(size, 100_000), first = Math.floor(Math.random() * Math.max(1, size - len));
-        op({op: "get", key, range: [first, first + len - 1]}).then(r => {
+        op({op: "get", bucket: state.bucket, key, range: [first, first + len - 1]}).then(r => {
           if (r && !r.error) caption(t("demo.read_done", {len: bytes(r.len), key: esc(key)}));
         });
       });
-      btn(t("try.copy"), () => op({op: "copy", key, to: key.replace(/(\.[^.]*)?$/, m => `-copy${m}`)}));
-      btn(t("try.delete"), () => op({op: "delete", key}));
+      btn(t("try.copy"), () => op({op: "copy", bucket: state.bucket, key, to: key.replace(/(\.[^.]*)?$/, m => `-copy${m}`)}));
+      btn(t("try.delete"), () => op({op: "delete", bucket: state.bucket, key}));
       tr.append(acts);
       rows.append(tr);
     }
@@ -969,6 +1013,7 @@
     renderBgPanel();
     const editor = $("config-text");
     editor.value = state.config;
+    editor.readOnly = state.admin;
     $("config-reset").addEventListener("click", () => { editor.value = state.demo; $("config-error").textContent = ""; });
     $("config-apply").addEventListener("click", () => restart(editor.value));
     editor.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); restart(editor.value); } });
@@ -1002,7 +1047,6 @@
   const STEPS = ["channels", "copies", "meta", "bots", "review"];
   const MAX_CHANNELS = 4, MAX_BOTS = 4;
   let step = 0, edited = null;     // edited: the toml as the reader changed it
-  const appOf = k => (k === "telegram" ? "Telegram" : "Discord");
   const divisors = n => Array.from({length: n}, (_, i) => i + 1).filter(d => n % d === 0);
   // Sends a minute per bot and channel: the services' defaults, or the demo's.
   const perMinute = (kind, pace) => (pace === "demo" ? 1200 : kind === "telegram" ? 18 : 60);
@@ -1327,11 +1371,27 @@
     $("caption").append(" ", b);
   }
 
+  // A real node: no setup, no restart; its config read-only, its buckets.
+  async function startAdmin() {
+    state.admin = true;
+    document.body.classList.add("admin");
+    const t0 = performance.now();
+    const {reply} = await call({op: "info"});
+    if (!reply || reply.error) { $("status").textContent = t("try.error", {error: reply?.error || "no answer"}); return; }
+    state.config = reply.config || "";
+    state.buckets = reply.buckets || [];
+    state.bucket = state.buckets[0] || "";
+    await boot(reply);
+    $("status").textContent = t("admin.ready", {host: location.host, ms: Math.round(performance.now() - t0)});
+    caption(t("admin.caption", {n: state.buckets.length}));
+  }
+
   started.then(async data => {
     if (data.reply?.error) {
       $("status").textContent = data.reply.error === "other-tab" ? t("try.other_tab") : t("try.error", {error: data.reply.error});
       return;
     }
+    if (data.reply.admin) { await startAdmin(); return; }
     state.demo = data.reply.demo;
     state.config = data.reply.config;
     state.persistent = data.reply.persistent;

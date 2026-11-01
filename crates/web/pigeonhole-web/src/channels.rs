@@ -188,3 +188,41 @@ impl World {
         }))
     }
 }
+
+/// The demo's channels for the admin ops: fakes it can break.
+pub struct DemoChannels {
+    pub world: std::sync::Arc<World>,
+    pub channels: Vec<ChannelRef>,
+}
+
+impl DemoChannels {
+    fn find(&self, store: &str) -> Result<&ChannelRef> {
+        self.channels.iter().find(|c| c.store == store).ok_or_else(|| anyhow::anyhow!("no fake channel {store:?}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl pigeonhole_admin::Channels for DemoChannels {
+    async fn describe(&self, limit: usize) -> Result<Value> {
+        let mut out = Vec::new();
+        for c in &self.channels {
+            out.push(self.world.describe(c, limit).await?);
+        }
+        Ok(json!({ "channels": out }))
+    }
+
+    async fn delete_message(&self, store: &str, id: &str) -> Result<()> {
+        self.world.delete_message(self.find(store)?, id).await
+    }
+
+    async fn fault(&self, op: &str, store: &str, down: bool) -> Result<Value> {
+        let c = self.find(store)?;
+        Ok(match op {
+            "outage" => {
+                self.world.set_down(c, down);
+                json!({ "down": down })
+            }
+            _ => json!({ "deleted": self.world.wipe(c).await? }),
+        })
+    }
+}

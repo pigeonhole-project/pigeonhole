@@ -32,7 +32,19 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         let schedule = rt.dynamic.metrics.schedule();
         pigeonhole::state_metrics::spawn(rt.meta.clone(), index.clone(), rt.store.db().clone(), schedule);
     }
-    spawn_admin(&cfg, &rt).await?;
+    let admin = std::sync::Arc::new(pigeonhole_admin::Admin {
+        meta: rt.meta.clone(),
+        log: rt.log.clone(),
+        store: rt.store.clone(),
+        s3: s3_gateway.clone(),
+        index: index.clone(),
+        dynamic: rt.dynamic.clone(),
+        inline_on: cfg.inline.max_object_size.is_some(),
+        snapshot_every: cfg.meta.snapshot_every_entries,
+        channels: Some(std::sync::Arc::new(pigeonhole_admin::ListedStores(listed_stores(&cfg)))),
+        config_text: std::fs::read_to_string(&cfg.config_path).ok(),
+    });
+    spawn_admin(&cfg, &rt, admin).await?;
 
     #[cfg(feature = "bytestream")]
     spawn_bytestream(&cfg, &rt).await?;
@@ -67,6 +79,40 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The stores as the config names them, for the admin UI's graph: the data
+/// stores with their place in the placement, the log's and the snapshots'.
+fn listed_stores(cfg: &Config) -> Vec<serde_json::Value> {
+    use pigeonhole::config::{LogSettings, SnapshotSettings};
+    let shards = &cfg.placement.shards;
+    let mut out: Vec<serde_json::Value> = cfg
+        .instances
+        .iter()
+        .map(|i| {
+            let place = shards.iter().enumerate().find_map(|(shard, s)| {
+                let copy = s.group.iter().position(|m| *m == i.info.id)?;
+                Some(serde_json::json!({ "shard": shard, "shards": shards.len(), "copy": copy, "copies": s.group.len() }))
+            });
+            let bots = i.bot_token_envs.len().max(1);
+            serde_json::json!({ "store": i.info.id, "role": "data", "kind": i.kind.as_str(), "scope": i.scope_id, "bots": bots, "place": place, "messages": [] })
+        })
+        .collect();
+    let kind = |log: bool| match (log, &cfg.meta.log, &cfg.meta.snapshot) {
+        (true, LogSettings::Telegram { .. }, _) | (false, _, SnapshotSettings::Telegram { .. }) => Some("telegram"),
+        (true, LogSettings::Discord { .. }, _) | (false, _, SnapshotSettings::Discord { .. }) => Some("discord"),
+        (true, LogSettings::LocalDisk { .. }, _) | (false, _, SnapshotSettings::LocalDisk { .. }) => Some("local_disk"),
+        (true, LogSettings::Memory, _) | (false, _, SnapshotSettings::Memory) => Some("memory"),
+        _ => None,
+    };
+    for (role, log) in [("log", true), ("snapshots", false)] {
+        if let Some(kind) = kind(log) {
+            out.push(
+                serde_json::json!({ "store": format!("meta-{role}"), "role": role, "kind": kind, "messages": [] }),
+            );
+        }
+    }
+    out
+}
+
 /// The REAPI / ByteStream server on its own port, if enabled.
 #[cfg(feature = "bytestream")]
 async fn spawn_bytestream(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow::Result<()> {
@@ -95,7 +141,11 @@ async fn spawn_bytestream(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow:
 
 /// The admin API (`[admin] listen_addr`, off by default): the dynamic
 /// config and passes on demand (docs/dynamic-config.md).
-async fn spawn_admin(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow::Result<()> {
+async fn spawn_admin(
+    cfg: &Config,
+    rt: &crate::runtime::Runtime,
+    admin: std::sync::Arc<pigeonhole_admin::Admin>,
+) -> anyhow::Result<()> {
     let Some(addr) = &cfg.admin.listen_addr else { return Ok(()) };
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind admin {addr}"))?;
     let sock = listener.local_addr()?;
@@ -103,7 +153,7 @@ async fn spawn_admin(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow::Resu
         tracing::warn!(%sock, "the admin API has no authentication and listens beyond this host");
     }
     info!(%sock, "admin API listening");
-    let app = pigeonhole::admin_http::router(rt.dynamic.clone());
+    let app = pigeonhole::admin_http::with_ui(rt.dynamic.clone(), admin, cfg.admin.ui_dir.as_deref());
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "admin API stopped");

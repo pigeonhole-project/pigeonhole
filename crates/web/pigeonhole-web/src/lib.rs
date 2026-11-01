@@ -9,11 +9,10 @@
 //! its log. The S3 calls go straight to [`S3Gateway`], the server's handlers.
 
 use anyhow::{bail, Context, Result};
-use bytes::{Bytes, BytesMut};
-use http::{Extensions, HeaderMap, Method, Uri};
+use pigeonhole_admin::Admin;
 use pigeonhole_blob::{erase, CheapestFirst, InstanceInfo, MetricsBackend, Replicated, SharedBackend};
 use pigeonhole_chunk_store::{BlobDb, BlockCache, ChunkStore, IngestOptions};
-use pigeonhole_chunk_store::{RepairStats, Repairer, SweepStats, Sweeper};
+use pigeonhole_chunk_store::{Repairer, Sweeper};
 use pigeonhole_config::instances::{check_fingerprints, InstanceConfig, InstanceKind};
 use pigeonhole_config::stores::{FakeBacking, FakeChannel};
 use pigeonhole_config::{Config, DynConfig, LogSettings, SnapshotSettings};
@@ -27,16 +26,12 @@ use pigeonhole_storage_memory::MemoryBlobStore;
 use pigeonhole_storage_telegram::fake::bot::FakeBot as TelegramBot;
 use pigeonhole_storage_telegram::pool::PooledChannel;
 use pigeonhole_storage_telegram::TelegramBlobStore;
-use s3s::dto::{CopyObjectInput, CreateBucketInput, DeleteObjectInput, GetObjectInput, ListObjectsV2Input};
-use s3s::dto::{PutObjectInput, StreamingBlob};
-use s3s::{S3Request, S3};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod channels;
-mod log_view;
 #[cfg(target_family = "wasm")]
 mod web;
 
@@ -208,20 +203,19 @@ impl World {
 }
 
 pub struct Node {
+    /// The admin ops over this node (`Deref`: `node.put(…)`, `node.verify(…)`).
+    pub admin: Admin,
     /// The fake channels the config uses, data, log and snapshots.
     pub channels: Vec<channels::ChannelRef>,
-    /// The store the node's metadata log lives in (read by the inspector).
-    pub log: Arc<dyn LogStore>,
-    pub meta: Arc<MetaStore>,
-    pub store: Arc<ChunkStore>,
-    pub s3: S3Gateway,
-    /// The background loops' knobs, the file's with the tablet's overrides.
-    pub dynamic: Arc<DynConfig>,
     /// The background loops, as the server's: repair, sweep, cool.
     loops: Vec<tokio::task::JoinHandle<()>>,
-    index: Index,
-    inline_on: bool,
-    snapshot_every: Option<u64>,
+}
+
+impl std::ops::Deref for Node {
+    type Target = Admin;
+    fn deref(&self) -> &Admin {
+        &self.admin
+    }
 }
 
 /// The cooler's loop, as the server's (`[inline] cool_every`).
@@ -241,20 +235,6 @@ async fn cooler(
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "cooler pass failed"),
         }
         schedule.done();
-    }
-}
-
-fn req<T>(input: T) -> S3Request<T> {
-    S3Request {
-        input,
-        method: Method::GET,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::default(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
     }
 }
 
@@ -360,7 +340,7 @@ impl World {
 
 impl Node {
     /// Boots over `world`: claims the log, loads its snapshot, replays the rest.
-    pub async fn open(world: &World, cfg: &Config) -> Result<Self> {
+    pub async fn open(world: &Arc<World>, cfg: &Config) -> Result<Self> {
         let namespaces = DynConfig::register(Index::register(BlobDb::register(Namespaces::new())));
         let opts = MetaOptions {
             snapshot_every: cfg.meta.snapshot_every_entries,
@@ -413,24 +393,22 @@ impl Node {
             spawn(Box::pin(sweeper.run_loop(dynamic.sweep.schedule()))),
             spawn(Box::pin(cooler(dynamic.cool.schedule(), s3.clone(), meta.clone(), inline_on))),
         ];
-        Ok(Self {
-            channels: channels::of(cfg),
-            log,
+        let channels = channels::of(cfg);
+        let view: Arc<dyn pigeonhole_admin::Channels> =
+            Arc::new(channels::DemoChannels { world: world.clone(), channels: channels.clone() });
+        let admin = Admin {
             meta,
+            log,
             store,
             s3,
-            dynamic,
-            loops,
             index,
+            dynamic,
             inline_on,
             snapshot_every: cfg.meta.snapshot_every_entries,
-        })
-    }
-
-    /// The log's entries as they lie in its store, commands decoded: the last
-    /// `limit`, or `limit` from position `from`.
-    pub async fn log_entries(&self, from: Option<u64>, limit: usize) -> Result<serde_json::Value> {
-        log_view::read(self.log.as_ref(), from, limit).await
+            channels: Some(view),
+            config_text: None,
+        };
+        Ok(Self { admin, channels, loops })
     }
 
     /// Stops the tablet, as a process exit would.
@@ -438,142 +416,6 @@ impl Node {
         for task in &self.loops {
             task.abort();
         }
-        self.meta.close().await
+        self.admin.meta.close().await
     }
-
-    /// What runs in the background, task by task (the ones this node runs:
-    /// repair, sweep, cool, snapshot): its period, when it passes next, and
-    /// the work waiting for it.
-    pub async fn background(&self) -> Result<serde_json::Value> {
-        use serde_json::json;
-        let found = self.log.discover().await?;
-        let (head, base) = found.map_or((0, 0), |d| (d.head.position, d.base.map_or(0, |b| b.at)));
-        let jobs = self.store.db().repair_jobs().await;
-        let zero_ref = self.store.db().list_zero_ref_chunks().await?;
-        let policy = self.dynamic.cool.get().policy.with_inlining(self.inline_on);
-        let cold = self.index.cool_candidates(chrono::Utc::now(), &policy);
-        let work = |task: &str| {
-            match task {
-            "repair" => json!(jobs.iter().map(|(chunk, store)| json!({ "chunk": chunk, "store": store })).collect::<Vec<_>>()),
-            "sweep" => json!(zero_ref.iter().map(|chunk| json!({ "chunk": chunk })).collect::<Vec<_>>()),
-            "cool" => json!(cold
-                .iter()
-                .map(|c| json!({ "key": c.key, "bucket": c.bucket, "size": c.bytes.len(), "reason": format!("{:?}", c.reason).to_lowercase() }))
-                .collect::<Vec<_>>()),
-            _ => json!([]),
-        }
-        };
-        let tasks: Vec<_> = self
-            .dynamic
-            .tasks()
-            .into_iter()
-            .filter(|t| ["repair", "sweep", "cool", "snapshot"].contains(&t.task))
-            .map(|t| json!({ "task": t.task, "every": t.every, "next_in_ms": t.next_in_ms, "work": work(t.task) }))
-            .collect();
-        Ok(json!({ "tasks": tasks, "snapshot": { "head": head, "base": base, "every": self.snapshot_every } }))
-    }
-
-    /// Entries the boot replayed from the log after its snapshot.
-    pub fn replayed(&self) -> u64 {
-        self.meta.applied_position().saturating_sub(self.meta.base_position())
-    }
-
-    pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
-        self.s3.create_bucket(req(CreateBucketInput { bucket: bucket.into(), ..Default::default() })).await?;
-        Ok(())
-    }
-
-    pub async fn put(&self, bucket: &str, key: &str, body: Bytes) -> Result<()> {
-        let input = PutObjectInput {
-            bucket: bucket.into(),
-            key: key.into(),
-            body: Some(StreamingBlob::from_bytes(body)),
-            ..Default::default()
-        };
-        self.s3.put_object(req(input)).await?;
-        Ok(())
-    }
-
-    /// The object, or the bytes `first..=last` of it.
-    pub async fn get(&self, bucket: &str, key: &str, range: Option<(u64, u64)>) -> Result<Bytes> {
-        let input = GetObjectInput {
-            bucket: bucket.into(),
-            key: key.into(),
-            range: range.map(|(first, last)| s3s::dto::Range::Int { first, last: Some(last) }),
-            ..Default::default()
-        };
-        let out = self.s3.get_object(req(input)).await?;
-        let mut body = out.output.body.context("no body")?;
-        let mut buf = BytesMut::new();
-        while let Some(chunk) = futures_next(&mut body).await {
-            buf.extend_from_slice(&chunk?);
-        }
-        Ok(buf.freeze())
-    }
-
-    pub async fn copy(&self, bucket: &str, from: &str, to: &str) -> Result<()> {
-        let input = CopyObjectInput::builder()
-            .bucket(bucket.into())
-            .key(to.into())
-            .copy_source(s3s::dto::CopySource::Bucket { bucket: bucket.into(), key: from.into(), version_id: None })
-            .build()?;
-        self.s3.copy_object(req(input)).await?;
-        Ok(())
-    }
-
-    pub async fn delete(&self, bucket: &str, key: &str) -> Result<()> {
-        let input = DeleteObjectInput { bucket: bucket.into(), key: key.into(), ..Default::default() };
-        self.s3.delete_object(req(input)).await?;
-        Ok(())
-    }
-
-    /// The keys in `bucket` with their sizes.
-    pub async fn list(&self, bucket: &str) -> Result<Vec<(String, i64)>> {
-        let input = ListObjectsV2Input { bucket: bucket.into(), ..Default::default() };
-        let out = self.s3.list_objects_v2(req(input)).await?;
-        Ok(out
-            .output
-            .contents
-            .unwrap_or_default()
-            .into_iter()
-            .map(|o| (o.key.unwrap_or_default(), o.size.unwrap_or(0)))
-            .collect())
-    }
-
-    /// One repair pass: copy chunks that lost a replica back to full.
-    pub async fn repair(&self) -> Result<RepairStats> {
-        let repairer =
-            Repairer::new(self.store.db().clone(), self.store.replicated().clone(), self.dynamic.repair.get());
-        repairer.repair_once().await
-    }
-
-    /// Repair jobs waiting.
-    pub async fn repair_queue(&self) -> Result<u64> {
-        self.store.db().repair_queue_len().await
-    }
-
-    /// Probe every copy store `id` should hold; queue a repair for each one
-    /// gone. How many it checked, and how many were gone.
-    pub async fn verify(&self, id: &str) -> Result<(u64, u64)> {
-        let repairer =
-            Repairer::new(self.store.db().clone(), self.store.replicated().clone(), self.dynamic.repair.get());
-        repairer.verify_instance(id).await
-    }
-
-    /// One sweeper pass: delete posts that no chunk points to.
-    pub async fn sweep(&self) -> Result<SweepStats> {
-        let replicated = self.store.replicated();
-        let sweeper = Sweeper::new(
-            self.store.db().clone(),
-            replicated.members().to_vec(),
-            self.dynamic.sweep.get(),
-            replicated.pins().clone(),
-        );
-        sweeper.sweep_once().await
-    }
-}
-
-async fn futures_next(body: &mut StreamingBlob) -> Option<Result<Bytes>> {
-    use futures::StreamExt;
-    body.next().await.map(|r| r.map_err(|e| anyhow::anyhow!("{e}")))
 }

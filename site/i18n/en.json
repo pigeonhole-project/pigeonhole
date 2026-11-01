@@ -352,5 +352,15 @@
     "other": "{n} pinned messages"
   },
   "js.demo.tg_pinned_service": "pigeonhole pinned a message",
-  "js.demo.owner_marker": "Owner marker: this channel belongs to deployment {owner}; another deployment refuses it."
+  "js.demo.owner_marker": "Owner marker: this channel belongs to deployment {owner}; another deployment refuses it.",
+  "js.admin.ready": "Connected to pigeonhole at {host} ({ms} ms). This is its admin: changes here are real.",
+  "js.admin.caption": {
+    "one": "A real node: {n} bucket. Its background tasks, its log and its config are live; the channels' messages are not read yet.",
+    "other": "A real node: {n} buckets. Its background tasks, its log and its config are live; the channels' messages are not read yet."
+  },
+  "js.admin.bucket": "Bucket",
+  "js.admin.channel_note": "A real channel: check finds copies it lost, repair writes them back. Its messages are not read from here yet.",
+  "js.kind.local_disk": "local disk",
+  "js.kind.memory": "memory",
+  "js.admin.no_view": "A {kind} store: no messages to show, its blobs are files."
 }

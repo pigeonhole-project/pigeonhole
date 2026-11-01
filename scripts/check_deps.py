@@ -31,6 +31,8 @@ ROLE = {
     "pigeonhole-gateway-webdav": "gateway",
     # pigeonhole.toml read into a Config: what the binary and the web build share.
     "pigeonhole-config": "config",
+    # The admin ops over a running node: the binary's admin API and the demo.
+    "pigeonhole-admin": "admin",
     "pigeonhole": "bin",
     # The in-browser build: a composition root like the binary.
     "pigeonhole-web": "bin",
@@ -172,6 +174,14 @@ def main() -> int:
                     errors.append(
                         f"{name} (chunk-store) must not depend on {dep['name']}"
                     )
+
+        elif role == "admin":
+            # Builds for wasm too: no store, no network client, no server.
+            allowed = {"blob", "chunk-store", "codec", "config", "gateway", "limits", "meta", "storage-api", "types"}
+            for dep_name in dep_names:
+                dr = ROLE.get(dep_name)
+                if dr is not None and dr not in allowed:
+                    errors.append(f"{name} (admin) → {dep_name} ({dr}); allowed: {sorted(allowed)}")
 
         elif role == "standalone":
             for dep_name in dep_names:
