@@ -173,6 +173,7 @@
   "js.demo.channel_sub_data": "A fake {app} channel ({scope}) holding chunks. Kept in this browser.",
   "js.demo.channel_sub_snapshots": "A fake {app} channel ({scope}) holding snapshots of the metadata.",
   "js.demo.no_messages": "No messages yet.",
+  "js.demo.earlier": "{n} earlier messages are not shown",
   "js.demo.text_meta": "{name}, {size} as text, message {id}",
   "js.demo.other_meta": "a message that is not ours, {id}",
   "js.demo.file_meta": "{size}, message {id}",

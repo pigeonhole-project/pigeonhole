@@ -41,7 +41,7 @@
   // ------------------------------------------------------------ state
   const state = {
     demo: "", config: "", persistent: false,
-    channels: [],          // {store, role, kind, scope, messages: [...]}
+    channels: [],          // {store, role, kind, scope, total, messages: [the last 200]}
     objects: [],
     log: null,             // {head, base, entries}
     open: null,            // the node whose panel is open
@@ -107,9 +107,9 @@
       n.label(-88, 0, "start");
       // The channel's message count, top right.
       n.count = s("text", {class: "count", x: 116, y: -10, "text-anchor": "end"}, n.g);
-      n.count.textContent = String(c.messages.filter(m => !m.gone).length);
+      n.count.textContent = String(c.total);
       const tip = s("title", {}, n.g);
-      tip.textContent = t("demo.messages", {n: c.messages.length});
+      tip.textContent = t("demo.messages", {n: c.total});
     }
     markOpen();
   }
@@ -210,12 +210,15 @@
         const m = {id: f.message_id, kind: f.kind, name: f.name, size: +f.bytes, preview: f.kind === "text" ? preview : undefined, fresh: true, at: new Date()};
         preview = null;
         c.messages.push(m);
+        c.total++;
         const at = c.role === "snapshots" && /-(\d+)\.snap/.exec(m.name || "");
         if (at) said.push({op: "Snapshot", at: +at[1]});
         fly(f.store, false, m.size).then(() => { bump(f.store); refreshCount(c); if (state.open === f.store) renderPanel(); });
       } else if (msg === "deleted" && stores[f.store]) {
         const ids = String(f.messages || "").match(/\d+/g) || [];
         for (const m of stores[f.store].messages) if (ids.includes(String(m.id))) m.gone = true;
+        stores[f.store].total = Math.max(0, stores[f.store].total - ids.length);
+        refreshCount(stores[f.store]);
         if (state.open === f.store) renderPanel();
       } else if (msg === "store call" && span?.op === "get" && stores[span.instance]) {
         fly(span.instance, true, +span.bytes || 4096);
@@ -229,7 +232,7 @@
   function refreshCount(c) {
     const n = nodes[c.store];
     if (!n) return;
-    if (n.count) n.count.textContent = String(c.messages.filter(m => !m.gone).length);
+    if (n.count) n.count.textContent = String(c.total);
   }
 
   // What an S3 call did, in a sentence.
@@ -410,6 +413,8 @@
     head.append(ava, who);
     const chat = h("div", "tg-chat");
     const live = c.messages.slice(-200);
+    const earlier = c.total - live.filter(m => !m.gone).length;
+    if (earlier > 0) chat.append(h("div", "tg-day", t("demo.earlier", {n: earlier})));
     if (!live.length) chat.append(h("p", "tg-empty", t("demo.no_messages")));
     else chat.append(h("div", "tg-day", t("demo.today")));
     for (const m of live) {
@@ -445,6 +450,8 @@
     head.append(h("span", "dc-hash", "#"), h("b", "", c.store), h("span", "dc-topic", t(`demo.dc_topic_${c.role}`)));
     const chat = h("div", "dc-chat");
     const live = c.messages.slice(-200);
+    const earlier = c.total - live.filter(m => !m.gone).length;
+    if (earlier > 0) chat.append(h("div", "dc-day", t("demo.earlier", {n: earlier})));
     if (!live.length) chat.append(h("p", "dc-empty", t("demo.no_messages")));
     else chat.append(h("div", "dc-day", t("demo.today")));
     let last = null;

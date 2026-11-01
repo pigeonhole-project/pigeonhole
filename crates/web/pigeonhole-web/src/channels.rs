@@ -132,25 +132,27 @@ fn discord(id: u64, m: &DcMessage, role: &str) -> Value {
 }
 
 impl World {
-    /// Channel `c` as it is: its last `limit` messages.
+    /// Channel `c` as it is: how many messages it holds and the last `limit`.
     pub async fn describe(&self, c: &ChannelRef, limit: usize) -> Result<Value> {
-        let messages: Vec<Value> = match c.kind {
+        let (total, messages): (usize, Vec<Value>) = match c.kind {
             InstanceKind::Telegram => {
                 let ch = self.telegram(&c.scope, &c.backing).await?;
                 ch.host().read(|s: &TelegramChannelState| {
                     let all: Vec<Value> = s.messages().map(|(id, m)| telegram(id, m, c.role)).collect();
-                    all[all.len().saturating_sub(limit)..].to_vec()
+                    (all.len(), all[all.len().saturating_sub(limit)..].to_vec())
                 })
             }
             InstanceKind::Discord => {
                 let ch = self.discord(&c.scope, &c.backing).await?;
                 ch.host().read(|s: &DiscordChannelState| {
                     let all: Vec<Value> = s.messages().map(|(id, m)| discord(id, m, c.role)).collect();
-                    all[all.len().saturating_sub(limit)..].to_vec()
+                    (all.len(), all[all.len().saturating_sub(limit)..].to_vec())
                 })
             }
-            _ => Vec::new(),
+            _ => (0, Vec::new()),
         };
-        Ok(json!({ "store": c.store, "role": c.role, "kind": c.kind.as_str(), "scope": c.scope, "messages": messages }))
+        Ok(
+            json!({ "store": c.store, "role": c.role, "kind": c.kind.as_str(), "scope": c.scope, "total": total, "messages": messages }),
+        )
     }
 }

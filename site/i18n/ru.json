@@ -181,6 +181,7 @@
   "js.demo.channel_sub_data": "Фейковый канал {app} ({scope}) с чанками. Хранится в этом браузере.",
   "js.demo.channel_sub_snapshots": "Фейковый канал {app} ({scope}) со снапшотами метаданных.",
   "js.demo.no_messages": "Сообщений пока нет.",
+  "js.demo.earlier": "ещё {n} сообщений выше не показаны",
   "js.demo.text_meta": "{name}, {size} текстом, сообщение {id}",
   "js.demo.other_meta": "чужое сообщение, {id}",
   "js.demo.file_meta": "{size}, сообщение {id}",
