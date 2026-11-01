@@ -35,9 +35,10 @@ jobs:
           curl -sSfL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz | tar xz -C "$RUNNER_TEMP"
           echo "WASI_SDK=$RUNNER_TEMP/wasi-sdk-25.0-x86_64-linux" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
+      # Node 22's WASI segfaults on the smoke; 24 runs it.
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
