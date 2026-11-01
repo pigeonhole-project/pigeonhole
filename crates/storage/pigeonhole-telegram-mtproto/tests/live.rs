@@ -439,3 +439,62 @@ async fn second_bot_sees_first_bots_posts() {
     mine.delete_messages(&[id]).await.unwrap();
     assert!(by_id, "the second bot does not read the first one's post by id");
 }
+
+/// The owner marker on `TG_BLOBS_CHAT_ID`: posted and pinned, read back by
+/// another deployment, then deleted with the pin's service message.
+#[tokio::test]
+#[ignore = "needs a Telegram bot, api id and a test channel"]
+async fn the_owner_marker_is_pinned_and_read_back() {
+    use pigeonhole_storage_api::Owner;
+    use pigeonhole_storage_telegram::ChannelMessage;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    dotenvy::from_path(root.join(".env")).ok();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
+    let cfg = MtprotoConfig {
+        api_id: env("TG_API_ID").parse().unwrap(),
+        api_hash: env("TG_API_HASH"),
+        bot_token: env("TG_BOT_TOKEN"),
+        session: root.join(".cache/tgm-live.session"),
+    };
+    let tg = TelegramMtproto::connect(&cfg).await.unwrap();
+    let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()));
+    let channel = Arc::new(tg.channel(chat_id, Lane::Blobs, limiter.clone()).await.unwrap());
+    let store = |id: &str| {
+        let info = InstanceInfo {
+            id: id.into(),
+            kind: pigeonhole_storage_telegram::KIND,
+            fingerprint: format!("tg:{}:{}", tg.bot_id(), channel.channel_id()),
+            location: format!("tg:chat:{chat_id}"),
+            role: InstanceRole::ReadWrite,
+        };
+        TelegramBlobStore::new(channel.clone(), limiter.clone(), info)
+    };
+    let before = channel.pinned().await.unwrap();
+    println!("pinned before: {before:?}");
+    let ours = Owner::random();
+    let t = Instant::now();
+    let marked = store("live-a").mark_owner(ours).await;
+    println!("marked as {ours} in {:?}: {marked:?}", t.elapsed());
+    let pinned = channel.pinned().await.unwrap();
+    println!("pinned now: {pinned:?}");
+    let other = store("live-b").mark_owner(Owner(ours.0 ^ 1)).await;
+    println!("another deployment sees: {other:?}");
+
+    // Clean up: our marker and the service messages after it.
+    if let Some(marker) = pinned.filter(|p| Some(*p) != before) {
+        let ids: Vec<i64> = (marker..marker + 5).collect();
+        let msgs = channel.get_messages(&ids).await.unwrap();
+        let ours_only: Vec<i64> = ids
+            .iter()
+            .zip(&msgs)
+            .filter(|(id, m)| **id == marker || matches!(m, ChannelMessage::Other))
+            .map(|(id, _)| *id)
+            .collect();
+        println!("deleting {ours_only:?}");
+        channel.delete_messages(&ours_only).await.unwrap();
+    }
+    println!("pinned after cleanup: {:?}", channel.pinned().await.unwrap());
+    assert_eq!(marked.unwrap(), ours);
+    assert_eq!(other.unwrap(), ours, "another deployment learns whose channel it is");
+}

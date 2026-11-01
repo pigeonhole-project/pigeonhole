@@ -230,3 +230,38 @@ async fn empty_test_channels() {
         empty(&ch).await;
     }
 }
+
+/// The owner marker on the blobs channel: posted and pinned, listed back,
+/// read by another deployment; then the marker and the pin's system message
+/// are deleted (nothing else).
+#[tokio::test]
+#[ignore = "needs a Discord bot and a test channel"]
+async fn the_owner_marker_is_pinned_and_read_back() {
+    use pigeonhole_storage_api::Owner;
+    let (ch, limiter, _client, id) = channel("DISCORD_BLOBS_CHANNEL_ID");
+    let before: Vec<u64> = ch.pinned().await.unwrap().iter().map(|m| m.id).collect();
+    println!("pinned before: {before:?}");
+    let ours = Owner::random();
+    let t = Instant::now();
+    let marked = store_on(&ch, &limiter, id).mark_owner(ours).await;
+    println!("marked as {ours} in {:?}: {marked:?}", t.elapsed());
+    let pins = ch.pinned().await.unwrap();
+    println!(
+        "pinned now: {:?}",
+        pins.iter().map(|m| (m.id, m.kind, m.content.chars().take(40).collect::<String>())).collect::<Vec<_>>()
+    );
+    let other = store_on(&ch, &limiter, id).mark_owner(Owner(ours.0 ^ 1)).await;
+    println!("another deployment sees: {other:?}");
+
+    // Clean up: our marker and the system messages after it.
+    let marker = pins.iter().map(|m| m.id).find(|p| !before.contains(p));
+    if let Some(marker) = marker {
+        let after = ch.list(None, Some(marker - 1), 10).await.unwrap();
+        let ours_only: Vec<u64> = after.iter().filter(|m| m.id == marker || m.kind != 0).map(|m| m.id).collect();
+        println!("deleting {ours_only:?} of {:?}", after.iter().map(|m| (m.id, m.kind)).collect::<Vec<_>>());
+        ch.delete_messages(&ours_only).await.unwrap();
+    }
+    println!("pinned after cleanup: {:?}", ch.pinned().await.unwrap().iter().map(|m| m.id).collect::<Vec<_>>());
+    assert_eq!(marked.unwrap(), ours);
+    assert_eq!(other.unwrap(), ours, "another deployment learns whose channel it is");
+}
