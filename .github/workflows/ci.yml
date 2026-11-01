@@ -39,6 +39,16 @@ jobs:
       # so code behind a feature or behind its absence is linted too.
       - run: make lint
 
+  site:
+    name: site JavaScript (biome, node --test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: make lint-js test-js
+
   simulation:
     name: simulation (madsim)
     # madsim makes entropy deterministic on macOS (symbol overrides); on Linux
