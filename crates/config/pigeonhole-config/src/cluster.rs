@@ -6,9 +6,12 @@
 //! same blob stores); each has a `[meta]` log and snapshots of its own, and
 //! knows which node it is from `[cluster] node` or `PIGEONHOLE_NODE`. Two
 //! nodes talk over gRPC when both have `grpc`, else over the chat when both
-//! have an `outbox`.
+//! have an `outbox`: a channel each posts its frames into, and every other
+//! node reads, all with their own bots (`[cluster] bot_token_envs`, its
+//! values set on each host apart).
 
-use crate::stores::{Store, Topology};
+use crate::instances::TelegramLogin;
+use crate::stores::TelegramBots;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,8 +31,15 @@ pub struct NodeSettings {
     pub id: u64,
     /// `host:port` it serves Raft on and the others call it at.
     pub grpc: Option<String>,
-    /// The channel it posts its Raft frames into (a telegram or discord store).
-    pub outbox: Option<Store>,
+    /// The channel it posts its Raft frames into (`-100…`).
+    pub outbox: Option<i64>,
+}
+
+/// The chat the outboxes are in, and this node's bots there.
+#[derive(Clone, Debug)]
+pub enum ChatSettings {
+    /// The primary bot first; each reads and posts for the node.
+    Telegram { logins: Vec<TelegramLogin> },
 }
 
 /// The cluster as this node sees it.
@@ -42,6 +52,8 @@ pub struct ClusterSettings {
     /// The secret every frame is sealed with.
     pub key: [u8; 32],
     pub nodes: Vec<NodeSettings>,
+    /// Set when this node has a chat link.
+    pub chat: Option<ChatSettings>,
     pub heartbeat: Duration,
     pub election_timeout: (Duration, Duration),
     /// The chat transport's tick and poll.
@@ -88,6 +100,12 @@ pub(crate) struct FileCluster {
     tick: Option<Duration>,
     #[serde(with = "humantime_serde")]
     poll: Option<Duration>,
+    /// The chat of the outboxes: `"telegram"` (the default).
+    chat: Option<String>,
+    /// Env vars with this node's bots' tokens; default `["RAFT_BOT_TOKEN"]`.
+    bot_token_envs: Option<Vec<String>>,
+    api_id_env: Option<String>,
+    api_hash_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,8 +113,8 @@ pub(crate) struct FileCluster {
 pub(crate) struct FileNode {
     id: u64,
     grpc: Option<String>,
-    /// A `[[store]]` id.
-    outbox: Option<String>,
+    /// A channel's id (`-100…`).
+    outbox: Option<i64>,
 }
 
 /// Timing for the slowest link: heartbeat, election timeout, tick, poll
@@ -107,59 +125,54 @@ const fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
+/// gRPC alone, or a Telegram link somewhere in the cluster (it paces
+/// every node: a leader's heartbeat must reach that follower in time).
 fn timing(nodes: &[NodeSettings]) -> Timing {
-    let chats: Vec<&Store> = nodes.iter().filter_map(|n| n.outbox.as_ref()).collect();
     let uses_chat = nodes.iter().any(|a| nodes.iter().any(|b| a.id != b.id && link(a, b) == Some(Link::Chat)));
-    match (uses_chat, chats.iter().any(|s| matches!(s, Store::Telegram { .. }))) {
-        (false, _) => Timing(ms(250), (ms(1_500), ms(3_000)), ms(20), ms(200)),
-        (true, true) => Timing(ms(10_000), (ms(45_000), ms(90_000)), ms(4_000), ms(3_000)),
-        (true, false) => Timing(ms(3_000), (ms(15_000), ms(30_000)), ms(1_000), ms(1_000)),
+    match uses_chat {
+        false => Timing(ms(250), (ms(1_500), ms(3_000)), ms(20), ms(200)),
+        true => Timing(ms(10_000), (ms(45_000), ms(90_000)), ms(4_000), ms(3_000)),
     }
+}
+
+fn read_nodes(nodes: Vec<FileNode>) -> Result<Vec<NodeSettings>> {
+    let mut ids = BTreeSet::new();
+    let mut settings = Vec::new();
+    for n in nodes {
+        if !ids.insert(n.id) {
+            bail!("[[node]] id {} twice", n.id);
+        }
+        settings.push(NodeSettings { id: n.id, grpc: n.grpc, outbox: n.outbox });
+    }
+    for a in &settings {
+        for b in settings.iter().filter(|b| b.id > a.id) {
+            if link(a, b).is_none() {
+                bail!("[[node]] {} and {} share no transport: give both `grpc`, or both an `outbox`", a.id, b.id);
+            }
+        }
+    }
+    Ok(settings)
 }
 
 impl FileCluster {
     /// `None` without `[[node]]`s: a cluster of one.
-    pub(crate) fn into_settings(
-        self,
-        nodes: Vec<FileNode>,
-        topology: &mut Topology,
-    ) -> Result<Option<ClusterSettings>> {
+    pub(crate) fn into_settings(self, nodes: Vec<FileNode>) -> Result<Option<ClusterSettings>> {
         if nodes.is_empty() {
             return Ok(None);
         }
-        let mut ids = BTreeSet::new();
-        let mut settings = Vec::new();
-        for n in nodes {
-            if !ids.insert(n.id) {
-                bail!("[[node]] id {} twice", n.id);
-            }
-            let outbox = match n.outbox {
-                None => None,
-                Some(id) => match topology.meta_store(&id, "[[node]] outbox")? {
-                    s @ (Store::Telegram { .. } | Store::Discord { .. } | Store::Fake(_)) => Some(s),
-                    _ => bail!("[[node]] {}: outbox {id:?} must be a telegram or discord store", n.id),
-                },
-            };
-            settings.push(NodeSettings { id: n.id, grpc: n.grpc, outbox });
-        }
-        for a in &settings {
-            for b in settings.iter().filter(|b| b.id > a.id) {
-                if link(a, b).is_none() {
-                    bail!("[[node]] {} and {} share no transport: give both `grpc`, or both an `outbox`", a.id, b.id);
-                }
-            }
-        }
+        let nodes = read_nodes(nodes)?;
         let node = match std::env::var("PIGEONHOLE_NODE") {
             Ok(v) => v.parse().with_context(|| format!("PIGEONHOLE_NODE={v:?}"))?,
             Err(_) => self.node.context("[cluster] node (or PIGEONHOLE_NODE): which [[node]] this process is")?,
         };
-        if !ids.contains(&node) {
-            bail!("this node, {node}, is not a [[node]]");
-        }
+        let me =
+            nodes.iter().find(|n| n.id == node).with_context(|| format!("this node, {node}, is not a [[node]]"))?;
+        let chat_link = nodes.iter().any(|n| n.id != node && link(me, n) == Some(Link::Chat));
+        let chat = if chat_link { Some(self.chat_settings()?) } else { None };
         let key_env = self.key_env.context("[cluster] key_env: the env var with the cluster's key")?;
         let key = parse_key(&std::env::var(&key_env).with_context(|| format!("{key_env} is not set"))?)
             .with_context(|| key_env.clone())?;
-        let Timing(heartbeat, election, tick, poll) = timing(&settings);
+        let Timing(heartbeat, election, tick, poll) = timing(&nodes);
         let election_timeout =
             (self.election_timeout_min.unwrap_or(election.0), self.election_timeout_max.unwrap_or(election.1));
         let heartbeat = self.heartbeat.unwrap_or(heartbeat);
@@ -170,12 +183,33 @@ impl FileCluster {
             node,
             id: self.id as u128,
             key,
-            nodes: settings,
+            nodes,
+            chat,
             heartbeat,
             election_timeout,
             tick: self.tick.unwrap_or(tick),
             poll: self.poll.unwrap_or(poll),
         }))
+    }
+
+    /// This node's bots in the chat of the outboxes.
+    fn chat_settings(&self) -> Result<ChatSettings> {
+        match self.chat.as_deref().unwrap_or("telegram") {
+            "telegram" => {
+                let envs = self.bot_token_envs.clone().unwrap_or_else(|| vec!["RAFT_BOT_TOKEN".into()]);
+                if envs.is_empty() {
+                    bail!("[cluster] bot_token_envs is empty");
+                }
+                let bots = TelegramBots {
+                    envs: &envs,
+                    api_id_env: self.api_id_env.clone(),
+                    api_hash_env: self.api_hash_env.clone(),
+                    session: None,
+                };
+                Ok(ChatSettings::Telegram { logins: bots.logins("[cluster]")? })
+            }
+            other => bail!("[cluster] chat = {other:?}: only \"telegram\" for now"),
+        }
     }
 }
 

@@ -292,23 +292,33 @@ knows which node it is from `[cluster] node` or `PIGEONHOLE_NODE`.
 node = 1                        # or PIGEONHOLE_NODE
 id = 7                          # frames of another cluster are dropped
 key_env = "PH_CLUSTER_KEY"      # 64 hex digits: `openssl rand -hex 32`
+chat = "telegram"               # the outboxes' chat (the default)
+bot_token_envs = ["RAFT_BOT_TOKEN"]   # this node's bots; each host sets its own
+# api_id_env / api_hash_env: TG_API_ID / TG_API_HASH by default
 # heartbeat, election_timeout_min / _max, tick, poll: set for the slowest
 # link unless given (§ Timing)
 
 [[node]]
 id = 1
 grpc = "10.0.0.1:7001"          # serves Raft here; the others call it here
-outbox = "raft-1"               # a telegram or discord [[store]]
+outbox = -1001111111111         # the channel it posts its frames into
 
 [[node]]
 id = 2
 grpc = "10.0.0.2:7001"
-outbox = "raft-2"
+outbox = -1002222222222
 
 [[node]]
 id = 3
-outbox = "raft-3"               # only channels: 1 and 2 reach it over the chat
+outbox = -1003333333333         # only a channel: 1 and 2 reach it over the chat
 ```
+
+The file is the same on every host. The bots are not: `bot_token_envs`
+names env vars whose values differ from host to host. A node posts into its
+own outbox and reads its chat peers' outboxes through its own bots (several:
+a pool, as a store's). So every node's bots are admins of every outbox it
+uses: its own, to post, and its chat peers', to read and be pushed their
+posts. Only nodes with a chat link log in.
 
 ## Transports
 
@@ -332,9 +342,22 @@ the defaults follow the slowest link. Commits stay fast all the same. Two
 nodes on gRPC are a quorum of three, and the chat node catches up behind
 them.
 
-**Status.** The binary boots a cluster whose links are all gRPC. A chat
-link is refused at boot: there is no Telegram or Discord mailbox yet (step
-5). Mixed clusters run in the tests over `FakeChat`.
+**The Telegram outbox** (`pigeonhole::raft_mailbox::TelegramMailbox`)
+works as follows:
+- a frame is a message named `raft.bin`: inline text when it fits
+  (~7.5 KB), a document otherwise; its position is the message id;
+- bots can read only by id, so a reader reads ids upward, 100 a time, and
+  skips holes and foreign messages;
+- a reader learns how far the channel goes from its own posts, from the
+  posts pushed to any of the process's bots (`channel_log::on_post`, every
+  bot logs in with updates), and at the start from a lookup: windows of
+  100 ids with doubling strides, then halving;
+- `wait` wakes on a push, else after `poll`.
+
+**Status.** Mixed gRPC + Telegram clusters boot in the binary. In tests,
+two gRPC nodes and one on `TelegramMailbox` over fake channels
+(`tests/raft_telegram.rs`), which also survive the leader's death. A live
+run on real channels is next, and Discord after it.
 
 ## Clients: always the leader
 

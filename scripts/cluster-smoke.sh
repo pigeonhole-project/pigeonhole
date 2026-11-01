@@ -4,9 +4,17 @@
 # one shared local_disk blob store. Writes go to the leader, found by
 # GET /_pigeonhole/leader; the leader is killed with -9, a new one serves
 # what the old one wrote, and the killed node rejoins as a follower.
+#
+# CHAT=telegram: node 3 has no gRPC, only a Telegram outbox; 1 and 2 reach
+# it over the chat (live: channels TG_RAFT_OUTBOX_1..3 from .env, each
+# node's bot RAFT_BOT_TOKEN_<n> or else TG_BOT_TOKEN[_2], admin of all
+# three). Telegram paces the whole cluster: elections take a minute or two.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ -f "$ROOT/.env" ]]; then set -a; source "$ROOT/.env"; set +a; fi
+CHAT="${CHAT:-}"
+[[ "$CHAT" == telegram ]] && : "${LEADER_WAIT:=300}"
 BIN="${BIN:-$ROOT/target/debug/pigeonhole}"
 export AWS_ACCESS_KEY_ID=pigeonhole AWS_SECRET_ACCESS_KEY=pigeonholesecret AWS_DEFAULT_REGION=us-east-1
 export AWS_EC2_METADATA_DISABLED=true
@@ -24,7 +32,21 @@ cleanup() {
 trap cleanup EXIT
 
 s3_port() { echo $((18330 + $1)); }
+node_conf() { # $1: node id
+  local grpc outbox
+  for m in 1 2 3; do
+    grpc="grpc = \"127.0.0.1:1700$m\""
+    outbox=""
+    if [[ "$CHAT" == telegram ]]; then
+      local var="TG_RAFT_OUTBOX_$m"
+      outbox="outbox = ${!var:?set $var in .env: the Raft outbox channel of node $m}"
+      [[ $m == 3 ]] && grpc=""
+    fi
+    printf '\n[[node]]\nid = %s\n%s\n%s\n' "$m" "$grpc" "$outbox"
+  done
+}
 for n in 1 2 3; do
+  mkdir -p "$DIR/run$n"
   cat > "$DIR/node$n.toml" <<TOML
 listen_addr = "127.0.0.1:$(s3_port "$n")"
 
@@ -48,29 +70,26 @@ path = "$DIR/data"
 node = $n
 id = 1
 key_env = "PH_CLUSTER_KEY"
-
-[[node]]
-id = 1
-grpc = "127.0.0.1:17001"
-
-[[node]]
-id = 2
-grpc = "127.0.0.1:17002"
-
-[[node]]
-id = 3
-grpc = "127.0.0.1:17003"
+bot_token_envs = ["RAFT_BOT_TOKEN"]
+$(node_conf "$n")
 TOML
 done
 
+bot_of() { # this node's bot token: RAFT_BOT_TOKEN_<n>, else one of the test bots
+  local var="RAFT_BOT_TOKEN_$1" fallback
+  case $1 in 2) fallback="${TG_BOT_TOKEN_2:-}" ;; *) fallback="${TG_BOT_TOKEN:-}" ;; esac
+  echo "${!var:-$fallback}"
+}
 start() {
-  PIGEONHOLE_CONFIG="$DIR/node$1.toml" RUST_LOG=info "$BIN" >"$DIR/node$1.log" 2>&1 &
+  # Its own directory: the bots' session files.
+  (cd "$DIR/run$1" && PIGEONHOLE_CONFIG="$DIR/node$1.toml" RAFT_BOT_TOKEN="$(bot_of "$1")" RUST_LOG=info \
+    exec "$BIN" >"$DIR/node$1.log" 2>&1) &
   PID[$1]=$!
 }
 
 # The node that answers 200 on /_pigeonhole/leader, among $@.
 leader_of() {
-  local deadline=$((SECONDS + 30))
+  local deadline=$((SECONDS + ${LEADER_WAIT:-30}))
   while ((SECONDS < deadline)); do
     for n in "$@"; do
       if curl -sf "http://127.0.0.1:$(s3_port "$n")/_pigeonhole/leader" >/dev/null 2>&1; then echo "$n"; return; fi

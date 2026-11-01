@@ -80,26 +80,8 @@ impl FileStore {
             FileStore::Memory { .. } => Store::Memory,
             FileStore::Telegram { chat_id, bot_token_envs, api_id_env, api_hash_env, session, .. } => {
                 let bot_token_envs = token_envs(&id, bot_token_envs, "BOT_TOKEN")?;
-                if session.is_some() && bot_token_envs.len() > 1 {
-                    bail!("[[store]] {id}: `session` names one bot's session file; with several bots each has its own default");
-                }
-                let api_id_env = api_id_env.unwrap_or_else(|| "TG_API_ID".into());
-                let api_id = token(&id, &api_id_env)?
-                    .trim()
-                    .parse()
-                    .with_context(|| format!("[[store]] {id}: env {api_id_env} is not a number"))?;
-                let api_hash = token(&id, api_hash_env.as_deref().unwrap_or("TG_API_HASH"))?;
-                let logins = bot_token_envs
-                    .iter()
-                    .map(|env| {
-                        let bot_token = token(&id, env)?;
-                        let bot_id = bot_token.split(':').next().unwrap_or_default();
-                        let session =
-                            session.clone().unwrap_or_else(|| format!("pigeonhole-tg-{bot_id}.session").into());
-                        Ok(TelegramLogin { bot_token, api_id, api_hash: api_hash.clone(), session })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                distinct_bots(&id, logins.iter().map(|l| l.bot_token.split(':').next().unwrap_or_default()))?;
+                let bots = TelegramBots { envs: &bot_token_envs, api_id_env, api_hash_env, session };
+                let logins = bots.logins(&format!("[[store]] {id}"))?;
                 Store::Telegram { chat_id: chat_id.to_string(), bot_token_envs, logins }
             }
             FileStore::Discord { channel_id, bot_token_envs, max_blob_size, .. } => {
@@ -185,6 +167,46 @@ fn token_envs(id: &str, envs: Option<Vec<String>>, default: &str) -> Result<Vec<
         bail!("[[store]] {id}: bot_token_envs is empty");
     }
     Ok(envs)
+}
+
+/// Telegram bots named by env vars (a store's, or a cluster node's).
+pub(crate) struct TelegramBots<'a> {
+    pub envs: &'a [String],
+    pub api_id_env: Option<String>,
+    pub api_hash_env: Option<String>,
+    /// One bot's session file; default `pigeonhole-tg-<bot id>.session`.
+    pub session: Option<PathBuf>,
+}
+
+impl TelegramBots<'_> {
+    /// Their logins, from the env; `what` names them in errors.
+    pub(crate) fn logins(self, what: &str) -> Result<Vec<TelegramLogin>> {
+        if self.session.is_some() && self.envs.len() > 1 {
+            bail!("{what}: `session` names one bot's session file; with several bots each has its own default");
+        }
+        let env = |name: &str| std::env::var(name).with_context(|| format!("{what}: env {name} is not set"));
+        let api_id_env = self.api_id_env.unwrap_or_else(|| "TG_API_ID".into());
+        let api_id =
+            env(&api_id_env)?.trim().parse().with_context(|| format!("{what}: env {api_id_env} is not a number"))?;
+        let api_hash = env(self.api_hash_env.as_deref().unwrap_or("TG_API_HASH"))?;
+        let logins = self
+            .envs
+            .iter()
+            .map(|name| {
+                let bot_token = env(name)?;
+                let bot_id = bot_token.split(':').next().unwrap_or_default();
+                let session = self.session.clone().unwrap_or_else(|| format!("pigeonhole-tg-{bot_id}.session").into());
+                Ok(TelegramLogin { bot_token, api_id, api_hash: api_hash.clone(), session })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut seen = HashSet::new();
+        for bot in logins.iter().map(|l| l.bot_token.split(':').next().unwrap_or_default()) {
+            if !seen.insert(bot) {
+                bail!("{what}: bot {bot} is listed twice in bot_token_envs");
+            }
+        }
+        Ok(logins)
+    }
 }
 
 /// No bot twice in one store (one bot cannot add to its own budget).

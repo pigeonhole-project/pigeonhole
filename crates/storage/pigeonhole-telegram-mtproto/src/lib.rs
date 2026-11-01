@@ -15,7 +15,8 @@ mod pool;
 mod session;
 
 pub use client::{
-    bot_id_of, channel_id_of, Lane, MtprotoChannel, MtprotoConfig, TelegramMtproto, UpdatesRx, CALL_DEADLINE,
+    bot_id_of, channel_id_of, new_channel_posts, Lane, MtprotoChannel, MtprotoConfig, TelegramMtproto, UpdatesRx,
+    CALL_DEADLINE,
 };
 pub use pool::{pooled, PooledChannel};
 pub use session::FileSession;
