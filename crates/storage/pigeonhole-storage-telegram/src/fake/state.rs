@@ -142,7 +142,10 @@ impl TelegramChannelState {
         }
         Ok(match self.messages.get(&file.id) {
             Some(Message::Doc { blob, size, .. }) => Some((blob, *size)),
-            _ => None,
+            // A reference belongs to its message: gone with it, as Telegram
+            // answers FILE_REFERENCE_EXPIRED (the reader reads the message again).
+            None => return Err(crate::FileReferenceExpired.into()),
+            Some(_) => None,
         })
     }
 

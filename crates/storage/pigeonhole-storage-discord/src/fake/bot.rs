@@ -1,7 +1,7 @@
 //! A fake channel as one bot sees it: every API call first takes the bot's
 //! budget from its limiter, as `DiscordChannel`'s calls do, so a fake
 //! channel is paced like Discord and several bots go faster than one
-//! ([`crate::pool::PooledDiscord`]). CDN downloads are not API calls.
+//! ([`crate::pool::PooledDiscord`]). CDN downloads take no budget.
 
 use crate::limits::{DELETE, READ, SEND};
 use crate::{DcMessage, DiscordApi, ThreadStart};
@@ -92,7 +92,12 @@ impl<A: DiscordApi> DiscordApi for FakeBot<A> {
         self.api.delete_thread(message_id).await
     }
 
+    /// Not an API call (no budget), but a channel that is down is down
+    /// for its CDN too.
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes> {
+        if self.down.load(Ordering::SeqCst) {
+            bail!("download: the channel is down");
+        }
         self.api.download(url, range).await
     }
 }

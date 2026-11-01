@@ -43,7 +43,9 @@
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }
+/* A full-screen app: the bar on top, the rest below; the page never scrolls. */
 body {
+  display: flex; flex-direction: column; overflow: hidden;
   margin: 0; background: var(--feather); color: var(--wing);
   font: 400 16px/1.5 var(--sans); font-stretch: 100%;
 }
@@ -66,7 +68,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .icon { border: 1px solid var(--line); background: none; border-radius: 50%; width: 32px; height: 32px; cursor: pointer; }
 
 /* the loft: the graph, and a panel when a node is opened */
-#app { height: calc(100% - 61px); display: flex; flex-direction: column; }
+#app { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .loft { flex: 1; display: grid; grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr); min-height: 0; }
 .loft.zoomed { grid-template-columns: minmax(220px, 26%) 1fr; }
 .sky { position: relative; min-height: 0; display: flex; flex-direction: column; }
@@ -344,3 +346,26 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .faults-note { margin: 0; font-size: 14px; color: var(--wing-2); max-width: 70ch; }
 .faults .row { margin-bottom: 0; }
 .caption .err { font-family: var(--mono); font-size: 13px; color: var(--eye); }
+
+/* background work: repair jobs on the graph, the repair clock, the panel */
+.queue .job { fill: var(--eye); opacity: .85; }
+.queue .job-more { font-size: 11px; fill: var(--eye); }
+.clock-face { fill: var(--plume); stroke: var(--slate-2); stroke-width: 2; }
+.clock-arc { fill: none; stroke: var(--teal); stroke-width: 3; stroke-dasharray: 100; transition: stroke-dashoffset 1s linear; }
+.node.queued .clock-arc { stroke: var(--eye); }
+.clock-text { font: 600 11px var(--mono); fill: var(--wing-2); }
+.bg-row { margin: 0 0 16px; }
+.bg-label { font-size: 14px; margin-bottom: 6px; }
+.meter { height: 6px; border-radius: 3px; background: var(--feather); border: 1px solid var(--line); overflow: hidden; }
+.meter .fill { height: 100%; background: var(--teal); transition: width 1s linear; }
+.meter .fill.amethyst { background: var(--amethyst); }
+.jobs { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 10px 0 0; }
+.job-tile { font: 12px var(--mono); padding: 3px 8px; border-radius: 6px; border: 1px solid var(--eye); color: var(--eye); }
+.deletable { position: relative; }
+.msg-del {
+  position: absolute; top: 6px; right: 6px; width: 28px; height: 28px; border-radius: 8px; border: 0;
+  display: grid; place-items: center; cursor: pointer; opacity: 0; background: rgba(0,0,0,.35); color: #fff;
+}
+.msg-del .ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.deletable:hover .msg-del, .msg-del:focus-visible { opacity: 1; }
+@media (hover: none) { .msg-del { opacity: .8; } }

@@ -507,6 +507,14 @@ impl BlobDb {
     }
 
     /// Pending repair queue depth (tests / metrics).
+    /// The repair jobs waiting, (chunk, instance), in queue order.
+    pub async fn repair_jobs(&self) -> Vec<(ChunkId, String)> {
+        let local = self.local.lock().unwrap();
+        let mut jobs: Vec<_> = local.repair_queue.iter().map(|(k, &seq)| (seq, k.clone())).collect();
+        jobs.sort();
+        jobs.into_iter().map(|(_, k)| k).collect()
+    }
+
     pub async fn repair_queue_len(&self) -> Result<u64> {
         Ok(self.local.lock().unwrap().repair_queue.len() as u64)
     }

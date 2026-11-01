@@ -299,5 +299,23 @@
   "js.say.failed_down": "The upload failed: a channel is down, and the write quorum needs its copy. <span class=\"err\">{error}</span>",
   "js.demo.repair": "Run repair",
   "js.try.erase": "Erase and set up again",
-  "js.try.loading": "Loading pigeonhole (wasm, ~7 MB)…"
+  "js.try.loading": "Loading pigeonhole (wasm, ~7 MB)…",
+  "js.wiz.toml_repair": "Repair passes in the background, as on a server (there every 30 s).",
+  "js.demo.clock_tip": "The next background repair pass",
+  "js.demo.job": "chunk {chunk} → {store}",
+  "js.demo.bg_repair": {
+    "one": "Repair: {n} copy queued, the next pass in {s} s",
+    "other": "Repair: {n} copies queued, the next pass in {s} s"
+  },
+  "js.demo.bg_queue_empty": "Nothing to repair.",
+  "js.demo.bg_snapshot": "Snapshot: {n} entries to go (the last at {at})",
+  "js.demo.delete": "Delete",
+  "js.demo.delete_confirm": "Delete this message for everyone?",
+  "js.say.deleted_one": "A message of <b>{store}</b> is deleted ({name}). The node finds out when it reads that copy, or when you check the channel.",
+  "js.say.repair_pass": {
+    "one": "A background repair pass wrote back {n} copy.",
+    "other": "A background repair pass wrote back {n} copies."
+  },
+  "demo.bg_title": "Background work",
+  "js.say.read_failed_down": "The read failed: one copy is down, and the other is gone. The read queued the lost one for repair. <span class=\"err\">{error}</span>"
 }

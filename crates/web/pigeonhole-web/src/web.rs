@@ -53,6 +53,9 @@ struct Request {
     store: String,
     #[serde(default)]
     down: bool,
+    /// `delete_message`: the message's id (a string: Discord's exceed JS numbers).
+    #[serde(default)]
+    message: String,
 }
 
 fn demo() -> String {
@@ -87,7 +90,7 @@ pub extern "C" fn ph_open() -> i32 {
         .with_current_span(true)
         .with_span_list(true)
         .with_env_filter(
-            "warn,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
+            "warn,pigeonhole_web=info,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
              pigeonhole_chunk_store=debug,pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug,pigeonhole_fake_channels=debug",
         )
         .with_writer(std::io::stdout)
@@ -197,7 +200,8 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
             }
             json!({ "channels": out })
         }
-        "outage" | "wipe" => {
+        "background" => node.background().await?,
+        "outage" | "wipe" | "delete_message" => {
             let world = WORLD.with(Rc::clone);
             let c = node
                 .channels
@@ -207,6 +211,9 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
             if r.op == "outage" {
                 world.set_down(c, r.down);
                 json!({ "down": r.down })
+            } else if r.op == "delete_message" {
+                world.delete_message(c, &r.message).await?;
+                json!({ "deleted": 1 })
             } else {
                 json!({ "deleted": world.wipe(c).await? })
             }

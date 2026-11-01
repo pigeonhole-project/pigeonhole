@@ -48,6 +48,7 @@
     logView: "readable",   // the log panel: "readable" or "channel"
     busy: false,
     wizard: false,         // the first visit's setup is on screen
+    bg: null,              // what runs in the background: {repair: {queue, every_ms, next_ms}, snapshot}
   };
   const byStore = () => Object.fromEntries(state.channels.map(c => [c.store, c]));
   // The open panel is the log's (it opens by the log channel's id).
@@ -98,6 +99,13 @@
     const loft = node("loft", pos.loft, "pigeonhole", t("demo.loft_role"));
     dovecote(loft.g);
     loft.label(0, 100);
+    // The repair clock: the arc fills up to the next background pass.
+    const clock = s("g", {class: "clock", transform: "translate(92,-96)"}, loft.g);
+    s("circle", {class: "clock-face", r: 13}, clock);
+    loft.arc = s("circle", {class: "clock-arc", r: 13, pathLength: 100, transform: "rotate(-90)"}, clock);
+    loft.clockText = s("text", {class: "clock-text", y: 4, "text-anchor": "middle"}, clock);
+    const clockTip = s("title", {}, clock);
+    clockTip.textContent = t("demo.clock_tip");
 
     for (const c of state.channels) {
       const app = c.kind === "telegram" ? "Telegram" : "Discord";
@@ -110,13 +118,89 @@
       n.label(-88, 0, "start");
       // The channel's message count, top right.
       n.count = s("text", {class: "count", x: 116, y: -10, "text-anchor": "end"}, n.g);
+      // Repair jobs waiting for this channel: a square each, under the card.
+      n.queue = s("g", {class: "queue", transform: "translate(-118,46)"}, n.g);
       if (c.total == null) continue;    // a sketch: nothing posted yet
       n.count.textContent = String(c.total);
       const tip = s("title", {}, n.g);
       tip.textContent = t("demo.messages", {n: c.total});
     }
     markOpen();
+    renderBackground();
   }
+
+  // What runs in the background, on the graph: each channel's queued
+  // repairs, the clock of the next pass; in the loft's panel, the list.
+  function renderBackground() {
+    const bg = state.bg;
+    if (!bg) return;
+    const byChannel = {};
+    for (const j of bg.repair.queue) (byChannel[j.store] ||= []).push(j);
+    for (const c of state.channels) {
+      const n = nodes[c.store];
+      if (!n?.queue) continue;
+      const jobs = byChannel[c.store] || [];
+      n.queue.replaceChildren();
+      jobs.slice(0, 12).forEach((j, i) => {
+        const sq = s("rect", {class: "job", x: i * 14, y: 0, width: 10, height: 10, rx: 2}, n.queue);
+        s("title", {}, sq).textContent = t("demo.job", {chunk: j.chunk, store: c.store});
+      });
+      if (jobs.length > 12) s("text", {class: "job-more", x: 12 * 14 + 2, y: 9}, n.queue).textContent = `+${jobs.length - 12}`;
+    }
+    const loft = nodes.loft;
+    if (loft?.arc) {
+      const left = bg.repair.next_ms / bg.repair.every_ms;
+      loft.arc.style.strokeDashoffset = String(Math.round(100 * left));
+      loft.clockText.textContent = String(Math.ceil(bg.repair.next_ms / 1000));
+      loft.g.classList.toggle("queued", bg.repair.queue.length > 0);
+    }
+    if (state.open === "loft") renderBgPanel();
+  }
+
+  function renderBgPanel() {
+    const box = $("bg"), bg = state.bg;
+    if (!box || !bg) return;
+    box.replaceChildren();
+    const rep = h("div", "bg-row");
+    const sec = Math.ceil(bg.repair.next_ms / 1000);
+    rep.append(h("div", "bg-label", t("demo.bg_repair", {n: bg.repair.queue.length, s: sec})));
+    const bar = h("div", "meter");
+    const fill = h("div", "fill");
+    fill.style.width = `${100 * (1 - bg.repair.next_ms / bg.repair.every_ms)}%`;
+    bar.append(fill);
+    rep.append(bar);
+    const jobs = h("ol", "jobs");
+    for (const j of bg.repair.queue) {
+      const c = byStore()[j.store];
+      const li = h("li", "job-tile " + (c?.kind || ""), t("demo.job", {chunk: j.chunk, store: j.store}));
+      jobs.append(li);
+    }
+    if (!bg.repair.queue.length) jobs.append(h("li", "empty", t("demo.bg_queue_empty")));
+    rep.append(jobs);
+    box.append(rep);
+    const sn = bg.snapshot;
+    if (sn.every) {
+      const row = h("div", "bg-row");
+      const done = sn.head - sn.base;
+      row.append(h("div", "bg-label", t("demo.bg_snapshot", {n: Math.max(0, sn.every - done), at: sn.base})));
+      const b = h("div", "meter");
+      const f = h("div", "fill amethyst");
+      f.style.width = `${Math.min(100, (100 * done) / sn.every)}%`;
+      b.append(f);
+      row.append(b);
+      box.append(row);
+    }
+  }
+
+  // Poll the background while idle; the worker lets it run between calls.
+  setInterval(async () => {
+    if (state.busy || state.wizard || !nodes.loft) return;
+    const {reply} = await call({op: "background"});
+    if (reply && !reply.error) {
+      state.bg = reply;
+      renderBackground();
+    }
+  }, 1000);
 
   // What a channel is for; a data channel, its place among the others.
   function placeNote(c, app) {
@@ -241,6 +325,8 @@
         fly(span.instance, true, 512);
       } else if (msg === "store call failed" && stores[span?.instance]) {
         fly(span.instance, false, 2048, true);
+      } else if (msg === "repair pass" && +f.repaired > 0) {
+        said.push({op: "RepairPass", n: +f.repaired});
       } else if ((line.target || "").startsWith("pigeonhole_gateway_s3") && msg.endsWith(" ok")) {
         said.push({op: msg.slice(0, -3), ...f});
       }
@@ -269,6 +355,7 @@
     if (op.op === "CopyObject") return t("say.CopyObject", {key, chunks: t("chunks", {n: +op.extents})});
     if (op.op === "DeleteObject") return t("say.DeleteObject", {key});
     if (op.op === "Snapshot") return t("say.snapshot", {at: op.at});
+    if (op.op === "RepairPass") return t("say.repair_pass", {n: op.n});
     return "";
   }
   function caption(html) {
@@ -280,6 +367,12 @@
     const said = apply(events);
     const snap = said.find(x => x.op === "Snapshot");
     if (snap) caption(t("say.snapshot", {at: snap.at}));
+    const pass = said.find(x => x.op === "RepairPass");
+    if (pass) {
+      caption(t("say.repair_pass", {n: pass.n}));
+      await flying;
+      await refreshChannels();
+    }
     await flying;
     if (snap && (state.open === "loft" || logOpen())) {
       await loadLog();
@@ -293,7 +386,9 @@
     for (const c of state.channels) for (const m of c.messages) m.fresh = false;
     const data = await call(request, body);
     const said = apply(data.events);
-    if (data.reply?.error && state.channels.some(c => c.down)) caption(t("say.failed_down", {error: esc(data.reply.error)}));
+    if (data.reply?.error && state.channels.some(c => c.down)) {
+      caption(t(request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: esc(data.reply.error)}));
+    }
     else if (data.reply?.error) caption(`<b>${esc(t("try.error", {error: data.reply.error}))}</b>`);
     else if (said.length) caption(sentence(said.at(-1)));
     await flying;
@@ -468,6 +563,27 @@
     return c.kind === "telegram" ? telegramView(c) : discordView(c);
   }
 
+  // A message anyone in the channel could delete, as in the app: a trash
+  // button on hover or focus, and the context menu (right click).
+  const ICON_TRASH = "M5 7h14M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3";
+  function deletable(el, c, m) {
+    const del = async () => {
+      if (!confirm(t("demo.delete_confirm"))) return;
+      const r = await op({op: "delete_message", store: c.store, message: String(m.id)});
+      if (r && !r.error) caption(t("say.deleted_one", {store: esc(c.store), name: esc(m.name || "")}));
+      await refreshChannels();
+    };
+    const b = h("button", "msg-del");
+    b.type = "button";
+    b.setAttribute("aria-label", t("demo.delete"));
+    b.title = t("demo.delete");
+    b.append(svgIcon(ICON_TRASH, "ic"));
+    b.addEventListener("click", del);
+    el.classList.add("deletable");
+    el.append(b);
+    el.addEventListener("contextmenu", e => { e.preventDefault(); del(); });
+  }
+
   function telegramView(c) {
     const app = h("div", "app tg");
     const head = h("div", "tg-head");
@@ -495,6 +611,7 @@
         b.append(doc);
       }
       if (m.log) b.append(h("div", "post-log", logLabel(m.log)));
+      if (c.role === "data" && !m.gone) deletable(b, c, m);
       const foot = h("div", "tg-meta");
       foot.append(svgIcon(ICON_EYE, "eye"), document.createTextNode("1"));
       const at = when(c, m);
@@ -544,6 +661,7 @@
       }
       if (m.log) body.append(h("div", "post-log", logLabel(m.log)));
       row.append(body);
+      if (c.role === "data" && !m.gone) deletable(row, c, m);
       chat.append(row);
       last = at;
     }
@@ -720,6 +838,7 @@
     counter(state.channels.filter(c => c.role === "data").length, t("demo.c_channels"));
     counter(state.log?.head ?? "…", t("demo.c_head"));
     counter(state.log?.base?.at ?? 0, t("demo.c_base"));
+    renderBgPanel();
     const editor = $("config-text");
     editor.value = state.config;
     $("config-reset").addEventListener("click", () => { editor.value = state.demo; $("config-error").textContent = ""; });
@@ -826,6 +945,7 @@
     out.push("");
     out.push("[chunk]", `store = "${chunkStore}"`, 'size = "4 MiB"', 'block_size = "1 MiB"', 'codec = "zstd"', "");
     out.push("[inline]", 'max_object_size = "1 KiB"', "", "[cache]", "enabled = false", "");
+    out.push(`# ${t("wiz.toml_repair")}`, "[repair]", 'interval = "10s"', "");
     if (w.pace === "demo") {
       out.push(`# ${t("wiz.toml_fast")}`, "[telegram.send]", "rate_per_sec = 20.0", "burst = 20.0", "",
         "[discord.send]", "rate_per_sec = 20.0", "burst = 20.0", "");

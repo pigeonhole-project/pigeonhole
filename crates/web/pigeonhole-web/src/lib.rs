@@ -104,6 +104,23 @@ impl World {
         self.outage(c.kind, &c.scope).load(Ordering::SeqCst)
     }
 
+    /// Channel `c` loses message `id` (someone deleted it in the app).
+    pub async fn delete_message(&self, c: &channels::ChannelRef, id: &str) -> Result<()> {
+        match c.kind {
+            InstanceKind::Telegram => {
+                use pigeonhole_storage_telegram::ChannelApi;
+                let id = id.parse().with_context(|| format!("message id {id:?}"))?;
+                self.telegram(&c.scope, &c.backing).await?.delete_messages(&[id]).await
+            }
+            InstanceKind::Discord => {
+                use pigeonhole_storage_discord::DiscordApi;
+                let id = id.parse().with_context(|| format!("message id {id:?}"))?;
+                self.discord(&c.scope, &c.backing).await?.delete_messages(&[id]).await
+            }
+            _ => bail!("{}: not a fake channel", c.store),
+        }
+    }
+
     /// Channel `c` loses every message (an admin cleared it); how many.
     pub async fn wipe(&self, c: &channels::ChannelRef) -> Result<usize> {
         use pigeonhole_storage_api::fake::FakeHost;
@@ -198,6 +215,39 @@ pub struct Node {
     pub meta: Arc<MetaStore>,
     pub store: Arc<ChunkStore>,
     pub s3: S3Gateway,
+    /// Repair passes in the background, as the server's (`[repair] interval`).
+    repair: Background,
+    snapshot_every: Option<u64>,
+}
+
+/// A background loop: when its last pass ended, its pause, its task.
+struct Background {
+    every: std::time::Duration,
+    last: Arc<Mutex<Option<tokio::time::Instant>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Background {
+    /// Repair passes every `every`, until the tablet stops.
+    fn repair(store: &Arc<ChunkStore>, every: std::time::Duration) -> Self {
+        let last = Arc::new(Mutex::new(None));
+        let (db, replicated, done) = (store.db().clone(), store.replicated().clone(), last.clone());
+        let task = tokio::spawn(tracing::Instrument::in_current_span(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                if db.tablet_stopped() {
+                    return;
+                }
+                let repairer = Repairer::new(db.clone(), replicated.clone(), RepairConfig::default());
+                match repairer.repair_once().await {
+                    Ok(s) => tracing::info!(repaired = s.repaired, failed = s.failed, "repair pass"),
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "repair pass failed"),
+                }
+                *done.lock().unwrap() = Some(tokio::time::Instant::now());
+            }
+        }));
+        Self { every, last, task }
+    }
 }
 
 fn req<T>(input: T) -> S3Request<T> {
@@ -355,7 +405,16 @@ impl Node {
         }
         let store = Arc::new(store);
         let s3 = S3Gateway::new(cfg.s3_options(), Index::open(meta.clone()).await?, store.clone());
-        Ok(Self { channels: channels::of(cfg), log, meta, store, s3 })
+        let repair = Background::repair(&store, cfg.repair.interval);
+        Ok(Self {
+            channels: channels::of(cfg),
+            log,
+            meta,
+            store,
+            s3,
+            repair,
+            snapshot_every: cfg.meta.snapshot_every_entries,
+        })
     }
 
     /// The log's entries as they lie in its store, commands decoded: the last
@@ -366,7 +425,26 @@ impl Node {
 
     /// Stops the tablet, as a process exit would.
     pub async fn close(&self) -> Result<()> {
+        self.repair.task.abort();
         self.meta.close().await
+    }
+
+    /// What runs in the background: the repair queue and when its next pass
+    /// is due; how far the log is from its next snapshot.
+    pub async fn background(&self) -> Result<serde_json::Value> {
+        let jobs = self.store.db().repair_jobs().await;
+        let since = self.repair.last.lock().unwrap().map(|t| t.elapsed());
+        let next_ms = self.repair.every.saturating_sub(since.unwrap_or_default()).as_millis() as u64;
+        let found = self.log.discover().await?;
+        let (head, base) = found.map_or((0, 0), |d| (d.head.position, d.base.map_or(0, |b| b.at)));
+        Ok(serde_json::json!({
+            "repair": {
+                "queue": jobs.iter().map(|(chunk, store)| serde_json::json!({ "chunk": chunk, "store": store })).collect::<Vec<_>>(),
+                "every_ms": self.repair.every.as_millis() as u64,
+                "next_ms": next_ms,
+            },
+            "snapshot": { "head": head, "base": base, "every": self.snapshot_every },
+        }))
     }
 
     /// Entries the boot replayed from the log after its snapshot.
@@ -440,6 +518,11 @@ impl Node {
     pub async fn repair(&self) -> Result<RepairStats> {
         let repairer = Repairer::new(self.store.db().clone(), self.store.replicated().clone(), RepairConfig::default());
         repairer.repair_once().await
+    }
+
+    /// Repair jobs waiting.
+    pub async fn repair_queue(&self) -> Result<u64> {
+        self.store.db().repair_queue_len().await
     }
 
     /// Probe every copy store `id` should hold; queue a repair for each one
