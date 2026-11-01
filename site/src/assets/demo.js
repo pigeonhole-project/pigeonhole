@@ -15,7 +15,7 @@
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   // ------------------------------------------------------------ the worker
-  const worker = new Worker(window.ASSETS + "web-worker.js");
+  const worker = new Worker(window.ASSETS + "web-worker.js" + (document.currentScript?.src.match(/\?v=\w+/)?.[0] || ""));
   // Let go of the files at once, for the next page (a reload, the other language).
   addEventListener("pagehide", () => worker.terminate());
   addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
@@ -703,7 +703,7 @@
     const booted = await call({op: "open"});
     if (booted.reply?.error) { $("status").textContent = t("try.error", {error: booted.reply.error}); return; }
     await boot(booted.reply);
-    $("status").textContent = `${t("try.ready", {ms: Math.round(performance.now() - t0)})} ${t(state.persistent ? "try.kept" : "try.not_kept")}`;
+    $("status").textContent = `${t("try.ready", {ms: Math.round(performance.now() - t0)})} ${state.persistent ? t("try.kept") : t("try.not_kept")}${data.reply.why ? ` (${data.reply.why})` : ""}`;
     caption(data.reply.saved ? t("say.welcome_back", {n: booted.reply.replayed}) : t("demo.first_caption"));
   });
 })();

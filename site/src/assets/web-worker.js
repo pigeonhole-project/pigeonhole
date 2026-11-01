@@ -6,7 +6,9 @@
 // Messages: {id, op, …, body: ArrayBuffer} in, {id, events: [...], reply, ms}
 // out; id 0 is the start ({reply: {config, demo, saved, persistent}}).
 // {op: "reset"} drops everything kept (the page reloads after it).
-importScripts("wasi.js");
+// The page passes its assets' version (?v=…): the same for what this loads.
+const V = self.location.search;
+importScripts("wasi.js" + V);
 const {Wasi, Pool, MemoryHandle} = self.PHWasi;
 
 const POOL_DIR = "pigeonhole";
@@ -14,7 +16,7 @@ const POOL_START = 64;   // files opened at start
 const POOL_LOW = 24;     // fewer free than this after a call: open POOL_MORE
 const POOL_MORE = 32;
 
-let wasi, exports, pool, dir = null, opened = 0, persistent = false, inFlight = false;
+let wasi, exports, pool, dir = null, opened = 0, persistent = false, inFlight = false, why = "";
 const enc = new TextEncoder();
 
 async function openFiles(n) {
@@ -44,6 +46,7 @@ async function openPool() {
     dir = await root.getDirectoryHandle(POOL_DIR, {create: true});
   } catch (e) {
     console.warn("no OPFS, keeping files in memory:", e);
+    why = String((e && (e.name || e.message)) || e);
     return new Pool(Array.from({length: 256}, () => new MemoryHandle()));
   }
   let existing = 0;
@@ -87,11 +90,11 @@ async function reset() {
 const ready = (async () => {
   pool = await openPool();
   wasi = new Wasi({pool, preopen: "/data"});
-  const {instance} = await WebAssembly.instantiateStreaming(fetch("pigeonhole.wasm"), {wasi_snapshot_preview1: wasi.imports()});
+  const {instance} = await WebAssembly.instantiateStreaming(fetch("pigeonhole.wasm" + V), {wasi_snapshot_preview1: wasi.imports()});
   exports = instance.exports;
   wasi.memory = exports.memory;
   const out = call(exports.ph_open, {op: "start"});
-  out.reply = {...out.reply, persistent};
+  out.reply = {...out.reply, persistent, why};
   postMessage({id: 0, ...out});
 })().catch(e => postMessage({id: 0, reply: {error: String(e.message || e)}, events: []}));
 

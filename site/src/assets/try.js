@@ -7,7 +7,7 @@
   const status = document.getElementById("status");
   const rows = document.getElementById("obj-rows");
   const buttons = [...document.querySelectorAll(".toolbar button, .toolbar input, .config-actions button")];
-  const worker = new Worker(window.ASSETS + "web-worker.js");
+  const worker = new Worker(window.ASSETS + "web-worker.js" + (document.currentScript?.src.match(/\?v=\w+/)?.[0] || ""));
   const waiting = new Map();
   let nextId = 1, busy = Promise.resolve(), t0 = performance.now();
 
