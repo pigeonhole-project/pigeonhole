@@ -176,7 +176,6 @@ async fn handles_across_bots() {
 #[tokio::test]
 #[ignore = "needs two Telegram bots, admins of a test channel"]
 async fn a_pool_of_two_bots_sends_twice_as_fast() {
-    use pigeonhole_telegram_mtproto::PooledChannel;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     dotenvy::from_path(root.join(".env")).ok();
     let _ = tracing_subscriber::fmt()
@@ -197,7 +196,7 @@ async fn a_pool_of_two_bots_sends_twice_as_fast() {
         let limiter = reg.chat(&tg.bot_id().to_string(), &chat_id.to_string());
         members.push(tg.channel(chat_id, Lane::Meta, limiter).await.unwrap());
     }
-    let pooled = PooledChannel::of(members);
+    let pooled = pigeonhole_telegram_mtproto::pooled(members);
     let t0 = Instant::now();
     let mut ids = Vec::new();
     for i in 0..sends {
@@ -218,7 +217,6 @@ async fn a_pool_of_two_bots_sends_twice_as_fast() {
 async fn a_pooled_store_reads_with_each_bots_own_locations() {
     use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
     use pigeonhole_storage_telegram::TelegramBlobStore;
-    use pigeonhole_telegram_mtproto::PooledChannel;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     dotenvy::from_path(root.join(".env")).ok();
     let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
@@ -235,7 +233,7 @@ async fn a_pooled_store_reads_with_each_bots_own_locations() {
         let limiter = reg.chat(&tg.bot_id().to_string(), &chat_id.to_string());
         members.push(tg.channel(chat_id, Lane::Blobs, limiter).await.unwrap());
     }
-    let pooled = Arc::new(PooledChannel::of(members));
+    let pooled = Arc::new(pigeonhole_telegram_mtproto::pooled(members));
     let info = InstanceInfo {
         id: "pooled".into(),
         kind: pigeonhole_storage_telegram::KIND,
@@ -271,7 +269,6 @@ async fn a_pooled_store_reads_with_each_bots_own_locations() {
 async fn ranged_reads_one_bot_against_two() {
     use pigeonhole_storage_api::{collect_stream, BlobBackend, BlobId, InstanceInfo, InstanceRole};
     use pigeonhole_storage_telegram::TelegramBlobStore;
-    use pigeonhole_telegram_mtproto::PooledChannel;
     use pigeonhole_types::ByteRange;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     dotenvy::from_path(root.join(".env")).ok();
@@ -298,7 +295,7 @@ async fn ranged_reads_one_bot_against_two() {
         role: InstanceRole::ReadWrite,
     };
     let store_of = |members: Vec<MtprotoChannel>, id: &str| {
-        let pooled = Arc::new(PooledChannel::of(members));
+        let pooled = Arc::new(pigeonhole_telegram_mtproto::pooled(members));
         TelegramBlobStore::new(pooled.clone(), pooled.limiter().clone(), info(id)).with_inline(false)
     };
     let one = store_of(vec![channels[0].clone()], "one");

@@ -7,4 +7,4 @@ mod pacer;
 mod pool;
 
 pub use client::{DiscordChannel, DiscordClient};
-pub use pool::PooledDiscord;
+pub use pool::{pooled, PooledDiscord};

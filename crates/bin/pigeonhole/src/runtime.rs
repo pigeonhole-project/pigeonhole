@@ -108,7 +108,7 @@ async fn telegram_channel(
             .with_context(|| format!("bot {bot}"))?;
         members.push(channel);
     }
-    Ok(PooledChannel::of(members))
+    Ok(pigeonhole::telegram::pooled(members))
 }
 
 /// A channel holding the log or the snapshots, as a blob store whose blobs
@@ -142,7 +142,7 @@ async fn discord_channel(
     channel_id: &str,
     chain: bool,
 ) -> anyhow::Result<(pigeonhole_discord_http::PooledDiscord, String)> {
-    use pigeonhole_discord_http::{DiscordClient, PooledDiscord};
+    use pigeonhole_discord_http::DiscordClient;
     let id: u64 = channel_id.parse().with_context(|| format!("channel id {channel_id:?}"))?;
     let mut members = Vec::new();
     for token in bot_tokens {
@@ -152,7 +152,7 @@ async fn discord_channel(
         members.push(dc.channel(id, limiter));
     }
     let app_id = members[0].client().app_id();
-    Ok((PooledDiscord::of(members), app_id))
+    Ok((pigeonhole_discord_http::pooled(members), app_id))
 }
 
 /// A Discord channel holding the log or the snapshots: its store, handed to
