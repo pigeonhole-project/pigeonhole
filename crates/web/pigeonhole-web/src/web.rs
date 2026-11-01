@@ -6,16 +6,17 @@
 
 use crate::{parse_config, Node, World, DEMO_CONFIG};
 use bytes::Bytes;
-use serde::Deserialize;
+use pigeonhole_admin::Request;
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::io::{BufRead, Read, Write};
 use std::rc::Rc;
+use std::sync::Arc;
 
 thread_local! {
     static RT: tokio::runtime::Runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
-    static WORLD: Rc<World> = Rc::new(World::default());
+    static WORLD: Arc<World> = Arc::new(World::default());
     static NODE: RefCell<Option<Rc<Node>>> = const { RefCell::new(None) };
     static CONFIG: RefCell<String> = RefCell::new(saved_config().unwrap_or_else(|| DEMO_CONFIG.to_string()));
 }
@@ -25,47 +26,6 @@ const SAVED_CONFIG: &str = "/data/pigeonhole.toml";
 
 fn saved_config() -> Option<String> {
     std::fs::read_to_string(SAVED_CONFIG).ok()
-}
-
-#[derive(Deserialize)]
-struct Request {
-    op: String,
-    #[serde(default = "demo")]
-    bucket: String,
-    #[serde(default)]
-    key: String,
-    #[serde(default)]
-    to: String,
-    #[serde(default)]
-    range: Option<(u64, u64)>,
-    /// `pigeonhole.toml` for `open` / `restart`.
-    #[serde(default)]
-    config: Option<String>,
-    #[serde(default)]
-    len: usize,
-    /// `log`: the first position, and how many.
-    #[serde(default)]
-    from: Option<u64>,
-    #[serde(default)]
-    limit: Option<usize>,
-    /// `outage` / `wipe`: the channel's store id; `outage`: down or back.
-    #[serde(default)]
-    store: String,
-    /// `dynamic_set`: the value of the dynamic key `key`.
-    #[serde(default)]
-    value: String,
-    /// `run_task`: which background loop.
-    #[serde(default)]
-    task: String,
-    #[serde(default)]
-    down: bool,
-    /// `delete_message`: the message's id (a string: Discord's exceed JS numbers).
-    #[serde(default)]
-    message: String,
-}
-
-fn demo() -> String {
-    "demo".into()
 }
 
 fn answer(v: &Value) {
@@ -138,7 +98,7 @@ fn read_request() -> anyhow::Result<(Request, Bytes)> {
 /// (Re)starts the node on `text`; the old one keeps running if this fails.
 async fn start(text: String) -> anyhow::Result<Value> {
     let cfg = parse_config(&text)?;
-    let world = WORLD.with(Rc::clone);
+    let world = WORLD.with(Arc::clone);
     let old = NODE.with(|n| n.borrow_mut().take());
     if let Some(old) = &old {
         old.close().await?;
@@ -179,73 +139,5 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
         _ => {}
     }
     let node = NODE.with(|n| n.borrow().clone()).ok_or_else(|| anyhow::anyhow!("no node: open first"))?;
-    Ok(match r.op.as_str() {
-        "put" => {
-            node.put(&r.bucket, &r.key, body).await?;
-            json!({ "ok": true })
-        }
-        "get" => {
-            let bytes = node.get(&r.bucket, &r.key, r.range).await?;
-            json!({ "len": bytes.len() })
-        }
-        "copy" => {
-            node.copy(&r.bucket, &r.key, &r.to).await?;
-            json!({ "ok": true })
-        }
-        "delete" => {
-            node.delete(&r.bucket, &r.key).await?;
-            json!({ "ok": true })
-        }
-        "list" => json!({ "objects": node.list(&r.bucket).await? }),
-        "log" => node.log_entries(r.from, r.limit.unwrap_or(200)).await?,
-        "channels" => {
-            let world = WORLD.with(Rc::clone);
-            let mut out = Vec::new();
-            for c in &node.channels {
-                out.push(world.describe(c, r.limit.unwrap_or(200)).await?);
-            }
-            json!({ "channels": out })
-        }
-        "background" => node.background().await?,
-        "dynamic" => json!({ "keys": node.dynamic.keys(), "tasks": node.dynamic.tasks() }),
-        "dynamic_set" => {
-            node.dynamic.set(&r.key, &r.value).await?;
-            json!({ "ok": true })
-        }
-        "dynamic_unset" => json!({ "unset": node.dynamic.unset(&r.key).await? }),
-        "run_task" => {
-            node.dynamic.run_now(&r.task)?;
-            json!({ "ok": true })
-        }
-        "outage" | "wipe" | "delete_message" => {
-            let world = WORLD.with(Rc::clone);
-            let c = node
-                .channels
-                .iter()
-                .find(|c| c.store == r.store)
-                .ok_or_else(|| anyhow::anyhow!("no fake channel {:?}", r.store))?;
-            if r.op == "outage" {
-                world.set_down(c, r.down);
-                json!({ "down": r.down })
-            } else if r.op == "delete_message" {
-                world.delete_message(c, &r.message).await?;
-                json!({ "deleted": 1 })
-            } else {
-                json!({ "deleted": world.wipe(c).await? })
-            }
-        }
-        "verify" => {
-            let (checked, gone) = node.verify(&r.store).await?;
-            json!({ "checked": checked, "gone": gone })
-        }
-        "repair" => {
-            let s = node.repair().await?;
-            json!({ "repaired": s.repaired, "failed": s.failed, "queued": s.scrub_enqueued })
-        }
-        "sweep" => {
-            let s = node.sweep().await?;
-            json!({ "deleted": s.keys_deleted, "zero_ref": s.zero_ref_chunks })
-        }
-        other => anyhow::bail!("unknown op {other:?}"),
-    })
+    node.admin.handle(&r, body).await
 }

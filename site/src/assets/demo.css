@@ -380,16 +380,28 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .deletable:hover .msg-del, .msg-del:focus-visible { opacity: 1; }
 @media (hover: none) { .msg-del { opacity: .8; } }
 
-/* the node's background tasks: chips on the graph, cards in its panel */
-.chip { cursor: pointer; }
-.chip-box { fill: var(--plume); stroke: var(--slate-2); stroke-width: 1.2; }
-.chip:hover .chip-box, .chip:focus-visible .chip-box { stroke: var(--teal); }
-.chip-name { font-size: 11.5px; fill: var(--wing-2); }
-.chip-count { font: 600 11px var(--mono); fill: var(--slate); }
-.chip.busy .chip-count { fill: var(--eye); }
-.chip.busy .clock-arc { stroke: var(--eye); }
-.chip.off { opacity: .55; }
-.chip.off .chip-box { stroke-dasharray: 3 3; }
+/* the node's background tasks: in the dovecote's windows, cards in its panel */
+.win { cursor: pointer; }
+.win-light { fill: var(--teal); opacity: .85; transition: y 1s linear, height 1s linear; }
+.win-glow { fill: var(--teal); opacity: .22; }
+.win-frame { fill: none; stroke: var(--teal); stroke-width: 1.6; opacity: .75; }
+.win-boarded .win-board-back { fill: var(--plume); stroke: var(--slate-2); stroke-width: 1.2; }
+.win-plank { stroke: var(--slate); stroke-width: 3; stroke-linecap: round; }
+.win:hover .win-frame, .win:focus-visible .win-frame { stroke-width: 2.6; opacity: 1; }
+.win:focus-visible { outline: none; }
+.win-bird { opacity: 0; transition: opacity .3s; }
+/* a rock dove's grey whatever the theme */
+.win-bird .bird-body { fill: #d9dee3; stroke: #2e3439; stroke-width: 1; }
+.win-bird .bird-lines { fill: none; stroke: #2e3439; stroke-width: 1; stroke-linecap: round; }
+.win-bird .bird-eye { fill: #2e3439; }
+.win.busy .win-bird { opacity: 1; }
+.win.busy .win-light { fill: var(--eye); }
+.win-badge { opacity: 0; transition: opacity .3s; }
+.win.busy .win-badge { opacity: 1; }
+.win-badge circle { fill: var(--eye); }
+.win-badge text { font: 700 9px var(--mono); fill: #fff; }
+.win.off .win-light, .win.off .win-glow { opacity: 0; }
+.win.off .win-frame { stroke: var(--slate); stroke-dasharray: 2 2; }
 .task { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin: 0 0 12px; }
 .task.off { border-style: dashed; }
 .task-head { display: flex; gap: 10px; align-items: center; }
@@ -401,3 +413,25 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .switch[aria-checked="true"] { background: var(--teal); border-color: var(--teal); }
 .switch[aria-checked="true"]::after { left: 16px; background: #fff; }
 .job-tile.more { border-style: dashed; }
+
+/* pins: Telegram's bar under the header, Discord's count in it */
+.tg-pinbar { display: flex; gap: 10px; align-items: center; padding: 6px 14px; background: var(--tg-bar); color: var(--tg-ink); border-top: 1px solid rgba(127,127,127,.18); font-size: 13px; }
+.tg-pinbar b { color: #3390ec; font-weight: 600; }
+.tg-pinbar-text { opacity: .8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60ch; }
+.tg-pinbar .ic, .dc-pins .ic, .tg-meta .pin { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.tg-pinbar .ic { color: #3390ec; }
+.tg-service-line { align-items: center; padding-right: 0; }
+.dc-pins { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--dc-muted); font-size: 13px; }
+.dc-pinned { font-size: 12px; color: var(--dc-muted); margin-bottom: 2px; }
+
+/* the page as a real node's admin: no restart, no erase; a bucket to pick */
+body.admin #config-apply, body.admin #config-reset, body.admin #erase { display: none; }
+.bucket-pick { margin: 0 0 12px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--feather); font: inherit; color: inherit; }
+
+/* a window's tooltip */
+.tip { position: fixed; z-index: 10; max-width: 280px; padding: 10px 12px; border-radius: 10px; background: var(--plume); border: 1px solid var(--line); box-shadow: 0 6px 24px rgba(0,0,0,.25); font-size: 13.5px; pointer-events: none; }
+.tip b { font-size: 14px; }
+.tip p { margin: 4px 0 8px; color: var(--wing-2); }
+.tip-when { color: var(--slate); }
+.tip-work { margin-top: 2px; }
+.tip-work.busy { color: var(--eye); font-weight: 600; }

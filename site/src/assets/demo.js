@@ -14,21 +14,47 @@
   const esc = v => String(v).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"})[c]);
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  // ------------------------------------------------------------ the worker
-  const worker = new Worker(window.ASSETS + "web-worker.js" + (document.currentScript?.src.match(/\?v=\w+/)?.[0] || ""));
-  // Let go of the files at once, for the next page (a reload, the other language).
-  addEventListener("pagehide", () => worker.terminate());
-  addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
+  // ------------------------------------------------------------ the node
+  // The demo's node runs in a worker (wasm). Served by a real node's admin
+  // address ([admin] ui_dir), the page is its admin: the same ops, over
+  // HTTP to /admin/ops (pigeonhole-admin runs them in both).
+  const workerUrl = window.ASSETS + "web-worker.js" + (document.currentScript?.src.match(/\?v=\w+/)?.[0] || "");
+  let worker = null;
   const waiting = new Map();
   let nextId = 1, queue = Promise.resolve();
-  worker.onmessage = ({data}) => {
-    if (data.id === -1) { background(data.events); return; }
-    const done = waiting.get(data.id);
-    waiting.delete(data.id);
-    if (done) done(data);
-  };
+  const isAdmin = fetch("/admin/config", {cache: "no-store"})
+    .then(r => r.ok && (r.headers.get("content-type") || "").includes("json"))
+    .catch(() => false);
+  const started = isAdmin.then(admin => {
+    if (admin) return {id: 0, reply: {admin: true, saved: true, persistent: true}, events: []};
+    worker = new Worker(workerUrl);
+    worker.onmessage = ({data}) => {
+      if (data.id === -1) { background(data.events); return; }
+      const done = waiting.get(data.id);
+      waiting.delete(data.id);
+      if (done) done(data);
+    };
+    return new Promise(res => waiting.set(0, res));
+  });
+  // Let go of the files at once, for the next page (a reload, the other language).
+  addEventListener("pagehide", () => worker?.terminate());
+  addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
+  const enc = new TextEncoder();
+  // An op on a real node: the JSON line, then the body, as the worker reads them.
+  async function httpCall(request, body) {
+    const head = enc.encode(JSON.stringify({...request, len: body ? body.byteLength : 0}) + "\n");
+    const payload = new Uint8Array(head.length + (body ? body.byteLength : 0));
+    payload.set(head);
+    if (body) payload.set(new Uint8Array(body), head.length);
+    try {
+      const r = await fetch("/admin/ops", {method: "POST", body: payload});
+      return {reply: (await r.json()).reply, events: []};
+    } catch (e) {
+      return {reply: {error: String(e)}, events: []};
+    }
+  }
   function call(request, body) {
-    const run = queue.then(() => new Promise(res => {
+    const run = queue.then(() => started).then(() => state.admin ? httpCall(request, body) : new Promise(res => {
       const id = nextId++;
       waiting.set(id, res);
       worker.postMessage({id, ...request, body}, body ? [body] : []);
@@ -36,7 +62,6 @@
     queue = run.catch(() => {});
     return run;
   }
-  const started = new Promise(res => waiting.set(0, res));
 
   // ------------------------------------------------------------ state
   const state = {
@@ -48,18 +73,30 @@
     logView: "readable",   // the log panel: "readable" or "channel"
     busy: false,
     wizard: false,         // the first visit's setup is on screen
+    admin: false,          // the page is a real node's admin (not the demo)
+    bucket: "demo",        // the bucket the client panel shows
     bg: null,              // what runs in the background: {repair: {queue, every_ms, next_ms}, snapshot}
   };
   const byStore = () => Object.fromEntries(state.channels.map(c => [c.store, c]));
   // The open panel is the log's (it opens by the log channel's id).
   const logOpen = () => byStore()[state.open]?.role === "log";
 
+  // A store's kind as a name: the app, or what a server's own store is.
+  const appOf = k => ({telegram: "Telegram", discord: "Discord"})[k] || t(`kind.${k}`);
+  const KIND_COLOR = {telegram: "var(--tg)", discord: "var(--dc)"};
+
   // ------------------------------------------------------------ the graph
   const graph = $("graph");
   let nodes = {}, edges = {};
   const W = 1000;
   // A pigeon in flight, facing right: wings up from a small body, a tail.
-  const BIRD = "M-9,1 Q-6,-1 -3,0 Q-1,-9 3,-11 Q2,-4 2,-1 Q6,-2 9,0 Q6,2 2,2 Q0,4 -3,3 Q-6,3 -9,1 Z";
+  // A pigeon in flight, side on, facing right: the body, and the wing raised
+  // behind it (it beats about the shoulder at 2.8,-1.2).
+  const FLY_BODY = "M-11,1.5 L-6.5,-0.2 Q-2,-1.6 3,-1.2 Q4.4,-4 7,-3.8 Q9,-3.6 9.2,-2.2 L11,-1.6 L9,-1 Q8.6,1.4 6.2,2.4 Q3.6,4.4 -2,4 Q-7,3.6 -11,1.5 Z";
+  const FLY_WING = "M2.8,-1.2 Q1.6,-6.4 -2.4,-11 Q-2.2,-8.4 -4.4,-9.6 Q-3.8,-7.2 -6.4,-8.2 Q-5.2,-5.8 -7.6,-6.2 Q-5.4,-3.4 -3.8,-0.8 Z";
+  // A pigeon sitting, side on, facing right; its legs; its wing's line.
+  const PERCHED = "M-10,3.5 L-5,1 Q-3,-2.5 1.5,-2.5 Q2,-6.5 5,-6.5 Q7.4,-6.5 7.6,-4.6 L9.4,-4 L7.6,-3.4 Q7.4,-2 6.2,-1.4 Q9,1 7.4,4.2 Q5.4,6.6 1.4,6.6 L-3,6.2 Q-6.4,5.4 -10,3.5 Z";
+  const PERCHED_LINES = "M1.2,6.4 L1.2,8.8 M3.4,6.4 L3.4,8.8 M-5.6,1.6 Q-1,-0.6 3.4,2.6";
 
   // The channels in two groups: the data channels (blob stores, the
   // chunks) and the node's own, the log and its snapshots.
@@ -114,30 +151,16 @@
 
     // The loft: a dovecote, the node itself.
     const loft = node("loft", pos.loft, "pigeonhole", t("demo.loft_role"));
-    dovecote(loft.g);
+    taskWindows(loft, dovecote(loft.g));
     loft.label(0, 100);
-    // The background tasks: a chip each, its clock and how much work waits.
-    loft.chips = {};
-    TASKS.forEach((task, i) => {
-      const g = s("g", {class: "chip", transform: `translate(-236,${-150 + i * 30})`, tabindex: 0, role: "button"}, loft.g);
-      s("rect", {class: "chip-box", x: 0, y: 0, width: 132, height: 24, rx: 12}, g);
-      s("circle", {class: "clock-face", cx: 13, cy: 12, r: 7}, g);
-      const arc = s("circle", {class: "clock-arc", cx: 13, cy: 12, r: 7, pathLength: 100, transform: "rotate(-90 13 12)"}, g);
-      s("text", {class: "chip-name", x: 26, y: 16}, g).textContent = t(`bg.${task}`);
-      const count = s("text", {class: "chip-count", x: 122, y: 16, "text-anchor": "end"}, g);
-      const tip = s("title", {}, g);
-      g.addEventListener("click", e => { e.stopPropagation(); openPanel("loft"); });
-      loft.chips[task] = {g, arc, count, tip};
-    });
-
     for (const c of state.channels) {
-      const app = c.kind === "telegram" ? "Telegram" : "Discord";
+      const app = appOf(c.kind);
       const bots = c.bots > 1 ? `, ${t("demo.bots", {n: c.bots})}` : "";
       const role = placeNote(c, app) + bots + (c.down ? `, ${t("demo.down")}` : "");
       const n = node(c.store, pos[c.store], c.store, role);
       n.g.classList.toggle("down", !!c.down);
       s("rect", {class: `shape${c.role === "data" ? "" : " meta"}`, x: -130, y: -34, width: 260, height: 68, rx: 14}, n.g);
-      s("circle", {class: "badge", cx: -106, cy: 0, r: 9, fill: c.kind === "telegram" ? "var(--tg)" : "var(--dc)"}, n.g);
+      logo(c.kind, n.g, -106, 0);
       n.label(-88, 0, "start");
       // The channel's message count, top right.
       n.count = s("text", {class: "count", x: 116, y: -10, "text-anchor": "end"}, n.g);
@@ -171,7 +194,7 @@
   function workOf(task) {
     if (task.task === "snapshot") {
       const sn = state.bg.snapshot;
-      return sn.every ? {n: sn.head - sn.base, of: sn.every} : {n: 0};
+      return {n: Math.max(0, sn.head - sn.base), of: sn.every || undefined};
     }
     return {n: task.work.length};
   }
@@ -193,16 +216,25 @@
       if (jobs.length > 12) s("text", {class: "job-more", x: 12 * 14 + 2, y: 9}, n.queue).textContent = `+${jobs.length - 12}`;
     }
     for (const task of bg.tasks) {
-      const chip = nodes.loft?.chips?.[task.task];
-      if (!chip) continue;
+      const win = nodes.loft?.windows?.[task.task];
+      if (!win) continue;
       const period = ms(task.every), w = workOf(task);
-      const left = period && task.next_in_ms != null ? Math.min(1, task.next_in_ms / period) : 1;
-      chip.arc.style.strokeDashoffset = String(Math.round(100 * left));
-      chip.count.textContent = w.of ? `${w.n}/${w.of}` : String(w.n);
-      chip.g.classList.toggle("off", !period);
-      chip.g.classList.toggle("busy", !w.of && w.n > 0);
-      chip.tip.textContent = period ? t("bg.tip", {task: t(`bg.${task.task}`), s: Math.ceil((task.next_in_ms || 0) / 1000)}) : t("bg.tip_off", {task: t(`bg.${task.task}`)});
+      // How lit: the time to the next pass gone by; a snapshot, its entries too.
+      let lit = period && task.next_in_ms != null ? 1 - Math.min(1, task.next_in_ms / period) : 0;
+      if (w.of) lit = Math.max(lit, Math.min(1, w.n / w.of));
+      const h = Math.round(24 * lit);
+      win.light.setAttribute("y", String(win.w.y + 14 - h));
+      win.light.setAttribute("height", String(h));
+      // Work waits: jobs in a queue; for the snapshot, entries after the last one.
+      const busy = w.n > 0;
+      win.count.textContent = w.n > 99 ? "99+" : String(w.n);
+      win.g.classList.toggle("off", !period);
+      win.g.classList.toggle("busy", busy);
+      const name = t(`bg.${task.task}`);
+      const when = period ? t("bg.tip", {task: name, when: soon(task.next_in_ms)}) : t("bg.tip_off", {task: name});
+      win.tip.textContent = task.task === "snapshot" ? `${when}; ${t(w.of ? "bg.entries_short" : "bg.entries_since", {n: w.n, of: w.of})}` : busy ? `${when}; ${t("bg.waiting", {n: w.n})}` : when;
     }
+    fillTip();
     if (state.open === "loft") renderBgPanel();
   }
 
@@ -214,6 +246,7 @@
     for (const task of TASKS.map(taskOf).filter(Boolean)) {
       const period = ms(task.every), w = workOf(task);
       const card = h("div", "task" + (period ? "" : " off"));
+      card.id = `task-${task.task}`;
       const head = h("div", "task-head");
       head.append(h("b", "", t(`bg.${task.task}`)));
       const sw = h("button", "switch");
@@ -234,7 +267,7 @@
       const fill = h("div", "fill");
       fill.style.width = period && task.next_in_ms != null ? `${100 * (1 - Math.min(1, task.next_in_ms / period))}%` : "0%";
       meter.append(fill);
-      card.append(meter, h("div", "task-when", period ? t("bg.next", {s: Math.ceil((task.next_in_ms || 0) / 1000)}) : t("bg.parked")));
+      card.append(meter, h("div", "task-when", period ? t("bg.next", {when: soon(task.next_in_ms)}) : t("bg.parked")));
       if (task.task === "snapshot") {
         if (w.of) {
           const m2 = h("div", "meter");
@@ -299,6 +332,26 @@
     return t("wiz.note_shard", {app, shard});
   }
 
+  // A store's mark on its card: the app's logo (simplified), else a dot.
+  function logo(kind, g, x, y) {
+    const mark = s("g", {class: "badge", transform: `translate(${x},${y})`}, g);
+    if (kind === "telegram") {
+      s("circle", {r: 11, fill: "#2AABEE"}, mark);
+      // The paper plane.
+      s("path", {fill: "#fff", d: "M-6.2,-0.4 L5.8,-5.2 Q6.6,-5.4 6.4,-4.4 L4.4,5 Q4.2,5.8 3.4,5.3 L0.4,3.1 L-1.1,4.6 Q-1.6,5 -1.7,4.3 L-1.9,1.7 L3.9,-3.6 L-2.8,0.9 L-6,-0.1 Q-6.8,-0.3 -6.2,-0.4 Z"}, mark);
+    } else if (kind === "discord") {
+      s("circle", {r: 11, fill: "#5865F2"}, mark);
+      // The controller-shaped face, its two eyes.
+      s("path", {fill: "#fff", d: "M-5.6,-3.9 Q-3.4,-5 -1.6,-5.2 L-1.1,-4.3 Q0,-4.5 1.1,-4.3 L1.6,-5.2 Q3.4,-5 5.6,-3.9 Q7.4,-0.6 7.1,3.7 Q5.3,5.1 3.2,5.6 L2.4,4.4 Q0,5.1 -2.4,4.4 L-3.2,5.6 Q-5.3,5.1 -7.1,3.7 Q-7.4,-0.6 -5.6,-3.9 Z"}, mark);
+      s("ellipse", {cx: -2.4, cy: 0.9, rx: 1.3, ry: 1.5, fill: "#5865F2"}, mark);
+      s("ellipse", {cx: 2.4, cy: 0.9, rx: 1.3, ry: 1.5, fill: "#5865F2"}, mark);
+    } else {
+      s("circle", {r: 9, fill: "var(--slate)"}, mark);
+    }
+    s("title", {}, mark).textContent = appOf(kind);
+    return mark;
+  }
+
   // A pigeon tower: a round body narrowing upward, a cone roof with a lantern
   // and a finial, two rows of arched entrances with perches, a plinth.
   function dovecote(g) {
@@ -314,12 +367,96 @@
     s("path", {...line, d: "M0,-124 L0,-136"}, g);
     s("circle", {cx: 0, cy: -105, r: 3.5, fill: "var(--wing-2)"}, g);
     // Entrances: an arch over a dark hole, a perch under it.
+    const windows = [];
     const arch = (x, y) => {
-      s("path", {d: `M${x - 10},${y + 14} L${x - 10},${y} A10,10 0 0 1 ${x + 10},${y} L${x + 10},${y + 14} Z`, fill: "var(--wing-2)", "fill-opacity": .78}, g);
+      const d = `M${x - 10},${y + 14} L${x - 10},${y} A10,10 0 0 1 ${x + 10},${y} L${x + 10},${y + 14} Z`;
+      s("path", {d, fill: "var(--wing-2)", "fill-opacity": .78}, g);
       s("path", {...line, d: `M${x - 15},${y + 18} L${x + 15},${y + 18}`}, g);
+      windows.push({x, y, d});
     };
     for (const x of [-34, 0, 34]) arch(x, -2);
     for (const x of [-36, 0, 36]) arch(x, 34);
+    return windows;
+  }
+
+  // "45 s", "9 min": how long until a pass.
+  function soon(msLeft) {
+    const sec = Math.ceil((msLeft || 0) / 1000);
+    return sec < 120 ? t("time.s", {n: sec}) : t("time.min", {n: Math.round(sec / 60)});
+  }
+
+  // A window's tooltip: what the task is, when it passes next, what waits.
+  const tipBox = h("div", "tip");
+  tipBox.setAttribute("role", "tooltip");
+  tipBox.hidden = true;
+  document.body.append(tipBox);
+  let tipFor = null;
+  function showTip(task, el) {
+    tipFor = {task, el};
+    fillTip();
+    tipBox.hidden = false;
+    const r = el.getBoundingClientRect();
+    tipBox.style.left = `${Math.round(r.right + 12)}px`;
+    tipBox.style.top = `${Math.round(r.top - 8)}px`;
+  }
+  function hideTip() {
+    tipFor = null;
+    tipBox.hidden = true;
+  }
+  function fillTip() {
+    if (!tipFor) return;
+    const task = taskOf(tipFor.task);
+    tipBox.replaceChildren(h("b", "", t(`bg.${tipFor.task}`)), h("p", "", t(`bg.${tipFor.task}_note`)));
+    if (!task) return;
+    const period = ms(task.every), w = workOf(task);
+    tipBox.append(h("div", "tip-when", period ? t("bg.next", {when: soon(task.next_in_ms)}) : t("bg.parked")));
+    let work;
+    if (task.task === "snapshot") work = t(w.of ? "bg.entries_short" : "bg.entries_since", {n: w.n, of: w.of});
+    else work = w.n ? t("bg.waiting", {n: w.n}) : t("bg.idle");
+    tipBox.append(h("div", "tip-work" + (w.n ? " busy" : ""), work));
+  }
+
+  // The background tasks live in the dovecote's windows: the light rises
+  // as the next pass nears; a pigeon sits in while work waits (the badge
+  // counts it); a task that is off has its shutters closed.
+  const TASK_WINDOW = {repair: 0, sweep: 1, cool: 2, snapshot: 4};
+  function taskWindows(loft, windows) {
+    loft.windows = {};
+    for (const task of TASKS) {
+      const w = windows[TASK_WINDOW[task]];
+      const g = s("g", {class: "win", tabindex: 0, role: "button", "aria-label": t(`bg.${task}`)}, loft.g);
+      const clip = s("clipPath", {id: `win-${task}`}, g);
+      s("path", {d: w.d}, clip);
+      // Lived in: a faint glow always, the light rising over it.
+      s("path", {class: "win-glow", d: w.d}, g);
+      const light = s("rect", {class: "win-light", x: w.x - 10, y: w.y + 14, width: 20, height: 0, "clip-path": `url(#win-${task})`}, g);
+      s("path", {class: "win-frame", d: w.d}, g);
+      const bird = s("g", {class: "win-bird", transform: `translate(${w.x},${w.y + 4}) scale(.82)`}, g);
+      s("path", {class: "bird-body", d: PERCHED}, bird);
+      s("path", {class: "bird-lines", d: PERCHED_LINES}, bird);
+      s("circle", {class: "bird-eye", cx: 5.6, cy: -4.4, r: 0.8}, bird);
+      const badge = s("g", {class: "win-badge"}, g);
+      s("circle", {cx: w.x + 11, cy: w.y - 9, r: 7}, badge);
+      const count = s("text", {x: w.x + 11, y: w.y - 6, "text-anchor": "middle"}, badge);
+      const tip = s("title", {}, g);
+      const open = e => { e.stopPropagation(); hideTip(); openPanel("loft"); $(`task-${task}`)?.scrollIntoView({block: "nearest"}); };
+      g.addEventListener("mouseenter", () => showTip(task, g));
+      g.addEventListener("focus", () => showTip(task, g));
+      g.addEventListener("mouseleave", hideTip);
+      g.addEventListener("blur", hideTip);
+      g.addEventListener("click", open);
+      g.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(e); } });
+      loft.windows[task] = {g, w, light, bird, badge, count, tip};
+    }
+    // The windows no task lives in are boarded up.
+    const used = new Set(Object.values(TASK_WINDOW));
+    windows.forEach((w, i) => {
+      if (used.has(i)) return;
+      const g = s("g", {class: "win-boarded"}, loft.g);
+      s("path", {class: "win-board-back", d: w.d}, g);
+      s("path", {class: "win-plank", d: `M${w.x - 9},${w.y - 4} L${w.x + 9},${w.y + 12}`}, g);
+      s("path", {class: "win-plank", d: `M${w.x + 9},${w.y - 4} L${w.x - 9},${w.y + 12}`}, g);
+    });
   }
 
   // A clickable node: a group at `p`, its name, role and a count.
@@ -355,7 +492,8 @@
       // A small pigeon, wings beating; bigger for bigger payloads.
       const scale = 0.9 + Math.min(1, Math.log2(1 + size / 4096) / 10);
       const bird = s("g", {class: "flight" + (failed ? " failed" : "")}, graph);
-      const body = s("path", {fill: "url(#iris)", d: BIRD}, bird);
+      s("path", {fill: "url(#iris)", d: FLY_BODY}, bird);
+      const wing = s("path", {fill: "url(#iris)", d: FLY_WING}, bird);
       const len = path.getTotalLength(), t0 = performance.now(), dur = 680;
       flights.push(bird);
       const step = now => {
@@ -366,7 +504,7 @@
         const flip = ahead.x < pt.x ? -1 : 1;
         const flap = 0.55 + 0.45 * Math.abs(Math.sin((now - t0) / 55));
         bird.setAttribute("transform", `translate(${pt.x},${pt.y}) scale(${flip * scale},${scale})`);
-        body.setAttribute("transform", `scale(1,${flap})`);
+        wing.setAttribute("transform", `translate(2.8,-1.2) scale(1,${flap}) translate(-2.8,1.2)`);
         if (k < 1) requestAnimationFrame(step);
         else { bird.remove(); done(); }
       };
@@ -423,7 +561,7 @@
 
   function refreshCount(c) {
     const n = nodes[c.store];
-    if (!n) return;
+    if (!n || c.total == null) return;
     if (n.count) n.count.textContent = String(c.total);
   }
 
@@ -486,7 +624,7 @@
   }
 
   async function refreshObjects() {
-    const {reply} = await call({op: "list"});
+    const {reply} = await call({op: "list", bucket: state.bucket});
     state.objects = reply?.objects || [];
     const n = nodes.client;
     if (n) n.countText.textContent = `${t("demo.you")}, ${t("demo.objects", {n: state.objects.length})}`;
@@ -559,10 +697,10 @@
       wireNode();
     } else if (c?.role === "log") {
       $("panel-title").textContent = t("demo.log_title");
-      $("panel-sub").textContent = t("demo.log_sub", {store: c.store, app: c.kind === "telegram" ? "Telegram" : "Discord"});
+      $("panel-sub").textContent = t("demo.log_sub", {store: c.store, app: appOf(c.kind)});
       renderLog(body);
     } else if (c) {
-      const app = c.kind === "telegram" ? "Telegram" : "Discord";
+      const app = appOf(c.kind);
       $("panel-title").textContent = c.store;
       $("panel-sub").textContent = t(`demo.channel_sub_${c.role}`, {app, scope: c.scope});
       body.replaceChildren(...(c.role === "data" ? [faults(c)] : []), feed(c));
@@ -573,7 +711,7 @@
   // gone behind the node's back); check finds what is gone, repair puts it back.
   function faults(c) {
     const box = h("div", "faults");
-    box.append(h("p", "faults-note", t(c.down ? "demo.fault_down_note" : "demo.fault_note")));
+    box.append(h("p", "faults-note", t(state.admin ? "admin.channel_note" : c.down ? "demo.fault_down_note" : "demo.fault_note")));
     const row = h("div", "row");
     const btn = (label, cls, fn) => {
       const b = h("button", `btn ${cls}`, label);
@@ -582,12 +720,12 @@
       row.append(b);
     };
     const store = esc(c.store);
-    btn(t(c.down ? "demo.bring_back" : "demo.take_down"), c.down ? "primary" : "", async () => {
+    if (!state.admin) btn(t(c.down ? "demo.bring_back" : "demo.take_down"), c.down ? "primary" : "", async () => {
       const r = await op({op: "outage", store: c.store, down: !c.down});
       if (r && !r.error) caption(t(r.down ? "say.down" : "say.up", {store}));
       await refreshChannels();
     });
-    btn(t("demo.wipe"), "danger", async () => {
+    if (!state.admin) btn(t("demo.wipe"), "danger", async () => {
       const r = await op({op: "wipe", store: c.store});
       if (r && !r.error) caption(t("say.wiped", {store, n: r.deleted}));
       await refreshChannels();
@@ -650,7 +788,17 @@
   }
   const service = m => m.log && m.log.what !== "batch";
 
+  // Pins: the owner marker (docs/store-owner.md) is a pinned file.
+  const ICON_PIN = "M14 4l6 6-3 1-4 4 1 5-2 1-4-5-5 5M10 9l5 5";
+  const isPinned = (c, m) => (c.pinned || []).some(p => String(p.id) === String(m.id));
+  const ownerOf = m => /^owner-([0-9a-f]{8})\.bin$/.exec(m.name || "")?.[1];
+  function pinNote(m) {
+    const owner = ownerOf(m);
+    return owner ? h("div", "post-log", t("demo.owner_marker", {owner})) : null;
+  }
+
   function feed(c) {
+    if (!KIND_COLOR[c.kind]) return h("p", "empty", t("admin.no_view", {kind: appOf(c.kind)}));
     return c.kind === "telegram" ? telegramView(c) : discordView(c);
   }
 
@@ -682,6 +830,13 @@
     const who = h("div");
     who.append(h("b", "", t("demo.tg_title", {store: c.store})), h("small", "", t("demo.tg_subs")));
     head.append(ava, who);
+    const pin = (c.pinned || [])[0];
+    const bar = pin ? h("div", "tg-pinbar") : null;
+    if (bar) {
+      const col = h("div");
+      col.append(h("b", "", t("demo.pinned_message")), h("div", "tg-pinbar-text", pin.name || t("demo.tg_service")));
+      bar.append(svgIcon(ICON_PIN, "ic"), col);
+    }
     const chat = h("div", "tg-chat");
     const live = c.messages.slice(-200);
     const earlier = c.total - live.filter(m => !m.gone).length;
@@ -692,7 +847,13 @@
       const line = h("div", "tg-line");
       const b = h("div", "tg-post" + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : "") + (service(m) ? " service" : ""));
       if (m.kind === "text") b.append(h("div", "tg-text cjk", payload(m)));
-      else if (m.kind === "other") b.append(h("div", "tg-text", t("demo.tg_service")));
+      else if (m.kind === "other") {
+        // A service message (a pin): a pill in the middle, as Telegram draws it.
+        line.className = "tg-line tg-service-line";
+        line.append(h("div", "tg-day", t("demo.tg_pinned_service")));
+        chat.append(line);
+        continue;
+      }
       else {
         const doc = h("div", "tg-doc");
         const ic = h("div", "tg-doc-ic");
@@ -703,7 +864,10 @@
         b.append(doc);
       }
       if (m.log) b.append(h("div", "post-log", logLabel(m.log)));
+      const note = pinNote(m);
+      if (note) b.append(note);
       const foot = h("div", "tg-meta");
+      if (isPinned(c, m)) foot.append(svgIcon(ICON_PIN, "pin"));
       foot.append(svgIcon(ICON_EYE, "eye"), document.createTextNode("1"));
       const at = when(c, m);
       if (at) foot.append(document.createTextNode(` ${hhmm(at)}`));
@@ -713,7 +877,7 @@
       chat.append(line);
     }
     const input = h("div", "tg-input", t("demo.tg_broadcast"));
-    app.append(head, chat, input);
+    app.append(...[head, bar, chat, input].filter(Boolean));
     requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
     return app;
   }
@@ -722,6 +886,12 @@
     const app = h("div", "app dc");
     const head = h("div", "dc-head");
     head.append(h("span", "dc-hash", "#"), h("b", "", c.store), h("span", "dc-topic", t(`demo.dc_topic_${c.role}`)));
+    if (c.pinned?.length) {
+      const pins = h("span", "dc-pins");
+      pins.title = t("demo.pinned_n", {n: c.pinned.length});
+      pins.append(svgIcon(ICON_PIN, "ic"), document.createTextNode(String(c.pinned.length)));
+      head.append(pins);
+    }
     const chat = h("div", "dc-chat");
     const live = c.messages.slice(-200);
     const earlier = c.total - live.filter(m => !m.gone).length;
@@ -754,6 +924,9 @@
         body.append(card);
       }
       if (m.log) body.append(h("div", "post-log", logLabel(m.log)));
+      const note = pinNote(m);
+      if (note) body.append(note);
+      if (isPinned(c, m)) body.prepend(h("div", "dc-pinned", t("demo.pinned")));
       row.append(body);
       if (c.role === "data" && !m.gone) deletable(row, c, m);
       chat.append(row);
@@ -854,7 +1027,19 @@
   // You: uploads and the bucket.
   function wireClient() {
     const drop = $("drop");
-    const put = (name, buf) => op({op: "put", key: name}, buf);
+    if (state.admin) {
+      const sel = h("select", "bucket-pick");
+      sel.setAttribute("aria-label", t("admin.bucket"));
+      for (const b of state.buckets || []) {
+        const opt = h("option", "", b);
+        opt.value = b;
+        opt.selected = b === state.bucket;
+        sel.append(opt);
+      }
+      sel.addEventListener("change", () => { state.bucket = sel.value; refreshObjects(); });
+      drop.before(sel);
+    }
+    const put = (name, buf) => op({op: "put", bucket: state.bucket, key: name}, buf);
     $("file").addEventListener("change", async ev => {
       for (const f of ev.target.files) {
         if (f.size > 64 << 20) { caption(esc(t("try.too_big"))); continue; }
@@ -909,12 +1094,12 @@
       };
       btn(t("try.read"), () => {
         const len = Math.min(size, 100_000), first = Math.floor(Math.random() * Math.max(1, size - len));
-        op({op: "get", key, range: [first, first + len - 1]}).then(r => {
+        op({op: "get", bucket: state.bucket, key, range: [first, first + len - 1]}).then(r => {
           if (r && !r.error) caption(t("demo.read_done", {len: bytes(r.len), key: esc(key)}));
         });
       });
-      btn(t("try.copy"), () => op({op: "copy", key, to: key.replace(/(\.[^.]*)?$/, m => `-copy${m}`)}));
-      btn(t("try.delete"), () => op({op: "delete", key}));
+      btn(t("try.copy"), () => op({op: "copy", bucket: state.bucket, key, to: key.replace(/(\.[^.]*)?$/, m => `-copy${m}`)}));
+      btn(t("try.delete"), () => op({op: "delete", bucket: state.bucket, key}));
       tr.append(acts);
       rows.append(tr);
     }
@@ -935,6 +1120,7 @@
     renderBgPanel();
     const editor = $("config-text");
     editor.value = state.config;
+    editor.readOnly = state.admin;
     $("config-reset").addEventListener("click", () => { editor.value = state.demo; $("config-error").textContent = ""; });
     $("config-apply").addEventListener("click", () => restart(editor.value));
     editor.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); restart(editor.value); } });
@@ -968,7 +1154,6 @@
   const STEPS = ["channels", "copies", "meta", "bots", "review"];
   const MAX_CHANNELS = 4, MAX_BOTS = 4;
   let step = 0, edited = null;     // edited: the toml as the reader changed it
-  const appOf = k => (k === "telegram" ? "Telegram" : "Discord");
   const divisors = n => Array.from({length: n}, (_, i) => i + 1).filter(d => n % d === 0);
   // Sends a minute per bot and channel: the services' defaults, or the demo's.
   const perMinute = (kind, pace) => (pace === "demo" ? 1200 : kind === "telegram" ? 18 : 60);
@@ -1293,11 +1478,27 @@
     $("caption").append(" ", b);
   }
 
+  // A real node: no setup, no restart; its config read-only, its buckets.
+  async function startAdmin() {
+    state.admin = true;
+    document.body.classList.add("admin");
+    const t0 = performance.now();
+    const {reply} = await call({op: "info"});
+    if (!reply || reply.error) { $("status").textContent = t("try.error", {error: reply?.error || "no answer"}); return; }
+    state.config = reply.config || "";
+    state.buckets = reply.buckets || [];
+    state.bucket = state.buckets[0] || "";
+    await boot(reply);
+    $("status").textContent = t("admin.ready", {host: location.host, ms: Math.round(performance.now() - t0)});
+    caption(t("admin.caption", {n: state.buckets.length}));
+  }
+
   started.then(async data => {
     if (data.reply?.error) {
       $("status").textContent = data.reply.error === "other-tab" ? t("try.other_tab") : t("try.error", {error: data.reply.error});
       return;
     }
+    if (data.reply.admin) { await startAdmin(); return; }
     state.demo = data.reply.demo;
     state.config = data.reply.config;
     state.persistent = data.reply.persistent;

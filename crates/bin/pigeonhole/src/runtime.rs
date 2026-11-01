@@ -23,6 +23,8 @@ pub struct Runtime {
     pub store: Arc<ChunkStore>,
     /// The background loops' knobs: the file's, with the tablet's overrides.
     pub dynamic: Arc<DynConfig>,
+    /// The store the metadata log lives in (the admin's log inspector).
+    pub log: Arc<dyn LogStore>,
 }
 
 /// The configured metadata log (`[meta] log`).
@@ -199,7 +201,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
         keep_snapshots: cfg.meta.keep_snapshots,
         ..MetaOptions::default()
     };
-    let meta = MetaStore::open(log, snapshots, namespaces, opts).await.context("boot metadata tablet")?;
+    let meta = MetaStore::open(log.clone(), snapshots, namespaces, opts).await.context("boot metadata tablet")?;
     let blob_db = BlobDb::open(meta.clone()).await.context("open chunk metadata")?;
 
     let stored = blob_db.list_instance_fingerprints().await.context("list instance fingerprints")?;
@@ -214,7 +216,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
     let layer = ChunkStore::open_replicated(blob_db, replicated, opts).await.context("open ChunkStore")?;
     let store = Arc::new(with_optional_caches(layer, cfg));
     let dynamic = Arc::new(DynConfig::open(cfg.clone(), meta.clone()));
-    Ok(Runtime { meta, store, dynamic })
+    Ok(Runtime { meta, store, dynamic, log })
 }
 
 async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {

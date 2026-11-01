@@ -45,7 +45,7 @@ fn main() -> anyhow::Result<()> {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
         ));
         let on_disk = DEMO_CONFIG.replace("\"/data/channels\"", &format!("{:?}", dir.display().to_string()));
-        let world = World::default();
+        let world = std::sync::Arc::new(World::default());
         let node = Node::open(&world, &parse_config(&in_memory)?).await?;
         node.create_bucket("demo").await?;
         let photo = noise(7 << 20);
@@ -97,7 +97,7 @@ fn main() -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(&dir);
         let t1 = std::time::Instant::now();
         {
-            let world = World::default();
+            let world = std::sync::Arc::new(World::default());
             let node = Node::open(&world, &parse_config(&on_disk)?).await?;
             node.create_bucket("demo").await?;
             node.put("demo", "photo.jpg", photo.clone()).await?;
@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
             node.close().await?;
             world.close().await?;
         }
-        let world = World::default();
+        let world = std::sync::Arc::new(World::default());
         let node = Node::open(&world, &parse_config(&on_disk)?).await?;
         anyhow::ensure!(node.get("demo", "photo.jpg", None).await? == photo, "photo differs after a new process");
         anyhow::ensure!(node.get("demo", "small.bin", None).await? == small, "small differs after a new process");

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 const CFG: &str = include_str!("discord-log.toml");
 
 async fn open_once(text: &str) -> Duration {
-    let world = World::default();
+    let world = std::sync::Arc::new(World::default());
     let t0 = Instant::now();
     let node = Node::open(&world, &parse_config(text).unwrap()).await.unwrap();
     let took = t0.elapsed();

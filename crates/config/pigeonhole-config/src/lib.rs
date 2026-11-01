@@ -275,6 +275,9 @@ pub struct AdminSettings {
     /// Where it listens (`127.0.0.1:9100`); `None`: no admin API. It has no
     /// authentication: keep it on loopback.
     pub listen_addr: Option<String>,
+    /// The site built by `site/build.py` (`target/site`): served at `/` of
+    /// the admin address, the demo's UI on this node. `None`: the API only.
+    pub ui_dir: Option<PathBuf>,
 }
 
 impl AdminSettings {

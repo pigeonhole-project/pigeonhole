@@ -324,13 +324,13 @@
   "js.bg.sweep": "sweeper",
   "js.bg.cool": "cooler",
   "js.bg.snapshot": "snapshot",
-  "js.bg.tip": "{task}: the next pass in {s} s",
+  "js.bg.tip": "{task}: the next pass in {when}",
   "js.bg.tip_off": "{task}: off",
   "js.bg.on_off": "{task} on or off",
   "js.bg.run_now": "Run now",
   "js.bg.every": "every {every}",
   "js.bg.off": "off",
-  "js.bg.next": "the next pass in {s} s",
+  "js.bg.next": "the next pass in {when}",
   "js.bg.parked": "off: parked until turned on or run by hand",
   "js.bg.entries": "{n} of {of} entries since the last snapshot (at {at}): at {of} the tablet takes one",
   "js.bg.idle": "Nothing to do.",
@@ -344,5 +344,34 @@
   "js.bg.repair_note": "Copies back what a read or a check found missing, from the other copies.",
   "js.bg.sweep_note": "Deletes the posts no chunk uses: chunks no object needs any more, and orphans of failed uploads.",
   "js.bg.cool_note": "Moves small objects kept in the log itself (inline) out to chunks once they go cold.",
-  "js.bg.snapshot_note": "Writes the whole state as one file, so that a restart replays only what came after. By time (this switch) and every so many entries."
+  "js.bg.snapshot_note": "Writes the whole state as one file, so that a restart replays only what came after: by time, and every so many entries.",
+  "js.demo.pinned_message": "Pinned message",
+  "js.demo.pinned": "📌 Pinned",
+  "js.demo.pinned_n": {
+    "one": "{n} pinned message",
+    "other": "{n} pinned messages"
+  },
+  "js.demo.tg_pinned_service": "pigeonhole pinned a message",
+  "js.demo.owner_marker": "Owner marker: this channel belongs to deployment {owner}; another deployment refuses it.",
+  "js.admin.ready": "Connected to pigeonhole at {host} ({ms} ms). This is its admin: changes here are real.",
+  "js.admin.caption": {
+    "one": "A real node: {n} bucket. Its background tasks, its log and its config are live; the channels' messages are not read yet.",
+    "other": "A real node: {n} buckets. Its background tasks, its log and its config are live; the channels' messages are not read yet."
+  },
+  "js.admin.bucket": "Bucket",
+  "js.admin.channel_note": "A real channel: check finds copies it lost, repair writes them back. Its messages are not read from here yet.",
+  "js.kind.local_disk": "local disk",
+  "js.kind.memory": "memory",
+  "js.admin.no_view": "A {kind} store: no messages to show, its blobs are files.",
+  "js.bg.entries_short": "{n} of {of} entries",
+  "js.bg.waiting": {
+    "one": "{n} job waits",
+    "other": "{n} jobs wait"
+  },
+  "js.bg.entries_since": {
+    "one": "{n} entry since the last snapshot",
+    "other": "{n} entries since the last snapshot"
+  },
+  "js.time.s": "{n} s",
+  "js.time.min": "{n} min"
 }
