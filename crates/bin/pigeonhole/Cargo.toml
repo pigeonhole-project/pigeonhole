@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 pigeonhole-admin = { workspace = true }
+pigeonhole-fake-channels = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
@@ -59,6 +60,9 @@ default = ["discord", "metrics-prometheus"]
 discord = ["dep:pigeonhole-storage-discord", "dep:pigeonhole-discord-http", "pigeonhole-config/discord"]
 bytestream = ["dep:pigeonhole-gateway-bytestream"]
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
+# Telegram and Discord stores on fake channels (`fake = …` in a store): the
+# site's recordings, a node to play with; never in a release build.
+fake = ["discord", "dep:pigeonhole-fake-channels", "pigeonhole-config/fake"]
 
 [dev-dependencies]
 pigeonhole-storage-telegram = { workspace = true, features = ["fake"] }

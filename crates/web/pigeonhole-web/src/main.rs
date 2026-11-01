@@ -70,11 +70,12 @@ fn main() -> anyhow::Result<()> {
             eprintln!("{}", serde_json::to_string_pretty(&view)?);
         }
         // What the channels hold, as a page draws them after a reload.
-        for c in &node.channels {
-            let v = world.describe(c, 50).await?;
-            anyhow::ensure!(v["messages"].as_array().is_some_and(|m| !m.is_empty()), "channel {}: empty", c.store);
+        let described = node.admin.channels.as_ref().expect("the demo's view").describe(50).await?;
+        for c in described["channels"].as_array().into_iter().flatten() {
+            let messages = c["messages"].as_array().map_or(0, Vec::len);
+            anyhow::ensure!(messages > 0, "channel {}: empty", c["store"]);
             if std::env::var("SMOKE_SHOW_LOG").is_ok() {
-                eprintln!("{} ({}): {}", c.store, c.role, v["messages"].as_array().map_or(0, Vec::len));
+                eprintln!("{} ({}): {messages}", c["store"], c["role"]);
             }
         }
         node.copy("demo", "photo.jpg", "photo-copy.jpg").await?;

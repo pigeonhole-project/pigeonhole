@@ -4,6 +4,7 @@ mod admin;
 mod admin_cli;
 mod background;
 mod channel_log;
+mod fakes;
 mod runtime;
 mod serve;
 

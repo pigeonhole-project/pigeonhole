@@ -11,6 +11,7 @@ mod chain;
 mod error;
 #[cfg(feature = "fake")]
 pub mod fake;
+pub mod inspect;
 mod stream;
 pub mod text;
 

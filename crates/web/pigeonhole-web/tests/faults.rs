@@ -2,6 +2,7 @@
 //! down; reads go to the other copy, and repair puts the copies back.
 
 use bytes::Bytes;
+use pigeonhole_config::stores::FakeChannel;
 use pigeonhole_web::{parse_config, Node, World, DEMO_CONFIG};
 use std::time::Duration;
 
@@ -35,9 +36,19 @@ fn object(i: u8) -> Bytes {
 const TG_MARKER: u64 = 2;
 const DC_MARKER: u64 = 1;
 
-async fn count(world: &World, node: &Node, store: &str) -> u64 {
-    let c = node.channels.iter().find(|c| c.store == store).unwrap();
-    world.describe(c, 0).await.unwrap()["total"].as_u64().unwrap()
+/// Store `store` of `node`'s fake channels.
+fn fake(node: &Node, store: &str) -> FakeChannel {
+    node.stores.iter().find(|s| s.store == store).and_then(|s| s.fake.clone()).unwrap()
+}
+
+/// Channel `store` as the admin's UI sees it, with its last `limit` messages.
+async fn describe(node: &Node, store: &str, limit: usize) -> serde_json::Value {
+    let all = node.admin.channels.as_ref().unwrap().describe(limit).await.unwrap();
+    all["channels"].as_array().unwrap().iter().find(|c| c["store"] == store).unwrap().clone()
+}
+
+async fn count(_world: &World, node: &Node, store: &str) -> u64 {
+    describe(node, store, 0).await["total"].as_u64().unwrap()
 }
 
 #[tokio::test]
@@ -48,8 +59,8 @@ async fn a_wiped_channel_is_read_around_found_by_verify_and_repaired() {
     for i in 0..3 {
         node.put("demo", &format!("k{i}"), object(i)).await.unwrap();
     }
-    let tg = node.channels.iter().find(|c| c.store == "telegram").unwrap().clone();
-    assert_eq!(world.wipe(&tg).await.unwrap() as u64, 3 + TG_MARKER, "a chunk a message, and the marker");
+    let tg = fake(&node, "telegram");
+    assert_eq!(world.fakes.wipe(&tg).await.unwrap() as u64, 3 + TG_MARKER, "a chunk a message, and the marker");
     assert_eq!(count(&world, &node, "telegram").await, 0);
     for i in 0..3 {
         assert_eq!(node.get("demo", &format!("k{i}"), None).await.unwrap(), object(i), "read from discord");
@@ -69,11 +80,11 @@ async fn a_channel_down_fails_a_write_of_two_and_takes_one_of_two() {
         let world = std::sync::Arc::new(World::default());
         let node = Node::open(&world, &config(quorum)).await.unwrap();
         node.create_bucket("demo").await.unwrap();
-        let dc = node.channels.iter().find(|c| c.store == "discord").unwrap().clone();
-        world.set_down(&dc, true);
+        let dc = fake(&node, "discord");
+        world.fakes.set_down(&dc, true);
         let put = node.put("demo", "k", object(1)).await;
         assert_eq!(put.is_ok(), quorum == 1, "quorum {quorum}: {put:?}");
-        world.set_down(&dc, false);
+        world.fakes.set_down(&dc, false);
         assert_eq!(count(&world, &node, "discord").await, DC_MARKER);
         let repaired = node.repair().await.unwrap().repaired;
         // The write that counted with one copy gets its second once discord is back.
@@ -104,20 +115,21 @@ async fn a_read_that_finds_a_document_gone_queues_it_and_the_background_repairs_
         let (world, node) = open_with_repair().await;
         let body = noise(2_000_000);
         node.put("demo", "k", body.clone()).await.unwrap();
-        let lost = node.channels.iter().find(|c| c.store == wiped).unwrap().clone();
-        let other = node.channels.iter().find(|c| c.role == "data" && c.store != wiped).unwrap().clone();
-        world.wipe(&lost).await.unwrap();
-        world.set_down(&other, true);
+        let lost = fake(&node, wiped);
+        let other =
+            node.stores.iter().find(|s| s.role == "data" && s.store != wiped).and_then(|s| s.fake.clone()).unwrap();
+        world.fakes.wipe(&lost).await.unwrap();
+        world.fakes.set_down(&other, true);
         assert!(node.get("demo", "k", None).await.is_err(), "{wiped}: no copy to read");
-        world.set_down(&other, false);
+        world.fakes.set_down(&other, false);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(node.repair_queue().await.unwrap(), 1, "{wiped}: the read queued the lost copy");
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(node.repair_queue().await.unwrap(), 0, "{wiped}: a background pass repaired it");
         assert_eq!(count(&world, &node, wiped).await, 1, "the marker went with the wipe");
-        world.set_down(&other, true);
+        world.fakes.set_down(&other, true);
         assert_eq!(node.get("demo", "k", None).await.unwrap(), body, "{wiped}: read from the repaired copy");
-        world.set_down(&other, false);
+        world.fakes.set_down(&other, false);
         node.close().await.unwrap();
         world.close().await.unwrap();
     }
@@ -129,13 +141,13 @@ async fn a_read_that_finds_a_document_gone_queues_it_and_the_background_repairs_
 async fn a_deleted_text_blob_is_still_read_from_the_cache_until_verify() {
     let (world, node) = open_with_repair().await;
     node.put("demo", "k", object(1)).await.unwrap();
-    let tg = node.channels.iter().find(|c| c.store == "telegram").unwrap().clone();
-    let id = world.describe(&tg, 1).await.unwrap()["messages"][0]["id"].to_string();
-    world.delete_message(&tg, &id).await.unwrap();
-    let dc = node.channels.iter().find(|c| c.store == "discord").unwrap().clone();
-    world.set_down(&dc, true);
+    let tg = fake(&node, "telegram");
+    let id = describe(&node, "telegram", 1).await["messages"][0]["id"].to_string();
+    world.fakes.delete_message(&tg, &id).await.unwrap();
+    let dc = fake(&node, "discord");
+    world.fakes.set_down(&dc, true);
     assert_eq!(node.get("demo", "k", None).await.unwrap(), object(1), "from telegram's cache");
-    world.set_down(&dc, false);
+    world.fakes.set_down(&dc, false);
     assert_eq!(node.repair_queue().await.unwrap(), 0);
     assert_eq!(node.verify("telegram").await.unwrap(), (1, 1));
     tokio::time::sleep(Duration::from_millis(1500)).await;

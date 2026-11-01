@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub use io::{Fs, SimFs, StdFs};
-pub use segments::DEFAULT_SEGMENT_BYTES;
+pub use segments::{inspect, inspect_dir, DEFAULT_SEGMENT_BYTES};
 
 /// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
 pub const KIND: &str = "local_disk";

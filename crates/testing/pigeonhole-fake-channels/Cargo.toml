@@ -9,7 +9,9 @@ description = "Fake Telegram and Discord channels kept by a metadata tablet: a l
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+pigeonhole-admin = { workspace = true }
 pigeonhole-blob = { workspace = true }
+pigeonhole-config = { workspace = true, features = ["discord", "fake"] }
 pigeonhole-meta = { workspace = true }
 pigeonhole-storage-api = { workspace = true, features = ["fake"] }
 pigeonhole-storage-discord = { workspace = true, features = ["fake"] }
@@ -19,6 +21,7 @@ pigeonhole-storage-telegram = { workspace = true, features = ["fake"] }
 pigeonhole-types = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
