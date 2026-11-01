@@ -28,8 +28,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1
-          # llvm-ar: zstd's C code is archived for wasm32 (Makefile, web).
-          components: llvm-tools
+      # zstd's C code is compiled for wasm32 with wasi-sdk's clang and libc
+      # headers (Makefile, web): the runner's clang only has glibc's.
+      - name: Install wasi-sdk
+        run: |
+          curl -sSfL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "WASI_SDK=$RUNNER_TEMP/wasi-sdk-25.0-x86_64-linux" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:

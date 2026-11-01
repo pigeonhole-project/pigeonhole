@@ -11,10 +11,13 @@ smoke:
 	./scripts/smoke.sh
 
 # The in-browser build (crates/web). zstd's C objects need an archiver that
-# knows wasm: llvm-ar from `rustup component add llvm-tools`.
+# knows wasm: llvm-ar from `rustup component add llvm-tools`. With WASI_SDK
+# (a wasi-sdk release) its clang and libc headers compile them: the system
+# clang on Linux has no WASI headers and picks up glibc's (CI does this).
 WASM_AR = $(shell rustc --print sysroot)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar
+WASM_CC_ENV = $(if $(WASI_SDK),CC_wasm32_wasip1=$(WASI_SDK)/bin/clang AR_wasm32_wasip1=$(WASI_SDK)/bin/llvm-ar,AR_wasm32_wasip1=$(WASM_AR))
 web:
-	AR_wasm32_wasip1=$(WASM_AR) cargo build --release --target wasm32-wasip1 -p pigeonhole-web
+	$(WASM_CC_ENV) cargo build --release --target wasm32-wasip1 -p pigeonhole-web
 
 # The smoke under Node's WASI, then under the site's own shim (its file pool
 # on buffers), then a page load and a reload on one pool.
