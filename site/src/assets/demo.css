@@ -380,16 +380,24 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .deletable:hover .msg-del, .msg-del:focus-visible { opacity: 1; }
 @media (hover: none) { .msg-del { opacity: .8; } }
 
-/* the node's background tasks: chips on the graph, cards in its panel */
-.chip { cursor: pointer; }
-.chip-box { fill: var(--plume); stroke: var(--slate-2); stroke-width: 1.2; }
-.chip:hover .chip-box, .chip:focus-visible .chip-box { stroke: var(--teal); }
-.chip-name { font-size: 11.5px; fill: var(--wing-2); }
-.chip-count { font: 600 11px var(--mono); fill: var(--slate); }
-.chip.busy .chip-count { fill: var(--eye); }
-.chip.busy .clock-arc { stroke: var(--eye); }
-.chip.off { opacity: .55; }
-.chip.off .chip-box { stroke-dasharray: 3 3; }
+/* the node's background tasks: in the dovecote's windows, cards in its panel */
+.win { cursor: pointer; }
+.win-light { fill: var(--teal); opacity: .85; transition: y 1s linear, height 1s linear; }
+.win-glow { fill: var(--teal); opacity: .22; }
+.win-frame { fill: none; stroke: var(--teal); stroke-width: 1.6; opacity: .75; }
+.win-boarded .win-board-back { fill: var(--plume); stroke: var(--slate-2); stroke-width: 1.2; }
+.win-plank { stroke: var(--slate); stroke-width: 3; stroke-linecap: round; }
+.win:hover .win-frame, .win:focus-visible .win-frame { stroke-width: 2.6; opacity: 1; }
+.win:focus-visible { outline: none; }
+.win-bird { fill: var(--plume); stroke: var(--wing); stroke-width: 1; opacity: 0; transition: opacity .3s; }
+.win.busy .win-bird { opacity: 1; }
+.win.busy .win-light { fill: var(--eye); }
+.win-badge { opacity: 0; transition: opacity .3s; }
+.win.busy .win-badge { opacity: 1; }
+.win-badge circle { fill: var(--eye); }
+.win-badge text { font: 700 9px var(--mono); fill: #fff; }
+.win.off .win-light, .win.off .win-glow { opacity: 0; }
+.win.off .win-frame { stroke: var(--slate); stroke-dasharray: 2 2; }
 .task { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin: 0 0 12px; }
 .task.off { border-style: dashed; }
 .task-head { display: flex; gap: 10px; align-items: center; }

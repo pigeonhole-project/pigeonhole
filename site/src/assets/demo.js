@@ -145,22 +145,8 @@
 
     // The loft: a dovecote, the node itself.
     const loft = node("loft", pos.loft, "pigeonhole", t("demo.loft_role"));
-    dovecote(loft.g);
+    taskWindows(loft, dovecote(loft.g));
     loft.label(0, 100);
-    // The background tasks: a chip each, its clock and how much work waits.
-    loft.chips = {};
-    TASKS.forEach((task, i) => {
-      const g = s("g", {class: "chip", transform: `translate(-236,${-150 + i * 30})`, tabindex: 0, role: "button"}, loft.g);
-      s("rect", {class: "chip-box", x: 0, y: 0, width: 132, height: 24, rx: 12}, g);
-      s("circle", {class: "clock-face", cx: 13, cy: 12, r: 7}, g);
-      const arc = s("circle", {class: "clock-arc", cx: 13, cy: 12, r: 7, pathLength: 100, transform: "rotate(-90 13 12)"}, g);
-      s("text", {class: "chip-name", x: 26, y: 16}, g).textContent = t(`bg.${task}`);
-      const count = s("text", {class: "chip-count", x: 122, y: 16, "text-anchor": "end"}, g);
-      const tip = s("title", {}, g);
-      g.addEventListener("click", e => { e.stopPropagation(); openPanel("loft"); });
-      loft.chips[task] = {g, arc, count, tip};
-    });
-
     for (const c of state.channels) {
       const app = appOf(c.kind);
       const bots = c.bots > 1 ? `, ${t("demo.bots", {n: c.bots})}` : "";
@@ -168,7 +154,7 @@
       const n = node(c.store, pos[c.store], c.store, role);
       n.g.classList.toggle("down", !!c.down);
       s("rect", {class: `shape${c.role === "data" ? "" : " meta"}`, x: -130, y: -34, width: 260, height: 68, rx: 14}, n.g);
-      s("circle", {class: "badge", cx: -106, cy: 0, r: 9, fill: KIND_COLOR[c.kind] || "var(--slate)"}, n.g);
+      logo(c.kind, n.g, -106, 0);
       n.label(-88, 0, "start");
       // The channel's message count, top right.
       n.count = s("text", {class: "count", x: 116, y: -10, "text-anchor": "end"}, n.g);
@@ -224,15 +210,22 @@
       if (jobs.length > 12) s("text", {class: "job-more", x: 12 * 14 + 2, y: 9}, n.queue).textContent = `+${jobs.length - 12}`;
     }
     for (const task of bg.tasks) {
-      const chip = nodes.loft?.chips?.[task.task];
-      if (!chip) continue;
+      const win = nodes.loft?.windows?.[task.task];
+      if (!win) continue;
       const period = ms(task.every), w = workOf(task);
-      const left = period && task.next_in_ms != null ? Math.min(1, task.next_in_ms / period) : 1;
-      chip.arc.style.strokeDashoffset = String(Math.round(100 * left));
-      chip.count.textContent = w.of ? `${w.n}/${w.of}` : String(w.n);
-      chip.g.classList.toggle("off", !period);
-      chip.g.classList.toggle("busy", !w.of && w.n > 0);
-      chip.tip.textContent = period ? t("bg.tip", {task: t(`bg.${task.task}`), s: Math.ceil((task.next_in_ms || 0) / 1000)}) : t("bg.tip_off", {task: t(`bg.${task.task}`)});
+      // How lit: the time to the next pass gone by; a snapshot, its entries too.
+      let lit = period && task.next_in_ms != null ? 1 - Math.min(1, task.next_in_ms / period) : 0;
+      if (w.of) lit = Math.max(lit, Math.min(1, w.n / w.of));
+      const h = Math.round(24 * lit);
+      win.light.setAttribute("y", String(win.w.y + 14 - h));
+      win.light.setAttribute("height", String(h));
+      const busy = !w.of && w.n > 0;
+      win.count.textContent = w.n > 99 ? "99+" : String(w.n);
+      win.g.classList.toggle("off", !period);
+      win.g.classList.toggle("busy", busy);
+      const name = t(`bg.${task.task}`);
+      const when = period ? t("bg.tip", {task: name, s: Math.ceil((task.next_in_ms || 0) / 1000)}) : t("bg.tip_off", {task: name});
+      win.tip.textContent = w.of ? `${when}; ${t("bg.entries_short", {n: w.n, of: w.of})}` : busy ? `${when}; ${t("bg.waiting", {n: w.n})}` : when;
     }
     if (state.open === "loft") renderBgPanel();
   }
@@ -245,6 +238,7 @@
     for (const task of TASKS.map(taskOf).filter(Boolean)) {
       const period = ms(task.every), w = workOf(task);
       const card = h("div", "task" + (period ? "" : " off"));
+      card.id = `task-${task.task}`;
       const head = h("div", "task-head");
       head.append(h("b", "", t(`bg.${task.task}`)));
       const sw = h("button", "switch");
@@ -330,6 +324,26 @@
     return t("wiz.note_shard", {app, shard});
   }
 
+  // A store's mark on its card: the app's logo (simplified), else a dot.
+  function logo(kind, g, x, y) {
+    const mark = s("g", {class: "badge", transform: `translate(${x},${y})`}, g);
+    if (kind === "telegram") {
+      s("circle", {r: 11, fill: "#2AABEE"}, mark);
+      // The paper plane.
+      s("path", {fill: "#fff", d: "M-6.2,-0.4 L5.8,-5.2 Q6.6,-5.4 6.4,-4.4 L4.4,5 Q4.2,5.8 3.4,5.3 L0.4,3.1 L-1.1,4.6 Q-1.6,5 -1.7,4.3 L-1.9,1.7 L3.9,-3.6 L-2.8,0.9 L-6,-0.1 Q-6.8,-0.3 -6.2,-0.4 Z"}, mark);
+    } else if (kind === "discord") {
+      s("circle", {r: 11, fill: "#5865F2"}, mark);
+      // The controller-shaped face, its two eyes.
+      s("path", {fill: "#fff", d: "M-5.6,-3.9 Q-3.4,-5 -1.6,-5.2 L-1.1,-4.3 Q0,-4.5 1.1,-4.3 L1.6,-5.2 Q3.4,-5 5.6,-3.9 Q7.4,-0.6 7.1,3.7 Q5.3,5.1 3.2,5.6 L2.4,4.4 Q0,5.1 -2.4,4.4 L-3.2,5.6 Q-5.3,5.1 -7.1,3.7 Q-7.4,-0.6 -5.6,-3.9 Z"}, mark);
+      s("ellipse", {cx: -2.4, cy: 0.9, rx: 1.3, ry: 1.5, fill: "#5865F2"}, mark);
+      s("ellipse", {cx: 2.4, cy: 0.9, rx: 1.3, ry: 1.5, fill: "#5865F2"}, mark);
+    } else {
+      s("circle", {r: 9, fill: "var(--slate)"}, mark);
+    }
+    s("title", {}, mark).textContent = appOf(kind);
+    return mark;
+  }
+
   // A pigeon tower: a round body narrowing upward, a cone roof with a lantern
   // and a finial, two rows of arched entrances with perches, a plinth.
   function dovecote(g) {
@@ -345,12 +359,52 @@
     s("path", {...line, d: "M0,-124 L0,-136"}, g);
     s("circle", {cx: 0, cy: -105, r: 3.5, fill: "var(--wing-2)"}, g);
     // Entrances: an arch over a dark hole, a perch under it.
+    const windows = [];
     const arch = (x, y) => {
-      s("path", {d: `M${x - 10},${y + 14} L${x - 10},${y} A10,10 0 0 1 ${x + 10},${y} L${x + 10},${y + 14} Z`, fill: "var(--wing-2)", "fill-opacity": .78}, g);
+      const d = `M${x - 10},${y + 14} L${x - 10},${y} A10,10 0 0 1 ${x + 10},${y} L${x + 10},${y + 14} Z`;
+      s("path", {d, fill: "var(--wing-2)", "fill-opacity": .78}, g);
       s("path", {...line, d: `M${x - 15},${y + 18} L${x + 15},${y + 18}`}, g);
+      windows.push({x, y, d});
     };
     for (const x of [-34, 0, 34]) arch(x, -2);
     for (const x of [-36, 0, 36]) arch(x, 34);
+    return windows;
+  }
+
+  // The background tasks live in the dovecote's windows: the light rises
+  // as the next pass nears; a pigeon sits in while work waits (the badge
+  // counts it); a task that is off has its shutters closed.
+  const TASK_WINDOW = {repair: 0, sweep: 1, cool: 2, snapshot: 4};
+  function taskWindows(loft, windows) {
+    loft.windows = {};
+    for (const task of TASKS) {
+      const w = windows[TASK_WINDOW[task]];
+      const g = s("g", {class: "win", tabindex: 0, role: "button", "aria-label": t(`bg.${task}`)}, loft.g);
+      const clip = s("clipPath", {id: `win-${task}`}, g);
+      s("path", {d: w.d}, clip);
+      // Lived in: a faint glow always, the light rising over it.
+      s("path", {class: "win-glow", d: w.d}, g);
+      const light = s("rect", {class: "win-light", x: w.x - 10, y: w.y + 14, width: 20, height: 0, "clip-path": `url(#win-${task})`}, g);
+      s("path", {class: "win-frame", d: w.d}, g);
+      const bird = s("path", {class: "win-bird", d: BIRD, transform: `translate(${w.x},${w.y + 7}) scale(.85)`}, g);
+      const badge = s("g", {class: "win-badge"}, g);
+      s("circle", {cx: w.x + 11, cy: w.y - 9, r: 7}, badge);
+      const count = s("text", {x: w.x + 11, y: w.y - 6, "text-anchor": "middle"}, badge);
+      const tip = s("title", {}, g);
+      const open = e => { e.stopPropagation(); openPanel("loft"); $(`task-${task}`)?.scrollIntoView({block: "nearest"}); };
+      g.addEventListener("click", open);
+      g.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(e); } });
+      loft.windows[task] = {g, w, light, bird, badge, count, tip};
+    }
+    // The windows no task lives in are boarded up.
+    const used = new Set(Object.values(TASK_WINDOW));
+    windows.forEach((w, i) => {
+      if (used.has(i)) return;
+      const g = s("g", {class: "win-boarded"}, loft.g);
+      s("path", {class: "win-board-back", d: w.d}, g);
+      s("path", {class: "win-plank", d: `M${w.x - 9},${w.y - 4} L${w.x + 9},${w.y + 12}`}, g);
+      s("path", {class: "win-plank", d: `M${w.x + 9},${w.y - 4} L${w.x - 9},${w.y + 12}`}, g);
+    });
   }
 
   // A clickable node: a group at `p`, its name, role and a count.

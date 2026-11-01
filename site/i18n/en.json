@@ -362,5 +362,10 @@
   "js.admin.channel_note": "A real channel: check finds copies it lost, repair writes them back. Its messages are not read from here yet.",
   "js.kind.local_disk": "local disk",
   "js.kind.memory": "memory",
-  "js.admin.no_view": "A {kind} store: no messages to show, its blobs are files."
+  "js.admin.no_view": "A {kind} store: no messages to show, its blobs are files.",
+  "js.bg.entries_short": "{n} of {of} entries",
+  "js.bg.waiting": {
+    "one": "{n} job waits",
+    "other": "{n} jobs wait"
+  }
 }
