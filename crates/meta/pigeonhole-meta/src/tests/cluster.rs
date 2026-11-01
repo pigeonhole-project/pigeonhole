@@ -24,6 +24,10 @@ fn settings() -> Settings {
 
 /// Node `id` of a cluster of `MEMBERS`, its log and snapshots in memory.
 async fn node(chat: FakeChat, id: u64) -> Arc<MetaStore> {
+    node_with(chat, id, opts()).await
+}
+
+async fn node_with(chat: FakeChat, id: u64, opts: MetaOptions) -> Arc<MetaStore> {
     let peers: HashMap<u64, Arc<dyn Mailbox>> =
         MEMBERS.iter().filter(|&&m| m != id).map(|&m| (m, chat.mailbox(id, m))).collect();
     let net = ChatNetwork::<TypeConfig>::new(id, settings(), chat.mailbox(id, id), peers);
@@ -36,7 +40,7 @@ async fn node(chat: FakeChat, id: u64) -> Arc<MetaStore> {
         network: net,
         serve: Some(Box::new(move |raft| Box::pin(async move { serving.serve(Arc::new(raft)).await }))),
     };
-    MetaStore::open_in(log, snapshots, counter(), opts(), cluster).await.unwrap()
+    MetaStore::open_in(log, snapshots, counter(), opts, cluster).await.unwrap()
 }
 
 /// The three nodes, started together (each waits for a leader).
@@ -176,4 +180,47 @@ async fn raft_gauges_show_roles_and_a_lagging_peer() {
 
     chat.isolate(behind, false);
     eventually("the healed peer catches up", || gauges(&nodes[&leader])[&lag(behind)] == 0.0).await;
+}
+
+#[tokio::test]
+async fn only_the_leader_says_it_leads() {
+    let chat = FakeChat::new();
+    let nodes = three(&chat).await;
+    let leader = agreed_leader(&nodes).await;
+    eventually("the leader knows it leads", || nodes[&leader].is_leader()).await;
+    assert!(nodes.iter().all(|(&id, n)| n.is_leader() == (id == leader)));
+
+    // Cut off, it may think it leads a while; healed, it knows it does not.
+    chat.isolate(leader, true);
+    let rest: HashMap<_, _> = nodes.iter().filter(|(&id, _)| id != leader).map(|(&id, n)| (id, n.clone())).collect();
+    let new = agreed_leader(&rest).await;
+    chat.isolate(leader, false);
+    eventually("the old leader follows", || nodes[&leader].leader() == Some(new)).await;
+    eventually("one leader again", || nodes.iter().all(|(&id, n)| n.is_leader() == (id == new))).await;
+}
+
+#[tokio::test]
+async fn a_follower_behind_the_purged_log_catches_up_from_a_snapshot() {
+    let chat = FakeChat::new();
+    let often = MetaOptions { snapshot_every: Some(4), keep_snapshots: 1, ..opts() };
+    let started = futures::future::join_all(MEMBERS.map(|id| node_with(chat.clone(), id, often.clone()))).await;
+    let nodes: HashMap<u64, Arc<MetaStore>> = MEMBERS.into_iter().zip(started).collect();
+    let leader = agreed_leader(&nodes).await;
+    let behind = *MEMBERS.iter().find(|&&m| m != leader).unwrap();
+    nodes[&leader].propose::<Counter>(op(0, 1)).await.unwrap().unwrap();
+    eventually("all applied the first commit", || nodes.values().all(|n| value(n) == 1)).await;
+
+    chat.isolate(behind, true);
+    let applied_then = nodes[&behind].applied_position();
+    for i in 1..20 {
+        nodes[&leader].propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    eventually("the leader's log starts past what the cut-off follower has", || {
+        nodes[&leader].base_position() > applied_then
+    })
+    .await;
+
+    chat.isolate(behind, false);
+    eventually("the follower caught up", || value(&nodes[&behind]) == 20).await;
+    assert!(nodes[&behind].base_position() > applied_then, "from a snapshot, not entry by entry");
 }

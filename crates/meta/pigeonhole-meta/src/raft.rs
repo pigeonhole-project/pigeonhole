@@ -56,6 +56,8 @@ pub type NodeId = u64;
 pub type RaftEntry = openraft::Entry<TypeConfig>;
 pub type RaftLogId = openraft::LogId<NodeId>;
 pub type Raft = openraft::Raft<TypeConfig>;
+/// What Raft reports of a node: its role, its leader, what it applied.
+pub type Metrics = openraft::RaftMetrics<NodeId, BasicNode>;
 type SErr = StorageError<NodeId>;
 
 /// The only node of a cluster of one.
@@ -103,6 +105,8 @@ pub(crate) struct Shared {
     /// Position the log starts from.
     pub(crate) based: AtomicU64,
     pub(crate) current: Mutex<Option<CurrentSnapshot>>,
+    /// Notified whenever `current` changes.
+    pub(crate) kept: tokio::sync::Notify,
     /// The base this node started from or last rebased on: the log's own,
     /// or an older one it keeps when the newest snapshot could not be
     /// loaded. Raft sees the log as purged up to it.
@@ -434,8 +438,7 @@ impl RaftLogStorage<TypeConfig> for LogAdapter {
     }
 
     async fn purge(&mut self, id: RaftLogId) -> Result<(), SErr> {
-        let current = self.shared.current.lock().unwrap().clone();
-        let Some(current) = current.filter(|c| c.meta.last_log_id.is_some_and(|l| l.index >= id.index)) else {
+        let Some(current) = self.covering(&id).await else {
             return Err(StorageIOError::write_logs(AnyError::error(format!(
                 "purge up to {id} without a snapshot covering it"
             )))
@@ -451,6 +454,30 @@ impl RaftLogStorage<TypeConfig> for LogAdapter {
         let mut head = self.head.lock().unwrap();
         *head = (*head).max(position(&id));
         Ok(())
+    }
+}
+
+/// How long a purge waits for the snapshot that covers it.
+const COVERING_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl LogAdapter {
+    /// The current snapshot once it covers `id`. On a follower that installs
+    /// one from its leader, Raft asks to purge the log behind it while the
+    /// state machine is still storing it: wait for that (a while), never
+    /// purge entries no stored snapshot holds.
+    async fn covering(&self, id: &RaftLogId) -> Option<CurrentSnapshot> {
+        let deadline = tokio::time::Instant::now() + COVERING_WAIT;
+        loop {
+            let kept = self.shared.kept.notified();
+            tokio::pin!(kept);
+            kept.as_mut().enable();
+            let current = self.shared.current.lock().unwrap().clone();
+            if let Some(c) = current.filter(|c| c.meta.last_log_id.is_some_and(|l| l.index >= id.index)) {
+                return Some(c);
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::timeout(left, kept).await.ok()?;
+        }
     }
 }
 
@@ -487,6 +514,7 @@ impl StateMachine {
         tracing::info!(at, bytes = data.len(), ms = t0.elapsed().as_millis() as u64, "snapshot stored");
         let current = CurrentSnapshot { meta: snap.meta.clone(), data, snapshot };
         let old = shared.current.lock().unwrap().replace(current.clone());
+        shared.kept.notify_waiters();
         // A newer one replaced it before the log moved onto it: unused (the
         // one the node starts from stays until the log drops it).
         let base_ref = shared.base.lock().unwrap().as_ref().map(|b| b.snapshot.clone());

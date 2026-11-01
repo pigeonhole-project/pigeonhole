@@ -72,8 +72,8 @@ impl Repairer {
     }
 
     /// Background loop: scrub (optional) and drain the queue whenever
-    /// `schedule` says, with its knobs (at once when on); ends once the
-    /// tablet stops.
+    /// `schedule` says, with its knobs (at once when on), while this node
+    /// leads; ends once the tablet stops.
     pub async fn run_loop(mut self, mut schedule: Schedule<RepairConfig>) {
         self.config = schedule.knobs();
         if self.config.interval.is_none() {
@@ -84,39 +84,48 @@ impl Repairer {
                 info!("metadata tablet stopped; repair exits");
                 return;
             }
-            let t0 = std::time::Instant::now();
-            let pass = self.repair_once().await;
-            pigeonhole_blob::record_background_pass("repair", pass.is_ok(), t0.elapsed());
-            match pass {
-                Ok(stats) => {
-                    pigeonhole_blob::record_repair("repaired", stats.repaired);
-                    pigeonhole_blob::record_repair("scrub_enqueued", stats.scrub_enqueued);
-                    pigeonhole_blob::record_repair("skipped_budget", stats.skipped_budget);
-                    pigeonhole_blob::record_repair("skipped_noop", stats.skipped_noop);
-                    pigeonhole_blob::record_repair("failed", stats.failed);
-                    if let Ok(depth) = self.db.repair_queue_len().await {
-                        pigeonhole_blob::set_repair_queue_depth(depth);
-                    }
-                    if stats.repaired > 0 || stats.scrub_enqueued > 0 || stats.failed > 0 {
-                        info!(
-                            repaired = stats.repaired,
-                            scrub_enqueued = stats.scrub_enqueued,
-                            skipped_budget = stats.skipped_budget,
-                            failed = stats.failed,
-                            "repair pass complete"
-                        );
-                    } else {
-                        debug!(
-                            skipped_noop = stats.skipped_noop,
-                            skipped_budget = stats.skipped_budget,
-                            "repair pass idle"
-                        );
-                    }
-                }
-                Err(e) => warn!(error = %e, "repair pass failed"),
+            if self.db.is_leader() {
+                self.background_pass().await;
+            } else {
+                debug!("not the leader: no repair pass");
             }
             schedule.done();
             self.config = schedule.next(|c| c.interval).await;
+        }
+    }
+
+    /// One pass of the background loop, recorded and logged.
+    async fn background_pass(&self) {
+        let t0 = std::time::Instant::now();
+        let pass = self.repair_once().await;
+        pigeonhole_blob::record_background_pass("repair", pass.is_ok(), t0.elapsed());
+        match pass {
+            Ok(stats) => {
+                pigeonhole_blob::record_repair("repaired", stats.repaired);
+                pigeonhole_blob::record_repair("scrub_enqueued", stats.scrub_enqueued);
+                pigeonhole_blob::record_repair("skipped_budget", stats.skipped_budget);
+                pigeonhole_blob::record_repair("skipped_noop", stats.skipped_noop);
+                pigeonhole_blob::record_repair("failed", stats.failed);
+                if let Ok(depth) = self.db.repair_queue_len().await {
+                    pigeonhole_blob::set_repair_queue_depth(depth);
+                }
+                if stats.repaired > 0 || stats.scrub_enqueued > 0 || stats.failed > 0 {
+                    info!(
+                        repaired = stats.repaired,
+                        scrub_enqueued = stats.scrub_enqueued,
+                        skipped_budget = stats.skipped_budget,
+                        failed = stats.failed,
+                        "repair pass complete"
+                    );
+                } else {
+                    debug!(
+                        skipped_noop = stats.skipped_noop,
+                        skipped_budget = stats.skipped_budget,
+                        "repair pass idle"
+                    );
+                }
+            }
+            Err(e) => warn!(error = %e, "repair pass failed"),
         }
     }
 

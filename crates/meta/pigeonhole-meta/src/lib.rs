@@ -554,6 +554,7 @@ impl MetaStore {
             applied: AtomicU64::new(0),
             based: AtomicU64::new(0),
             current: Mutex::new(None),
+            kept: tokio::sync::Notify::new(),
             base: Mutex::new(None),
         });
         let mut sm = raft::StateMachine {
@@ -650,6 +651,19 @@ impl MetaStore {
             .map_err(|e| self.stopped_by(e))
             .context("boot the tablet: no leader")?;
         Ok(())
+    }
+
+    /// Whether this node leads its cluster now, as far as it knows. A leader
+    /// cut off from the others learns it once its lease runs out; its writes
+    /// fail meanwhile. Work only the leader should do checks this first.
+    pub fn is_leader(&self) -> bool {
+        self.raft.metrics().borrow().state == openraft::ServerState::Leader
+    }
+
+    /// Changes on every change Raft reports (an entry applied, a new leader,
+    /// a new role): how a follower sees what replication brought.
+    pub fn changes(&self) -> watch::Receiver<raft::Metrics> {
+        self.raft.metrics()
     }
 
     pub fn has_namespace(&self, name: &str) -> bool {
@@ -995,6 +1009,10 @@ fn raft_config(opts: &MetaOptions) -> Result<openraft::Config> {
         },
         max_in_snapshot_log_to_keep: 0,
         purge_batch_size: 1,
+        // openraft's 200 ms is a LAN's: over a chat one round trip of a
+        // snapshot chunk takes longer than that, and every send would time
+        // out. Scaled with the election timeout, which is set for the network.
+        install_snapshot_timeout: (opts.election_timeout.1 * 4).as_millis() as u64,
         ..Default::default()
     }
     .validate()

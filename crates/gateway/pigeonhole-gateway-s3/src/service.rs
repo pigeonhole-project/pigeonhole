@@ -165,11 +165,22 @@ impl S3Gateway {
         outcomes.take(slot).map_err(Self::map_err)
     }
 
+    /// An error of the layers below: on a node that does not lead the
+    /// tablet's cluster, `ServiceUnavailable` (503: ask the leader, or again
+    /// once one is elected); anything else as [`Self::internal`].
+    fn map_err(e: impl Into<anyhow::Error>) -> s3s::S3Error {
+        let e = e.into();
+        if let Some(not) = e.chain().find_map(|c| c.downcast_ref::<pigeonhole_meta::NotLeader>()) {
+            return s3_error!(ServiceUnavailable, "{not}");
+        }
+        Self::internal(e)
+    }
+
     /// An internal error: answered as `InternalError` with its text, and
     /// logged with it (the request log has the status only).
-    fn map_err(e: impl std::fmt::Display) -> s3s::S3Error {
-        tracing::warn!(error = %e, "internal error");
-        s3_error!(InternalError, "{}", e)
+    fn internal(e: impl std::fmt::Display) -> s3s::S3Error {
+        tracing::warn!(error = %format!("{e:#}"), "internal error");
+        s3_error!(InternalError, "{e:#}")
     }
 
     /// A write's error: a refused condition as S3 answers it (412 / 404),
@@ -177,7 +188,7 @@ impl S3Gateway {
     fn write_err(e: anyhow::Error) -> s3s::S3Error {
         match e.downcast_ref::<Rejected>() {
             Some(Rejected(reject)) => Self::refused(*reject),
-            None => Self::map_err(format!("{e:#}")),
+            None => Self::map_err(e),
         }
     }
 
@@ -186,7 +197,7 @@ impl S3Gateway {
             S3Reject::PreconditionFailed => s3_error!(PreconditionFailed),
             S3Reject::NoSuchKey => s3_error!(NoSuchKey),
             S3Reject::BucketNotFound => s3_error!(NoSuchBucket),
-            other => Self::map_err(format!("rejected: {other:?}")),
+            other => Self::internal(format!("rejected: {other:?}")),
         }
     }
 
@@ -272,7 +283,7 @@ impl S3Gateway {
     fn part_refused(reject: S3Reject) -> s3s::S3Error {
         match reject {
             S3Reject::NoSuchUpload => s3_error!(NoSuchUpload),
-            other => Self::map_err(format!("part rejected: {other:?}")),
+            other => Self::internal(format!("part rejected: {other:?}")),
         }
     }
 

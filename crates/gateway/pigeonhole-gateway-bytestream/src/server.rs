@@ -151,6 +151,9 @@ fn spawn_cas_gc(state: ReapiState, mut schedule: Schedule<Expiry>) {
 }
 
 async fn cas_gc_pass(state: &ReapiState, ttl: Duration) {
+    if !state.cas.cas.is_leader() {
+        return;
+    }
     let cutoff = Utc::now() - ChronoDuration::seconds(ttl.as_secs() as i64);
     let (cas, store) = (&state.cas.cas, &state.cas.store);
     let Ok(stale) = cas.stale_before(cutoff).await else { return };

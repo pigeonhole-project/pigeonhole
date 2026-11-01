@@ -230,6 +230,10 @@ async fn cooler(
         if meta.is_stopped() {
             return;
         }
+        if !meta.is_leader() {
+            schedule.done();
+            continue;
+        }
         match s3.cool_pass(&cooling.policy.with_inlining(inline_on)).await {
             Ok(s) => tracing::info!(by_age = s.by_age, by_budget = s.by_budget, "cooled inline objects"),
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "cooler pass failed"),
@@ -392,6 +396,7 @@ impl Node {
                 as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
             spawn(Box::pin(sweeper.run_loop(dynamic.sweep.schedule()))),
             spawn(Box::pin(cooler(dynamic.cool.schedule(), s3.clone(), meta.clone(), inline_on))),
+            spawn(Box::pin(dynamic.clone().follow())),
         ];
         let channels = channels::of(cfg);
         let view: Arc<dyn pigeonhole_admin::Channels> =

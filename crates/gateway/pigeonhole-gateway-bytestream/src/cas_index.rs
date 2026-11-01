@@ -39,6 +39,11 @@ impl CasIndex {
         namespaces.with::<CasState>()
     }
 
+    /// Whether this node leads the tablet's cluster (only the leader GCs).
+    pub fn is_leader(&self) -> bool {
+        self.meta.is_leader()
+    }
+
     /// Use `meta`, which must have been opened with [`Self::register`].
     pub async fn open(meta: Arc<MetaStore>) -> Result<Self> {
         if !meta.has_namespace(NAMESPACE) {
