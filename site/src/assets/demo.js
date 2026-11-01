@@ -650,6 +650,15 @@
   }
   const service = m => m.log && m.log.what !== "batch";
 
+  // Pins: the owner marker (docs/store-owner.md) is a pinned file.
+  const ICON_PIN = "M14 4l6 6-3 1-4 4 1 5-2 1-4-5-5 5M10 9l5 5";
+  const isPinned = (c, m) => (c.pinned || []).some(p => String(p.id) === String(m.id));
+  const ownerOf = m => /^owner-([0-9a-f]{8})\.bin$/.exec(m.name || "")?.[1];
+  function pinNote(m) {
+    const owner = ownerOf(m);
+    return owner ? h("div", "post-log", t("demo.owner_marker", {owner})) : null;
+  }
+
   function feed(c) {
     return c.kind === "telegram" ? telegramView(c) : discordView(c);
   }
@@ -682,6 +691,13 @@
     const who = h("div");
     who.append(h("b", "", t("demo.tg_title", {store: c.store})), h("small", "", t("demo.tg_subs")));
     head.append(ava, who);
+    const pin = (c.pinned || [])[0];
+    const bar = pin ? h("div", "tg-pinbar") : null;
+    if (bar) {
+      const col = h("div");
+      col.append(h("b", "", t("demo.pinned_message")), h("div", "tg-pinbar-text", pin.name || t("demo.tg_service")));
+      bar.append(svgIcon(ICON_PIN, "ic"), col);
+    }
     const chat = h("div", "tg-chat");
     const live = c.messages.slice(-200);
     const earlier = c.total - live.filter(m => !m.gone).length;
@@ -692,7 +708,13 @@
       const line = h("div", "tg-line");
       const b = h("div", "tg-post" + (m.gone ? " gone" : "") + (m.fresh ? " fresh" : "") + (service(m) ? " service" : ""));
       if (m.kind === "text") b.append(h("div", "tg-text cjk", payload(m)));
-      else if (m.kind === "other") b.append(h("div", "tg-text", t("demo.tg_service")));
+      else if (m.kind === "other") {
+        // A service message (a pin): a pill in the middle, as Telegram draws it.
+        line.className = "tg-line tg-service-line";
+        line.append(h("div", "tg-day", t("demo.tg_pinned_service")));
+        chat.append(line);
+        continue;
+      }
       else {
         const doc = h("div", "tg-doc");
         const ic = h("div", "tg-doc-ic");
@@ -703,7 +725,10 @@
         b.append(doc);
       }
       if (m.log) b.append(h("div", "post-log", logLabel(m.log)));
+      const note = pinNote(m);
+      if (note) b.append(note);
       const foot = h("div", "tg-meta");
+      if (isPinned(c, m)) foot.append(svgIcon(ICON_PIN, "pin"));
       foot.append(svgIcon(ICON_EYE, "eye"), document.createTextNode("1"));
       const at = when(c, m);
       if (at) foot.append(document.createTextNode(` ${hhmm(at)}`));
@@ -713,7 +738,7 @@
       chat.append(line);
     }
     const input = h("div", "tg-input", t("demo.tg_broadcast"));
-    app.append(head, chat, input);
+    app.append(...[head, bar, chat, input].filter(Boolean));
     requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
     return app;
   }
@@ -722,6 +747,12 @@
     const app = h("div", "app dc");
     const head = h("div", "dc-head");
     head.append(h("span", "dc-hash", "#"), h("b", "", c.store), h("span", "dc-topic", t(`demo.dc_topic_${c.role}`)));
+    if (c.pinned?.length) {
+      const pins = h("span", "dc-pins");
+      pins.title = t("demo.pinned_n", {n: c.pinned.length});
+      pins.append(svgIcon(ICON_PIN, "ic"), document.createTextNode(String(c.pinned.length)));
+      head.append(pins);
+    }
     const chat = h("div", "dc-chat");
     const live = c.messages.slice(-200);
     const earlier = c.total - live.filter(m => !m.gone).length;
@@ -754,6 +785,9 @@
         body.append(card);
       }
       if (m.log) body.append(h("div", "post-log", logLabel(m.log)));
+      const note = pinNote(m);
+      if (note) body.append(note);
+      if (isPinned(c, m)) body.prepend(h("div", "dc-pinned", t("demo.pinned")));
       row.append(body);
       if (c.role === "data" && !m.gone) deletable(row, c, m);
       chat.append(row);

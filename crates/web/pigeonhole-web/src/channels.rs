@@ -146,22 +146,31 @@ fn discord(id: u64, m: &DcMessage, role: &str) -> Value {
 impl World {
     /// Channel `c` as it is: how many messages it holds and the last `limit`.
     pub async fn describe(&self, c: &ChannelRef, limit: usize) -> Result<Value> {
-        let (total, messages): (usize, Vec<Value>) = match c.kind {
+        // The last `limit` messages, and the pinned ones wherever they are.
+        let (total, messages, pinned): (usize, Vec<Value>, Vec<Value>) = match c.kind {
             InstanceKind::Telegram => {
                 let ch = self.telegram(&c.scope, &c.backing).await?;
                 ch.host().read(|s: &TelegramChannelState| {
-                    let all: Vec<Value> = s.messages().map(|(id, m)| telegram(id, s.date_ms(id), m, c.role)).collect();
-                    (all.len(), all[all.len().saturating_sub(limit)..].to_vec())
+                    let one = |(id, m): (i64, &TgMessage)| telegram(id, s.date_ms(id), m, c.role);
+                    let all: Vec<Value> = s.messages().map(one).collect();
+                    let pinned = s.pinned().and_then(|p| s.message(p).map(|m| one((p, m)))).into_iter().collect();
+                    (all.len(), all[all.len().saturating_sub(limit)..].to_vec(), pinned)
                 })
             }
             InstanceKind::Discord => {
                 let ch = self.discord(&c.scope, &c.backing).await?;
                 ch.host().read(|s: &DiscordChannelState| {
                     let all: Vec<Value> = s.messages().map(|(id, m)| discord(id, m, c.role)).collect();
-                    (all.len(), all[all.len().saturating_sub(limit)..].to_vec())
+                    let pins = s.pinned();
+                    let pinned = s
+                        .messages()
+                        .filter(|(id, _)| pins.contains(id))
+                        .map(|(id, m)| discord(id, m, c.role))
+                        .collect();
+                    (all.len(), all[all.len().saturating_sub(limit)..].to_vec(), pinned)
                 })
             }
-            _ => (0, Vec::new()),
+            _ => (0, Vec::new(), Vec::new()),
         };
         let place =
             c.place.map(|p| json!({ "shard": p.shard, "shards": p.shards, "copy": p.copy, "copies": p.copies }));
@@ -175,6 +184,7 @@ impl World {
             "place": place,
             "total": total,
             "messages": messages,
+            "pinned": pinned,
         }))
     }
 }

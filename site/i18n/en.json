@@ -344,5 +344,13 @@
   "js.bg.repair_note": "Copies back what a read or a check found missing, from the other copies.",
   "js.bg.sweep_note": "Deletes the posts no chunk uses: chunks no object needs any more, and orphans of failed uploads.",
   "js.bg.cool_note": "Moves small objects kept in the log itself (inline) out to chunks once they go cold.",
-  "js.bg.snapshot_note": "Writes the whole state as one file, so that a restart replays only what came after. By time (this switch) and every so many entries."
+  "js.bg.snapshot_note": "Writes the whole state as one file, so that a restart replays only what came after. By time (this switch) and every so many entries.",
+  "js.demo.pinned_message": "Pinned message",
+  "js.demo.pinned": "📌 Pinned",
+  "js.demo.pinned_n": {
+    "one": "{n} pinned message",
+    "other": "{n} pinned messages"
+  },
+  "js.demo.tg_pinned_service": "pigeonhole pinned a message",
+  "js.demo.owner_marker": "Owner marker: this channel belongs to deployment {owner}; another deployment refuses it."
 }
