@@ -109,7 +109,8 @@ fn log_post(name: &str, data: Option<bytes::Bytes>, kind: InstanceKind) -> Value
     }
 }
 
-fn telegram(id: i64, m: &TgMessage, role: &str) -> Value {
+/// Message `id`, posted at `at` (ms since the epoch).
+fn telegram(id: i64, at: Option<u64>, m: &TgMessage, role: &str) -> Value {
     let mut v = match m {
         TgMessage::Other => json!({ "kind": "other" }),
         TgMessage::Text(t) => text(t, role, InstanceKind::Telegram),
@@ -122,6 +123,7 @@ fn telegram(id: i64, m: &TgMessage, role: &str) -> Value {
         }
     };
     v["id"] = json!(id);
+    v["at"] = json!(at);
     v
 }
 
@@ -137,6 +139,7 @@ fn discord(id: u64, m: &DcMessage, role: &str) -> Value {
         None => text(&m.content, role, InstanceKind::Discord),
     };
     v["id"] = json!(id.to_string());
+    v["at"] = json!(pigeonhole_storage_discord::snowflake_timestamp_ms(id));
     v
 }
 
@@ -147,7 +150,7 @@ impl World {
             InstanceKind::Telegram => {
                 let ch = self.telegram(&c.scope, &c.backing).await?;
                 ch.host().read(|s: &TelegramChannelState| {
-                    let all: Vec<Value> = s.messages().map(|(id, m)| telegram(id, m, c.role)).collect();
+                    let all: Vec<Value> = s.messages().map(|(id, m)| telegram(id, s.date_ms(id), m, c.role)).collect();
                     (all.len(), all[all.len().saturating_sub(limit)..].to_vec())
                 })
             }

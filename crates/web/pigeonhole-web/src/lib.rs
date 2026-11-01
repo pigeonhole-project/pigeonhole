@@ -217,9 +217,31 @@ pub struct Node {
     pub s3: S3Gateway,
     /// The background loops' knobs, the file's with the tablet's overrides.
     pub dynamic: Arc<DynConfig>,
-    /// Repair passes in the background, as the server's (`[repair]`).
-    repair: tokio::task::JoinHandle<()>,
+    /// The background loops, as the server's: repair, sweep, cool.
+    loops: Vec<tokio::task::JoinHandle<()>>,
+    index: Index,
+    inline_on: bool,
     snapshot_every: Option<u64>,
+}
+
+/// The cooler's loop, as the server's (`[inline] cool_every`).
+async fn cooler(
+    mut schedule: pigeonhole_types::schedule::Schedule<pigeonhole_config::Cooling>,
+    s3: S3Gateway,
+    meta: Arc<MetaStore>,
+    inline_on: bool,
+) {
+    loop {
+        let cooling = schedule.next(|c| c.every).await;
+        if meta.is_stopped() {
+            return;
+        }
+        match s3.cool_pass(&cooling.policy.with_inlining(inline_on)).await {
+            Ok(s) => tracing::info!(by_age = s.by_age, by_budget = s.by_budget, "cooled inline objects"),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "cooler pass failed"),
+        }
+        schedule.done();
+    }
 }
 
 fn req<T>(input: T) -> S3Request<T> {
@@ -376,10 +398,21 @@ impl Node {
             store = store.with_caches(Some(l1), l2, cfg.cache.write_through);
         }
         let store = Arc::new(store);
-        let s3 = S3Gateway::new(cfg.s3_options(), Index::open(meta.clone()).await?, store.clone());
+        let index = Index::open(meta.clone()).await?;
+        let s3 = S3Gateway::new(cfg.s3_options(), index.clone(), store.clone());
         let dynamic = Arc::new(DynConfig::open(cfg.clone(), meta.clone()));
+        let inline_on = cfg.inline.max_object_size.is_some();
+        let spawn = |f| tokio::spawn(tracing::Instrument::in_current_span(f));
         let repairer = Repairer::new(store.db().clone(), store.replicated().clone(), dynamic.repair.get());
-        let repair = tokio::spawn(tracing::Instrument::in_current_span(repairer.run_loop(dynamic.repair.schedule())));
+        let members = store.replicated().members().to_vec();
+        let pins = store.replicated().pins().clone();
+        let sweeper = Sweeper::new(store.db().clone(), members, dynamic.sweep.get(), pins);
+        let loops = vec![
+            spawn(Box::pin(repairer.run_loop(dynamic.repair.schedule()))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
+            spawn(Box::pin(sweeper.run_loop(dynamic.sweep.schedule()))),
+            spawn(Box::pin(cooler(dynamic.cool.schedule(), s3.clone(), meta.clone(), inline_on))),
+        ];
         Ok(Self {
             channels: channels::of(cfg),
             log,
@@ -387,7 +420,9 @@ impl Node {
             store,
             s3,
             dynamic,
-            repair,
+            loops,
+            index,
+            inline_on,
             snapshot_every: cfg.meta.snapshot_every_entries,
         })
     }
@@ -400,27 +435,42 @@ impl Node {
 
     /// Stops the tablet, as a process exit would.
     pub async fn close(&self) -> Result<()> {
-        self.repair.abort();
+        for task in &self.loops {
+            task.abort();
+        }
         self.meta.close().await
     }
 
-    /// What runs in the background: the repair queue and when its next pass
-    /// is due; how far the log is from its next snapshot.
+    /// What runs in the background, task by task (the ones this node runs:
+    /// repair, sweep, cool, snapshot): its period, when it passes next, and
+    /// the work waiting for it.
     pub async fn background(&self) -> Result<serde_json::Value> {
-        let jobs = self.store.db().repair_jobs().await;
-        let every = self.dynamic.repair.get().interval;
-        let due = self.dynamic.repair.due(|c| c.interval);
-        let next_ms = due.map(|at| at.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64);
+        use serde_json::json;
         let found = self.log.discover().await?;
         let (head, base) = found.map_or((0, 0), |d| (d.head.position, d.base.map_or(0, |b| b.at)));
-        Ok(serde_json::json!({
-            "repair": {
-                "queue": jobs.iter().map(|(chunk, store)| serde_json::json!({ "chunk": chunk, "store": store })).collect::<Vec<_>>(),
-                "every_ms": every.map(|d| d.as_millis() as u64),
-                "next_ms": next_ms,
-            },
-            "snapshot": { "head": head, "base": base, "every": self.snapshot_every },
-        }))
+        let jobs = self.store.db().repair_jobs().await;
+        let zero_ref = self.store.db().list_zero_ref_chunks().await?;
+        let policy = self.dynamic.cool.get().policy.with_inlining(self.inline_on);
+        let cold = self.index.cool_candidates(chrono::Utc::now(), &policy);
+        let work = |task: &str| {
+            match task {
+            "repair" => json!(jobs.iter().map(|(chunk, store)| json!({ "chunk": chunk, "store": store })).collect::<Vec<_>>()),
+            "sweep" => json!(zero_ref.iter().map(|chunk| json!({ "chunk": chunk })).collect::<Vec<_>>()),
+            "cool" => json!(cold
+                .iter()
+                .map(|c| json!({ "key": c.key, "bucket": c.bucket, "size": c.bytes.len(), "reason": format!("{:?}", c.reason).to_lowercase() }))
+                .collect::<Vec<_>>()),
+            _ => json!([]),
+        }
+        };
+        let tasks: Vec<_> = self
+            .dynamic
+            .tasks()
+            .into_iter()
+            .filter(|t| ["repair", "sweep", "cool", "snapshot"].contains(&t.task))
+            .map(|t| json!({ "task": t.task, "every": t.every, "next_in_ms": t.next_in_ms, "work": work(t.task) }))
+            .collect();
+        Ok(json!({ "tasks": tasks, "snapshot": { "head": head, "base": base, "every": self.snapshot_every } }))
     }
 
     /// Entries the boot replayed from the log after its snapshot.

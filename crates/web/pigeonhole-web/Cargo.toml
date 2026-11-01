@@ -10,6 +10,8 @@ description = "pigeonhole in one process on in-memory stores, for the site's in-
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+pigeonhole-types = { workspace = true }
+chrono = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }

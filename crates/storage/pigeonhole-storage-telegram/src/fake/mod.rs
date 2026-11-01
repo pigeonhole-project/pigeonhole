@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_storage_api::fake::{FakeHost, MemoryHost};
-use state::{check_ids, check_text, check_window, Command, Message, Reply, TelegramChannelState};
+use state::{check_ids, check_text, check_window, now_ms, Command, Message, Reply, TelegramChannelState};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -55,14 +55,17 @@ impl FakeChannel {
 
     /// Someone else posts a message that is not ours (a service message).
     pub fn post_text(&self) -> i64 {
-        posted(self.host.apply_now(Command::Post { message: Message::Other }))
+        posted(self.host.apply_now(Command::Post { message: Message::Other, now_ms: now_ms() }))
     }
 
     /// Someone else posts a document; returns its id.
     pub fn post_document(&self, name: &str, data: &[u8]) -> i64 {
         let size = data.len() as u64;
         let blob = self.host.put_blob_now(Bytes::copy_from_slice(data));
-        posted(self.host.apply_now(Command::Post { message: Message::Doc { name: name.into(), size, blob } }))
+        posted(
+            self.host
+                .apply_now(Command::Post { message: Message::Doc { name: name.into(), size, blob }, now_ms: now_ms() }),
+        )
     }
 
     /// Every file reference handed out so far stops working.
@@ -120,7 +123,7 @@ impl FakeChannel {
 
     /// Someone pins message `id`.
     pub fn pin_now(&self, id: i64) {
-        self.host.apply_now(Command::Pin { id });
+        self.host.apply_now(Command::Pin { id, now_ms: now_ms() });
     }
 }
 
@@ -173,7 +176,7 @@ impl<H> FakeChannel<H> {
 impl<H: FakeHost<TelegramChannelState>> FakeChannel<H> {
     /// A send through the host: the message's id, and whether it is new.
     async fn send(&self, random_id: i64, message: Message) -> Result<(i64, bool)> {
-        match self.host.apply(Command::Send { random_id, message }).await? {
+        match self.host.apply(Command::Send { random_id, message, now_ms: now_ms() }).await? {
             Reply::Sent { id, fresh } => Ok((id, fresh)),
             other => bail!("a send answered {other:?}"),
         }
@@ -257,7 +260,7 @@ impl<H: FakeHost<TelegramChannelState>> ChannelApi for FakeChannel<H> {
 
     async fn pin(&self, id: i64) -> Result<()> {
         self.knobs.lock().unwrap().calls.pin += 1;
-        self.host.apply(Command::Pin { id }).await?;
+        self.host.apply(Command::Pin { id, now_ms: now_ms() }).await?;
         Ok(())
     }
 }
