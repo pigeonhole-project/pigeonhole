@@ -241,6 +241,12 @@ above, and why:
   anchor message the store posts on an empty channel; if two stores post one
   at once, the oldest serves both and the other is deleted. The anchor and
   its link are never pruned.
+- **A put after a pruned message** (a writer deposed before a collection)
+  loses: to the successor its thread still names, else to the tail, since
+  only a newer base prunes a member. Pruning retires a thread on a deleted
+  message only if it names a deleted blob: an unlinked lease batch or a
+  loser names that message too, while its thread tells the first survivor
+  won.
 - **The tail is the newest member that won its link**, checked through its
   `prev`'s thread (`GET /channels/{prev}`: a thread outlives its message), not
   by following links from the start: removing an old snapshot or pruning

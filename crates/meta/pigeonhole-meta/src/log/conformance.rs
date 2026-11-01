@@ -40,6 +40,38 @@ where
     truncate_replaces_a_divergent_tail(fresh()).await;
     the_vote_survives_and_is_fenced(fresh()).await;
     a_rebase_past_the_head_empties_the_log(fresh()).await;
+    a_writer_deposed_before_a_collection_stays_fenced(fresh()).await;
+}
+
+/// A writer asleep while the next generation claimed, wrote, rebased far
+/// past its tip and collected what the rebase dropped: on waking it is
+/// still fenced, and readers follow the newer generation.
+pub async fn a_writer_deposed_before_a_collection_stays_fenced<Open, Fut>(open: Open)
+where
+    Open: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn LogStore>>,
+{
+    let a = open().await;
+    a.claim(1).await.unwrap();
+    a.append(1, &[entry(1)]).await.unwrap();
+    a.append(1, &[entry(2)]).await.unwrap();
+
+    let b = open().await;
+    assert_eq!(b.claim(2).await.unwrap().position, 2);
+    for i in 3..=10 {
+        b.append(2, &[entry(i)]).await.unwrap();
+    }
+    b.rebase(2, Base { at: 9, term: 1, leader: 0, snapshot: SnapshotRef("s9".into()) }, 1).await.unwrap();
+    b.settle().await;
+    let before = open().await.discover().await.unwrap().map(|d| (d.gen, d.head.position));
+    assert_eq!(before, Some((2, 10)), "before the deposed writer wakes");
+
+    let appended = a.append(1, &[entry(99)]).await;
+    assert!(matches!(appended, Err(LogError::Fenced { current: 2 })), "the deposed writer's append: {appended:?}");
+    let confirmed = a.confirm(1).await;
+    assert!(matches!(confirmed, Err(LogError::Fenced { current: 2 })), "the deposed writer's confirm: {confirmed:?}");
+    let d = open().await.discover().await.unwrap().unwrap();
+    assert_eq!((d.gen, d.head.position), (2, 10), "a new reader follows generation 2");
 }
 
 /// A follower installing a snapshot from elsewhere: the log jumps to it.

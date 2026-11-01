@@ -225,7 +225,10 @@ Where the code differs from the design above:
 - **Telegram**: a member is a document named `<label>~<prev>.bin` (`root`
   for the first). `put_after` posts with a fresh `random_id` per call (two
   writers putting the same name must get two messages), wins iff nothing in
-  `(prev, b)` names `prev` (no read when `b == prev + 1`). `tail` and
+  `(prev, b)` names `prev` or a blob newer than `prev` (no read when
+  `b == prev + 1`). The second half fences a writer deposed before a
+  collection pruned the claim that followed its tip: what the chain went on
+  with is still there, and names newer blobs. `tail` and
   `successor` post a probe to learn the top (probes stay: a hole in a checked
   range costs re-reads), so a snapshot (`put_loose`) goes after the one put
   before it when the caller knows it, which needs no probe; `tail` walks down to the newest message that won its

@@ -52,6 +52,9 @@ const PRUNE_BATCH: usize = 100;
 struct ChainLinks {
     next: HashMap<Option<i64>, i64>,
     tail: Option<i64>,
+    /// Each member's label, kept past a prune with its link: a writer that
+    /// loses to a pruned member still learns who won.
+    labels: HashMap<i64, String>,
 }
 
 /// Alias matching Stage 3 naming.
@@ -158,7 +161,8 @@ impl MemoryBlobStore {
     /// The id of message `message_id`, with the name it was put under.
     fn linked(&self, message_id: i64) -> Linked<MemoryId> {
         let file_id = self.messages.lock().unwrap().get(&message_id).cloned().unwrap_or_default();
-        let label = self.names.lock().unwrap().get(&message_id).cloned().unwrap_or_default();
+        let label = self.names.lock().unwrap().get(&message_id).cloned();
+        let label = label.or_else(|| self.chain.lock().unwrap().labels.get(&message_id).cloned()).unwrap_or_default();
         Linked { id: MemoryId { file_id, message_id: message_id as u64 }, label }
     }
 
@@ -262,7 +266,8 @@ impl Chain for MemoryBlobStore {
     async fn put_after(&self, prev: Option<&Self::Id>, label: &str, data: Bytes) -> Result<After<Self::Id>> {
         let _op = self.limiter.op().await;
         let prev = prev.map(|p| p.message_id as i64);
-        if let Some(&winner) = self.chain.lock().unwrap().next.get(&prev) {
+        let taken = self.chain.lock().unwrap().next.get(&prev).copied();
+        if let Some(winner) = taken {
             return Ok(After::Lost(self.linked(winner)));
         }
         let id = self.put(data, label).await?;
@@ -274,6 +279,7 @@ impl Chain for MemoryBlobStore {
         }
         chain.next.insert(prev, mine);
         chain.tail = Some(mine);
+        chain.labels.insert(mine, label.to_string());
         tracing::debug!(store = %self.instance.id, label, ?prev, message_id = mine, "linked");
         Ok(After::Won(id))
     }
