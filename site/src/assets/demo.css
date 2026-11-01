@@ -389,7 +389,11 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .win-plank { stroke: var(--slate); stroke-width: 3; stroke-linecap: round; }
 .win:hover .win-frame, .win:focus-visible .win-frame { stroke-width: 2.6; opacity: 1; }
 .win:focus-visible { outline: none; }
-.win-bird { fill: var(--plume); stroke: var(--wing); stroke-width: 1; opacity: 0; transition: opacity .3s; }
+.win-bird { opacity: 0; transition: opacity .3s; }
+/* a rock dove's grey whatever the theme */
+.win-bird .bird-body { fill: #d9dee3; stroke: #2e3439; stroke-width: 1; }
+.win-bird .bird-lines { fill: none; stroke: #2e3439; stroke-width: 1; stroke-linecap: round; }
+.win-bird .bird-eye { fill: #2e3439; }
 .win.busy .win-bird { opacity: 1; }
 .win.busy .win-light { fill: var(--eye); }
 .win-badge { opacity: 0; transition: opacity .3s; }

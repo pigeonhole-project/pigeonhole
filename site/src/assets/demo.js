@@ -90,7 +90,13 @@
   let nodes = {}, edges = {};
   const W = 1000;
   // A pigeon in flight, facing right: wings up from a small body, a tail.
-  const BIRD = "M-9,1 Q-6,-1 -3,0 Q-1,-9 3,-11 Q2,-4 2,-1 Q6,-2 9,0 Q6,2 2,2 Q0,4 -3,3 Q-6,3 -9,1 Z";
+  // A pigeon in flight, side on, facing right: the body, and the wing raised
+  // behind it (it beats about the shoulder at 2.8,-1.2).
+  const FLY_BODY = "M-11,1.5 L-6.5,-0.2 Q-2,-1.6 3,-1.2 Q4.4,-4 7,-3.8 Q9,-3.6 9.2,-2.2 L11,-1.6 L9,-1 Q8.6,1.4 6.2,2.4 Q3.6,4.4 -2,4 Q-7,3.6 -11,1.5 Z";
+  const FLY_WING = "M2.8,-1.2 Q1.6,-6.4 -2.4,-11 Q-2.2,-8.4 -4.4,-9.6 Q-3.8,-7.2 -6.4,-8.2 Q-5.2,-5.8 -7.6,-6.2 Q-5.4,-3.4 -3.8,-0.8 Z";
+  // A pigeon sitting, side on, facing right; its legs; its wing's line.
+  const PERCHED = "M-10,3.5 L-5,1 Q-3,-2.5 1.5,-2.5 Q2,-6.5 5,-6.5 Q7.4,-6.5 7.6,-4.6 L9.4,-4 L7.6,-3.4 Q7.4,-2 6.2,-1.4 Q9,1 7.4,4.2 Q5.4,6.6 1.4,6.6 L-3,6.2 Q-6.4,5.4 -10,3.5 Z";
+  const PERCHED_LINES = "M1.2,6.4 L1.2,8.8 M3.4,6.4 L3.4,8.8 M-5.6,1.6 Q-1,-0.6 3.4,2.6";
 
   // The channels in two groups: the data channels (blob stores, the
   // chunks) and the node's own, the log and its snapshots.
@@ -425,7 +431,10 @@
       s("path", {class: "win-glow", d: w.d}, g);
       const light = s("rect", {class: "win-light", x: w.x - 10, y: w.y + 14, width: 20, height: 0, "clip-path": `url(#win-${task})`}, g);
       s("path", {class: "win-frame", d: w.d}, g);
-      const bird = s("path", {class: "win-bird", d: BIRD, transform: `translate(${w.x},${w.y + 7}) scale(.85)`}, g);
+      const bird = s("g", {class: "win-bird", transform: `translate(${w.x},${w.y + 4}) scale(.82)`}, g);
+      s("path", {class: "bird-body", d: PERCHED}, bird);
+      s("path", {class: "bird-lines", d: PERCHED_LINES}, bird);
+      s("circle", {class: "bird-eye", cx: 5.6, cy: -4.4, r: 0.8}, bird);
       const badge = s("g", {class: "win-badge"}, g);
       s("circle", {cx: w.x + 11, cy: w.y - 9, r: 7}, badge);
       const count = s("text", {x: w.x + 11, y: w.y - 6, "text-anchor": "middle"}, badge);
@@ -483,7 +492,8 @@
       // A small pigeon, wings beating; bigger for bigger payloads.
       const scale = 0.9 + Math.min(1, Math.log2(1 + size / 4096) / 10);
       const bird = s("g", {class: "flight" + (failed ? " failed" : "")}, graph);
-      const body = s("path", {fill: "url(#iris)", d: BIRD}, bird);
+      s("path", {fill: "url(#iris)", d: FLY_BODY}, bird);
+      const wing = s("path", {fill: "url(#iris)", d: FLY_WING}, bird);
       const len = path.getTotalLength(), t0 = performance.now(), dur = 680;
       flights.push(bird);
       const step = now => {
@@ -494,7 +504,7 @@
         const flip = ahead.x < pt.x ? -1 : 1;
         const flap = 0.55 + 0.45 * Math.abs(Math.sin((now - t0) / 55));
         bird.setAttribute("transform", `translate(${pt.x},${pt.y}) scale(${flip * scale},${scale})`);
-        body.setAttribute("transform", `scale(1,${flap})`);
+        wing.setAttribute("transform", `translate(2.8,-1.2) scale(1,${flap}) translate(-2.8,1.2)`);
         if (k < 1) requestAnimationFrame(step);
         else { bird.remove(); done(); }
       };
