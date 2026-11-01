@@ -13,6 +13,13 @@
 //! winner is in the chain and the tail is the newest winner: found walking
 //! down from the top, checking each candidate's own range.
 //!
+//! Members get deleted (a collection prunes below the log's base), the
+//! successor of `p` among them: a writer deposed long ago, whose tip is `p`,
+//! would then find nothing in `(p, b)` that names `p`. But the chain went on
+//! past `p`, and what it went on with names blobs newer than `p`: a member
+//! in `(p, b)` that names one is just as final a "no" (and its label tells
+//! the writer who holds the log now).
+//!
 //! The top of a channel is only learnt by posting: `tail` and `successor`
 //! post a probe (kept: deleting it would leave an empty id in a range some
 //! check reads). An empty id inside a checked range is read again a few
@@ -135,7 +142,9 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
         Ok(())
     }
 
-    /// The first member in `(lo, hi)` that names `prev`, read and settled.
+    /// What `prev` (at `lo`) is followed by in `(lo, hi)`, read and
+    /// settled: the first member that names it, else the first that names a
+    /// newer one (the chain went on past `prev`; its successor was deleted).
     async fn first_naming(
         &self,
         view: &mut View,
@@ -145,12 +154,15 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
     ) -> Result<Option<Linked<TelegramId>>> {
         self.fill(view, lo + 1, hi - 1).await?;
         self.settle(view, lo, hi).await?;
-        Ok(view.range(lo + 1..hi).find_map(|(id, s)| match s {
-            Seen::Member(label, p) if *p == prev => {
-                Some(Linked { id: TelegramId { message_id: *id }, label: label.clone() })
-            }
-            _ => None,
-        }))
+        let first = |follows: &dyn Fn(Option<i64>) -> bool| {
+            view.range(lo + 1..hi).find_map(|(id, s)| match s {
+                Seen::Member(label, p) if follows(*p) => {
+                    Some(Linked { id: TelegramId { message_id: *id }, label: label.clone() })
+                }
+                _ => None,
+            })
+        };
+        Ok(first(&|p| p == prev).or_else(|| first(&|p| p.is_some_and(|p| p > lo))))
     }
 
     /// Post a blob (text if it fits); its id.

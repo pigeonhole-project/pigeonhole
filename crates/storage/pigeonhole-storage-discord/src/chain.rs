@@ -135,9 +135,12 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
         for &m in gone {
             let name = self.names.lock().unwrap().pop(&m);
             let Some((_, prev)) = name.as_deref().and_then(parse_name) else { continue };
-            // Incoming: the link on `prev` names `m`, which is gone.
+            // Incoming: the link on `prev`, if it names `m` (gone). An
+            // unlinked blob or a loser names `prev` too, while `prev`'s link
+            // names another: maybe the first survivor, which it tells won.
             if let Some(p) = prev {
-                if Some(p) != anchor && !exists(p).await? {
+                let into_m = self.link_of(p).await?.is_some_and(|l| l.id.message_id == m);
+                if into_m && Some(p) != anchor && !exists(p).await? {
                     self.api.delete_thread(p).await?;
                     tracing::debug!(store = %self.instance().id, thread = p, "retired a link");
                 }
@@ -194,7 +197,18 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
                 tracing::debug!(%store, label, from, message_id = b, winner = winner.id.message_id, winner_label = %winner.label, "lost the link (thread taken)");
                 Ok(After::Lost(winner))
             }
-            ThreadStart::NoMessage => bail!("message {from} to link from is gone"),
+            // A deposed writer's tip, pruned below a newer base: a link on
+            // it names its successor; once that is pruned too, the chain went
+            // on past it to the tail.
+            ThreadStart::NoMessage => {
+                let winner = match self.link_of(from).await? {
+                    Some(next) => Some(next),
+                    None => self.tail().await?.filter(|t| t.id.message_id > from),
+                };
+                let winner = winner.with_context(|| format!("message {from} to link from is gone"))?;
+                tracing::debug!(%store, label, from, message_id = b, winner = winner.id.message_id, winner_label = %winner.label, "lost the link (message gone)");
+                Ok(After::Lost(winner))
+            }
         }
     }
 
