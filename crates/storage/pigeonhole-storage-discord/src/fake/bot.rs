@@ -100,4 +100,14 @@ impl<A: DiscordApi> DiscordApi for FakeBot<A> {
         }
         self.api.download(url, range).await
     }
+
+    async fn pinned(&self) -> Result<Vec<DcMessage>> {
+        self.spend(Spend::Class(READ), "pinned").await?;
+        self.api.pinned().await
+    }
+
+    async fn pin(&self, id: u64) -> Result<()> {
+        self.spend(Spend::Class(SEND), "pin").await?;
+        self.api.pin(id).await
+    }
 }

@@ -97,6 +97,14 @@ impl<C: DiscordApi> DiscordApi for PooledDiscord<C> {
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes> {
         self.members[0].download(url, range).await
     }
+
+    async fn pinned(&self) -> Result<Vec<DcMessage>> {
+        self.pool.run(Spend::Class(READ), DEADLINE, rate_limited, |m| self.members[m].pinned()).await
+    }
+
+    async fn pin(&self, id: u64) -> Result<()> {
+        self.pool.run(Spend::Class(SEND), DEADLINE, rate_limited, |m| self.members[m].pin(id)).await
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +162,12 @@ mod tests {
         }
         async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes> {
             self.channel.download(url, range).await
+        }
+        async fn pinned(&self) -> Result<Vec<DcMessage>> {
+            self.channel.pinned().await
+        }
+        async fn pin(&self, id: u64) -> Result<()> {
+            self.channel.pin(id).await
         }
     }
 

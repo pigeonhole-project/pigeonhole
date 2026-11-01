@@ -20,7 +20,7 @@ pub use metrics::{
 };
 pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
 pub use pigeonhole_storage_api::{
-    text, After, Chain, Failure, LeaseChain, Linked, MakeAfter, NotFound, RateLimited, Unavailable,
+    text, After, Chain, Failure, LeaseChain, Linked, MakeAfter, NotFound, Owner, RateLimited, Unavailable,
 };
 pub use pigeonhole_types::{BackendId, BackendLimits, BlobKey, ByteRange, DeleteOutcome, RangeSupport};
 pub use replicated::{

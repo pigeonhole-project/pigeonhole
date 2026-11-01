@@ -122,7 +122,7 @@ impl PartPacker {
 
         let instance = self.backend.instance().id.clone();
         let pin = self.pins.pin(&instance);
-        let blob_id = BlobId::random();
+        let blob_id = BlobId::random_of(self.pins.owner());
         let locator = self.backend.put(payload, &blob_id.name()).await.with_context(|| {
             format!(
                 "part put failed for instance {} (blocks {}..{})",
@@ -227,7 +227,13 @@ mod tests {
             }
             Ok(())
         }
-        async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
+        async fn candidates(
+            &self,
+            _owner: pigeonhole_storage_api::Owner,
+            after: Option<u64>,
+            upto: u64,
+            limit: usize,
+        ) -> Result<Vec<u64>> {
             let mut keys: Vec<u64> = self
                 .data
                 .lock()

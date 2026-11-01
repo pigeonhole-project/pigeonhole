@@ -9,7 +9,7 @@
 
 use crate::blob_db::{ChunkId, StoredBlock};
 use anyhow::{bail, Result};
-use pigeonhole_blob::{BlobId, BlobLocator, PartLayout, ReplicaLayout};
+use pigeonhole_blob::{BlobId, BlobLocator, Owner, PartLayout, ReplicaLayout};
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -41,6 +41,8 @@ pub enum ChunkCommand {
     DropChunk { chunk_id: ChunkId },
     /// Replace one instance's replica of a chunk (repair / backfill).
     AddReplica { chunk_id: ChunkId, replica: Replica },
+    /// The deployment's [`Owner`], chosen by the first proposer; kept once set.
+    SetOwner { owner: Owner },
 }
 
 /// Deterministic failure of a [`ChunkCommand`].
@@ -113,13 +115,16 @@ pub struct ChunkState {
     /// Highest chunk id ever committed: ids are never reused (block cache and
     /// extents are keyed by chunk id).
     pub(crate) last_chunk_id: ChunkId,
+    /// Whose blobs this deployment's are (in every [`BlobId`] it mints); set
+    /// once, it survives snapshots and a lossy restore.
+    pub(crate) owner: Option<Owner>,
 }
 
 type Applied = std::result::Result<(), ChunkReject>;
 
 impl StateMachine for ChunkState {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 4;
+    const VERSION: u32 = 5;
     type Command = ChunkCommand;
     type Reply = ();
     type Reject = ChunkReject;
@@ -138,6 +143,10 @@ impl StateMachine for ChunkState {
                 Ok(Ok(()))
             }
             ChunkCommand::AddReplica { chunk_id, replica } => self.add_replica(chunk_id, replica),
+            ChunkCommand::SetOwner { owner } => {
+                self.owner.get_or_insert(owner);
+                Ok(Ok(()))
+            }
         }
     }
 
@@ -372,6 +381,6 @@ mod tests {
     fn command_encoding_is_pinned() {
         let cmd = ChunkCommand::Release { chunk_ids: vec![1, 2] };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 2, 2, 4]);
-        assert_eq!(ChunkState::VERSION, 4);
+        assert_eq!(ChunkState::VERSION, 5);
     }
 }

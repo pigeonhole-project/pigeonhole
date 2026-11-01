@@ -15,6 +15,7 @@
 //! garbage, and [`UploadPins::seed`] lets them be swept right away.
 
 use crate::replicated::InstanceId;
+use pigeonhole_storage_api::Owner;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -31,11 +32,25 @@ struct InstancePins {
 #[derive(Debug, Default)]
 pub struct UploadPins {
     inner: Mutex<HashMap<InstanceId, InstancePins>>,
+    /// Whose blobs the uploads are: set once the metadata is open.
+    owner: std::sync::OnceLock<Owner>,
 }
 
 impl UploadPins {
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// The owner every upload's [`BlobId`](pigeonhole_storage_api::BlobId)
+    /// carries; set once, from the metadata.
+    pub fn set_owner(&self, owner: Owner) {
+        let set = *self.owner.get_or_init(|| owner);
+        assert_eq!(set, owner, "uploads of one process have one owner");
+    }
+
+    /// The owner set ([`Owner`]`(0)` before: tests without metadata).
+    pub fn owner(&self) -> Owner {
+        self.owner.get().copied().unwrap_or(Owner(0))
     }
 
     /// Pin an upload to `instance` that is about to start; hold the pin until

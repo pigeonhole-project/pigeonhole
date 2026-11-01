@@ -107,6 +107,13 @@ pub trait ChannelApi: Send + Sync + 'static {
     /// Delete messages (at most [`IDS_PER_CALL`]); missing ids are fine.
     async fn delete_messages(&self, ids: &[i64]) -> Result<()>;
 
+    /// The pinned message, if any: the latest pinned, all a bot can learn
+    /// (`channels.getFullChannel`; it may not search for the others).
+    async fn pinned(&self) -> Result<Option<i64>>;
+
+    /// Pin message `id`, silently (the channel shows a service message).
+    async fn pin(&self, id: i64) -> Result<()>;
+
     /// Of the bots holding a location of a document (`holders`, not empty),
     /// the one to download with, or [`ReadVia::Locate`]. A channel of one
     /// bot always has its location.
@@ -134,6 +141,12 @@ impl<C: ChannelApi + ?Sized> ChannelApi for std::sync::Arc<C> {
     }
     async fn delete_messages(&self, ids: &[i64]) -> Result<()> {
         (**self).delete_messages(ids).await
+    }
+    async fn pinned(&self) -> Result<Option<i64>> {
+        (**self).pinned().await
+    }
+    async fn pin(&self, id: i64) -> Result<()> {
+        (**self).pin(id).await
     }
     fn read_via(&self, holders: &[usize]) -> ReadVia {
         (**self).read_via(holders)

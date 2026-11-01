@@ -35,6 +35,8 @@ pub struct DiscordChannelState {
     by_nonce: BTreeMap<String, u64>,
     /// Bumped by [`Command::ExpireUrls`]: older URLs fail.
     url_epoch: u32,
+    /// Pinned message ids.
+    pinned: std::collections::BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +70,9 @@ pub enum Command {
         id: u64,
         message: Message,
     },
+    Pin {
+        id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,7 +93,7 @@ pub enum Reply {
 
 impl FakeState for DiscordChannelState {
     const NAME: &'static str = "fake-discord";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     type Command = Command;
     type Reply = Reply;
 
@@ -103,13 +108,22 @@ impl FakeState for DiscordChannelState {
                 Reply::Sent { id: Some(id), fresh: true }
             }
             Command::Post { message, now_ms } => Reply::Sent { id: Some(self.post(message, now_ms)), fresh: true },
-            Command::Delete { ids } => Reply::Released {
-                blobs: ids
-                    .iter()
-                    .filter_map(|id| self.messages.remove(id))
-                    .filter_map(|m| m.file.map(|f| f.blob))
-                    .collect(),
-            },
+            Command::Delete { ids } => {
+                self.pinned.retain(|p| !ids.contains(p));
+                Reply::Released {
+                    blobs: ids
+                        .iter()
+                        .filter_map(|id| self.messages.remove(id))
+                        .filter_map(|m| m.file.map(|f| f.blob))
+                        .collect(),
+                }
+            }
+            Command::Pin { id } => {
+                if self.messages.contains_key(&id) {
+                    self.pinned.insert(id);
+                }
+                Reply::Done
+            }
             Command::StartThread { id, name } => Reply::Thread(if !self.messages.contains_key(&id) {
                 ThreadStart::NoMessage
             } else {
@@ -141,6 +155,10 @@ impl FakeState for DiscordChannelState {
 }
 
 impl DiscordChannelState {
+    pub fn pinned(&self) -> Vec<u64> {
+        self.pinned.iter().copied().collect()
+    }
+
     /// A snowflake for `now_ms`, above every id so far.
     fn post(&mut self, mut message: Message, now_ms: u64) -> u64 {
         // Discord keeps only some characters of a file name (it drops `~`).

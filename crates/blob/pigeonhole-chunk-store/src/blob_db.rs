@@ -6,9 +6,9 @@
 //! process: it is not replicated and starts empty on every boot.
 
 use crate::commands::{ChunkCommand, ChunkRec, ChunkReject, ChunkState, InstanceRec, Replica, NAMESPACE};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use pigeonhole_blob::{InstanceInfo, ReplicaLayout};
+use pigeonhole_blob::{InstanceInfo, Owner, ReplicaLayout};
 use pigeonhole_meta::{MetaStore, Namespaces, Prepared, Proposal};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -195,6 +195,15 @@ impl BlobDb {
             Ok(()) => Ok(()),
             Err(reason) => bail!("unexpected rejection {reason:?}"),
         }
+    }
+
+    /// The deployment's owner, chosen at random and committed on first use.
+    pub async fn owner(&self) -> Result<Owner> {
+        if let Some(owner) = self.read(|s| s.owner) {
+            return Ok(owner);
+        }
+        self.propose_infallible(ChunkCommand::SetOwner { owner: Owner::random() }).await?;
+        self.read(|s| s.owner).context("the owner was just set")
     }
 
     pub async fn sync_instances(&self, configured: &[InstanceInfo]) -> Result<()> {

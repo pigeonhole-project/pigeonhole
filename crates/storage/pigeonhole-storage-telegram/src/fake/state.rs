@@ -29,6 +29,8 @@ pub struct TelegramChannelState {
     by_random_id: BTreeMap<i64, i64>,
     /// Bumped by [`Command::ExpireReferences`]: older file references fail.
     reference_epoch: u8,
+    /// The latest pinned message ([`Command::Pin`]).
+    pinned: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +54,11 @@ pub enum Command {
         id: i64,
         message: Message,
     },
+    /// Pin message `id`: it becomes the pinned one, and a service message
+    /// says so.
+    Pin {
+        id: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +77,7 @@ pub enum Reply {
 
 impl FakeState for TelegramChannelState {
     const NAME: &'static str = "fake-telegram";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     type Command = Command;
     type Reply = Reply;
 
@@ -85,9 +92,21 @@ impl FakeState for TelegramChannelState {
                 Reply::Sent { id, fresh: true }
             }
             Command::Post { message } => Reply::Sent { id: self.post(message), fresh: true },
-            Command::Delete { ids } => Reply::Released {
-                blobs: ids.iter().filter_map(|id| self.messages.remove(id)).filter_map(blob).collect(),
-            },
+            Command::Delete { ids } => {
+                if self.pinned.is_some_and(|p| ids.contains(&p)) {
+                    self.pinned = None;
+                }
+                Reply::Released {
+                    blobs: ids.iter().filter_map(|id| self.messages.remove(id)).filter_map(blob).collect(),
+                }
+            }
+            Command::Pin { id } => {
+                if self.messages.contains_key(&id) {
+                    self.pinned = Some(id);
+                    self.post(Message::Other);
+                }
+                Reply::Done
+            }
             Command::ExpireReferences => {
                 self.reference_epoch = self.reference_epoch.wrapping_add(1);
                 Reply::Done
@@ -112,6 +131,10 @@ impl TelegramChannelState {
         self.top += 1;
         self.messages.insert(self.top, message);
         self.top
+    }
+
+    pub fn pinned(&self) -> Option<i64> {
+        self.pinned
     }
 
     pub fn message(&self, id: i64) -> Option<&Message> {

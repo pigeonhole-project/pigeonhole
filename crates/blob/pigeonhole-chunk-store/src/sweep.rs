@@ -160,7 +160,7 @@ impl Sweeper {
 
         loop {
             let keys = backend
-                .candidates(after.as_deref(), &upto, batch)
+                .candidates(self.pins.owner(), after.as_deref(), &upto, batch)
                 .await
                 .with_context(|| format!("candidates for {instance_id}"))?;
             if keys.is_empty() {
@@ -248,9 +248,14 @@ mod tests {
         Sweeper::new(f.db.clone(), vec![f.backend.clone()], config, f.pins.clone())
     }
 
+    /// A name of this deployment's blobs.
+    fn ours(f: &Fixture) -> String {
+        pigeonhole_blob::BlobId::random_of(f.pins.owner()).name()
+    }
+
     /// An upload this process saw finish and never committed (a failed chunk).
     async fn orphan(f: &Fixture, data: &'static [u8]) -> BlobLocator {
-        let loc = f.backend.put(Bytes::from_static(data), "orphan.bin").await.unwrap();
+        let loc = f.backend.put(Bytes::from_static(data), &ours(f)).await.unwrap();
         f.pins.returned("default", &loc.key);
         loc
     }
@@ -288,7 +293,7 @@ mod tests {
         let f = setup().await;
         let old = orphan(&f, b"old-orphan").await;
         // An upload this process never saw return (another writer's, say).
-        let unseen = f.backend.put(Bytes::from_static(b"unseen"), "orphan.bin").await.unwrap();
+        let unseen = f.backend.put(Bytes::from_static(b"unseen"), &ours(&f)).await.unwrap();
         let stats = sweeper(&f).sweep_once().await.unwrap();
         assert_eq!(stats.keys_deleted, 1);
         assert!(!on_backend(&f, &old));
@@ -301,7 +306,7 @@ mod tests {
         let before = orphan(&f, b"before").await;
         // A slow chunk: pinned, uploaded, not committed; later uploads finish.
         let pin = f.pins.pin("default");
-        let slow = f.backend.put(Bytes::from_static(b"slow-part"), "orphan.bin").await.unwrap();
+        let slow = f.backend.put(Bytes::from_static(b"slow-part"), &ours(&f)).await.unwrap();
         f.pins.returned("default", &slow.key);
         let after = orphan(&f, b"after").await;
 
@@ -430,7 +435,7 @@ mod tests {
     async fn restart_seeds_the_horizon_from_committed_parts() {
         let f = setup().await;
         // A dead writer's upload, then a committed chunk above it.
-        let dead = f.backend.put(Bytes::from_static(b"dead-writer"), "orphan.bin").await.unwrap();
+        let dead = f.backend.put(Bytes::from_static(b"dead-writer"), &ours(&f)).await.unwrap();
         let id = f.layer.put_small(Bytes::from_static(b"committed")).await.unwrap();
 
         // Restart: fresh pins, nothing returned in this process yet.
@@ -440,5 +445,31 @@ mod tests {
         assert_eq!(stats.keys_deleted, 1);
         assert!(!on_backend(&f, &dead));
         assert!(f.db.chunk_meta(id).await.unwrap().is_some());
+    }
+
+    /// Two deployments on one store by mistake: neither one's sweep takes
+    /// the other's blobs for orphans, though each knows only its own.
+    #[tokio::test]
+    async fn another_deployments_blobs_are_never_orphans() {
+        let a = setup().await;
+        let dir_b = tempfile::tempdir().unwrap();
+        let db_b = BlobDb::open(pigeonhole_testkit::tablet(dir_b.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let (layer_b, pins_b) = open_layer(db_b.clone(), a.backend.clone()).await;
+        assert_ne!(a.pins.owner(), pins_b.owner());
+
+        let id_a = a.layer.put_small(Bytes::from_static(b"a's object")).await.unwrap();
+        let id_b = layer_b.put_small(Bytes::from_static(b"b's object")).await.unwrap();
+        let both = a.mem.message_keys();
+        assert_eq!(both.len(), 2);
+
+        let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: Some(Duration::from_secs(1)) };
+        let by_b = Sweeper::new(db_b.clone(), vec![a.backend.clone()], config.clone(), pins_b).sweep_once().await;
+        assert_eq!(by_b.unwrap().keys_deleted, 0, "b's sweep left a's part");
+        assert_eq!(sweeper(&a).sweep_once().await.unwrap().keys_deleted, 0, "a's sweep left b's part");
+        assert_eq!(a.mem.message_keys(), both);
+        assert!(a.db.chunk_meta(id_a).await.unwrap().is_some());
+        assert!(db_b.chunk_meta(id_b).await.unwrap().is_some());
     }
 }

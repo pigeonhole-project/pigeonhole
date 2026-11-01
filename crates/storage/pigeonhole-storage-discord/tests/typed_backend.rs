@@ -61,7 +61,7 @@ async fn small_blobs_are_text_messages() {
     let big = first.put(pattern(5_000), &BlobId::random().name()).await.unwrap();
 
     let other = store_on(&channel);
-    let found = other.candidates(None, big.message_id, 10).await.unwrap();
+    let found = other.candidates(pigeonhole_storage_api::Owner(0), None, big.message_id, 10).await.unwrap();
     assert_eq!(found, vec![id.message_id, big.message_id]);
     let before = channel.calls();
     assert_eq!(collect_stream(other.get(&id, None).await.unwrap()).await.unwrap(), small);
@@ -106,10 +106,37 @@ async fn sweeps_only_our_blobs() {
         channel.post_text("noise");
     }
     let late = store.put(pattern(9_000), &BlobId::random().name()).await.unwrap().message_id;
-    assert_eq!(store.candidates(None, late + 5, 100).await.unwrap(), vec![ours, late]);
-    assert_eq!(store.candidates(Some(ours), late, 1).await.unwrap(), vec![late]);
-    assert!(store.candidates(Some(late), late + 5, 100).await.unwrap().is_empty());
+    assert_eq!(
+        store.candidates(pigeonhole_storage_api::Owner(0), None, late + 5, 100).await.unwrap(),
+        vec![ours, late]
+    );
+    assert_eq!(store.candidates(pigeonhole_storage_api::Owner(0), Some(ours), late, 1).await.unwrap(), vec![late]);
+    assert!(store.candidates(pigeonhole_storage_api::Owner(0), Some(late), late + 5, 100).await.unwrap().is_empty());
     store.delete(&[ours, late]).await.unwrap();
     let gone = store.get(&DiscordId { message_id: ours }, None).await;
     assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound);
+}
+
+/// The first deployment marks the channel with a pinned message; another
+/// one learns the channel is taken; two racing ones agree on the older.
+#[tokio::test]
+async fn a_pinned_marker_tells_whose_channel_it_is() {
+    use pigeonhole_storage_api::Owner;
+    use pigeonhole_storage_discord::DiscordApi;
+    let (channel, a) = store();
+    let (ours, theirs) = (Owner(0xa), Owner(0xb));
+    assert_eq!(a.mark_owner(ours).await.unwrap(), ours);
+    assert_eq!(channel.pinned().await.unwrap().len(), 1);
+    assert_eq!(store_on(&channel).mark_owner(theirs).await.unwrap(), ours, "the channel is taken");
+    let posts = channel.message_ids().len();
+    assert_eq!(store_on(&channel).mark_owner(ours).await.unwrap(), ours);
+    assert_eq!(channel.message_ids().len(), posts, "a marked channel takes no new post");
+
+    // A race on a new channel: the first posts its marker, the second marks
+    // and pins its own, then the first pins: both pinned, the older wins.
+    let fresh = Arc::new(FakeDiscord::new(78));
+    let older = fresh.post_text(&pigeonhole_storage_api::text::encode(&ours.marker_name(), b"marker"));
+    assert_eq!(store_on(&fresh).mark_owner(theirs).await.unwrap(), theirs, "nothing pinned yet: its own");
+    fresh.pin(older).await.unwrap();
+    assert_eq!(store_on(&fresh).mark_owner(theirs).await.unwrap(), ours, "the older pinned marker wins");
 }

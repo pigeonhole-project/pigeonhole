@@ -358,6 +358,8 @@ budgeted! {
     functions::messages::SendMedia => "messages.sendMedia", Spend::Class(SEND), Level::Class;
     functions::messages::SendMessage => "messages.sendMessage", Spend::Class(SEND), Level::Class;
     functions::channels::DeleteMessages => "channels.deleteMessages", Spend::Class(DELETE), Level::Class;
+    functions::channels::GetFullChannel => "channels.getFullChannel", Spend::Class(READ), Level::Class;
+    functions::messages::UpdatePinnedMessage => "messages.updatePinnedMessage", Spend::Class(SEND), Level::Class;
     // Not tied to a chat: a flood wait holds the whole bot.
     functions::upload::GetFile => "upload.getFile", Spend::Bot, Level::Bot;
     functions::upload::SaveFilePart => "upload.saveFilePart", Spend::Bot, Level::Bot;
@@ -755,6 +757,31 @@ impl ChannelApi for MtprotoChannel {
             id: ids.iter().map(|&id| id as i32).collect(),
         };
         self.invoke(None, &request).await?;
+        Ok(())
+    }
+
+    async fn pinned(&self) -> Result<Option<i64>> {
+        let request = functions::channels::GetFullChannel { channel: self.input_channel() };
+        let enums::messages::ChatFull::Full(full) = self.invoke(None, &request).await?;
+        Ok(match full.full_chat {
+            enums::ChatFull::ChannelFull(c) => c.pinned_msg_id.map(i64::from),
+            enums::ChatFull::Full(c) => c.pinned_msg_id.map(i64::from),
+            enums::ChatFull::CommunityFull(_) => None,
+        })
+    }
+
+    /// Needs the pin (supergroup) or edit (channel) messages admin right.
+    async fn pin(&self, id: i64) -> Result<()> {
+        let request = functions::messages::UpdatePinnedMessage {
+            silent: true,
+            unpin: false,
+            pm_oneside: false,
+            peer: self.input_peer(),
+            id: id as i32,
+        };
+        self.invoke(None, &request)
+            .await
+            .map_err(|e| e.context("pin a message: the bot needs the right to pin (or edit) messages"))?;
         Ok(())
     }
 }

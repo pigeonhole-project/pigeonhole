@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_limits::StoreLimiter;
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked,
-    NotFound, OpKind, Unavailable,
+    bytes_stream, slice_range, After, BlobBackend, BlobId, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole,
+    Linked, NotFound, OpKind, Unavailable,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -249,11 +249,23 @@ impl BlobBackend for MemoryBlobStore {
         Ok(())
     }
 
-    async fn candidates(&self, after: Option<Self::Key>, upto: Self::Key, limit: usize) -> Result<Vec<Self::Key>> {
+    async fn candidates(
+        &self,
+        owner: pigeonhole_storage_api::Owner,
+        after: Option<Self::Key>,
+        upto: Self::Key,
+        limit: usize,
+    ) -> Result<Vec<Self::Key>> {
         let _op = self.limiter.op().await;
         let messages = self.messages.lock().unwrap();
-        let mut keys: Vec<u64> =
-            messages.keys().copied().map(|m| m as u64).filter(|&k| k <= upto && after.is_none_or(|a| k > a)).collect();
+        let names = self.names.lock().unwrap();
+        let owned = |m: &i64| names.get(m).and_then(|n| BlobId::from_name(n)).is_some_and(|b| b.owner() == owner);
+        let mut keys: Vec<u64> = messages
+            .keys()
+            .filter(|m| owned(m))
+            .map(|&m| m as u64)
+            .filter(|&k| k <= upto && after.is_none_or(|a| k > a))
+            .collect();
         keys.sort_unstable();
         keys.truncate(limit);
         Ok(keys)
@@ -397,10 +409,10 @@ mod tests {
     #[tokio::test]
     async fn typed_backend_put_get_sweep() {
         let store = MemoryBlobStore::new();
-        let id = BlobBackend::put(&store, Bytes::from_static(b"typed"), "t.bin").await.unwrap();
+        let id = BlobBackend::put(&store, Bytes::from_static(b"typed"), &BlobId::random().name()).await.unwrap();
         let got = collect_stream(BlobBackend::get(&store, &id, None).await.unwrap()).await.unwrap();
         assert_eq!(got.as_ref(), b"typed");
-        let keys = BlobBackend::candidates(&store, None, u64::MAX, 10).await.unwrap();
+        let keys = BlobBackend::candidates(&store, pigeonhole_storage_api::Owner(0), None, u64::MAX, 10).await.unwrap();
         assert!(keys.contains(&id.message_id));
         BlobBackend::delete(&store, &[id.message_id]).await.unwrap();
         assert!(BlobBackend::get(&store, &id, None).await.is_err());

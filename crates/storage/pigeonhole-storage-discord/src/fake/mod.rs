@@ -23,6 +23,7 @@ pub struct Calls {
     pub start_thread: usize,
     pub archive_thread: usize,
     pub download: usize,
+    pub pin: usize,
 }
 
 /// What tests make a channel do wrong; not part of its state.
@@ -183,6 +184,16 @@ impl<H: FakeHost<DiscordChannelState>> DiscordApi for FakeDiscord<H> {
     async fn get_message(&self, id: u64) -> Result<Option<DcMessage>> {
         self.count(|c| c.get_message += 1);
         Ok(self.host.read(|s| s.view(self.id, id)))
+    }
+
+    async fn pinned(&self) -> Result<Vec<DcMessage>> {
+        Ok(self.host.read(|s| s.pinned().into_iter().filter_map(|id| s.view(self.id, id)).collect()))
+    }
+
+    async fn pin(&self, id: u64) -> Result<()> {
+        self.count(|c| c.pin += 1);
+        self.host.apply(Command::Pin { id }).await?;
+        Ok(())
     }
 
     async fn list(&self, before: Option<u64>, after: Option<u64>, limit: usize) -> Result<Vec<DcMessage>> {

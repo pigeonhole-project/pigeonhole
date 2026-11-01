@@ -10,7 +10,7 @@ use lru::LruCache;
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_api::text;
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind,
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind, Owner,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,9 @@ pub fn blob_nonce(channel: u64, name: &str) -> String {
     name.hash(&mut h);
     format!("b{:016x}{:08x}", a, h.finish() as u32)
 }
+
+/// What an owner marker says to a person reading the channel.
+const OWNER_MARKER: &[u8] = b"pigeonhole: the blobs in this channel are this deployment's";
 
 pub struct DiscordBlobStore<A> {
     limits: BackendLimits,
@@ -145,6 +148,16 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
     }
 
     /// Post blob `name` as text if it fits, else as an attachment; the message.
+    /// The owner the oldest pinned marker marks the channel for.
+    async fn pinned_owner(&self) -> Result<Option<Owner>> {
+        let pins = self.api.pinned().await?;
+        Ok(pins
+            .iter()
+            .filter_map(|m| blob_name(m).and_then(Owner::from_marker).map(|o| (m.id, o)))
+            .min()
+            .map(|(_, o)| o))
+    }
+
     pub(crate) async fn post_blob(&self, name: &str, data: Bytes, nonce: &str) -> Result<DcMessage> {
         let (bytes, as_text) = (data.len(), self.inline && text::fits(name, data.len(), CONTENT_MAX_CHARS));
         let m = if as_text {
@@ -231,6 +244,21 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
         Ok(DiscordId { message_id: m.id })
     }
 
+    /// The oldest pinned owner marker if there is one, else ours, posted and
+    /// pinned (read again after: of two deployments racing on a new channel,
+    /// the one whose marker is older keeps it).
+    async fn mark_owner(&self, owner: Owner) -> Result<Owner> {
+        if let Some(marked) = self.pinned_owner().await? {
+            return Ok(marked);
+        }
+        let name = owner.marker_name();
+        let nonce = blob_nonce(self.api.channel_id(), &name);
+        let m = self.post_blob(&name, Bytes::from_static(OWNER_MARKER), &nonce).await?;
+        self.api.pin(m.id).await?;
+        tracing::info!(store = %self.instance.id, %owner, message_id = m.id, "marked the channel as this deployment's");
+        Ok(self.pinned_owner().await?.unwrap_or(owner))
+    }
+
     /// The message, read from the channel now: a text blob's bytes stay in
     /// our cache after it was deleted.
     async fn exists(&self, id: &Self::Id) -> Result<bool> {
@@ -288,9 +316,16 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
         self.retire_links(keys).await
     }
 
-    /// Our blobs (attachments or texts named by a [`BlobId`]) with ids in
-    /// `(after, upto]`, listed 100 at a time; nothing else is a candidate.
-    async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
+    /// `owner`'s blobs (attachments or texts named by a [`BlobId`] of its)
+    /// with ids in `(after, upto]`, listed 100 at a time; nothing else is a
+    /// candidate.
+    async fn candidates(
+        &self,
+        owner: pigeonhole_storage_api::Owner,
+        after: Option<u64>,
+        upto: u64,
+        limit: usize,
+    ) -> Result<Vec<u64>> {
         let mut out = Vec::new();
         let mut cursor = after.unwrap_or(0);
         while out.len() < limit {
@@ -300,7 +335,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
                 if m.id > upto {
                     break;
                 }
-                if blob_name(m).and_then(BlobId::from_name).is_some() {
+                if blob_name(m).and_then(BlobId::from_name).is_some_and(|b| b.owner() == owner) {
                     self.remember(m);
                     out.push(m.id);
                 }

@@ -120,6 +120,14 @@ impl<C: ChannelApi> ChannelApi for PooledChannel<C> {
         self.pool.run(Spend::Class(DELETE), self.deadline, rate_limited, |m| self.members[m].delete_messages(ids)).await
     }
 
+    async fn pinned(&self) -> Result<Option<i64>> {
+        self.pool.run(Spend::Class(READ), self.deadline, rate_limited, |m| self.members[m].pinned()).await
+    }
+
+    async fn pin(&self, id: i64) -> Result<()> {
+        self.pool.run(Spend::Class(SEND), self.deadline, rate_limited, |m| self.members[m].pin(id)).await
+    }
+
     /// The holder whose download budget (its bot's) is ready soonest, unless
     /// a bot without a location could read the message (`read`, and its bot)
     /// sooner still: then [`ReadVia::Locate`], and it gets one.
@@ -200,6 +208,12 @@ mod tests {
         }
         async fn delete_messages(&self, ids: &[i64]) -> Result<()> {
             self.channel.delete_messages(ids).await
+        }
+        async fn pinned(&self) -> Result<Option<i64>> {
+            self.channel.pinned().await
+        }
+        async fn pin(&self, id: i64) -> Result<()> {
+            self.channel.pin(id).await
         }
     }
 

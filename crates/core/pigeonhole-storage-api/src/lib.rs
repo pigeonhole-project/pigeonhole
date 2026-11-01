@@ -14,7 +14,7 @@ pub mod fake;
 mod stream;
 pub mod text;
 
-pub use backend::{BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey};
+pub use backend::{BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey, Owner};
 pub use chain::{After, Chain, LeaseChain, Linked, MakeAfter, PUT_AFTER_TAIL_ATTEMPTS};
 pub use error::{Failure, NotFound, RateLimited, Unavailable};
 pub use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};

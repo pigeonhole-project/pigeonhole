@@ -76,4 +76,14 @@ impl<C: ChannelApi> ChannelApi for FakeBot<C> {
         self.spend(Spend::Class(DELETE), "delete_messages").await?;
         self.channel.delete_messages(ids).await
     }
+
+    async fn pinned(&self) -> Result<Option<i64>> {
+        self.spend(Spend::Class(READ), "pinned").await?;
+        self.channel.pinned().await
+    }
+
+    async fn pin(&self, id: i64) -> Result<()> {
+        self.spend(Spend::Class(SEND), "pin").await?;
+        self.channel.pin(id).await
+    }
 }

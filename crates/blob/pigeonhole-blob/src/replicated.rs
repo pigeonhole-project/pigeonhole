@@ -854,7 +854,13 @@ mod tests {
             }
             Ok(())
         }
-        async fn candidates(&self, after: Option<u64>, upto: u64, limit: usize) -> Result<Vec<u64>> {
+        async fn candidates(
+            &self,
+            _owner: pigeonhole_storage_api::Owner,
+            after: Option<u64>,
+            upto: u64,
+            limit: usize,
+        ) -> Result<Vec<u64>> {
             let mut keys: Vec<u64> = self
                 .data
                 .lock()

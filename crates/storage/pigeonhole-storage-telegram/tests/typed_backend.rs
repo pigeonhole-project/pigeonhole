@@ -82,11 +82,11 @@ async fn sweeps_only_our_blobs_and_reads_ranges_of_100_ids() {
     let late = store.put(pattern(10), &BlobId::random().name()).await.unwrap().message_id;
     let top = late + 5;
 
-    let got = store.candidates(None, top, 100).await.unwrap();
+    let got = store.candidates(pigeonhole_storage_api::Owner(0), None, top, 100).await.unwrap();
     assert_eq!(got, vec![ours, late]);
     assert_eq!(channel.calls().get_messages, 2, "{late} ids in pages of 100");
-    assert_eq!(store.candidates(Some(ours), top, 1).await.unwrap(), vec![late]);
-    assert!(store.candidates(Some(late), top, 100).await.unwrap().is_empty());
+    assert_eq!(store.candidates(pigeonhole_storage_api::Owner(0), Some(ours), top, 1).await.unwrap(), vec![late]);
+    assert!(store.candidates(pigeonhole_storage_api::Owner(0), Some(late), top, 100).await.unwrap().is_empty());
 
     // The listing also tells where the blobs are: reading them needs no lookup.
     let before = channel.calls().get_messages;
@@ -119,7 +119,10 @@ async fn small_blobs_are_text_messages() {
     assert_eq!((channel.calls().send_text, channel.calls().send_document), (1, 1));
 
     let (_, other) = store_on(channel.clone());
-    assert_eq!(other.candidates(None, big.message_id, 10).await.unwrap(), vec![id.message_id, big.message_id]);
+    assert_eq!(
+        other.candidates(pigeonhole_storage_api::Owner(0), None, big.message_id, 10).await.unwrap(),
+        vec![id.message_id, big.message_id]
+    );
     let reads = channel.calls();
     assert_eq!(collect_stream(other.get(&id, None).await.unwrap()).await.unwrap(), small);
     assert_eq!(collect_stream(other.get(&id, Some(10..20)).await.unwrap()).await.unwrap(), small.slice(10..20));
@@ -133,4 +136,28 @@ async fn small_blobs_are_text_messages() {
     let docs = docs.with_inline(false);
     docs.put(pattern(10), &BlobId::random().name()).await.unwrap();
     assert_eq!((channel.calls().send_text, channel.calls().send_document), (0, 1));
+}
+
+/// The first deployment marks the channel with a pinned message; another
+/// one learns the channel is taken; the first one again posts nothing.
+#[tokio::test]
+async fn a_pinned_marker_tells_whose_channel_it_is() {
+    use pigeonhole_storage_api::Owner;
+    let (channel, a) = store();
+    let (ours, theirs) = (Owner(0xa), Owner(0xb));
+    assert_eq!(a.mark_owner(ours).await.unwrap(), ours);
+    let marker = channel.names().into_iter().find(|(_, n)| n.starts_with(&ours.marker_name())).unwrap().0;
+    assert_eq!(channel.pinned_now(), Some(marker));
+
+    let (_, b) = store_on(channel.clone());
+    assert_eq!(b.mark_owner(theirs).await.unwrap(), ours, "the channel is taken");
+    let posts = channel.message_ids().len();
+    assert_eq!(store_on(channel.clone()).1.mark_owner(ours).await.unwrap(), ours);
+    assert_eq!(channel.message_ids().len(), posts, "a marked channel takes no new post");
+
+    // Someone pins another message: the next start marks the channel again.
+    let other = channel.post_text();
+    channel.pin_now(other);
+    assert_eq!(store_on(channel.clone()).1.mark_owner(ours).await.unwrap(), ours);
+    assert_ne!(channel.pinned_now(), Some(other));
 }
