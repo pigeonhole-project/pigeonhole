@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{title}}</title>
 <meta name="description" content="{{meta_desc}}">
+<link rel="stylesheet" href="{{@root}}assets/chat.css">
+<link rel="stylesheet" href="{{@root}}assets/log.css">
 <link rel="stylesheet" href="{{@root}}assets/site.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐦</text></svg>">
 </head>
@@ -39,17 +41,12 @@
       <div class="pane-h"><span class="dots"><i></i><i></i><i></i></span>{{replay.terminal}}</div>
       <div class="term-body" data-role="term"></div>
     </div>
-    <div class="pane chat tg">
-      <div class="pane-h"><span class="avatar">P</span><div><b>pigeonhole-blobs</b><small>{{replay.tg_sub}}</small></div></div>
-      <div class="msgs" data-role="telegram"><p class="empty">{{replay.empty}}</p></div>
-    </div>
-    <div class="pane chat dc">
-      <div class="pane-h"><span class="hash">#</span><div><b>pigeonhole-blobs</b><small>{{replay.dc_sub}}</small></div></div>
-      <div class="msgs" data-role="discord"><p class="empty">{{replay.empty}}</p></div>
-    </div>
-    <div class="pane log">
+    <div class="pane lane lane-tg" data-role="telegram"></div>
+    <div class="pane lane lane-dc" data-role="discord"></div>
+    <div class="pane log-pane">
       <div class="pane-h">{{replay.log}} <small>{{replay.log_sub}}</small></div>
       <div class="log-body" data-role="log"></div>
+      <ul class="entries log-open" data-role="entry" hidden></ul>
     </div>
     <div class="narration" data-role="say" aria-live="polite"></div>
     <div class="controls">

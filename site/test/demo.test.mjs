@@ -147,7 +147,7 @@ test("chatModel: what each message is, and the posts not shown", () => {
       {id: "14", kind: "document", name: "ph-2.bin", size: 9, gone: true},
     ],
   };
-  const model = chatModel(c);
+  const model = chatModel(c, true);
   assert.equal(model.earlier, 2);
   assert.equal(model.pins, 1);
   const [owner, text, service, gone] = model.messages;
@@ -157,6 +157,7 @@ test("chatModel: what each message is, and the posts not shown", () => {
   assert.equal(text.text, "ph-1.bin 461\n漢…");
   assert.equal(service.kind, "service");
   assert.ok(!gone.deletable && text.deletable);
+  assert.ok(chatModel(c).messages.every(m => !m.deletable));
   // A Discord id carries its time: 2015-01-01 plus the high bits, in ms.
   assert.equal(chatModel({...c, messages: [{id: String(1000n << 22n), kind: "other"}]}).messages[0].at.getTime(), 1420070401000);
 });
@@ -171,7 +172,7 @@ test("chatModel: the log's own posts are quiet; nothing to delete outside data c
       {id: 2, kind: "text", log: {what: "batch", gen: 1, first: 3, last: 4}},
     ],
   };
-  const [claim, batch] = chatModel(c).messages;
+  const [claim, batch] = chatModel(c, true).messages;
   assert.ok(claim.quiet && !batch.quiet);
   assert.deepEqual(batch.notes, ["demo.post_batch"]);
   assert.ok(!claim.deletable);

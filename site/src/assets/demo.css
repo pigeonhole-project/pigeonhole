@@ -98,7 +98,6 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .flight { pointer-events: none; }
 .node.landed .shape { animation: landed .6s ease-out; }
 @keyframes landed { 25% { stroke: var(--teal); stroke-width: 3; } }
-@keyframes arrive { 30% { transform: scale(1.06); } }
 
 /* the panel */
 .panel {
@@ -143,170 +142,18 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
   font: 12.5px/1.6 var(--mono); background: var(--feather); border: 1px solid var(--line); border-radius: 10px;
 }
 
-/* a channel's feed, in its app's look */
-.feed { display: flex; flex-direction: column; gap: 8px; padding: 14px; border-radius: 14px; min-height: 120px; }
-.feed.telegram { background: #e6ebf1; }
-.feed.discord { background: #ffffff; border: 1px solid var(--line); }
-:root[data-theme="dark"] .feed.telegram { background: #17212b; }
-:root[data-theme="dark"] .feed.discord { background: #313338; }
-@media (prefers-color-scheme: dark) {
-  :root:where(:not([data-theme="light"])) .feed.telegram { background: #17212b; }
-  :root:where(:not([data-theme="light"])) .feed.discord { background: #313338; }
-}
-.msg { max-width: 88%; padding: 8px 12px; border-radius: 14px 14px 14px 4px; background: var(--plume); box-shadow: 0 1px 1px rgba(0,0,0,.06); }
-.feed.discord .msg { max-width: 100%; border-radius: 6px; box-shadow: none; background: transparent; padding: 4px 0; }
-.msg .file { display: flex; gap: 10px; align-items: center; }
-.msg .glyph { width: 34px; height: 34px; border-radius: 50%; flex: none; display: grid; place-items: center; color: #fff; font-size: 14px; }
-.feed.telegram .glyph { background: var(--tg); }
-.feed.discord .glyph { background: var(--dc); border-radius: 8px; }
-.msg .fname { font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
-.feed.telegram .fname { color: var(--tg); }
-.feed.discord .fname { color: var(--dc); }
-.msg .meta { font-size: 12.5px; color: var(--slate); }
-.msg .cjk {
-  font-size: 15px; line-height: 1.35; word-break: break-all;
-  font-family: "PingFang SC", "Hiragino Sans", "Songti SC", "Noto Sans CJK SC", "SimSun-ExtB", sans-serif;
-}
-.msg.gone { opacity: .35; text-decoration: line-through; }
-.msg.fresh { animation: arrive .45s ease-out; }
 
-/* the log, entry by entry */
-.log-head { display: flex; gap: 24px; color: var(--slate); font-size: 14px; margin-bottom: 8px; }
-.entries { list-style: none; margin: 0; padding: 0; }
-.entry { border-top: 1px solid var(--line); }
-.entry > button {
-  width: 100%; display: grid; grid-template-columns: 4.5em 1fr auto; gap: 12px; align-items: baseline;
-  padding: 9px 4px; background: none; border: 0; text-align: left; cursor: pointer;
-}
-.entry .pos { font-family: var(--mono); color: var(--slate); font-variant-numeric: tabular-nums; }
-.entry .what { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.entry .term { color: var(--slate); font-size: 13px; }
-.entry.base { border-top: 2px solid var(--amethyst); }
-.entry.fresh > button { animation: arrive .45s ease-out; }
-.cmds { margin: 0 0 10px 5.4em; padding: 0; list-style: none; }
-.cmd { padding: 6px 0; border-top: 1px dashed var(--line); }
-.cmd .ns { display: inline-block; min-width: 3.4em; font-family: var(--mono); font-size: 12.5px; color: var(--teal); }
-.cmd .verb { font-weight: 600; }
-.cmd .fields { display: block; color: var(--wing-2); font-size: 14px; margin-top: 2px; }
-.cmd details summary { cursor: pointer; color: var(--slate); font-size: 13px; margin-top: 4px; }
-.cmd pre { font: 12px/1.5 var(--mono); background: var(--feather); padding: 10px; border-radius: 8px; overflow: auto; max-height: 320px; }
 
 @media (max-width: 800px) {
   .loft.zoomed { grid-template-columns: 1fr; grid-template-rows: 30vh minmax(0, 1fr); }
   .panel { border-left: 0; border-top: 1px solid var(--line); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .node.landed .shape, .msg.fresh, .entry.fresh > button { animation: none; }
+  .node.landed .shape { animation: none; }
 }
 .panel[hidden] { display: none; }
 
-/* ---------------------------------------------------------------- the apps
-   Inside a channel's panel: Telegram's and Discord's own look, their light
-   and dark themes following the site's, and the system font they use. */
-.app {
-  --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-  font-family: var(--ui); font-stretch: 100%;
-  display: flex; flex-direction: column; height: min(72vh, 680px);
-  border-radius: 14px; overflow: hidden; border: 1px solid var(--line);
-}
-.app .cjk {
-  font-family: "PingFang SC", "Hiragino Sans", "Songti SC", "Noto Sans CJK SC", "SimSun-ExtB", var(--ui);
-  word-break: break-all; white-space: pre-line;
-}
-.app .gone { opacity: .35; }
-.app .fresh { animation: arrive .45s ease-out; }
 
-/* Telegram, a channel */
-.app.tg {
-  --tg-bar: #ffffff; --tg-ink: #000000; --tg-sub: #707579; --tg-bubble: #ffffff; --tg-accent: #3390ec;
-  --tg-meta: #a0acb6; --tg-wall: linear-gradient(140deg, #dbddbb 0%, #a6c48c 35%, #d5d88d 65%, #88b884 100%);
-}
-:root[data-theme="dark"] .app.tg {
-  --tg-bar: #212121; --tg-ink: #ffffff; --tg-sub: #aaaaaa; --tg-bubble: #212121; --tg-accent: #8774e1;
-  --tg-meta: #8b8b8b; --tg-wall: linear-gradient(140deg, #0f0f0f 0%, #1a2026 60%, #10151a 100%);
-}
-@media (prefers-color-scheme: dark) {
-  :root:where(:not([data-theme="light"])) .app.tg {
-    --tg-bar: #212121; --tg-ink: #ffffff; --tg-sub: #aaaaaa; --tg-bubble: #212121; --tg-accent: #8774e1;
-    --tg-meta: #8b8b8b; --tg-wall: linear-gradient(140deg, #0f0f0f 0%, #1a2026 60%, #10151a 100%);
-  }
-}
-.tg-head { display: flex; gap: 12px; align-items: center; padding: 8px 16px; background: var(--tg-bar); color: var(--tg-ink); }
-.tg-head b { display: block; font-size: 16px; font-weight: 600; }
-.tg-head small { color: var(--tg-sub); font-size: 14px; }
-.tg-ava {
-  width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; flex: none;
-  color: #fff; font-weight: 600; font-size: 16px; background: linear-gradient(#72d5fd, #2a9ef1);
-}
-.tg-chat { flex: 1; overflow: auto; background: var(--tg-wall); padding: 14px 18px; display: flex; flex-direction: column; gap: 6px; }
-.tg-empty { margin: auto; padding: 6px 12px; border-radius: 12px; background: rgba(0,0,0,.25); color: #fff; font-size: 14px; }
-.tg-post {
-  align-self: flex-start; max-width: min(440px, 88%); background: var(--tg-bubble); color: var(--tg-ink);
-  border-radius: 12px 12px 12px 4px; padding: 6px 10px 5px; box-shadow: 0 1px 2px rgba(0,0,0,.13);
-  position: relative;
-}
-.tg-author { color: var(--tg-accent); font-size: 14px; font-weight: 600; margin-bottom: 2px; }
-.tg-text { font-size: 15px; line-height: 1.35; }
-.tg-doc { display: flex; gap: 10px; align-items: center; padding: 2px 0; }
-.tg-doc-ic { width: 46px; height: 46px; border-radius: 50%; background: var(--tg-accent); display: grid; place-items: center; flex: none; }
-.tg-doc-ic .ic { width: 24px; height: 24px; fill: none; stroke: #fff; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
-.tg-doc-name { font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
-.tg-doc-size { color: var(--tg-sub); font-size: 14px; }
-.tg-meta { display: flex; justify-content: flex-end; align-items: center; gap: 3px; color: var(--tg-meta); font-size: 12px; margin-top: 2px; }
-.tg-meta .eye { width: 15px; height: 15px; fill: currentColor; }
-.tg-input { background: var(--tg-bar); color: var(--tg-sub); padding: 14px 18px; font-size: 15px; border-top: 1px solid rgba(0,0,0,.06); }
-
-/* Discord, a text channel */
-.app.dc {
-  --dc-bg: #ffffff; --dc-ink: #313338; --dc-head: #060607; --dc-muted: #5c5e66; --dc-line: #e1e2e4;
-  --dc-card: #f2f3f5; --dc-link: #006ce7; --dc-input: #ebedef; --dc-hover: #f2f3f5;
-}
-:root[data-theme="dark"] .app.dc {
-  --dc-bg: #313338; --dc-ink: #dbdee1; --dc-head: #f2f3f5; --dc-muted: #949ba4; --dc-line: #3f4147;
-  --dc-card: #2b2d31; --dc-link: #00a8fc; --dc-input: #383a40; --dc-hover: #2e3035;
-}
-@media (prefers-color-scheme: dark) {
-  :root:where(:not([data-theme="light"])) .app.dc {
-    --dc-bg: #313338; --dc-ink: #dbdee1; --dc-head: #f2f3f5; --dc-muted: #949ba4; --dc-line: #3f4147;
-    --dc-card: #2b2d31; --dc-link: #00a8fc; --dc-input: #383a40; --dc-hover: #2e3035;
-  }
-}
-.app.dc { background: var(--dc-bg); color: var(--dc-ink); }
-.dc-head { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--dc-line); box-shadow: 0 1px 0 rgba(0,0,0,.04); }
-.dc-head b { color: var(--dc-head); font-size: 16px; }
-.dc-hash { color: var(--dc-muted); font-size: 24px; line-height: 1; font-weight: 400; }
-.dc-topic { color: var(--dc-muted); font-size: 14px; padding-left: 10px; margin-left: 4px; border-left: 1px solid var(--dc-line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dc-chat { flex: 1; overflow: auto; padding: 8px 0 16px; }
-.dc-empty { color: var(--dc-muted); padding: 16px; }
-.dc-day { display: flex; align-items: center; gap: 8px; color: var(--dc-muted); font-size: 12px; font-weight: 600; margin: 8px 16px; }
-.dc-day::before, .dc-day::after { content: ""; flex: 1; height: 1px; background: var(--dc-line); }
-.dc-msg { position: relative; display: grid; grid-template-columns: 40px 1fr; column-gap: 16px; padding: 2px 16px 2px; margin-top: 14px; }
-.dc-msg.grouped { margin-top: 0; }
-.dc-msg:hover { background: var(--dc-hover); }
-.dc-ava { grid-row: span 2; width: 40px; height: 40px; border-radius: 50%; background: #5865f2; display: grid; place-items: center; font-size: 20px; }
-.dc-msg.grouped .dc-body { grid-column: 2; }
-.dc-top { display: flex; align-items: baseline; gap: 6px; }
-.dc-name { color: var(--dc-head); font-weight: 600; font-size: 16px; }
-.dc-tag { background: #5865f2; color: #fff; font-size: 10px; font-weight: 600; padding: 1px 4px; border-radius: 3px; position: relative; top: -2px; }
-.dc-time { color: var(--dc-muted); font-size: 12px; }
-.dc-text { font-size: 16px; line-height: 1.375; }
-.dc-file {
-  display: flex; gap: 10px; align-items: center; margin: 4px 0; max-width: 420px;
-  background: var(--dc-card); border: 1px solid var(--dc-line); border-radius: 8px; padding: 10px;
-}
-.dc-file .doc { width: 30px; height: 40px; fill: #e3e5e8; stroke: #949ba4; stroke-width: 1.2; flex: none; }
-.dc-file-name { color: var(--dc-link); font-size: 16px; overflow-wrap: anywhere; }
-.dc-file-size { color: var(--dc-muted); font-size: 12px; }
-.dc-input { margin: 0 16px 16px; padding: 11px 16px; border-radius: 8px; background: var(--dc-input); color: var(--dc-muted); font-size: 16px; }
-.tg-day { align-self: center; padding: 2px 10px; border-radius: 12px; background: rgba(0,0,0,.22); color: #fff; font-size: 13px; font-weight: 500; margin: 4px 0; }
-
-/* the log's two views */
-.tabs { display: inline-flex; gap: 2px; padding: 3px; border-radius: 10px; background: var(--feather); border: 1px solid var(--line); margin-bottom: 14px; }
-.tab { border: 0; background: none; padding: 6px 14px; border-radius: 7px; cursor: pointer; font-size: 14px; color: var(--wing-2); }
-.tab[aria-selected="true"] { background: var(--plume); color: var(--wing); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
-.post-log { margin-top: 4px; font-size: 12.5px; color: var(--teal); font-weight: 500; }
-.app .service { opacity: .62; }
-.log-note { color: var(--slate); font-size: 13.5px; margin: 0 0 12px; max-width: 70ch; }
 
 /* the wizard: the setup on the right, its sketch on the graph */
 .loft.zoomed.wizard { grid-template-columns: 1fr minmax(340px, 40%); }
@@ -360,25 +207,12 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .meter .fill.amethyst { background: var(--amethyst); }
 .jobs { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 10px 0 0; }
 .job-tile { font: 12px var(--mono); padding: 3px 8px; border-radius: 6px; border: 1px solid var(--eye); color: var(--eye); }
-.deletable { position: relative; }
-/* The delete button: the same place in both apps, the line's top right. */
-.msg-del {
-  position: absolute; top: 2px; right: 8px; width: 28px; height: 28px; border-radius: 8px; border: 0;
-  display: grid; place-items: center; cursor: pointer; opacity: 0; background: rgba(0,0,0,.45); color: #fff;
-}
-.tg-line { position: relative; display: flex; flex-direction: column; align-items: flex-start; padding-right: 44px; }
-.dc-msg.deletable { padding-right: 44px; }
-.dc-gutter-time { position: absolute; left: 4px; top: 5px; width: 64px; text-align: center; white-space: nowrap; font-size: 10.5px; color: var(--dc-muted); opacity: 0; }
-.dc-msg:hover .dc-gutter-time { opacity: 1; }
 /* the graph's two groups of channels */
 .group { fill: none; stroke: var(--line); stroke-width: 1.5; }
 .group.meta { stroke-dasharray: 5 5; }
 .group-label { font-size: 13px; font-weight: 600; fill: var(--slate); }
 .edge.meta { stroke-dasharray: 4 5; }
 .node .shape.meta { fill: var(--feather); }
-.msg-del .ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.deletable:hover .msg-del, .msg-del:focus-visible { opacity: 1; }
-@media (hover: none) { .msg-del { opacity: .8; } }
 
 /* the node's background tasks: in the dovecote's windows, cards in its panel */
 .win { cursor: pointer; }
@@ -414,15 +248,6 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .switch[aria-checked="true"]::after { left: 16px; background: #fff; }
 .job-tile.more { border-style: dashed; }
 
-/* pins: Telegram's bar under the header, Discord's count in it */
-.tg-pinbar { display: flex; gap: 10px; align-items: center; padding: 6px 14px; background: var(--tg-bar); color: var(--tg-ink); border-top: 1px solid rgba(127,127,127,.18); font-size: 13px; }
-.tg-pinbar b { color: #3390ec; font-weight: 600; }
-.tg-pinbar-text { opacity: .8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60ch; }
-.tg-pinbar .ic, .dc-pins .ic, .tg-meta .pin { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.tg-pinbar .ic { color: #3390ec; }
-.tg-service-line { align-items: center; padding-right: 0; }
-.dc-pins { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--dc-muted); font-size: 13px; }
-.dc-pinned { font-size: 12px; color: var(--dc-muted); margin-bottom: 2px; }
 
 /* the page as a real node's admin: no restart, no erase; a bucket to pick */
 body.admin #config-apply, body.admin #config-reset, body.admin #erase { display: none; }

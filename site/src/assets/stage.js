@@ -1,17 +1,27 @@
 // The home page's stage: a terminal, two channels, the metadata log and a
-// sentence, drawn from a recorded trace's steps (site/record.py), in
-// panes named by the recording's stores: "telegram" and "discord".
-import {h} from "./lib/dom.js";
+// sentence, drawn from a recorded trace (site/record.py). The channels are
+// the demo's chat views (demo/chat), named by the recording's stores:
+// "telegram" and "discord"; the log's entries open into their commands as
+// on the demo's log panel (demo/log-view.js).
+//
+// trace: {steps, log: the entries with their commands}; `at(t)`: the Date
+// of a step's time t (ms into the recording).
+import {chatView} from "./demo/chat/index.js";
+import {entryView} from "./demo/log-view.js";
+import {button, h} from "./lib/dom.js";
 import {bytes, t, tHtml} from "./lib/i18n.js";
 
-export function makeStage(stage) {
+// Both recorded channels hold the chunks under one name, as a deployment's would.
+const CHANNEL = "blobs";
+
+export function makeStage(stage, {entries, at}) {
   const $ = role => stage.querySelector(`[data-role="${role}"]`);
   const term = $("term"),
     log = $("log"),
+    opened = $("entry"),
     say = $("say");
-  const lanes = {telegram: $("telegram"), discord: $("discord")};
-  for (const lane of Object.values(lanes)) lane.dataset.empty = lane.querySelector(".empty")?.textContent || "";
-  let entry = null; // the log entry being committed
+  const lanes = Object.fromEntries(["telegram", "discord"].map(kind => [kind, {el: $(kind), channel: null}]));
+  let chip = null; // the log entry being committed
 
   const secs = ms => `+${(ms / 1000).toFixed(2)} s`;
   function termLine(cls, text, ts) {
@@ -24,75 +34,54 @@ export function makeStage(stage) {
     return body;
   }
 
-  // A chip with the payload's size, from the terminal to the channel.
-  function fly(lane, label) {
+  // A tag with the payload's size, from the terminal to the channel.
+  function fly(kind, label) {
     const from = term.getBoundingClientRect(),
-      to = lanes[lane].getBoundingClientRect(),
+      to = lanes[kind].el.getBoundingClientRect(),
       box = stage.getBoundingClientRect();
-    const chip = h("div", "flyer", label);
-    chip.style.background = lane === "telegram" ? "var(--tg)" : "var(--dc)";
-    chip.style.left = `${from.right - box.left - 120}px`;
-    chip.style.top = `${from.top - box.top + from.height * 0.55}px`;
-    stage.append(chip);
+    const tag = h("div", "flyer", label);
+    tag.style.background = kind === "telegram" ? "var(--tg)" : "var(--dc)";
+    tag.style.left = `${from.right - box.left - 120}px`;
+    tag.style.top = `${from.top - box.top + from.height * 0.55}px`;
+    stage.append(tag);
     requestAnimationFrame(() =>
       requestAnimationFrame(() => {
-        chip.style.transform = `translate(${to.left - from.right + 140}px, ${to.bottom - from.top - from.height * 0.55 - 40}px)`;
-        chip.style.opacity = "0.15";
+        tag.style.transform = `translate(${to.left - from.right + 140}px, ${to.bottom - from.top - from.height * 0.55 - 40}px)`;
+        tag.style.opacity = "0.15";
       }),
     );
-    setTimeout(() => chip.remove(), 600);
+    setTimeout(() => tag.remove(), 600);
   }
 
-  // A post's text: the payload as text, or the file's name; its size and id.
-  function postBody(e) {
-    const short = String(e.name || "").replace(/^ph-(\w{6})\w+(\w{4})\.bin$/, "ph-$1…$2.bin");
-    // Discord ids are snowflakes (time in the high bits): the tail tells them apart.
-    const id = String(e.msg ?? "");
-    const meta = `${bytes(e.bytes)} · ${t("msg", {n: id.length > 8 ? `…${id.slice(-6)}` : id})}`;
-    const col = h("div");
-    col.style.minWidth = "0";
-    if (e.kind === "text") col.append(h("div", "ttext", e.preview ? `${e.preview}…` : short), h("div", "fmeta", `${t("as_text")} · ${meta}`));
-    else col.append(h("div", "fname", short), h("div", "fmeta", meta));
-    return col;
-  }
+  const drawLane = lane => lane.el.replaceChildren(chatView(lane.channel));
 
-  function telegramPost(e) {
-    const node = h("div", `bubble pop${e.kind === "text" ? " text" : ""}`);
-    if (e.kind !== "text") node.append(h("div", "file", "⬇"));
-    node.append(postBody(e));
-    return node;
-  }
-
-  function discordPost(e) {
-    const name = h("div", "name", "pigeonhole");
-    name.append(h("small", "", "BOT"));
-    const col = h("div");
-    if (e.kind === "text") col.append(name, postBody(e));
-    else {
-      const att = h("div", "att");
-      att.append(h("span", "ic", "🗎"), postBody(e));
-      col.append(name, att);
-    }
-    const node = h("div", "post pop");
-    node.append(h("div", "who", "P"), col);
-    return node;
-  }
-
+  // A post in a channel, the newest one marked.
   function post(e) {
-    const lane = lanes[e.store];
-    lane.querySelector(".empty")?.remove();
-    lane.append(e.store === "telegram" ? telegramPost(e) : discordPost(e));
-    lane.scrollTop = lane.scrollHeight;
+    const {channel} = lanes[e.store];
+    for (const m of channel.messages) m.fresh = false;
+    channel.messages.push({id: e.msg, kind: e.kind, name: e.name, size: e.bytes, preview: e.preview, fresh: true, at: at(e.t)});
+    channel.total++;
+    drawLane(lanes[e.store]);
   }
 
+  // A log batch: a chip for its entries; clicked, they open under the row.
   function logEntry(e) {
-    entry = h("div", "entry new");
-    entry.append(h("b", "", t("position", {n: e.first})), h("span", "", bytes(e.bytes || 0)));
-    log.append(entry);
+    const mine = entries.filter(x => x.position >= e.first && x.position <= e.last);
+    const b = button("log-chip pop", null, () => {
+      const open = b.getAttribute("aria-expanded") !== "true";
+      for (const c of log.querySelectorAll(".log-chip")) c.setAttribute("aria-expanded", "false");
+      b.setAttribute("aria-expanded", String(open));
+      opened.replaceChildren(...(open ? mine.map(x => entryView(x, {open: true})) : []));
+      opened.hidden = !open;
+    });
+    b.setAttribute("aria-expanded", "false");
+    b.append(h("b", "", t("position", {n: e.first})), h("span", "", bytes(e.bytes || 0)));
+    log.append(b);
+    chip = b;
     log.scrollLeft = log.scrollWidth;
   }
   function committed(e) {
-    if (entry) entry.querySelector("span").textContent += ` · ${t("commands", {n: e.entries})}`;
+    if (chip) chip.querySelector("span").textContent += ` · ${t("commands", {n: e.entries})}`;
   }
 
   // A say.* string ([key, vars]; the values are escaped), fading in.
@@ -106,10 +95,15 @@ export function makeStage(stage) {
   function reset() {
     term.replaceChildren();
     log.replaceChildren();
+    opened.replaceChildren();
+    opened.hidden = true;
     say.replaceChildren();
-    for (const lane of Object.values(lanes)) lane.replaceChildren(h("p", "empty", lane.dataset.empty));
+    for (const [kind, lane] of Object.entries(lanes)) {
+      lane.channel = {store: CHANNEL, kind, role: "data", total: 0, messages: []};
+      drawLane(lane);
+    }
     for (const f of stage.querySelectorAll(".flyer")) f.remove();
-    entry = null;
+    chip = null;
   }
 
   // Draws one step; resolves after its animation, `wait(ms)` paces it.

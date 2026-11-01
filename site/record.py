@@ -5,7 +5,8 @@ Starts the release binary on in-memory stores named `telegram` and `discord`
 (a replica group: every chunk goes to both), with JSON logs at debug, runs the
 scenario's AWS CLI commands, stops the server and keeps what the site plays
 back: the commands and their output, every store call, every log batch and
-commit, and the S3 operations that changed something.
+commit, the S3 operations that changed something, and the log's entries
+with their commands (the admin API's `log` op, as the demo reads it).
 
     cargo build --release -p pigeonhole
     python3 site/record.py              # every scenario
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,6 +69,9 @@ max_object_size = "off"
 [cache]
 enabled = {cache}
 
+[admin]
+listen_addr = "127.0.0.1:{admin}"
+
 [log]
 level = "warn,pigeonhole_meta=debug,pigeonhole_storage_memory=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,pigeonhole_chunk_store=info"
 format = "json"
@@ -91,6 +96,18 @@ SCENARIOS = {
         "aws s3 ls s3://demo/",
     ]),
 }
+
+
+def log_entries(admin: int) -> list[dict]:
+    """The log's entries, decoded: the `log` op on the admin API, framed as
+    the demo frames it (a JSON line, then the body: none)."""
+    body = json.dumps({"op": "log", "limit": 200, "len": 0}).encode() + b"\n"
+    req = urllib.request.Request(f"http://127.0.0.1:{admin}/admin/ops", data=body, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        reply = json.load(r)["reply"]
+    if "error" in reply:
+        raise SystemExit(f"log: {reply['error']}")
+    return reply["entries"]
 
 
 def free_port() -> int:
@@ -133,11 +150,11 @@ def event(line: dict) -> dict | None:
 
 def record(name: str) -> Path:
     knobs, commands = SCENARIOS[name]
-    port = free_port()
+    port, admin = free_port(), free_port()
     with tempfile.TemporaryDirectory(prefix="ph-rec-") as d:
         tmp = Path(d)
         files(tmp)
-        (tmp / "pigeonhole.toml").write_text(CONFIG.format(port=port, **knobs))
+        (tmp / "pigeonhole.toml").write_text(CONFIG.format(port=port, admin=admin, **knobs))
         log = (tmp / "server.jsonl").open("w")
         env = {"HOME": os.environ["HOME"], "PATH": os.environ["PATH"],
                "PIGEONHOLE_CONFIG": str(tmp / "pigeonhole.toml")}
@@ -167,6 +184,7 @@ def record(name: str) -> Path:
                                  if l.strip() and not l.startswith("Completed "))
                 steps.append({"t": now(), "type": "out", "text": text})
                 time.sleep(0.3)  # let commits that follow the answer land in this step
+            entries = log_entries(admin)
         finally:
             server.terminate()
             server.wait()
@@ -187,7 +205,7 @@ def record(name: str) -> Path:
         s["t"] = round((s["t"] - first) * 1000, 1)
     sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, text=True, capture_output=True).stdout.strip()
     out = {"name": name, "recorded": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-           "commit": sha, "config": knobs, "steps": steps}
+           "commit": sha, "config": knobs, "steps": steps, "log": entries}
     TRACES.mkdir(parents=True, exist_ok=True)
     path = TRACES / f"{name}.json"
     path.write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
