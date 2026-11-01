@@ -225,9 +225,10 @@
       win.g.classList.toggle("off", !period);
       win.g.classList.toggle("busy", busy);
       const name = t(`bg.${task.task}`);
-      const when = period ? t("bg.tip", {task: name, s: Math.ceil((task.next_in_ms || 0) / 1000)}) : t("bg.tip_off", {task: name});
+      const when = period ? t("bg.tip", {task: name, when: soon(task.next_in_ms)}) : t("bg.tip_off", {task: name});
       win.tip.textContent = task.task === "snapshot" ? `${when}; ${t(w.of ? "bg.entries_short" : "bg.entries_since", {n: w.n, of: w.of})}` : busy ? `${when}; ${t("bg.waiting", {n: w.n})}` : when;
     }
+    fillTip();
     if (state.open === "loft") renderBgPanel();
   }
 
@@ -260,7 +261,7 @@
       const fill = h("div", "fill");
       fill.style.width = period && task.next_in_ms != null ? `${100 * (1 - Math.min(1, task.next_in_ms / period))}%` : "0%";
       meter.append(fill);
-      card.append(meter, h("div", "task-when", period ? t("bg.next", {s: Math.ceil((task.next_in_ms || 0) / 1000)}) : t("bg.parked")));
+      card.append(meter, h("div", "task-when", period ? t("bg.next", {when: soon(task.next_in_ms)}) : t("bg.parked")));
       if (task.task === "snapshot") {
         if (w.of) {
           const m2 = h("div", "meter");
@@ -372,6 +373,43 @@
     return windows;
   }
 
+  // "45 s", "9 min": how long until a pass.
+  function soon(msLeft) {
+    const sec = Math.ceil((msLeft || 0) / 1000);
+    return sec < 120 ? t("time.s", {n: sec}) : t("time.min", {n: Math.round(sec / 60)});
+  }
+
+  // A window's tooltip: what the task is, when it passes next, what waits.
+  const tipBox = h("div", "tip");
+  tipBox.setAttribute("role", "tooltip");
+  tipBox.hidden = true;
+  document.body.append(tipBox);
+  let tipFor = null;
+  function showTip(task, el) {
+    tipFor = {task, el};
+    fillTip();
+    tipBox.hidden = false;
+    const r = el.getBoundingClientRect();
+    tipBox.style.left = `${Math.round(r.right + 12)}px`;
+    tipBox.style.top = `${Math.round(r.top - 8)}px`;
+  }
+  function hideTip() {
+    tipFor = null;
+    tipBox.hidden = true;
+  }
+  function fillTip() {
+    if (!tipFor) return;
+    const task = taskOf(tipFor.task);
+    tipBox.replaceChildren(h("b", "", t(`bg.${tipFor.task}`)), h("p", "", t(`bg.${tipFor.task}_note`)));
+    if (!task) return;
+    const period = ms(task.every), w = workOf(task);
+    tipBox.append(h("div", "tip-when", period ? t("bg.next", {when: soon(task.next_in_ms)}) : t("bg.parked")));
+    let work;
+    if (task.task === "snapshot") work = t(w.of ? "bg.entries_short" : "bg.entries_since", {n: w.n, of: w.of});
+    else work = w.n ? t("bg.waiting", {n: w.n}) : t("bg.idle");
+    tipBox.append(h("div", "tip-work" + (w.n ? " busy" : ""), work));
+  }
+
   // The background tasks live in the dovecote's windows: the light rises
   // as the next pass nears; a pigeon sits in while work waits (the badge
   // counts it); a task that is off has its shutters closed.
@@ -392,7 +430,11 @@
       s("circle", {cx: w.x + 11, cy: w.y - 9, r: 7}, badge);
       const count = s("text", {x: w.x + 11, y: w.y - 6, "text-anchor": "middle"}, badge);
       const tip = s("title", {}, g);
-      const open = e => { e.stopPropagation(); openPanel("loft"); $(`task-${task}`)?.scrollIntoView({block: "nearest"}); };
+      const open = e => { e.stopPropagation(); hideTip(); openPanel("loft"); $(`task-${task}`)?.scrollIntoView({block: "nearest"}); };
+      g.addEventListener("mouseenter", () => showTip(task, g));
+      g.addEventListener("focus", () => showTip(task, g));
+      g.addEventListener("mouseleave", hideTip);
+      g.addEventListener("blur", hideTip);
       g.addEventListener("click", open);
       g.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(e); } });
       loft.windows[task] = {g, w, light, bird, badge, count, tip};
