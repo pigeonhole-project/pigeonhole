@@ -51,7 +51,15 @@ Every loop waits on a `Schedule` (`pigeonhole_types::schedule`). Its
 - `None` parks the loop until it is turned back on;
 - `run_now` starts one pass even while the loop is off.
 
-The period counts from the end of the previous pass. The snapshot ticker's
+The period counts from the end of the previous pass.
+
+In a cluster only the leader does the work. Every loop but the snapshot
+ticker skips its pass on a follower (`MetaStore::is_leader`), so a new
+leader takes the work over with its next pass. Overrides reach the
+followers through replication. `DynConfig::follow` recomputes the knobs
+whenever they change, so a node that takes over runs with the latest
+ones, and each node's snapshot ticker follows `meta.snapshot_every`. On a
+follower, `PUT` and `DELETE` answer 503 (`NotLeader`): ask the leader. The snapshot ticker's
 control lives in the `MetaStore` (`snapshot_schedule()`). The bytestream
 server takes its GC schedules in `Gc`.
 

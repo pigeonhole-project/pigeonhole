@@ -26,6 +26,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     let index = Index::open(rt.meta.clone()).await.context("open s3 index")?;
 
     let s3_gateway = build_s3_gateway(cfg.s3_options(), index.clone(), rt.store.clone());
+    tokio::spawn(rt.dynamic.clone().follow());
     spawn_background_tasks(&rt);
     spawn_cooler(&rt, cfg.inline.max_object_size.is_some(), s3_gateway.clone());
     if cfg.metrics.enabled {

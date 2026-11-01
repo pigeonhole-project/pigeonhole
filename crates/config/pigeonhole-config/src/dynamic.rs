@@ -346,6 +346,25 @@ impl DynConfig {
         Ok(true)
     }
 
+    /// Keep the knobs in step with the overrides in the tablet as they
+    /// change by replication (on a follower, or written by the leader
+    /// before this node took over); ends once the tablet stops.
+    pub async fn follow(self: Arc<Self>) {
+        let mut changes = self.meta.changes();
+        let mut seen = self.overrides();
+        while changes.changed().await.is_ok() && !self.meta.is_stopped() {
+            if self.overrides() == seen {
+                continue;
+            }
+            let _one = self.writes.lock().await;
+            seen = self.overrides();
+            let (knobs, refused) = self.config.dynamic_lenient(&seen);
+            *self.refused.lock().unwrap() = refused;
+            self.apply(knobs);
+            tracing::info!(overrides = seen.len(), "config overrides changed by replication");
+        }
+    }
+
     fn apply(&self, knobs: DynamicConfig) {
         self.sweep.set(knobs.sweep);
         self.repair.set(knobs.repair);
@@ -518,6 +537,25 @@ mod tests {
         dynamic.set("repair.batch_size", "4").await.unwrap();
         assert_eq!(dynamic.repair.get().batch_size, 4);
         assert!(dynamic.keys().iter().all(|k| k.refused.is_none()));
+    }
+
+    #[tokio::test]
+    async fn overrides_by_replication_are_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = pigeonhole_testkit::tablet(dir.path(), DynConfig::register).await;
+        let dynamic = Arc::new(DynConfig::open(config(""), meta.clone()));
+        let follow = tokio::spawn(dynamic.clone().follow());
+        // As the leader's entry would reach a follower: not through `set`.
+        let set = OverrideCommand::Set { key: "repair.interval".into(), value: "off".into() };
+        meta.propose::<Overrides>(set).await.unwrap().unwrap();
+        for _ in 0..100 {
+            if dynamic.repair.get().interval.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(dynamic.repair.get().interval, None);
+        follow.abort();
     }
 
     #[tokio::test]

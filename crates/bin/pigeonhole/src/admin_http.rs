@@ -62,15 +62,25 @@ async fn set(State(d): State<Arc<DynConfig>>, Path(key): Path<String>, body: Byt
     };
     match d.set(&key, value.trim()).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}\n")).into_response(),
+        Err(e) => refused(e),
     }
+}
+
+/// A change refused: 503 on a node that does not lead (ask the leader),
+/// 400 with the reason otherwise.
+fn refused(e: anyhow::Error) -> Response {
+    let status = match e.chain().any(|c| c.is::<pigeonhole_meta::NotLeader>()) {
+        true => StatusCode::SERVICE_UNAVAILABLE,
+        false => StatusCode::BAD_REQUEST,
+    };
+    (status, format!("{e:#}\n")).into_response()
 }
 
 async fn unset(State(d): State<Arc<DynConfig>>, Path(key): Path<String>) -> Response {
     match d.unset(&key).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, format!("{key} has no override\n")).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}\n")).into_response(),
+        Err(e) => refused(e),
     }
 }
 

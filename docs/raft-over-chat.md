@@ -1,6 +1,7 @@
 # Raft over chat: openraft's network through Telegram and Discord channels
 
-Status: design (2026-10-30). Not implemented.
+Status: steps 1–4 and 6 done, 7 in part (2026-11-01): a cluster runs in one
+process over `FakeChat`; no chat mailbox and no `[cluster]` config yet.
 
 A transport for [openraft](https://docs.rs/openraft) whose wire is chat
 messages: Raft nodes talk by posting into channels and reading them. With it,
@@ -377,8 +378,19 @@ a switch in the developer portal.
    push: `connect_with_updates` / the gateway), then live runs of 3 nodes,
    each with its own bot: election time, commit latency, failover against
    § Timing, watched on the dashboard.
-6. A lagging follower catches up by snapshot (`InstallSnapshot` over the
-   chat): a cluster test, then live.
+6. ✅ A lagging follower catches up by snapshot (`InstallSnapshot` over the
+   chat): a cluster test; live with step 5. Two fixes it took:
+   - openraft's `install_snapshot_timeout` (200 ms, a LAN's) is now four
+     election timeouts: a chat round trip is longer;
+   - a follower's purge waits for the snapshot it installs: Raft asks for
+     the purge while the state machine still stores it.
+7. In pigeonhole: `[cluster] transport`, `[[node]] outbox`, `Forward` to the
+   leader, with the step-8 work every transport needs. Done: leader-only
+   side effects (sweeper, repair, cooler and the CAS GC pass only while
+   `MetaStore::is_leader`), the dynamic config following overrides that
+   replication brings (`DynConfig::follow`), `NotLeader` as 503 in S3 and
+   the admin API. The plan for the rest: the leader does all the work and a
+   follower proxies S3 and admin requests to it.
 7. In pigeonhole: `[cluster] transport`, `[[node]] outbox`, `Forward` to the
    leader, with the step-8 work every transport needs (leader-only side
    effects: sweeper, repair, cooler).
@@ -386,8 +398,10 @@ a switch in the developer portal.
    (role, term, leader, lag), edited in place, so the channel shows the
    cluster's state without Grafana.
 
-Not done from § Tests: madsim runs with latency and reordering (the
-`FakeChat` tests run on tokio).
+madsim (`pigeonhole-sim/tests/cluster.rs`): three nodes over a `FakeChat`
+that delays (`set_delay`), loses and doubles posts while a node at a time is
+cut off and healed; every acknowledged command survives and the nodes
+converge.
 
 ## Risks
 

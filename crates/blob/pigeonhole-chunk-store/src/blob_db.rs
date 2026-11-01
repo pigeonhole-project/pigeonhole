@@ -179,6 +179,12 @@ impl BlobDb {
         self.meta.confirm_active().await
     }
 
+    /// Whether this node leads its tablet's cluster: only the leader does
+    /// background work (a follower's writes would fail).
+    pub fn is_leader(&self) -> bool {
+        self.meta.is_leader()
+    }
+
     /// Whether the tablet has stopped (fenced or failed): background work ends.
     pub fn tablet_stopped(&self) -> bool {
         self.meta.is_stopped()

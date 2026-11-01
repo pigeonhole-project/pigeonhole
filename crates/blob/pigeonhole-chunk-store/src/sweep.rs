@@ -59,8 +59,8 @@ impl Sweeper {
     }
 
     /// Background loop: [`Self::sweep_once`] whenever `schedule` says, with
-    /// its knobs; ends once the tablet stops (a fenced incarnation must not
-    /// delete anything).
+    /// its knobs, while this node leads; ends once the tablet stops (a fenced
+    /// incarnation must not delete anything).
     pub async fn run_loop(mut self, mut schedule: Schedule<SweepConfig>) {
         loop {
             self.config = schedule.next(|c| c.interval).await;
@@ -68,28 +68,37 @@ impl Sweeper {
                 info!("metadata tablet stopped; sweeper exits");
                 return;
             }
-            let t0 = std::time::Instant::now();
-            let pass = self.sweep_once().await;
-            pigeonhole_blob::record_background_pass("sweep", pass.is_ok(), t0.elapsed());
-            match pass {
-                Ok(stats) => {
-                    pigeonhole_blob::record_sweep("deleted", stats.keys_deleted);
-                    pigeonhole_blob::record_sweep("skipped_live", stats.keys_skipped_live);
-                    pigeonhole_blob::record_sweep("zero_ref", stats.zero_ref_chunks);
-                    if stats.keys_deleted > 0 || stats.zero_ref_chunks > 0 {
-                        info!(
-                            zero_ref_chunks = stats.zero_ref_chunks,
-                            keys_deleted = stats.keys_deleted,
-                            keys_skipped_live = stats.keys_skipped_live,
-                            "sweep pass complete"
-                        );
-                    } else {
-                        debug!(keys_skipped_live = stats.keys_skipped_live, "sweep pass idle");
-                    }
-                }
-                Err(e) => warn!(error = %e, "sweep pass failed"),
+            if self.db.is_leader() {
+                self.background_pass().await;
+            } else {
+                debug!("not the leader: no sweep pass");
             }
             schedule.done();
+        }
+    }
+
+    /// One pass of the background loop, recorded and logged.
+    async fn background_pass(&self) {
+        let t0 = std::time::Instant::now();
+        let pass = self.sweep_once().await;
+        pigeonhole_blob::record_background_pass("sweep", pass.is_ok(), t0.elapsed());
+        match pass {
+            Ok(stats) => {
+                pigeonhole_blob::record_sweep("deleted", stats.keys_deleted);
+                pigeonhole_blob::record_sweep("skipped_live", stats.keys_skipped_live);
+                pigeonhole_blob::record_sweep("zero_ref", stats.zero_ref_chunks);
+                if stats.keys_deleted > 0 || stats.zero_ref_chunks > 0 {
+                    info!(
+                        zero_ref_chunks = stats.zero_ref_chunks,
+                        keys_deleted = stats.keys_deleted,
+                        keys_skipped_live = stats.keys_skipped_live,
+                        "sweep pass complete"
+                    );
+                } else {
+                    debug!(keys_skipped_live = stats.keys_skipped_live, "sweep pass idle");
+                }
+            }
+            Err(e) => warn!(error = %e, "sweep pass failed"),
         }
     }
 

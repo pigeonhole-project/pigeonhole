@@ -2821,6 +2821,7 @@ dependencies = [
  "http",
  "madsim",
  "madsim-tokio",
+ "openraft-chat",
  "pigeonhole-blob",
  "pigeonhole-chunk-store",
  "pigeonhole-gateway-s3",
