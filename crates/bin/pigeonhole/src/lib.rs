@@ -1,5 +1,6 @@
 //! Pigeonhole binary facade: re-exports used by tests and scripts.
 
+pub mod admin_http;
 pub mod gateway_metrics;
 pub mod http_timeout;
 pub mod logging;

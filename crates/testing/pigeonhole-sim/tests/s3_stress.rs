@@ -106,7 +106,7 @@ fn sweeper(node: &Node) -> Sweeper {
     Sweeper::new(
         node.store.db().clone(),
         node.backends.clone(),
-        SweepConfig { batch_size: 5, interval: Duration::ZERO },
+        SweepConfig { batch_size: 5, interval: None },
         node.store.replicated().pins().clone(),
     )
 }

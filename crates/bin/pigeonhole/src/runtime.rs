@@ -3,7 +3,7 @@
 use crate::channel_log;
 use anyhow::Context;
 use pigeonhole::config::Config;
-use pigeonhole::config::{LogSettings, SnapshotSettings};
+use pigeonhole::config::{DynConfig, LogSettings, SnapshotSettings};
 use pigeonhole::index::Index;
 use pigeonhole::instances::{check_fingerprints, InstanceConfig, InstanceKind, TelegramLogin};
 use pigeonhole::memory::MemoryBlobStore;
@@ -21,6 +21,8 @@ pub struct Runtime {
     /// The one metadata store every layer registers its namespace on.
     pub meta: Arc<MetaStore>,
     pub store: Arc<ChunkStore>,
+    /// The background loops' knobs: the file's, with the tablet's overrides.
+    pub dynamic: Arc<DynConfig>,
 }
 
 /// The configured metadata log (`[meta] log`).
@@ -185,7 +187,7 @@ fn parse_chat(chat_id: &str) -> anyhow::Result<i64> {
 }
 
 pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
-    let namespaces = Index::register(BlobDb::register(Namespaces::new()));
+    let namespaces = DynConfig::register(Index::register(BlobDb::register(Namespaces::new())));
     #[cfg(feature = "bytestream")]
     let namespaces = pigeonhole_gateway_bytestream::cas_index::CasIndex::register(namespaces);
     let log = open_log(cfg).await?;
@@ -211,7 +213,8 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
 
     let layer = ChunkStore::open_replicated(blob_db, replicated, opts).await.context("open ChunkStore")?;
     let store = Arc::new(with_optional_caches(layer, cfg));
-    Ok(Runtime { meta, store })
+    let dynamic = Arc::new(DynConfig::open(cfg.clone(), meta.clone()));
+    Ok(Runtime { meta, store, dynamic })
 }
 
 async fn build_placement(cfg: &Config) -> anyhow::Result<Arc<Replicated>> {

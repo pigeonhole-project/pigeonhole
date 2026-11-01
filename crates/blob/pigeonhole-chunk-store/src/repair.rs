@@ -6,6 +6,7 @@ use futures::StreamExt;
 use pigeonhole_blob::{
     collect_stream, EncodedBlock, OpKind, PartLayout, PartPacker, ReplicaLayout, Replicated, SharedBackend, UploadPin,
 };
+use pigeonhole_types::schedule::Schedule;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -20,9 +21,10 @@ pub const REPAIR_CONCURRENCY: usize = 4;
 pub const DEFAULT_MAX_COST_WAIT_SECS: f64 = 2.0;
 
 /// Runtime knobs for the repairer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RepairConfig {
-    pub interval: Duration,
+    /// Pause between passes; `None`: no passes but those asked for.
+    pub interval: Option<Duration>,
     pub batch_size: usize,
     /// Jobs copied at once; their replicas are committed together.
     pub concurrency: usize,
@@ -34,7 +36,7 @@ pub struct RepairConfig {
 impl Default for RepairConfig {
     fn default() -> Self {
         Self {
-            interval: DEFAULT_REPAIR_INTERVAL,
+            interval: Some(DEFAULT_REPAIR_INTERVAL),
             batch_size: REPAIR_BATCH_SIZE,
             concurrency: REPAIR_CONCURRENCY,
             max_cost_wait_secs: DEFAULT_MAX_COST_WAIT_SECS,
@@ -69,10 +71,14 @@ impl Repairer {
         &self.config
     }
 
-    /// Background loop: scrub (optional), drain queue, sleep; ends once the
+    /// Background loop: scrub (optional) and drain the queue whenever
+    /// `schedule` says, with its knobs (at once when on); ends once the
     /// tablet stops.
-    pub async fn run_loop(self) {
-        let period = self.config.interval.max(Duration::from_secs(1));
+    pub async fn run_loop(mut self, mut schedule: Schedule<RepairConfig>) {
+        self.config = schedule.knobs();
+        if self.config.interval.is_none() {
+            self.config = schedule.next(|c| c.interval).await;
+        }
         loop {
             if self.db.tablet_stopped() {
                 info!("metadata tablet stopped; repair exits");
@@ -109,7 +115,8 @@ impl Repairer {
                 }
                 Err(e) => warn!(error = %e, "repair pass failed"),
             }
-            tokio::time::sleep(period).await;
+            schedule.done();
+            self.config = schedule.next(|c| c.interval).await;
         }
     }
 
@@ -607,6 +614,45 @@ mod tests {
             let got = collect_stream(rep.read(std::slice::from_ref(b), 0..1).await.unwrap()).await.unwrap();
             assert_eq!(got, Bytes::from(vec![i as u8; 1000]));
         }
+    }
+
+    #[tokio::test]
+    async fn the_loop_follows_its_schedule() {
+        use pigeonhole_types::schedule::Control;
+        let a = lim("a", 4 * MIB);
+        let (_dir, layer, _) = open_layer(vec![a.clone()], 1, MIB, MIB).await;
+        let id = layer.put_small(Bytes::from_static(b"one")).await.unwrap();
+        let rep = add_b(&layer, a).await;
+        let db = layer.db().clone();
+        db.enqueue_repair(id, "b").await.unwrap();
+
+        let off = RepairConfig { interval: None, scrub: false, ..RepairConfig::default() };
+        let control = Control::new(off.clone());
+        let task = tokio::spawn(Repairer::new(db.clone(), rep, off).run_loop(control.schedule()));
+        let drained = |db: BlobDb| async move {
+            for _ in 0..200 {
+                if db.repair_queue_len().await.unwrap() == 0 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(db.repair_queue_len().await.unwrap(), 1, "off: no pass");
+        control.run_now();
+        assert!(drained(db.clone()).await, "a pass asked for runs while off");
+
+        // Turned on: the next job goes without being asked.
+        let other = layer.put_small(Bytes::from_static(b"two")).await.unwrap();
+        db.enqueue_repair(other, "b").await.unwrap();
+        control.set(RepairConfig {
+            interval: Some(Duration::from_millis(50)),
+            scrub: false,
+            ..RepairConfig::default()
+        });
+        assert!(drained(db.clone()).await, "on again");
+        task.abort();
     }
 
     #[tokio::test]

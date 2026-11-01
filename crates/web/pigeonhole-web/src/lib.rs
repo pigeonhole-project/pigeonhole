@@ -13,10 +13,10 @@ use bytes::{Bytes, BytesMut};
 use http::{Extensions, HeaderMap, Method, Uri};
 use pigeonhole_blob::{erase, CheapestFirst, InstanceInfo, MetricsBackend, Replicated, SharedBackend};
 use pigeonhole_chunk_store::{BlobDb, BlockCache, ChunkStore, IngestOptions};
-use pigeonhole_chunk_store::{RepairConfig, RepairStats, Repairer, SweepConfig, SweepStats, Sweeper};
+use pigeonhole_chunk_store::{RepairStats, Repairer, SweepStats, Sweeper};
 use pigeonhole_config::instances::{check_fingerprints, InstanceConfig, InstanceKind};
 use pigeonhole_config::stores::{FakeBacking, FakeChannel};
-use pigeonhole_config::{Config, LogSettings, SnapshotSettings};
+use pigeonhole_config::{Config, DynConfig, LogSettings, SnapshotSettings};
 use pigeonhole_fake_channels::{self as fake, DiscordChannel, TelegramChannel};
 use pigeonhole_gateway_s3::{Index, S3Gateway};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, LogStore, MetaOptions, MetaStore, Namespaces, SnapshotStore};
@@ -215,39 +215,11 @@ pub struct Node {
     pub meta: Arc<MetaStore>,
     pub store: Arc<ChunkStore>,
     pub s3: S3Gateway,
-    /// Repair passes in the background, as the server's (`[repair] interval`).
-    repair: Background,
+    /// The background loops' knobs, the file's with the tablet's overrides.
+    pub dynamic: Arc<DynConfig>,
+    /// Repair passes in the background, as the server's (`[repair]`).
+    repair: tokio::task::JoinHandle<()>,
     snapshot_every: Option<u64>,
-}
-
-/// A background loop: when its last pass ended, its pause, its task.
-struct Background {
-    every: std::time::Duration,
-    last: Arc<Mutex<Option<tokio::time::Instant>>>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Background {
-    /// Repair passes every `every`, until the tablet stops.
-    fn repair(store: &Arc<ChunkStore>, every: std::time::Duration) -> Self {
-        let last = Arc::new(Mutex::new(None));
-        let (db, replicated, done) = (store.db().clone(), store.replicated().clone(), last.clone());
-        let task = tokio::spawn(tracing::Instrument::in_current_span(async move {
-            loop {
-                tokio::time::sleep(every).await;
-                if db.tablet_stopped() {
-                    return;
-                }
-                let repairer = Repairer::new(db.clone(), replicated.clone(), RepairConfig::default());
-                match repairer.repair_once().await {
-                    Ok(s) => tracing::info!(repaired = s.repaired, failed = s.failed, "repair pass"),
-                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "repair pass failed"),
-                }
-                *done.lock().unwrap() = Some(tokio::time::Instant::now());
-            }
-        }));
-        Self { every, last, task }
-    }
 }
 
 fn req<T>(input: T) -> S3Request<T> {
@@ -367,7 +339,7 @@ impl World {
 impl Node {
     /// Boots over `world`: claims the log, loads its snapshot, replays the rest.
     pub async fn open(world: &World, cfg: &Config) -> Result<Self> {
-        let namespaces = Index::register(BlobDb::register(Namespaces::new()));
+        let namespaces = DynConfig::register(Index::register(BlobDb::register(Namespaces::new())));
         let opts = MetaOptions {
             snapshot_every: cfg.meta.snapshot_every_entries,
             snapshot_interval: cfg.meta.snapshot_interval,
@@ -405,13 +377,16 @@ impl Node {
         }
         let store = Arc::new(store);
         let s3 = S3Gateway::new(cfg.s3_options(), Index::open(meta.clone()).await?, store.clone());
-        let repair = Background::repair(&store, cfg.repair.interval);
+        let dynamic = Arc::new(DynConfig::open(cfg.clone(), meta.clone()));
+        let repairer = Repairer::new(store.db().clone(), store.replicated().clone(), dynamic.repair.get());
+        let repair = tokio::spawn(tracing::Instrument::in_current_span(repairer.run_loop(dynamic.repair.schedule())));
         Ok(Self {
             channels: channels::of(cfg),
             log,
             meta,
             store,
             s3,
+            dynamic,
             repair,
             snapshot_every: cfg.meta.snapshot_every_entries,
         })
@@ -425,7 +400,7 @@ impl Node {
 
     /// Stops the tablet, as a process exit would.
     pub async fn close(&self) -> Result<()> {
-        self.repair.task.abort();
+        self.repair.abort();
         self.meta.close().await
     }
 
@@ -433,14 +408,15 @@ impl Node {
     /// is due; how far the log is from its next snapshot.
     pub async fn background(&self) -> Result<serde_json::Value> {
         let jobs = self.store.db().repair_jobs().await;
-        let since = self.repair.last.lock().unwrap().map(|t| t.elapsed());
-        let next_ms = self.repair.every.saturating_sub(since.unwrap_or_default()).as_millis() as u64;
+        let every = self.dynamic.repair.get().interval;
+        let due = self.dynamic.repair.due(|c| c.interval);
+        let next_ms = due.map(|at| at.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64);
         let found = self.log.discover().await?;
         let (head, base) = found.map_or((0, 0), |d| (d.head.position, d.base.map_or(0, |b| b.at)));
         Ok(serde_json::json!({
             "repair": {
                 "queue": jobs.iter().map(|(chunk, store)| serde_json::json!({ "chunk": chunk, "store": store })).collect::<Vec<_>>(),
-                "every_ms": self.repair.every.as_millis() as u64,
+                "every_ms": every.map(|d| d.as_millis() as u64),
                 "next_ms": next_ms,
             },
             "snapshot": { "head": head, "base": base, "every": self.snapshot_every },
@@ -516,7 +492,8 @@ impl Node {
 
     /// One repair pass: copy chunks that lost a replica back to full.
     pub async fn repair(&self) -> Result<RepairStats> {
-        let repairer = Repairer::new(self.store.db().clone(), self.store.replicated().clone(), RepairConfig::default());
+        let repairer =
+            Repairer::new(self.store.db().clone(), self.store.replicated().clone(), self.dynamic.repair.get());
         repairer.repair_once().await
     }
 
@@ -528,7 +505,8 @@ impl Node {
     /// Probe every copy store `id` should hold; queue a repair for each one
     /// gone. How many it checked, and how many were gone.
     pub async fn verify(&self, id: &str) -> Result<(u64, u64)> {
-        let repairer = Repairer::new(self.store.db().clone(), self.store.replicated().clone(), RepairConfig::default());
+        let repairer =
+            Repairer::new(self.store.db().clone(), self.store.replicated().clone(), self.dynamic.repair.get());
         repairer.verify_instance(id).await
     }
 
@@ -538,7 +516,7 @@ impl Node {
         let sweeper = Sweeper::new(
             self.store.db().clone(),
             replicated.members().to_vec(),
-            SweepConfig::default(),
+            self.dynamic.sweep.get(),
             replicated.pins().clone(),
         );
         sweeper.sweep_once().await

@@ -8,6 +8,7 @@
 use crate::blob_db::BlobDb;
 use anyhow::{Context, Result};
 use pigeonhole_blob::{SharedBackend, UploadPins};
+use pigeonhole_types::schedule::Schedule;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -18,15 +19,16 @@ pub const SWEEP_BATCH_SIZE: usize = 100;
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Runtime knobs for the sweeper.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SweepConfig {
     pub batch_size: usize,
-    pub interval: Duration,
+    /// Pause between passes; `None`: no passes but those asked for.
+    pub interval: Option<Duration>,
 }
 
 impl Default for SweepConfig {
     fn default() -> Self {
-        Self { batch_size: SWEEP_BATCH_SIZE, interval: DEFAULT_SWEEP_INTERVAL }
+        Self { batch_size: SWEEP_BATCH_SIZE, interval: Some(DEFAULT_SWEEP_INTERVAL) }
     }
 }
 
@@ -56,12 +58,12 @@ impl Sweeper {
         &self.config
     }
 
-    /// Background loop: sleep `interval`, then [`Self::sweep_once`]; ends once
-    /// the tablet stops (a fenced incarnation must not delete anything).
-    pub async fn run_loop(self) {
-        let period = self.config.interval.max(Duration::from_secs(1));
+    /// Background loop: [`Self::sweep_once`] whenever `schedule` says, with
+    /// its knobs; ends once the tablet stops (a fenced incarnation must not
+    /// delete anything).
+    pub async fn run_loop(mut self, mut schedule: Schedule<SweepConfig>) {
         loop {
-            tokio::time::sleep(period).await;
+            self.config = schedule.next(|c| c.interval).await;
             if self.db.tablet_stopped() {
                 info!("metadata tablet stopped; sweeper exits");
                 return;
@@ -87,6 +89,7 @@ impl Sweeper {
                 }
                 Err(e) => warn!(error = %e, "sweep pass failed"),
             }
+            schedule.done();
         }
     }
 
@@ -241,7 +244,7 @@ mod tests {
     }
 
     fn sweeper(f: &Fixture) -> Sweeper {
-        let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: Duration::from_secs(1) };
+        let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: Some(Duration::from_secs(1)) };
         Sweeper::new(f.db.clone(), vec![f.backend.clone()], config, f.pins.clone())
     }
 
@@ -432,7 +435,7 @@ mod tests {
 
         // Restart: fresh pins, nothing returned in this process yet.
         let (_layer, pins) = open_layer(f.db.clone(), f.backend.clone()).await;
-        let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: Duration::from_secs(1) };
+        let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: Some(Duration::from_secs(1)) };
         let stats = Sweeper::new(f.db.clone(), vec![f.backend.clone()], config, pins).sweep_once().await.unwrap();
         assert_eq!(stats.keys_deleted, 1);
         assert!(!on_backend(&f, &dead));

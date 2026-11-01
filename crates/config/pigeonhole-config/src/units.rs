@@ -43,6 +43,11 @@ pub(crate) fn duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<
     }
 }
 
+/// `d` as a humantime string (`"1m 30s"`), as the config reads it.
+pub(crate) fn format_duration(d: Duration) -> String {
+    humantime::format_duration(d).to_string()
+}
+
 /// [`duration_or_off`] of an optional field (with `#[serde(default)]`):
 /// `None` when absent, `Some(None)` when off.
 pub(crate) fn opt_duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<Duration>>, D::Error> {

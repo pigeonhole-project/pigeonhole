@@ -1,6 +1,7 @@
 //! `pigeonhole` binary: argument parsing and subcommand dispatch.
 
 mod admin;
+mod admin_cli;
 mod background;
 mod channel_log;
 mod runtime;
@@ -17,6 +18,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("config") => admin_cli::cmd_config(&args.collect::<Vec<_>>()).await,
+        Some("run") => admin_cli::cmd_run(&args.collect::<Vec<_>>()).await,
         Some("restore") => {
             let mut lossy = false;
             for a in args {
@@ -49,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
         Some(other) => {
             bail!(
                 "unknown command {other:?}; usage: pigeonhole \
-                 [purge --yes | restore --lossy]"
+                 [purge --yes | restore --lossy | config [set KEY VALUE | unset KEY] | run TASK]"
             )
         }
         None => cmd_serve().await,

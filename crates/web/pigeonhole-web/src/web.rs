@@ -51,6 +51,12 @@ struct Request {
     /// `outage` / `wipe`: the channel's store id; `outage`: down or back.
     #[serde(default)]
     store: String,
+    /// `dynamic_set`: the value of the dynamic key `key`.
+    #[serde(default)]
+    value: String,
+    /// `run_task`: which background loop.
+    #[serde(default)]
+    task: String,
     #[serde(default)]
     down: bool,
     /// `delete_message`: the message's id (a string: Discord's exceed JS numbers).
@@ -201,6 +207,16 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
             json!({ "channels": out })
         }
         "background" => node.background().await?,
+        "dynamic" => json!({ "keys": node.dynamic.keys(), "tasks": node.dynamic.tasks() }),
+        "dynamic_set" => {
+            node.dynamic.set(&r.key, &r.value).await?;
+            json!({ "ok": true })
+        }
+        "dynamic_unset" => json!({ "unset": node.dynamic.unset(&r.key).await? }),
+        "run_task" => {
+            node.dynamic.run_now(&r.task)?;
+            json!({ "ok": true })
+        }
         "outage" | "wipe" | "delete_message" => {
             let world = WORLD.with(Rc::clone);
             let c = node

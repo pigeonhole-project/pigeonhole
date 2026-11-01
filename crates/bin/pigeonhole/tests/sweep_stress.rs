@@ -24,7 +24,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 const BUCKET: &str = "stress";
 const KEYS: u64 = 12;
@@ -134,7 +133,7 @@ fn sweeper(node: &Node) -> Sweeper {
     Sweeper::new(
         node.store.db().clone(),
         vec![node.backend.clone()],
-        SweepConfig { batch_size: 7, interval: Duration::ZERO },
+        SweepConfig { batch_size: 7, interval: None },
         node.store.replicated().pins().clone(),
     )
 }

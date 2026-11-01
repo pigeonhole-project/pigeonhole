@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use openraft::EntryPayload;
 use pigeonhole_chunk_store::ChunkState;
+use pigeonhole_config::dynamic::Overrides;
 use pigeonhole_gateway_s3::S3State;
 use pigeonhole_meta::raft::RaftEntry;
 use pigeonhole_meta::{Command, LogStore, StateMachine};
@@ -22,6 +23,7 @@ fn decode(command: &Command) -> Value {
     match command.namespace.as_str() {
         ChunkState::NAME => typed::<ChunkState>(&command.command),
         S3State::NAME => typed::<S3State>(&command.command),
+        Overrides::NAME => typed::<Overrides>(&command.command),
         _ => json!({ "bytes": command.command.len() }),
     }
 }

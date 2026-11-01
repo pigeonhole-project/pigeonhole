@@ -4,7 +4,7 @@ use crate::bytestream_pb::{
 };
 use crate::cas::CasStore;
 use crate::cas_index::CasIndex;
-use crate::config::BytestreamConfig;
+use crate::config::{BytestreamConfig, Gc};
 use crate::digest::{digest_hash_hex, verify_sha256};
 use crate::reapi::{
     action_cache_server::{ActionCache, ActionCacheServer},
@@ -22,6 +22,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use pigeonhole_chunk_store::ChunkStore;
+use pigeonhole_types::schedule::{Expiry, Schedule};
 use prost::Message;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
@@ -56,7 +57,7 @@ struct PendingUpload {
     last_activity: Instant,
 }
 
-fn make_state(cfg: &BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>) -> ReapiState {
+fn make_state(cfg: &BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>, gc: Gc) -> ReapiState {
     let state = ReapiState {
         cas: CasStore::new(cas, store),
         instance: cfg.instance_name.clone(),
@@ -64,13 +65,13 @@ fn make_state(cfg: &BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>) -> 
         upload_ttl: Duration::from_secs(cfg.upload_ttl_secs.max(60)),
         uploads: Arc::new(Mutex::new(HashMap::new())),
     };
-    spawn_cas_gc(state.clone(), cfg.gc_ttl);
-    spawn_upload_gc(state.clone());
+    spawn_cas_gc(state.clone(), gc.cas);
+    spawn_upload_gc(state.clone(), gc.uploads);
     state
 }
 
-pub async fn serve(cfg: BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>) -> Result<()> {
-    let state = make_state(&cfg, cas, store);
+pub async fn serve(cfg: BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>, gc: Gc) -> Result<()> {
+    let state = make_state(&cfg, cas, store, gc);
 
     let addr = cfg.listen_addr.parse().context("parse bytestream listen_addr")?;
     info!(%addr, instance = %cfg.instance_name, "REAPI bytestream listening");
@@ -92,13 +93,14 @@ pub async fn serve_ephemeral(
     cfg: BytestreamConfig,
     cas: CasIndex,
     store: Arc<ChunkStore>,
+    gc: Gc,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind ephemeral")?;
     let addr = listener.local_addr()?;
     let mut cfg = cfg;
     cfg.listen_addr = addr.to_string();
 
-    let state = make_state(&cfg, cas, store);
+    let state = make_state(&cfg, cas, store, gc);
 
     let svc_cap = CapabilitiesServer::new(state.clone());
     let svc_cas = ContentAddressableStorageServer::new(state.clone());
@@ -119,53 +121,49 @@ pub async fn serve_ephemeral(
     Ok((addr, handle))
 }
 
-fn spawn_upload_gc(state: ReapiState) {
+fn spawn_upload_gc(state: ReapiState, mut schedule: Schedule<Option<Duration>>) {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            schedule.next(|every| *every).await;
             let ttl = state.upload_ttl;
             let mut uploads = state.uploads.lock().await;
             let now = Instant::now();
             uploads.retain(|_, u| now.duration_since(u.last_activity) < ttl);
+            drop(uploads);
+            schedule.done();
         }
     });
 }
 
-fn spawn_cas_gc(state: ReapiState, ttl: Option<Duration>) {
-    let Some(ttl) = ttl else { return };
+/// Release the CAS entries not read for the GC's `ttl`, whenever its
+/// schedule says.
+fn spawn_cas_gc(state: ReapiState, mut schedule: Schedule<Expiry>) {
     tokio::spawn(async move {
-        let ttl = ChronoDuration::seconds(ttl.as_secs() as i64);
-        let cas = state.cas.cas.clone();
-        let store = state.cas.store.clone();
         loop {
-            tokio::time::sleep(Duration::from_secs(300)).await;
-            let cutoff = Utc::now() - ttl;
-            if let Ok(stale) = cas.stale_before(cutoff).await {
-                for row in stale {
-                    match cas.release(&row.hash, row.size).await {
-                        Ok(ids) => {
-                            if let Err(e) = store.release(&ids).await {
-                                warn!(
-                                    error = %e,
-                                    hash = %row.hash,
-                                    size = row.size,
-                                    "cas gc chunk release"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                hash = %row.hash,
-                                size = row.size,
-                                "cas gc release"
-                            );
-                        }
-                    }
-                }
+            // No TTL: nothing is ever stale, no passes.
+            let gc = schedule.next(Expiry::period).await;
+            if let Some(ttl) = gc.ttl {
+                cas_gc_pass(&state, ttl).await;
             }
+            schedule.done();
         }
     });
+}
+
+async fn cas_gc_pass(state: &ReapiState, ttl: Duration) {
+    let cutoff = Utc::now() - ChronoDuration::seconds(ttl.as_secs() as i64);
+    let (cas, store) = (&state.cas.cas, &state.cas.store);
+    let Ok(stale) = cas.stale_before(cutoff).await else { return };
+    for row in stale {
+        match cas.release(&row.hash, row.size).await {
+            Ok(ids) => {
+                if let Err(e) = store.release(&ids).await {
+                    warn!(error = %e, hash = %row.hash, size = row.size, "cas gc chunk release");
+                }
+            }
+            Err(e) => warn!(error = %e, hash = %row.hash, size = row.size, "cas gc release"),
+        }
+    }
 }
 
 fn grpc_status(code: tonic::Code, msg: impl Into<String>) -> Status {
