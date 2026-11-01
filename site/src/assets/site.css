@@ -119,6 +119,10 @@ h1 { font-size: clamp(34px, 5.4vw, 60px); line-height: 1.05; letter-spacing: -0.
 .lane-dc { grid-area: dc; }
 /* The apps' own sizes, a third of the stage wide: smaller, as a phone's would be. */
 .lane .app { height: calc(100% / .8); border: 0; border-radius: 0; zoom: .8; }
+/* Long file names on one line: the hash's start and end are what tell them apart. */
+.lane .tg-doc > div:last-child, .lane .dc-file > div, .lane .dc-body { min-width: 0; }
+.lane .dc-file { max-width: 100%; }
+.lane .tg-doc-name, .lane .dc-file-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* the log: a chip per batch; a chip opens its entries (log.css) under the row */
 .log-pane { grid-area: log; background: var(--surface-2); }

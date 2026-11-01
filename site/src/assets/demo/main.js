@@ -46,8 +46,10 @@ const nodeOf = open => (open?.kind === "log" ? {kind: "store", store: logChannel
 const node = await connect(new URL(`../web-worker.js${new URL(import.meta.url).search}`, import.meta.url));
 
 let updateWindows = () => {};
+let relayout = () => redraw(); // the screen turned narrow or wide: what is on the graph, again
 const graph = makeGraph($("graph"), {
   onOpen: openPanel,
+  onRelayout: () => relayout(),
   onLoft: (g, entrances) => {
     updateWindows = taskWindows(g, entrances, task => {
       openPanel({kind: "loft"});
@@ -393,7 +395,9 @@ function openWizard() {
   $("panel").hidden = false;
   $("panel-close").hidden = true;
   const panel = {title: $("panel-title"), sub: $("panel-sub"), body: $("panel-body")};
-  makeWizard(panel, {sketch: channels => graph.draw(channels, 0), start: startFromWizard}).render();
+  const wizard = makeWizard(panel, {sketch: channels => graph.draw(channels, 0), start: startFromWizard});
+  relayout = wizard.render;
+  wizard.render();
   say(["wiz.caption", {}]);
 }
 
@@ -405,6 +409,7 @@ async function startFromWizard(text) {
   if (reply?.error) return reply.error;
   state.config = text;
   state.wizard = false;
+  relayout = redraw;
   $("loft").classList.remove("zoomed", "wizard");
   $("panel").hidden = true;
   $("panel-close").hidden = false;
