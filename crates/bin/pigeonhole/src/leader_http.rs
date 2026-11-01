@@ -25,7 +25,9 @@ pub async fn only_on_the_leader(
     if meta.is_leader() || matches!(req.uri().path(), PATH | "/metrics") {
         return next.run(req).await;
     }
-    let message = match meta.leader() {
+    let leader = meta.leader();
+    tracing::info!(op = %format!("{} {}", req.method(), req.uri().path()), leader, "not the leader");
+    let message = match leader {
         Some(id) => format!("not the leader; node {id} is"),
         None => "not the leader; no leader known".to_string(),
     };

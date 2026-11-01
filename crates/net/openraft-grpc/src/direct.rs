@@ -100,12 +100,14 @@ pub struct DirectClient<C: RaftTypeConfig> {
 }
 
 impl<C: RaftTypeConfig> DirectClient<C> {
-    /// `call` on the peer's handler, within `ttl`.
+    /// `call` on the peer's handler, within `ttl`; `kind` and the request's
+    /// size are for the log.
     #[allow(clippy::result_large_err)] // openraft's error type, as RaftNetwork returns it
     async fn call<T, E, F>(
         &self,
-        action: RPCTypes,
+        (action, kind): (RPCTypes, &'static str),
         ttl: Duration,
+        bytes: Option<usize>,
         call: impl FnOnce(Arc<dyn Handler<C>>) -> F,
     ) -> Result<T, RPCError<C::NodeId, C::Node, RaftError<C::NodeId, E>>>
     where
@@ -115,11 +117,16 @@ impl<C: RaftTypeConfig> DirectClient<C> {
         let Some((handler, delay)) = self.net.route(&self.me, &self.target) else {
             return Err(RPCError::Unreachable(Unreachable::new(&AnyError::error("cut off"))));
         };
+        let (me, to) = (&self.me, &self.target);
+        tracing::debug!(node = %me, %to, kind, reply = false, via = "grpc", bytes, "raft frame sent");
         let answer = async {
             if let Some(d) = delay {
                 tokio::time::sleep(d).await;
             }
-            call(handler).await
+            tracing::debug!(node = %to, from = %me, kind, reply = false, via = "grpc", "raft frame received");
+            let answer = call(handler).await;
+            tracing::debug!(node = %to, to = %me, kind, reply = true, via = "grpc", "raft frame sent");
+            answer
         };
         match tokio::time::timeout(ttl, answer).await {
             Ok(r) => r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target.clone(), e))),
@@ -139,7 +146,10 @@ impl<C: RaftTypeConfig> RaftNetwork<C> for DirectClient<C> {
         rpc: AppendEntriesRequest<C>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
-        self.call(RPCTypes::AppendEntries, option.hard_ttl(), |h| async move { h.append_entries(rpc).await }).await
+        let kind = if rpc.entries.is_empty() { "heartbeat" } else { "append" };
+        let size = encoded_len(&rpc);
+        let call = |h: Arc<dyn Handler<C>>| async move { h.append_entries(rpc).await };
+        self.call((RPCTypes::AppendEntries, kind), option.hard_ttl(), size, call).await
     }
 
     async fn install_snapshot(
@@ -150,7 +160,9 @@ impl<C: RaftTypeConfig> RaftNetwork<C> for DirectClient<C> {
         InstallSnapshotResponse<C::NodeId>,
         RPCError<C::NodeId, C::Node, RaftError<C::NodeId, InstallSnapshotError>>,
     > {
-        self.call(RPCTypes::InstallSnapshot, option.hard_ttl(), |h| async move { h.install_snapshot(rpc).await }).await
+        let size = encoded_len(&rpc);
+        let call = |h: Arc<dyn Handler<C>>| async move { h.install_snapshot(rpc).await };
+        self.call((RPCTypes::InstallSnapshot, "snapshot"), option.hard_ttl(), size, call).await
     }
 
     async fn vote(
@@ -158,6 +170,13 @@ impl<C: RaftTypeConfig> RaftNetwork<C> for DirectClient<C> {
         rpc: VoteRequest<C::NodeId>,
         option: RPCOption,
     ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
-        self.call(RPCTypes::Vote, option.hard_ttl(), |h| async move { h.vote(rpc).await }).await
+        let size = encoded_len(&rpc);
+        self.call((RPCTypes::Vote, "vote"), option.hard_ttl(), size, |h| async move { h.vote(rpc).await }).await
     }
+}
+
+/// A request's size as the wire would carry it (postcard), when frames are
+/// logged.
+fn encoded_len(request: &impl serde::Serialize) -> Option<usize> {
+    tracing::enabled!(tracing::Level::DEBUG).then(|| postcard::to_stdvec(request).map_or(0, |v| v.len()))
 }

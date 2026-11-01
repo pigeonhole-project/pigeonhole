@@ -9,6 +9,8 @@ description = "openraft's networks besides the chat: gRPC (frames of openraft-ch
 anyhow = { workspace = true }
 openraft = { workspace = true }
 openraft-chat = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
 prost = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, optional = true }
@@ -19,9 +21,6 @@ tracing = { workspace = true }
 default = ["transport"]
 # gRPC over tonic (sockets): not in the in-browser build.
 transport = ["dep:prost", "dep:tokio-stream", "dep:tonic"]
-
-[dev-dependencies]
-serde = { workspace = true }
 
 [build-dependencies]
 protoc-bin-vendored = { workspace = true }

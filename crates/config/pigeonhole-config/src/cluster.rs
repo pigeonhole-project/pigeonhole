@@ -25,6 +25,15 @@ pub enum Link {
     Chat,
 }
 
+impl Link {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Link::Grpc => "grpc",
+            Link::Chat => "chat",
+        }
+    }
+}
+
 /// One member of the cluster.
 #[derive(Clone, Debug)]
 pub struct NodeSettings {
@@ -64,6 +73,17 @@ pub struct ClusterSettings {
 impl ClusterSettings {
     pub fn me(&self) -> &NodeSettings {
         self.nodes.iter().find(|n| n.id == self.node).expect("checked when read")
+    }
+
+    /// How every two nodes talk, `(a, b, link)` with `a < b`.
+    pub fn pairs(&self) -> Vec<(u64, u64, Link)> {
+        let mut out = Vec::new();
+        for a in &self.nodes {
+            for b in self.nodes.iter().filter(|b| b.id > a.id) {
+                out.push((a.id, b.id, link(a, b).expect("checked when read")));
+            }
+        }
+        out
     }
 
     /// How this node talks to each other one.

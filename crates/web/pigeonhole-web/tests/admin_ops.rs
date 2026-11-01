@@ -29,6 +29,19 @@ async fn the_ui_ops_run_on_a_node() {
     );
     assert_eq!(op(&node, r#"{"op":"get","bucket":"photos","key":"a.txt","range":[0,99]}"#, b"").await["len"], 100);
 
+    // A cluster of one: this node leads, no links.
+    let cluster = op(&node, r#"{"op":"cluster"}"#, b"").await;
+    assert_eq!(
+        (&cluster["me"], &cluster["leader"], &cluster["links"]),
+        (&Value::from(1), &Value::from(1), &serde_json::json!([]))
+    );
+    let me = &cluster["nodes"][0];
+    assert_eq!(
+        (&me["role"], &me["log"], &me["lag"]),
+        (&Value::from("leader"), &Value::from("meta-log"), &Value::from(0))
+    );
+    assert!(me["applied"].as_u64().unwrap() > 0);
+
     let bg = op(&node, r#"{"op":"background"}"#, b"").await;
     let tasks: Vec<&str> = bg["tasks"].as_array().unwrap().iter().map(|t| t["task"].as_str().unwrap()).collect();
     assert_eq!(tasks, ["sweep", "repair", "cool", "snapshot"]);

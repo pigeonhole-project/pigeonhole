@@ -412,6 +412,7 @@ impl Node {
             snapshot_every: cfg.meta.snapshot_every_entries,
             channels: Some(view),
             config_text: None,
+            cluster: cfg.cluster.clone(),
         };
         Ok(Self { admin, channels, loops })
     }

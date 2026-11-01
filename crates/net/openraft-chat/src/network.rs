@@ -208,8 +208,13 @@ async fn send_loop<C: RaftTypeConfig>(inner: std::sync::Weak<Inner<C>>) {
             envelopes,
         };
         let n = frame.envelopes.len();
+        let sealed = seal(&frame, &this.settings.key);
+        for env in &frame.envelopes {
+            let (kind, reply) = (env.body.kind(), !env.body.is_request());
+            debug!(node = %this.me, to = %env.to, kind, reply, via = "chat", bytes = sealed.len(), "raft frame sent");
+        }
         let t0 = Instant::now();
-        let posted = this.outbox.post(seal(&frame, &this.settings.key)).await;
+        let posted = this.outbox.post(sealed).await;
         telemetry::record_post(posted.is_ok(), n, t0.elapsed());
         match posted {
             Ok(pos) => debug!(node = %this.me, pos, envelopes = n, "posted a frame"),
@@ -298,6 +303,8 @@ impl<C: RaftTypeConfig> Inner<C> {
             if env.to != self.me {
                 continue;
             }
+            let (kind, reply) = (env.body.kind(), !env.body.is_request());
+            debug!(node = %self.me, from = %peer, kind, reply, via = "chat", "raft frame received");
             if env.body.is_request() {
                 let Some(handler) = self.handler.get().cloned() else { continue };
                 telemetry::record_served(peer.to_string(), env.body.rpc());

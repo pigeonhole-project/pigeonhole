@@ -19,8 +19,11 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 mod background;
+mod cluster;
 pub mod log_view;
 mod s3;
+
+pub use cluster::{outbox_store, LOG_STORE, SNAPSHOT_STORE};
 
 /// The channels behind the node's stores, as their apps show them.
 #[async_trait]
@@ -101,6 +104,8 @@ pub struct Admin {
     /// The config file as the node read it (no secrets: those are in the
     /// environment), shown read-only.
     pub config_text: Option<String>,
+    /// The tablet's Raft cluster as the config has it; `None`: of one.
+    pub cluster: Option<pigeonhole_config::cluster::ClusterSettings>,
 }
 
 /// The node's stores as the config names them, without their messages:
@@ -144,6 +149,7 @@ impl Admin {
             }),
             "log" => self.log_entries(r.from, r.limit.unwrap_or(200)).await?,
             "background" => self.background().await?,
+            "cluster" => self.cluster(),
             "dynamic" => json!({ "keys": self.dynamic.keys(), "tasks": self.dynamic.tasks() }),
             "dynamic_set" => {
                 self.dynamic.set(&r.key, &r.value).await?;

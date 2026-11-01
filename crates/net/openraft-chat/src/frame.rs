@@ -57,6 +57,18 @@ impl<C: RaftTypeConfig> Body<C> {
         matches!(self, Body::AppendEntries(_) | Body::Vote(_) | Body::InstallSnapshot(_))
     }
 
+    /// What it carries, as the admin UI draws it: `heartbeat` (entries
+    /// none), `append`, `vote`, `snapshot`; a response, its request's
+    /// (`append` for a heartbeat's).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Body::AppendEntries(r) if r.entries.is_empty() => "heartbeat",
+            Body::AppendEntries(_) | Body::Appended(_) => "append",
+            Body::Vote(_) | Body::Voted(_) => "vote",
+            Body::InstallSnapshot(_) | Body::Installed(_) => "snapshot",
+        }
+    }
+
     /// The RPC a request or a response belongs to.
     pub fn rpc(&self) -> &'static str {
         match self {
