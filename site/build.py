@@ -64,9 +64,10 @@ def assets_version() -> str:
     """A hash of every asset and the wasm, for the assets' URLs."""
     h = hashlib.sha256()
     wasm = ROOT / "target" / "wasm32-wasip1" / "release" / "pigeonhole_web.wasm"
-    for f in sorted((SITE / "src" / "assets").iterdir()) + [wasm]:
+    for f in sorted((SITE / "src" / "assets").rglob("*")) + [wasm]:
         if f.is_file():
-            h.update(f.name.encode() + f.read_bytes())
+            name = f.name if f == wasm else f.relative_to(SITE).as_posix()
+            h.update(name.encode() + f.read_bytes())
     return h.hexdigest()[:10]
 
 
@@ -92,7 +93,15 @@ def render(tpl: str, lang: str, prefix: str, strings: dict, st: dict) -> str:
     html = re.sub(r"\{\{\s*([@\w.:-]+)\s*\}\}", sub, tpl)
     # Scripts and styles carry the assets' version: a browser never mixes a
     # cached old worker with a new page.
-    return re.sub(r'(assets/[\w.-]+\.(?:js|css))"', rf'\1?v={ASSETS_VERSION}"', html)
+    return re.sub(r'(assets/[\w./-]+\.(?:js|css))"', rf'\1?v={ASSETS_VERSION}"', html)
+
+
+def version_imports(assets: Path) -> None:
+    """The modules' imports of each other carry the assets' version too (a
+    module's URL is its cache key: Safari keeps old ones hard)."""
+    for f in assets.rglob("*.js"):
+        js = f.read_text()
+        f.write_text(re.sub(r'((?:from|import)\s*"\.{1,2}/[\w./-]+\.js)"', rf'\1?v={ASSETS_VERSION}"', js))
 
 
 def main() -> int:
@@ -106,6 +115,7 @@ def main() -> int:
     if args.out.exists():
         shutil.rmtree(args.out)
     shutil.copytree(SITE / "src" / "assets", args.out / "assets")
+    version_imports(args.out / "assets")
     wasm = ROOT / "target" / "wasm32-wasip1" / "release" / "pigeonhole_web.wasm"
     if wasm.exists():
         shutil.copy(wasm, args.out / "assets" / "pigeonhole.wasm")

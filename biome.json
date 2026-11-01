@@ -1,0 +1,17 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.6.4/schema.json",
+  "files": {
+    "includes": ["site/src/assets/**/*.js", "site/test/**/*.mjs", "crates/web/*.mjs"]
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 160
+  },
+  "javascript": {
+    "formatter": {
+      "bracketSpacing": false,
+      "arrowParentheses": "asNeeded"
+    }
+  }
+}

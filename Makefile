@@ -1,4 +1,4 @@
-.PHONY: web web-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint
+.PHONY: web web-smoke lint-js test-js sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint
 
 run:
 	cargo run --release
@@ -26,6 +26,16 @@ web-smoke: web
 	node --no-warnings crates/web/run-shim.mjs smoke target/wasm32-wasip1/release/pigeonhole-web.wasm 2>&1 | grep -q "smoke ok"
 	node --no-warnings crates/web/run-shim.mjs reload target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep "reload"
 	node --no-warnings crates/web/run-shim.mjs snapshot target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep 'base {"at":50'
+	node --no-warnings crates/web/run-shim.mjs events target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep "events ok"
+
+# The site's JavaScript: biome (biome.json) checks its lint, format and
+# imports, as `lint` does for Rust; the tests are the modules without DOM.
+BIOME = npx --yes @biomejs/biome@2.6.4
+lint-js:
+	$(BIOME) ci
+
+test-js:
+	node --test site/test/
 
 # Curated ceph/s3-tests (see compat/known-good.txt)
 compat:
