@@ -311,7 +311,9 @@ def short_crate(crate: str) -> str:
 def render_traits(g: TraitGraph) -> list[str]:
     """One Mermaid block per family (connected component), plain syntax only:
     no namespaces or labels, which many renderers get wrong."""
-    nodes = g.traits | g.types
+    # A trait seen only through an impl (defined behind a feature the docs
+    # were built without, e.g. `fake`) is still a node.
+    nodes = g.traits | g.types | {tr for _, tr, _ in g.impls} | {k for pair in g.supers for k in pair}
     base = lambda k: k[1].split("<")[0]
     clash = defaultdict(int)
     for k in nodes:

@@ -1049,6 +1049,8 @@ mod tests {
         tgm_store(id, chat)
     }
 
+    // Without the Discord store there are no Discord classes to set.
+    #[cfg(feature = "discord")]
     #[test]
     fn discord_limits_are_its_own() {
         let send = Class("send");
