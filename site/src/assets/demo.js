@@ -1022,6 +1022,21 @@
     loadLog();
   }
 
+  // The node would not start on what this browser keeps: say why, and offer
+  // the way out (the loft's panel, where "erase" is, needs a running node).
+  function bootFailed(error) {
+    $("status").textContent = t("try.error", {error});
+    caption(esc(t("demo.boot_failed")));
+    const b = h("button", "btn danger", t("try.erase"));
+    b.type = "button";
+    b.addEventListener("click", async () => {
+      if (!confirm(t("try.erase_confirm"))) return;
+      await call({op: "reset"});
+      location.reload();
+    });
+    $("caption").append(" ", b);
+  }
+
   started.then(async data => {
     if (data.reply?.error) {
       $("status").textContent = data.reply.error === "other-tab" ? t("try.other_tab") : t("try.error", {error: data.reply.error});
@@ -1037,7 +1052,7 @@
     }
     const t0 = performance.now();
     const booted = await call({op: "open"});
-    if (booted.reply?.error) { $("status").textContent = t("try.error", {error: booted.reply.error}); return; }
+    if (booted.reply?.error) { bootFailed(booted.reply.error); return; }
     await boot(booted.reply);
     $("status").textContent = `${t("try.ready", {ms: Math.round(performance.now() - t0)})} ${state.persistent ? t("try.kept") : t("try.not_kept")}${data.reply.why ? ` (${data.reply.why})` : ""}`;
     caption(t("say.welcome_back", {n: booted.reply.replayed}));

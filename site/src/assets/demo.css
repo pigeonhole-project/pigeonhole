@@ -67,7 +67,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 
 /* the loft: the graph, and a panel when a node is opened */
 #app { height: calc(100% - 61px); display: flex; flex-direction: column; }
-.loft { flex: 1; display: grid; grid-template-columns: 1fr; min-height: 0; }
+.loft { flex: 1; display: grid; grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr); min-height: 0; }
 .loft.zoomed { grid-template-columns: minmax(220px, 26%) 1fr; }
 .sky { position: relative; min-height: 0; display: flex; flex-direction: column; }
 #graph { flex: 1; width: 100%; height: 100%; min-height: 320px; transition: opacity .2s; }
@@ -101,13 +101,13 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 /* the panel */
 .panel {
   border-left: 1px solid var(--line); background: var(--plume);
-  display: flex; flex-direction: column; min-height: 0;
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .panel-head { display: flex; gap: 16px; align-items: flex-start; padding: 18px 24px 12px; border-bottom: 1px solid var(--line); }
 .panel-head h2 { margin: 0; font-size: 26px; font-weight: 800; font-stretch: 125%; letter-spacing: -0.015em; line-height: 1.1; }
 .panel-head p { margin: 4px 0 0; color: var(--slate); font-size: 14px; }
 .back { border: 1px solid var(--line); background: none; border-radius: 8px; padding: 4px 10px; cursor: pointer; color: var(--wing-2); }
-.panel-body { overflow: auto; padding: 18px 24px 32px; }
+.panel-body { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 18px 24px 32px; }
 .panel-body h3 { font-size: 15px; margin: 24px 0 8px; font-weight: 700; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
 .btn {
@@ -190,7 +190,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .cmd pre { font: 12px/1.5 var(--mono); background: var(--feather); padding: 10px; border-radius: 8px; overflow: auto; max-height: 320px; }
 
 @media (max-width: 800px) {
-  .loft.zoomed { grid-template-columns: 1fr; grid-template-rows: 30vh 1fr; }
+  .loft.zoomed { grid-template-columns: 1fr; grid-template-rows: 30vh minmax(0, 1fr); }
   .panel { border-left: 0; border-top: 1px solid var(--line); }
 }
 @media (prefers-reduced-motion: reduce) {
