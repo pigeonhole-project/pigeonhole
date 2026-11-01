@@ -94,7 +94,8 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .node.down .shape { stroke: var(--eye); stroke-dasharray: 4 4; }
 .loft-title { font-weight: 800; font-stretch: 125%; font-size: 17px; fill: var(--wing); }
 .flight { pointer-events: none; }
-.arrived { animation: arrive .45s ease-out; transform-box: fill-box; transform-origin: center; }
+.node.landed .shape { animation: landed .6s ease-out; }
+@keyframes landed { 25% { stroke: var(--teal); stroke-width: 3; } }
 @keyframes arrive { 30% { transform: scale(1.06); } }
 
 /* the panel */
@@ -193,7 +194,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
   .panel { border-left: 0; border-top: 1px solid var(--line); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .arrived, .msg.fresh, .entry.fresh > button { animation: none; }
+  .node.landed .shape, .msg.fresh, .entry.fresh > button { animation: none; }
 }
 .panel[hidden] { display: none; }
 

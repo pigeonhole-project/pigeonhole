@@ -183,7 +183,8 @@
   function bump(id) {
     const n = nodes[id];
     if (!n || reduced) return;
-    n.g.classList.remove("arrived"); void n.g.getBBox(); n.g.classList.add("arrived");
+    // A flash of the outline: animating transform would undo the node's position.
+    n.g.classList.remove("landed"); void n.g.getBBox(); n.g.classList.add("landed");
   }
 
   // ------------------------------------------------------------ events
