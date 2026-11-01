@@ -2805,7 +2805,9 @@ dependencies = [
  "bytes",
  "futures",
  "pigeonhole-types",
+ "postcard",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -2951,6 +2953,7 @@ dependencies = [
  "futures",
  "http",
  "madsim-tokio",
+ "openraft",
  "pigeonhole-blob",
  "pigeonhole-chunk-store",
  "pigeonhole-config",
@@ -2961,6 +2964,7 @@ dependencies = [
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
  "pigeonhole-storage-telegram",
+ "postcard",
  "s3s",
  "serde",
  "serde_json",

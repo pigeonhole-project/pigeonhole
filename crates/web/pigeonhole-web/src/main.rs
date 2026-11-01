@@ -62,6 +62,13 @@ fn main() -> anyhow::Result<()> {
         let part = node.get("demo", "photo.jpg", Some((5_000_000, 5_100_000))).await?;
         anyhow::ensure!(part == photo.slice(5_000_000..=5_100_000), "range read differs");
         anyhow::ensure!(node.get("demo", "notes.md", None).await? == text, "text read differs");
+        // The log inspector: the entries as they lie in the log's channel.
+        let view = node.log_entries(None, 50).await?;
+        let text = view.to_string();
+        anyhow::ensure!(text.contains("photo.jpg") && text.contains("\"namespace\":\"chunk\""), "log view: {text}");
+        if std::env::var("SMOKE_SHOW_LOG").is_ok() {
+            eprintln!("{}", serde_json::to_string_pretty(&view)?);
+        }
         node.copy("demo", "photo.jpg", "photo-copy.jpg").await?;
         node.delete("demo", "photo.jpg").await?;
 

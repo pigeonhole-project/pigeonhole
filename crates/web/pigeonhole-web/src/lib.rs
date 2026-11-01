@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+mod log_view;
 #[cfg(target_family = "wasm")]
 mod web;
 
@@ -120,6 +121,8 @@ impl World {
 }
 
 pub struct Node {
+    /// The store the node's metadata log lives in (read by the inspector).
+    pub log: Arc<dyn LogStore>,
     pub meta: Arc<MetaStore>,
     pub store: Arc<ChunkStore>,
     pub s3: S3Gateway,
@@ -245,7 +248,8 @@ impl Node {
             keep_snapshots: cfg.meta.keep_snapshots,
             ..MetaOptions::default()
         };
-        let meta = MetaStore::open(open_log(world, cfg).await?, open_snapshots(world, cfg).await?, namespaces, opts)
+        let log = open_log(world, cfg).await?;
+        let meta = MetaStore::open(log.clone(), open_snapshots(world, cfg).await?, namespaces, opts)
             .await
             .context("boot metadata tablet")?;
         let db = BlobDb::open(meta.clone()).await.context("open chunk metadata")?;
@@ -274,7 +278,13 @@ impl Node {
         }
         let store = Arc::new(store);
         let s3 = S3Gateway::new(cfg.s3_options(), Index::open(meta.clone()).await?, store.clone());
-        Ok(Self { meta, store, s3 })
+        Ok(Self { log, meta, store, s3 })
+    }
+
+    /// The log's entries as they lie in its store, commands decoded: the last
+    /// `limit`, or `limit` from position `from`.
+    pub async fn log_entries(&self, from: Option<u64>, limit: usize) -> Result<serde_json::Value> {
+        log_view::read(self.log.as_ref(), from, limit).await
     }
 
     /// Stops the tablet, as a process exit would.

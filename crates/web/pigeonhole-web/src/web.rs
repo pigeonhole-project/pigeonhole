@@ -43,6 +43,11 @@ struct Request {
     config: Option<String>,
     #[serde(default)]
     len: usize,
+    /// `log`: the first position, and how many.
+    #[serde(default)]
+    from: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 fn demo() -> String {
@@ -167,6 +172,7 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
             json!({ "ok": true })
         }
         "list" => json!({ "objects": node.list(&r.bucket).await? }),
+        "log" => node.log_entries(r.from, r.limit.unwrap_or(200)).await?,
         "repair" => {
             let s = node.repair().await?;
             json!({ "repaired": s.repaired, "failed": s.failed, "queued": s.scrub_enqueued })
