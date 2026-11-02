@@ -301,11 +301,13 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
 
   // ---- pigeons (pigeons/): the town tells them where its places are
   // A place's spot, chosen once: a window by what the flight is after
-  // (flights.js); null when it is not drawn.
+  // (flights.js); null when it is not drawn (or not yet shown).
   function spot(p) {
-    if (p.client) return client ? {client: true} : null;
-    if ("node" in p) return loftOf(p.node) ? {node: p.node} : null;
-    const n = cards.get(p.store);
+    // While the town comes up (the first boot), only to what is up already.
+    const up = n => (n && (!el.classList.contains("booting") || n.g.classList.contains("up")) ? n : null);
+    if (p.client) return up(client) ? {client: true} : null;
+    if ("node" in p) return up(loftOf(p.node)) ? {node: p.node} : null;
+    const n = up(cards.get(p.store));
     if (!n) return null;
     if (p.at === "sign") return {store: p.store, sign: true};
     const {count} = contents(n.c);
@@ -326,7 +328,9 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     el.classList.add("booting");
   }
   function reveal(target) {
-    nodeOf(target)?.g.classList.add("up");
+    // The nodes: every one of a cluster at once.
+    const shown = target.kind === "loft" && target.node == null ? [...lofts.values()] : [nodeOf(target)];
+    for (const n of shown) n?.g.classList.add("up");
     const e = edges.get(target.kind === "store" ? target.store : target.kind === "client" ? "" : null);
     if (!e) return;
     if (reduced) {

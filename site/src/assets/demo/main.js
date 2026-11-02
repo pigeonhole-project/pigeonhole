@@ -48,7 +48,10 @@ const channel = store => state.channels.find(c => c.store === store);
 const shown = () => state.node ?? state.cluster?.leader ?? state.nodes[0];
 // A request for the node the page talks to (the server picks the leader without one).
 const onNode = request => (state.node == null || request.node != null ? request : {...request, node: state.node});
-const logChannel = () => state.channels.find(c => c.role === "log");
+// The log the `log` op reads: the node on screen's.
+const logChannel = () => state.channels.find(c => c.role === "log" && (c.node == null || c.node === shown()));
+// The node on screen follows a leader it knows: the leader's tasks are not its.
+const following = () => state.nodes.length > 1 && state.cluster?.leader != null && shown() !== state.cluster.leader;
 const isOpen = kind => state.open?.kind === kind;
 // The graph's node for a panel: the log's is its channel's card.
 const nodeOf = open => (open?.kind === "log" ? {kind: "store", store: logChannel()?.store} : open);
@@ -61,10 +64,15 @@ const graph = makeGraph($("graph"), {
   onOpen: openPanel,
   onRelayout: () => relayout(),
   onLoft: (g, entrances) => {
-    updateWindows = taskWindows(g, entrances, task => {
-      openPanel({kind: "loft"});
-      $(`task-${task}`)?.scrollIntoView({block: "nearest"});
-    });
+    updateWindows = taskWindows(
+      g,
+      entrances,
+      task => {
+        openPanel({kind: "loft"});
+        $(`task-${task}`)?.scrollIntoView({block: "nearest"});
+      },
+      {follower: following()},
+    );
   },
 });
 // The cluster as the graph draws it: who leads, who is cut off, which node is on screen.
@@ -188,7 +196,7 @@ async function op(request, body) {
 
 function setBusy(on) {
   state.busy = on;
-  for (const b of document.querySelectorAll(".panel button, .panel input")) if (!b.classList.contains("back")) b.disabled = on;
+  for (const b of document.querySelectorAll(".panel button, .panel input")) if (!b.classList.contains("back") && !("locked" in b.dataset)) b.disabled = on;
 }
 
 async function refreshObjects() {
@@ -345,7 +353,10 @@ async function openPanel(target) {
   if (state.wizard) return;
   // Another node's dovecote: that node on screen, then its panel.
   if (target.kind === "loft" && target.node != null && target.node !== shown()) await pickNode(target.node);
-  if (target.kind === "store" && channel(target.store)?.role === "log") target = {kind: "log"};
+  // A log: that node's, read on it.
+  const log = target.kind === "store" && channel(target.store)?.role === "log" ? channel(target.store) : null;
+  if (log?.node != null && log.node !== shown()) await pickNode(log.node);
+  if (log) target = {kind: "log"};
   state.open = target;
   $("loft").classList.add("zoomed");
   $("panel").hidden = false;
@@ -384,7 +395,7 @@ function renderPanel() {
     show(t("demo.you"), t("demo.you_sub"), v.nodes, v);
   } else if (open.kind === "loft") {
     const id = shown();
-    const cluster = state.nodes.length > 1 ? {node: id, cut: state.cut.has(id)} : null;
+    const cluster = state.nodes.length > 1 ? {node: id, cut: state.cut.has(id), leader: state.cluster?.leader ?? null} : null;
     // A cluster's "reset" is its own config back: the demo's is one node's.
     const demo = cluster ? state.config : state.demo;
     const v = loftView({counters: counters(), ...state, demo, cluster}, loftOps);

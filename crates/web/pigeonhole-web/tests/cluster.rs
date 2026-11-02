@@ -81,6 +81,11 @@ async fn three_nodes_in_one_process_elect_write_and_fail_over() {
     let follower = *nodes.nodes.keys().find(|&&id| id != first).unwrap();
     let refused = op(&nodes, Some(follower), r#"{"op":"put","bucket":"demo","key":"b.bin"}"#).await.unwrap_err();
     assert_eq!(refused.to_string(), format!("not the leader; node {first} is"));
+    // So is a change of the dynamic config, or a task run by hand: the leader's.
+    let set = r#"{"op":"dynamic_set","key":"repair.interval","value":"off"}"#;
+    assert!(op(&nodes, Some(follower), set).await.is_err());
+    assert!(op(&nodes, Some(follower), r#"{"op":"run_task","task":"repair"}"#).await.is_err());
+    op(&nodes, Some(first), set).await.unwrap();
     // The cluster as each node sees it: the leader, and its own log by its id.
     let view = op(&nodes, Some(follower), r#"{"op":"cluster"}"#).await.unwrap();
     assert_eq!(view["leader"], first);
