@@ -99,25 +99,20 @@ pub struct Nodes {
 }
 
 impl Nodes {
-    /// Boots one node per config: a cluster's all at once (a tablet waits
-    /// for a leader), or one without `[cluster]` (node 1).
-    pub async fn open(world: &Arc<World>, configs: &[Config]) -> Result<Self> {
+    /// Boots the config `text` describes: one node (node 1), or every
+    /// `[[node]]` of its cluster, each reading the one file as itself, all
+    /// at once (a tablet waits for a leader).
+    pub async fn open(world: &Arc<World>, text: &str) -> Result<Self> {
         let net = Net::default();
-        let cluster = configs.first().and_then(|c| c.cluster.clone());
-        let nodes = match &cluster {
-            None => {
-                let [cfg] = configs else {
-                    anyhow::bail!("{} configs without [cluster]: one node, one config", configs.len())
-                };
-                [(1, crate::Node::open(world, cfg).await?)].into()
-            }
-            Some(_) => {
-                let ids = configs.iter().map(|c| c.cluster.as_ref().map_or(0, |c| c.node));
-                let opened =
-                    futures::future::join_all(configs.iter().map(|cfg| crate::Node::open_in(world, cfg, &net))).await;
-                ids.zip(opened).map(|(id, n)| Ok((id, n?))).collect::<Result<_>>()?
-            }
-        };
+        let ids = Config::node_ids(text)?;
+        if ids.is_empty() {
+            let node = crate::Node::open(world, &crate::parse_config(text)?).await?;
+            return Ok(Self { nodes: [(1, node)].into(), net, cluster: None });
+        }
+        let configs = ids.iter().map(|&id| crate::parse_config_as(text, id)).collect::<Result<Vec<_>>>()?;
+        let cluster = configs[0].cluster.clone();
+        let opened = futures::future::join_all(configs.iter().map(|cfg| crate::Node::open_in(world, cfg, &net))).await;
+        let nodes = ids.into_iter().zip(opened).map(|(id, n)| Ok((id, n?))).collect::<Result<_>>()?;
         Ok(Self { nodes, net, cluster })
     }
 

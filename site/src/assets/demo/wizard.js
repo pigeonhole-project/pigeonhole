@@ -1,13 +1,13 @@
 // The first visit: the setup step by step, the graph sketching it as it
-// grows, then the pigeonhole.toml it makes (one per node of a cluster).
-// Start boots the node, or every node, on them.
+// grows, then the pigeonhole.toml it makes (one for every node of a
+// cluster). Start boots the node, or every node, on it.
 //
-// makeWizard(panel, {sketch(channels), start([toml, …]) → error | null}):
+// makeWizard(panel, {sketch(channels), start(toml) → error | null}):
 // panel: {title, sub, body} elements. Returns {render()}.
 import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
 import {appOf} from "./channels.js";
-import {divisors, perMinute, STEPS, sketch, tomlsOf} from "./toml.js";
+import {divisors, perMinute, STEPS, sketch, tomlOf} from "./toml.js";
 
 const MAX_CHANNELS = 4,
   MAX_BOTS = 4;
@@ -27,8 +27,7 @@ export function makeWizard(panel, on) {
     },
   };
   let step = 0;
-  let edited = []; // each node's toml as the reader changed it on the last step
-  let shown = 0; // the node whose toml the last step shows
+  let edited = null; // the toml as the reader changed it on the last step
   // A choice's effect: setup[key] = the value picked.
   const set = key => v => {
     setup[key] = v;
@@ -200,29 +199,14 @@ export function makeWizard(panel, on) {
       ];
     },
     review() {
-      const made = tomlsOf(setup);
-      const texts = made.map((toml, i) => {
-        const text = h("textarea", "toml");
-        text.wrap = "off";
-        Object.assign(text, {spellcheck: false, value: edited[i] ?? toml, hidden: i !== shown});
-        text.setAttribute("aria-label", made.length > 1 ? t("wiz.review_node", {n: i + 1}) : "pigeonhole.toml");
-        text.addEventListener("input", () => {
-          edited[i] = text.value;
-        });
-        return text;
+      const text = h("textarea", "toml");
+      text.wrap = "off";
+      Object.assign(text, {spellcheck: false, value: edited ?? tomlOf(setup)});
+      text.setAttribute("aria-label", "pigeonhole.toml");
+      text.addEventListener("input", () => {
+        edited = text.value;
       });
-      const lede = h("p", "lede", t(made.length > 1 ? "wiz.review_lede_many" : "wiz.review_lede"));
-      if (made.length === 1) return [lede, ...texts, h("p", "error", "")];
-      // One file per node: a tab each.
-      const tabs = choices(
-        t("wiz.review_nodes"),
-        made.map((_, i) => [i, t("wiz.review_node", {n: i + 1})]),
-        shown,
-        i => {
-          shown = i;
-        },
-      );
-      return [lede, tabs, ...texts, h("p", "error", "")];
+      return [h("p", "lede", t(setup.nodes > 1 ? "wiz.review_lede_many" : "wiz.review_lede")), text, h("p", "error", "")];
     },
   };
 
@@ -250,15 +234,14 @@ export function makeWizard(panel, on) {
     const next = button("btn primary", last ? t("wiz.start") : t("wiz.next"), async () => {
       if (!last) {
         step++;
-        if (STEPS[step] === "review") [edited, shown] = [[], 0];
+        if (STEPS[step] === "review") edited = null;
         render();
         return;
       }
-      const texts = [...panel.body.querySelectorAll("textarea")].map(text => text.value);
-      const error = panel.body.querySelector(".error");
+      const [text, error] = [panel.body.querySelector("textarea"), panel.body.querySelector(".error")];
       next.disabled = true;
       error.textContent = "";
-      const failed = await on.start(texts);
+      const failed = await on.start(text.value);
       if (failed) {
         error.textContent = failed;
         next.disabled = false;

@@ -5,7 +5,7 @@
 //! events the call produced (JSON lines too, the server's format).
 
 use crate::cluster::Nodes;
-use crate::{parse_config, World, DEMO_CONFIG};
+use crate::{World, DEMO_CONFIG};
 use bytes::Bytes;
 use pigeonhole_admin::Request;
 use serde_json::{json, Value};
@@ -19,15 +19,15 @@ thread_local! {
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     static WORLD: Arc<World> = Arc::new(World::default());
     static NODES: RefCell<Option<Rc<Nodes>>> = const { RefCell::new(None) };
-    static CONFIGS: RefCell<Vec<String>> = RefCell::new(saved_configs().unwrap_or_else(|| vec![DEMO_CONFIG.to_string()]));
+    static CONFIG: RefCell<String> = RefCell::new(saved_config().unwrap_or_else(|| DEMO_CONFIG.to_string()));
 }
 
-/// Where the configs that last booted are kept (the page's OPFS, as
-/// `/data`): one node's, or each node's of a cluster, as a JSON list.
-const SAVED_CONFIGS: &str = "/data/configs.json";
+/// Where the config that last booted is kept (the page's OPFS, as
+/// `/data`): one node's, or the cluster's, every node in one file.
+const SAVED_CONFIG: &str = "/data/pigeonhole.toml";
 
-fn saved_configs() -> Option<Vec<String>> {
-    serde_json::from_str(&std::fs::read_to_string(SAVED_CONFIGS).ok()?).ok()
+fn saved_config() -> Option<String> {
+    std::fs::read_to_string(SAVED_CONFIG).ok()
 }
 
 fn answer(v: &Value) {
@@ -63,9 +63,10 @@ pub extern "C" fn ph_open() -> i32 {
         )
         .with_writer(std::io::stdout)
         .init();
-    let saved = saved_configs();
-    let configs = saved.clone().unwrap_or_else(|| vec![DEMO_CONFIG.to_string()]);
-    reply(Ok(json!({ "configs": configs, "demo": DEMO_CONFIG, "saved": saved.is_some() })))
+    let saved = saved_config();
+    reply(Ok(
+        json!({ "config": saved.clone().unwrap_or_else(|| DEMO_CONFIG.to_string()), "demo": DEMO_CONFIG, "saved": saved.is_some() }),
+    ))
 }
 
 /// Lets the node's background work run for a moment (a snapshot being
@@ -96,22 +97,21 @@ fn read_request() -> anyhow::Result<(Request, Bytes)> {
     Ok((req, Bytes::from(body)))
 }
 
-/// (Re)starts on `texts` (one node's config, or each node's of a
-/// cluster); the old nodes are back if this fails.
-async fn start(texts: Vec<String>) -> anyhow::Result<Value> {
-    let configs = texts.iter().map(|t| parse_config(t)).collect::<anyhow::Result<Vec<_>>>()?;
+/// (Re)starts on `text`: its node, or every node of its cluster; the old
+/// ones are back if this fails.
+async fn start(text: String) -> anyhow::Result<Value> {
     let world = WORLD.with(Arc::clone);
     let old = NODES.with(|n| n.borrow_mut().take());
     if let Some(old) = &old {
         old.close().await?;
     }
-    let nodes = match Nodes::open(&world, &configs).await {
+    let nodes = match Nodes::open(&world, &text).await {
         Ok(nodes) => nodes,
         Err(e) => {
-            // Back on the configs that ran: their tablets claim their logs again.
+            // Back on the config that ran: its tablets claim their logs again.
             if old.is_some() {
-                let previous = CONFIGS.with(|c| c.borrow().clone());
-                let previous = previous.iter().map(|t| parse_config(t)).collect::<anyhow::Result<Vec<_>>>()?;
+                let previous = CONFIG.with(|c| c.borrow().clone());
+                NODES.with(|n| n.borrow_mut().take());
                 let nodes = Nodes::open(&world, &previous).await?;
                 NODES.with(|n| *n.borrow_mut() = Some(Rc::new(nodes)));
             }
@@ -127,22 +127,18 @@ async fn start(texts: Vec<String>) -> anyhow::Result<Value> {
     let leading = nodes.leader();
     NODES.with(|n| *n.borrow_mut() = Some(Rc::new(nodes)));
     // Kept for the next page load; nowhere to keep it without a file system.
-    let _ = std::fs::write(SAVED_CONFIGS, serde_json::to_string(&texts)?);
-    CONFIGS.with(|c| *c.borrow_mut() = texts);
+    let _ = std::fs::write(SAVED_CONFIG, &text);
+    CONFIG.with(|c| *c.borrow_mut() = text);
     Ok(json!({ "replayed": replayed, "restarted": old.is_some(), "nodes": ids, "leader": leading }))
 }
 
 async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
     match r.op.as_str() {
         "open" | "restart" => {
-            let texts = match (r.configs, r.config) {
-                (Some(configs), _) => configs,
-                (None, Some(one)) => vec![one],
-                (None, None) => CONFIGS.with(|c| c.borrow().clone()),
-            };
-            return start(texts).await;
+            let text = r.config.unwrap_or_else(|| CONFIG.with(|c| c.borrow().clone()));
+            return start(text).await;
         }
-        "config" => return Ok(json!({ "configs": CONFIGS.with(|c| c.borrow().clone()) })),
+        "config" => return Ok(json!({ "config": CONFIG.with(|c| c.borrow().clone()) })),
         _ => {}
     }
     let nodes = NODES.with(|n| n.borrow().clone()).ok_or_else(|| anyhow::anyhow!("no node: open first"))?;

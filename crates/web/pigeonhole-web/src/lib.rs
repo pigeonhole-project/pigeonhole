@@ -37,6 +37,11 @@ pub fn parse_config(text: &str) -> Result<Config> {
     Config::from_toml(text, Path::new("pigeonhole.toml"))
 }
 
+/// Parses a cluster's `pigeonhole.toml` as node `node` reads it.
+pub fn parse_config_as(text: &str, node: u64) -> Result<Config> {
+    Config::from_toml_as(text, Path::new("pigeonhole.toml"), node)
+}
+
 /// What a server's restart keeps in this process: the fake channels (each a
 /// tablet of its own, in memory or in a directory) and the memory stores.
 #[derive(Default)]

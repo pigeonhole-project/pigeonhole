@@ -6,33 +6,34 @@
 use bytes::Bytes;
 use pigeonhole_admin::Request;
 use pigeonhole_web::cluster::Nodes;
-use pigeonhole_web::{parse_config, World, DEMO_CONFIG};
+use pigeonhole_web::{parse_config_as, World, DEMO_CONFIG};
 use std::sync::Arc;
 use std::time::Duration;
 
 const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
-/// Node `node`'s pigeonhole.toml: the demo's chunk channels (shared), its
-/// own log and snapshots channels, the cluster.
-fn config(node: u64) -> String {
+/// The cluster's pigeonhole.toml, one for every node: the demo's chunk
+/// channels (shared), each node's own log and snapshots channels named in
+/// its [[node]], the links.
+fn config() -> String {
     let data = DEMO_CONFIG
         .replace("fake = \"channel-data\"", "fake = \"memory\"")
-        .replace("[[store]]\nid = \"channel-data\"\nkind = \"local_disk\"\npath = \"/data/channels\"\n", "")
-        .replace("id = \"tg-log\"", &format!("id = \"tg-log-{node}\""))
-        .replace("-1001000000002", &format!("-100100000002{node}"))
-        .replace("id = \"tg-snapshots\"", &format!("id = \"tg-snapshots-{node}\""))
-        .replace("-1001000000003", &format!("-100100000003{node}"))
-        .replace(
-            "log = \"tg-log\"\nsnapshot = \"tg-snapshots\"",
-            &format!("log = \"tg-log-{node}\"\nsnapshot = \"tg-snapshots-{node}\""),
-        );
-    format!(
-        "{data}\n[cluster]\nid = 7\nnode = {node}\nkey_env = \"PH_DEMO_CLUSTER_KEY\"\nfake = \"memory\"\n\
+        .replace("[[store]]\nid = \"channel-data\"\nkind = \"local_disk\"\npath = \"/data/channels\"\n", "");
+    // The demo's log and snapshots channels become node 1's; nodes 2 and 3 get their own.
+    let mut text = data.replace("log = \"tg-log\"\nsnapshot = \"tg-snapshots\"\n", "");
+    for node in 2..=3 {
+        for (what, at) in [("log", 2), ("snapshots", 3)] {
+            text.push_str(&format!("\n[[store]]\nid = \"tg-{what}-{node}\"\nkind = \"telegram\"\nchat_id = -100100000{at}0{node}\nfake = \"memory\"\n"));
+        }
+    }
+    text.push_str(
+        "\n[cluster]\nid = 7\nkey_env = \"PH_DEMO_CLUSTER_KEY\"\nfake = \"memory\"\n\
          heartbeat = \"1s\"\nelection_timeout_min = \"4s\"\nelection_timeout_max = \"8s\"\ntick = \"100ms\"\npoll = \"200ms\"\n\
-         [[node]]\nid = 1\ngrpc = \"node-1\"\noutbox = -1001000000101\n\
-         [[node]]\nid = 2\ngrpc = \"node-2\"\noutbox = -1001000000102\n\
-         [[node]]\nid = 3\noutbox = -1001000000103\n"
-    )
+         [[node]]\nid = 1\ngrpc = \"node-1\"\noutbox = -1001000000101\nlog = \"tg-log\"\nsnapshot = \"tg-snapshots\"\n\
+         [[node]]\nid = 2\ngrpc = \"node-2\"\noutbox = -1001000000102\nlog = \"tg-log-2\"\nsnapshot = \"tg-snapshots-2\"\n\
+         [[node]]\nid = 3\noutbox = -1001000000103\nlog = \"tg-log-3\"\nsnapshot = \"tg-snapshots-3\"\n",
+    );
+    text
 }
 
 async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
@@ -59,8 +60,7 @@ async fn three_nodes_in_one_process_elect_write_and_fail_over() {
         .with_test_writer()
         .try_init();
     let world = Arc::new(World::default());
-    let configs: Vec<_> = (1..=3).map(|n| parse_config(&config(n)).unwrap()).collect();
-    let nodes = Nodes::open(&world, &configs).await.unwrap();
+    let nodes = Nodes::open(&world, &config()).await.unwrap();
     eventually("a leader", || nodes.leader().is_some()).await;
     let first = nodes.leader().unwrap();
 
@@ -85,7 +85,8 @@ async fn three_nodes_in_one_process_elect_write_and_fail_over() {
     let view = op(&nodes, Some(follower), r#"{"op":"cluster"}"#).await.unwrap();
     assert_eq!(view["leader"], first);
     let mine = view["nodes"].as_array().unwrap().iter().find(|n| n["id"] == follower).unwrap();
-    assert_eq!(mine["log"], format!("tg-log-{follower}"), "{view}");
+    let own = if follower == 1 { "tg-log".to_string() } else { format!("tg-log-{follower}") };
+    assert_eq!(mine["log"], own, "{view}");
     // The chat node's frames are posts in the fake outboxes.
     let channels = op(&nodes, None, r#"{"op":"channels","limit":5}"#).await.unwrap();
     let outbox = channels["channels"].as_array().unwrap().iter().find(|c| c["role"] == "outbox").unwrap();
@@ -106,7 +107,7 @@ async fn a_frame_posted_to_a_fake_outbox_is_read_back() {
     use openraft_chat::Mailbox;
     std::env::set_var("PH_DEMO_CLUSTER_KEY", KEY);
     let world = World::default();
-    let cfg = parse_config(&config(1)).unwrap();
+    let cfg = parse_config_as(&config(), 1).unwrap();
     let outbox = cfg.cluster.as_ref().unwrap().outbox_channel(3).unwrap();
     let writer = pigeonhole_raft_telegram::TelegramMailbox::new(Arc::new(
         world.fakes.telegram_bot(&cfg, &outbox).await.unwrap(),

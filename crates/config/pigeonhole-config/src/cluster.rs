@@ -160,6 +160,69 @@ pub(crate) struct FileNode {
     grpc: Option<String>,
     /// A channel's id (`-100…`).
     outbox: Option<i64>,
+    /// Its own log and snapshots (store ids, as `[meta]` names them): one
+    /// file serves the whole cluster, each node finds its own here.
+    log: Option<String>,
+    snapshot: Option<String>,
+}
+
+impl FileNode {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// What the running node takes from the `[[node]]` list before the stores
+/// are resolved: its own log and snapshots, and the stores that are other
+/// nodes' (checked, never opened: their bots' secrets are their hosts').
+#[derive(Default)]
+pub(crate) struct NodeStores {
+    pub log: Option<String>,
+    pub snapshot: Option<String>,
+    /// Store id → whose log or snapshots it is (`[[node]] 2 log`).
+    pub others: std::collections::HashMap<String, String>,
+}
+
+impl FileCluster {
+    /// Which `[[node]]` this process is: `as_node` (one process running
+    /// several, the site's demo), else `PIGEONHOLE_NODE`, else `[cluster]
+    /// node`. `None` without `[[node]]`s: a cluster of one.
+    pub(crate) fn this_node(&self, nodes: &[FileNode], as_node: Option<u64>) -> Result<Option<u64>> {
+        if nodes.is_empty() {
+            return Ok(None);
+        }
+        if let Some(n) = as_node {
+            return Ok(Some(n));
+        }
+        Ok(Some(match std::env::var("PIGEONHOLE_NODE") {
+            Ok(v) => v.parse().with_context(|| format!("PIGEONHOLE_NODE={v:?}"))?,
+            Err(_) => self.node.context("[cluster] node (or PIGEONHOLE_NODE): which [[node]] this process is")?,
+        }))
+    }
+}
+
+/// Node `me`'s own log and snapshots, and every other node's stores.
+pub(crate) fn node_stores(nodes: &[FileNode], me: Option<u64>) -> Result<NodeStores> {
+    let mut out = NodeStores::default();
+    let mut whose: std::collections::HashMap<&str, String> = Default::default();
+    for n in nodes {
+        for (what, id) in [("log", &n.log), ("snapshot", &n.snapshot)] {
+            let Some(id) = id.as_deref() else { continue };
+            let role = format!("[[node]] {} {what}", n.id);
+            if let Some(prev) = whose.insert(id, role.clone()) {
+                // A node's log and snapshots may share a directory; two nodes may not.
+                if !prev.starts_with(&format!("[[node]] {} ", n.id)) {
+                    bail!("[[store]] {id} is both {prev} and {role}: each node keeps its own");
+                }
+            }
+            if Some(n.id) == me {
+                *(if what == "log" { &mut out.log } else { &mut out.snapshot }) = Some(id.to_string());
+            } else {
+                out.others.insert(id.to_string(), role);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Timing for the slowest link: heartbeat, election timeout, tick, poll
@@ -202,19 +265,15 @@ fn read_nodes(nodes: Vec<FileNode>) -> Result<Vec<NodeSettings>> {
 impl FileCluster {
     /// `None` without `[[node]]`s: a cluster of one.
     /// `fake_base(store)`: what `[cluster] fake` names, resolved.
+    /// `node`: [`Self::this_node`]'s.
     pub(crate) fn into_settings(
         self,
         nodes: Vec<FileNode>,
+        node: Option<u64>,
         fake_base: impl FnOnce(&str) -> Result<FakeBacking>,
     ) -> Result<Option<ClusterSettings>> {
-        if nodes.is_empty() {
-            return Ok(None);
-        }
+        let Some(node) = node else { return Ok(None) };
         let nodes = read_nodes(nodes)?;
-        let node = match std::env::var("PIGEONHOLE_NODE") {
-            Ok(v) => v.parse().with_context(|| format!("PIGEONHOLE_NODE={v:?}"))?,
-            Err(_) => self.node.context("[cluster] node (or PIGEONHOLE_NODE): which [[node]] this process is")?,
-        };
         let me =
             nodes.iter().find(|n| n.id == node).with_context(|| format!("this node, {node}, is not a [[node]]"))?;
         let chat_link = nodes.iter().any(|n| n.id != node && link(me, n) == Some(Link::Chat));

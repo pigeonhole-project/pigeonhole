@@ -89,9 +89,6 @@ pub struct Request {
     /// The cluster node the op runs on (the demo runs them all; a server is one).
     #[serde(default)]
     pub node: Option<u64>,
-    /// `open` / `restart` of a cluster: each node's pigeonhole.toml.
-    #[serde(default)]
-    pub configs: Option<Vec<String>>,
 }
 
 impl Request {

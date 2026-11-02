@@ -23,7 +23,7 @@ const pause = ms => new Promise(r => setTimeout(r, reducedMotion() ? 0 : ms));
 
 const state = {
   demo: "", // the demo's own config (the loft's "reset")
-  configs: [], // each node's pigeonhole.toml, in the order of `nodes`
+  config: "", // the pigeonhole.toml the node runs (a cluster's: every node's)
   nodes: [1], // the nodes' ids: one, or a cluster's
   node: null, // the node the page looks at and sends to; null: whichever leads
   cluster: null, // the `cluster` op's: {leader, term, nodes}
@@ -45,7 +45,6 @@ const state = {
 const channel = store => state.channels.find(c => c.store === store);
 // The node on screen: the one picked, else the leader, else the first.
 const shown = () => state.node ?? state.cluster?.leader ?? state.nodes[0];
-const configOf = id => state.configs[state.nodes.indexOf(id)] ?? state.configs[0] ?? "";
 // A request for the node the page talks to (the server picks the leader without one).
 const onNode = request => (state.node == null || request.node != null ? request : {...request, node: state.node});
 const logChannel = () => state.channels.find(c => c.role === "log");
@@ -346,9 +345,9 @@ function renderPanel() {
   } else if (open.kind === "loft") {
     const id = shown();
     const cluster = state.nodes.length > 1 ? {node: id, cut: state.cut.has(id)} : null;
-    // A cluster node's "reset" is its own config back: the demo's is one node's.
-    const demo = cluster ? configOf(id) : state.demo;
-    const v = loftView({counters: counters(), ...state, config: configOf(id), demo, cluster}, loftOps);
+    // A cluster's "reset" is its own config back: the demo's is one node's.
+    const demo = cluster ? state.config : state.demo;
+    const v = loftView({counters: counters(), ...state, demo, cluster}, loftOps);
     show(cluster ? t("nodes.loft_title", {n: id}) : "pigeonhole", t("demo.loft_sub"), v.nodes, v);
     if (!state.log) loadLog();
   } else if (open.kind === "log") {
@@ -434,19 +433,17 @@ async function boot() {
   loadLog();
 }
 
-// The node on screen's config changed: every node restarts, as a cluster's
-// would one by one (the others' configs as they were).
+// A new config: every node restarts on it.
 async function restart(text) {
   view?.setError("");
   setBusy(true);
-  const configs = state.configs.map((c, i) => (state.nodes[i] === shown() ? text : c));
-  const {reply} = await node.call({op: "restart", configs});
+  const {reply} = await node.call({op: "restart", config: text});
   if (reply?.error) {
     view?.setError(reply.error);
     setBusy(false);
     return;
   }
-  state.configs = configs;
+  Object.assign(state, {config: text, nodes: reply.nodes});
   state.cut.clear();
   await boot();
   say(["say.restart", {n: reply.replayed}]);
@@ -474,14 +471,14 @@ function openWizard() {
   say(["wiz.caption", {}]);
 }
 
-// The wizard's configs: a node (or each node) boots on them. Returns the
+// The wizard's config: its node (or every node) boots on it. Returns the
 // error, if one does not.
-async function startFromWizard(texts) {
+async function startFromWizard(text) {
   const t0 = performance.now();
-  const {reply, events} = await node.call({op: "open", configs: texts});
+  const {reply, events} = await node.call({op: "open", config: text});
   const ms = performance.now() - t0;
   if (reply?.error) return reply.error;
-  Object.assign(state, {configs: texts, nodes: reply.nodes});
+  Object.assign(state, {config: text, nodes: reply.nodes});
   if (state.nodes.length > 1) await pollCluster();
   state.wizard = false;
   relayout = redraw;
@@ -542,7 +539,7 @@ async function startDemo() {
     status(reply.error === "other-tab" ? t("try.other_tab") : t("try.error", {error: reply.error}));
     return;
   }
-  Object.assign(state, {demo: reply.demo, configs: reply.configs, persistent: reply.persistent});
+  Object.assign(state, {demo: reply.demo, config: reply.config, persistent: reply.persistent});
   if (!reply.saved) {
     status(t("wiz.status"));
     openWizard();
@@ -571,7 +568,7 @@ async function startAdmin() {
     status(t("try.error", {error: reply?.error || "no answer"}));
     return;
   }
-  state.configs = [reply.config || ""];
+  state.config = reply.config || "";
   state.buckets = reply.buckets || [];
   state.bucket = state.buckets[0] || "";
   await boot();
