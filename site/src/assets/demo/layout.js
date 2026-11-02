@@ -55,16 +55,36 @@ function pair(at, own, x, {cols = () => 2, fit = false, gap, size, every, ground
   const width = c => cols(c) * COL;
   const slot = c => (fit ? Math.max(width(c) + 6, c.store.length * size * 0.62 + size * 2.6 + 6) : width(c));
   const need = c => floorsFor(contents(c).count, width(c) / COL, most, c.role === "log" && every ? Math.min(most, Math.ceil(every / (width(c) / COL)) + 1) : 0);
-  const floors = Math.max(MIN_FLOORS, ...own.map(need));
+  // As tall as they need, and low enough for the dovecote over them to show
+  // (a trial on ground 0 has no such bound).
+  const room = ground > 0 ? Math.floor((ground - 12 - size - 44 - 175 * scale - 16) / FLOOR) : Infinity;
+  const floors = Math.max(MIN_FLOORS, Math.min(room, Math.max(...own.map(need), 0)));
   const x0 = x;
   for (const c of own) {
     const each = slot(c);
-    at.set(c.store, {x: x + (each - width(c)) / 2, w: width(c), cols: width(c) / COL, ground, most, deep, floors, size});
+    // `most`: what the dovecote leaves room for (a block full to it is not drawn again).
+    at.set(c.store, {
+      x: x + (each - width(c)) / 2,
+      w: width(c),
+      cols: width(c) / COL,
+      ground,
+      most: Math.max(floors, Math.min(most, room)),
+      deep,
+      floors,
+      size,
+    });
     x += each + gap;
   }
   const end = own.length ? x - gap : x0 + 150;
   return {x: x0, w: end - x0, roof: ground - floors * FLOOR - 12, ground, scale, size, alone: !own.length};
 }
+
+// The ground a node's blocks need under the view's top for its dovecote
+// to show: `trial(own)` lays them out on ground 0; at least `least`.
+const groundFor = (trial, own, least) => {
+  const loft = trial(own);
+  return Math.max(least, Math.ceil(-loft.roof + loft.size + 44 + 175 * loft.scale + 12));
+};
 
 // Wide: one street, the view as tall as the screen's shape asks; you, the
 // node on its log and snapshots, then the data channels…
@@ -73,7 +93,7 @@ function wide(channels, height, every) {
   const ground = height - 6,
     most = Math.floor((ground - 12 - 70 - height * 0.12) / FLOOR);
   const at = new Map();
-  const loft = pair(at, ownOf(channels), 150, {cols: () => 3, gap: 30, size: 15, every, ground, most, deep: 2000, scale: 0.8});
+  const loft = pair(at, ownOf(channels), 150, {cols: () => 3, fit: true, gap: 10, size: 15, every, ground, most, deep: 2000, scale: 0.8});
   const x = loft.x + loft.w + 50,
     gap = 14;
   row(at, data, x, (1180 - x - (data.length - 1) * gap) / Math.max(1, data.length), gap, 2, 6, {ground, most, deep: 2000});
@@ -84,10 +104,14 @@ function wide(channels, height, every) {
 // first, the data channels on the one in front of it.
 function tall(channels, every) {
   const data = dataOf(channels);
-  const first = 400,
-    most = 12;
+  const most = 12;
   const at = new Map();
-  const loft = pair(at, ownOf(channels), 90, {cols: c => (c.role === "log" ? 2 : 3), gap: 10, size: 12, every, ground: first, most, deep: 0, scale: 0.55});
+  const first = groundFor(
+    own => pair(at, own, 90, {cols: () => 2, fit: true, gap: 8, size: 11, every, ground: 0, most, deep: 0, scale: 0.55}),
+    ownOf(channels),
+    400,
+  );
+  const loft = pair(at, ownOf(channels), 90, {cols: () => 2, fit: true, gap: 8, size: 11, every, ground: first, most, deep: 0, scale: 0.55});
   const gap = 10,
     each = (388 - (data.length - 1) * gap) / Math.max(1, data.length);
   const cols = Math.max(2, Math.min(8, Math.floor(each / COL)));
@@ -133,13 +157,14 @@ function wideCluster(channels, nodes, height, every) {
 // logs and snapshots; you, the outboxes and the data channels.
 function tallCluster(channels, nodes, every) {
   const front = [...outboxesOf(channels), ...dataOf(channels)];
-  const most = 12,
-    first = 330;
+  const most = 12;
   const at = new Map(),
     lofts = new Map();
+  const place = ground => ({fit: true, gap: 2, size: 6, every, ground, most, deep: 0, scale: 0.32});
+  const first = Math.max(...nodes.map(id => groundFor(own => pair(at, own, 0, place(0)), ownOf(channels, id), 330)));
   let x = 6;
   for (const id of nodes) {
-    const loft = pair(at, ownOf(channels, id), x, {fit: true, gap: 2, size: 6, every, ground: first, most, deep: 0, scale: 0.32});
+    const loft = pair(at, ownOf(channels, id), x, place(first));
     lofts.set(id, loft);
     x = loft.x + loft.w + 10;
   }

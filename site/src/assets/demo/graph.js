@@ -92,7 +92,8 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.c = c;
     n.cols = at.cols;
     n.most = at.most;
-    n.floors = floorsFor(contents(c).count, at.cols, at.most, at.floors);
+    // A node's own two blocks come as tall as each other (its bridge lies on both).
+    n.floors = at.floors ?? floorsFor(contents(c).count, at.cols, at.most);
     const b = tower(n.g, at.x, at.ground, at.w, n.floors, at.cols, {shade: c.role === "data" ? 1 : 3, deep: at.deep});
     n.slots = b.slots;
     n.win = svg("g", {}, n.g);
@@ -242,13 +243,14 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.g.classList.toggle("cut", scene.cut.has(id));
     // No log or snapshots of its own to stand on (a real node's in memory): a block of its own.
     if (L.alone) block(n.g, L.x, L.roof, L.w, L.ground - L.roof + 2000, rnd, {shade: 2, aerials: 1});
-    // The bridge: a slab on two posts from roof to roof, high over the blocks' letters.
+    // The bridge: a slab high over the blocks' letters, on two posts.
     const deck = L.roof - L.size - 44,
       cx = L.x + L.w / 2;
-    for (const px of [L.x + 3, L.x + L.w - 7]) svg("rect", {class: "post", x: px, y: deck, width: 4, height: L.roof - deck}, n.g);
-    svg("rect", {class: "parapet", x: L.x - 4, y: deck - 5, width: L.w + 8, height: 6}, n.g);
+    // Its posts stand beside the blocks, clear of their letters, down to the ground.
+    for (const px of [L.x - 5, L.x + L.w + 1]) svg("rect", {class: "post", x: px, y: deck, width: 4, height: L.ground - deck + 2000}, n.g);
+    svg("rect", {class: "parapet", x: L.x - 8, y: deck - 5, width: L.w + 16, height: 6}, n.g);
     // Its name (and in a cluster what it is now) on a sign under the slab.
-    const sign = svg("text", {class: "sign node-sign", x: cx, y: deck + 15, "text-anchor": "middle"}, n.g);
+    const sign = svg("text", {class: "sign node-sign", x: cx, y: deck + 15, "text-anchor": "middle", style: `font-size: ${Math.min(12, L.size + 2)}px`}, n.g);
     sign.textContent = name;
     if (cluster) {
       const r = svg("tspan", {class: `node-role${id === scene.leader ? " leading" : ""}`}, sign);

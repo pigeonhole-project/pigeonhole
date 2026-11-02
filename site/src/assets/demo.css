@@ -146,7 +146,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .flight { pointer-events: none; }
 /* a cluster: the leader's flag, a node cut off dark, Raft's traffic */
 .flag-pole { stroke: var(--seam); stroke-width: 3; } .flag { fill: var(--eye); }
-.post { fill: var(--seam); } .node-sign { font-size: 12px; }
+.post { fill: var(--seam); }
 .node-role { font-weight: 400; fill: var(--wing-2); } .node-role.leading { fill: var(--teal); font-weight: 600; }
 .node.cut .cote, .node.cut .cote-roof { fill: var(--cote-off); } .node.cut .pane.lit { fill: var(--pane); }
 .node.cut .letters { fill: var(--seam); filter: none; } .node.cut .node-role { fill: var(--eye); }
