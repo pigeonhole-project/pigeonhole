@@ -222,6 +222,9 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
       edges.set(c.store, svg("path", {class: `edge${c.role === "data" ? "" : " own"}`, d: arc(homeOf(c).door, cards.get(c.store).sign, lift * 0.6)}, routes));
     for (const l of scene.links.filter(l => l.via === "grpc" && lofts.has(l.a) && lofts.has(l.b)))
       edges.set(`raft:${l.a}-${l.b}`, svg("path", {class: "edge raft", d: arc(lofts.get(l.a).door, lofts.get(l.b).door, lift * 0.4)}, routes));
+    // Drawn anew mid-boot (a poll changed the town): what was up stays up.
+    for (const t of revealed) up(t);
+    if (waysUp) for (const e of edges.values()) e.classList.add("up");
   }
 
   // A node: the dovecote on its block's roof, the name on the roof. In a
@@ -323,31 +326,37 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   }
   const pigeons = makePigeons({spot, point, lift: () => lift, small: () => el.classList.contains("tall")});
 
-  // ---- the first boot: nodes and ways come up one by one
+  // ---- the first boot: the places come up one by one, the ways last
+  // What is up so far (kept across a redraw), and whether the ways are.
+  let revealed = [],
+    waysUp = false;
   function hideAll() {
+    revealed = [];
+    waysUp = false;
     el.classList.add("booting");
   }
-  function reveal(target) {
+  function up(target) {
     // The nodes: every one of a cluster at once.
     const shown = target.kind === "loft" && target.node == null ? [...lofts.values()] : [nodeOf(target)];
     for (const n of shown) n?.g.classList.add("up");
-    const e = edges.get(target.kind === "store" ? target.store : target.kind === "client" ? "" : null);
-    if (!e) return;
-    if (reduced) {
-      e.classList.add("up");
-      return;
-    }
-    const len = e.getTotalLength();
-    e.style.strokeDasharray = `${len}`;
-    e.style.strokeDashoffset = `${len}`;
-    requestAnimationFrame(() => e.classList.add("up"));
   }
+  function reveal(target) {
+    revealed.push(target);
+    up(target);
+  }
+  // Every place is up: the ways fade in, as they are drawn (dotted), just
+  // before the first pigeons take them.
   function showAll() {
-    el.classList.remove("booting");
-    for (const e of edges.values()) {
-      e.style.strokeDasharray = "";
-      e.style.strokeDashoffset = "";
-    }
+    waysUp = true;
+    for (const e of edges.values()) e.classList.add("up");
+    setTimeout(
+      () => {
+        el.classList.remove("booting");
+        revealed = [];
+        waysUp = false;
+      },
+      reduced ? 0 : 450,
+    );
   }
 
   return {
