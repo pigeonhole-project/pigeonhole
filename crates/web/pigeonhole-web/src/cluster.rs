@@ -90,3 +90,63 @@ impl Net {
         }
     }
 }
+
+/// The nodes of one boot: one, or every node of a cluster, and their links.
+pub struct Nodes {
+    pub nodes: std::collections::BTreeMap<u64, crate::Node>,
+    net: Net,
+    cluster: Option<ClusterSettings>,
+}
+
+impl Nodes {
+    /// Boots one node per config: a cluster's all at once (a tablet waits
+    /// for a leader), or one without `[cluster]` (node 1).
+    pub async fn open(world: &Arc<World>, configs: &[Config]) -> Result<Self> {
+        let net = Net::default();
+        let cluster = configs.first().and_then(|c| c.cluster.clone());
+        let nodes = match &cluster {
+            None => {
+                let [cfg] = configs else {
+                    anyhow::bail!("{} configs without [cluster]: one node, one config", configs.len())
+                };
+                [(1, crate::Node::open(world, cfg).await?)].into()
+            }
+            Some(_) => {
+                let ids = configs.iter().map(|c| c.cluster.as_ref().map_or(0, |c| c.node));
+                let opened =
+                    futures::future::join_all(configs.iter().map(|cfg| crate::Node::open_in(world, cfg, &net))).await;
+                ids.zip(opened).map(|(id, n)| Ok((id, n?))).collect::<Result<_>>()?
+            }
+        };
+        Ok(Self { nodes, net, cluster })
+    }
+
+    /// The node that leads, if one does. A leader cut off still thinks it
+    /// leads until it hears otherwise: the newest term's is the one.
+    pub fn leader(&self) -> Option<u64> {
+        let leaders = self.nodes.iter().filter(|(_, n)| n.admin.meta.is_leader());
+        leaders.max_by_key(|(_, n)| n.admin.meta.cluster_view().term).map(|(id, _)| *id)
+    }
+
+    /// Node `id`; without one, the leader (or the first, while none leads).
+    pub fn node(&self, id: Option<u64>) -> Result<&crate::Node> {
+        let id = id.or_else(|| self.leader()).or_else(|| self.nodes.keys().next().copied());
+        id.and_then(|id| self.nodes.get(&id)).with_context(|| format!("no node {id:?}"))
+    }
+
+    /// Cuts node `node` off from the others, or brings it back.
+    pub fn isolate(&self, world: &World, node: u64, cut: bool) -> Result<()> {
+        let cluster = self.cluster.as_ref().context("isolate: one node, no cluster")?;
+        anyhow::ensure!(self.nodes.contains_key(&node), "no node {node}");
+        self.net.isolate(world, cluster, node, cut);
+        Ok(())
+    }
+
+    /// Stops every node, as their processes' exits would.
+    pub async fn close(&self) -> Result<()> {
+        for n in self.nodes.values() {
+            n.close().await?;
+        }
+        Ok(())
+    }
+}

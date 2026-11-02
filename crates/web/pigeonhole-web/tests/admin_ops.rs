@@ -38,7 +38,8 @@ async fn the_ui_ops_run_on_a_node() {
     let me = &cluster["nodes"][0];
     assert_eq!(
         (&me["role"], &me["log"], &me["lag"]),
-        (&Value::from("leader"), &Value::from("meta-log"), &Value::from(0))
+        // The demo's log is a fake channel: its own id, as `channels` lists it.
+        (&Value::from("leader"), &Value::from("tg-log"), &Value::from(0))
     );
     assert!(me["applied"].as_u64().unwrap() > 0);
 

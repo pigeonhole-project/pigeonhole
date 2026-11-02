@@ -4,9 +4,9 @@
 //! the leader cut off, another takes over.
 
 use bytes::Bytes;
-use pigeonhole_web::cluster::Net;
-use pigeonhole_web::{parse_config, Node, World, DEMO_CONFIG};
-use std::collections::BTreeMap;
+use pigeonhole_admin::Request;
+use pigeonhole_web::cluster::Nodes;
+use pigeonhole_web::{parse_config, World, DEMO_CONFIG};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,8 +45,10 @@ async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
     panic!("never: {what}");
 }
 
-fn leader(nodes: &BTreeMap<u64, Node>) -> Option<u64> {
-    nodes.iter().find(|(_, n)| n.admin.meta.is_leader()).map(|(id, _)| *id)
+/// An op as the page sends it, on node `node`.
+async fn op(nodes: &Nodes, node: Option<u64>, json: &str) -> anyhow::Result<serde_json::Value> {
+    let r: Request = serde_json::from_str(json).unwrap();
+    nodes.node(node)?.admin.handle(&Request { node, ..r }, Bytes::from(vec![5u8; 3000])).await
 }
 
 #[tokio::test]
@@ -57,17 +59,16 @@ async fn three_nodes_in_one_process_elect_write_and_fail_over() {
         .with_test_writer()
         .try_init();
     let world = Arc::new(World::default());
-    let net = Net::default();
     let configs: Vec<_> = (1..=3).map(|n| parse_config(&config(n)).unwrap()).collect();
-    // All at once: a tablet of a cluster waits for a leader.
-    let opened = futures::future::join_all(configs.iter().map(|cfg| Node::open_in(&world, cfg, &net))).await;
-    let mut nodes: BTreeMap<u64, Node> = (1..=3).zip(opened.into_iter().map(Result::unwrap)).collect();
-    eventually("a leader", || leader(&nodes).is_some()).await;
-    let first = leader(&nodes).unwrap();
+    let nodes = Nodes::open(&world, &configs).await.unwrap();
+    eventually("a leader", || nodes.leader().is_some()).await;
+    let first = nodes.leader().unwrap();
 
-    nodes[&first].create_bucket("demo").await.unwrap();
-    nodes[&first].put("demo", "a.bin", Bytes::from(vec![7u8; 9000])).await.unwrap();
-    for (id, node) in &nodes {
+    // The page's ops go to the leader unless they name a node.
+    op(&nodes, None, r#"{"op":"put","bucket":"demo","key":"a.bin"}"#).await.unwrap_err();
+    nodes.node(None).unwrap().create_bucket("demo").await.unwrap();
+    op(&nodes, None, r#"{"op":"put","bucket":"demo","key":"a.bin"}"#).await.unwrap();
+    for (id, node) in &nodes.nodes {
         let objects = loop {
             match node.list("demo").await {
                 Ok(o) if !o.is_empty() => break o,
@@ -76,21 +77,27 @@ async fn three_nodes_in_one_process_elect_write_and_fail_over() {
         };
         assert_eq!(objects.len(), 1, "node {id} applied the put");
     }
+    // A client knocking on a follower is turned away, told who leads.
+    let follower = *nodes.nodes.keys().find(|&&id| id != first).unwrap();
+    let refused = op(&nodes, Some(follower), r#"{"op":"put","bucket":"demo","key":"b.bin"}"#).await.unwrap_err();
+    assert_eq!(refused.to_string(), format!("not the leader; node {first} is"));
+    // The cluster as each node sees it: the leader, and its own log by its id.
+    let view = op(&nodes, Some(follower), r#"{"op":"cluster"}"#).await.unwrap();
+    assert_eq!(view["leader"], first);
+    let mine = view["nodes"].as_array().unwrap().iter().find(|n| n["id"] == follower).unwrap();
+    assert_eq!(mine["log"], format!("tg-log-{follower}"), "{view}");
     // The chat node's frames are posts in the fake outboxes.
-    let outboxes = nodes[&first].admin.channels.as_ref().unwrap().describe(10).await.unwrap();
-    assert!(outboxes.to_string().contains("outbox"), "{outboxes}");
+    let channels = op(&nodes, None, r#"{"op":"channels","limit":5}"#).await.unwrap();
+    let outbox = channels["channels"].as_array().unwrap().iter().find(|c| c["role"] == "outbox").unwrap();
+    assert!(outbox["total"].as_u64().unwrap() > 0, "{outbox}");
 
     // The leader cut off: the other two elect one of themselves and go on.
-    net.isolate(&world, configs[0].cluster.as_ref().unwrap(), first, true);
-    let gone = nodes.remove(&first).unwrap();
-    eventually("a new leader", || leader(&nodes).is_some_and(|l| l != first)).await;
-    let second = leader(&nodes).unwrap();
-    nodes[&second].put("demo", "b.bin", Bytes::from(vec![8u8; 9000])).await.unwrap();
-    assert_eq!(nodes[&second].list("demo").await.unwrap().len(), 2);
-    gone.close().await.unwrap();
-    for n in nodes.values() {
-        n.close().await.unwrap();
-    }
+    nodes.isolate(&world, first, true).unwrap();
+    eventually("a new leader", || nodes.leader().is_some_and(|l| l != first)).await;
+    let second = nodes.leader().unwrap();
+    op(&nodes, Some(second), r#"{"op":"put","bucket":"demo","key":"c.bin"}"#).await.unwrap();
+    assert_eq!(nodes.nodes[&second].list("demo").await.unwrap().len(), 2);
+    nodes.close().await.unwrap();
     world.close().await.unwrap();
 }
 

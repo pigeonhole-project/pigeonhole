@@ -268,6 +268,7 @@ impl Node {
             channels: Some(view),
             config_text: None,
             cluster: cfg.cluster.clone(),
+            stores: stores.clone(),
         };
         Ok(Self { admin, stores, loops })
     }

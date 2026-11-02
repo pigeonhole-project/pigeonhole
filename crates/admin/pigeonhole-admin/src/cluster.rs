@@ -14,6 +14,12 @@ pub fn outbox_store(node: u64) -> String {
 }
 
 impl Admin {
+    /// This node's own `role` store (its log, its snapshots) as `channels`
+    /// lists it: a fake channel goes by its own id, not by these constants.
+    fn own_store(&self, role: &str) -> Option<&str> {
+        self.stores.iter().find(|s| s.role == role).map(|s| s.store.as_str())
+    }
+
     /// `{me, leader, term, nodes: [{id, role, grpc, outbox, log, snapshots,
     /// applied, lag}], links: [{a, b, via}]}`. Only this node's own log and
     /// snapshots are known here; `applied` is this node's, `lag` known on
@@ -33,8 +39,8 @@ impl Admin {
                     "grpc": node.and_then(|c| c.grpc.clone()),
                     "outbox": node.and_then(|c| c.outbox).map(|_| outbox_store(n.id)),
                     "chat": node.and_then(|c| c.outbox).map(|chat| chat.to_string()),
-                    "log": mine.then_some(LOG_STORE),
-                    "snapshots": mine.then_some(SNAPSHOT_STORE),
+                    "log": mine.then(|| self.own_store("log")).flatten(),
+                    "snapshots": mine.then(|| self.own_store("snapshots")).flatten(),
                     "applied": n.applied,
                     "lag": n.lag,
                 })

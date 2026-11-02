@@ -44,6 +44,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         inline_on: cfg.inline.max_object_size.is_some(),
         snapshot_every: cfg.meta.snapshot_every_entries,
         channels: Some(channels_view(&cfg)),
+        stores: pigeonhole_admin::stores::of(&cfg),
         config_text: std::fs::read_to_string(&cfg.config_path).ok(),
         cluster: cfg.cluster.clone(),
     });
