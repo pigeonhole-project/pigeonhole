@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+pub mod cluster;
 #[cfg(target_family = "wasm")]
 mod web;
 
@@ -34,6 +35,11 @@ pub const DEMO_CONFIG: &str = include_str!("../demo.toml");
 /// Parses a `pigeonhole.toml` as the binary would.
 pub fn parse_config(text: &str) -> Result<Config> {
     Config::from_toml(text, Path::new("pigeonhole.toml"))
+}
+
+/// Parses a cluster's `pigeonhole.toml` as node `node` reads it.
+pub fn parse_config_as(text: &str, node: u64) -> Result<Config> {
+    Config::from_toml_as(text, Path::new("pigeonhole.toml"), node)
 }
 
 /// What a server's restart keeps in this process: the fake channels (each a
@@ -175,6 +181,16 @@ async fn member(world: &World, cfg: &Config, inst: &InstanceConfig) -> Result<Sh
 impl Node {
     /// Boots over `world`: claims the log, loads its snapshot, replays the rest.
     pub async fn open(world: &Arc<World>, cfg: &Config) -> Result<Self> {
+        Self::boot(world, cfg, None).await
+    }
+
+    /// Boots node `[cluster] node` of a cluster whose other nodes boot in
+    /// this process too, over `net` (all at once: a tablet waits for a leader).
+    pub async fn open_in(world: &Arc<World>, cfg: &Config, net: &cluster::Net) -> Result<Self> {
+        Self::boot(world, cfg, Some(net)).await
+    }
+
+    async fn boot(world: &Arc<World>, cfg: &Config, net: Option<&cluster::Net>) -> Result<Self> {
         let namespaces = DynConfig::register(Index::register(BlobDb::register(Namespaces::new())));
         let opts = MetaOptions {
             snapshot_every: cfg.meta.snapshot_every_entries,
@@ -184,9 +200,16 @@ impl Node {
             ..MetaOptions::default()
         };
         let log = open_log(world, cfg).await?;
-        let meta = MetaStore::open(log.clone(), open_snapshots(world, cfg).await?, namespaces, opts)
-            .await
-            .context("boot metadata tablet")?;
+        let snapshots = open_snapshots(world, cfg).await?;
+        let meta = match (&cfg.cluster, net) {
+            (Some(c), Some(net)) => {
+                let opts = MetaOptions { heartbeat: c.heartbeat, election_timeout: c.election_timeout, ..opts };
+                MetaStore::open_in(log.clone(), snapshots, namespaces, opts, net.cluster(world, cfg, c).await?).await
+            }
+            (Some(_), None) => bail!("[cluster]: a node of a cluster boots with the others (Node::open_in)"),
+            (None, _) => MetaStore::open(log.clone(), snapshots, namespaces, opts).await,
+        }
+        .context("boot metadata tablet")?;
         let db = BlobDb::open(meta.clone()).await.context("open chunk metadata")?;
         let stored = db.list_instance_fingerprints().await.context("list instance fingerprints")?;
         check_fingerprints(&cfg.instances, &stored).context("fingerprint check")?;
@@ -227,6 +250,8 @@ impl Node {
             spawn(Box::pin(sweeper.run_loop(dynamic.sweep.schedule()))),
             spawn(Box::pin(cooler(dynamic.cool.schedule(), s3.clone(), meta.clone(), inline_on))),
             spawn(Box::pin(dynamic.clone().follow())),
+            // In a cluster the chunk stores are the leader's: taken over when it leads.
+            spawn(Box::pin(store.clone().follow_leadership())),
         ];
         let stores = stores::of(cfg);
         let view: Arc<dyn pigeonhole_admin::Channels> = Arc::new(Views {
@@ -248,6 +273,7 @@ impl Node {
             channels: Some(view),
             config_text: None,
             cluster: cfg.cluster.clone(),
+            stores: stores.clone(),
         };
         Ok(Self { admin, stores, loops })
     }

@@ -7,6 +7,9 @@
 //   {type: "repair_pass", repaired}
 //   {type: "claimed", generation}                              the node took the metadata log
 //   {type: "s3", op, ...fields}                                an S3 call that succeeded
+//   {type: "raft", from, to, via, kind, at}                    a Raft request between nodes:
+//       via "grpc" (direct), or "chat" through the sender's outbox; `at`
+//       "sent" (into the outbox, over the chat) or "read" (out of it)
 //
 // The fake channels' own tablets (span fake_channel) are not the node's: left out.
 export function readEvents(lines) {
@@ -38,6 +41,10 @@ export function readEvents(lines) {
       out.push({type: "repair_pass", repaired: +f.repaired});
     } else if (msg === "claimed the metadata log") {
       out.push({type: "claimed", generation: f.generation});
+    } else if (msg === "raft frame sent" && f.reply === false) {
+      out.push({type: "raft", from: +f.node, to: +f.to, via: f.via, kind: f.kind, at: "sent"});
+    } else if (msg === "raft frame received" && f.reply === false && f.via === "chat") {
+      out.push({type: "raft", from: +f.from, to: +f.node, via: f.via, kind: f.kind, at: "read"});
     } else if ((line.target || "").startsWith("pigeonhole_gateway_s3") && msg.endsWith(" ok")) {
       const {message: _, ...fields} = f;
       out.push({type: "s3", ...fields, op: msg.slice(0, -3)});

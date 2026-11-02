@@ -11,12 +11,14 @@
 <link rel="stylesheet" href="{{@root}}assets/chat.css">
 <link rel="stylesheet" href="{{@root}}assets/log.css">
 <link rel="stylesheet" href="{{@root}}assets/demo.css">
+<link rel="stylesheet" href="{{@root}}assets/nodes.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐦</text></svg>">
 </head>
 <body>
 <header class="bar">
   <a class="brand" href="{{@root}}{{nav.home_href}}">pigeonhole</a>
   <p class="status" id="status" role="status">{{try.loading}}</p>
+  <nav class="nodes" id="nodes" aria-label="{{demo.nodes}}" hidden></nav>
   <nav class="bar-links">
     <a class="lang" href="{{nav.demo_lang_href}}" hreflang="{{nav.lang_code}}">{{nav.lang}}</a>
     <button class="icon" id="theme" type="button" aria-label="{{nav.theme}}">◐</button>

@@ -7,7 +7,6 @@ pub mod leader_http;
 pub mod logging;
 #[cfg(feature = "metrics-prometheus")]
 pub mod prometheus;
-pub mod raft_mailbox;
 pub mod request_log;
 pub mod state_metrics;
 

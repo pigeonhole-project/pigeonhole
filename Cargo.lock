@@ -2551,6 +2551,7 @@ dependencies = [
  "pigeonhole-gateway-s3",
  "pigeonhole-limits",
  "pigeonhole-meta",
+ "pigeonhole-raft-telegram",
  "pigeonhole-storage-api",
  "pigeonhole-storage-discord",
  "pigeonhole-storage-disk",
@@ -2837,6 +2838,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pigeonhole-raft-telegram"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "madsim-tokio",
+ "openraft-chat",
+ "pigeonhole-storage-api",
+ "pigeonhole-storage-telegram",
+ "uuid",
+]
+
+[[package]]
 name = "pigeonhole-sim"
 version = "0.1.0"
 dependencies = [
@@ -3018,6 +3033,8 @@ dependencies = [
  "http",
  "madsim-tokio",
  "openraft",
+ "openraft-chat",
+ "openraft-grpc",
  "pigeonhole-admin",
  "pigeonhole-blob",
  "pigeonhole-chunk-store",
@@ -3025,6 +3042,7 @@ dependencies = [
  "pigeonhole-fake-channels",
  "pigeonhole-gateway-s3",
  "pigeonhole-meta",
+ "pigeonhole-raft-telegram",
  "pigeonhole-storage-api",
  "pigeonhole-storage-discord",
  "pigeonhole-storage-disk",

@@ -4,7 +4,8 @@
 //! `len` bytes of body; the answer is one JSON line on stdout, after the log
 //! events the call produced (JSON lines too, the server's format).
 
-use crate::{parse_config, Node, World, DEMO_CONFIG};
+use crate::cluster::Nodes;
+use crate::{World, DEMO_CONFIG};
 use bytes::Bytes;
 use pigeonhole_admin::Request;
 use serde_json::{json, Value};
@@ -17,11 +18,12 @@ thread_local! {
     static RT: tokio::runtime::Runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     static WORLD: Arc<World> = Arc::new(World::default());
-    static NODE: RefCell<Option<Rc<Node>>> = const { RefCell::new(None) };
+    static NODES: RefCell<Option<Rc<Nodes>>> = const { RefCell::new(None) };
     static CONFIG: RefCell<String> = RefCell::new(saved_config().unwrap_or_else(|| DEMO_CONFIG.to_string()));
 }
 
-/// Where the last config that booted is kept (the page's OPFS, as `/data`).
+/// Where the config that last booted is kept (the page's OPFS, as
+/// `/data`): one node's, or the cluster's, every node in one file.
 const SAVED_CONFIG: &str = "/data/pigeonhole.toml";
 
 fn saved_config() -> Option<String> {
@@ -57,7 +59,8 @@ pub extern "C" fn ph_open() -> i32 {
         .with_span_list(true)
         .with_env_filter(
             "warn,pigeonhole_web=info,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
-             pigeonhole_chunk_store=debug,pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug,pigeonhole_fake_channels=debug",
+             pigeonhole_chunk_store=debug,pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug,pigeonhole_fake_channels=debug,\
+             openraft_grpc=debug,openraft_chat=debug",
         )
         .with_writer(std::io::stdout)
         .init();
@@ -95,38 +98,39 @@ fn read_request() -> anyhow::Result<(Request, Bytes)> {
     Ok((req, Bytes::from(body)))
 }
 
-/// (Re)starts the node on `text`; the old one keeps running if this fails.
+/// (Re)starts on `text`: its node, or every node of its cluster; the old
+/// ones are back if this fails.
 async fn start(text: String) -> anyhow::Result<Value> {
-    let cfg = parse_config(&text)?;
     let world = WORLD.with(Arc::clone);
-    let old = NODE.with(|n| n.borrow_mut().take());
+    let old = NODES.with(|n| n.borrow_mut().take());
     if let Some(old) = &old {
         old.close().await?;
     }
-    let node = match Node::open(&world, &cfg).await {
-        Ok(node) => node,
+    let nodes = match Nodes::open(&world, &text).await {
+        Ok(nodes) => nodes,
         Err(e) => {
-            // Back on the config that ran: its tablet claims the log again.
+            // Back on the config that ran: its tablets claim their logs again.
             if old.is_some() {
                 let previous = CONFIG.with(|c| c.borrow().clone());
-                let node = Node::open(&world, &parse_config(&previous)?).await?;
-                NODE.with(|n| *n.borrow_mut() = Some(Rc::new(node)));
+                NODES.with(|n| n.borrow_mut().take());
+                let nodes = Nodes::open(&world, &previous).await?;
+                NODES.with(|n| *n.borrow_mut() = Some(Rc::new(nodes)));
             }
             return Err(e);
         }
     };
-    let replayed = node.replayed();
-    if node.list("demo").await.is_err() {
-        node.create_bucket("demo").await?;
+    let leader = nodes.node(None)?;
+    let replayed = leader.replayed();
+    if leader.list("demo").await.is_err() {
+        leader.create_bucket("demo").await?;
     }
-    NODE.with(|n| *n.borrow_mut() = Some(Rc::new(node)));
+    let ids: Vec<u64> = nodes.nodes.keys().copied().collect();
+    let leading = nodes.leader();
+    NODES.with(|n| *n.borrow_mut() = Some(Rc::new(nodes)));
     // Kept for the next page load; nowhere to keep it without a file system.
     let _ = std::fs::write(SAVED_CONFIG, &text);
     CONFIG.with(|c| *c.borrow_mut() = text);
-    // Which channel pane each store is drawn in.
-    let stores: Vec<Value> =
-        cfg.instances.iter().map(|i| json!({ "id": i.info.id, "kind": i.kind.as_str() })).collect();
-    Ok(json!({ "replayed": replayed, "restarted": old.is_some(), "stores": stores }))
+    Ok(json!({ "replayed": replayed, "restarted": old.is_some(), "nodes": ids, "leader": leading }))
 }
 
 async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
@@ -138,6 +142,11 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
         "config" => return Ok(json!({ "config": CONFIG.with(|c| c.borrow().clone()) })),
         _ => {}
     }
-    let node = NODE.with(|n| n.borrow().clone()).ok_or_else(|| anyhow::anyhow!("no node: open first"))?;
-    node.admin.handle(&r, body).await
+    let nodes = NODES.with(|n| n.borrow().clone()).ok_or_else(|| anyhow::anyhow!("no node: open first"))?;
+    if r.op == "isolate" {
+        let node = r.node.ok_or_else(|| anyhow::anyhow!("isolate: which node"))?;
+        nodes.isolate(&WORLD.with(Arc::clone), node, r.down)?;
+        return Ok(json!({ "node": node, "isolated": r.down }));
+    }
+    nodes.node(r.node)?.admin.handle(&r, body).await
 }

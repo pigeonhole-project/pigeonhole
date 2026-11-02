@@ -132,6 +132,22 @@ test("tomlOf: the log and snapshots on the node's disk, one store for both", () 
   );
 });
 
+test("tomlOf: one file for a cluster, each [[node]] its own log and snapshots", () => {
+  const others = [
+    {log: "discord", snapshots: "discord"},
+    {log: "local_disk", snapshots: "local_disk"},
+  ];
+  const toml = tomlOf(setup(["telegram", "discord"], 2, {nodes: 3, links: "mixed", others}));
+  assert.match(toml, /\[cluster\]\nid = 1\nkey_env/, "no `node`: every node runs this file");
+  assert.match(toml, /\[\[node\]\]\nid = 1\ngrpc = "node-1:7001"\noutbox = -1001000009001\nlog = "tg-log-1"\nsnapshot = "dc-snap-1"/);
+  assert.match(toml, /\[\[node\]\]\nid = 2\ngrpc = "node-2:7001"\noutbox = -1001000009002\nlog = "dc-log-2"/);
+  assert.match(toml, /\[\[node\]\]\nid = 3\noutbox = -1001000009003\nlog = "node-3-disk"\nsnapshot = "node-3-disk"/, "node 3 over the chat, on its disk");
+  assert.match(toml, /id = "node-3-disk"\nkind = "local_disk"\npath = "\/data\/node-3"/);
+  assert.match(toml, /\[meta\]\nsnapshot_every_entries = \d+\n# [^\n]*\nlease = "5s"/, "no log in [meta]; a Discord log takes a lease");
+  assert.match(toml, /members = \["tg-1", "dc-1"\]/, "the chunk channels are the same for all");
+  assert.doesNotMatch(tomlOf(setup(["telegram"], 1, {nodes: 3, links: "direct", others})), /outbox/);
+});
+
 test("sketch: each data channel's place; the log and snapshots last", () => {
   const chans = sketch(setup(["telegram", "discord", "telegram", "discord"], 2));
   assert.deepEqual(

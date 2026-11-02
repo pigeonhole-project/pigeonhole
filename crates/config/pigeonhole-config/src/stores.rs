@@ -296,6 +296,9 @@ pub(crate) struct Topology {
     /// Store id → purpose that uses it.
     used: HashMap<String, &'static str>,
     used_groups: HashSet<String>,
+    /// Other nodes' log and snapshot stores: never resolved here (their
+    /// bots' secrets are on their hosts), never taken for anything else.
+    others: HashMap<String, String>,
 }
 
 /// Store, replica group and shard ids share one namespace.
@@ -321,14 +324,26 @@ fn token(store: &str, env_name: &str) -> Result<String> {
 }
 
 impl Topology {
-    pub(crate) fn new(stores: Vec<FileStore>, replicas: Vec<FileReplicas>, shards: Vec<FileShards>) -> Result<Self> {
+    /// `others`: store id → the other node whose log or snapshots it is.
+    pub(crate) fn new(
+        stores: Vec<FileStore>,
+        replicas: Vec<FileReplicas>,
+        shards: Vec<FileShards>,
+        others: HashMap<String, String>,
+    ) -> Result<Self> {
         let mut ids = HashSet::new();
         let mut by_id = HashMap::new();
         let mut locations: HashMap<String, String> = HashMap::new();
+        let mut elsewhere = HashMap::new();
         for f in stores {
             let id = f.id().to_string();
             if id.is_empty() {
                 bail!("[[store]] id must be non-empty");
+            }
+            if let Some(whose) = others.get(&id) {
+                unique(&mut ids, &id)?;
+                elsewhere.insert(id, whose.clone());
+                continue;
             }
             let store = f.resolve()?;
             if let Some(loc) = store.location() {
@@ -363,12 +378,16 @@ impl Topology {
             check_members("[[shards]]", &id, &g.members)?;
             sharded.insert(id, g);
         }
+        if let Some(id) = others.keys().find(|id| !elsewhere.contains_key(*id)) {
+            bail!("{}: no [[store]] {id:?}", others[id]);
+        }
         let mut topology = Self {
             stores: by_id,
             replicas: groups,
             shards: sharded,
             used: HashMap::new(),
             used_groups: HashSet::new(),
+            others: elsewhere,
         };
         topology.resolve_fakes()?;
         Ok(topology)
@@ -393,8 +412,24 @@ impl Topology {
         Ok(())
     }
 
+    /// What fake channels named `fake = under` keep themselves in: memory,
+    /// or the directory of a local_disk store (each channel one inside).
+    pub(crate) fn fake_base(&mut self, under: &str) -> Result<FakeBacking> {
+        if under == "memory" {
+            return Ok(FakeBacking::Memory);
+        }
+        Ok(match self.take(under, "fake channels")? {
+            Store::LocalDisk { path } => FakeBacking::Dir(path),
+            Store::Memory => FakeBacking::Memory,
+            _ => bail!("fake = {under:?}: a local_disk or memory store keeps fake channels"),
+        })
+    }
+
     /// Take store `id` for `purpose` (see [`Store::may_share`]).
     fn take(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
+        if let Some(whose) = self.others.get(id) {
+            bail!("{purpose} = {id:?}: that [[store]] is {whose}; a store serves one node");
+        }
         let store = self.stores.get(id).cloned().with_context(|| {
             if self.replicas.contains_key(id) || self.shards.contains_key(id) {
                 format!("{purpose} = {id:?}: a group is not supported here yet; use a [[store]]")
@@ -468,7 +503,7 @@ impl Topology {
             }
         }
         for id in self.stores.keys() {
-            if !self.used.contains_key(id) {
+            if !self.used.contains_key(id) && !self.others.contains_key(id) {
                 bail!("[[store]] {id} is not used by [meta] log / snapshot or [chunk] store");
             }
         }

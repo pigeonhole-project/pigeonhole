@@ -1,13 +1,14 @@
 // The node's panel: counters, the background tasks, the config (on a real
 // node, read-only).
 //
-// on: {restart(text), erase(), toggle(task, on), run(task)}.
+// on: {restart(text), erase(), toggle(task, on), run(task), isolate(node, cut)}.
+// cluster: {node, cut}, the node of a cluster this panel is: it can be cut off.
 // Returns {nodes, setCounters({objects, dataChannels, log}), setBackground(bg), setError(text)}.
-import {h} from "../lib/dom.js";
+import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
 import {taskCards} from "./tasks.js";
 
-export function loftView({counters: counts, config, demo, admin, bg}, on) {
+export function loftView({counters: counts, config, demo, admin, bg, cluster}, on) {
   const view = document.getElementById("tpl-node").content.cloneNode(true);
   const $ = id => view.querySelector(`#${id}`);
 
@@ -26,6 +27,16 @@ export function loftView({counters: counts, config, demo, admin, bg}, on) {
     );
   };
   setCounters(counts);
+
+  if (cluster) {
+    const {node, cut} = cluster;
+    const row = h("div", "row node-cut");
+    row.append(
+      button(`btn${cut ? " primary" : " danger"}`, t(cut ? "nodes.bring_back" : "nodes.cut_off", {n: node}), () => on.isolate(node, !cut)),
+      h("p", "field-note", t("nodes.cut_note")),
+    );
+    counters.after(row);
+  }
 
   const setBackground = taskCards($("bg"), {onToggle: on.toggle, onRun: on.run});
   setBackground(bg);

@@ -3,11 +3,11 @@
 
 use openraft_chat::{ChatNetwork, Mailbox, Settings};
 use openraft_grpc::{GrpcNetwork, Identity, Mixed};
-use pigeonhole::raft_mailbox::TelegramMailbox;
 use pigeonhole_meta::raft::TypeConfig;
 use pigeonhole_meta::{
     BlobSnapshotStore, ChainLogStore, Cluster, MetaOptions, MetaStore, Namespaces, Never, Outcome, Serve, StateMachine,
 };
+use pigeonhole_raft_telegram::TelegramMailbox;
 use pigeonhole_storage_memory::MemoryBlobStore;
 use pigeonhole_storage_telegram::fake::FakeChannel;
 use serde::{Deserialize, Serialize};

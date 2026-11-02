@@ -301,9 +301,12 @@ row of them.
 
 ## Configuration (pigeonhole)
 
-Every node runs with the same `[cluster]`, the same `[[node]]` list and the
-same blob stores. Each node has a `[meta]` log and snapshots of its own, and
-knows which node it is from `[cluster] node` or `PIGEONHOLE_NODE`.
+One pigeonhole.toml serves the whole cluster, as zoo.cfg does ZooKeeper's:
+the same `[cluster]`, `[[node]]` list and blob stores on every host. A node
+knows which one it is from `PIGEONHOLE_NODE` (or `[cluster] node`). Each
+`[[node]]` names its own log and snapshots stores; a node opens only its
+own and leaves the others' unresolved (their env vars need not be set).
+A store serves one node: two nodes naming the same log is an error.
 
 ```toml
 [cluster]
@@ -320,15 +323,21 @@ bot_token_envs = ["RAFT_BOT_TOKEN"]   # this node's bots; each host sets its own
 id = 1
 grpc = "10.0.0.1:7001"          # serves Raft here; the others call it here
 outbox = -1001111111111         # the channel it posts its frames into
+log = "log-1"                   # its [meta] log and snapshots: [[store]] ids
+snapshot = "snapshots-1"
 
 [[node]]
 id = 2
 grpc = "10.0.0.2:7001"
 outbox = -1002222222222
+log = "log-2"
+snapshot = "snapshots-2"
 
 [[node]]
 id = 3
 outbox = -1003333333333         # only a channel: 1 and 2 reach it over the chat
+log = "log-3"
+snapshot = "snapshots-3"
 ```
 
 The file is the same on every host. The bots are not: `bot_token_envs`
@@ -364,7 +373,7 @@ the defaults follow the slowest link. Commits stay fast all the same. Two
 nodes on gRPC are a quorum of three, and the chat node catches up behind
 them.
 
-**The Telegram outbox** (`pigeonhole::raft_mailbox::TelegramMailbox`)
+**The Telegram outbox** (`pigeonhole_raft_telegram::TelegramMailbox`, crates/net/pigeonhole-raft-telegram)
 works as follows:
 - a frame is a message named `raft.bin`: inline text when it fits
   (~7.5 KB), a document otherwise; its position is the message id;

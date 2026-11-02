@@ -1,5 +1,6 @@
 //! A node's Raft outbox in a Telegram channel (docs/raft-over-chat.md §
-//! Topology): openraft-chat's [`Mailbox`] over the store's `ChannelApi`.
+//! Topology): openraft-chat's [`Mailbox`] over the store's `ChannelApi`,
+//! the binary's real channels and the demo's fake ones alike.
 //!
 //! A frame is one message: a text when it fits (`raft.bin`, inline as the
 //! store writes small blobs), a document otherwise. Its position is the

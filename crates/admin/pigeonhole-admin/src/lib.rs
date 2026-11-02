@@ -86,6 +86,28 @@ pub struct Request {
     /// `delete_message`: the message's id.
     #[serde(default)]
     pub message: String,
+    /// The cluster node the op runs on (the demo runs them all; a server is one).
+    #[serde(default)]
+    pub node: Option<u64>,
+}
+
+impl Request {
+    /// The op as the S3 request it stands for, if it is one: a follower
+    /// turns those away, as the binary's S3 port does (and the chunk
+    /// store's own ops, verify and repair: the stores are the leader's).
+    fn s3(&self) -> Option<String> {
+        let (b, k) = (&self.bucket, &self.key);
+        Some(match self.op.as_str() {
+            "put" => format!("PUT /{b}/{k}"),
+            "get" => format!("GET /{b}/{k}"),
+            "copy" => format!("PUT /{b}/{} (copy of {k})", self.to),
+            "delete" => format!("DELETE /{b}/{k}"),
+            "list" => format!("GET /{b}"),
+            "buckets" => "GET /".to_string(),
+            "verify" | "repair" => format!("{} (the chunk store)", self.op),
+            _ => return None,
+        })
+    }
 }
 
 fn demo() -> String {
@@ -112,11 +134,30 @@ pub struct Admin {
     pub config_text: Option<String>,
     /// The tablet's Raft cluster as the config has it; `None`: of one.
     pub cluster: Option<pigeonhole_config::cluster::ClusterSettings>,
+    /// The node's stores as the config names them ([`stores::of`]).
+    pub stores: Vec<StoreRef>,
 }
 
 impl Admin {
+    /// A node that does not lead turns S3 requests away, as the binary's
+    /// S3 port does (pigeonhole::leader_http): the same log line.
+    fn only_on_the_leader(&self, op: &str) -> Result<()> {
+        if self.meta.is_leader() {
+            return Ok(());
+        }
+        let leader = self.meta.leader();
+        tracing::info!(op, leader, "not the leader");
+        match leader {
+            Some(id) => bail!("not the leader; node {id} is"),
+            None => bail!("not the leader; no leader known"),
+        }
+    }
+
     /// Runs `r` (with `body`, an upload's bytes).
     pub async fn handle(&self, r: &Request, body: Bytes) -> Result<Value> {
+        if let Some(op) = r.s3() {
+            self.only_on_the_leader(&op)?;
+        }
         Ok(match r.op.as_str() {
             "put" => {
                 self.put(&r.bucket, &r.key, body).await?;

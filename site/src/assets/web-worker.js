@@ -15,6 +15,9 @@ import {MemoryHandle, Pool, Wasi} from "./wasi.js";
 const V = new URL(import.meta.url).search;
 
 const POOL_DIR = "pigeonhole";
+// The demo's cluster seals its Raft frames with this key ([cluster]
+// key_env): no secret, every visitor's is the same.
+const DEMO_CLUSTER_KEY = "706967656f6e686f6c652064656d6f20636c75737465723a206e6f206b657900";
 const POOL_START = 64; // files opened at start
 const POOL_LOW = 24; // fewer free than this after a call: open POOL_MORE
 const POOL_MORE = 32;
@@ -95,7 +98,7 @@ async function reset() {
 
 const ready = (async () => {
   pool = await openPool();
-  wasi = new Wasi({pool, preopen: "/data"});
+  wasi = new Wasi({pool, preopen: "/data", env: {PH_DEMO_CLUSTER_KEY: DEMO_CLUSTER_KEY}});
   const {instance} = await WebAssembly.instantiateStreaming(fetch(`pigeonhole.wasm${V}`), {wasi_snapshot_preview1: wasi.imports()});
   exports = instance.exports;
   wasi.memory = exports.memory;
@@ -106,7 +109,8 @@ const ready = (async () => {
 // Between calls nothing runs on this thread: once a second, while idle, let
 // the node's background work go on (a snapshot being built, timers) and pass
 // on what it logged.
-const TICK_MS = 1000;
+// Often: a cluster's heartbeats and elections run only while it ticks.
+const TICK_MS = 200;
 setInterval(() => {
   if (inFlight || !exports?.ph_tick) return;
   wasi.setStdin(new Uint8Array(0));

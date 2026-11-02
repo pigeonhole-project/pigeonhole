@@ -1,0 +1,19 @@
+/* A cluster's nodes in the bar: the one on screen pressed, the leader ★,
+   one cut off ✂; following the leader, its button is outlined. */
+.nodes { display: flex; gap: 4px; }
+.nodes[hidden] { display: none; }
+.node-pick {
+  border: 1px solid var(--line); background: none; border-radius: 999px; padding: 3px 10px;
+  font: inherit; font-size: 13px; cursor: pointer; white-space: nowrap; color: var(--wing-2);
+}
+.node-pick.following { border-color: var(--teal); }
+.node-pick[aria-pressed="true"] { background: var(--teal); border-color: var(--teal); color: #fff; }
+/* The node's panel: cutting it off. */
+.node-cut { align-items: center; margin: 4px 0 8px; }
+.node-cut .field-note { margin: 0; }
+@media (max-width: 640px) {
+  /* a row of their own under the brand and the status */
+  .bar:has(.nodes:not([hidden])) { flex-wrap: wrap; row-gap: 6px; }
+  .nodes { order: 5; flex-basis: 100%; }
+  .node-pick { padding: 2px 7px; font-size: 12px; }
+}

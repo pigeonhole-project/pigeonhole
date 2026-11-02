@@ -1,8 +1,11 @@
-// The wizard's setup → the pigeonhole.toml it makes, and the channels it
-// will have (the graph's sketch). A setup:
+// The wizard's setup → the pigeonhole.toml it makes (one for every node of
+// a cluster), and the channels it will have (the graph's sketch). A setup:
 //   {channels: ["telegram" | "discord", …], copies, quorum,
-//    log: kind, snapshots: kind, every: entries, bots, pace: "demo" | "real"}
+//    log: kind, snapshots: kind, every: entries, bots, pace: "demo" | "real",
+//    nodes: 1 | 3, links: "direct" | "chat" | "mixed",
+//    others: [{log, snapshots}, …]: nodes 2 and 3's own (node 1's: log, snapshots)}
 // Its data channels form groups of `copies` (replicas); the groups are shards.
+// Every node of a cluster shares them; each has its own log and snapshots.
 import {t} from "../lib/i18n.js";
 
 export const divisors = n => Array.from({length: n}, (_, i) => i + 1).filter(d => n % d === 0);
@@ -27,19 +30,58 @@ function dataChannels(w) {
   });
 }
 
-// Where the node keeps its own log and snapshots on a local disk (the
+// Where a node keeps its own log and snapshots on a local disk (the
 // browser's storage, in the demo): one store, a directory each.
-const NODE_DISK = {id: "node-disk", path: "/data/node"};
+const diskId = node => (node ? `node-${node}-disk` : "node-disk");
+const diskPath = node => (node ? `/data/node-${node}` : "/data/node");
 
-// The log's and the snapshots' store: a channel, or the node's disk (as
-// the node lists it: meta-log, meta-snap).
-function metaStore(kind, what) {
+// The log's and the snapshots' store of node `node` (0: no cluster): a
+// channel of its own, or its disk (as the node lists it: meta-log, meta-snap).
+function metaStore(kind, what, node = 0) {
   const name = what === "snapshots" ? "snap" : what;
-  if (kind === "local_disk") return {id: `meta-${name}`, kind, scope: `${NODE_DISK.path}/${what}`, disk: true};
+  if (kind === "local_disk") return {id: `meta-${name}`, kind, scope: `${diskPath(node)}/${what}`, disk: true};
   const tail = what === "log" ? "01" : "02";
-  return {id: `${short(kind)}-${name}`, kind, scope: kind === "telegram" ? `-10010000001${tail}` : `10000000000000001${tail}`};
+  const n = node || 1;
+  return {
+    id: `${short(kind)}-${name}${node ? `-${node}` : ""}`,
+    kind,
+    scope: kind === "telegram" ? `-1001000000${n}${tail}` : `1000000000000000${n}${tail}`,
+  };
 }
 
+// Node `node`'s own log and snapshots: node 1 has the metadata step's, the others theirs.
+const placeOf = (w, node) => (node <= 1 ? {log: w.log, snapshots: w.snapshots} : w.others[node - 2]);
+
+// Each node's log and snapshots stores (one node: node 0, no cluster).
+function metas(w) {
+  const nodes = w.nodes > 1 ? Array.from({length: w.nodes}, (_, i) => i + 1) : [0];
+  return nodes.map(node => {
+    const place = placeOf(w, node);
+    return {node, kind: place.log, log: metaStore(place.log, "log", node), snaps: metaStore(place.snapshots, "snapshots", node)};
+  });
+}
+// A meta store as [meta] or [[node]] names it: its channel, or its node's disk.
+const storeId = (m, node) => (m.disk ? diskId(node) : m.id);
+
+// The cluster: every node runs this one file, knowing itself from
+// PIGEONHOLE_NODE (the demo runs them all). Its links are direct (gRPC's
+// place; in a browser, in memory) or over the chat (each node's outbox, a
+// fake Telegram channel); each [[node]] names its own log and snapshots.
+function clusterToml(w, nodes) {
+  const direct = n => w.links === "direct" || (w.links === "mixed" && n <= 2);
+  const chat = () => w.links !== "direct";
+  const out = [`# ${t("wiz.toml_cluster", {n: w.nodes})}`, "[cluster]", "id = 1", 'key_env = "PH_DEMO_CLUSTER_KEY"'];
+  out.push('fake = "channel-data"', 'heartbeat = "1s"', 'election_timeout_min = "4s"', 'election_timeout_max = "8s"', 'tick = "100ms"', 'poll = "200ms"', "");
+  for (const m of nodes) {
+    out.push("[[node]]", `id = ${m.node}`);
+    if (direct(m.node)) out.push(`grpc = "node-${m.node}:7001"`);
+    if (chat()) out.push(`outbox = -100100000900${m.node}`);
+    out.push(`log = "${storeId(m.log, m.node)}"`, `snapshot = "${storeId(m.snaps, m.node)}"`, "");
+  }
+  return out;
+}
+
+// The pigeonhole.toml: one node's, or every node's of a cluster.
 export function tomlOf(w) {
   const data = dataChannels(w),
     shards = w.channels.length / w.copies;
@@ -90,21 +132,23 @@ export function tomlOf(w) {
     chunkStore = "shards";
   }
 
-  const log = metaStore(w.log, "log"),
-    snaps = metaStore(w.snapshots, "snapshots");
-  const chats = [log, snaps].filter(m => !m.disk);
+  const nodes = metas(w);
+  const chats = nodes.flatMap(m => [m.log, m.snaps]).filter(m => !m.disk);
   for (const [i, m] of chats.entries()) out.push(...store(m, i === 0 ? t("wiz.toml_meta") : null));
-  if (log.disk || snaps.disk) {
-    out.push(`# ${t("wiz.toml_node_disk")}`, "[[store]]", `id = "${NODE_DISK.id}"`, 'kind = "local_disk"', `path = "${NODE_DISK.path}"`, "");
+  for (const m of nodes.filter(m => m.log.disk || m.snaps.disk)) {
+    out.push(`# ${t("wiz.toml_node_disk")}`, "[[store]]", `id = "${diskId(m.node)}"`, 'kind = "local_disk"', `path = "${diskPath(m.node)}"`, "");
   }
   out.push(`# ${t("wiz.toml_disk")}`, "[[store]]", 'id = "channel-data"', 'kind = "local_disk"', 'path = "/data/channels"', "");
-  const id = m => (m.disk ? NODE_DISK.id : m.id);
-  out.push("[meta]", `log = "${id(log)}"`, `snapshot = "${id(snaps)}"`, `snapshot_every_entries = ${w.every}`);
-  if (w.log === "discord") out.push(`# ${t("wiz.toml_lease")}`, 'lease = "5s"');
+  // One node: its log and snapshots in [meta]; a cluster's: in each [[node]].
+  out.push("[meta]");
+  if (!(w.nodes > 1)) out.push(`log = "${storeId(nodes[0].log, 0)}"`, `snapshot = "${storeId(nodes[0].snaps, 0)}"`);
+  out.push(`snapshot_every_entries = ${w.every}`);
+  if (nodes.some(m => m.kind === "discord")) out.push(`# ${t("wiz.toml_lease")}`, 'lease = "5s"');
   out.push("");
   out.push("[chunk]", `store = "${chunkStore}"`, 'size = "4 MiB"', 'block_size = "1 MiB"', 'codec = "zstd"', "");
   out.push("[inline]", 'max_object_size = "1 KiB"', "", "[cache]", "enabled = false", "");
   out.push(`# ${t("wiz.toml_repair")}`, "[repair]", 'interval = "10s"', "");
+  if (w.nodes > 1) out.push(...clusterToml(w, nodes));
   if (w.pace === "demo") {
     out.push(
       `# ${t("wiz.toml_fast")}`,
@@ -124,7 +168,7 @@ export function tomlOf(w) {
 }
 
 // The wizard's steps, in order: what the setup has decided by each.
-export const STEPS = ["channels", "copies", "meta", "bots", "review"];
+export const STEPS = ["channels", "copies", "meta", "nodes", "bots", "review"];
 
 // The channels of the setup as they will be, nothing posted (no `total`),
 // as far as the wizard has come: the data channels first, their places once

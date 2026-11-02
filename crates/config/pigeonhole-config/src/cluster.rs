@@ -11,7 +11,7 @@
 //! values set on each host apart).
 
 use crate::instances::TelegramLogin;
-use crate::stores::TelegramBots;
+use crate::stores::{FakeBacking, FakeChannel, TelegramBots};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,6 +49,9 @@ pub struct NodeSettings {
 pub enum ChatSettings {
     /// The primary bot first; each reads and posts for the node.
     Telegram { logins: Vec<TelegramLogin> },
+    /// Fake Telegram channels ([`ClusterSettings::outbox_channel`]; the
+    /// feature `fake`): no bots, the site's demo.
+    Fake,
 }
 
 /// The cluster as this node sees it.
@@ -68,9 +71,28 @@ pub struct ClusterSettings {
     /// The chat transport's tick and poll.
     pub tick: Duration,
     pub poll: Duration,
+    /// Where fake outboxes keep themselves (`[cluster] fake`).
+    pub fake: Option<FakeBacking>,
 }
 
 impl ClusterSettings {
+    /// Node `node`'s outbox as a fake Telegram channel, with `[cluster] fake`.
+    pub fn outbox_channel(&self, node: u64) -> Option<FakeChannel> {
+        let fake = self.fake.as_ref()?;
+        let chat = self.nodes.iter().find(|n| n.id == node)?.outbox?;
+        let backing = match fake {
+            FakeBacking::Dir(dir) => FakeBacking::Dir(dir.join(format!("telegram-{chat}"))),
+            other => other.clone(),
+        };
+        Some(FakeChannel {
+            id: format!("outbox-{node}"),
+            kind: crate::instances::InstanceKind::Telegram,
+            scope: chat.to_string(),
+            backing,
+            bots: 1,
+        })
+    }
+
     pub fn me(&self) -> &NodeSettings {
         self.nodes.iter().find(|n| n.id == self.node).expect("checked when read")
     }
@@ -122,6 +144,9 @@ pub(crate) struct FileCluster {
     poll: Option<Duration>,
     /// The chat of the outboxes: `"telegram"` (the default).
     chat: Option<String>,
+    /// Fake outboxes (builds with the feature `fake`): `"memory"`, or the
+    /// local_disk store they keep themselves in; no bots.
+    fake: Option<String>,
     /// Env vars with this node's bots' tokens; default `["RAFT_BOT_TOKEN"]`.
     bot_token_envs: Option<Vec<String>>,
     api_id_env: Option<String>,
@@ -135,6 +160,69 @@ pub(crate) struct FileNode {
     grpc: Option<String>,
     /// A channel's id (`-100…`).
     outbox: Option<i64>,
+    /// Its own log and snapshots (store ids, as `[meta]` names them): one
+    /// file serves the whole cluster, each node finds its own here.
+    log: Option<String>,
+    snapshot: Option<String>,
+}
+
+impl FileNode {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// What the running node takes from the `[[node]]` list before the stores
+/// are resolved: its own log and snapshots, and the stores that are other
+/// nodes' (checked, never opened: their bots' secrets are their hosts').
+#[derive(Default)]
+pub(crate) struct NodeStores {
+    pub log: Option<String>,
+    pub snapshot: Option<String>,
+    /// Store id → whose log or snapshots it is (`[[node]] 2 log`).
+    pub others: std::collections::HashMap<String, String>,
+}
+
+impl FileCluster {
+    /// Which `[[node]]` this process is: `as_node` (one process running
+    /// several, the site's demo), else `PIGEONHOLE_NODE`, else `[cluster]
+    /// node`. `None` without `[[node]]`s: a cluster of one.
+    pub(crate) fn this_node(&self, nodes: &[FileNode], as_node: Option<u64>) -> Result<Option<u64>> {
+        if nodes.is_empty() {
+            return Ok(None);
+        }
+        if let Some(n) = as_node {
+            return Ok(Some(n));
+        }
+        Ok(Some(match std::env::var("PIGEONHOLE_NODE") {
+            Ok(v) => v.parse().with_context(|| format!("PIGEONHOLE_NODE={v:?}"))?,
+            Err(_) => self.node.context("[cluster] node (or PIGEONHOLE_NODE): which [[node]] this process is")?,
+        }))
+    }
+}
+
+/// Node `me`'s own log and snapshots, and every other node's stores.
+pub(crate) fn node_stores(nodes: &[FileNode], me: Option<u64>) -> Result<NodeStores> {
+    let mut out = NodeStores::default();
+    let mut whose: std::collections::HashMap<&str, String> = Default::default();
+    for n in nodes {
+        for (what, id) in [("log", &n.log), ("snapshot", &n.snapshot)] {
+            let Some(id) = id.as_deref() else { continue };
+            let role = format!("[[node]] {} {what}", n.id);
+            if let Some(prev) = whose.insert(id, role.clone()) {
+                // A node's log and snapshots may share a directory; two nodes may not.
+                if !prev.starts_with(&format!("[[node]] {} ", n.id)) {
+                    bail!("[[store]] {id} is both {prev} and {role}: each node keeps its own");
+                }
+            }
+            if Some(n.id) == me {
+                *(if what == "log" { &mut out.log } else { &mut out.snapshot }) = Some(id.to_string());
+            } else {
+                out.others.insert(id.to_string(), role);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Timing for the slowest link: heartbeat, election timeout, tick, poll
@@ -176,19 +264,34 @@ fn read_nodes(nodes: Vec<FileNode>) -> Result<Vec<NodeSettings>> {
 
 impl FileCluster {
     /// `None` without `[[node]]`s: a cluster of one.
-    pub(crate) fn into_settings(self, nodes: Vec<FileNode>) -> Result<Option<ClusterSettings>> {
-        if nodes.is_empty() {
-            return Ok(None);
-        }
+    /// `fake_base(store)`: what `[cluster] fake` names, resolved.
+    /// `node`: [`Self::this_node`]'s.
+    pub(crate) fn into_settings(
+        self,
+        nodes: Vec<FileNode>,
+        node: Option<u64>,
+        fake_base: impl FnOnce(&str) -> Result<FakeBacking>,
+    ) -> Result<Option<ClusterSettings>> {
+        let Some(node) = node else { return Ok(None) };
         let nodes = read_nodes(nodes)?;
-        let node = match std::env::var("PIGEONHOLE_NODE") {
-            Ok(v) => v.parse().with_context(|| format!("PIGEONHOLE_NODE={v:?}"))?,
-            Err(_) => self.node.context("[cluster] node (or PIGEONHOLE_NODE): which [[node]] this process is")?,
-        };
         let me =
             nodes.iter().find(|n| n.id == node).with_context(|| format!("this node, {node}, is not a [[node]]"))?;
         let chat_link = nodes.iter().any(|n| n.id != node && link(me, n) == Some(Link::Chat));
-        let chat = if chat_link { Some(self.chat_settings()?) } else { None };
+        let fake = match &self.fake {
+            None => None,
+            Some(_) if !cfg!(feature = "fake") => {
+                bail!("[cluster] fake: fake outboxes are only in builds with the `fake` feature")
+            }
+            Some(_) if self.bot_token_envs.is_some() || self.api_id_env.is_some() => {
+                bail!("[cluster] fake outboxes have no real bots: drop bot_token_envs, api_id_env, api_hash_env")
+            }
+            Some(under) => Some(fake_base(under).context("[cluster] fake")?),
+        };
+        let chat = match (chat_link, &fake) {
+            (false, _) => None,
+            (true, Some(_)) => Some(ChatSettings::Fake),
+            (true, None) => Some(self.chat_settings()?),
+        };
         let key_env = self.key_env.context("[cluster] key_env: the env var with the cluster's key")?;
         let key = parse_key(&std::env::var(&key_env).with_context(|| format!("{key_env} is not set"))?)
             .with_context(|| key_env.clone())?;
@@ -209,6 +312,7 @@ impl FileCluster {
             election_timeout,
             tick: self.tick.unwrap_or(tick),
             poll: self.poll.unwrap_or(poll),
+            fake,
         }))
     }
 

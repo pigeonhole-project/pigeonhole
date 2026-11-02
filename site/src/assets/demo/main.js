@@ -23,7 +23,12 @@ const pause = ms => new Promise(r => setTimeout(r, reducedMotion() ? 0 : ms));
 
 const state = {
   demo: "", // the demo's own config (the loft's "reset")
-  config: "", // the config the node runs
+  config: "", // the pigeonhole.toml the node runs (a cluster's: every node's)
+  nodes: [1], // the nodes' ids: one, or a cluster's
+  node: null, // the node the page looks at and sends to; null: whichever leads
+  cluster: null, // the `cluster` op's: {leader, term, nodes}
+  term: null, // the newest term seen: a new leader is told once
+  cut: new Set(), // the nodes cut off from the others
   persistent: false, // the node's files outlive the page (OPFS)
   admin: false, // a real node's admin, not the demo
   buckets: [],
@@ -38,6 +43,10 @@ const state = {
   wizard: false, // the first visit's setup is on screen
 };
 const channel = store => state.channels.find(c => c.store === store);
+// The node on screen: the one picked, else the leader, else the first.
+const shown = () => state.node ?? state.cluster?.leader ?? state.nodes[0];
+// A request for the node the page talks to (the server picks the leader without one).
+const onNode = request => (state.node == null || request.node != null ? request : {...request, node: state.node});
 const logChannel = () => state.channels.find(c => c.role === "log");
 const isOpen = kind => state.open?.kind === kind;
 // The graph's node for a panel: the log's is its channel's card.
@@ -57,8 +66,14 @@ const graph = makeGraph($("graph"), {
     });
   },
 });
+// The cluster as the graph draws it: who leads, who is cut off, which node is on screen.
+let drawnLeader = null,
+  drawnLinks = 0; // the cluster drawn last
+const scene = () => ({leader: state.cluster?.leader ?? null, cut: state.cut, shown: shown(), links: state.cluster?.links || []});
 function redraw() {
-  graph.draw(state.channels, state.objects.length);
+  drawnLeader = state.cluster?.leader ?? null;
+  drawnLinks = state.cluster?.links?.length ?? 0;
+  graph.draw(state.channels, state.objects.length, scene());
   graph.markOpen(nodeOf(state.open));
   renderBackground();
 }
@@ -96,6 +111,14 @@ function apply(events) {
       graph.fly(c.store, {back: true, size: e.op === "get" ? e.bytes || 4096 : 512});
     } else if (e.type === "call_failed" && c) {
       graph.fly(c.store, {size: 2048, failed: true});
+    } else if (e.type === "raft") {
+      graph.flyRaft(e);
+      // Over the chat, a frame is a post in the sender's outbox.
+      const box = e.via === "chat" && e.at === "sent" && channel(`outbox-${e.from}`);
+      if (box) {
+        box.total = (box.total ?? 0) + 1;
+        graph.setTotal(box.store);
+      }
     } else if (e.type === "repair_pass" && e.repaired > 0) {
       said.push(["say.repair_pass", {n: e.repaired}]);
     } else if (e.type === "s3") {
@@ -128,7 +151,7 @@ async function background(events) {
 // A call that is not an op of yours (a list, the log): what the node
 // logged meanwhile is its own doing (its timers ran), drawn as such.
 async function call(request, body) {
-  const r = await node.call(request, body);
+  const r = await node.call(onNode(request), body);
   if (r.events.length) background(r.events);
   return r;
 }
@@ -138,9 +161,13 @@ async function call(request, body) {
 async function op(request, body) {
   setBusy(true);
   for (const c of state.channels) for (const m of c.messages) m.fresh = false;
-  const {reply, events} = await node.call(request, body);
+  const {reply, events} = await node.call(onNode(request), body);
   const said = apply(readEvents(events));
-  if (reply?.error && state.channels.some(c => c.down)) say([request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: reply.error}]);
+  if (reply?.error?.startsWith("not the leader")) {
+    // You knocked on a follower: your pigeon turns back at its door.
+    graph.fly("", {failed: true});
+    say(["say.not_leader", {n: shown(), error: reply.error}]);
+  } else if (reply?.error && state.channels.some(c => c.down)) say([request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: reply.error}]);
   else if (reply?.error) sayError(reply.error);
   else if (said.length) say(said.at(-1));
   await graph.landed();
@@ -165,10 +192,17 @@ async function refreshObjects() {
 
 // The channels as the node has them now; the posts seen arriving stay
 // marked. A local disk has files, not messages.
+// In a cluster, each other node's own log and snapshots too: the node on
+// screen lists only its own.
 async function loadChannels() {
   const {reply} = await call({op: "channels"});
   const fresh = new Set(state.channels.flatMap(c => c.messages.filter(m => m.fresh).map(m => `${c.store}/${m.id}`)));
-  state.channels = (reply?.channels || []).map(c => ({...c, messages: (c.messages || []).map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
+  const listed = [...(reply?.channels || [])];
+  for (const id of state.nodes.length > 1 ? state.nodes.filter(id => id !== shown()) : []) {
+    const other = await call({op: "channels", node: id});
+    listed.push(...(other.reply?.channels || []).filter(c => c.node === id && c.role !== "outbox"));
+  }
+  state.channels = listed.map(c => ({...c, messages: (c.messages || []).map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
 }
 
 // The channels anew, drawn (a fault changes them behind the events).
@@ -195,6 +229,61 @@ async function pollBackground() {
   if (!ok(reply)) return;
   state.bg = reply;
   renderBackground();
+  if (state.nodes.length > 1) await pollCluster();
+}
+
+// ------------------------------------------------------------ the cluster
+// Who leads, as the node on screen sees it; a new leader is told.
+async function pollCluster() {
+  const {reply} = await call({op: "cluster"});
+  if (!ok(reply)) return;
+  // A newer term only: a node cut off still thinks it leads, in its old term.
+  const seen = state.term;
+  // A node back from a cut still names itself in its old term: the newer word stands.
+  state.cluster = seen != null && reply.term < seen ? {...reply, leader: state.cluster?.leader ?? null} : reply;
+  state.term = Math.max(seen ?? 0, reply.term);
+  if (seen != null && reply.term > seen && reply.leader != null) say(["nodes.new_leader", {n: reply.leader, term: reply.term}]);
+  renderNodes();
+  // A new leader: its flag, its ways to the data channels.
+  if (graph.drawn() && !state.wizard && (reply.leader !== drawnLeader || reply.links.length !== drawnLinks)) redraw();
+}
+
+// The nodes in the bar: which leads (★), which is cut off; the one on
+// screen pressed. Picking a node shows it and sends to it; picking it
+// again follows the leader.
+function renderNodes() {
+  const bar = $("nodes");
+  bar.hidden = state.nodes.length < 2;
+  bar.replaceChildren(
+    ...state.nodes.map(id => {
+      const marks = `${id === state.cluster?.leader ? " ★" : ""}${state.cut.has(id) ? " ✂" : ""}`;
+      const b = button("node-pick", `${t("nodes.node", {n: id})}${marks}`, () => pickNode(state.node === id ? null : id));
+      b.setAttribute("aria-pressed", String(state.node === id));
+      b.classList.toggle("following", state.node == null && id === shown());
+      return b;
+    }),
+  );
+}
+
+async function pickNode(id) {
+  state.node = id;
+  say(id == null ? ["nodes.following", {}] : ["nodes.looking", {n: id}]);
+  renderNodes();
+  await refreshChannels();
+  await refreshObjects();
+  await loadLog();
+  await pollBackground();
+}
+
+// Node `id` cut off from the others, or back: its links and its outbox.
+async function isolate(id, cut) {
+  const {reply} = await node.call({op: "isolate", node: id, down: cut});
+  if (!ok(reply)) return sayError(reply?.error);
+  if (cut) state.cut.add(id);
+  else state.cut.delete(id);
+  say([cut ? "nodes.cut" : "nodes.back", {n: id}]);
+  renderNodes();
+  await refreshChannels(); // its outbox up or down
 }
 // While idle: the worker lets the node's loops run between calls.
 setInterval(() => {
@@ -241,8 +330,10 @@ async function runTask(task) {
 // ------------------------------------------------------------ panels
 let view = null; // the open panel's view, for updates in place
 
-function openPanel(target) {
+async function openPanel(target) {
   if (state.wizard) return;
+  // Another node's dovecote: that node on screen, then its panel.
+  if (target.kind === "loft" && target.node != null && target.node !== shown()) await pickNode(target.node);
   if (target.kind === "store" && channel(target.store)?.role === "log") target = {kind: "log"};
   state.open = target;
   $("loft").classList.add("zoomed");
@@ -281,8 +372,12 @@ function renderPanel() {
     const v = clientView(state, clientOps);
     show(t("demo.you"), t("demo.you_sub"), v.nodes, v);
   } else if (open.kind === "loft") {
-    const v = loftView({counters: counters(), ...state}, loftOps);
-    show("pigeonhole", t("demo.loft_sub"), v.nodes, v);
+    const id = shown();
+    const cluster = state.nodes.length > 1 ? {node: id, cut: state.cut.has(id)} : null;
+    // A cluster's "reset" is its own config back: the demo's is one node's.
+    const demo = cluster ? state.config : state.demo;
+    const v = loftView({counters: counters(), ...state, demo, cluster}, loftOps);
+    show(cluster ? t("nodes.loft_title", {n: id}) : "pigeonhole", t(cluster ? "nodes.loft_sub" : "demo.loft_sub"), v.nodes, v);
     if (!state.log) loadLog();
   } else if (open.kind === "log") {
     const c = logChannel();
@@ -321,7 +416,7 @@ const clientOps = {
 };
 
 // The node: its config, its background tasks.
-const loftOps = {restart, erase, toggle: toggleTask, run: runTask};
+const loftOps = {restart, erase, toggle: toggleTask, run: runTask, isolate};
 
 // A data channel's faults, and what finds and mends them.
 const faultOps = c => {
@@ -367,6 +462,7 @@ async function boot() {
   loadLog();
 }
 
+// A new config: every node restarts on it.
 async function restart(text) {
   view?.setError("");
   setBusy(true);
@@ -376,7 +472,8 @@ async function restart(text) {
     setBusy(false);
     return;
   }
-  state.config = text;
+  Object.assign(state, {config: text, nodes: reply.nodes});
+  state.cut.clear();
   await boot();
   say(["say.restart", {n: reply.replayed}]);
   setBusy(false);
@@ -403,13 +500,15 @@ function openWizard() {
   say(["wiz.caption", {}]);
 }
 
-// The wizard's config: a node boots on it. Returns the error, if it does not.
+// The wizard's config: its node (or every node) boots on it. Returns the
+// error, if one does not.
 async function startFromWizard(text) {
   const t0 = performance.now();
   const {reply, events} = await node.call({op: "open", config: text});
   const ms = performance.now() - t0;
   if (reply?.error) return reply.error;
-  state.config = text;
+  Object.assign(state, {config: text, nodes: reply.nodes});
+  if (state.nodes.length > 1) await pollCluster();
   state.wizard = false;
   relayout = redraw;
   $("loft").classList.remove("zoomed", "wizard");
@@ -481,6 +580,8 @@ async function startDemo() {
     bootFailed(booted.reply.error);
     return;
   }
+  state.nodes = booted.reply.nodes;
+  if (state.nodes.length > 1) await pollCluster();
   await boot();
   ready(performance.now() - t0, reply.why);
   say(["say.welcome_back", {n: booted.reply.replayed}]);

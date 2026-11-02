@@ -268,7 +268,8 @@ impl LogSettings {
 impl MetaSettings {
     /// Defaults with the log and snapshots under `dir` (tests).
     pub fn in_dir(dir: &Path) -> Self {
-        let mut topology = Topology::new(Vec::new(), Vec::new(), Vec::new()).expect("empty topology");
+        let mut topology =
+            Topology::new(Vec::new(), Vec::new(), Vec::new(), Default::default()).expect("empty topology");
         let mut meta = FileMeta::default().into_settings(&mut topology).expect("default meta settings");
         if let LogSettings::LocalDisk { path } = &mut meta.log {
             *path = dir.join(&*path);
@@ -405,12 +406,28 @@ impl Config {
     /// The config in `text`, as if read from `path` (relative paths and
     /// messages name it); secrets from the environment as it is.
     pub fn from_toml(text: &str, path: &Path) -> Result<Self> {
-        let file: FileConfig = toml::from_str(text).with_context(|| format!("parse TOML {}", path.display()))?;
-        let table = text.parse().with_context(|| format!("parse TOML {}", path.display()))?;
-        Self::from_file(file, table, path.to_path_buf())
+        Self::parse(text, path, None)
     }
 
-    fn from_file(file: FileConfig, table: toml::Table, config_path: PathBuf) -> Result<Self> {
+    /// The config in `text` as node `node` of its cluster reads it, whatever
+    /// `PIGEONHOLE_NODE` says: one process running every node (the site's demo).
+    pub fn from_toml_as(text: &str, path: &Path, node: u64) -> Result<Self> {
+        Self::parse(text, path, Some(node))
+    }
+
+    /// The `[[node]]` ids in `text`: none without a cluster.
+    pub fn node_ids(text: &str) -> Result<Vec<u64>> {
+        let file: FileConfig = toml::from_str(text).context("parse TOML")?;
+        Ok(file.node.iter().map(|n| n.id()).collect())
+    }
+
+    fn parse(text: &str, path: &Path, node: Option<u64>) -> Result<Self> {
+        let file: FileConfig = toml::from_str(text).with_context(|| format!("parse TOML {}", path.display()))?;
+        let table = text.parse().with_context(|| format!("parse TOML {}", path.display()))?;
+        Self::from_file(file, table, path.to_path_buf(), node)
+    }
+
+    fn from_file(mut file: FileConfig, table: toml::Table, config_path: PathBuf, as_node: Option<u64>) -> Result<Self> {
         let access_key = env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "pigeonhole".into());
         let secret_key = env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "pigeonholesecret".into());
         if access_key.is_empty() || secret_key.is_empty() {
@@ -435,7 +452,17 @@ impl Config {
         let tg = file.telegram.into_limiter_config("telegram", pigeonhole_storage_telegram::limits())?;
         let discord = file.discord.into_limiter_config("discord", discord_limits())?;
 
-        let mut topology = Topology::new(file.store, file.replicas, file.shards)?;
+        // In a cluster, this node's own log and snapshots replace [meta]'s;
+        // the other nodes' are checked, not opened.
+        let me = file.cluster.this_node(&file.node, as_node)?;
+        let own = cluster::node_stores(&file.node, me)?;
+        if own.log.is_some() {
+            file.meta.log = own.log;
+            file.meta.snapshot = own.snapshot;
+        } else if own.snapshot.is_some() {
+            file.meta.snapshot = own.snapshot;
+        }
+        let mut topology = Topology::new(file.store, file.replicas, file.shards, own.others)?;
         let meta = file.meta.into_settings(&mut topology)?;
         let blob_store = file
             .chunk
@@ -443,7 +470,7 @@ impl Config {
             .as_deref()
             .context("[chunk] store is required: the [[store]] or [[replicas]] id chunks go to")?;
         let (instances, placement) = topology.blob_placement(blob_store)?;
-        let cluster = file.cluster.into_settings(file.node)?;
+        let cluster = file.cluster.into_settings(file.node, me, |under| topology.fake_base(under))?;
         topology.check_all_used()?;
         check_block_size_against_instances(block_size, &instances)?;
 
@@ -1800,6 +1827,68 @@ max_batch_total_size = "8 MiB"
         // A chat link sets the pace of the whole cluster.
         assert_eq!((two.heartbeat, two.election_timeout.0), (Duration::from_secs(10), Duration::from_secs(45)));
         assert_eq!(on(3).links(), [(1, Link::Chat), (2, Link::Chat)].into());
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn a_cluster_on_fake_outboxes_needs_no_bots() {
+        use crate::cluster::{ChatSettings, Link};
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        let text = |node: u64| {
+            format!(
+                "[cluster]\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\nfake = \"outboxes\"\nnode = {node}\n\
+                 [[node]]\nid = 1\ngrpc = \"node-1:7001\"\noutbox = -1001\n\
+                 [[node]]\nid = 2\ngrpc = \"node-2:7001\"\noutbox = -1002\n\
+                 [[node]]\nid = 3\noutbox = -1003\n\
+                 [[store]]\nid = \"outboxes\"\nkind = \"local_disk\"\npath = \"demo-data\"\n"
+            )
+        };
+        let three = load_mem(&text(3)).unwrap().cluster.unwrap();
+        assert!(matches!(three.chat, Some(ChatSettings::Fake)), "a chat link, on fakes");
+        assert_eq!(three.links(), [(1, Link::Chat), (2, Link::Chat)].into());
+        let outbox = three.outbox_channel(1).unwrap();
+        assert_eq!((outbox.id.as_str(), outbox.scope.as_str()), ("outbox-1", "-1001"));
+        assert_eq!(outbox.backing, stores::FakeBacking::Dir("demo-data/telegram--1001".into()));
+        let one = load_mem(&text(1)).unwrap().cluster.unwrap();
+        assert!(one.outbox_channel(3).is_some(), "every node's outbox, not only its own peers'");
+        let err = format!(
+            "{:#}",
+            load_mem(&text(1).replace("fake = \"outboxes\"", "fake = \"outboxes\"\nbot_token_envs = [\"X\"]"))
+                .unwrap_err()
+        );
+        assert!(err.contains("no real bots"), "{err}");
+    }
+
+    #[test]
+    fn one_file_for_the_cluster_each_node_its_own_log() {
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        let file = "[cluster]\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n\
+             [[node]]\nid = 1\ngrpc = \"a:1\"\nlog = \"disk-1\"\n\
+             [[node]]\nid = 2\ngrpc = \"b:1\"\nlog = \"dc-log-2\"\nsnapshot = \"dc-snap-2\"\n\
+             [[node]]\nid = 3\ngrpc = \"c:1\"\n\
+             [chunk]\nstore = \"blobs\"\n[[store]]\nid = \"blobs\"\nkind = \"memory\"\n\
+             [[store]]\nid = \"disk-1\"\nkind = \"local_disk\"\npath = \"node-1\"\n\
+             [[store]]\nid = \"dc-log-2\"\nkind = \"discord\"\nchannel_id = 21\nbot_token_envs = [\"PH_TEST_NODE2_BOT\"]\n\
+             [[store]]\nid = \"dc-snap-2\"\nkind = \"discord\"\nchannel_id = 22\nbot_token_envs = [\"PH_TEST_NODE2_BOT\"]\n";
+        let path = Path::new("pigeonhole.toml");
+        assert_eq!(Config::node_ids(file).unwrap(), [1, 2, 3]);
+        // Node 1 never reads node 2's bot token: it is on node 2's host.
+        let one = Config::from_toml_as(file, path, 1).unwrap();
+        assert_eq!(one.meta.log, LogSettings::LocalDisk { path: "node-1".into() });
+        assert_eq!(one.cluster.as_ref().unwrap().node, 1);
+        let two = format!("{:#}", Config::from_toml_as(file, path, 2).unwrap_err());
+        assert!(two.contains("PH_TEST_NODE2_BOT"), "node 2 needs its own bot: {two}");
+        // Without its own, a node keeps [meta]'s (the default: a local disk).
+        let three = Config::from_toml_as(file, path, 3).unwrap();
+        assert_eq!(three.meta.log, LogSettings::LocalDisk { path: DEFAULT_META_DIR.into() });
+
+        // A node's store serves that node only.
+        let chunks = file.replace("store = \"blobs\"", "store = \"dc-log-2\"");
+        let err = format!("{:#}", Config::from_toml_as(&chunks, path, 1).unwrap_err());
+        assert!(err.contains("[[node]] 2 log; a store serves one node"), "{err}");
+        let shared = file.replace("log = \"dc-log-2\"", "log = \"disk-1\"");
+        let err = format!("{:#}", Config::from_toml_as(&shared, path, 3).unwrap_err());
+        assert!(err.contains("is both [[node]] 1 log and [[node]] 2 log"), "{err}");
     }
 
     #[test]

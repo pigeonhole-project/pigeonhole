@@ -19,6 +19,9 @@ bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 openraft = { workspace = true }
+openraft-chat = { workspace = true }
+openraft-grpc = { workspace = true }
+pigeonhole-raft-telegram = { workspace = true }
 pigeonhole-blob = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
 pigeonhole-config = { workspace = true, features = ["discord", "fake"] }
