@@ -84,10 +84,10 @@ impl Repairer {
                 info!("metadata tablet stopped; repair exits");
                 return;
             }
-            if self.db.is_leader() {
+            if self.db.can_write() {
                 self.background_pass().await;
             } else {
-                debug!("not the leader: no repair pass");
+                debug!("not the leader, or no quorum: no repair pass");
             }
             schedule.done();
             self.config = schedule.next(|c| c.interval).await;

@@ -108,6 +108,11 @@ impl Request {
             _ => return None,
         })
     }
+
+    /// Whether it writes to the tablet: a read-only leader turns it away.
+    fn writes(&self) -> bool {
+        matches!(self.op.as_str(), "put" | "copy" | "delete" | "verify" | "repair")
+    }
 }
 
 fn demo() -> String {
@@ -140,9 +145,14 @@ pub struct Admin {
 
 impl Admin {
     /// A node that does not lead turns S3 requests away, as the binary's
-    /// S3 port does (pigeonhole::leader_http): the same log line.
-    fn only_on_the_leader(&self, op: &str) -> Result<()> {
+    /// S3 port does (pigeonhole::leader_http): the same log lines. A
+    /// read-only leader (no quorum) turns writes away.
+    fn only_on_the_leader(&self, op: &str, writes: bool) -> Result<()> {
         if self.meta.is_leader() {
+            if writes && self.meta.is_read_only() {
+                tracing::info!(op, "read-only: no quorum");
+                bail!("read-only: this leader has no quorum; writes wait for one");
+            }
             return Ok(());
         }
         let leader = self.meta.leader();
@@ -156,7 +166,7 @@ impl Admin {
     /// Runs `r` (with `body`, an upload's bytes).
     pub async fn handle(&self, r: &Request, body: Bytes) -> Result<Value> {
         if let Some(op) = r.s3() {
-            self.only_on_the_leader(&op)?;
+            self.only_on_the_leader(&op, r.writes())?;
         }
         Ok(match r.op.as_str() {
             "put" => {

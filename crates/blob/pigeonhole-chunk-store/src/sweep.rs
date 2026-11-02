@@ -68,10 +68,10 @@ impl Sweeper {
                 info!("metadata tablet stopped; sweeper exits");
                 return;
             }
-            if self.db.is_leader() {
+            if self.db.can_write() {
                 self.background_pass().await;
             } else {
-                debug!("not the leader: no sweep pass");
+                debug!("not the leader, or no quorum: no sweep pass");
             }
             schedule.done();
         }

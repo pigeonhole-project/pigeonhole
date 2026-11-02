@@ -66,10 +66,10 @@ async fn set(State(d): State<Arc<DynConfig>>, Path(key): Path<String>, body: Byt
     }
 }
 
-/// A change refused: 503 on a node that does not lead (ask the leader),
-/// 400 with the reason otherwise.
+/// A change refused: 503 on a node that cannot write now (not the leader,
+/// or read-only without a quorum), 400 with the reason otherwise.
 fn refused(e: anyhow::Error) -> Response {
-    let status = match e.chain().any(|c| c.is::<pigeonhole_meta::NotLeader>()) {
+    let status = match pigeonhole_meta::unavailable(&e) {
         true => StatusCode::SERVICE_UNAVAILABLE,
         false => StatusCode::BAD_REQUEST,
     };

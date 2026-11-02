@@ -400,6 +400,47 @@ impl fmt::Display for NotLeader {
 
 impl std::error::Error for NotLeader {}
 
+/// A write on a leader no quorum has acknowledged for longer than its lease
+/// (`election_timeout.1`): the node is read-only until one does again
+/// (docs/cluster.md § Losing the quorum). Nothing was proposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoQuorum {
+    /// Since a quorum last acknowledged this leader, when known.
+    pub for_secs: Option<u64>,
+}
+
+impl fmt::Display for NoQuorum {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.for_secs {
+            Some(s) => write!(f, "read-only: no quorum has acknowledged this leader for {s}s"),
+            None => write!(f, "read-only: no quorum has acknowledged this leader"),
+        }
+    }
+}
+
+impl std::error::Error for NoQuorum {}
+
+/// A write handed to Raft before the leader lost its quorum: it commits if
+/// this node still leads when the quorum comes back, and is lost if another
+/// node took over. The caller cannot tell which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitUnknown;
+
+impl fmt::Display for CommitUnknown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the leader lost its quorum while committing: the write may or may not take effect")
+    }
+}
+
+impl std::error::Error for CommitUnknown {}
+
+/// Whether `e` says this node cannot write now but the cluster may: not
+/// the leader ([`NotLeader`]), read-only ([`NoQuorum`]), or the quorum lost
+/// mid-commit ([`CommitUnknown`]). A client asks again (S3: 503).
+pub fn unavailable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<NotLeader>() || c.is::<NoQuorum>() || c.is::<CommitUnknown>())
+}
+
 pub(crate) type States = HashMap<&'static str, Arc<dyn AnyState>>;
 
 /// A proposal waiting for its batch: one or more commands that go into one
@@ -449,7 +490,13 @@ async fn batcher(raft: raft::Raft, shared: Arc<raft::Shared>, mut rx: tokio::syn
     }
 }
 
-async fn write_batch(raft: &raft::Raft, shared: &raft::Shared, batch: Vec<Pending>) {
+async fn write_batch(raft: &raft::Raft, shared: &raft::Shared, mut batch: Vec<Pending>) {
+    // A caller that gave up (the leader lost its quorum) is told the
+    // outcome is unknown: a proposal not yet written stays unwritten.
+    batch.retain(|p| !p.reply.is_closed());
+    if batch.is_empty() {
+        return;
+    }
     let commands: Vec<Command> = batch.iter().flat_map(|p| p.commands.iter().cloned()).collect();
     let (n, t0) = (commands.len(), std::time::Instant::now());
     for p in &batch {
@@ -505,6 +552,8 @@ pub struct MetaStore {
     ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Its period (`None`: only when asked).
     snapshots: Control<Option<Duration>>,
+    /// Leading without a quorum ([`Self::is_read_only`]).
+    read_only: watch::Receiver<bool>,
 }
 
 impl Drop for MetaStore {
@@ -602,6 +651,7 @@ impl MetaStore {
         }
         let (queue, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(batcher(raft.clone(), shared.clone(), rx).in_current_span());
+        let read_only = spawn_quorum_watch(raft.metrics(), opts.election_timeout.1);
         let store = Self {
             states,
             gen,
@@ -613,6 +663,7 @@ impl MetaStore {
             stop,
             ticker: Mutex::new(None),
             snapshots: Control::new(opts.snapshot_interval),
+            read_only,
         };
         store.wait_ready(cluster.members.len(), &opts).await?;
         if fell_back {
@@ -661,6 +712,24 @@ impl MetaStore {
     /// fail meanwhile. Work only the leader should do checks this first.
     pub fn is_leader(&self) -> bool {
         self.raft.metrics().borrow().state == openraft::ServerState::Leader
+    }
+
+    /// Whether this node leads but no quorum has acknowledged it for longer
+    /// than its lease (`election_timeout.1`): it serves reads (as of the
+    /// last commit it saw; a majority elsewhere may have moved on) and
+    /// refuses writes with [`NoQuorum`]. Never on a cluster of one.
+    pub fn is_read_only(&self) -> bool {
+        *self.read_only.borrow()
+    }
+
+    /// Whether this node may write now: it leads and is not read-only.
+    /// Background work that writes checks this.
+    pub fn has_quorum(&self) -> bool {
+        self.is_leader() && !self.is_read_only()
+    }
+
+    fn no_quorum(&self) -> NoQuorum {
+        NoQuorum { for_secs: self.raft.metrics().borrow().millis_since_quorum_ack.map(|ms| ms / 1000) }
     }
 
     /// The cluster as this node sees it: roles, the leader, the term, and
@@ -765,6 +834,9 @@ impl MetaStore {
         if proposal.commands.is_empty() {
             return Ok((self.applied_position(), Outcomes { outcomes: Vec::new() }));
         }
+        if self.is_read_only() {
+            return Err(self.no_quorum().into());
+        }
         let (reply, rx) = tokio::sync::oneshot::channel();
         let enqueued = std::time::Instant::now();
         // Counted before the send: the batcher may take it at once.
@@ -773,7 +845,17 @@ impl MetaStore {
             telemetry::record_dequeued(1);
             bail!("the tablet's batcher is gone");
         }
-        let answer = rx.await.context("the tablet's batcher dropped the proposal").and_then(|r| r);
+        let mut read_only = self.read_only.clone();
+        let quorum_lost = async move {
+            if read_only.wait_for(|&r| r).await.is_err() {
+                // The watch ended with Raft: the batcher answers.
+                std::future::pending::<()>().await;
+            }
+        };
+        let answer = tokio::select! {
+            r = rx => r.context("the tablet's batcher dropped the proposal").and_then(|r| r),
+            () = quorum_lost => Err(CommitUnknown.into()),
+        };
         telemetry::record_propose(answer.is_ok(), enqueued.elapsed());
         // In the caller's span (a request): which entry holds its commands.
         match &answer {
@@ -1055,6 +1137,52 @@ fn spawn_leader_log(mut metrics: watch::Receiver<raft::Metrics>) {
         }
         .in_current_span(),
     );
+}
+
+/// Whether this node leads without a quorum: no quorum acknowledged it for
+/// longer than `lease`. Re-checked on every change Raft reports and every
+/// quarter lease (a cut-off leader may report nothing new); logged and
+/// recorded on each change.
+fn spawn_quorum_watch(mut metrics: watch::Receiver<raft::Metrics>, lease: Duration) -> watch::Receiver<bool> {
+    let (tx, rx) = watch::channel(false);
+    let step = (lease / 4).max(Duration::from_millis(10));
+    tokio::spawn(
+        async move {
+            // When a quorum last acknowledged this leader, as of the last
+            // report; `None` off the lead, or alone (always a quorum).
+            let acked_at = |m: &raft::Metrics| {
+                let alone = m.membership_config.membership().voter_ids().count() <= 1;
+                if m.state != openraft::ServerState::Leader || alone {
+                    return None;
+                }
+                let now = tokio::time::Instant::now();
+                m.millis_since_quorum_ack.map(|ms| now.checked_sub(Duration::from_millis(ms)).unwrap_or(now))
+            };
+            let mut acked = acked_at(&metrics.borrow_and_update());
+            loop {
+                let read_only = acked.is_some_and(|t| t.elapsed() > lease);
+                if tx.send_if_modified(|was| std::mem::replace(was, read_only) != read_only) {
+                    let since = acked.map(|t| t.elapsed().as_secs());
+                    match read_only {
+                        true => tracing::warn!(?since, "no quorum: read-only"),
+                        false => tracing::info!("quorum back (or not leading): writable"),
+                    }
+                }
+                telemetry::record_read_only(read_only);
+                tokio::select! {
+                    changed = metrics.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        acked = acked_at(&metrics.borrow_and_update());
+                    }
+                    () = tokio::time::sleep(step) => {}
+                }
+            }
+        }
+        .in_current_span(),
+    );
+    rx
 }
 
 /// Ask for a snapshot whenever `schedule` says (every its period, `None`:

@@ -38,8 +38,8 @@ pub fn spawn_cooler(rt: &Runtime, inline_on: bool, gateway: S3Gateway) {
             if meta.is_stopped() {
                 return;
             }
-            if !meta.is_leader() {
-                tracing::debug!("not the leader: no cooler pass");
+            if !meta.has_quorum() {
+                tracing::debug!("not the leader, or no quorum: no cooler pass");
                 schedule.done();
                 continue;
             }

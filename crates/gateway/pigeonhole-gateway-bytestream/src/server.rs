@@ -151,7 +151,7 @@ fn spawn_cas_gc(state: ReapiState, mut schedule: Schedule<Expiry>) {
 }
 
 async fn cas_gc_pass(state: &ReapiState, ttl: Duration) {
-    if !state.cas.cas.is_leader() {
+    if !state.cas.cas.can_write() {
         return;
     }
     let cutoff = Utc::now() - ChronoDuration::seconds(ttl.as_secs() as i64);
@@ -166,6 +166,15 @@ async fn cas_gc_pass(state: &ReapiState, ttl: Duration) {
             }
             Err(e) => warn!(error = %e, hash = %row.hash, size = row.size, "cas gc release"),
         }
+    }
+}
+
+/// A write's failure: `UNAVAILABLE` where the node cannot write now (not
+/// the leader, no quorum: try again, elsewhere or later), else `INTERNAL`.
+fn write_status(e: &anyhow::Error) -> tonic::Code {
+    match pigeonhole_meta::unavailable(e) {
+        true => tonic::Code::Unavailable,
+        false => tonic::Code::Internal,
     }
 }
 
@@ -262,7 +271,7 @@ impl ReapiState {
         }
         ingested
             .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?
-            .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
+            .map_err(|e| grpc_status(write_status(&e), e.to_string()))?;
         Ok(committed)
     }
 }
@@ -350,7 +359,7 @@ impl ContentAddressableStorage for ReapiState {
                     if let Err(e) = self.cas.put_bytes(&hash_hex, digest.size_bytes, Bytes::from(r.data)).await {
                         responses.push(batch_update_blobs_response::Response {
                             digest: Some(digest.clone()),
-                            status: Some(google_rpc_status(tonic::Code::Internal, e.to_string())),
+                            status: Some(google_rpc_status(write_status(&e), e.to_string())),
                         });
                     } else {
                         responses
@@ -462,7 +471,7 @@ impl ActionCache for ReapiState {
         self.cas
             .put_bytes(&hash_hex, digest.size_bytes, Bytes::from(bytes))
             .await
-            .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
+            .map_err(|e| grpc_status(write_status(&e), e.to_string()))?;
         Ok(Response::new(result.clone()))
     }
 }

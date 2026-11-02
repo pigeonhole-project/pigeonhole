@@ -97,6 +97,11 @@ pub const METRICS: &[MetricDoc] = &[
         &[],
         "On the leader: time since a quorum last acknowledged it (NaN on a follower); grows when the leader is cut off",
     ),
+    MetricDoc::gauge(
+        "pigeonhole_meta_read_only",
+        &[],
+        "1 while this node leads without a quorum (read-only: writes answer 503), else 0",
+    ),
 ];
 
 fn outcome(ok: bool) -> &'static str {
@@ -211,4 +216,8 @@ pub(crate) fn record_lease_wait(reason: &'static str, d: Duration) {
 
 pub(crate) fn record_collect(ok: bool, d: Duration) {
     metrics::histogram!("pigeonhole_meta_log_collect_seconds", "outcome" => outcome(ok)).record(d.as_secs_f64());
+}
+
+pub(crate) fn record_read_only(read_only: bool) {
+    metrics::gauge!("pigeonhole_meta_read_only").set(if read_only { 1.0 } else { 0.0 });
 }
