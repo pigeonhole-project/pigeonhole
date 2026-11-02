@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.6.4/schema.json",
   "files": {
-    "includes": ["site/src/assets/**/*.js", "site/test/**/*.mjs", "crates/web/*.mjs"]
+    "includes": ["site/src/assets/**/*.js", "site/test/**/*.mjs", "crates/web/*.mjs", "!site/src/assets/demo/pigeon-art.js"]
   },
   "formatter": {
     "indentStyle": "space",

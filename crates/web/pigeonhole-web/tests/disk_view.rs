@@ -12,9 +12,9 @@ async fn a_log_on_a_local_disk_shows_its_segments_and_batches() {
     let dir = tempfile::tempdir().unwrap();
     let text = DEMO_CONFIG
         .replace("kind = \"local_disk\"\npath = \"/data/channels\"", "kind = \"memory\"")
-        .replace("log = \"tg-log\"\nsnapshot = \"tg-snapshots\"", "log = \"node-disk\"\nsnapshot = \"node-disk\"")
+        .replace("log = \"tg-log\"\nsnapshot = \"tg-snap\"", "log = \"node-disk\"\nsnapshot = \"node-disk\"")
         .replace("[[store]]\nid = \"tg-log\"\nkind = \"telegram\"\nchat_id = -1001000000002\nfake = \"channel-data\"\n", "")
-        .replace("[[store]]\nid = \"tg-snapshots\"\nkind = \"telegram\"\nchat_id = -1001000000003\nfake = \"channel-data\"\n", "")
+        .replace("[[store]]\nid = \"tg-snap\"\nkind = \"telegram\"\nchat_id = -1001000000003\nfake = \"channel-data\"\n", "")
         + &format!("\n[[store]]\nid = \"node-disk\"\nkind = \"local_disk\"\npath = {:?}\n", dir.path().display().to_string());
     let world = Arc::new(World::default());
     let node = Node::open(&world, &parse_config(&text).unwrap()).await.unwrap();

@@ -27,7 +27,7 @@ fake = "channel-data"
 bots = 2
 
 [[store]]
-id = "tg-snapshots"
+id = "tg-snap"
 kind = "telegram"
 chat_id = -1001000000102
 fake = "channel-data"
@@ -40,7 +40,7 @@ path = "DIR"
 
 [meta]
 log = "dc-log"
-snapshot = "tg-snapshots"
+snapshot = "tg-snap"
 snapshot_every_entries = 50
 
 [chunk]

@@ -147,6 +147,7 @@
   "demo.title": "Голубятня",
   "demo.graph_label": "pigeonhole и его каналы",
   "demo.hint": "Нажмите на узел, чтобы заглянуть внутрь. Начните с себя: загрузите файл.",
+  "demo.credit": "Голуби: <a href=\"https://lottiefiles.com/free-animation/flying-pigeon-jvvifwQyXz\">Итай Алон</a> (LottieFiles)",
   "demo.close": "Назад",
   "demo.drop": "Перетащите файлы сюда или",
   "demo.bucket": "Бакет demo",
@@ -177,7 +178,12 @@
   "js.demo.channel_sub_snapshots": "Фейковый канал {app} ({scope}) со снапшотами метаданных.",
   "js.demo.no_messages": "Сообщений пока нет.",
   "js.demo.no_files": "Файлов пока нет.",
-  "js.demo.disk_records": {"one": "{n} запись хранится", "few": "{n} записи хранятся", "many": "{n} записей хранится", "other": "{n} записи хранится"},
+  "js.demo.disk_records": {
+    "one": "{n} запись хранится",
+    "few": "{n} записи хранятся",
+    "many": "{n} записей хранится",
+    "other": "{n} записи хранится"
+  },
   "js.demo.earlier": "ещё {n} сообщений выше не показаны",
   "js.demo.text_meta": "{name}, {size} текстом, сообщение {id}",
   "js.demo.other_meta": "чужое сообщение, {id}",

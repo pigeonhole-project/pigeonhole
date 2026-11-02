@@ -1,66 +1,179 @@
-// The demo's drawings, in SVG: the pigeons, the dovecote, the apps' logos.
+// The demo's drawings, in SVG: the pigeons, the dovecote, the channels'
+// hutches, the blocks of flats they stand on, the apps' logos.
 import {svg} from "../lib/dom.js";
+import {FLIGHT, SITTING} from "./pigeon-art.js";
 
-// A pigeon in flight, side on, facing right: the body, and the wing raised
-// behind it (it beats about the shoulder at 2.8,-1.2).
-export const FLY_BODY = "M-11,1.5 L-6.5,-0.2 Q-2,-1.6 3,-1.2 Q4.4,-4 7,-3.8 Q9,-3.6 9.2,-2.2 L11,-1.6 L9,-1 Q8.6,1.4 6.2,2.4 Q3.6,4.4 -2,4 Q-7,3.6 -11,1.5 Z";
-export const FLY_WING = "M2.8,-1.2 Q1.6,-6.4 -2.4,-11 Q-2.2,-8.4 -4.4,-9.6 Q-3.8,-7.2 -6.4,-8.2 Q-5.2,-5.8 -7.6,-6.2 Q-5.4,-3.4 -3.8,-0.8 Z";
-
-// A pigeon sitting, side on, facing right: the body, its legs and its wing's line.
-export function perched(parent, attrs) {
-  const bird = svg("g", attrs, parent);
-  svg(
-    "path",
-    {
-      class: "bird-body",
-      d: "M-10,3.5 L-5,1 Q-3,-2.5 1.5,-2.5 Q2,-6.5 5,-6.5 Q7.4,-6.5 7.6,-4.6 L9.4,-4 L7.6,-3.4 Q7.4,-2 6.2,-1.4 Q9,1 7.4,4.2 Q5.4,6.6 1.4,6.6 L-3,6.2 Q-6.4,5.4 -10,3.5 Z",
-    },
-    bird,
-  );
-  svg("path", {class: "bird-lines", d: "M1.2,6.4 L1.2,8.8 M3.4,6.4 L3.4,8.8 M-5.6,1.6 Q-1,-0.6 3.4,2.6"}, bird);
-  svg("circle", {class: "bird-eye", cx: 5.6, cy: -4.4, r: 0.8}, bird);
-  return bird;
+// ---- pigeons: Itay Alon's (pigeon-art.js), drawn once into the picture as
+// symbols (birdDefs()), each bird a <use> of the drawing it is at.
+const LEGS = [
+  ["#554645", 3.2, "M76,79 L75,90 M84,79 L84,90"],
+  ["#C24059", 1.8, "M76,79 L75,90 M71,91 L79,91 M84,79 L84,90 M80,91 L88,91"],
+];
+export function birdDefs(root) {
+  const defs = svg("defs", {}, root);
+  const shapes = (parent, list) => {
+    for (const [fill, d] of list) svg("path", {fill, d}, parent);
+  };
+  for (const [i, frame] of FLIGHT.entries()) shapes(svg("symbol", {id: `pg-${i}`, viewBox: "0 0 141 110", width: 141, height: 110}, defs), frame);
+  const sit = svg("symbol", {id: "pg-sit", viewBox: "0 0 141 110", width: 141, height: 110}, defs);
+  shapes(svg("g", {transform: "rotate(-10 80 60)"}, sit), SITTING);
+  for (const [stroke, width, d] of LEGS) svg("path", {d, fill: "none", stroke, "stroke-width": width, "stroke-linecap": "round"}, sit);
 }
 
-// A pigeon tower: a round body narrowing upward, a cone roof with a lantern
-// and a finial, two rows of arched entrances with perches, a plinth. Returns
-// the entrances ({x, y, d: the arch's outline}), the top row first.
+// A pigeon sitting, side on, facing right, about 14 tall, its feet at y 8.
+export function perched(parent, attrs = {}) {
+  const g = svg("g", attrs, parent);
+  svg("use", {href: "#pg-sit", transform: "translate(0,8) scale(0.2) translate(-80,-91)"}, g);
+  return g;
+}
+
+// A pigeon in flight, side on, facing right, about 38 long, centred on its
+// body; move it with beat(bird, phase) or glide(bird).
+export function flying(parent, attrs = {}) {
+  const g = svg("g", attrs, parent);
+  const use = svg("use", {href: "#pg-0", transform: "scale(0.34) translate(-74,-62)"}, g);
+  return {g, use, at: 0};
+}
+const show = (bird, i) => {
+  if (bird.at === i) return;
+  bird.at = i;
+  bird.use.setAttribute("href", `#pg-${i}`);
+};
+// A wing beat at phase k (0..1), through the nine drawings.
+export const beat = (bird, k) => show(bird, Math.floor((((k % 1) + 1) % 1) * FLIGHT.length));
+// Gliding: the drawing with the wings swept back along the body.
+export const glide = bird => show(bird, 3);
+
+const n2 = v => v.toFixed(2);
+
+// ---- the dovecote: the node, on its block's roof. Its foot is at y 0;
+// two rows of three arched entrances, the background tasks' windows.
+// Returns the entrances ({x, y, d: the arch's outline}), the top row first.
 export function dovecote(g) {
-  const line = {fill: "none", stroke: "var(--slate)", "stroke-width": 1.5, "stroke-linecap": "round"};
-  svg("rect", {class: "shape", x: -78, y: 64, width: 156, height: 12, rx: 3}, g);
-  svg("path", {class: "shape", d: "M-66,64 L-58,-18 L58,-18 L66,64 Z"}, g);
-  svg("rect", {class: "shape", x: -70, y: -26, width: 140, height: 9, rx: 3}, g);
-  svg("path", {class: "shape", d: "M-80,-26 Q-28,-64 -9,-98 L9,-98 Q28,-64 80,-26 Z"}, g);
-  svg("path", {...line, d: "M-60,-38 Q0,-52 60,-38"}, g);
-  svg("path", {...line, d: "M-38,-60 Q0,-72 38,-60"}, g);
-  svg("rect", {class: "shape", x: -10, y: -112, width: 20, height: 15, rx: 2}, g);
-  svg("path", {class: "shape", d: "M-14,-112 L0,-124 L14,-112 Z"}, g);
-  svg("path", {...line, d: "M0,-124 L0,-136"}, g);
-  svg("circle", {cx: 0, cy: -105, r: 3.5, fill: "var(--wing-2)"}, g);
-  // Entrances: an arch over a dark hole, a perch under it.
+  svg("rect", {class: "cote-board", x: -70, y: -6, width: 140, height: 6, rx: 1.5}, g);
+  svg("rect", {class: "cote", x: -60, y: -86, width: 120, height: 80}, g);
+  svg("path", {class: "cote-roof", d: "M-72,-84 L0,-140 L72,-84 Z"}, g);
+  svg("rect", {class: "cote", x: -11, y: -160, width: 22, height: 24}, g);
+  svg("path", {class: "cote-roof", d: "M-16,-158 L0,-172 L16,-158 Z"}, g);
+  svg("rect", {class: "cote-hole", x: -5, y: -153, width: 10, height: 13, rx: 5}, g);
   const windows = [];
   const arch = (x, y) => {
     const d = `M${x - 10},${y + 14} L${x - 10},${y} A10,10 0 0 1 ${x + 10},${y} L${x + 10},${y + 14} Z`;
-    svg("path", {d, fill: "var(--wing-2)", "fill-opacity": 0.78}, g);
-    svg("path", {...line, d: `M${x - 15},${y + 18} L${x + 15},${y + 18}`}, g);
+    svg("path", {class: "cote-hole", d}, g);
+    svg("rect", {class: "cote-board", x: x - 15, y: y + 14, width: 30, height: 3, rx: 1}, g);
     windows.push({x, y, d});
   };
-  for (const x of [-34, 0, 34]) arch(x, -2);
-  for (const x of [-36, 0, 36]) arch(x, 34);
+  for (const x of [-36, 0, 36]) arch(x, -64);
+  for (const x of [-36, 0, 36]) arch(x, -32);
   return windows;
 }
 
-// An entrance no one lives in: boarded up.
+// An entrance no task lives in: shuttered.
 export function boarded(parent, w) {
   const g = svg("g", {class: "win-boarded"}, parent);
-  svg("path", {class: "win-board-back", d: w.d}, g);
-  svg("path", {class: "win-plank", d: `M${w.x - 9},${w.y - 4} L${w.x + 9},${w.y + 12}`}, g);
-  svg("path", {class: "win-plank", d: `M${w.x + 9},${w.y - 4} L${w.x - 9},${w.y + 12}`}, g);
+  svg("rect", {class: "shutter", x: w.x - 11, y: w.y - 8, width: 11, height: 22, rx: 1}, g);
+  svg("rect", {class: "shutter", x: w.x, y: w.y - 8, width: 11, height: 22, rx: 1}, g);
 }
 
-// A store's mark on its card: the app's logo (simplified), else a dot.
-export function logo(kind, parent, x, y, title) {
-  const mark = svg("g", {class: "badge", transform: `translate(${x},${y})`}, parent);
+// ---- a channel: a whole block of flats, a window to a message. Its floors
+// from `ground` up, `cols` windows to a floor; returns its roof's y and
+// each window's box ({x, y, w, h}), the ground floor's first, row by row.
+// (The windows' panes are the caller's to draw: what each holds.)
+export const FLOOR = 22;
+export function tower(parent, x, ground, w, floors, cols, {shade = 1, deep = 2000} = {}) {
+  const g = svg("g", {class: "block"}, parent);
+  const roof = ground - floors * FLOOR - 12,
+    pw = w / cols;
+  svg("rect", {class: `wall-${shade}`, x, y: roof, width: w, height: ground - roof + deep}, g);
+  svg("rect", {class: "parapet", x: x - 2, y: roof - 4, width: w + 4, height: 5}, g);
+  for (let c = 0; c < cols; c++) svg("rect", {class: "vent", x: x + c * pw + pw / 2 - 4, y: roof + 4, width: 8, height: 4, rx: 1}, g);
+  let seams = "";
+  for (let c = 1; c < cols; c++) seams += `M${n2(x + c * pw)},${roof + 12} L${n2(x + c * pw)},${ground + deep} `;
+  const slots = [];
+  for (let r = 0; r < floors; r++) {
+    const fy = ground - (r + 1) * FLOOR;
+    seams += `M${x},${fy + FLOOR} L${x + w},${fy + FLOOR} `;
+    for (let c = 0; c < cols; c++) slots.push({x: x + c * pw + pw / 2 - 6, y: fy + 5, w: 12, h: 13});
+  }
+  svg("path", {class: "seam", d: seams}, g);
+  return {roof, slots, g};
+}
+
+// Letters on a roof, as on a Soviet block's (a slogan on a lattice), red by
+// day, neon by night: a name, the app's emblem before it if `kind`, a
+// count after it. `x` the letters' middle; returns the count's text.
+export function roofLetters(parent, x, roof, name, {kind = null, app = "", size = 15} = {}) {
+  const g = svg("g", {class: "roof-letters"}, parent);
+  const w = name.length * size * 0.62 + (kind ? size + 4 : 0) + size * 1.6,
+    left = x - w / 2,
+    base = roof - 9;
+  // the lattice the letters stand on
+  let d = `M${left},${base + 2} L${left + w},${base + 2} M${left},${roof - 4} L${left + w},${roof - 4}`;
+  for (let i = 0; i <= Math.ceil(w / 12); i++) {
+    const a = Math.min(left + i * 12, left + w);
+    d += ` M${a},${roof - 4} L${Math.min(a + 6, left + w)},${base + 2}`;
+  }
+  svg("path", {class: "lattice", d}, g);
+  let at = left;
+  if (kind) {
+    logo(kind, g, at + size / 2, base - size * 0.36, app, size / 2);
+    at += size + 4;
+  }
+  svg("text", {class: "letters", x: at, y: base, "font-size": size}, g).textContent = name;
+  return svg("text", {class: "letters count", x: left + w, y: base, "font-size": size * 0.8, "text-anchor": "end"}, g);
+}
+
+// ---- a Soviet block of flats: concrete panels and their seams, a window to
+// a panel, stacks of loggias with coloured screens, the attic's vents, the
+// lift's machine room and aerials on the roof. Its roof at y, `h` down from
+// it; `rnd` a seeded random (which windows are lit). Returns its group.
+export function block(parent, x, y, w, h, rnd, {shade = 1, loggias = [], room = null, aerials = 1, floor = 26} = {}) {
+  const cols = Math.max(2, Math.round(w / 30)),
+    pw = w / cols;
+  const g = svg("g", {class: "block"}, parent);
+  if (room != null) {
+    svg("rect", {class: "wall-3", x: x + room, y: y - 20, width: 36, height: 20}, g);
+    svg("rect", {class: "parapet", x: x + room - 2, y: y - 22, width: 40, height: 3}, g);
+  }
+  for (let a = 0; a < aerials; a++) {
+    const ax = x + w * (0.25 + (0.5 * a) / Math.max(1, aerials - 1)) + (rnd() - 0.5) * 30;
+    svg(
+      "path",
+      {
+        class: "aerial",
+        d: `M${ax},${y} L${ax},${y - 30} M${ax - 9},${y - 26} L${ax + 9},${y - 26} M${ax - 7},${y - 20} L${ax + 7},${y - 20} M${ax - 5},${y - 14} L${ax + 5},${y - 14}`,
+      },
+      g,
+    );
+  }
+  svg("rect", {class: `wall-${shade}`, x, y, width: w, height: h}, g);
+  svg("rect", {class: "parapet", x: x - 2, y: y - 4, width: w + 4, height: 5}, g);
+  for (let c = 0; c < cols; c++) svg("rect", {class: "vent", x: x + c * pw + pw / 2 - 4, y: y + 5, width: 8, height: 4, rx: 1}, g);
+  const top = y + 14;
+  let seams = "";
+  for (let c = 1; c < cols; c++) seams += `M${n2(x + c * pw)},${top} L${n2(x + c * pw)},${y + h} `;
+  for (let r = 0; top + r * floor < y + h; r++) {
+    const fy = top + r * floor;
+    seams += `M${x},${fy} L${x + w},${fy} `;
+    for (let c = 0; c < cols; c++) {
+      const px = x + c * pw,
+        lit = rnd() < 0.08 ? " lit" : "";
+      if (loggias.includes(c)) {
+        svg("rect", {class: `pane${lit}`, x: px + pw / 2 - 6, y: fy + 4, width: 12, height: 13}, g);
+        svg("rect", {class: `screen-${c % 3}`, x: px + 2, y: fy + 14, width: pw - 4, height: 9}, g);
+        svg("rect", {class: "parapet", x: px + 1, y: fy + 23, width: pw - 2, height: 2}, g);
+      } else {
+        svg("rect", {class: `pane${lit}`, x: px + pw / 2 - 7, y: fy + 6, width: 14, height: 14}, g);
+      }
+    }
+  }
+  svg("path", {class: "seam", d: seams}, g);
+  return g;
+}
+
+// A store's mark: the app's logo (simplified), a drive for a local disk, else a dot.
+export function logo(kind, parent, x, y, title, r = 11) {
+  const mark = svg("g", {class: "badge", transform: `translate(${x},${y}) scale(${r / 11})`}, parent);
   if (kind === "telegram") {
     svg("circle", {r: 11, fill: "#2AABEE"}, mark);
     // The paper plane.

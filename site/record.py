@@ -59,7 +59,7 @@ chat_id = -1001000000002
 fake = "memory"
 
 [[store]]
-id = "tg-snapshots"
+id = "tg-snap"
 kind = "telegram"
 chat_id = -1001000000003
 fake = "memory"
@@ -71,7 +71,7 @@ write_quorum = 2
 
 [meta]
 log = "tg-log"
-snapshot = "tg-snapshots"
+snapshot = "tg-snap"
 
 [chunk]
 store = "channels"

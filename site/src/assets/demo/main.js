@@ -183,7 +183,7 @@ async function refreshChannels() {
 async function loadLog() {
   const {reply} = await call({op: "log", limit: 200});
   await loadChannels();
-  for (const c of state.channels) graph.setTotal(c.store, c.total);
+  graph.setChannels(state.channels);
   state.log = reply;
   if (isOpen("log")) renderPanel();
   view?.setCounters?.(counters());
