@@ -155,6 +155,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `openraft_chat_envelopes_per_frame` | histogram |  | Envelopes (requests and responses) coalesced in one posted frame |
 | `openraft_chat_call_seconds` | histogram | `peer`, `rpc`, `outcome` | A request's round trip, from queued to its response (outcome: ok, timeout) |
 | `openraft_chat_frames_received_total` | counter | `peer`, `outcome` | Frames read from a peer's outbox (outcome: ok, duplicate, bad_frame, foreign) |
+| `openraft_chat_stray_responses_total` | counter | `peer` | Responses from a peer that no call to it waits for (late, or to an earlier run of this node), dropped |
 | `openraft_chat_read_errors_total` | counter | `peer` | Failed reads of a peer's outbox |
 | `openraft_chat_requests_served_total` | counter | `peer`, `rpc` | Requests from a peer handed to this node's Raft |
 

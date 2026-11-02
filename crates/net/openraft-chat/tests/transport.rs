@@ -217,3 +217,91 @@ async fn calls_frames_and_posts_are_counted() {
     assert_eq!(frames("1", "duplicate"), 3, "and each a second time");
     assert!(matches!(find("openraft_chat_posts_total", &[("outcome", "ok")]), DebugValue::Counter(n) if *n >= 6));
 }
+
+/// Grants votes; a vote in a term listed in `delays` it answers only after
+/// that delay.
+struct Slow {
+    delays: HashMap<u64, Duration>,
+}
+
+#[async_trait]
+impl Handler<Config> for Slow {
+    async fn append_entries(
+        &self,
+        _: AppendEntriesRequest<Config>,
+    ) -> Result<AppendEntriesResponse<u64>, RaftError<u64>> {
+        Ok(AppendEntriesResponse::Success)
+    }
+    async fn vote(&self, req: VoteRequest<u64>) -> Result<VoteResponse<u64>, RaftError<u64>> {
+        if let Some(d) = self.delays.get(&req.vote.leader_id().term) {
+            tokio::time::sleep(*d).await;
+        }
+        Ok(VoteResponse::new(req.vote, None, true))
+    }
+    async fn install_snapshot(
+        &self,
+        req: InstallSnapshotRequest<Config>,
+    ) -> Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>> {
+        Ok(InstallSnapshotResponse { vote: req.vote })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_response_from_another_peer_does_not_answer_a_call() {
+    // Node 1 asks node 3, which never answers. Node 2 posts a well-sealed
+    // response to the very rpc id node 1 used: node 1 must not take it.
+    let chat = FakeChat::new();
+    let peers: HashMap<u64, Arc<dyn Mailbox>> = [(2, chat.mailbox(1, 2)), (3, chat.mailbox(1, 3))].into();
+    let mut one = ChatNetwork::<Config>::new(1, settings(KEY), chat.mailbox(1, 1), peers);
+    one.serve(Arc::new(Yes::default())).await;
+    let call = tokio::spawn(async move { vote(&mut one, 3, 7, Duration::from_secs(5)).await });
+
+    // The request node 1 posted: its rpc id.
+    let mut rpc = None;
+    while rpc.is_none() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let frames = chat.mailbox(9, 1).read_after(0, 10).await.unwrap();
+        rpc = frames.first().map(|(_, b)| open::<Config>(b, &KEY).unwrap().envelopes[0].rpc);
+    }
+    let forged = Frame::<Config> {
+        version: FRAME_VERSION,
+        cluster: 42,
+        from: 2,
+        seq: 1,
+        envelopes: vec![Envelope {
+            to: 1,
+            rpc: rpc.unwrap(),
+            body: Body::Voted(Ok(VoteResponse::new(Vote::new(7, 1), None, true))),
+        }],
+    };
+    chat.mailbox(2, 2).post(seal(&forged, &KEY)).await.unwrap();
+
+    let err = call.await.unwrap().unwrap_err();
+    assert!(matches!(err, RPCError::Timeout(_)), "node 2's response answered a call to node 3: {err:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_response_to_an_earlier_run_is_not_taken_for_this_ones() {
+    // Node 1 asks node 2 for a vote in term 7, and restarts before node 2
+    // answers; its new run asks in term 8. Node 2 answers the old request
+    // first (at 2 s, the new one at 4 s): the new run must not take that
+    // answer for its own.
+    let chat = FakeChat::new();
+    let two = ChatNetwork::<Config>::new(2, settings(KEY), chat.mailbox(2, 2), [(1, chat.mailbox(2, 1))].into());
+    let delays = [(7, Duration::from_secs(2)), (8, Duration::from_secs(4))].into();
+    two.serve(Arc::new(Slow { delays })).await;
+    let node1 = || ChatNetwork::<Config>::new(1, settings(KEY), chat.mailbox(1, 1), [(2, chat.mailbox(1, 2))].into());
+
+    let mut first = node1();
+    first.serve(Arc::new(Yes::default())).await;
+    let old = tokio::spawn(async move { vote(&mut first, 2, 7, Duration::from_secs(30)).await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    old.abort(); // the restart: the old run and its call are gone
+    let _ = old.await;
+    std::thread::sleep(Duration::from_millis(2)); // a run starts at a later instant
+
+    let mut second = node1();
+    second.serve(Arc::new(Yes::default())).await;
+    let resp = vote(&mut second, 2, 8, Duration::from_secs(30)).await.unwrap();
+    assert_eq!(resp.vote, Vote::new(8, 1), "the new run took the answer meant for the old one");
+}
