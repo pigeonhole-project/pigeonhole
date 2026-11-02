@@ -237,8 +237,8 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .wiz-nav { margin-top: 22px; justify-content: flex-end; }
 
 /* the first boot: the graph appears as the node opens it */
-.booting .node, .booting .edge { opacity: 0; transition: opacity .45s ease-out, stroke-dashoffset .6s ease-out; }
-.booting .node.up, .booting .edge.up { opacity: 1; stroke-dashoffset: 0 !important; }
+.booting .node, .booting .edge { opacity: 0; transition: opacity .45s ease-out; }
+.booting .node.up, .booting .edge.up { opacity: 1; }
 @media (prefers-reduced-motion: reduce) { .booting .node, .booting .edge { transition: none; } }
 
 /* faults: a channel down, a failed call */
