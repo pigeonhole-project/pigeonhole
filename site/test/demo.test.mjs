@@ -49,6 +49,18 @@ test("readEvents: deletions, store calls, repair, the claim, S3", () => {
   ]);
 });
 
+test("readEvents: an outbox post is a frame, responses and all; a response flies no pigeon", () => {
+  const events = readEvents([
+    line("raft frame sent", {node: 2, to: 1, kind: "append", reply: true, via: "chat"}),
+    line("raft frame sent", {node: 1, to: 2, kind: "heartbeat", reply: false, via: "chat"}),
+    line("posted a frame", {node: 2, pos: 9, envelopes: 2}),
+  ]);
+  assert.deepEqual(events, [
+    {type: "raft", from: 1, to: 2, via: "chat", kind: "heartbeat", at: "sent"},
+    {type: "frame", from: 2, envelopes: 2},
+  ]);
+});
+
 test("readEvents: a fake channel's own tablet is not the node's", () => {
   assert.deepEqual(readEvents([line("posted", {store: "x"}, [{name: "fake_channel"}])]), []);
 });

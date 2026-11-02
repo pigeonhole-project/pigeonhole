@@ -135,8 +135,9 @@ function apply(events) {
     } else if (e.type === "raft") {
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
       said.push(...raft.frame(e, performance.now()));
-      // Over the chat, a frame is a post in the sender's outbox.
-      const box = e.via === "chat" && e.at === "sent" && channel(`outbox-${e.from}`);
+    } else if (e.type === "frame") {
+      // A post in the sender's outbox: responses too, many envelopes in one.
+      const box = channel(`outbox-${e.from}`);
       if (box) {
         box.total = (box.total ?? 0) + 1;
         graph.setTotal(box.store);
