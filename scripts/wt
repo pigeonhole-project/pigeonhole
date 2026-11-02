@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# A git worktree per task, next to the main checkout, and all of it gone
+# (the directory, its target/, the branch) once the branch is in main.
+#
+#   scripts/wt new <branch> [base]   ../pigeonhole-<branch>, a new branch off base (main)
+#   scripts/wt list                  each worktree: in main or not, uncommitted work, target/ size, last commit
+#   scripts/wt done <branch> [--force]
+#                                    remove the worktree and delete the branch; refuses if
+#                                    the branch is not in main or the worktree has uncommitted
+#                                    work (--force removes it anyway)
+#   scripts/wt clean [--yes]         `done` for every worktree whose branch is in main, is
+#                                    clean and was not touched in the last hour; without
+#                                    --yes only says which
+#
+# The main checkout itself is never removed, nor the worktree you stand in.
+set -euo pipefail
+
+MAIN_BRANCH=main
+# The main checkout: the first worktree git lists.
+MAIN_DIR="$(git worktree list --porcelain | awk '/^worktree /{print substr($0, 10); exit}')"
+PARENT="$(dirname "$MAIN_DIR")"
+PREFIX="$(basename "$MAIN_DIR")"
+HERE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+git() { command git -C "$MAIN_DIR" "$@"; }
+
+die() { echo "wt: $*" >&2; exit 1; }
+dir_of() { echo "$PARENT/$PREFIX-${1//\//-}"; }
+
+# "dir branch" per worktree but the main checkout (a detached one: branch "-").
+worktrees() {
+  git worktree list --porcelain | awk -v main="$MAIN_DIR" '
+    /^worktree /{ dir = substr($0, 10); branch = "-" }
+    /^branch /{ branch = substr($0, 8); sub("refs/heads/", "", branch) }
+    /^$/{ if (dir != main) print dir, branch; dir = "" }
+    END{ if (dir != "" && dir != main) print dir, branch }'
+}
+# The worktree of a branch (or a worktree's own directory, given that).
+find_dir() {
+  local want="$1" dir branch
+  while read -r dir branch; do
+    if [[ "$branch" == "$want" || "$dir" == "$want" || "$dir" == "$(dir_of "$want")" ]]; then echo "$dir $branch"; return; fi
+  done < <(worktrees)
+}
+merged() { [[ "$1" != "-" ]] && git merge-base --is-ancestor "$1" "$MAIN_BRANCH" 2>/dev/null; }
+dirty() { [[ -n "$(command git -C "$1" status --porcelain 2>/dev/null)" ]]; }
+# Touched in the last hour: a file under it (target/ too: a build) newer than that.
+recent() { [[ -n "$(find "$1" -mindepth 1 -maxdepth 3 -type f -newermt "-60 minutes" -not -name .git -print -quit 2>/dev/null)" ]]; }
+
+cmd_new() {
+  local branch="${1:-}" base="${2:-$MAIN_BRANCH}"
+  [[ -n "$branch" ]] || die "usage: wt new <branch> [base]"
+  local dir; dir="$(dir_of "$branch")"
+  [[ -e "$dir" ]] && die "$dir exists already"
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    git worktree add -q "$dir" "$branch"
+  else
+    git worktree add -q -b "$branch" "$dir" "$base"
+  fi
+  echo "$dir"
+}
+
+cmd_list() {
+  local dir branch state size last
+  while read -r dir branch; do
+    if merged "$branch"; then state="in-main"; else state="open"; fi
+    dirty "$dir" && state="$state,uncommitted"
+    recent "$dir" && state="$state,busy"
+    size="-"
+    [[ -d "$dir/target" ]] && size="$(du -sh "$dir/target" 2>/dev/null | cut -f1)"
+    last="$(command git -C "$dir" log -1 --format=%cr 2>/dev/null || echo "?")"
+    printf "%-28s %-24s target %-6s %s\n" "$branch" "$state" "$size" "$last"
+  done < <(worktrees)
+}
+
+remove() {
+  local dir="$1" branch="$2" force="$3"
+  [[ "$dir" == "$MAIN_DIR" ]] && die "not removing the main checkout"
+  [[ "$HERE" == "$dir" || "$HERE" == "$dir"/* ]] && die "you are in $dir: leave it first"
+  if [[ "$force" != yes ]]; then
+    merged "$branch" || die "$branch is not in $MAIN_BRANCH (--force removes it anyway)"
+    dirty "$dir" && die "$dir has uncommitted work (--force removes it anyway)"
+  fi
+  # The worktree with its target/ (ignored files git would otherwise keep it for).
+  git worktree remove --force "$dir"
+  if [[ "$branch" != "-" ]]; then
+    if [[ "$force" == yes ]]; then git branch -q -D "$branch"; else git branch -q -d "$branch"; fi
+  fi
+  if [[ "$branch" == "-" ]]; then echo "removed $dir"; else echo "removed $dir and branch $branch"; fi
+}
+
+cmd_done() {
+  local want="${1:-}" force=no
+  [[ -n "$want" ]] || die "usage: wt done <branch> [--force]"
+  [[ "${2:-}" == "--force" ]] && force=yes
+  local found; found="$(find_dir "$want")"
+  [[ -n "$found" ]] || die "no worktree for $want"
+  remove "${found% *}" "${found##* }" "$force"
+}
+
+cmd_clean() {
+  local yes=no dir branch n=0
+  [[ "${1:-}" == "--yes" ]] && yes=yes
+  while read -r dir branch; do
+    merged "$branch" || continue
+    dirty "$dir" && continue
+    recent "$dir" && continue
+    n=$((n + 1))
+    if [[ "$yes" == yes ]]; then remove "$dir" "$branch" no; else echo "would remove $dir ($branch)"; fi
+  done < <(worktrees)
+  [[ "$yes" == yes || $n -eq 0 ]] || echo "($n; scripts/wt clean --yes removes them)"
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  list) cmd_list ;;
+  done) shift; cmd_done "$@" ;;
+  clean) shift; cmd_clean "$@" ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
