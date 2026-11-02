@@ -314,7 +314,7 @@ over the S3 `Index` as a gateway: WebDAV (`dav-server-opendalfs`), then
 
 ### Step 13 — Turso replica
 
-[turso-replica.md](turso-replica.md): a Turso database whose WAL frames go
+[proposals/turso-replica.md](proposals/turso-replica.md): a Turso database whose WAL frames go
 into any `Chain` store's log and whose checkpoints become snapshots;
 fencing between two primaries; restore and followers.
 

@@ -1,8 +1,10 @@
 # A Turso database replicated into pigeonhole
 
-Status: **proposal**, not spiked. Read [roadmap.md](roadmap.md) § Ground rules,
-[meta-backends.md](meta-backends.md) (LogStore, SnapshotStore, generations),
-[telegram-mtproto.md](telegram-mtproto.md) and [discord-log.md](discord-log.md)
+Status: **proposal**, not spiked (roadmap step 13). Written against the
+single-writer tablet; a Raft cluster ([cluster.md](../cluster.md)) changes
+who ships, not how. Read [roadmap.md](../roadmap.md) § Ground rules,
+[meta-backends.md](../meta-backends.md) (LogStore, SnapshotStore, generations),
+[telegram-mtproto.md](../telegram-mtproto.md) and [discord-log.md](../discord-log.md)
 (the fenced logs this runs on) first.
 
 ## Idea
@@ -42,14 +44,14 @@ These are pre-release and feature-gated: pin the exact version.
 
 ### Shape
 
-- A library crate `apps/pigeonhole-turso`: `Replica::open(config) -> Replica`,
+- A library crate (say `crates/apps/pigeonhole-turso`): `Replica::open(config) -> Replica`,
   `replica.connection()` hands out Turso connections, a background shipper
   task, `replica.wait_shipped(frame)` for synchronous durability, and
   `restore` / `follow` for other processes.
 - The log and the snapshot store are built from pigeonhole's config
-  (`[[store]]`): `open_log` / `open_snapshots` and the chat adapters
-  (`telegram_log.rs`) move from the binary into the `pigeonhole` library crate
-  so that other crates can open them.
+  (`[[store]]`): `open_log` / `open_snapshots` (today in the binary's
+  `runtime.rs`, with the chat clients of `channel_log.rs`) move into a
+  library crate so that other crates can open them.
 - A demo binary (`pigeonhole turso demo` or an example) runs a workload
   against a replica.
 
