@@ -1,9 +1,13 @@
 # Discord vs Telegram: one node, measured
 
+> A record of 2026-10-29 (plus the lease update of the same day). Since
+> then the Discord log runs on a lease, a store can post through a pool of
+> bots, and small objects are inline: § What would move the numbers.
+
 One run on 2026-10-29 (code at 26b9e37), the same S3 workload against a
 pigeonhole whose blobs, log and snapshots all live in one service's test
 channels, and against a local disk for scale. Raw results:
-[bench/2026-10-29/](bench/2026-10-29/) (`tables.md` has every number below,
+[bench/2026-10-29/](2026-10-29/) (`tables.md` has every number below,
 the JSON files every counter).
 
 ## Summary
@@ -119,7 +123,7 @@ and ~50 thread deletes at 1/s) for 112 s, every entry queued behind it.
 Since `ChainLogStore::rebase` returns once the base is written (the
 collection runs in the background) and snapshots on Discord are plain
 messages (no paced thread), the same run gives
-([raw](bench/2026-10-29-log-collect/discord.json)):
+([raw](2026-10-29-log-collect/discord.json)):
 
 | Discord, 8 clients | before | after |
 |---|---|---|
@@ -138,7 +142,7 @@ stalls.
 Since the lease (`[meta] lease`, 45 s by default) a Discord log entry is
 a plain post; threads are only for the lease records. The same full run on
 Discord, against the earlier ones and the first Telegram run (not rerun:
-its code did not change for this) ([raw](bench/2026-10-29-lease/discord.json)):
+its code did not change for this) ([raw](2026-10-29-lease/discord.json)):
 
 | | Discord first | Discord, log-collect | **Discord, lease** | Telegram first |
 |---|---|---|---|---|
@@ -167,7 +171,7 @@ its code did not change for this) ([raw](bench/2026-10-29-lease/discord.json)):
 
 A chunk store that read up to n blocks of a chunk at once (an experiment,
 not kept: the reads go one block at a time). The same read phases with
-n = 1 and n = 8, back to back ([raw](bench/2026-10-29-read-concurrency/)):
+n = 1 and n = 8, back to back ([raw](2026-10-29-read-concurrency/)):
 
 | cold GET, 92 MiB | n = 1 | n = 8 |
 |---|---|---|
@@ -194,15 +198,24 @@ is what showed it.
   for writes under load; `[[shards]]` over several blob chats multiplies it
   (step 7). The log channel then becomes the limit at 0.3 entries/s, where
   group commit starts to pay as it does on Discord.
+- **Both: more bots.** Done: send limits turned out to be per bot, and a
+  store takes a pool of bots (`bot_token_envs`); two bots nearly doubled
+  writes bound by a bot's budget, the log's included
+  ([shared-limiter.md](../shared-limiter.md) § Bench).
 - **Discord: fewer threads.** A log entry costs a paced thread; more blob
   channels would not help. Batching already helps under load; an entry
   that links less often than once per message would lift the ceiling
-  (a design question for the chain, docs/discord-log.md).
+  (a design question for the chain, docs/discord-log.md). Done: the lease
+  ([discord-lease.md](../discord-lease.md)), § Update: the Discord log on a
+  lease.
 - ~~**Both: reads in parallel.**~~ Tried and measured (below): not faster.
   With the cache on (the default), reads after a write are free (L2
   write-through).
 - **Small objects and Telegram's text path**: blobs that fit a text
-  message already go as text; they still cost a send each.
+  message already go as text; they still cost a send each. Done for small
+  objects: up to `[inline] max_object_size` (1 KiB by default) they live in
+  the metadata and cost no blob send at all
+  ([inline-objects.md](../inline-objects.md)).
 
 ## Caveats
 
@@ -226,5 +239,5 @@ cat .cache/bench/report.md
 It needs the test channels and tokens in `.env`. The run leaves those
 channels as it found them: Discord's are emptied whole, Telegram's between
 two marker messages it posts (`bench_window` in
-`crates/storage/pigeonhole-storage-telegram/tests/live.rs`). While it runs,
+`crates/storage/pigeonhole-telegram-mtproto/tests/live.rs`). While it runs,
 the dashboard is up at http://127.0.0.1:3000/d/pigeonhole/pigeonhole.

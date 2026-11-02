@@ -3,7 +3,7 @@
 Status: **implemented** for Discord logs (`[meta] lease`, default `"45s"`). See § Implementation notes for where the code differs from the design.
 Read [discord-log.md](discord-log.md) (the thread fence this changes),
 [chain-log.md](chain-log.md) and
-[bench-discord-vs-telegram.md](bench-discord-vs-telegram.md) first.
+[bench/discord-vs-telegram.md](bench/discord-vs-telegram.md) first.
 
 ## Why
 
@@ -263,7 +263,7 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
    answered after the deadline, release); the simulation is not.
 4. ✅ Live run (`discord-http/tests/live.rs`
    `lease_log_against_a_live_channel`) and bench:
-   [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md) § Update.
+   [bench/discord-vs-telegram.md](bench/discord-vs-telegram.md) § Update.
 
 ## Open questions
 

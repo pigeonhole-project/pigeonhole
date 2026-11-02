@@ -2,7 +2,7 @@
 
 Status: **implemented**: steps 1–5 of § Plan (plans taken at once, one
 retry loop, pools of bots, the bench); step 6 waits for a need. Read
-[bench-discord-vs-telegram.md](bench-discord-vs-telegram.md) (what limited
+[bench/discord-vs-telegram.md](bench/discord-vs-telegram.md) (what limited
 us on 2026-10-29) and [telegram-mtproto.md](telegram-mtproto.md) (the order fence,
 which does not care which bot posts) first.
 
@@ -357,7 +357,7 @@ until the round trip (~0.3–0.5 s per send) is what is left.
 ## Bench (2026-10-31)
 
 `BENCH_BOTS=2 ./scripts/bench.sh telegram discord` (the workload of
-[bench-discord-vs-telegram.md](bench-discord-vs-telegram.md), default
+[bench/discord-vs-telegram.md](bench/discord-vs-telegram.md), default
 limits), one machine on AC power under `caffeinate` (a run on battery was
 spoiled by macOS Maintenance Sleep: 15-minute gaps, then timeouts, and a
 Discord lease running out). Raw data: [bench/2026-10-31-pool](bench/2026-10-31-pool/);
