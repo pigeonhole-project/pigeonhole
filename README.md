@@ -1,377 +1,226 @@
 # pigeonhole
 
-> **⚠️ Educational project.** pigeonhole is a learning exercise in building a
-> storage system (chunking, replication, refcounting, garbage collection,
-> crash recovery) on top of deliberately unusual backends. It is **not** meant
-> for storing real data, and it is **not** an invitation to use Telegram or
-> Discord as free file hosting. Using a messenger as a general-purpose storage
-> backend may violate the [Telegram Terms of Service](https://telegram.org/tos),
-> the [Telegram API Terms](https://core.telegram.org/api/terms) and
-> [Bot Developer Terms](https://telegram.org/tos/bot-developers),
-> the [Discord Terms of Service](https://discord.com/terms) and the
-> [Discord Developer Policy](https://discord.com/developers/docs/policies-and-agreements/developer-policy).
-> If you run it against a real bot, keep it to small, short-lived test data in
-> a private chat you own, and make sure your usage complies with those terms.
-> For tests and development use a `kind = "memory"` instance — no external service involved.
-> The authors take no responsibility for misuse.
+S3-compatible storage, written in Rust, that keeps its bytes in Telegram and
+Discord channels (or on a local disk, or in memory), and its metadata too:
+a log fenced by the order of messages, snapshots, Raft between nodes.
 
-Pluggable blob storage with protocol gateways, written in Rust. The main
-gateway is S3-compatible HTTP (via [s3s](https://github.com/s3s-project/s3s));
-a Bazel/Buck2 remote cache (REAPI v2) gateway is optional. Bytes are stored as
-documents/attachments in Telegram (MTProto, logged in as a bot) or Discord
-channels, in files on a local disk, or in memory.
+**Try it in the browser:**
+[pigeonhole-project.github.io/pigeonhole](https://pigeonhole-project.github.io/pigeonhole/).
+The real code is built for wasm and runs on fake Telegram and Discord
+channels, and you watch the messages it posts. **Docs:**
+[docs/README.md](docs/README.md). **Roadmap:** [docs/roadmap.md](docs/roadmap.md).
 
-Objects are split into **chunks** (`chunk.size`: default ≤ 19 MiB on the
-wire, up to 256 MiB). Chunk encoding is `raw` | `gzip` | `zstd`
-(default `zstd`): compressing policies pack independent 1 MiB **blocks** into
-backend messages so each block is compressed once and Range reads only touch
-the blocks they need. Chunks are refcounted, so `CopyObject` shares the
-source's chunks instead of re-sending bytes (there is no content dedup).
+> **⚠️ Educational project.** A learning exercise in building a storage
+> system (chunking, replication, refcounting, garbage collection, crash
+> recovery, consensus) on deliberately unusual backends. It is **not** for
+> real data, and **not** an invitation to use messengers as free file
+> hosting: that may violate the [Telegram Terms of Service](https://telegram.org/tos),
+> [API Terms](https://core.telegram.org/api/terms) and
+> [Bot Developer Terms](https://telegram.org/tos/bot-developers), the
+> [Discord Terms of Service](https://discord.com/terms) and
+> [Developer Policy](https://discord.com/developers/docs/policies-and-agreements/developer-policy).
+> Against a real bot, keep to small, short-lived test data in a private
+> channel you own. For development use `kind = "memory"` stores. The
+> authors take no responsibility for misuse.
 
-A chunk can have **replicas** on several **instances** (bot + chat/channel,
-Telegram and/or Discord). A background repair task re-replicates
-under-replicated chunks; a sweeper deletes unreferenced backend messages.
-Metadata is a log of commands (a tablet, see
-[docs/meta-backends.md](docs/meta-backends.md)); the state is rebuilt from the
-log on every boot.
+## How it works
 
-Architecture terms: [docs/glossary.md](docs/glossary.md) (Instance, Blob, Block,
-Chunk, Replica, Extent, Tablet, LogStore, Snapshot). GC rules:
-[docs/sweep-invariants.md](docs/sweep-invariants.md).
+- **Gateways.** S3 over HTTP ([s3s](https://github.com/s3s-project/s3s)) and,
+  optionally, a Bazel/Buck2 remote cache (REAPI v2, gRPC).
+- **Chunks.** Objects are cut into chunks (`chunk.size`, ≤ 19 MiB on the
+  wire by default) of independently compressed 1 MiB blocks (`zstd` by
+  default), so a range read fetches only its blocks. Chunks are refcounted:
+  `CopyObject` shares them.
+- **Stores.** A chunk goes to a **store**: a Telegram channel (MTProto,
+  logged in as a bot), a Discord channel, a local directory, or memory.
+  `[[replicas]]` copy a chunk to several stores and `[[shards]]` spread
+  chunks over them. Repair brings back lost copies; a sweeper deletes what
+  nothing references.
+- **Metadata.** A **tablet**: typed commands in a log, applied to in-memory
+  state and rebuilt from the newest snapshot and the log on every boot.
+  There is no local database. The log lives on any store and is fenced
+  there: on disk by `flock`, in a Telegram channel by the order of message
+  ids, in Discord by threads and a lease. One S3 operation is one log entry;
+  conditional writes are decided in the log; small objects live inline in it.
+- **Cluster.** Several nodes run the tablet as one Raft group (openraft).
+  Nodes talk over gRPC, or through Telegram channels for a node that has
+  nothing but a channel. The leader does all the work.
 
-## Layout
-
-Cargo workspace under `crates/` (role dirs + `pigeonhole-*` names):
-
-| Crate | Role |
-|---|---|
-| `core/pigeonhole-types` | Shared types (`BlobKey`, `Locator`, errors) |
-| `core/pigeonhole-codec` | Codecs + `BlockWriter` |
-| `core/pigeonhole-storage-api` | What a store implements: `BlobBackend`, `Chain`, `LeaseChain`, and the failures it reports by type (`NotFound`, `Unavailable`, `RateLimited`) |
-| `core/pigeonhole-limits` | Rate limiters a store paces its calls with (`ChatLimiter`, `StoreLimiter`) |
-| `meta/pigeonhole-meta` | Metadata tablet: layer commands in a fencing `LogStore`, applied to in-memory `StateMachine`s (`MetaStore`) |
-| `blob/pigeonhole-blob` | Stores behind one object-safe face (`DynBlobBackend`), `Replicated`, part packing, store metrics, cache knobs |
-| `blob/pigeonhole-chunk-store` | `ChunkStore`, the `chunk` namespace, ingest, sweeper, repair (no protocol or store-specific crates) |
-| `storage/pigeonhole-storage-telegram` | Telegram storage over MTProto (grammers), logged in as a bot |
-| `storage/pigeonhole-storage-discord` | Discord storage: blobs, and a chain over threads for the log and snapshots |
-| `storage/pigeonhole-storage-memory` | In-memory blob storage for tests / `kind = "memory"` stores |
-| `storage/pigeonhole-storage-disk` | Blobs as files in a directory (`kind = "local_disk"`) |
-| `gateway/pigeonhole-gateway-s3` | S3 (`s3s`) gateway |
-| `gateway/pigeonhole-gateway-bytestream` | REAPI v2 remote cache |
-| `testing/pigeonhole-testkit` | Storage conformance suites |
-| `testing/pigeonhole-sim` | Fault injection (`Faulty<B>`) and deterministic simulation scenarios (madsim) |
-| `bin/pigeonhole` | The `pigeonhole` binary: config (`pigeonhole.toml`, `[[store]]`), wiring of stores, tablet and gateways (features select storage/gateways) |
-
-Dependency layering is enforced by `./scripts/check-deps.sh --strict` in CI.
+Terms: [glossary](docs/glossary.md). The tablet:
+[meta-backends.md](docs/meta-backends.md). The cluster:
+[cluster.md](docs/cluster.md).
 
 ## Quick start (no external services)
 
 ```bash
-cp pigeonhole.toml.example pigeonhole.toml
-cp .env.example .env
-# in pigeonhole.toml replace the "tg-main" [[store]] with a memory one:
-#   [[store]]
-#   id = "tg-main"
-#   kind = "memory"
+cat > pigeonhole.toml <<'EOF'
+[[store]]
+id = "mem"
+kind = "memory"
+
+[chunk]
+store = "mem"
+EOF
 cargo run --release
 ```
 
-Listens on `http://0.0.0.0:8333` by default (`listen_addr`). Point the AWS CLI
-at it:
+The metadata goes to `./pigeonhole-meta` (a local disk log), the bytes to
+memory. The node listens on `http://0.0.0.0:8333` (`listen_addr`); point any
+S3 client at it:
 
 ```bash
-export AWS_ACCESS_KEY_ID=pigeonhole
-export AWS_SECRET_ACCESS_KEY=pigeonholesecret
-export AWS_DEFAULT_REGION=us-east-1
-
+export AWS_ACCESS_KEY_ID=pigeonhole AWS_SECRET_ACCESS_KEY=pigeonholesecret AWS_DEFAULT_REGION=us-east-1
 aws --endpoint-url http://127.0.0.1:8333 s3 mb s3://demo
 aws --endpoint-url http://127.0.0.1:8333 s3 cp ./file.bin s3://demo/file.bin
 aws --endpoint-url http://127.0.0.1:8333 s3 cp s3://demo/file.bin ./out.bin
 ```
 
-Authentication is AWS SigV4 via s3s `SimpleAuth` (keys from `AWS_ACCESS_KEY_ID` /
-`AWS_SECRET_ACCESS_KEY`; the defaults above are for local use only).
+Settings are in `pigeonhole.toml` (`PIGEONHOLE_CONFIG` overrides the path);
+[pigeonhole.toml.example](pigeonhole.toml.example) has every key with
+comments. Unknown keys are refused. Secrets never go in the file: it names
+env vars (`.env` is read), see [.env.example](.env.example).
 
-Non-secret settings live in **`pigeonhole.toml`** (path override:
-`PIGEONHOLE_CONFIG`). Secrets stay in **`.env` / environment**: `BOT_TOKEN`,
-`TG_API_ID`, `TG_API_HASH`, `DISCORD_BOT_TOKEN`, `AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`.
+## Backends
 
-## Telegram backend
+Every place bytes can live is a `[[store]]`. `[chunk] store` names where
+chunks go (a store, a `[[replicas]]` group or `[[shards]]`), and `[meta] log`
+and `snapshot` name where the metadata goes. A channel serves one purpose.
 
-Read the disclaimer at the top first.
+- **Telegram** (`kind = "telegram"`). Create a bot with
+  [@BotFather](https://t.me/BotFather), get an app's `api_id`/`api_hash` at
+  [my.telegram.org](https://my.telegram.org), and make the bot an admin of a
+  private channel (post, delete, and pin on a blob channel). pigeonhole logs
+  in over MTProto as the bot: files up to the chunk size, a channel read by
+  message id, about 20 posts a minute per bot and channel. Several bots per
+  store add up their budgets. See
+  [telegram-mtproto.md](docs/telegram-mtproto.md) and
+  [shared-limiter.md](docs/shared-limiter.md).
+- **Discord** (`kind = "discord"`, on by default). The bot views the
+  channel, sends messages, attaches files, reads history and manages
+  messages; a log or snapshot channel also needs threads. Attachments are up
+  to 20 MiB. See [discord-log.md](docs/discord-log.md) and
+  [discord-lease.md](docs/discord-lease.md).
+- **Local disk** (`kind = "local_disk"`): append-only segment files.
+- **Memory** (`kind = "memory"`): tests and throwaway runs.
 
-pigeonhole talks MTProto (the protocol of Telegram's own apps, via
-[grammers](https://codeberg.org/Lonami/grammers)) but logs in as a **bot**,
-with its token: no user account, no interactive login.
+A store is marked with its deployment's owner. Two configs pointed at one
+channel by mistake: the second refuses to start, and neither deletes the
+other's blobs ([store-owner.md](docs/store-owner.md)).
 
-1. Create a bot with [@BotFather](https://t.me/BotFather) and get a `BOT_TOKEN`.
-2. Register an app at [my.telegram.org](https://my.telegram.org) for
-   `TG_API_ID` / `TG_API_HASH`.
-3. Create a private **channel** or **supergroup** per purpose (blobs, log,
-   snapshots) and add the bot as **administrator** with the post and delete
-   messages rights, and on a blob channel the right to pin messages (edit
-   messages in a channel, pin in a supergroup). Basic groups and private
-   chats are refused: only channels number their messages per chat.
-4. Set `chat_id` (`-100…`) per `[[store]]` in `pigeonhole.toml`, the secrets
-   in `.env`.
-
-The first start logs in (~2 s) and caches the auth key in the session file
-(`pigeonhole-tg-<bot id>.session`, 0600, one per bot; delete it to log in
-again). On startup the bot's rights in each channel are checked.
-
-What MTProto gives a bot over the Bot API: any message of a channel can be
-read by id (`channels.getMessages`), so a channel is listed by reading id
-ranges (ids are dense), the sweeper deletes only our `ph-<hex>.bin`
-documents, and the log needs no pins (it is fenced by the order of message
-ids, [docs/telegram-mtproto.md](docs/telegram-mtproto.md)); files are not
-capped at 20 MiB and are read in exact 512 KiB windows. What it does not
-change: about 20 messages a minute per channel. `FLOOD_WAIT` answers cool the
-budget they hit (`[telegram]`) and are waited out.
-
-## Discord backend
-
-Discord is enabled by default (`--features discord`):
+## A cluster
 
 ```toml
-[[store]]
-id = "dc"
-kind = "discord"
-channel_id = 123456789012345678
-# optional: max_blob_size = "20 MiB"
+[cluster]
+node = 1                              # or PIGEONHOLE_NODE
+id = 7
+key_env = "PH_CLUSTER_KEY"            # 64 hex digits
 
-[chunk]
-store = "dc"
+[[node]]
+id = 1
+grpc = "10.0.0.1:7001"
+[[node]]
+id = 2
+grpc = "10.0.0.2:7001"
+[[node]]
+id = 3
+outbox = -1003333333333               # no address: reached through a Telegram channel
 ```
 
-Secret: `DISCORD_BOT_TOKEN` in `.env` (or the env vars named by
-`bot_token_envs`: several bots in one channel multiply its budget, see
-docs/shared-limiter.md).
-The bot needs to view the (text) channel, send messages, attach files, read
-history and manage messages (delete; pin, on a blob channel); a channel
-holding the log or snapshots also needs create public threads and manage
-threads. Blobs up to ~3.6 KiB go
-as text messages (read with the listing), larger ones as attachments (20 MiB
-per file by default; more on boosted servers via `max_blob_size`); CDN URLs
-are cached and refreshed by fetching the message.
+Each node has its own metadata log; the blob stores are shared.
 
-A Discord channel can also hold the metadata log or snapshots (each its own
-channel): the log is fenced by threads — a message can start one thread,
-ever (docs/discord-log.md). About ten log appends a minute.
+- The leader serves S3 and runs the background work. A follower answers 503.
+- `GET /_pigeonhole/leader` is 200 on the leader only: point a load
+  balancer's health check at it.
+- Transports are chosen per pair: gRPC when both nodes have an address,
+  Telegram outboxes when both have a channel.
+- `make cluster-smoke` runs three processes on localhost and kills the
+  leader.
 
-## Stores and replication
+Everything else: [cluster.md](docs/cluster.md).
 
-Every place bytes can live is a `[[store]]` (`local_disk`, `memory`,
-`telegram`, `discord`; secrets are referenced by env var name, never inline). Stores are
-combined into `[[replicas]]` groups, and `[meta] log` / `snapshot` and
-`[chunk] store` name a store or a group:
+## Running it
 
-```toml
-[[store]]
-id = "tg-main"
-kind = "telegram"
-bot_token_envs = ["BOT_TOKEN"]    # more bots, more sends a minute
-chat_id = -1001234567890
+- **Admin API and UI** (`[admin] listen_addr`, off by default, no auth: keep
+  it on loopback). It shows the dynamic config and the background tasks.
+  With `[admin] ui_dir`, the same UI as the demo runs against the real node.
+- **Dynamic config.** The knobs of the background loops (sweep, repair,
+  cooler, snapshots, metrics, REAPI GC) change while running and are kept in
+  the tablet ([dynamic-config.md](docs/dynamic-config.md)):
 
-[[store]]
-id = "dc-backup"
-kind = "discord"
-bot_token_envs = ["DISCORD_BOT_TOKEN"]
-channel_id = 123456789012345678
+  ```bash
+  pigeonhole config                          # every dynamic key, every task
+  pigeonhole config set repair.interval off
+  pigeonhole run repair                      # a pass now
+  ```
+- **Logs.** stderr, text or JSON, one span per S3 request
+  ([observability.md](docs/observability.md)).
+- **Metrics.** Prometheus `/metrics`; `make metrics-demo` brings up
+  Prometheus and Grafana with a dashboard ([metrics.md](docs/metrics.md)).
+- **Durability.** Ship the log and snapshots off the host (Telegram or
+  Discord channels) and a clean machine boots from them. With a local log
+  and snapshots elsewhere, `pigeonhole restore --lossy` starts from the
+  newest snapshot ([log-retention.md](docs/log-retention.md)).
+  `pigeonhole purge --yes` deletes every object and lets the sweeper delete
+  their blobs.
+- **REAPI remote cache.** Build with `--features bytestream`, set
+  `[bytestream] enabled = true`, then
+  `bazel build --remote_cache=grpc://127.0.0.1:8980 //…`.
+- **Demos.** etcd and SQLite running on a Telegram channel through S3
+  conditional writes: [demos/](demos/README.md).
 
-[[replicas]]
-id = "blobs"
-members = ["tg-main", "dc-backup"]
-write_quorum = 1
-
-[chunk]
-store = "blobs"
-```
-
-Writes go to every member of the group; reads pick the cheapest available
-replica. A chat serves one purpose (log, snapshots or blobs).
-
-`[[shards]]` spreads chunks instead of copying them: each chunk goes to one
-member (the least loaded), a store or a `[[replicas]]` group. Telegram limits
-are per chat, so more blob chats mean more throughput; a replica group as a
-shard keeps that shard readable when one provider is down. Repair keeps each
-chunk on every member of its own shard.
-
-```toml
-[[shards]]
-id = "spread"
-members = ["tg-main", "tg-second", "blobs"]   # "blobs" = the replica group above
-
-[chunk]
-store = "spread"
-``` The `[repair]` task scrubs for under-replicated chunks and backfills
-them (re-packing parts when instance blob limits differ).
-
-## Bazel / Buck2 remote cache (REAPI)
-
-Build with the `bytestream` feature, enable `[bytestream]` in `pigeonhole.toml`,
-then point Bazel at the gRPC listener (separate port from S3):
-
-```bash
-cargo run --release --features bytestream
-# pigeonhole.toml: [bytestream] enabled = true, listen_addr = "127.0.0.1:8980"
-
-bazel build --remote_cache=grpc://127.0.0.1:8980 //your/target
-```
-
-The server exposes REAPI v2 `Capabilities`, `ContentAddressableStorage`,
-`ActionCache`, and `google.bytestream.ByteStream` (SHA256 digests, cache-only).
-
-## Configuration
-
-See [`pigeonhole.toml.example`](pigeonhole.toml.example) for every key with
-comments. Sections:
-
-| TOML | Meaning |
-|---|---|
-| `[[store]]` | Where bytes live: id, kind (`local_disk` + `path` / `memory` / `telegram` + `chat_id` / `discord` + `channel_id`), secret env names (`bot_token_envs`, the bots of a chat, the first the primary; telegram also `api_id_env`, `api_hash_env`), telegram `session`, discord `max_blob_size`. Every kind holds blobs; the log and snapshots go to `local_disk`, `memory`, `telegram` or `discord` |
-| `[[replicas]]` | A group of blob stores holding a copy each: `members`, `write_quorum` |
-| `[[shards]]` | Chunks spread over `members` (stores or replica groups), one member per chunk |
-| `listen_addr`, `region` | S3 bind address, SigV4 region |
-| `[meta]` | Metadata tablet: `log` / `snapshot` (store ids), `snapshot_every_entries` / `snapshot_every` (`"off"` = never), `keep_snapshots` (the newest snapshots kept with the log between them; default 2) |
-| `[chunk]` | `store` (a blob store, replica group or shards), `size` (max on-wire), `codec`, `block_size` |
-| `[ingest]` | `memory_budget`: cap on chunks being filled or uploaded across concurrent PUTs (≥ `chunk.size` + `block_size`) |
-| `[telegram]` | Rate limits on two levels: per bot (`[telegram.bot]`) and per channel and class of call (`[telegram.send]`, `read`, `delete`), each `rate_per_sec` / `burst`; a `FLOOD_WAIT` freezes the bucket it hit; upload/download concurrency. `[discord]` takes the same tables |
-| `[cache]` | In-memory block caches: L1 decoded, L2 stored (compressed) blocks |
-| `[sweep]` | Garbage collector: `interval`, `batch_size` |
-| `[repair]` | Replica repair/backfill: interval, batch, cost limit, `scrub` |
-| `[http]` | Body/header timeouts, concurrency limit, max headers |
-| `[metrics]` | Prometheus `/metrics` (feature `metrics-prometheus`, on by default) |
-| `[bytestream]` | REAPI gRPC remote cache (feature `bytestream`) |
-
-Sizes are bytes or binary-unit strings (`"19 MiB"`, `"512 KiB"`; decimal
-`KB` / `MB` / `GB` are refused), durations humantime strings (`"45s"`,
-`"10m"`, `"7d"`); a knob that can be switched off takes `"off"`. Unknown
-keys are rejected, so a stale config fails at startup instead of being
-half-applied.
-
-## Logs and traces
-
-Logs go to stderr: `[log] level` (tracing directives, default
-`info,openraft=warn,s3s=off`; `RUST_LOG` overrides), `format = "text" |
-"json"`, `slow_request`. Every S3 request runs in a span with an id, sent
-back as `x-pigeonhole-request-id`; store calls and the tablet's commit run
-below it, so `RUST_LOG=debug` follows one request from the gateway to the
-blob it stored and the log position its commit landed at. Levels, spans and
-an example: [docs/observability.md](docs/observability.md).
-
-## Durability and restore
-
-Every metadata change is a layer command. `pigeonhole-meta` appends it to the
-command log (`[meta] log`, fsynced per batch) and then applies it to the
-in-memory state of its layer (`chunk`, `s3`, `cas`); the log is the source of
-truth and every boot rebuilds the state by replaying it (see
-[docs/meta-backends.md](docs/meta-backends.md)). There is no local database.
-
-Every `[meta] snapshot_every_entries` entries (and every `snapshot_every`
-when anything changed) the tablet snapshots all states into the snapshot store and
-drops the log behind the oldest of the `keep_snapshots` newest snapshots, so
-boot = the newest snapshot + the log after it, or, if that snapshot cannot be
-read, an older one + a longer replay ([docs/log-retention.md](docs/log-retention.md)). Log and
-snapshots are configured separately:
-
-| `[meta] log` | `[meta] snapshot` | losing this host's disk |
-|---|---|---|
-| a `local_disk` store | the same store (default) | loses the metadata |
-| a `local_disk` store | a `local_disk` on another disk, or a `telegram` store | `restore --lossy`: loses the changes after the newest snapshot |
-| a `telegram` store | another `telegram` store | loses nothing: a clean machine boots from the channels |
-
-After losing a local log whose snapshots survived:
-
-```bash
-# starts an empty [meta] log from the newest snapshot; changes after it are lost
-cargo run --release -- restore --lossy
-```
-
-Chunks committed after that snapshot become orphans (the sweeper deletes them).
-Objects in it read back whole: when snapshots outlive the log, the sweeper
-deletes a chunk's parts only after a stored snapshot shows the chunk released.
-Starting the server on an empty log next to stored snapshots is refused
-instead of booting with empty metadata.
-
-Delete every object, upload and bucket; the sweeper then deletes their blobs
-(server must be stopped):
-
-```bash
-cargo run --release -- purge --yes [--expect-chat CHAT_ID]
-```
-
-## Supported S3 ops (subset)
+## S3 support
 
 | Operation | Status |
 |---|---|
-| CreateBucket / ListBuckets / DeleteBucket / HeadBucket | yes |
-| GetBucketLocation | yes |
+| CreateBucket / ListBuckets / DeleteBucket / HeadBucket / GetBucketLocation | yes |
 | PutObject / GetObject / HeadObject / DeleteObject / DeleteObjects | yes |
-| ListObjects (v1) / ListObjectsV2 | yes |
-| ListObjectVersions (non-versioned stub, `VersionId=null`) | yes |
+| ListObjects (v1) / ListObjectsV2 / ListObjectVersions (non-versioned) | yes |
 | Multipart (Create / UploadPart / UploadPartCopy / Complete / Abort / ListParts / ListMultipartUploads) | yes |
-| GetObject Range (streaming, block-granular) | yes |
-| CopyObject (shallow — shares refcounted chunks) | yes |
-| Object tagging (Put/Get/Delete + header on Put/CreateMultipart) | yes |
-| Content-MD5 (`InvalidDigest` / `BadDigest`) / CRC32 on Put/UploadPart | yes |
-| User metadata (`x-amz-meta-*`) | yes |
-| Zero-byte objects (no backend upload) | yes |
-| Presigned URLs / ACL / bucket versioning | later |
+| GetObject Range (block-granular) | yes |
+| CopyObject (shares refcounted chunks) | yes |
+| Conditional writes (`If-Match`, `If-None-Match`) | yes |
+| Object tagging, user metadata, Content-MD5 / CRC32 checks | yes |
+| Presigned URLs / ACLs / versioning | no |
 
-## Tests / CI
+One access key pair, no ACLs: a single tenant.
 
-GitHub Actions (`.github/workflows/ci.yml`) runs `cargo test --workspace`, the
-dependency layering check, and four in-memory client suites: `compat-memory`
-(ceph/s3-tests known-good), `compat-s3s-boto3`, `compat-s3s-e2e`, and
-`compat-rclone`, and the simulation (`make sim`, `make sim-all`). None of
-them touch Telegram or Discord.
+## Development
 
-```bash
-cargo test --workspace         # or: make test
-make smoke                     # AWS CLI smoke against a running server
+A Cargo workspace under `crates/`, by role:
 
-make compat-memory             # ceph/s3-tests, curated (compat/known-good.txt)
-./scripts/compat-memory.sh --all
-make compat-s3s-boto3          # s3s upstream boto3 tests
-make compat-s3s-e2e            # s3s-e2e (Basic + Advanced)
-make compat-s3s-e2e ARGS='--filter ^Basic'
-make compat-rclone             # rclone S3 e2e (downloads pinned rclone)
-```
+| Crates | Role |
+|---|---|
+| `core/`: `types`, `codec`, `storage-api`, `limits` | shared types, block codecs, what a store implements (`BlobBackend`, `Chain`), rate limiters |
+| `meta/pigeonhole-meta` | the tablet: commands, states, the log, snapshots, openraft |
+| `net/`: `openraft-chat`, `openraft-grpc` | Raft transports: chat channels (standalone crate), gRPC, `Direct` in memory, per-pair `Mixed` |
+| `blob/`: `pigeonhole-blob`, `pigeonhole-chunk-store` | stores behind one face, replication; the chunk store, ingest, sweeper, repair |
+| `storage/` | Telegram (MTProto client + store), Discord (HTTP + store), disk, memory |
+| `gateway/` | S3 and REAPI |
+| `config/pigeonhole-config` | `pigeonhole.toml` into a `Config`, the dynamic config |
+| `admin/pigeonhole-admin` | the admin ops, shared by a real node and the demo |
+| `bin/pigeonhole` | the binary: wiring, HTTP, the Raft runtime, the CLI |
+| `web/pigeonhole-web` | the binary's stack for wasm (the demo) |
+| `testing/` | conformance suites, the simulation, fake channels |
 
-Deterministic simulation ([docs/simulation.md](docs/simulation.md)): the
-fault scenarios under madsim, one seed per run; CI runs 50 seeds.
-
-```bash
-make sim                                   # pigeonhole-sim under --cfg madsim
-MADSIM_TEST_NUM=50 MADSIM_TEST_CHECK_DETERMINISM=1 make sim
-MADSIM_TEST_SEED=1234 make sim             # replay a failing seed
-make sim-all                               # every library's tests in the simulator
-```
-
-Manual live suites (not in CI; they purge the store first — use a throwaway
-test channel and see the disclaimer). They read `TG_BOT_TOKEN`, `TG_API_ID`,
-`TG_API_HASH`, `TG_BLOBS_CHAT_ID` / `DISCORD_CHANNEL_ID` from `.env`. The
-Telegram one is slow: every small put is a message, ~20 a minute.
+Layering is enforced by `./scripts/check-deps.sh --strict`. How agents and
+people work in this repository (a worktree per task, checks, merging):
+[AGENTS.md](AGENTS.md).
 
 ```bash
-make compat-telegram
-make compat-discord
+make lint                # rustfmt --check, clippy -D warnings
+cargo test --workspace   # or: make test
+make sim                 # the simulation under madsim (docs/simulation.md)
+make web-smoke           # the wasm build, run under Node
+make lint-js test-js     # the site's JavaScript
+make cluster-smoke       # three processes as one cluster
+make compat-memory       # ceph/s3-tests, curated; also compat-s3s-boto3, compat-s3s-e2e, compat-rclone
+make compat-telegram     # live, against a throwaway channel (see the disclaimer)
 ```
 
-## Limitations / ops notes
-
-- **One active process per log.** A process booting on the same `[meta] log`
-  claims a newer generation and fences the running one, which exits. The
-  `local_disk` log fences only processes on the same host.
-- **Blobs are bot-bound.** A blob is a message id in a channel; another bot
-  admin of the same channel reads it, but the store's fingerprint includes the
-  bot id, so changing the bot is refused at startup (a moved store would need
-  a new id).
-- **Single tenant.** One access key pair, no ACLs.
-- HTTP uses tower timeouts, a concurrency limit and a header-count guard
-  (`[http]`). Backend/cache counters are logged periodically and, with
-  `[metrics] enabled = true`, exported for Prometheus.
+CI runs the format, lint (Rust and the site's JavaScript), layering and
+complexity checks, the workspace tests, the simulation (50 seeds) and the
+in-memory client suites; none of it touches Telegram or Discord. The site is published to GitHub Pages from
+`site/` ([site/README.md](site/README.md)).
 
 ## License
 
