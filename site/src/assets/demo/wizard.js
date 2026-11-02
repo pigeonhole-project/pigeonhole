@@ -15,7 +15,7 @@ const numbers = n => Array.from({length: n}, (_, i) => [i + 1, String(i + 1)]);
 
 export function makeWizard(panel, on) {
   const setup = {
-    ...{channels: ["telegram", "discord"], copies: 2, quorum: 2, log: "telegram", snapshots: "telegram", every: 50, bots: 1, pace: "demo"},
+    ...{channels: ["telegram", "discord"], copies: 2, quorum: 2, log: "telegram", snapshots: "telegram", every: 15, bots: 1, pace: "demo"},
     // A cluster: nodes 2 and 3's own log and snapshots (the third on its disk).
     ...{
       nodes: 1,
@@ -94,9 +94,31 @@ export function makeWizard(panel, on) {
     return t("wiz.mixed", {shards: n / setup.copies, copies: setup.copies});
   }
 
+  // The quick way: a cluster of three on two copies (a Telegram channel and
+  // a Discord one), every node talking over the chat (its outbox), each
+  // node's log and snapshots somewhere else; straight to the toml.
+  function quick() {
+    Object.assign(setup, {
+      channels: ["telegram", "discord"],
+      copies: 2,
+      quorum: 2,
+      log: "telegram",
+      snapshots: "telegram",
+      nodes: 3,
+      links: "chat",
+      others: [
+        {log: "discord", snapshots: "discord"},
+        {log: "local_disk", snapshots: "local_disk"},
+      ],
+    });
+    step = STEPS.length - 1;
+    edited = null;
+    render();
+  }
+
   const steps = {
     channels() {
-      const out = [h("p", "lede", t("wiz.channels_lede"))];
+      const out = [field(t("wiz.quick"), button("btn primary", t("wiz.quick_go"), quick), t("wiz.quick_note")), h("p", "lede", t("wiz.channels_lede"))];
       setup.channels.forEach((kind, i) => {
         const row = h("div", "chan-row"),
           name = t("wiz.channel_n", {n: i + 1});
@@ -142,7 +164,7 @@ export function makeWizard(panel, on) {
       const every = h("input", "num");
       Object.assign(every, {type: "number", min: 5, max: 1000, step: 5, value: setup.every});
       every.addEventListener("change", () => {
-        setup.every = Math.max(5, Math.min(1000, Math.round(+every.value) || 50));
+        setup.every = Math.max(5, Math.min(1000, Math.round(+every.value) || 15));
         every.value = setup.every;
       });
       return [

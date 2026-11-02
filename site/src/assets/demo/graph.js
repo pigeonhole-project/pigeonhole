@@ -39,8 +39,7 @@ const seeded = seed => () => {
 
 // onLoft(g, windows): the node on screen was drawn, its dovecote's
 // entrances are free to dress (the other nodes' are shuttered).
-// onRelayout(): the screen turned narrow or wide, or a block needs another
-// floor: draw again.
+// onRelayout(): the screen turned narrow or wide: draw again.
 export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   const reduced = reducedMotion();
   const narrow = matchMedia(NARROW);
@@ -61,8 +60,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     lift = 80;
   let lofts = new Map(); // node id (0: the one node) → its block and dovecote
   // A cluster as the page knows it: who leads, who is cut off, which node is on screen.
-  // `every`: the entries between two snapshots (the log's block has room for them).
-  let scene = {leader: null, cut: new Set(), shown: null, links: [], every: 0};
+  let scene = {leader: null, cut: new Set(), shown: null, links: []};
   // A node's block: node `id`'s, else the one on screen, else the only one.
   // The one node's dovecote is every flight's; a cluster's, by its id.
   const loftOf = id => (lofts.has(0) ? lofts.get(0) : (lofts.get(id ?? scene.shown) ?? lofts.get(scene.leader) ?? lofts.values().next().value));
@@ -93,7 +91,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.cols = at.cols;
     n.most = at.most;
     // A node's own two blocks come as tall as each other (its bridge lies on both).
-    n.floors = at.floors ?? floorsFor(contents(c).count, at.cols, at.most);
+    n.floors = at.floors ?? floorsFor(at.most);
     const b = tower(n.g, at.x, at.ground, at.w, n.floors, at.cols, {shade: c.role === "data" ? 1 : 3, deep: at.deep});
     n.slots = b.slots;
     n.win = svg("g", {}, n.g);
@@ -137,8 +135,6 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.shown = shown;
     n.older.textContent = skip ? `+${skip}` : "";
     n.count.textContent = String(n.c.total ?? count);
-    // Full to its last free floor: draw again with a floor more.
-    if (count + n.cols > n.floors * n.cols && n.floors < n.most) onRelayout();
   }
   // Where a window is, by its place among the shown.
   const windowAt = (n, i) => {
@@ -147,9 +143,9 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   };
 
   // You: a block whose windows are your objects, a pigeon on its roof.
-  function you(at, objects, parent) {
+  function you(at, parent) {
     const n = node({kind: "client"}, parent, "");
-    n.floors = floorsFor(objects, at.cols, at.most);
+    n.floors = floorsFor(at.most);
     n.at = at;
     const b = tower(n.g, at.x, at.ground, at.w, n.floors, at.cols, {shade: 2, deep: at.deep});
     n.slots = b.slots;
@@ -167,7 +163,6 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     client.g.setAttribute("aria-label", `${t("demo.you")}: ${t("demo.objects", {n: count})}`);
     client.win.replaceChildren();
     for (const [i, s] of client.slots.entries()) svg("rect", {class: i < count ? "pane lit" : "pane", x: s.x, y: s.y, width: s.w, height: s.h}, client.win);
-    if (count + client.at.cols > client.floors * client.at.cols && client.floors < client.at.most) onRelayout();
   }
 
   // The sky, and the town far off: wider and taller than the view, so that
@@ -200,7 +195,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     el.replaceChildren();
     const tallNow = narrow.matches;
     lastHeight = wideHeight();
-    const at = layout(channels, {tall: tallNow, height: lastHeight, every: scene.every});
+    const at = layout(channels, {tall: tallNow, height: lastHeight});
     lift = at.lift;
     viewWidth = at.width;
     el.classList.toggle("tall", tallNow);
@@ -213,7 +208,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
       town = svg("g", {}, el);
     pigeons.attach(svg("g", {}, el));
 
-    client = you(at.client, objects, town);
+    client = you(at.client, town);
     setObjects(objects);
 
     const onScreen = at.lofts.has(0) ? 0 : (scene.shown ?? scene.leader ?? [...at.lofts.keys()][0]);

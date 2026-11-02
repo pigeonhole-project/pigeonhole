@@ -77,6 +77,8 @@ thread_local! {
     /// The requests in flight: tasks of this thread (the nodes are `Rc`).
     static LOCAL: tokio::task::LocalSet = tokio::task::LocalSet::new();
     static CALLS: Cell<u32> = const { Cell::new(0) };
+    /// Whether [`ph_run`] started its far timer yet.
+    static FAR: Cell<bool> = const { Cell::new(false) };
     static WORLD: Arc<World> = Arc::new(World::default());
     static NODES: RefCell<Option<Rc<Nodes>>> = const { RefCell::new(None) };
     static CONFIG: RefCell<String> = RefCell::new(saved_config().unwrap_or_else(|| DEMO_CONFIG.to_string()));
@@ -164,6 +166,18 @@ pub extern "C" fn ph_call() -> i32 {
 #[allow(unsafe_code)] // `no_mangle` only: exported to JS, no unsafe code.
 #[no_mangle]
 pub extern "C" fn ph_run() -> i32 {
+    // A park with no timer at all would wait on a condvar, which a wasm
+    // without threads cannot (it aborts): one timer far off keeps every park
+    // a timed one, through the shim's poll_oneoff.
+    if !FAR.with(|f| f.replace(true)) {
+        LOCAL.with(|local| {
+            local.spawn_local(async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            })
+        });
+    }
     let clear = || YIELD.iter().for_each(|f| f.store(0, Ordering::SeqCst));
     clear();
     RUNNING.store(true, Ordering::SeqCst);

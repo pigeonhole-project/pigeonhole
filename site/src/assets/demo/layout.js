@@ -12,8 +12,7 @@
 import {FLOOR} from "./art.js";
 
 export const COL = 26; // a window's column
-const MIN_FLOORS = 6,
-  HEADROOM = 2; // a block's floors at least; empty floors over its last message
+const FLOORS = 8; // every block's: they do not grow; the newest messages show
 
 // What a channel's windows hold, oldest first: as many unnamed messages as
 // its total has beyond the ones it lists, then those.
@@ -22,8 +21,8 @@ export function contents(c) {
   const older = Math.max(0, (c.total ?? 0) - list.length);
   return {older, list, count: older + list.length};
 }
-// A block's floors for so many windows, `cols` to a floor (`least`: at least).
-export const floorsFor = (count, cols, most, least = 0) => Math.max(MIN_FLOORS, least, Math.min(most, Math.ceil(count / cols) + HEADROOM));
+// A block's floors: the same for every block, `most` at most (what the view has room for).
+export const floorsFor = most => Math.min(FLOORS, most);
 
 // The channels by what they are: the chunk stores, a node's own (its log
 // and snapshots: the one node's, or node `id`'s), the Raft outboxes.
@@ -43,22 +42,16 @@ function row(at, channels, x, each, gap, lo, hi, place) {
   }
   return x - gap;
 }
-// The floors the tallest of these channels needs, `cols` to a floor.
-const floorsOf = (channels, cols, most) => Math.max(MIN_FLOORS, ...channels.map(c => floorsFor(contents(c).count, cols, most)));
-
-// A node's own two blocks side by side from `x`, as tall as each other
-// (the bridge lies on both): the log's room for the entries between two
-// snapshots (`every`: one post each, at most), or for what they hold now.
+// A node's own two blocks side by side from `x` (the bridge lies on both).
 // `cols(c)`: a block's columns; `fit`: its room as wide as its name needs.
 // Returns its loft.
-function pair(at, own, x, {cols = () => 2, fit = false, gap, size, every, ground, most, deep, scale}) {
+function pair(at, own, x, {cols = () => 2, fit = false, gap, size, ground, most, deep, scale}) {
   const width = c => cols(c) * COL;
   const slot = c => (fit ? Math.max(width(c) + 6, c.store.length * size * 0.62 + size * 2.6 + 6) : width(c));
-  const need = c => floorsFor(contents(c).count, width(c) / COL, most, c.role === "log" && every ? Math.min(most, Math.ceil(every / (width(c) / COL)) + 1) : 0);
-  // As tall as they need, and low enough for the dovecote over them to show
-  // (a trial on ground 0 has no such bound).
+  // Low enough for the dovecote over them to show (a trial on ground 0 has
+  // no such bound).
   const room = ground > 0 ? Math.floor((ground - 12 - size - 44 - 175 * scale - 16) / FLOOR) : Infinity;
-  const floors = Math.max(MIN_FLOORS, Math.min(room, Math.max(...own.map(need), 0)));
+  const floors = Math.max(1, Math.min(room, floorsFor(most)));
   const x0 = x;
   for (const c of own) {
     const each = slot(c);
@@ -88,12 +81,12 @@ const groundFor = (trial, own, least) => {
 
 // Wide: one street, the view as tall as the screen's shape asks; you, the
 // node on its log and snapshots, then the data channels…
-function wide(channels, height, every) {
+function wide(channels, height) {
   const data = dataOf(channels);
   const ground = height - 6,
     most = Math.floor((ground - 12 - 70 - height * 0.12) / FLOOR);
   const at = new Map();
-  const loft = pair(at, ownOf(channels), 150, {cols: () => 3, fit: true, gap: 10, size: 15, every, ground, most, deep: 2000, scale: 0.8});
+  const loft = pair(at, ownOf(channels), 150, {cols: () => 3, fit: true, gap: 10, size: 15, ground, most, deep: 2000, scale: 0.8});
   const x = loft.x + loft.w + 50,
     gap = 14;
   row(at, data, x, (1180 - x - (data.length - 1) * gap) / Math.max(1, data.length), gap, 2, 6, {ground, most, deep: 2000});
@@ -102,20 +95,15 @@ function wide(channels, height, every) {
 
 // …or two streets top to bottom, for a phone: you and the node on the
 // first, the data channels on the one in front of it.
-function tall(channels, every) {
+function tall(channels) {
   const data = dataOf(channels);
   const most = 12;
   const at = new Map();
-  const first = groundFor(
-    own => pair(at, own, 90, {cols: () => 2, fit: true, gap: 8, size: 11, every, ground: 0, most, deep: 0, scale: 0.55}),
-    ownOf(channels),
-    400,
-  );
-  const loft = pair(at, ownOf(channels), 90, {cols: () => 2, fit: true, gap: 8, size: 11, every, ground: first, most, deep: 0, scale: 0.55});
+  const first = groundFor(own => pair(at, own, 90, {cols: () => 2, fit: true, gap: 8, size: 11, ground: 0, most, deep: 0, scale: 0.55}), ownOf(channels), 400);
+  const loft = pair(at, ownOf(channels), 90, {cols: () => 2, fit: true, gap: 8, size: 11, ground: first, most, deep: 0, scale: 0.55});
   const gap = 10,
     each = (388 - (data.length - 1) * gap) / Math.max(1, data.length);
-  const cols = Math.max(2, Math.min(8, Math.floor(each / COL)));
-  const second = first + 70 + floorsOf(data, cols, most) * FLOOR + 12;
+  const second = first + 70 + floorsFor(most) * FLOOR + 12;
   row(at, data, 6, each, gap, 2, 8, {ground: second, most, deep: 2000});
   return {width: 400, height: second + 8, client: {x: 6, w: 2 * COL, cols: 2, ground: first, most, deep: 0}, lofts: new Map([[0, loft]]), stores: at, lift: 40};
 }
@@ -133,7 +121,7 @@ function thin(at, channels, x, gap, place) {
 
 // A cluster, wide: you; each node on its log and snapshots; the outboxes;
 // the data channels. Wider than one node's town.
-function wideCluster(channels, nodes, height, every) {
+function wideCluster(channels, nodes, height) {
   const data = dataOf(channels);
   const ground = height - 6,
     most = Math.floor((ground - 12 - 70 - height * 0.12) / FLOOR);
@@ -142,7 +130,7 @@ function wideCluster(channels, nodes, height, every) {
     place = {ground, most, deep: 2000};
   let x = 140;
   for (const id of nodes) {
-    const loft = pair(at, ownOf(channels, id), x, {fit: true, gap: 4, size: 10, every, ...place, scale: 0.55});
+    const loft = pair(at, ownOf(channels, id), x, {fit: true, gap: 4, size: 10, ...place, scale: 0.55});
     lofts.set(id, loft);
     x = loft.x + loft.w + 30;
   }
@@ -155,12 +143,12 @@ function wideCluster(channels, nodes, height, every) {
 
 // A cluster on a phone: two streets, back to front: the nodes on their
 // logs and snapshots; you, the outboxes and the data channels.
-function tallCluster(channels, nodes, every) {
+function tallCluster(channels, nodes) {
   const front = [...outboxesOf(channels), ...dataOf(channels)];
   const most = 12;
   const at = new Map(),
     lofts = new Map();
-  const place = ground => ({fit: true, gap: 2, size: 6, every, ground, most, deep: 0, scale: 0.32});
+  const place = ground => ({fit: true, gap: 2, size: 6, ground, most, deep: 0, scale: 0.32});
   const first = Math.max(...nodes.map(id => groundFor(own => pair(at, own, 0, place(0)), ownOf(channels, id), 330)));
   let x = 6;
   for (const id of nodes) {
@@ -168,17 +156,15 @@ function tallCluster(channels, nodes, every) {
     lofts.set(id, loft);
     x = loft.x + loft.w + 10;
   }
-  const each = (388 - 60 - (front.length - 1) * 8) / Math.max(1, front.length),
-    cols = Math.max(1, Math.min(6, Math.floor(each / COL)));
-  const second = first + 60 + floorsOf(front, cols, most) * FLOOR;
+  const each = (388 - 60 - (front.length - 1) * 8) / Math.max(1, front.length);
+  const second = first + 60 + floorsFor(most) * FLOOR;
   row(at, front, 66, each, 8, 1, 6, {ground: second, most, deep: 2000, size: 8});
   return {width: 400, height: second + 8, client: {x: 6, w: 2 * COL, cols: 2, ground: second, most, deep: 2000}, lofts, stores: at, lift: 40};
 }
 
-// The town for these channels: one node's or a cluster's, wide or tall;
-// `every`: the entries between two snapshots.
-export function layout(channels, {tall: tallNow, height, every = 0}) {
+// The town for these channels: one node's or a cluster's, wide or tall.
+export function layout(channels, {tall: tallNow, height}) {
   const nodes = nodesOf(channels);
-  if (nodes.length) return tallNow ? tallCluster(channels, nodes, every) : wideCluster(channels, nodes, height, every);
-  return tallNow ? tall(channels, every) : wide(channels, height, every);
+  if (nodes.length) return tallNow ? tallCluster(channels, nodes) : wideCluster(channels, nodes, height);
+  return tallNow ? tall(channels) : wide(channels, height);
 }

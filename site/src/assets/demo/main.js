@@ -89,14 +89,12 @@ const graph = makeGraph($("graph"), {
 });
 // The cluster as the graph draws it: who leads, who is cut off, which node is on screen.
 let drawnLeader = null,
-  drawnLinks = 0, // the cluster drawn last
-  drawnEvery = 0; // the snapshots' entries the log's block was drawn for
+  drawnLinks = 0; // the cluster drawn last
 const scene = () => ({
   leader: state.cluster?.leader ?? null,
   cut: state.cut,
   shown: shown(),
   links: state.cluster?.links || [],
-  every: state.bg?.snapshot?.every ?? 0,
 });
 // A mention anywhere (entities.js) marks its thing on the graph (the
 // cluster: its chip) and opens its panel.
@@ -113,7 +111,6 @@ setLinks({
 function redraw() {
   drawnLeader = state.cluster?.leader ?? null;
   drawnLinks = state.cluster?.links?.length ?? 0;
-  drawnEvery = state.bg?.snapshot?.every ?? 0;
   graph.draw(state.channels, state.objects.length, scene());
   graph.markOpen(nodeOf(state.open));
   renderBackground();
@@ -296,8 +293,6 @@ async function pollBackground() {
   if (!ok(reply)) return;
   state.bg = reply;
   await pollBudgets();
-  // The log's block is as tall as the entries between two snapshots need.
-  if (graph.drawn() && !state.wizard && (reply.snapshot?.every ?? 0) !== drawnEvery) redraw();
   renderBackground();
   if (state.nodes.length > 1) await pollCluster();
 }
