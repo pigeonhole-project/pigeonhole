@@ -351,8 +351,10 @@ async function toggleTask(task, on) {
 }
 
 async function runTask(task) {
-  await call({op: "run_task", task});
-  say(["bg.asked", {task: t(`bg.${task}`)}]);
+  const {reply} = await call({op: "run_task", task});
+  if (reply?.error) sayError(reply.error);
+  else say(["bg.asked", {task: t(`bg.${task}`)}]);
+  await pollBackground();
 }
 
 // ------------------------------------------------------------ panels
