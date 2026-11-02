@@ -63,8 +63,8 @@ mod on {
         }))
     }
 
-    pub fn view(stores: &[StoreRef]) -> Option<Arc<dyn Channels>> {
-        Some(Arc::new(FakeView::new(WORLD.clone(), stores)))
+    pub fn view(stores: &[StoreRef], key: Option<[u8; 32]>) -> Option<Arc<dyn Channels>> {
+        Some(Arc::new(FakeView::new(WORLD.clone(), stores, key)))
     }
 }
 
@@ -88,7 +88,7 @@ mod on {
         Err(refused(&format!("store {:?}", inst.info.id)))
     }
 
-    pub fn view(_stores: &[StoreRef]) -> Option<Arc<dyn Channels>> {
+    pub fn view(_stores: &[StoreRef], _key: Option<[u8; 32]>) -> Option<Arc<dyn Channels>> {
         None
     }
 }

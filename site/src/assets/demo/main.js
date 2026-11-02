@@ -7,6 +7,7 @@ import {bytes, t, tHtml} from "../lib/i18n.js";
 import {s3Sentence} from "../lib/say.js";
 import {appOf} from "./channels.js";
 import {chatView} from "./chat/index.js";
+import {forgetPlaces} from "./chat/scroll.js";
 import {clientView} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {readEvents} from "./events.js";
@@ -135,11 +136,13 @@ function apply(events) {
     } else if (e.type === "raft") {
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
       said.push(...raft.frame(e, performance.now()));
-      // Over the chat, a frame is a post in the sender's outbox.
-      const box = e.via === "chat" && e.at === "sent" && channel(`outbox-${e.from}`);
+    } else if (e.type === "frame") {
+      // A post in the sender's outbox: responses too, many envelopes in one.
+      const box = channel(`outbox-${e.from}`);
       if (box) {
         box.total = (box.total ?? 0) + 1;
         graph.setTotal(box.store);
+        if (panelShows(box.store)) outboxChanged();
       }
     } else if (e.type === "repair_pass" && e.repaired > 0) {
       said.push(["say.repair_pass", {n: e.repaired}]);
@@ -151,6 +154,19 @@ function apply(events) {
     }
   }
   return said;
+}
+
+// An open outbox's frames are read from the node: its posts are not
+// logged one by one. Read a second after a frame, one read at a time.
+let outboxReading = false;
+function outboxChanged() {
+  if (outboxReading) return;
+  outboxReading = true;
+  setTimeout(async () => {
+    await loadChannels();
+    outboxReading = false;
+    renderPanel();
+  }, 1000);
 }
 
 // A pigeon landed on a channel.
@@ -429,10 +445,12 @@ async function openPanel(target) {
   if (log?.node != null && log.node !== shown()) await pickNode(log.node);
   if (log) target = {kind: "log"};
   state.open = target;
+  forgetPlaces();
   $("loft").classList.add("zoomed");
   $("panel").hidden = false;
   graph.markOpen(nodeOf(target));
   if (target.kind === "log") loadLog();
+  if (target.kind === "store" && channel(target.store)?.role === "outbox") outboxChanged();
   renderPanel();
   $("panel-close").focus();
 }

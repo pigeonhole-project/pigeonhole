@@ -13,6 +13,8 @@
 //   {type: "raft", from, to, via, kind, at}                    a Raft request between nodes:
 //       via "grpc" (direct), or "chat" through the sender's outbox; `at`
 //       "sent" (into the outbox, over the chat) or "read" (out of it)
+//   {type: "frame", from, envelopes}                           a post in node `from`'s outbox:
+//       one per tick, its requests and its responses together
 //
 // The fake channels' own tablets (span fake_channel) are not the node's: left out.
 export function readEvents(lines) {
@@ -46,6 +48,8 @@ export function readEvents(lines) {
       out.push({type: "lease_wait", ms: +f.wait_ms});
     } else if (msg === "claimed the metadata log") {
       out.push({type: "claimed", generation: f.generation});
+    } else if (msg === "posted a frame") {
+      out.push({type: "frame", from: +f.node, envelopes: +f.envelopes});
     } else if (msg === "raft frame sent" && f.reply === false) {
       out.push({type: "raft", from: +f.node, to: +f.to, via: f.via, kind: f.kind, at: "sent"});
     } else if (msg === "raft vote answered") {

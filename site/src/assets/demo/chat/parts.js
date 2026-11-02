@@ -21,6 +21,34 @@ export function chatStart(chat, model, cls) {
 // The node's notes on a post (what it is to the log, an owner marker).
 export const notes = m => m.notes.map(n => h("div", "post-log", n));
 
+// The posts opened (`store/id`): open again when the chat is drawn anew.
+const opened = new Set();
+
+// An outbox's post: the frame it holds, a line per envelope, and every
+// field behind a click on the post. `key`: the post's, `store/id`.
+export function frameNotes(post, frame, key) {
+  if (!frame) return [];
+  const out = [frame.head && h("div", "post-log", frame.head), ...frame.lines.map(l => h("div", "post-log frame-line", l))].filter(Boolean);
+  if (!frame.fields.length) return out;
+  const more = h("details", "frame-fields");
+  more.open = opened.has(key);
+  more.addEventListener("toggle", () => (more.open ? opened.add(key) : opened.delete(key)));
+  more.append(h("summary", "", t("frame.fields")));
+  for (const fields of frame.fields) {
+    const table = h("dl");
+    for (const [k, v] of fields) table.append(h("dt", "", k), h("dd", "", Array.isArray(v) ? v.join("–") : String(v)));
+    more.append(table);
+  }
+  // The whole post opens it, not its summary alone.
+  post.classList.add("openable");
+  post.addEventListener("click", e => {
+    if (e.target.closest("summary, dl")) return;
+    more.open = !more.open;
+  });
+  out.push(more);
+  return out;
+}
+
 // A message anyone could delete, as in the app: a trash button on hover or
 // focus, and the context menu (right click).
 export function deletable(el, onDelete) {
@@ -33,13 +61,6 @@ export function deletable(el, onDelete) {
   el.addEventListener("contextmenu", e => {
     e.preventDefault();
     onDelete();
-  });
-}
-
-// The chat scrolled to its newest post once it is on the page.
-export function scrolledDown(chat) {
-  requestAnimationFrame(() => {
-    chat.scrollTop = chat.scrollHeight;
   });
 }
 

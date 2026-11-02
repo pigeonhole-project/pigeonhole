@@ -2,12 +2,13 @@
 
 import {h, icon} from "../../lib/dom.js";
 import {bytes, t} from "../../lib/i18n.js";
-import {chatStart, deletable, flags, hhmm, ICON_DOC, ICON_PIN, notes, scrolledDown} from "./parts.js";
+import {chatStart, deletable, flags, hhmm, ICON_DOC, ICON_PIN, notes} from "./parts.js";
+import {scrolled} from "./scroll.js";
 
 // Discord runs one author's messages together within a few minutes.
 const GROUP_MS = 7 * 60 * 1000;
 
-export function discordView(c, model, onDelete) {
+export function discordView(c, model, onDelete, follow) {
   const head = h("div", "dc-head");
   head.append(h("span", "dc-hash", "#"), h("b", "", c.store), h("span", "dc-topic", t(`demo.dc_topic_${c.role}`)));
   if (model.pins) {
@@ -27,13 +28,16 @@ export function discordView(c, model, onDelete) {
   }
 
   const app = h("div", "app dc");
-  app.append(head, chat, h("div", "dc-input", t("demo.dc_message", {store: c.store})));
-  scrolledDown(chat);
+  const box = h("div", "chat-box");
+  box.append(chat);
+  app.append(head, box, h("div", "dc-input", t("demo.dc_message", {store: c.store})));
+  scrolled(chat, box, follow ? null : c.store, "dc");
   return app;
 }
 
 function message(m, grouped, onDelete) {
   const row = h("div", `dc-msg${grouped ? " grouped" : ""}${flags(m)}`);
+  row.dataset.id = m.id;
   if (grouped) {
     if (m.at) row.append(h("span", "dc-gutter-time", hhmm(m.at)));
   } else {
