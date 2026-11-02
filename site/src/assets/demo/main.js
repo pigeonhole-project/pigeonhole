@@ -196,7 +196,7 @@ async function op(request, body) {
 
 function setBusy(on) {
   state.busy = on;
-  for (const b of document.querySelectorAll(".panel button, .panel input")) if (!b.classList.contains("back") && !("locked" in b.dataset)) b.disabled = on;
+  for (const b of document.querySelectorAll(".panel button, .panel input")) if (!b.classList.contains("back")) b.disabled = on;
 }
 
 async function refreshObjects() {
@@ -327,6 +327,15 @@ function renderBackground() {
 // On: back to the file's period (or a default when the file has it off);
 // off: an override of "off". Both are entries in the log, as on a server.
 async function toggleTask(task, on) {
+  // In a cluster a node's snapshots are its own key, set (as every change of
+  // the dynamic config: an entry in the log) through the leader.
+  if (task === "snapshot" && state.nodes.length > 1) {
+    const key = `node.${shown()}.snapshot_every`;
+    const r = await call({op: "dynamic_set", key, value: on ? TASK_ON.snapshot : "off", node: state.cluster?.leader ?? undefined});
+    if (r.reply?.error) sayError(r.reply.error);
+    else say([on ? "bg.turned_on" : "bg.turned_off", {task: t("bg.snapshot"), key}]);
+    return pollBackground();
+  }
   const key = TASK_KEY[task];
   let r;
   if (!on) r = await call({op: "dynamic_set", key, value: "off"});

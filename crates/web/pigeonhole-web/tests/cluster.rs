@@ -85,6 +85,8 @@ async fn three_nodes_in_one_process_elect_write_and_fail_over() {
     let set = r#"{"op":"dynamic_set","key":"repair.interval","value":"off"}"#;
     assert!(op(&nodes, Some(follower), set).await.is_err());
     assert!(op(&nodes, Some(follower), r#"{"op":"run_task","task":"repair"}"#).await.is_err());
+    // A snapshot is each node's own: a follower takes one when asked.
+    op(&nodes, Some(follower), r#"{"op":"run_task","task":"snapshot"}"#).await.unwrap();
     op(&nodes, Some(first), set).await.unwrap();
     // The cluster as each node sees it: the leader, and its own log by its id.
     let view = op(&nodes, Some(follower), r#"{"op":"cluster"}"#).await.unwrap();

@@ -225,7 +225,7 @@
   "js.nodes.role_follower": "follower",
   "js.nodes.role_cut": "cut off",
   "js.nodes.loft_sub": "A node of the cluster: S3 in front, its copy of the metadata tablet (its own log and snapshots), the chunk store; only the leader writes.",
-  "js.nodes.tasks_leader": "Only the leader runs the background tasks and changes their settings (entries in the log): do it on node {n}.",
+  "js.nodes.tasks_leader": "Repair, the sweeper and the cooler run on the leader only (node {n}); this node takes its own snapshots. Their settings are entries in the log: the leader writes them.",
   "js.nodes.loft_title": "pigeonhole · node {n}",
   "js.nodes.looking": "You look at <b>node {n}</b> now: its log, its channels, and your requests go to it.",
   "js.nodes.following": "You follow the leader: your requests go to whichever node leads (★).",

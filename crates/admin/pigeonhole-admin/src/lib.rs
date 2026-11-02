@@ -108,17 +108,16 @@ impl Request {
             "buckets" => "GET /".to_string(),
             "verify" | "repair" => format!("{} (the chunk store)", self.op),
             "dynamic_set" | "dynamic_unset" => format!("{} {} (the dynamic config)", self.op, self.key),
-            "run_task" => format!("run_task {} (a background task)", self.task),
+            // A snapshot is every node's own; the other tasks are the leader's work.
+            "run_task" if self.task != "snapshot" => format!("run_task {} (a background task)", self.task),
             _ => return None,
         })
     }
 
     /// Whether it writes to the tablet: a read-only leader turns it away.
     fn writes(&self) -> bool {
-        matches!(
-            self.op.as_str(),
-            "put" | "copy" | "delete" | "verify" | "repair" | "dynamic_set" | "dynamic_unset" | "run_task"
-        )
+        matches!(self.op.as_str(), "put" | "copy" | "delete" | "verify" | "repair" | "dynamic_set" | "dynamic_unset")
+            || (self.op == "run_task" && self.task != "snapshot")
     }
 }
 

@@ -185,20 +185,19 @@ const tip = (() => {
 
 // ---- the loft's panel: a card per task in `box`, updated in place (a
 // poll keeps the focus where it was). onToggle(name, on), onRun(name);
-// `readOnly`: why they cannot be changed here (a follower's: the leader's
-// are), shown above them; there the leader's own tasks do not run at all.
-// Returns update(bg).
-export function taskCards(box, {onToggle, onRun, readOnly = null}) {
-  const cards = TASKS.map(name => taskCard(name, onToggle, onRun, !!readOnly));
-  box.replaceChildren(...(readOnly ? [h("p", "field-note tasks-ro", readOnly)] : []), ...cards.map(c => c.el));
+// `follower`: why the leader's tasks are not here (a follower runs none of
+// them), shown above; its snapshots are its own. Returns update(bg).
+export function taskCards(box, {onToggle, onRun, follower = null}) {
+  const cards = TASKS.map(name => taskCard(name, onToggle, onRun, !!follower));
+  box.replaceChildren(...(follower ? [h("p", "field-note tasks-ro", follower)] : []), ...cards.map(c => c.el));
   return bg => {
     for (const c of cards) c.update(describe(bg, c.name));
   };
 }
 
-function taskCard(name, onToggle, onRun, readOnly) {
+function taskCard(name, onToggle, onRun, follower) {
   // A follower's view of a task only the leader runs: no clock, no queue.
-  const away = readOnly && LEADER_TASKS.has(name);
+  const away = follower && LEADER_TASKS.has(name);
   const el = h("div", "task");
   el.id = `task-${name}`;
   let on = false;
@@ -206,9 +205,6 @@ function taskCard(name, onToggle, onRun, readOnly) {
   sw.setAttribute("role", "switch");
   sw.setAttribute("aria-label", t("bg.on_off", {task: t(`bg.${name}`)}));
   const run = button("mini", t("bg.run_now"), () => onRun(name));
-  sw.disabled = run.disabled = readOnly;
-  // Kept so while the page waits on an op and after (main.js setBusy).
-  if (readOnly) sw.dataset.locked = run.dataset.locked = "";
   // Not this node's task at all: nothing to switch or run here.
   sw.hidden = run.hidden = away;
   const every = h("span", "task-every");
