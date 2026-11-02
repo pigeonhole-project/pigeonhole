@@ -10,6 +10,7 @@ import {chatView} from "./chat/index.js";
 import {clientView} from "./client-view.js";
 import {readEvents} from "./events.js";
 import {faultsView} from "./faults-view.js";
+import {flightsOf, refused} from "./flights.js";
 import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
@@ -68,11 +69,19 @@ const graph = makeGraph($("graph"), {
 });
 // The cluster as the graph draws it: who leads, who is cut off, which node is on screen.
 let drawnLeader = null,
-  drawnLinks = 0; // the cluster drawn last
-const scene = () => ({leader: state.cluster?.leader ?? null, cut: state.cut, shown: shown(), links: state.cluster?.links || []});
+  drawnLinks = 0, // the cluster drawn last
+  drawnEvery = 0; // the snapshots' entries the log's block was drawn for
+const scene = () => ({
+  leader: state.cluster?.leader ?? null,
+  cut: state.cut,
+  shown: shown(),
+  links: state.cluster?.links || [],
+  every: state.bg?.snapshot?.every ?? 0,
+});
 function redraw() {
   drawnLeader = state.cluster?.leader ?? null;
   drawnLinks = state.cluster?.links?.length ?? 0;
+  drawnEvery = state.bg?.snapshot?.every ?? 0;
   graph.draw(state.channels, state.objects.length, scene());
   graph.markOpen(nodeOf(state.open));
   renderBackground();
@@ -91,6 +100,8 @@ const status = text => {
 // ------------------------------------------------------------ events
 // What the node logged: pigeons to fly, posts and deletions in the channels.
 // Returns what it said, as sentences, newest last.
+// Whose traffic is whose (flights.js): the leader as last seen, the node on screen.
+const flightCtx = () => ({leader: state.cluster?.leader ?? null, shown: shown()});
 function apply(events) {
   const said = [];
   for (const e of events) {
@@ -101,18 +112,16 @@ function apply(events) {
       c.total++;
       const snap = c.role === "snapshots" && /-(\d+)\.snap/.exec(m.name || "");
       if (snap) said.push(["say.snapshot", {at: +snap[1]}]);
-      graph.fly(c.store, {size: m.size}).then(() => landed(c.store));
+      for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f).then(() => landed(c.store));
     } else if (e.type === "deleted" && c) {
       for (const m of c.messages) if (e.ids.includes(String(m.id))) m.gone = true;
       c.total = Math.max(0, c.total - e.ids.length);
       graph.setTotal(c.store, c.total);
       if (panelShows(c.store)) renderPanel();
-    } else if (e.type === "call" && c && (e.op === "get" || e.op === "exists")) {
-      graph.fly(c.store, {back: true, size: e.op === "get" ? e.bytes || 4096 : 512});
-    } else if (e.type === "call_failed" && c) {
-      graph.fly(c.store, {size: 2048, failed: true});
+    } else if (e.type === "call" || e.type === "call_failed") {
+      for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
     } else if (e.type === "raft") {
-      graph.flyRaft(e);
+      for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
       // Over the chat, a frame is a post in the sender's outbox.
       const box = e.via === "chat" && e.at === "sent" && channel(`outbox-${e.from}`);
       if (box) {
@@ -165,7 +174,7 @@ async function op(request, body) {
   const said = apply(readEvents(events));
   if (reply?.error?.startsWith("not the leader")) {
     // You knocked on a follower: your pigeon turns back at its door.
-    graph.fly("", {failed: true});
+    graph.fly(refused(shown()));
     say(["say.not_leader", {n: shown(), error: reply.error}]);
   } else if (reply?.error && state.channels.some(c => c.down)) say([request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: reply.error}]);
   else if (reply?.error) sayError(reply.error);
@@ -228,6 +237,8 @@ async function pollBackground() {
   const {reply} = await call({op: "background"});
   if (!ok(reply)) return;
   state.bg = reply;
+  // The log's block is as tall as the entries between two snapshots need.
+  if (graph.drawn() && !state.wizard && (reply.snapshot?.every ?? 0) !== drawnEvery) redraw();
   renderBackground();
   if (state.nodes.length > 1) await pollCluster();
 }
