@@ -33,7 +33,7 @@ command -v uv >/dev/null || { echo "missing dependency: uv (brew install uv)" >&
 before() {
   case "$1" in
     telegram)
-      TG_BENCH=mark cargo test -q -p pigeonhole-storage-telegram --test live bench_window -- --ignored --nocapture \
+      TG_BENCH=mark cargo test -q -p pigeonhole-telegram-mtproto --test live bench_window -- --ignored --nocapture \
         | grep -E "from|test result" ;;
   esac
 }
@@ -44,7 +44,7 @@ after() {
       cargo test -q -p pigeonhole-storage-discord --test live empty_test_channels -- --ignored --nocapture --test-threads 1 \
         | grep -E "emptied|test result" ;;
     telegram)
-      TG_BENCH=clean cargo test -q -p pigeonhole-storage-telegram --test live bench_window -- --ignored --nocapture \
+      TG_BENCH=clean cargo test -q -p pigeonhole-telegram-mtproto --test live bench_window -- --ignored --nocapture \
         | grep -E "deleted|test result" ;;
   esac
 }
