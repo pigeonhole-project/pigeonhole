@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {beforeEach, test} from "node:test";
 import {chatModel} from "../src/assets/demo/chat/model.js";
 import {readEvents} from "../src/assets/demo/events.js";
+import {flightsOf, ownerOf} from "../src/assets/demo/flights.js";
 import {summary} from "../src/assets/demo/log-view.js";
 import {describe, ms} from "../src/assets/demo/tasks.js";
 import {divisors, sketch, tomlOf} from "../src/assets/demo/toml.js";
@@ -228,4 +229,20 @@ test("chatModel: the log's own posts are quiet; nothing to delete outside data c
 test("summary: a command's verb and what it touched", () => {
   assert.deepEqual(summary({namespace: "s3", command: {PutObject: {bucket: "b", key: "k", size: 2048}}}), {verb: "PutObject", fields: "b/k, 2.0 KiB"});
   assert.deepEqual(summary({namespace: "chunk", command: {AddReplica: {chunk_id: 3, replica: {}}}}), {verb: "AddReplica", fields: "demo.chunk_n"});
+});
+
+test("flightsOf: a node's own channel is its; a data channel the leader's; Raft by its frame", () => {
+  const channels = {"tg-log-2": {store: "tg-log-2", node: 2}, "tg-1": {store: "tg-1", node: null}, "outbox-3": {store: "outbox-3", node: 3}};
+  const channel = s => channels[s];
+  const ctx = {leader: 1, shown: 2};
+  assert.deepEqual(flightsOf({type: "posted", store: "tg-log-2", bytes: 300}, channel, ctx), [
+    {from: {node: 2}, to: {store: "tg-log-2", at: "new"}, size: 300},
+  ]);
+  assert.deepEqual(flightsOf({type: "call", store: "tg-1", op: "get", bytes: 9}, channel, ctx)[0].to, {node: 1}, "the leader reads the data");
+  assert.equal(flightsOf({type: "call_failed", store: "tg-1"}, channel, ctx)[0].failed, true);
+  assert.deepEqual(flightsOf({type: "posted", store: "nope"}, channel, ctx), [], "a channel not drawn: nothing flies");
+  const read = flightsOf({type: "raft", from: 3, to: 1, via: "chat", kind: "append", at: "read"}, channel, ctx)[0];
+  assert.deepEqual([read.from, read.to, read.traffic], [{store: "outbox-3", at: "new"}, {node: 1}, "raft"]);
+  assert.equal(flightsOf({type: "raft", from: 1, to: 2, via: "grpc", kind: "heartbeat", at: "sent"}, channel, ctx)[0].spark, true);
+  assert.equal(ownerOf({node: null}, {leader: null, shown: 3}), 3, "no leader known: the node on screen");
 });

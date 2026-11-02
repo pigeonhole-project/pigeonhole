@@ -17,6 +17,7 @@ import {activate, reducedMotion, svg} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
 import {beat, birdDefs, block, boarded, dovecote, flag, flying, glide, perched, roofLetters, tower} from "./art.js";
 import {appOf, placeNote} from "./channels.js";
+import {ownerOf} from "./flights.js";
 import {contents, floorsFor, layout} from "./layout.js";
 
 const QUEUE_SHOWN = 12; // repair jobs drawn over a block; the rest as "+n"
@@ -61,12 +62,13 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     lift = 80;
   let lofts = new Map(); // node id (0: the one node) → its block and dovecote
   // A cluster as the page knows it: who leads, who is cut off, which node is on screen.
-  let scene = {leader: null, cut: new Set(), shown: null, links: []};
+  // `every`: the entries between two snapshots (the log's block has room for them).
+  let scene = {leader: null, cut: new Set(), shown: null, links: [], every: 0};
   // A node's block: node `id`'s, else the one on screen, else the only one.
-  const loftOf = id => lofts.get(id ?? scene.shown) ?? lofts.get(scene.leader) ?? lofts.values().next().value;
-  // Where a channel's pigeons leave from: its own node's dovecote; a data
-  // channel's, the leader's (it does all the writing).
-  const homeOf = c => loftOf(c?.node ?? scene.leader);
+  // The one node's dovecote is every flight's; a cluster's, by its id.
+  const loftOf = id => (lofts.has(0) ? lofts.get(0) : (lofts.get(id ?? scene.shown) ?? lofts.get(scene.leader) ?? lofts.values().next().value));
+  // The dovecote a channel's way leads from (flights.js: whose traffic it is).
+  const homeOf = c => loftOf(ownerOf(c, scene));
   let cards = new Map(); // store id → its block
   let edges = new Map(); // store id → the way to its block; "" → the client's
 
@@ -90,7 +92,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.c = c;
     n.cols = at.cols;
     n.most = at.most;
-    n.floors = floorsFor(contents(c).count, at.cols, at.most);
+    n.floors = floorsFor(contents(c).count, at.cols, at.most, at.floors);
     const b = tower(n.g, at.x, at.ground, at.w, n.floors, at.cols, {shade: c.role === "data" ? 1 : 3, deep: at.deep});
     n.slots = b.slots;
     n.win = svg("g", {}, n.g);
@@ -193,7 +195,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     el.replaceChildren();
     const tallNow = narrow.matches;
     lastHeight = wideHeight();
-    const at = layout(channels, {tall: tallNow, height: lastHeight});
+    const at = layout(channels, {tall: tallNow, height: lastHeight, every: scene.every});
     lift = at.lift;
     viewWidth = at.width;
     el.classList.toggle("tall", tallNow);
@@ -210,8 +212,9 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     setObjects(objects);
 
     const onScreen = at.lofts.has(0) ? 0 : (scene.shown ?? scene.leader ?? [...at.lofts.keys()][0]);
-    lofts = new Map([...at.lofts].map(([id, L]) => [id, loftBlock(id, L, town, rnd, id === onScreen)]));
+    // The blocks first: a node's bridge lies on its own two.
     cards = new Map(channels.map(c => [c.store, card(c, at.stores.get(c.store), town)]));
+    lofts = new Map([...at.lofts].map(([id, L]) => [id, loftBlock(id, L, town, rnd, id === onScreen)]));
 
     // The ways: you to the node you talk to, each node to its own channels,
     // the leader to the data channels; between nodes with a direct link, theirs.
@@ -237,23 +240,27 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     const name = cluster ? t("nodes.node", {n: id}) : "pigeonhole";
     const n = node(cluster ? {kind: "loft", node: id} : {kind: "loft"}, parent, `${name}: ${role}`);
     n.g.classList.toggle("cut", scene.cut.has(id));
-    const roof = L.ground - L.floors * 26 - 14;
-    block(n.g, L.x, roof, L.w, L.ground - roof + L.deep, rnd, {shade: 2, loggias: [2, 5], aerials: 1});
-    const cx = L.x + L.cote;
-    const cote = svg("g", {transform: `translate(${cx},${roof - 4}) scale(${L.scale})`}, n.g);
+    // No log or snapshots of its own to stand on (a real node's in memory): a block of its own.
+    if (L.alone) block(n.g, L.x, L.roof, L.w, L.ground - L.roof + 2000, rnd, {shade: 2, aerials: 1});
+    // The bridge: a slab on two posts from roof to roof, high over the blocks' letters.
+    const deck = L.roof - L.size - 44,
+      cx = L.x + L.w / 2;
+    for (const px of [L.x + 3, L.x + L.w - 7]) svg("rect", {class: "post", x: px, y: deck, width: 4, height: L.roof - deck}, n.g);
+    svg("rect", {class: "parapet", x: L.x - 4, y: deck - 5, width: L.w + 8, height: 6}, n.g);
+    // Its name (and in a cluster what it is now) on a sign under the slab.
+    const sign = svg("text", {class: "sign node-sign", x: cx, y: deck + 15, "text-anchor": "middle"}, n.g);
+    sign.textContent = name;
+    if (cluster) {
+      const r = svg("tspan", {class: `node-role${id === scene.leader ? " leading" : ""}`}, sign);
+      r.textContent = ` · ${role}`;
+    }
+    const cote = svg("g", {transform: `translate(${cx},${deck - 4}) scale(${L.scale})`}, n.g);
     const entrances = dovecote(cote);
     if (onScreen) onLoft(cote, entrances);
     else for (const w of entrances) boarded(cote, w);
     if (cluster && id === scene.leader && !scene.cut.has(id)) flag(cote);
-    n.door = [cx, roof - 4 - 150 * L.scale];
-    roofLetters(n.g, L.x + L.letters, roof, name, {size: L.size}).remove();
-    if (cluster)
-      svg(
-        "text",
-        {class: `sign-sub node-role${id === scene.leader ? " leading" : ""}`, x: L.x + L.letters, y: roof + 26, "text-anchor": "middle"},
-        n.g,
-      ).textContent = role;
-    ring(n, L.x, roof - 4 - 175 * L.scale, L.w, L.ground);
+    n.door = [cx, deck - 4 - 150 * L.scale];
+    ring(n, L.x - 4, deck - 4 - 175 * L.scale, L.w + 8, deck + 20);
     return n;
   }
 
@@ -292,57 +299,54 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     if (jobs.length > QUEUE_SHOWN) svg("text", {class: "job-more", x: left + QUEUE_SHOWN * 9 + 2, y: 6}, q).textContent = `+${jobs.length - QUEUE_SHOWN}`;
   }
 
-  // ---- pigeons
+  // ---- pigeons: flights (flights.js) from place to place
   const flights = new Set();
   let lastStart = Promise.resolve();
-  // A pigeon from the dovecote into a channel's window (the newest
-  // message's), or out of a lit one back; bigger for a bigger payload. A
-  // failed call reaches the block's next free window and turns back.
-  // Pigeons leave 70 ms apart, in the order the node logged them; resolves
-  // when this one lands. "" is the client's: between your roof and the node.
-  function fly(store, {back = false, size = 4096, failed = false} = {}) {
-    const n = cards.get(store);
-    if (!(n || (store === "" && client)) || reduced) return Promise.resolve();
+  let raftInAir = 0;
+
+  // Where a place is on the town now; null: not drawn.
+  function anchor(p) {
+    if (p.client) return client?.perch ?? null;
+    if ("node" in p) return loftOf(p.node)?.door ?? null;
+    const n = cards.get(p.store);
+    if (!n) return null;
+    if (p.at === "sign") return n.sign;
+    const {count} = contents(n.c);
+    const shown = Math.min(count, n.slots.length - (count > n.slots.length ? n.cols : 0));
+    const i = p.at === "free" ? shown : p.at === "any" ? Math.floor(Math.random() * Math.max(1, shown)) : shown - 1;
+    return windowAt(n, i);
+  }
+
+  // One flight; resolves when it lands. Yours and the node's leave 70 ms
+  // apart, in the order the node logged them; Raft's own traffic goes at
+  // once, a few in the air at most (the rest are let go), and is not waited for.
+  function fly(f) {
+    if (reduced) return Promise.resolve();
+    const raft = f.traffic === "raft";
+    if (raft && (raftInAir >= RAFT_SHOWN || [f.from, f.to].some(p => "node" in p && scene.cut.has(p.node)))) return Promise.resolve();
+    const go = () => {
+      const a = anchor(f.from),
+        b = anchor(f.to);
+      if (!a || !b || !air) return Promise.resolve();
+      const path = svg("path", {class: "way", d: arc(a, b, lift * (raft ? 0.45 : 1))}, air);
+      return f.spark ? spark(path) : wing(path, {size: f.size, failed: f.failed, cls: raft ? `raft ${f.kind}` : ""});
+    };
+    if (raft) {
+      raftInAir++;
+      const flight = go();
+      flight.finally(() => raftInAir--);
+      return flight;
+    }
     const start = lastStart.then(() => sleep(70));
     lastStart = start;
-    const flight = start.then(() => wing(way(n, back, failed), {back, size, failed, temp: !!n}));
+    const flight = start.then(go);
     flights.add(flight);
     flight.finally(() => flights.delete(flight));
     return flight;
   }
-  // Every pigeon in the air has landed.
+  // Every pigeon of yours or the node's in the air has landed.
   const landed = () => Promise.all([...flights]);
 
-  // The way for one pigeon: to the window it is after.
-  function way(n, back, failed) {
-    if (!n) return edges.get("");
-    const {count} = contents(n.c);
-    const shown = Math.min(count, n.slots.length - (count > n.slots.length ? n.cols : 0));
-    const i = failed ? shown : back ? Math.floor(Math.random() * Math.max(1, shown)) : shown - 1;
-    return svg("path", {class: "way", d: arc(homeOf(n.c).door, windowAt(n, i), lift)}, air);
-  }
-
-  // ---- Raft's pigeons: requests between the nodes, as they logged them.
-  // Over a direct link, from dovecote to dovecote; over the chat, into the
-  // sender's outbox, then out of it to the reader. A heartbeat is a spark
-  // along the way, not a pigeon. Not waited for, not queued: they are the
-  // cluster's own traffic, alongside yours.
-  let raftInAir = 0;
-  function flyRaft({from, to, via, kind, at}) {
-    const a = lofts.get(from),
-      b = lofts.get(to),
-      box = cards.get(`outbox-${from}`);
-    if (reduced || !a || !b || scene.cut.has(from) || scene.cut.has(to) || raftInAir >= RAFT_SHOWN) return;
-    let d;
-    if (via !== "chat") d = arc(a.door, b.door, lift * 0.4);
-    else if (!box) return;
-    else if (at === "sent") d = arc(a.door, windowAt(box, Math.min(contents(box.c).count, box.slots.length - 1)), lift * 0.5);
-    else d = arc(box.sign, b.door, lift * 0.5);
-    const path = svg("path", {class: "way", d}, air);
-    raftInAir++;
-    const done = kind === "heartbeat" ? spark(path) : wing(path, {size: 1024, temp: true, cls: `raft ${kind}`});
-    done.finally(() => raftInAir--);
-  }
   // A spark along a way: a heartbeat.
   function spark(path) {
     return new Promise(done => {
@@ -366,11 +370,11 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     });
   }
 
-  // One pigeon along `path`; `temp`: the way is its own, gone with it.
-  function wing(path, {back = false, size = 4096, failed = false, temp = false, cls = ""}) {
+  // One pigeon along `path` (its own: gone with it).
+  function wing(path, {size = 4096, failed = false, cls = ""}) {
     return new Promise(done => {
       const end = () => {
-        if (temp) path.remove();
+        path.remove();
         bird.g.remove();
         done();
       };
@@ -382,7 +386,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
       // Which way it faces, once for the flight; a failed one turns round at the far end.
       const a = path.getPointAtLength(0),
         b = path.getPointAtLength(len);
-      const facing = (b.x - a.x) * (back ? -1 : 1) < 0 ? -1 : 1;
+      const facing = b.x - a.x < 0 ? -1 : 1;
       let mark = null;
       const step = now => {
         // Redrawn under it: its place is gone, so is the pigeon.
@@ -394,9 +398,9 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
         const k = Math.max(0, Math.min(1, (now - t0) / dur)),
           e = k - (Math.sin(2 * Math.PI * k) / (2 * Math.PI)) * 0.5;
         const pos = failed ? 0.88 * (1 - Math.abs(1 - 2 * e)) : e;
-        const along = len * (back ? 1 - pos : pos),
+        const along = len * pos,
           returning = failed && e > 0.5,
-          ahead = back !== returning ? -3 : 3;
+          ahead = returning ? -3 : 3;
         const pt = path.getPointAtLength(along),
           p0 = path.getPointAtLength(Math.max(0, Math.min(len, along - ahead))),
           p1 = path.getPointAtLength(Math.max(0, Math.min(len, along + ahead)));
@@ -452,7 +456,6 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     setObjects,
     setQueue,
     fly,
-    flyRaft,
     landed,
     bump,
     hideAll,
