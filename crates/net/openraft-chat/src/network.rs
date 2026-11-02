@@ -473,7 +473,12 @@ impl<C: RaftTypeConfig> RaftNetwork<C> for ChatClient<C> {
     ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
         let ttl = option.hard_ttl();
         match self.net.call(self.target.clone(), Body::Vote(rpc), ttl).await {
-            Ok(Body::Voted(r)) => r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target.clone(), e))),
+            Ok(Body::Voted(r)) => {
+                if let Ok(v) = &r {
+                    debug!(node = %self.target, to = %self.net.inner.me, granted = v.vote_granted, via = "chat", "raft vote answered");
+                }
+                r.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target.clone(), e)))
+            }
             Ok(_) => Err(self.failed(RPCTypes::Vote, ttl, CallError::Mismatch)),
             Err(e) => Err(self.failed(RPCTypes::Vote, ttl, e)),
         }

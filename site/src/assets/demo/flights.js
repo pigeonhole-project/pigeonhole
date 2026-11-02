@@ -37,9 +37,11 @@ export function flightsOf(e, channel, ctx) {
 
 // A Raft request: over a direct link, dovecote to dovecote; over the chat,
 // into the sender's outbox ("sent"), or out of it to the reader ("read").
+// A vote's answer flies straight back to the candidate: for, or against.
 // Nothing gets to or from a node cut off.
 function raft(e, ctx) {
   if (ctx.cut?.has(e.from) || ctx.cut?.has(e.to)) return [];
+  if (e.kind === "voted") return [{lane: "raft", size: 1024, kind: e.granted ? "vote-for" : "vote-against", from: {node: e.from}, to: {node: e.to}}];
   const base = {lane: "raft", size: 1024, spark: e.kind === "heartbeat", kind: e.kind};
   if (e.via !== "chat") return [{...base, from: {node: e.from}, to: {node: e.to}}];
   const outbox = `outbox-${e.from}`;

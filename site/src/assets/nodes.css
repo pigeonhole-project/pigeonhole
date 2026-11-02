@@ -8,6 +8,16 @@
 }
 .node-pick.following { border-color: var(--teal); }
 .node-pick[aria-pressed="true"] { background: var(--teal); border-color: var(--teal); color: #fff; }
+/* The cluster chip: the cluster's panel. */
+.cluster-pick { font-weight: 600; }
+/* The cluster's panel: its nodes, the chronicle of its Raft. */
+.cluster-table { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 8px; }
+.cluster-table th { text-align: left; font-weight: 500; color: var(--wing-2); border-bottom: 1px solid var(--line); padding: 4px 6px; }
+.cluster-table td { padding: 5px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.cluster-table tr.leading td:first-child { color: var(--teal); font-weight: 600; }
+.chronicle { list-style: none; padding: 0; margin: 0; font-size: 14px; }
+.chronicle li { padding: 5px 0; border-bottom: 1px solid var(--line); }
+.chronicle-at { color: var(--wing-2); font-size: 12px; margin-right: 8px; font-variant-numeric: tabular-nums; }
 /* The node's panel: cutting it off. */
 .node-cut { align-items: center; margin: 4px 0 8px; }
 .node-cut .field-note { margin: 0; }

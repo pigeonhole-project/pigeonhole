@@ -6,6 +6,7 @@ import {chatModel} from "../src/assets/demo/chat/model.js";
 import {readEvents} from "../src/assets/demo/events.js";
 import {flightsOf, ownerOf} from "../src/assets/demo/flights.js";
 import {summary} from "../src/assets/demo/log-view.js";
+import {makeRaftWatch} from "../src/assets/demo/raft.js";
 import {describe, ms} from "../src/assets/demo/tasks.js";
 import {divisors, sketch, tomlOf} from "../src/assets/demo/toml.js";
 
@@ -244,4 +245,18 @@ test("flightsOf: a node's own channel is its; a data channel the leader's; Raft 
   assert.deepEqual([read.from, read.to, read.lane], [{store: "outbox-3", at: "new"}, {node: 1}, "raft"]);
   assert.equal(flightsOf({type: "raft", from: 1, to: 2, via: "grpc", kind: "heartbeat", at: "sent"}, channel, ctx)[0].spark, true);
   assert.equal(ownerOf({node: null}, {leader: null, shown: 3}), 3, "no leader known: the node on screen");
+});
+
+test("raft watch: a heartbeat winds a follower's clock; votes and a candidate are told", () => {
+  const w = makeRaftWatch();
+  w.view(2, {role: "follower", term: 1}, 0);
+  assert.equal(w.clock(2, 0, 1000), null, "not heard from a leader yet");
+  w.frame({kind: "heartbeat", via: "grpc", at: "sent", from: 1, to: 2}, 100);
+  assert.equal(w.clock(2, 600, 1000), 0.5);
+  assert.equal(w.clock(2, 5000, 1000), 0);
+  assert.deepEqual(w.view(2, {role: "candidate", term: 2}, 5000), [["raft.candidate", {n: 2, term: 2}]]);
+  assert.deepEqual(w.frame({kind: "voted", granted: true, from: 3, to: 2}, 5100), [["raft.vote_for", {from: 3, to: 2}]]);
+  assert.deepEqual(w.view(2, {role: "leader", term: 2}, 5200), [["raft.leader", {n: 2, term: 2}]]);
+  assert.equal(w.clock(2, 6000, 1000), null, "a leader runs no election clock");
+  assert.equal(w.chronicle().length, 3);
 });

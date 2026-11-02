@@ -8,6 +8,8 @@
 //   {type: "claimed", generation}                              the node took the metadata log
 //   {type: "lease_wait", ms}                                   it waits out the lease another held on it
 //   {type: "s3", op, ...fields}                                an S3 call that succeeded
+//   {type: "raft", from, to, via, kind: "voted", granted, at: "answered"}
+//                                                              a vote's answer, from the voter
 //   {type: "raft", from, to, via, kind, at}                    a Raft request between nodes:
 //       via "grpc" (direct), or "chat" through the sender's outbox; `at`
 //       "sent" (into the outbox, over the chat) or "read" (out of it)
@@ -46,6 +48,8 @@ export function readEvents(lines) {
       out.push({type: "claimed", generation: f.generation});
     } else if (msg === "raft frame sent" && f.reply === false) {
       out.push({type: "raft", from: +f.node, to: +f.to, via: f.via, kind: f.kind, at: "sent"});
+    } else if (msg === "raft vote answered") {
+      out.push({type: "raft", from: +f.node, to: +f.to, via: f.via, kind: "voted", granted: f.granted === true, at: "answered"});
     } else if (msg === "raft frame received" && f.reply === false && f.via === "chat") {
       out.push({type: "raft", from: +f.from, to: +f.node, via: f.via, kind: f.kind, at: "read"});
     } else if ((line.target || "").startsWith("pigeonhole_gateway_s3") && msg.endsWith(" ok")) {

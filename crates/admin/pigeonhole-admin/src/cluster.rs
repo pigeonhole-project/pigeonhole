@@ -21,7 +21,8 @@ impl Admin {
     }
 
     /// `{me, leader, term, nodes: [{id, role, grpc, outbox, log, snapshots,
-    /// applied, lag}], links: [{a, b, via}]}`. Only this node's own log and
+    /// applied, lag}], links: [{a, b, via}], read_only: a leader without a
+    /// quorum, timing: {heartbeat, election: [min, max]} (ms)}`. Only this node's own log and
     /// snapshots are known here; `applied` is this node's, `lag` known on
     /// the leader. A cluster of one: one leader, no links.
     pub fn cluster(&self) -> Value {
@@ -52,6 +53,15 @@ impl Admin {
             .flat_map(|c| c.pairs())
             .map(|(a, b, link)| json!({ "a": a, "b": b, "via": link.as_str() }))
             .collect();
-        json!({ "me": view.me, "leader": view.leader, "term": view.term, "nodes": nodes, "links": links })
+        // The clocks a follower's election runs by (ms): a heartbeat's period,
+        // the timeout's range; none for a cluster of one.
+        let timing = self.cluster.as_ref().map(|c| {
+            let ms = |d: std::time::Duration| d.as_millis() as u64;
+            json!({ "heartbeat": ms(c.heartbeat), "election": [ms(c.election_timeout.0), ms(c.election_timeout.1)] })
+        });
+        json!({
+            "me": view.me, "leader": view.leader, "term": view.term, "nodes": nodes, "links": links,
+            "read_only": self.meta.is_read_only(), "timing": timing,
+        })
     }
 }

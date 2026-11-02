@@ -165,7 +165,12 @@ impl<C: RaftTypeConfig> RaftNetwork<C> for GrpcClient<C> {
     ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
         let ttl = option.hard_ttl();
         match self.call(Body::Vote(rpc), ttl).await {
-            Ok(Body::Voted(r)) => r.map_err(|e| self.remote(e)),
+            Ok(Body::Voted(r)) => {
+                if let Ok(v) = &r {
+                    tracing::debug!(node = %self.target, to = %self.id.me, granted = v.vote_granted, via = "grpc", "raft vote answered");
+                }
+                r.map_err(|e| self.remote(e))
+            }
             Ok(_) => Err(self.failed(RPCTypes::Vote, ttl, Failure::Bad("a response of the wrong kind".into()))),
             Err(f) => Err(self.failed(RPCTypes::Vote, ttl, f)),
         }
