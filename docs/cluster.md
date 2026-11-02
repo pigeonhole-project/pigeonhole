@@ -1,305 +1,57 @@
-# Raft over chat: openraft's network through Telegram and Discord channels
+# Cluster: the tablet on several nodes
 
-Status: steps 1–4 and 6 done, 7 in part (2026-11-01). The binary runs as a
-node of a gRPC cluster (`[cluster]`, `[[node]]`). Mixed gRPC + chat clusters
-run in tests. There is no chat mailbox yet.
+Status (2026-11-02):
+- the binary runs as a node of a Raft cluster;
+- two nodes talk over gRPC, or over chat channels (Telegram outboxes);
+- the leader does all the work;
+- tested: in process over every transport, under madsim over a lossy chat,
+  and as three processes on localhost (`make cluster-smoke`).
 
-A transport for [openraft](https://docs.rs/openraft) whose wire is chat
-messages: Raft nodes talk by posting into channels and reading them. With it,
-and with each node's log and snapshots already in a chat
-(docs/meta-backends.md § Raft between nodes), a pigeonhole cluster needs no
-open port and no address: nodes can run behind NAT, on laptops, anywhere
-that reaches Telegram or Discord.
+Left (§ Status): a live run on real Telegram channels, a Discord outbox,
+outbox housekeeping, membership changes.
 
-The transport does not depend on pigeonhole. It is a crate of its own
-(`openraft-chat`) that any openraft application can use; pigeonhole is its
-first user.
+Each node keeps its own copy of the metadata tablet: its own log and
+snapshots, rebuilt from them on boot as on a single node
+([meta-backends.md](meta-backends.md)). openraft keeps the copies equal.
+The blob stores (`[chunk] store`) are shared: every node is configured
+with the same ones.
 
-## The seam in openraft
+## The leader does the work
 
-openraft does no I/O. Its network is two traits the application implements,
-plus calls the application makes into its own `Raft` when a message arrives.
+Only the leader writes, and only the leader serves:
 
-| side | API | what it carries |
-|---|---|---|
-| send | `RaftNetworkFactory::new_client(target, node)` | a client for one peer |
-| send | `RaftNetwork::append_entries(req, opt)` | log entries from the leader; an empty one is a heartbeat |
-| send | `RaftNetwork::vote(req, opt)` | a candidate asking for a vote |
-| send | `RaftNetwork::full_snapshot(vote, snapshot, cancel, opt)` | a whole snapshot for a follower too far behind |
-| receive | `raft.append_entries(req)`, `raft.vote(req)`, `raft.install_full_snapshot(vote, snapshot)` | the local node handles the request and returns the response |
+- **S3.** A follower answers every S3 request with 503
+  `ServiceUnavailable`, naming the leader. Writes would fail there, and
+  reads would see a state that may lag the leader's. There is no proxy
+  between nodes and no follower read.
+- **Finding the leader.** `GET /_pigeonhole/leader` answers on every node:
+  200 on the leader, 503 elsewhere, with `{node, leader, leading}`. A load
+  balancer's health check on it sends clients to the leader. `/metrics`
+  answers on every node.
+- **Background work.** Sweeper, repair, cooler and the CAS GC skip their
+  passes unless `MetaStore::is_leader`. A new leader takes the work over
+  with its next pass. Each node's snapshot ticker runs on its own:
+  snapshots are per node.
+- **Taking over** (`ChunkStore::take_over`, on boot when leading and again
+  on every gain of leadership). The leader:
+  - records the configured stores;
+  - chooses or reads the deployment's owner ([store-owner.md](store-owner.md))
+    and marks the stores with it;
+  - seeds the sweep's horizon from the committed parts.
+- **Chunk ids** go on after the newest the tablet applied, so a node that
+  took over never hands out an id its predecessor used.
+- **The dynamic config** ([dynamic-config.md](dynamic-config.md)).
+  Overrides reach every node by replication, and `DynConfig::follow`
+  recomputes the knobs there. On a follower, `PUT`/`DELETE
+  /admin/config/…` answer 503.
 
-Every send is request → response with a deadline (`RPCOption::hard_ttl`).
-Errors tell openraft what to do next:
+Pins (uploads in flight, reads in flight) live in the leader's process. Its
+sweeper is the only one that deletes, so they need not travel. When the
+leader changes, its uploads in flight can no longer commit. The new
+leader's horizon starts below them, so they are left alone for now and
+swept as orphans once its own uploads pass them.
 
-- `Unreachable`: the peer is down, back off;
-- `Network`: retry;
-- a remote error: the peer answered with one.
-
-pigeonhole today has `NoNetwork` (meta/pigeonhole-meta/src/raft.rs), which
-answers `Unreachable` to everything: a cluster of one. Step 8.3 of the
-roadmap plans a tonic gRPC network with the same three calls plus
-`Forward`, a follower's `propose` sent to the leader (application-level,
-not openraft's). A chat transport is another implementation of exactly that
-set, chosen per cluster in the config.
-
-Raft suits a lossy wire. Its RPCs may be lost, duplicated, delayed and
-reordered without harm, since terms and log indices decide; a lost message is
-a timeout and a retry. A chat is such a wire, only slow.
-
-## Shape
-
-```
-openraft-chat
-├── Mailbox            trait: post a frame, read frames after a position
-│   ├── telegram       MTProto (grammers), a channel per node
-│   ├── discord        HTTP, a channel per node
-│   └── fake           in memory, with latency / loss / duplication (tests, madsim)
-├── Transport          implements RaftNetworkFactory + RaftNetwork over Mailboxes
-├── Inbox              polls the peers' mailboxes, dispatches requests to the
-│                      local Raft, and responses to waiting senders
-└── Frame              wire format, HMAC, encoding
-```
-
-`Mailbox` is the only part that knows a chat:
-
-```rust
-#[async_trait]
-pub trait Mailbox: Send + Sync + 'static {
-    /// Post one frame; returns its position (message id).
-    async fn post(&self, frame: Bytes) -> Result<u64>;
-    /// Frames after `after`, oldest first, at most `limit`.
-    async fn read_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, Bytes)>>;
-    /// Delete own frames up to `upto` (housekeeping).
-    async fn delete_upto(&self, upto: u64) -> Result<()>;
-}
-```
-
-The Telegram and Discord mailboxes reuse what pigeonhole's storage crates
-already have: the MTProto client and Discord HTTP client, the rate limiters
-(`pigeonhole-limits`), and the text encoding for small payloads
-(`storage-api::text`). For a standalone crate those are dependencies to pull
-out or copy; the Raft logic does not care.
-
-## Topology: an outbox per node
-
-Every node owns one channel, its **outbox**. It posts all it sends there:
-requests to any peer and responses to requests it received. Every node reads
-every other node's outbox.
-
-- **Per-node rate.** The posting limit is per bot, not per channel
-  (measured 2026-10-30 with a live spike: two bots in one channel
-  post twice as much as one). So each node needs **its own bot**; its own
-  channel is for authorship and tidy reads, not for budget.
-- **Coalescing.** All a node has to send in one tick (heartbeats to every
-  follower, responses, votes) goes out as **one post**: a frame holds several
-  envelopes, each addressed to a node. A 3-node leader sends one post per
-  tick, not one per follower.
-- **Reading**: push first, polling as the safety net.
-  - Push: a bot that is a channel's member gets every new post as an update
-    (MTProto `updateNewChannelMessage`; Discord gateway `MESSAGE_CREATE`), no
-    poll interval and no read budget spent. pigeonhole's MTProto client gives
-    the update stream on request (`connect_with_updates`).
-  - Polling: one call per peer per poll, "messages after the last id I saw".
-    Telegram message ids in a channel are dense and increasing, Discord ids
-    are increasing snowflakes; both read in order. It fills the gaps updates
-    leave after a reconnect, and is the whole path if push turns out not to
-    deliver other bots' posts.
-- **Authorship.** A node's bot is the only member with post rights in its
-  outbox, so the channel itself says who wrote a frame. The HMAC below says
-  so cryptographically.
-
-The alternative, one channel per ordered pair (n·(n−1) channels), gives a
-budget per link. That buys nothing once frames coalesce, and it costs
-channels and reads that grow quadratically.
-
-### Budgets
-
-| per bot | Telegram | Discord |
-|---|---|---|
-| posts | ~20 / min (measured 19.7) | ~57 / min (measured, no 429) |
-| reads (ours) | `info` budget 2 / s | ~5 / s |
-
-A node posts at most once per **tick** and reads each peer once per
-**poll**. For n nodes:
-
-- posts per node: `1 / tick` against its bot's budget (Telegram: tick
-  ≥ 3.5 s to stay under ~0.33/s with room for the burst; Discord: tick
-  ≥ 1.1 s);
-- reads per node: `(n − 1) / poll` against the same bot's read budget, or
-  none with push updates.
-
-Bots shared between nodes share these budgets: one bot per node.
-
-## Wire format
-
-A frame is one chat message:
-
-```
-Frame {
-    version: u8,
-    cluster: u128,            // refuses frames of another cluster
-    from: NodeId,
-    seq: u64,                 // per sender, strictly increasing
-    sent_ms: u64,             // sender's clock, for logs only
-    envelopes: Vec<Envelope>,
-    mac: [u8; 32],            // HMAC-SHA256(cluster key, everything above)
-}
-
-Envelope {
-    to: NodeId,
-    rpc: u64,                 // the sender's id for this call
-    body: Body,
-}
-
-enum Body {
-    AppendEntries(AppendEntriesRequest),   Appended(Result<AppendEntriesResponse, RaftError>),
-    Vote(VoteRequest),                     Voted(Result<VoteResponse, RaftError>),
-    Snapshot(SnapshotHeader, SnapshotRef), Installed(Result<SnapshotResponse, Fatal>),
-    Forward(Bytes),                        Forwarded(Result<Bytes, String>),
-}
-```
-
-- **Encoding**: postcard. A frame that fits a text message (Telegram 4096,
-  Discord 2000 characters; with pigeonhole's 15-bits-per-character text
-  codec that is ~7.5 KB and ~3.6 KB) goes as text. Larger ones go as a
-  document or attachment. Heartbeats and votes are tens of bytes, so the
-  common frame is text.
-- **Responses** reuse the request's `rpc` id, addressed back to the
-  requester, in the responder's own outbox.
-
-## Sending and receiving
-
-**Send** (`RaftNetwork::append_entries` etc.):
-
-1. register `rpc` in a table of waiting calls;
-2. queue the envelope for the next tick's frame;
-3. wait for the response or `hard_ttl`.
-
-On timeout, return `Unreachable` if nothing came from that peer for a while,
-else `Network`. A response arriving after the deadline is dropped.
-
-**Tick** (every `tick`, or at once when an urgent envelope is queued and the
-budget allows): post one frame with every queued envelope. If the post fails
-(rate limit, outage), the envelopes stay queued; the calls time out and
-openraft retries as it would on a broken TCP connection.
-
-**Poll** (every `poll`, per peer outbox): read frames after the last
-position, verify the MAC, check `cluster`, drop frames with `seq` ≤ the last
-seen from that sender (duplicates), and handle each envelope addressed to
-this node:
-
-- requests go to the local `Raft` (`append_entries`, `vote`,
-  `install_full_snapshot`, or the application's `Forward` handler); the
-  response is queued for this node's next tick;
-- responses complete a waiting call by `rpc` id.
-
-**Duplicates and replays** are harmless to Raft but cost work. `seq`
-filters them, and `seq` survives restarts: it is restored from the last
-frame in the node's own outbox.
-
-## Timing
-
-A round trip costs at most a tick on each side, plus a poll on each side
-when reading by polling, plus two posts:
-
-```
-rtt ≲ 2·tick + 2·poll + 2·post_latency      (polling)
-rtt ≲ 2·tick + 2·post_latency                (push updates)
-```
-
-On Telegram with tick 4 s, poll 3 s and post ~0.5 s: up to ~15 s polling,
-~9 s with push (a push arrived 0.19 s after the post in the check below). On Discord with tick 1 s, poll 1 s: ~3–5 s polling, ~2–3 s
-with push.
-
-openraft's defaults (heartbeat 50 ms, election 150–300 ms) assume a LAN.
-Raft needs `heartbeat < election_timeout_min`, and the election timeout must
-cover a few round trips, or followers depose healthy leaders:
-
-| | heartbeat_interval | election_timeout | install_snapshot_timeout |
-|---|---|---|---|
-| Telegram | 10 s | 45–90 s | 10 min |
-| Discord | 3 s | 15–30 s | 5 min |
-
-A heartbeat is not a post by itself: it rides in the next tick's frame. The
-heartbeat interval only has to be at least one tick.
-
-Consequences:
-
-- **Commit latency** is a round trip leader → follower → leader plus the
-  node's own log append (a chat post when the log is a chat). That is
-  seconds on Discord and tens of seconds on Telegram. Fine for
-  pigeonhole's metadata at low write rates; not a database for chatty
-  workloads.
-- **Failover** takes an election timeout plus a round trip.
-
-## Snapshots
-
-`full_snapshot` sends a whole snapshot.
-
-- **Generic:** the snapshot goes as a document or attachment frame (Telegram
-  up to 2 GB, Discord 20 MiB per attachment as in pigeonhole's Discord store; larger ones in parts),
-  with `SnapshotHeader` (meta, size, crc) in the envelope.
-- **In pigeonhole:** the snapshot already sits in the leader's
-  `SnapshotStore` (a chat, often). The envelope carries the `SnapshotRef` and
-  the follower reads it from there, if it can reach that store. This is the
-  one place where the transport may know pigeonhole, through a hook the
-  application provides (`SnapshotRef` in, bytes out); the generic path
-  stays as the fallback.
-
-## Security
-
-- **HMAC-SHA256** over every frame with a per-cluster key from the
-  environment. Nodes drop frames that fail it, and log it.
-- **`cluster`** id in every frame: two clusters sharing channels by mistake
-  do not mix.
-- **Authorship:** only the node's own bot can post in its outbox (channel
-  admin rights). With one bot per node, the poster's bot id is checked
-  against the node id too.
-- **Replay:** `seq` per sender. Raft's terms make an old request harmless
-  anyway.
-- **Confidentiality:** none. Frames carry log entries in clear, like the
-  chat log itself does today. Encryption is the separate "encryption per
-  block" item on the roadmap.
-
-## Housekeeping
-
-Each node deletes its own outbox frames once they are old: older than
-`2 × election_timeout_max`, since nothing reads them after that. It does
-this in batches on spare budget (`wait_idle`), as the log collection does.
-Telegram deletes up to 100 ids per call, Discord bulk-deletes messages
-younger than 14 days.
-
-## Observability
-
-The tablet records openraft's own metrics (`Raft::metrics()`) as gauges on
-every `record_gauges`: the node's role, term, the leader it knows, its last
-log and applied indexes, and on the leader each peer's replication lag and
-the time since a quorum last acknowledged it. openraft-chat records its side
-through the `metrics` facade: posts and their time, envelopes per frame,
-every call's round trip by RPC and outcome (ok, timeout), frames read by
-outcome (ok, duplicate, bad_frame, foreign) and read errors. Names and
-labels: [metrics.md](metrics.md); the Grafana dashboard has a Cluster (Raft)
-row of them.
-
-**For the admin UI's graph:**
-- The admin op `cluster` (`MetaStore::cluster_view` plus the config) gives
-  `{me, leader, term, nodes, links}`.
-  - Each node is `{id, role, grpc, outbox, chat, log, snapshots, applied, lag}`.
-  - `log` and `snapshots` are known for this node only, as is `applied`.
-  - `lag` is known on the leader.
-  - `links` are `{a, b, via: grpc|chat}`.
-- `channels` lists a node's own log and snapshots with its `node`, and each
-  outbox as `outbox-<node>` (role `outbox`).
-- These log lines are stable; the graph animates them:
-  - `raft frame sent` and `raft frame received` (debug), with fields
-    `to`/`from`, `kind` (heartbeat, append, vote, snapshot), `reply`,
-    `via` (grpc, chat) and `bytes`. `Direct` logs as `grpc`.
-  - `leader changed` (info), with `term` and `leader` (absent during an
-    election).
-  - `not the leader` (info), with `op` (method and path) and `leader`:
-    a follower turning an S3 request away.
-
-## Configuration (pigeonhole)
+## Configuration
 
 One pigeonhole.toml serves the whole cluster, as zoo.cfg does ZooKeeper's:
 the same `[cluster]`, `[[node]]` list and blob stores on every host. A node
@@ -347,6 +99,9 @@ a pool, as a store's). So every node's bots are admins of every outbox it
 uses: its own, to post, and its chat peers', to read and be pushed their
 posts. Only nodes with a chat link log in.
 
+A fresh cluster is initialized by the member with the lowest id. The others
+wait for its leader. Membership is fixed by the `[[node]]` list.
+
 ## Transports
 
 The transport is chosen for each pair of nodes, not for the cluster.
@@ -356,159 +111,381 @@ Between two nodes:
 - **the chat**, when both have an `outbox`;
 - a config error otherwise.
 
-`openraft-grpc` carries the same frames as the chat: postcard, sealed with
-the cluster's key. Each call is one unary RPC holding one envelope. The
-crate also has `Direct`, the same link in memory: a call goes straight to
-the peer's `Raft`, with an optional delay and cut-off nodes. It is for
-tests, the simulation, and the in-browser demo, where no socket opens:
-`default-features = false` drops tonic (feature `transport`) and builds
-for wasm. `openraft_grpc::Mixed` is the node's network factory. It hands openraft a
-gRPC client for some peers and a chat client for the others. Every node
-serves both: a gRPC server on its address, and its peers' outboxes it
-reads. Either way requests reach the same `Raft`.
+`openraft_grpc::Mixed` is the node's network factory. openraft asks it for a
+client per peer, and it hands out a gRPC client for some peers and a chat
+client for the others. Every node serves both: a gRPC server on its address,
+and the outboxes of its chat peers, which it reads. Either way requests
+reach the same `Raft`.
+
+- **gRPC** (`openraft-grpc`, feature `transport`): one unary RPC per Raft
+  call. The request and the response are each one frame of the chat's wire
+  format (§ Wire format) holding one envelope, so both transports check the
+  same key.
+- **`Direct`** (`openraft-grpc`, no feature): the same link in memory. A
+  call goes straight to the peer's `Raft`, with an optional delay and
+  cut-off nodes. It serves tests, the simulation, and the in-browser demo,
+  where no socket opens: with `default-features = false` there is no tonic,
+  and the crate builds for wasm.
+- **The chat** (`openraft-chat`): § The chat transport.
 
 **Timing.** A leader's heartbeat must stay under every follower's election
-timeout, so one chat link sets the pace of the whole cluster (§ Timing):
-the defaults follow the slowest link. Commits stay fast all the same. Two
-nodes on gRPC are a quorum of three, and the chat node catches up behind
-them.
+timeout, so one chat link sets the pace of the whole cluster (§ Timing): the
+defaults follow the slowest link. Commits stay fast all the same: two nodes
+on gRPC are a quorum of three, and the chat node catches up behind them.
 
-**The Telegram outbox** (`pigeonhole_raft_telegram::TelegramMailbox`, crates/net/pigeonhole-raft-telegram)
-works as follows:
-- a frame is a message named `raft.bin`: inline text when it fits
-  (~7.5 KB), a document otherwise; its position is the message id;
-- bots can read only by id, so a reader reads ids upward, 100 a time, and
-  skips holes and foreign messages;
+## The seam in openraft
+
+openraft does no I/O. Its network is two traits the application implements,
+plus calls the application makes into its own `Raft` when a message arrives.
+
+| side | API | what it carries |
+|---|---|---|
+| send | `RaftNetworkFactory::new_client(target, node)` | a client for one peer |
+| send | `RaftNetwork::append_entries(req, opt)` | log entries from the leader; an empty one is a heartbeat |
+| send | `RaftNetwork::vote(req, opt)` | a candidate asking for a vote |
+| send | `RaftNetwork::install_snapshot(req, opt)` | a chunk of a snapshot, for a follower behind the leader's purged log |
+| receive | `raft.append_entries(req)`, `raft.vote(req)`, `raft.install_snapshot(req)` | the local node handles the request and returns the response |
+
+Every send is request → response with a deadline (`RPCOption::hard_ttl`).
+Errors tell openraft what to do next:
+
+- `Unreachable`: the peer is down, back off;
+- `Network`: retry;
+- a remote error: the peer answered with one.
+
+A cluster of one runs with `NoNetwork` (meta/pigeonhole-meta/src/raft.rs),
+which answers `Unreachable` to everything.
+
+Raft suits a lossy wire. Its RPCs may be lost, duplicated, delayed and
+reordered without harm, since terms and log indices decide; a lost message is
+a timeout and a retry. A chat is such a wire, only slow.
+
+## The chat transport
+
+Raft nodes talk by posting into channels and reading them. A node reached
+only this way needs no open port and no address: it can run behind NAT, on
+a laptop, anywhere that reaches Telegram.
+
+The crate `openraft-chat` does not depend on pigeonhole; any openraft
+application can use it:
+
+```
+openraft-chat
+├── Mailbox      trait: an outbox, as a node sees it
+├── FakeChat     in memory, with delay / loss / duplication / isolation (tests, madsim)
+├── ChatNetwork  RaftNetworkFactory + RaftNetwork over mailboxes: a send loop
+│                (one frame per tick) and a read loop per peer outbox
+├── Handler      what a request is handed to (the node's Raft)
+└── frame        wire format, HMAC
+```
+
+The Telegram outbox lives in pigeonhole (§ The Telegram outbox): it reuses
+the store's MTProto client, rate limiters and text encoding.
+
+```rust
+#[async_trait]
+pub trait Mailbox: Send + Sync + 'static {
+    /// Post one frame; its position (the message id).
+    async fn post(&self, frame: Bytes) -> Result<u64>;
+    /// Frames after `after`, oldest first, at most `limit`.
+    async fn read_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, Bytes)>>;
+    /// The position of the newest frame: where a reader that does not care
+    /// for the past starts.
+    async fn head(&self) -> Result<u64>;
+    /// Return once something may have been posted after `after`, or after
+    /// `timeout` (pushed mailboxes wake early).
+    async fn wait(&self, after: u64, timeout: Duration);
+}
+```
+
+### Topology: an outbox per node
+
+Every node owns one channel, its **outbox**. It posts all it sends there:
+requests to any peer and responses to requests it received. Every node
+reads the outboxes of its chat peers.
+
+- **Coalescing.** All a node has to send in one tick goes out as one post:
+  heartbeats to every follower, responses, votes. A frame holds several
+  envelopes, each addressed to a node. A 3-node leader sends one post per
+  tick, not one per follower.
+- **Reading: push first, polling as the safety net.**
+  - Push: a bot that is a channel's member gets every new post as an update
+    (MTProto `updateNewChannelMessage`). There is no poll interval, and no
+    read budget is spent.
+  - Polling: "messages after the last id I saw", one window per peer per
+    poll. It fills the gaps updates leave after a reconnect.
+- **Authorship.** Only the node's own bots have post rights in its outbox.
+  The HMAC below says who wrote a frame cryptographically.
+
+The alternative is one channel per pair, an honest duplex: each node reads
+only what is meant for it, and each link can be cut or moved alone. It
+costs N−1 posts per tick on the leader instead of one, and channels that
+grow quadratically. The outbox stays (decided 2026-11-02). In a mixed
+cluster the outboxes of the gRPC nodes carry frames for the chat node only,
+which is close to a pair channel anyway.
+
+### Budgets
+
+| per bot | Telegram | Discord |
+|---|---|---|
+| posts | ~20 / min (measured 19.7) | ~57 / min (measured, no 429) |
+| reads (ours) | `info` budget 2 / s | ~5 / s |
+
+A node posts at most once per **tick** and reads each peer once per
+**poll**. For n nodes:
+
+- posts per node: `1 / tick` against its bot's budget (Telegram: tick
+  ≥ 3.5 s to stay under ~0.33/s with room for the burst; Discord: tick
+  ≥ 1.1 s);
+- reads per node: `(n − 1) / poll` against the same bot's read budget, or
+  none with push updates.
+
+Bots shared between nodes share these budgets: one bot per node.
+
+### Wire format
+
+A frame is one chat message (or, over gRPC, one request or response):
+
+```
+Sealed { frame: Vec<u8>, mac: [u8; 32] }   // mac = HMAC-SHA256(cluster key, frame)
+
+Frame {
+    version: u8,
+    cluster: u128,            // refuses frames of another cluster
+    from: NodeId,
+    seq: u64,                 // per sender, strictly increasing
+    envelopes: Vec<Envelope>,
+}
+
+Envelope { to: NodeId, rpc: u64, body: Body }   // rpc: the sender's id for the call
+
+enum Body {
+    AppendEntries(AppendEntriesRequest),     Appended(Result<AppendEntriesResponse, RaftError>),
+    Vote(VoteRequest),                       Voted(Result<VoteResponse, RaftError>),
+    InstallSnapshot(InstallSnapshotRequest), Installed(Result<InstallSnapshotResponse, RaftError<…>>),
+}
+```
+
+- **Encoding**: postcard. On Telegram a frame that fits a text message (~7.5
+  KB with the 15-bits-per-character text codec) goes as text, a larger one
+  as a document. Heartbeats and votes are tens of bytes, so the common frame
+  is text.
+- **Responses** reuse the request's `rpc` id, addressed back to the
+  requester, in the responder's own outbox.
+
+### Sending and receiving
+
+**Send** (`RaftNetwork::append_entries` etc.):
+1. register `rpc` in a table of waiting calls;
+2. queue the envelope for the next tick's frame;
+3. wait for the response, or `hard_ttl`; a timeout is `Timeout`, and
+   openraft retries.
+
+**Tick** (every `tick`): post one frame with every queued envelope. If the
+post fails (rate limit, outage), the calls time out and openraft retries,
+as it would on a broken TCP connection.
+
+**Read** (per peer outbox, woken by `wait`):
+1. read the frames after the last position;
+2. verify the MAC and the cluster;
+3. drop frames with `seq` ≤ the last seen from that sender (duplicates);
+4. handle each envelope addressed to this node:
+   - a request goes to the local `Raft`, and its response is queued for
+     this node's next tick;
+   - a response completes a waiting call by its `rpc` id.
+
+Reading starts at each outbox's head as of `serve`: frames posted before
+the node came up are not replayed. `seq` starts from the clock, so it keeps
+growing across restarts.
+
+### Timing
+
+A round trip costs at most a tick on each side, plus a poll on each side
+when reading by polling, plus two posts:
+
+```
+rtt ≲ 2·tick + 2·poll + 2·post_latency      (polling)
+rtt ≲ 2·tick + 2·post_latency                (push updates)
+```
+
+On Telegram with tick 4 s, poll 3 s and post ~0.5 s: up to ~15 s polling,
+~9 s with push (a push arrived 0.19 s after the post, § Checks).
+
+openraft's defaults (heartbeat 50 ms, election 150–300 ms) assume a LAN.
+Raft needs `heartbeat < election_timeout_min`, and the election timeout must
+cover a few round trips, or followers depose healthy leaders. The defaults
+`[cluster]` picks:
+
+| links | heartbeat | election timeout | tick / poll |
+|---|---|---|---|
+| gRPC only | 250 ms | 1.5–3 s | — |
+| any Telegram link | 10 s | 45–90 s | 4 s / 3 s |
+
+`install_snapshot_timeout` is four maximal election timeouts (openraft's
+200 ms timed out every send over a chat). A heartbeat is not a post by
+itself: it rides in the next tick's frame.
+
+- **Commit latency** is a round trip leader → quorum → leader, plus the
+  leader's own log append (a chat post when the log is a chat). With a
+  gRPC quorum it is the gRPC round trip.
+- **Failover** takes an election timeout plus a round trip.
+
+### The Telegram outbox
+
+`pigeonhole_raft_telegram::TelegramMailbox` (crates/net/pigeonhole-raft-telegram:
+a `Mailbox` on the store's `ChannelApi`, over real channels in the binary
+and fake ones in the demo):
+- a frame is a message named `raft.bin`: text when it fits, a document
+  otherwise; its position is the message id;
+- bots can read only by id, so a reader reads ids upward, 100 at a time,
+  and skips holes and foreign messages (a window with nothing in it is
+  skipped while the channel is known to go past it);
 - a reader learns how far the channel goes from its own posts, from the
-  posts pushed to any of the process's bots (`channel_log::on_post`, every
-  bot logs in with updates), and at the start from a lookup: windows of
+  posts pushed to any of the process's bots (`channel_log::on_post`; every
+  bot logs in with updates), and, at the start, from a lookup: windows of
   100 ids with doubling strides, then halving;
 - `wait` wakes on a push, else after `poll`.
 
-**Status.** Mixed gRPC + Telegram clusters boot in the binary. In tests,
-two gRPC nodes and one on `TelegramMailbox` over fake channels
-(`tests/raft_telegram.rs`), which also survive the leader's death. A live
-run on real channels is next, and Discord after it.
+## Snapshots
 
-## Clients: always the leader
+A follower behind the leader's purged log gets the leader's snapshot through
+`install_snapshot`: openraft sends it in chunks, each a request over the
+link (a chat frame, a document when large). Two things this needed:
+- the send timeout above;
+- a follower's purge waits for the snapshot it installs, since Raft asks
+  to purge while the state machine is still storing it.
 
-There is no proxy between nodes. A follower answers every S3 request with
-503 `ServiceUnavailable` and names the leader in the message. Writes would
-fail there, and reads would see a state that may lag the leader's.
-`GET /_pigeonhole/leader` answers on every node: 200 on the leader, 503
-elsewhere, with `{node, leader, leading}`. A load balancer's health check
-on it sends clients to the leader. `/metrics` answers on every node.
+Not built: a snapshot as a reference. The snapshot already sits in the
+leader's `SnapshotStore`, often a chat, and the envelope could carry its
+`SnapshotRef` for the follower to read there. The leader purges its log
+right after a snapshot (`max_in_snapshot_log_to_keep: 0`), so even a short
+lag costs a whole snapshot. A margin of log behind the snapshot is an open
+question: boot replays from the base, and a base below the snapshot needs
+care.
 
-What the leader needs before it writes, it does when it takes over
-(`ChunkStore::take_over`): record the configured stores, choose or read the
-deployment's owner, mark the stores, seed the sweep's horizon. Chunk ids go
-on after the newest one the tablet applied, so a node that took over never
-hands out an id its predecessor used.
+## Security
 
-`scripts/cluster-smoke.sh` (`make cluster-smoke`) runs three processes on
-localhost: a write through the leader, `kill -9` of the leader, a read and a
-write through the new one, and the old one back as a follower.
+- **HMAC-SHA256** over every frame, chat or gRPC, with a per-cluster key
+  from the environment. Nodes drop frames that fail it, and log it.
+- **`cluster`** id in every frame: two clusters sharing channels by mistake
+  do not mix.
+- **Replay:** `seq` per sender. Raft's terms make an old request harmless
+  anyway.
+- **Not built:** checking a post's bot against the node it claims to come
+  from, and TLS on gRPC. Keep gRPC on a private network.
+- **Confidentiality:** none. Frames carry log entries in clear, like a chat
+  log does. Encryption is the "encryption per block" item on the roadmap.
 
-## What has to be true (checks before code)
+## Observability
 
-1. ~~**Reading another bot's posts in a channel.**~~ Confirmed 2026-10-30
-   (`tests/live.rs` `second_bot_sees_first_bots_posts`): a second bot reads
-   the first one's post by id (`channels.getMessages`) 0.19 s after it was
-   sent.
-2. **Discord: other bots' content.** Without the Message Content intent,
-   Discord returns empty `content` for messages that are not the bot's own,
-   on REST too. The intent is a switch in the developer portal (no review
-   under 100 servers). Check it, or carry frames as attachments, whose URLs
-   and bytes are not gated.
-3. **Polling cost** stays within the read budgets above for 3 nodes at the
-   suggested poll intervals. Measure it with `pigeonhole_limiter_wait_seconds`.
-4. ~~**MTProto updates** (push) for posts of another bot.~~ Confirmed the
-   same day, same test: the second bot got `updateNewChannelMessage` for the
-   first one's post 0.19 s after it was sent, once it had asked for updates
-   (`updates.getState`; `TelegramMtproto::connect_with_updates`). Posts in a
-   channel are the channel's, so the "bots do not see bots" rule of groups
-   does not apply. Push is the main path; polling fills gaps. Open: whether
-   several processes logged in as one bot all get the updates (one bot per
-   node avoids the question).
+The tablet records openraft's own metrics (`Raft::metrics()`) as gauges on
+every `record_gauges`: the node's role, term, the leader it knows, its last
+log and applied indexes, and on the leader each peer's replication lag and
+the time since a quorum last acknowledged it. openraft-chat records its side
+through the `metrics` facade: posts and their time, envelopes per frame,
+every call's round trip by RPC and outcome (ok, timeout), frames read by
+outcome (ok, duplicate, bad_frame, foreign) and read errors. gRPC links
+record no metrics of their own yet. Names and labels:
+[metrics.md](metrics.md); the Grafana dashboard has a Cluster (Raft) row of
+them.
 
-Setting up a second bot takes a person: create it in BotFather (bots cannot
-create bots), put its token in `.env` as `TG_BOT_TOKEN_2`, and add it as an
-admin (post, edit, delete) of each test channel. A bot cannot do the last
-step for it: `channels.editAdmin` on a bot that is not in the channel is an
-invitation, and Telegram refuses it to a bot with
-`CHAT_ADMIN_INVITE_REQUIRED` even when the bot holds every admin right
-(tried 2026-10-30).
-
-Both bots log in with the same `TG_API_ID` / `TG_API_HASH`: those identify
-the client application, not the account, and each bot has its own session
-file. Discord has no such shortcut: a second application is created and
-invited through its OAuth URL by a person, and the Message Content intent is
-a switch in the developer portal.
+**For the admin UI's graph:**
+- The admin op `cluster` (`MetaStore::cluster_view` plus the config) gives
+  `{me, leader, term, nodes, links}`.
+  - Each node is `{id, role, grpc, outbox, chat, log, snapshots, applied, lag}`.
+  - `log` and `snapshots` are known for this node only, as is `applied`.
+  - `lag` is known on the leader.
+  - `links` are `{a, b, via: grpc|chat}`.
+- `channels` lists a node's own log and snapshots with its `node`, and each
+  outbox as `outbox-<node>` (role `outbox`).
+- These log lines are stable; the graph animates them:
+  - `raft frame sent` and `raft frame received` (debug), with fields
+    `to`/`from`, `kind` (heartbeat, append, vote, snapshot), `reply`,
+    `via` (grpc, chat) and `bytes`. `Direct` logs as `grpc`.
+  - `leader changed` (info), with `term` and `leader` (absent during an
+    election).
+  - `not the leader` (info), with `op` (method and path) and `leader`:
+    a follower turning an S3 request away.
 
 ## Tests
 
-- **Unit:** frame encoding round trip; MAC rejection; `seq` dedup across
-  restarts; coalescing (one post per tick whatever the number of envelopes).
-- **Simulation** (madsim, `Mailbox::fake` with latency, loss, duplication and
-  reordering):
-  - 3 nodes elect a leader;
-  - writes commit;
-  - a partition of the leader elects a new one, and the old one steps down
-    when it heals;
-  - `kill -9` of the leader;
-  - a lagging follower installs a snapshot.
+- **openraft-chat** (`tests/transport.rs`): MAC, call and answer,
+  coalescing, partitions, duplicates, loss, a foreign key, metrics.
+- **The tablet** (`pigeonhole-meta` `tests/cluster.rs`):
+  - over `FakeChat`: election, commits everywhere, a write to a follower,
+    a killed leader, a partitioned leader that heals, gauges and lag, the
+    cluster view, a follower that catches up from a snapshot;
+  - over gRPC alone;
+  - two gRPC nodes and a chat node;
+  - a `Direct` pair and a chat node (this one under madsim too).
+- **The binary** (`tests/raft_telegram.rs`): two gRPC nodes and one on
+  `TelegramMailbox` over fake Telegram channels, through the leader's
+  death.
+- **Simulation** (`pigeonhole-sim/tests/cluster.rs`, madsim): three nodes
+  over a `FakeChat` that delays, loses and doubles posts, while a node at a
+  time is cut off and healed. Every acknowledged command survives, and the
+  nodes converge.
+- **Processes** (`make cluster-smoke`): three on localhost, a write through
+  the leader, `kill -9` of the leader, a read and a write through the new
+  one, the old one back as a follower. `CHAT=telegram` puts node 3 on
+  Telegram outboxes (`TG_RAFT_OUTBOX_1..3` in `.env`).
 
-  The same scenarios the gRPC network will need, so both transports share
-  them.
-- **Live** (not in CI): 3 nodes on Telegram (two or three bots), the same
-  on Discord. Measure election time, commit latency and failover against the
-  table above.
+## Checks (2026-10-30)
 
-## Steps
+1. **Reading another bot's posts in a channel**: a second bot reads the
+   first one's post by id (`channels.getMessages`) 0.19 s after it was sent
+   (`tests/live.rs` `second_bot_sees_first_bots_posts`).
+2. **Push of another bot's posts**: the second bot got
+   `updateNewChannelMessage` 0.19 s after the post, once it had asked for
+   updates (`updates.getState`; `TelegramMtproto::connect_with_updates`).
+   Posts in a channel are the channel's, so the "bots do not see bots" rule
+   of groups does not apply. Open: whether several processes logged in as
+   one bot all get the updates. One bot per node avoids the question.
+3. **Discord** (open, before a Discord outbox): without the Message Content
+   intent, Discord returns empty `content` for other bots' messages, on REST
+   too. Either switch the intent on in the developer portal, or carry frames
+   as attachments, whose bytes are not gated.
 
-1. ✅ The checks above: two bots, two channels, post and read; push
-   delivers another bot's posts (checks 1 and 4).
-2. ✅ `openraft-chat`: `Mailbox` with `FakeChat` (loss, duplication,
-   isolation), `Frame` / `Envelope`, `ChatNetwork` and `Handler`, with
-   transport tests (`tests/transport.rs`).
-3. ✅ Tablets in a cluster: `MetaStore::open_in` with a `Cluster` (node id,
-   members, network, a `serve` hook), `NotLeader` from a follower; 3-node
-   tests over `FakeChat` (election, commits everywhere, a write to a
-   follower, a killed leader, a partitioned leader that heals).
-4. ✅ Metrics (§ Observability) and the Grafana Cluster row.
-5. Telegram and Discord mailboxes (`post`, `read_after`, `head`, `wait` on
-   push: `connect_with_updates` / the gateway), then live runs of 3 nodes,
-   each with its own bot: election time, commit latency, failover against
-   § Timing, watched on the dashboard.
-6. ✅ A lagging follower catches up by snapshot (`InstallSnapshot` over the
-   chat): a cluster test; live with step 5. Two fixes it took:
-   - openraft's `install_snapshot_timeout` (200 ms, a LAN's) is now four
-     election timeouts: a chat round trip is longer;
-   - a follower's purge waits for the snapshot it installs: Raft asks for
-     the purge while the state machine still stores it.
-7. In pigeonhole: `[cluster] transport`, `[[node]] outbox`, `Forward` to the
-   leader, with the step-8 work every transport needs. Done: leader-only
-   side effects (sweeper, repair, cooler and the CAS GC pass only while
-   `MetaStore::is_leader`), the dynamic config following overrides that
-   replication brings (`DynConfig::follow`), `NotLeader` as 503 in S3 and
-   the admin API. The plan for the rest: the leader does all the work and a
-   follower proxies S3 and admin requests to it.
-7. In pigeonhole: `[cluster] transport`, `[[node]] outbox`, `Forward` to the
-   leader, with the step-8 work every transport needs (leader-only side
-   effects: sweeper, repair, cooler).
-8. Maybe, after the live runs: a status message per node in its outbox
-   (role, term, leader, lag), edited in place, so the channel shows the
-   cluster's state without Grafana.
+A second Telegram bot takes a person: create it in BotFather, put its token
+in `.env`, and add it as an admin of each channel. A bot cannot invite
+another one (`CHAT_ADMIN_INVITE_REQUIRED`, tried 2026-10-30). Both bots log
+in with the same `TG_API_ID` / `TG_API_HASH`: those identify the client
+application, not the account.
 
-madsim (`pigeonhole-sim/tests/cluster.rs`): three nodes over a `FakeChat`
-that delays (`set_delay`), loses and doubles posts while a node at a time is
-cut off and healed; every acknowledged command survives and the nodes
-converge.
+## Status
+
+Done:
+- the chat transport (`openraft-chat`) and `MetaStore::open_in`;
+- metrics and the Grafana row;
+- snapshot catch-up;
+- leader-only work, `DynConfig::follow`, 503 on followers;
+- gRPC, `Direct` and per-pair transports;
+- `[cluster]` / `[[node]]`;
+- the Telegram outbox;
+- the cluster view and the graph's log lines.
+
+Left:
+1. A live run of three nodes, one of them on real Telegram channels
+   (`CHAT=telegram make cluster-smoke`): election time, commit latency and
+   failover against § Timing.
+2. A Discord outbox (check 3 first).
+3. Outbox housekeeping: each node deletes its frames older than
+   `2 × election_timeout_max`, in batches on spare budget (`wait_idle`).
+   Until then outboxes only grow, and finding the head assumes no run of
+   100 deleted messages below it.
+4. `seq` restored from the node's own outbox rather than the clock; the
+   poster's bot checked against the node.
+5. A snapshot as a reference (§ Snapshots).
+6. Membership changes (add or remove a node, learners) through the admin
+   API, instead of a fixed `[[node]]` list.
+7. Maybe: a status message per node in its outbox (role, term, leader,
+   lag), edited in place, so the channel shows the cluster's state without
+   Grafana.
 
 ## Risks
 
-- **Latency.** Tens of seconds per commit on Telegram may be too slow even
-  for metadata under real use; Discord is the realistic chat transport.
+- **Latency.** Tens of seconds per commit when the quorum needs a Telegram
+  link. With a gRPC quorum the chat node only lags.
 - **Platform terms.** Bots chatting with bots in a loop is the kind of
   traffic platforms rate-limit or ban. Ticks keep it to a post every few
   seconds per node, far below the limits, but it is automated traffic all
