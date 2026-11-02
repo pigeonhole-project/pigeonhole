@@ -70,13 +70,17 @@ impl PendingChunks {
     }
 
     /// Add the commits to `proposal`; once it is committed, finish with
-    /// [`Committing::done`].
+    /// [`Committing::done`]. The upload pins go with the proposal: they are
+    /// dropped once its entry is applied ([`Proposal::hold`]), so a caller
+    /// that goes away meanwhile (a request dropped) cannot let the sweeper
+    /// at parts the entry is about to point at.
     pub fn propose_in(self, proposal: &mut Proposal) -> Committing {
         let mut slots = Vec::with_capacity(self.chunks.len());
         let mut rest = Vec::with_capacity(self.chunks.len());
         for c in self.chunks {
             slots.push(proposal.push(c.commit));
-            rest.push((c.chunk_id, c.layouts, c.pins));
+            proposal.hold(c.pins);
+            rest.push((c.chunk_id, c.layouts));
         }
         Committing { slots, chunks: rest }
     }
@@ -86,23 +90,43 @@ impl PendingChunks {
 #[must_use = "finish with done() once the proposal is committed"]
 pub struct Committing {
     slots: Vec<Slot<ChunkState>>,
-    chunks: Vec<(ChunkId, Vec<pigeonhole_blob::ReplicaLayout>, Vec<pigeonhole_blob::UploadPin>)>,
+    chunks: Vec<(ChunkId, Vec<pigeonhole_blob::ReplicaLayout>)>,
 }
 
 impl Committing {
-    /// Check the commits were applied, queue repair for replicas the write
-    /// missed, and release the upload pins.
+    /// Check the commits were applied and queue repair for replicas the
+    /// write missed.
     pub async fn done(self, store: &ChunkStore, outcomes: &mut Outcomes) -> Result<()> {
         for slot in self.slots {
             if let Err(reason) = outcomes.take(slot)? {
                 bail!("chunk commit rejected: {reason:?}");
             }
         }
-        for (chunk_id, layouts, pins) in self.chunks {
+        for (chunk_id, layouts) in self.chunks {
             store.enqueue_missing_replicas(chunk_id, &layouts).await?;
-            drop(pins);
         }
         Ok(())
+    }
+}
+
+/// Run `work` to its end even if the caller is dropped meanwhile (a client
+/// gone, a timeout, an admin request cancelled); the future returned gives
+/// its output. For a commit and what must follow it whatever the answer:
+/// releasing the chunks it replaced, or those of a commit refused. `work`
+/// starts at once, in a task of its own (a dropped `JoinHandle` does not
+/// cancel it) and in the caller's span. `Err` only when the runtime
+/// cancelled the task (shutting down); a panic in `work` panics the
+/// caller too.
+pub fn to_the_end<T: Send + 'static>(
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> impl std::future::Future<Output = Result<T>> {
+    let task = tokio::spawn(tracing::Instrument::in_current_span(work));
+    async move {
+        match task.await {
+            Ok(out) => Ok(out),
+            Err(e) if e.is_panic() => panic!("a commit's task panicked: {e}"),
+            Err(e) => Err(anyhow::anyhow!("a commit's task was cancelled: {e}")),
+        }
     }
 }
 
@@ -274,9 +298,9 @@ impl ChunkStore {
             codec: "raw".into(),
             crc32: crc,
         }];
-        let chunk_id = self.db.commit_chunk(logical, crc, &blocks, &sealed.layouts).await?;
-        self.enqueue_missing_replicas(chunk_id, &sealed.layouts).await?;
-        drop(sealed.pins);
+        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts);
+        let chunk = PendingChunk { chunk_id, commit, layouts: sealed.layouts, pins: sealed.pins };
+        self.commit(PendingChunks { chunks: vec![chunk] }).await?;
         Ok(chunk_id)
     }
 
@@ -1540,5 +1564,42 @@ mod tests {
         handle.abort();
         let _ = handle.await;
         assert_eq!(budget.available_permits(), budget.capacity());
+    }
+
+    /// The sweeper's second line: an entry already handed to the log when
+    /// the sweeper looks (its pins gone, as if they had not gone with it)
+    /// is applied by the time the generation is confirmed, and the keys are
+    /// looked up again then: its parts stay.
+    #[tokio::test]
+    async fn the_sweeper_looks_again_after_confirming() {
+        let dir = tempfile::tempdir().unwrap();
+        let (meta, gate) = pigeonhole_testkit::gated_tablet(dir.path().join("blob.log"), BlobDb::register).await;
+        let db = BlobDb::open(meta).await.unwrap();
+        let mut opts = default_layer_opts();
+        opts.chunk_size = 64 * 1024;
+        let store = Arc::new(ChunkStore::open(db.clone(), MemoryBlobStore::new(), opts).await.unwrap());
+
+        let data = Bytes::from_static(b"pins dropped too early");
+        let mut ingested = store.ingest(stream::iter([Ok(data.clone())]), None).await.unwrap();
+        for c in &mut ingested.chunks.chunks {
+            drop(std::mem::take(&mut c.pins));
+        }
+        gate.close();
+        let commit = tokio::spawn({
+            let store = store.clone();
+            async move { store.commit(ingested.chunks).await }
+        });
+        gate.parked().await;
+        let config = crate::SweepConfig { batch_size: crate::SWEEP_BATCH_SIZE, interval: None };
+        let members = store.replicated().members().to_vec();
+        let sweeper = crate::Sweeper::new(db, members, config, store.replicated().pins().clone());
+        let sweep = tokio::spawn(async move { sweeper.sweep_once().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.open();
+        commit.await.unwrap().unwrap();
+        let stats = sweep.await.unwrap().unwrap();
+        assert_eq!(stats.keys_deleted, 0, "{stats:?}");
+        assert!(stats.keys_skipped_live > 0, "{stats:?}");
+        assert_eq!(store.read(&ingested.extents, None).await.unwrap(), data);
     }
 }

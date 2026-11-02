@@ -16,7 +16,14 @@ that moment and is dropped only after the commit that references the part
 ingest's chunks are committed with the operation that points at them (one
 entry, see one-entry-per-operation.md), so their pins live across the whole
 S3 / CAS write; a write that fails before (a checksum mismatch) commits
-nothing and leaves the parts as orphans. Backend
+nothing and leaves the parts as orphans. The pins go **with the proposal**
+(`PendingChunks::propose_in` and `BlobDb::commit_instance_replicas` hand them
+to `Proposal::hold`): the tablet's batcher drops them once the entry is
+applied, or once it is certain the entry will not be (refused before the
+batcher, not the leader, the tablet stopped, the caller gone before the
+write began). A caller dropped while its entry is being written (a client
+gone, a timeout, an admin repair cancelled) no longer takes the pins with it,
+so the horizon cannot rise past parts an entry is about to point at. Backend
 keys grow with time (Telegram / Discord message ids, the memory store's
 counter), so whatever an in-flight upload gets lies above every pin's floor.
 
@@ -30,7 +37,11 @@ before deleting:
    live or released: released parts are reclaim's to delete);
 2. confirms the tablet still holds its generation (`MetaStore::confirm_active`,
    a round trip through the log; on a lease log also inside the lease's
-   local deadline, docs/discord-lease.md); a fenced incarnation deletes nothing.
+   local deadline, docs/discord-lease.md); a fenced incarnation deletes nothing;
+3. drops the owned keys once more: `confirm_active` returns once everything
+   committed is applied, so an entry already in Raft when step 1 looked is
+   in the state now. With the pins in the proposal this never finds anything;
+   it is the second line should a pin go early.
 
 No grace period and no per-batch in-flight check are needed: a key enters the
 candidate range only after its pin is gone, i.e. after its commit is visible in
