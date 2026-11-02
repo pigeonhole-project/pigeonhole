@@ -427,5 +427,8 @@
   "js.demo.send_now": "Now that is",
   "js.demo.send_fixed": "Only the leader serves: a follower turns your requests away and names the leader.",
   "js.nodes.sending": "Your requests go to <b>node {n}</b> now; you look at it too.",
-  "js.demo.own_channels": "Its own channels:"
+  "js.demo.own_channels": "Its own channels:",
+  "js.demo.kin_node": "Node:",
+  "js.demo.kin_copies": "Other copies:",
+  "js.demo.kin_shards": "Other shards:"
 }

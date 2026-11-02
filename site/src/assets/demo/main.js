@@ -5,7 +5,7 @@
 import {button, h, reducedMotion} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {s3Sentence} from "../lib/say.js";
-import {appOf} from "./channels.js";
+import {appOf, kinOf} from "./channels.js";
 import {chatView} from "./chat/index.js";
 import {forgetPlaces} from "./chat/scroll.js";
 import {clientView} from "./client-view.js";
@@ -532,6 +532,8 @@ function renderPanel() {
     if (!c) return;
     const nodes = [chatView(c, m => deleteMessage(c, m))];
     if (c.role === "data") nodes.unshift(faultsView(c, state.admin, faultOps(c)));
+    const kin = kinOf(c, state.channels);
+    if (kin) nodes.unshift(kin);
     show(c.store, t(`demo.channel_sub_${c.role}`, {app: appOf(c.kind), scope: c.scope}), nodes);
   }
 }

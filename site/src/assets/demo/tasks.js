@@ -7,6 +7,7 @@
 import {activate, button, h, svg} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {boarded, perched} from "./art.js";
+import {sentence} from "./entities.js";
 
 export const TASKS = ["repair", "sweep", "cool", "snapshot"];
 // The tasks only the leader runs (the chunk stores are its); every node
@@ -65,6 +66,14 @@ export function describe(bg, name) {
     next: period ? t("bg.next", {when: soon(task.next_in_ms)}) : of ? t("bg.at_entries", {of}) : t("bg.parked"),
     work,
   };
+}
+
+// A piece of work as a tile; a repair job's channel, a link to it.
+function jobTile(name, item) {
+  const li = h("li", "job-tile");
+  if (name === "repair") li.append(...sentence(["demo.job", {chunk: item.chunk, store: item.store}]));
+  else li.textContent = workLabel(name, item);
+  return li;
 }
 
 // One piece of a task's work, in words.
@@ -256,7 +265,7 @@ function taskCard(name, onToggle, onRun, follower) {
       return;
     }
     const work = d.task.work;
-    jobs.replaceChildren(...work.slice(0, JOBS_SHOWN).map(item => h("li", "job-tile", workLabel(name, item))));
+    jobs.replaceChildren(...work.slice(0, JOBS_SHOWN).map(item => jobTile(name, item)));
     if (work.length > JOBS_SHOWN) jobs.append(h("li", "job-tile more", `+${work.length - JOBS_SHOWN}`));
     if (!work.length) jobs.append(h("li", "empty", t("bg.idle")));
   }

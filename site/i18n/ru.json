@@ -451,5 +451,8 @@
   "js.demo.send_now": "Сейчас это",
   "js.demo.send_fixed": "Обслуживает только лидер: follower откажет и назовёт лидера.",
   "js.nodes.sending": "Ваши запросы теперь идут на <b>узел {n}</b>; вы смотрите на него же.",
-  "js.demo.own_channels": "Его каналы:"
+  "js.demo.own_channels": "Его каналы:",
+  "js.demo.kin_node": "Узел:",
+  "js.demo.kin_copies": "Другие копии:",
+  "js.demo.kin_shards": "Другие шарды:"
 }

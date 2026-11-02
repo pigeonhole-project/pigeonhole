@@ -63,7 +63,8 @@ export const channelLink = store => link(ref.channel(store), store);
 function mentionOf(key, name, value) {
   if (name === "store" && typeof value === "string" && value) return channelLink(value);
   // The sentence says "node {n}" itself: the number is the link.
-  if (/^(raft\.|nodes\.|say\.not_leader$)/.test(key) && ["n", "from", "to"].includes(name) && Number.isInteger(value)) return link(ref.node(value), String(value));
+  if (/^(raft\.|nodes\.|say\.not_leader$)/.test(key) && ["n", "from", "to"].includes(name) && Number.isInteger(value))
+    return link(ref.node(value), String(value));
   return null;
 }
 

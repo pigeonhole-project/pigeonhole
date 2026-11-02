@@ -149,7 +149,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .ref { border: 0; background: none; padding: 0 1px; font: inherit; color: var(--teal); cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
 .ref:hover, .ref:focus-visible { color: var(--eye); outline: none; }
 .cluster-pick.hl { border-color: var(--eye); }
-.own-channels { margin: 4px 0 10px; color: var(--wing-2); }
+.own-channels, .channel-kin { margin: 4px 0 10px; color: var(--wing-2); }
 .send-to h3 { margin-top: 0; }
 /* a cluster: the leader's flag, a node cut off dark, Raft's traffic */
 .flag-pole { stroke: var(--seam); stroke-width: 3; } .flag { fill: var(--eye); }
