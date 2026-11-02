@@ -288,8 +288,14 @@ async fn chat_network(
 ) -> anyhow::Result<openraft_chat::ChatNetwork<pigeonhole_meta::raft::TypeConfig>> {
     use openraft_chat::FakeChat;
     use pigeonhole::config::cluster::ChatSettings;
-    let settings =
-        openraft_chat::Settings { cluster: cluster.id, key: cluster.key, tick: cluster.tick, poll: cluster.poll };
+    let settings = openraft_chat::Settings {
+        cluster: cluster.id,
+        key: cluster.key,
+        tick: cluster.tick,
+        poll: cluster.poll,
+        // Past twice the longest election timeout no call waits for a frame.
+        keep: Some(2 * cluster.election_timeout.1),
+    };
     let me = cluster.me();
     if let Some(ChatSettings::Fake) = &cluster.chat {
         anyhow::bail!("[cluster] fake: fake outboxes run in the site's demo (pigeonhole-web), not in the binary");

@@ -10,7 +10,7 @@ Status (2026-11-02):
   outboxes.
 
 Left (§ Status): a live run on real Telegram channels, a Discord outbox,
-outbox housekeeping, membership changes.
+membership changes.
 
 Each node keeps its own copy of the metadata tablet: its own log and
 snapshots, rebuilt from them on boot as on a single node
@@ -294,11 +294,22 @@ as it would on a broken TCP connection.
 4. handle each envelope addressed to this node:
    - a request goes to the local `Raft`, and its response is queued for
      this node's next tick;
-   - a response completes a waiting call by its `rpc` id.
+   - a response completes the waiting call with its `rpc` id, if that call
+     went to this sender; any other response (late, to another peer's
+     call, to an earlier run of this node) is dropped and counted
+     (`openraft_chat_stray_responses_total`).
 
 Reading starts at each outbox's head as of `serve`: frames posted before
-the node came up are not replayed. `seq` starts from the clock, so it keeps
-growing across restarts.
+the node came up are not replayed. `seq` and `rpc` ids start from the
+clock, so they keep growing across restarts: a run never takes a frame or a
+response meant for an earlier one for its own.
+
+**Prune** (`Settings::keep`, `2 × election_timeout_max` in a node): past
+that age no call waits for a frame. Once per `keep`, on a tick with
+nothing queued, a node prunes its own outbox (`Mailbox::prune`): every
+frame of this run older than `keep` goes, the newest one stays. The first
+prune comes a `keep` after the run starts, and takes the frames of the
+runs before with it.
 
 ### Timing
 
@@ -345,8 +356,14 @@ and fake ones in the demo):
 - a reader learns how far the channel goes from its own posts, from the
   posts pushed to any of the process's bots (`channel_log::on_post`; every
   bot logs in with updates), and, at the start, from a lookup: windows of
-  100 ids with doubling strides, then halving;
-- `wait` wakes on a push, else after `poll`.
+  100 ids with doubling strides, then halving, up from the pinned anchor
+  (below);
+- `wait` wakes on a push, else after `poll`;
+- `prune` pins the frame it keeps from as the anchor, then deletes the ids
+  below it, 100 a call, at most 10 calls a prune (the rest the next time).
+  The lookup starts at the anchor, above which nothing was deleted, so it
+  never meets a run of 100 deleted ids. The node's bot needs the right to
+  pin messages in its outbox.
 
 ## Snapshots
 
@@ -466,6 +483,7 @@ Done:
 - gRPC, `Direct` and per-pair transports;
 - `[cluster]` / `[[node]]`;
 - the Telegram outbox;
+- outbox pruning (`Settings::keep`, a pinned anchor);
 - the cluster view and the graph's log lines;
 - one `pigeonhole.toml` for the whole cluster;
 - a cluster of three in the demo.
@@ -475,16 +493,12 @@ Left:
    (`CHAT=telegram make cluster-smoke`): election time, commit latency and
    failover against § Timing.
 2. A Discord outbox (check 3 first).
-3. Outbox housekeeping: each node deletes its frames older than
-   `2 × election_timeout_max`, in batches on spare budget (`wait_idle`).
-   Until then outboxes only grow, and finding the head assumes no run of
-   100 deleted messages below it.
-4. `seq` restored from the node's own outbox rather than the clock; the
+3. `seq` restored from the node's own outbox rather than the clock; the
    poster's bot checked against the node.
-5. A snapshot as a reference (§ Snapshots).
-6. Membership changes (add or remove a node, learners) through the admin
+4. A snapshot as a reference (§ Snapshots).
+5. Membership changes (add or remove a node, learners) through the admin
    API, instead of a fixed `[[node]]` list.
-7. Maybe: a status message per node in its outbox (role, term, leader,
+6. Maybe: a status message per node in its outbox (role, term, leader,
    lag), edited in place, so the channel shows the cluster's state without
    Grafana.
 

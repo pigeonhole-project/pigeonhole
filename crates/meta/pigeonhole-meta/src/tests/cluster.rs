@@ -19,7 +19,7 @@ fn opts() -> MetaOptions {
 }
 
 fn settings() -> Settings {
-    Settings { cluster: 7, key: [3; 32], tick: Duration::from_millis(20), poll: Duration::from_millis(200) }
+    Settings { cluster: 7, key: [3; 32], tick: Duration::from_millis(20), poll: Duration::from_millis(200), keep: None }
 }
 
 /// Node `id` of a cluster of `MEMBERS`, its log and snapshots in memory.

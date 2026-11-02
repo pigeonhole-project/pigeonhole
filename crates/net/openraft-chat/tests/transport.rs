@@ -26,7 +26,7 @@ openraft::declare_raft_types!(
 const KEY: [u8; 32] = [7; 32];
 
 fn settings(key: [u8; 32]) -> Settings {
-    Settings { cluster: 42, key, tick: Duration::from_millis(100), poll: Duration::from_millis(500) }
+    Settings { cluster: 42, key, tick: Duration::from_millis(100), poll: Duration::from_millis(500), keep: None }
 }
 
 /// Grants every vote and accepts every append; counts the requests.
@@ -304,4 +304,28 @@ async fn a_response_to_an_earlier_run_is_not_taken_for_this_ones() {
     second.serve(Arc::new(Yes::default())).await;
     let resp = vote(&mut second, 2, 8, Duration::from_secs(30)).await.unwrap();
     assert_eq!(resp.vote, Vote::new(8, 1), "the new run took the answer meant for the old one");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_outbox_keeps_only_its_recent_frames() {
+    // Frames live 5 s: over 30 s of calls the outboxes hold the last few
+    // seconds' frames, and the calls go through as before.
+    let chat = FakeChat::new();
+    let net = |me: u64, other: u64| {
+        let peers: HashMap<u64, Arc<dyn Mailbox>> = [(other, chat.mailbox(me, other))].into();
+        let settings = Settings { keep: Some(Duration::from_secs(5)), ..settings(KEY) };
+        ChatNetwork::<Config>::new(me, settings, chat.mailbox(me, me), peers)
+    };
+    let (mut one, two) = (net(1, 2), net(2, 1));
+    two.serve(Arc::new(Yes::default())).await;
+    one.serve(Arc::new(Yes::default())).await;
+    for term in 1..=60 {
+        assert!(vote(&mut one, 2, term, Duration::from_secs(10)).await.unwrap().vote_granted);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    for node in [1, 2] {
+        let (posted, kept) = (chat.posts_by(node), chat.kept(node));
+        assert!(posted >= 60, "node {node} posted {posted}");
+        assert!(kept <= 25, "node {node} keeps {kept} of {posted} frames");
+    }
 }

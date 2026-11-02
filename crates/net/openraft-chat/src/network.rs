@@ -13,7 +13,7 @@ use openraft::raft::{
     VoteResponse,
 };
 use openraft::{AnyError, Raft, RaftTypeConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -66,6 +66,10 @@ pub struct Settings {
     pub tick: Duration,
     /// How long a reader waits for a push before it reads anyway.
     pub poll: Duration,
+    /// How long a frame stays in the outbox (`None`: forever): older ones
+    /// are pruned, once per `keep`, on a tick with nothing to send. Past
+    /// twice the longest election timeout no call waits for a frame.
+    pub keep: Option<Duration>,
 }
 
 /// openraft's network over chat outboxes, for one node.
@@ -94,6 +98,10 @@ struct Inner<C: RaftTypeConfig> {
     seen: Mutex<HashMap<C::NodeId, u64>>,
     handler: OnceLock<Arc<dyn Handler<C>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// This run's posts not pruned yet, oldest first: position and when.
+    posted: Mutex<VecDeque<(u64, tokio::time::Instant)>>,
+    /// When the outbox was last pruned (or the run started).
+    pruned_at: Mutex<tokio::time::Instant>,
 }
 
 /// A call waiting for its response: the peer asked (only its response
@@ -143,6 +151,8 @@ impl<C: RaftTypeConfig> ChatNetwork<C> {
             seen: Mutex::default(),
             handler: OnceLock::new(),
             tasks: Mutex::default(),
+            posted: Mutex::default(),
+            pruned_at: Mutex::new(tokio::time::Instant::now()),
         });
         let sender = tokio::spawn(send_loop(Arc::downgrade(&inner)));
         inner.tasks.lock().unwrap().push(sender);
@@ -187,6 +197,39 @@ impl<C: RaftTypeConfig> ChatNetwork<C> {
 }
 
 impl<C: RaftTypeConfig> Inner<C> {
+    /// Prune the outbox if it is due (once per `keep`) and nothing waits to
+    /// be sent: every frame older than `keep` goes, but the newest frame
+    /// stays (a chat may need one to anchor the rest). The first prune
+    /// comes a `keep` after the run starts, so the frames of the run before
+    /// stay that long for peers to read.
+    async fn prune(&self) {
+        let Some(keep) = self.settings.keep else { return };
+        let now = tokio::time::Instant::now();
+        if now.duration_since(*self.pruned_at.lock().unwrap()) < keep || !self.queue.lock().unwrap().is_empty() {
+            return;
+        }
+        let keep_from = {
+            let mut posted = self.posted.lock().unwrap();
+            let mut last = None;
+            while posted.len() > 1 && posted.front().is_some_and(|(_, at)| now.duration_since(*at) >= keep) {
+                last = posted.pop_front();
+            }
+            match (posted.front(), last) {
+                (Some((pos, _)), _) => *pos,
+                (None, Some((pos, _))) => pos,
+                (None, None) => return,
+            }
+        };
+        *self.pruned_at.lock().unwrap() = now;
+        let t0 = Instant::now();
+        let pruned = self.outbox.prune(keep_from).await;
+        telemetry::record_prune(pruned.is_ok(), t0.elapsed());
+        match pruned {
+            Ok(()) => debug!(node = %self.me, keep_from, "pruned the outbox"),
+            Err(e) => warn!(node = %self.me, keep_from, error = %format!("{e:#}"), "prune failed"),
+        }
+    }
+
     /// A response from `peer` to call `rpc`: it completes the call if one
     /// waits for it from that peer. Any other (a late one, one to another
     /// peer's call, one to an earlier run of this node) is dropped.
@@ -241,13 +284,19 @@ async fn send_loop<C: RaftTypeConfig>(inner: std::sync::Weak<Inner<C>>) {
         let posted = this.outbox.post(sealed).await;
         telemetry::record_post(posted.is_ok(), n, t0.elapsed());
         match posted {
-            Ok(pos) => debug!(node = %this.me, pos, envelopes = n, "posted a frame"),
+            Ok(pos) => {
+                debug!(node = %this.me, pos, envelopes = n, "posted a frame");
+                this.posted.lock().unwrap().push_back((pos, tokio::time::Instant::now()));
+            }
             // The calls time out; openraft retries as on a broken connection.
             Err(e) => warn!(node = %this.me, envelopes = n, error = %format!("{e:#}"), "post failed"),
         }
         let tick = this.settings.tick;
         drop(this);
         tokio::time::sleep(tick).await;
+        if let Some(this) = inner.upgrade() {
+            this.prune().await;
+        }
     }
 }
 

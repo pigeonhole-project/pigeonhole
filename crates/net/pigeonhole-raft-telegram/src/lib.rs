@@ -9,6 +9,10 @@
 //! far up the channel goes from its own posts, from the posts Telegram
 //! pushes to it ([`TelegramMailbox::seen`]), and, at the start, by looking
 //! ids up ([`TelegramMailbox::head`]).
+//!
+//! Pruning deletes the owner's frames below a position; the frame at that
+//! position is pinned first, as an anchor: the lookup of the newest id
+//! starts at the pinned message, above which nothing was deleted.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -16,6 +20,7 @@ use bytes::{Bytes, BytesMut};
 use openraft_chat::Mailbox;
 use pigeonhole_storage_api::text;
 use pigeonhole_storage_telegram::{ChannelApi, ChannelMessage, FileLocation, IDS_PER_CALL, TEXT_MAX_CHARS, WINDOW};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -26,15 +31,22 @@ pub const FRAME_NAME: &str = "raft.bin";
 /// Largest frame a reader downloads (a snapshot chunk and some).
 const MAX_FRAME: u64 = 64 << 20;
 
+/// Most delete calls (of 100 ids each) one prune makes; the rest wait for
+/// the next one, so a long unpruned outbox is cleared over several.
+const DELETES_PER_PRUNE: usize = 10;
+
 pub struct TelegramMailbox<C> {
     channel: Arc<C>,
     /// The newest message id known to be in the channel (0: none yet).
     top: watch::Sender<i64>,
+    /// Pruning: the lowest id that may still hold a message below the
+    /// anchor (0: not known yet, the pinned anchor's or 1).
+    pruned_to: AtomicI64,
 }
 
 impl<C: ChannelApi> TelegramMailbox<C> {
     pub fn new(channel: Arc<C>) -> Self {
-        Self { channel, top: watch::channel(0).0 }
+        Self { channel, top: watch::channel(0).0, pruned_to: AtomicI64::new(0) }
     }
 
     /// Message `id` is in the channel (Telegram pushed it, or we read it):
@@ -79,13 +91,14 @@ impl<C: ChannelApi> TelegramMailbox<C> {
     }
 
     /// The newest message id, looked up: windows of 100 ids doubling their
-    /// stride up from the bottom until one is empty, then halving between
-    /// the last full and the first empty one (~2·log2(top / 100) reads).
-    /// Assumes no run of 100 deleted messages below the top.
+    /// stride up from the pinned anchor (or the bottom) until one is empty,
+    /// then halving between the last full and the first empty one
+    /// (~2·log2(top / 100) reads). Assumes no run of 100 deleted messages
+    /// between the anchor and the top: pruning deletes only below it.
     async fn find_top(&self) -> Result<i64> {
         let window = IDS_PER_CALL as i64;
         let (mut found, mut stride) = (None, window);
-        let mut at = 1;
+        let mut at = self.channel.pinned().await?.unwrap_or(1).max(1);
         let empty = loop {
             match self.newest_in(at).await? {
                 Some(id) => found = Some(id),
@@ -166,6 +179,35 @@ impl<C: ChannelApi> Mailbox for TelegramMailbox<C> {
         let mut top = self.top.subscribe();
         let _ = tokio::time::timeout(timeout, top.wait_for(|t| *t > after as i64)).await;
     }
+
+    /// Pin the frame at `keep_from` as the anchor, then delete the ids below
+    /// it, up from the last anchor, 100 a call, at most
+    /// [`DELETES_PER_PRUNE`] calls (the rest next time). Nothing is deleted
+    /// unless the anchor is pinned: the lookup of the top needs it.
+    async fn prune(&self, keep_from: u64) -> Result<()> {
+        let keep_from = keep_from as i64;
+        let pinned = self.channel.pinned().await?;
+        let mut low = match self.pruned_to.load(Ordering::Relaxed) {
+            0 => pinned.unwrap_or(1).max(1),
+            low => low,
+        };
+        if low >= keep_from {
+            return Ok(());
+        }
+        if pinned != Some(keep_from) {
+            self.channel.pin(keep_from).await.context("pin the outbox's anchor")?;
+        }
+        for _ in 0..DELETES_PER_PRUNE {
+            if low >= keep_from {
+                break;
+            }
+            let ids: Vec<i64> = (low..keep_from.min(low + IDS_PER_CALL as i64)).collect();
+            self.channel.delete_messages(&ids).await.context("delete old frames")?;
+            low += ids.len() as i64;
+            self.pruned_to.store(low, Ordering::Relaxed);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +265,36 @@ mod tests {
         }
         let top = outbox.post(Bytes::from_static(b"x")).await.unwrap();
         assert_eq!(outbox.head().await.unwrap(), top, "its own post is its head");
+    }
+
+    #[tokio::test]
+    async fn a_pruned_outbox_keeps_its_anchor_and_the_frames_above() {
+        let (channel, outbox) = mailbox();
+        let mut ids = Vec::new();
+        for i in 0..300u32 {
+            ids.push(outbox.post(Bytes::from(i.to_le_bytes().to_vec())).await.unwrap());
+        }
+        let (anchor, top) = (ids[249], ids[299]);
+        outbox.prune(anchor).await.unwrap();
+        assert_eq!(channel.pinned_now(), Some(anchor as i64), "the anchor is pinned");
+        let below: Vec<i64> = (1..anchor as i64).collect();
+        assert!(
+            channel.get_messages(&below[..100]).await.unwrap().iter().all(|m| *m == ChannelMessage::Empty),
+            "the frames below the anchor are gone"
+        );
+        // A reader that comes up now finds the top past 249 deleted ids (the
+        // pin's own service message, if the chat posts one, is newer still),
+        // and reads what is left: the frames, not the service message.
+        let reader = TelegramMailbox::new(channel.clone());
+        assert!(reader.head().await.unwrap() >= top);
+        let left = reader.read_after(anchor - 1, 100).await.unwrap();
+        assert_eq!(left.len(), 51);
+        assert_eq!(left[0].0, anchor);
+        // Pruning again, higher up, moves the anchor and deletes the old one.
+        outbox.prune(ids[289]).await.unwrap();
+        assert_eq!(channel.pinned_now(), Some(ids[289] as i64));
+        assert_eq!(channel.get_messages(&[anchor as i64]).await.unwrap(), vec![ChannelMessage::Empty]);
+        assert!(TelegramMailbox::new(channel).head().await.unwrap() >= top);
     }
 
     #[tokio::test]
