@@ -168,7 +168,8 @@ impl DiscordClient {
             let resp = build().send().await.map_err(AttemptFailed::Network)?;
             let status = resp.status().as_u16();
             let headers = resp.headers().clone();
-            let text = resp.text().await.unwrap_or_default();
+            // A body cut off is a lost answer (worth a retry), not an empty one.
+            let text = resp.text().await.map_err(AttemptFailed::Network)?;
             let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
             if status == 429 {
                 let wait = Duration::from_secs_f64(retry_after(&headers, &body));
