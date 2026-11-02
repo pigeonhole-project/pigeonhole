@@ -101,7 +101,7 @@ const status = text => {
 // What the node logged: pigeons to fly, posts and deletions in the channels.
 // Returns what it said, as sentences, newest last.
 // Whose traffic is whose (flights.js): the leader as last seen, the node on screen.
-const flightCtx = () => ({leader: state.cluster?.leader ?? null, shown: shown()});
+const flightCtx = () => ({leader: state.cluster?.leader ?? null, shown: shown(), cut: state.cut});
 function apply(events) {
   const said = [];
   for (const e of events) {
@@ -112,7 +112,7 @@ function apply(events) {
       c.total++;
       const snap = c.role === "snapshots" && /-(\d+)\.snap/.exec(m.name || "");
       if (snap) said.push(["say.snapshot", {at: +snap[1]}]);
-      for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f).then(() => landed(c.store));
+      for (const f of flightsOf(e, channel, flightCtx())) graph.fly({...f, onLand: () => landed(c.store)});
     } else if (e.type === "deleted" && c) {
       for (const m of c.messages) if (e.ids.includes(String(m.id))) m.gone = true;
       c.total = Math.max(0, c.total - e.ids.length);
@@ -142,7 +142,6 @@ function apply(events) {
 
 // A pigeon landed on a channel.
 function landed(store) {
-  graph.bump(store);
   graph.setTotal(store, channel(store)?.total);
   if (panelShows(store)) renderPanel();
 }

@@ -15,21 +15,21 @@
 // calls onOpen(target).
 import {activate, reducedMotion, svg} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
-import {beat, birdDefs, block, boarded, dovecote, flag, flying, glide, perched, roofLetters, tower} from "./art.js";
+import {birdDefs, block, boarded, dovecote, flag, perched, roofLetters, tower} from "./art.js";
 import {appOf, placeNote} from "./channels.js";
 import {ownerOf} from "./flights.js";
 import {contents, floorsFor, layout} from "./layout.js";
+import {arc as arcPoints} from "./pigeons/model.js";
+import {makePigeons} from "./pigeons/render.js";
 
 const QUEUE_SHOWN = 12; // repair jobs drawn over a block; the rest as "+n"
-const RAFT_SHOWN = 6; // Raft's pigeons in the air at most; the rest are let go
 // A phone's screen: the town top to bottom, scrolled.
 const NARROW = "(max-width: 640px)";
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 // A pigeon's way from one place to another: up over the roofs and down.
-const arc = ([x1, y1], [x2, y2], lift) => {
-  const top = Math.min(y1, y2) - lift;
-  return `M${x1},${y1} C${x1 + (x2 - x1) * 0.25},${top} ${x1 + (x2 - x1) * 0.75},${top} ${x2},${y2}`;
+const arc = (a, b, lift) => {
+  const [p0, p1, p2, p3] = arcPoints(a, b, lift);
+  return `M${p0} C${p1} ${p2} ${p3}`;
 };
 // The same windows lit on every drawing.
 const seeded = seed => () => {
@@ -58,7 +58,6 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
 
   let viewWidth = 1200;
   let client = null,
-    air = null,
     lift = 80;
   let lofts = new Map(); // node id (0: the one node) → its block and dovecote
   // A cluster as the page knows it: who leads, who is cut off, which node is on screen.
@@ -207,7 +206,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     backdrop(at, rnd, tallNow);
     const routes = svg("g", {}, el),
       town = svg("g", {}, el);
-    air = svg("g", {}, el);
+    pigeons.attach(svg("g", {}, el));
 
     client = you(at.client, objects, town);
     setObjects(objects);
@@ -301,128 +300,27 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     if (jobs.length > QUEUE_SHOWN) svg("text", {class: "job-more", x: left + QUEUE_SHOWN * 9 + 2, y: 6}, q).textContent = `+${jobs.length - QUEUE_SHOWN}`;
   }
 
-  // ---- pigeons: flights (flights.js) from place to place
-  const flights = new Set();
-  let lastStart = Promise.resolve();
-  let raftInAir = 0;
-
-  // Where a place is on the town now; null: not drawn.
-  function anchor(p) {
-    if (p.client) return client?.perch ?? null;
-    if ("node" in p) return loftOf(p.node)?.door ?? null;
+  // ---- pigeons (pigeons/): the town tells them where its places are
+  // A place's spot, chosen once: a window by what the flight is after
+  // (flights.js); null when it is not drawn.
+  function spot(p) {
+    if (p.client) return client ? {client: true} : null;
+    if ("node" in p) return loftOf(p.node) ? {node: p.node} : null;
     const n = cards.get(p.store);
     if (!n) return null;
-    if (p.at === "sign") return n.sign;
+    if (p.at === "sign") return {store: p.store, sign: true};
     const {count} = contents(n.c);
     const shown = Math.min(count, n.slots.length - (count > n.slots.length ? n.cols : 0));
-    const i = p.at === "free" ? shown : p.at === "any" ? Math.floor(Math.random() * Math.max(1, shown)) : shown - 1;
-    return windowAt(n, i);
+    return {store: p.store, i: p.at === "free" ? shown : p.at === "any" ? Math.floor(Math.random() * Math.max(1, shown)) : shown - 1};
   }
-
-  // One flight; resolves when it lands. Yours and the node's leave 70 ms
-  // apart, in the order the node logged them; Raft's own traffic goes at
-  // once, a few in the air at most (the rest are let go), and is not waited for.
-  function fly(f) {
-    if (reduced) return Promise.resolve();
-    const raft = f.traffic === "raft";
-    if (raft && (raftInAir >= RAFT_SHOWN || [f.from, f.to].some(p => "node" in p && scene.cut.has(p.node)))) return Promise.resolve();
-    const go = () => {
-      const a = anchor(f.from),
-        b = anchor(f.to);
-      if (!a || !b || !air) return Promise.resolve();
-      const path = svg("path", {class: "way", d: arc(a, b, lift * (raft ? 0.45 : 1))}, air);
-      return f.spark ? spark(path) : wing(path, {size: f.size, failed: f.failed, cls: raft ? `raft ${f.kind}` : ""});
-    };
-    if (raft) {
-      raftInAir++;
-      const flight = go();
-      flight.finally(() => raftInAir--);
-      return flight;
-    }
-    const start = lastStart.then(() => sleep(70));
-    lastStart = start;
-    const flight = start.then(go);
-    flights.add(flight);
-    flight.finally(() => flights.delete(flight));
-    return flight;
+  // Where a spot is on the town as drawn now.
+  function point(s) {
+    if (s.client) return client?.perch ?? null;
+    if ("node" in s) return loftOf(s.node)?.door ?? null;
+    const n = cards.get(s.store);
+    return !n ? null : s.sign ? n.sign : windowAt(n, s.i);
   }
-  // Every pigeon of yours or the node's in the air has landed.
-  const landed = () => Promise.all([...flights]);
-
-  // A spark along a way: a heartbeat.
-  function spark(path) {
-    return new Promise(done => {
-      const dot = svg("circle", {class: "spark", r: 2.6}, air),
-        len = path.getTotalLength(),
-        t0 = performance.now();
-      const step = now => {
-        const k = Math.min(1, (now - t0) / 700);
-        if (!path.isConnected || k >= 1) {
-          path.remove();
-          dot.remove();
-          done();
-          return;
-        }
-        const pt = path.getPointAtLength(len * k);
-        dot.setAttribute("cx", pt.x.toFixed(1));
-        dot.setAttribute("cy", pt.y.toFixed(1));
-        requestAnimationFrame(step);
-      };
-      requestAnimationFrame(step);
-    });
-  }
-
-  // One pigeon along `path` (its own: gone with it).
-  function wing(path, {size = 4096, failed = false, cls = ""}) {
-    return new Promise(done => {
-      const end = () => {
-        path.remove();
-        bird.g.remove();
-        done();
-      };
-      const len = path.getTotalLength();
-      const scale = (0.5 + Math.min(0.35, Math.log2(1 + size / 4096) / 12)) * (el.classList.contains("tall") ? 0.8 : 1);
-      const bird = flying(air, {class: `flight${failed ? " failed" : ""}${cls ? ` ${cls}` : ""}`});
-      const t0 = performance.now(),
-        dur = Math.min(1400, 450 + len * 1.1);
-      // Which way it faces, once for the flight; a failed one turns round at the far end.
-      const a = path.getPointAtLength(0),
-        b = path.getPointAtLength(len);
-      const facing = b.x - a.x < 0 ? -1 : 1;
-      let mark = null;
-      const step = now => {
-        // Redrawn under it: its place is gone, so is the pigeon.
-        if (!path.isConnected || !air.isConnected) {
-          end();
-          return;
-        }
-        // A soft start and landing.
-        const k = Math.max(0, Math.min(1, (now - t0) / dur)),
-          e = k - (Math.sin(2 * Math.PI * k) / (2 * Math.PI)) * 0.5;
-        const pos = failed ? 0.88 * (1 - Math.abs(1 - 2 * e)) : e;
-        const along = len * pos,
-          returning = failed && e > 0.5,
-          ahead = returning ? -3 : 3;
-        const pt = path.getPointAtLength(along),
-          p0 = path.getPointAtLength(Math.max(0, Math.min(len, along - ahead))),
-          p1 = path.getPointAtLength(Math.max(0, Math.min(len, along + ahead)));
-        const face = returning ? -facing : facing;
-        const tilt = Math.max(-35, Math.min(35, (Math.atan2(p1.y - p0.y, (p1.x - p0.x) * face) * 180) / Math.PI));
-        bird.g.setAttribute("transform", `translate(${pt.x.toFixed(1)},${pt.y.toFixed(1)}) scale(${face * scale},${scale}) rotate(${tilt.toFixed(1)})`);
-        // Flapping off and in to land, on a long way gliding a while between.
-        const phase = Math.max(0, now - t0) / 450;
-        if (dur > 1000 && e > 0.3 && e < 0.72 && Math.floor(phase) % 3) glide(bird);
-        else beat(bird, phase % 1);
-        if (returning && !mark) mark = svg("circle", {class: "failed-mark", cx: 14, cy: -16, r: 3.4}, bird.g);
-        if (k < 1) requestAnimationFrame(step);
-        else end();
-      };
-      requestAnimationFrame(step);
-    });
-  }
-
-  // A pigeon landed: its window lights up as the count comes (setTotal).
-  function bump() {}
+  const pigeons = makePigeons({spot, point, lift: () => lift, small: () => el.classList.contains("tall")});
 
   // ---- the first boot: nodes and ways come up one by one
   function hideAll() {
@@ -457,9 +355,8 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     setChannels,
     setObjects,
     setQueue,
-    fly,
-    landed,
-    bump,
+    fly: pigeons.fly,
+    landed: pigeons.landed,
     hideAll,
     reveal,
     showAll,
