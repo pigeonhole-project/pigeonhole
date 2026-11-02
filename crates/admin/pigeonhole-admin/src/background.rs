@@ -34,6 +34,10 @@ impl Admin {
             .filter(|t| ["repair", "sweep", "cool", "snapshot"].contains(&t.task))
             .map(|t| json!({ "task": t.task, "every": t.every, "next_in_ms": t.next_in_ms, "work": work(t.task) }))
             .collect();
-        Ok(json!({ "tasks": tasks, "snapshot": { "head": head, "base": base, "every": self.snapshot_every } }))
+        // `at`: the newest snapshot's position (the entries count from it); `base`: where the log starts.
+        let at = self.meta.snapshot_position().unwrap_or(base);
+        Ok(
+            json!({ "tasks": tasks, "snapshot": { "head": head, "base": base, "at": at, "every": self.snapshot_every } }),
+        )
     }
 }

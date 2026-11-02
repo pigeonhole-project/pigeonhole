@@ -943,6 +943,12 @@ impl MetaStore {
         self.shared.based.load(Ordering::SeqCst)
     }
 
+    /// The position this node's newest snapshot holds the tablet at; the
+    /// next by entries comes so many after it. `None`: none taken yet.
+    pub fn snapshot_position(&self) -> Option<Position> {
+        self.shared.current.lock().unwrap().as_ref().map(raft::CurrentSnapshot::at)
+    }
+
     /// When snapshots outlive the log ([`MetaOptions::snapshots_outlive_log`]):
     /// [`Self::base_position`], the least a lossy restore brings back.
     /// `None` when there is no such restore.

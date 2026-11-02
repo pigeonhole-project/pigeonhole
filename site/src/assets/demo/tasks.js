@@ -3,7 +3,7 @@
 // run now. They live in the dovecote's windows and in the loft's panel.
 //
 // The op's reply: {tasks: [{task, every: "10s" | "off", next_in_ms, work: [...]}],
-//                  snapshot: {head, base, every}}.
+//                  snapshot: {head, base, at: the newest snapshot's position, every}}.
 import {activate, button, h, svg} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {boarded, perched} from "./art.js";
@@ -43,7 +43,8 @@ export function describe(bg, name) {
   const toNext = period && task.next_in_ms != null ? 1 - Math.min(1, task.next_in_ms / period) : 0;
   let n, of, work, base;
   if (name === "snapshot") {
-    base = bg.snapshot.base;
+    // Counted from the newest snapshot (a hand-run one too), not the log's start.
+    base = bg.snapshot.at ?? bg.snapshot.base;
     n = Math.max(0, bg.snapshot.head - base);
     of = bg.snapshot.every || undefined;
     work = t(of ? "bg.entries_short" : "bg.entries_since", {n, of});
