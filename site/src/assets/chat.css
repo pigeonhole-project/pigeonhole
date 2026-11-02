@@ -38,6 +38,24 @@
   width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; flex: none;
   color: #fff; font-weight: 600; font-size: 16px; background: linear-gradient(#72d5fd, #2a9ef1);
 }
+.chat-box { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.chat-new[hidden] { display: none; }
+/* Telegram: a round button low on the right, the count on it. */
+.tg-new {
+  position: absolute; right: 16px; bottom: 14px; width: 48px; height: 48px; border-radius: 50%; border: 0;
+  background: var(--tg-bar); color: var(--tg-sub); display: grid; place-items: center; cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0,0,0,.25);
+}
+.tg-new .ic { width: 26px; height: 26px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.tg-new .chat-new-n {
+  position: absolute; top: -8px; left: 50%; transform: translateX(-50%); min-width: 22px; height: 22px; padding: 0 6px;
+  border-radius: 11px; background: var(--tg-accent); color: #fff; font-size: 12.5px; font-weight: 600; line-height: 22px;
+}
+/* Discord: a bar along the bottom of the messages. */
+.dc-new {
+  position: absolute; left: 16px; right: 16px; bottom: 0; display: flex; justify-content: space-between; align-items: center;
+  padding: 4px 12px; border: 0; border-radius: 8px 8px 0 0; background: #5865f2; color: #fff; font: inherit; font-size: 14px; cursor: pointer;
+}
 .tg-chat { flex: 1; overflow: auto; background: var(--tg-wall); padding: 14px 18px; display: flex; flex-direction: column; gap: 6px; }
 .tg-empty { margin: auto; padding: 6px 12px; border-radius: 12px; background: rgba(0,0,0,.25); color: #fff; font-size: 14px; }
 .tg-post {

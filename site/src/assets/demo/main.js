@@ -7,7 +7,7 @@ import {bytes, t, tHtml} from "../lib/i18n.js";
 import {s3Sentence} from "../lib/say.js";
 import {appOf} from "./channels.js";
 import {chatView} from "./chat/index.js";
-import {forgetPlaces} from "./chat/parts.js";
+import {forgetPlaces} from "./chat/scroll.js";
 import {clientView} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {readEvents} from "./events.js";

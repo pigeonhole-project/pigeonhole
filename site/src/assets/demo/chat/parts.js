@@ -64,34 +64,4 @@ export function deletable(el, onDelete) {
   });
 }
 
-// Where the reader is in each channel's chat they scrolled or clicked in:
-// the post at the top of the view (`data-id`), how far below its top.
-const places = new Map();
-
-// A channel's chat once it is on the page: at its newest post until the
-// reader scrolls it or clicks in it, then where they left it, whatever came
-// in or fell off since. `store` null: at its newest post always.
-export function scrolled(chat, store) {
-  requestAnimationFrame(() => {
-    const place = store != null && places.get(store);
-    const anchor = place && [...chat.querySelectorAll("[data-id]")].find(el => el.dataset.id === place.id);
-    if (anchor) chat.scrollTop += anchor.getBoundingClientRect().top - chat.getBoundingClientRect().top - place.offset;
-    else chat.scrollTop = chat.scrollHeight;
-    if (store == null) return;
-    // The scroll just made is not the reader's.
-    const ours = chat.scrollTop;
-    chat.addEventListener("scroll", () => Math.abs(chat.scrollTop - ours) >= 1 && remember(chat, store), {passive: true});
-    chat.addEventListener("click", () => remember(chat, store));
-  });
-}
-
-function remember(chat, store) {
-  const top = chat.getBoundingClientRect().top;
-  const first = [...chat.querySelectorAll("[data-id]")].find(el => el.getBoundingClientRect().bottom > top);
-  if (first) places.set(store, {id: first.dataset.id, offset: first.getBoundingClientRect().top - top});
-}
-
-// A channel opened anew: at its newest post again.
-export const forgetPlaces = () => places.clear();
-
 export const flags = m => (m.fresh ? " fresh" : "") + (m.quiet ? " service" : "");

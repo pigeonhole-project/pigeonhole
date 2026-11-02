@@ -2,7 +2,8 @@
 
 import {h, icon} from "../../lib/dom.js";
 import {bytes, t} from "../../lib/i18n.js";
-import {chatStart, deletable, flags, frameNotes, hhmm, ICON_DOWN, ICON_EYE, ICON_PIN, notes, scrolled} from "./parts.js";
+import {chatStart, deletable, flags, frameNotes, hhmm, ICON_DOWN, ICON_EYE, ICON_PIN, notes} from "./parts.js";
+import {scrolled} from "./scroll.js";
 
 export function telegramView(c, model, onDelete, follow) {
   const head = h("div", "tg-head");
@@ -17,8 +18,10 @@ export function telegramView(c, model, onDelete, follow) {
   const app = h("div", "app tg");
   app.append(head);
   if (model.pins) app.append(pinBar(model.pinned));
-  app.append(chat, h("div", "tg-input", t("demo.tg_broadcast")));
-  scrolled(chat, follow ? null : c.store);
+  const box = h("div", "chat-box");
+  box.append(chat);
+  app.append(box, h("div", "tg-input", t("demo.tg_broadcast")));
+  scrolled(chat, box, follow ? null : c.store, "tg");
   return app;
 }
 

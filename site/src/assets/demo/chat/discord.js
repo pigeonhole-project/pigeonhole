@@ -2,7 +2,8 @@
 
 import {h, icon} from "../../lib/dom.js";
 import {bytes, t} from "../../lib/i18n.js";
-import {chatStart, deletable, flags, hhmm, ICON_DOC, ICON_PIN, notes, scrolled} from "./parts.js";
+import {chatStart, deletable, flags, hhmm, ICON_DOC, ICON_PIN, notes} from "./parts.js";
+import {scrolled} from "./scroll.js";
 
 // Discord runs one author's messages together within a few minutes.
 const GROUP_MS = 7 * 60 * 1000;
@@ -27,8 +28,10 @@ export function discordView(c, model, onDelete, follow) {
   }
 
   const app = h("div", "app dc");
-  app.append(head, chat, h("div", "dc-input", t("demo.dc_message", {store: c.store})));
-  scrolled(chat, follow ? null : c.store);
+  const box = h("div", "chat-box");
+  box.append(chat);
+  app.append(head, box, h("div", "dc-input", t("demo.dc_message", {store: c.store})));
+  scrolled(chat, box, follow ? null : c.store, "dc");
   return app;
 }
 
