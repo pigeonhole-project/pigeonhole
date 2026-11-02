@@ -6,7 +6,6 @@ Pages are templates in site/src with placeholders:
     {{key}}           a string from site/i18n/<lang>.json (may hold HTML)
     {{@root}}         the path to the site root from this page ("" or "../")
     {{@lang}}         en | ru
-    {{@stat:name}}    a number counted from the repository at build time
     {{@trace:name}}   site/traces/<name>.json, as a JS object literal
     {{@js}}           the i18n strings whose keys start with "js.", as JSON
 
@@ -21,40 +20,12 @@ import hashlib
 import json
 import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 SITE = Path(__file__).resolve().parent
 ROOT = SITE.parent
 LANGS = {"en": "", "ru": "ru/"}
-
-
-def stats() -> dict[str, int]:
-    sys.path.insert(0, str(ROOT / "scripts"))
-    import code_report as cr
-
-    rust = tests = 0
-    crates = cr.workspace()
-    for c in crates:
-        for f in c.files:
-            rust += sum(cr.scan(f).code)
-            tests += len(re.findall(r"#\[(?:tokio::|madsim::)?test\b", f.read_text(errors="replace")))
-    git = lambda *a: subprocess.run(["git", *a], cwd=ROOT, text=True, capture_output=True, check=True).stdout
-    dates = set(git("log", "--format=%ad", "--date=short").split())
-    return {
-        "commits": int(git("rev-list", "--count", "HEAD")),
-        "days": len(dates),
-        "rust": rust,
-        "crates": len(crates),
-        "tests": tests,
-        "docs": len(list((ROOT / "docs").glob("*.md"))),
-    }
-
-
-def fmt_stat(n: int, lang: str) -> str:
-    s = f"{n:,}"
-    return s.replace(",", " " if lang == "ru" else ",")
 
 
 ASSETS_VERSION = ""
@@ -71,7 +42,7 @@ def assets_version() -> str:
     return h.hexdigest()[:10]
 
 
-def render(tpl: str, lang: str, prefix: str, strings: dict, st: dict) -> str:
+def render(tpl: str, lang: str, prefix: str, strings: dict) -> str:
     root = "../" * prefix.count("/")
 
     def sub(m: re.Match) -> str:
@@ -82,8 +53,6 @@ def render(tpl: str, lang: str, prefix: str, strings: dict, st: dict) -> str:
             return lang
         if key == "@js":
             return json.dumps({k[3:]: v for k, v in strings.items() if k.startswith("js.")}, ensure_ascii=False)
-        if key.startswith("@stat:"):
-            return fmt_stat(st[key[6:]], lang)
         if key.startswith("@trace:"):
             return (SITE / "traces" / f"{key[7:]}.json").read_text().strip()
         if key not in strings:
@@ -111,7 +80,6 @@ def main() -> int:
 
     global ASSETS_VERSION
     ASSETS_VERSION = assets_version()
-    st = stats()
     if args.out.exists():
         shutil.rmtree(args.out)
     shutil.copytree(SITE / "src" / "assets", args.out / "assets")
@@ -127,7 +95,7 @@ def main() -> int:
         for page in pages:
             out = args.out / prefix / page.name
             out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(render(page.read_text(), lang, prefix, strings, st))
+            out.write_text(render(page.read_text(), lang, prefix, strings))
             print(out)
     return 0
 
