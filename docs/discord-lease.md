@@ -134,8 +134,12 @@ larger than in entries.
 
 ## Also covered by the lease
 
-- **The sweeper.** It deletes only under a lease: before each delete batch it
-  checks the same local deadline as an append. Open question: a delete
+- **The sweeper.** It deletes only under a lease: before each delete batch
+  `confirm_active` runs the log's `confirm`, which keeps the lease as a
+  write does (renews once a third is gone, waits for the renewal after two
+  thirds) and checks the same local deadline as an append. An idle writer
+  whose lease ran out says no unless its renewal links in time: a claimant
+  may already be reading the tail it would judge deletes by. Open question: a delete
   request that hangs and lands after the expiry. Today's design has the same
   hole for any deposed writer's in-flight delete; see
   [sweep-invariants.md](sweep-invariants.md).
@@ -202,8 +206,14 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
   `Chain` subtrait in pigeonhole-storage-api), so a lease on any other store
   does not compile:
   - `stamp_ms`: Discord's snowflake time;
+  - `now_ms`: the store's clock now, for a claimant's wait (below);
   - `put_unlinked`: a member's name, no thread;
   - `list_after`: list newer blobs by label.
+
+  A lease store's chain holds lease records only (a claim decodes the tail
+  as one), so its `put_loose` must be a plain post, not a linked member as
+  `Chain`'s default is: a snapshot in the log's channel would otherwise
+  become the tail and break the next claim. The `LeaseChain` docs say so.
 
   Other stores keep the link-per-batch log.
   `[meta] lease = "off"` turns the lease off for Discord too.
@@ -215,7 +225,15 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
     on;
   - only after two thirds does a write wait for it;
   - a renewal names the writer's tip as a hint, but batches keep naming
-    batches: a renewal in flight cannot fork the log.
+    batches: a renewal in flight cannot fork the log;
+  - the newest lease record (`held`, with its local send time) and the
+    renewal in flight sit under one lock, so a write never sees a renewal
+    finished but `held` not yet moved on (it would renew after a record
+    that already has a successor);
+  - a renewal that loses to the writer's own renewal goes on after it,
+    bounded by the older record's send time (the winner was sent after it),
+    instead of stopping the tablet. A renewal never goes on after its own
+    release.
 
   A reader's tip under a renewal is the newest batch after that hint stamped
   inside the renewal's lease. Under a claim it is the newest batch after the
@@ -223,8 +241,9 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
 - **No background renewer when idle.** An idle writer's lease runs out. Its
   next write waits for a renewal: the compare-and-set after its last record
   either wins, and it holds again, or loses to a claim, and it is fenced.
-- **A claimant's wait** is measured by probes: a loose `log-probe` message,
-  its stamp read, deleted right after. Two posts per probe, a few per claim.
+- **A claimant's wait** is measured by probes (`LeaseChain::now_ms`): a
+  plain text message (no blob, outside the chain), its snowflake read,
+  deleted right after. Two calls per probe, a few per claim.
 - **Collection** never prunes below the newest lease record: it is the
   chain's tail.
 - **Metrics**: `pigeonhole_meta_lease_wait_seconds{reason}`, where `renew`

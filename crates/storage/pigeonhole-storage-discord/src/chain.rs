@@ -34,6 +34,8 @@ use bytes::Bytes;
 use pigeonhole_storage_api::{After, BlobBackend, Chain, LeaseChain, Linked};
 
 const ANCHOR: &str = "chain-anchor.bin";
+/// The text of a clock probe ([`LeaseChain::now_ms`]).
+const PROBE: &str = "clock probe";
 /// Thread names hold 100 characters.
 const THREAD_NAME_MAX: usize = 100;
 
@@ -316,6 +318,17 @@ impl<A: DiscordApi> LeaseChain for DiscordBlobStore<A> {
     /// A snowflake's millisecond timestamp.
     fn stamp_ms(&self, id: &DiscordId) -> u64 {
         crate::snowflake::snowflake_timestamp_ms(id.message_id)
+    }
+
+    /// A probe: a plain text message (no blob, so no reader takes it for
+    /// one), its snowflake read, deleted right after. The `Date` header has
+    /// whole seconds only (docs/discord-lease.md § Spike findings).
+    async fn now_ms(&self) -> Result<u64> {
+        let probe = self.api.send(PROBE, None, &Self::nonce()).await?.id;
+        if let Err(e) = self.api.delete_messages(&[probe]).await {
+            tracing::debug!(store = %self.instance().id, message_id = probe, error = %format!("{e:#}"), "a clock probe stays");
+        }
+        Ok(crate::snowflake::snowflake_timestamp_ms(probe))
     }
 
     /// Named like a member (`<label>~<prev>.bin`), so pruned like one, but

@@ -57,6 +57,13 @@ impl Lease {
     pub fn new(duration: Duration) -> Self {
         Self { duration, margin: Duration::from_secs(1).min(duration / 4) }
     }
+
+    /// The writer's local deadline under a lease record it sent at `sent`:
+    /// the send precedes the store's stamp, so it never falls after the
+    /// real expiry.
+    fn deadline(&self, sent: Instant) -> Instant {
+        sent + self.duration.saturating_sub(self.margin)
+    }
 }
 
 /// What a lease log needs of its store beyond [`Chain`]: [`LeaseChain`],
@@ -65,6 +72,7 @@ impl Lease {
 #[async_trait]
 trait LeaseStore<Id>: Send + Sync {
     fn stamp_ms(&self, id: &Id) -> u64;
+    async fn now_ms(&self) -> anyhow::Result<u64>;
     async fn put_unlinked(&self, prev: &Id, label: &str, data: Bytes) -> anyhow::Result<Id>;
     async fn list_after(&self, after: Option<&Id>, prefix: &str) -> anyhow::Result<Vec<Linked<Id>>>;
 }
@@ -73,6 +81,9 @@ trait LeaseStore<Id>: Send + Sync {
 impl<C: LeaseChain> LeaseStore<C::Id> for C {
     fn stamp_ms(&self, id: &C::Id) -> u64 {
         LeaseChain::stamp_ms(self, id)
+    }
+    async fn now_ms(&self) -> anyhow::Result<u64> {
+        LeaseChain::now_ms(self).await
     }
     async fn put_unlinked(&self, prev: &C::Id, label: &str, data: Bytes) -> anyhow::Result<C::Id> {
         LeaseChain::put_unlinked(self, prev, label, data).await
@@ -149,7 +160,12 @@ impl<Id: Serialize + for<'de> Deserialize<'de>> ChainDoc<Id> {
         if format != LOG_FORMAT {
             return Err(LogError::Lost(format!("log blob in format {format}, this binary reads {LOG_FORMAT}")));
         }
-        postcard::from_bytes(data).map_err(|e| LogError::Lost(format!("log blob: {e}")))
+        let doc: Self = postcard::from_bytes(data).map_err(|e| LogError::Lost(format!("log blob: {e}")))?;
+        // Every batch starts after position 0 (`head_position` counts on it).
+        if doc.batch.first == 0 {
+            return Err(LogError::Lost("log blob with a batch at position 0".into()));
+        }
+        Ok(doc)
     }
 }
 
@@ -247,11 +263,16 @@ struct State<Id> {
     /// The chain's tail as last read (by `discover`, or a claim fenced by
     /// it): the next claim puts after it without looking for it again.
     tail: Option<Id>,
+    /// A lease log's renewal in flight, off the writes' path. Under the
+    /// same lock as the owner's `held`, which the renewal moves on when it
+    /// links: read apart, a renewal finishing in between would leave a
+    /// writer renewing after a record that already has its successor.
+    renewing: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<Id> Default for State<Id> {
     fn default() -> Self {
-        Self { owner: None, seen: None, tail: None }
+        Self { owner: None, seen: None, tail: None, renewing: None }
     }
 }
 
@@ -271,8 +292,6 @@ pub struct ChainLogStore<C: Chain> {
     state: Arc<Mutex<State<C::Id>>>,
     /// One write at a time.
     writing: tokio::sync::Mutex<()>,
-    /// A lease log's renewal in flight, off the writes' path.
-    renewing: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The collection after the last rebase, in the background: on a chat
     /// it deletes one message (and thread) at a time, and the log's writer
     /// must not wait for it. Ends with the store.
@@ -285,7 +304,7 @@ impl<C: Chain> Drop for ChainLogStore<C> {
         if let Some(task) = self.collecting.lock().unwrap().take() {
             task.abort();
         }
-        if let Some(task) = self.renewing.lock().unwrap().take() {
+        if let Some(task) = self.state.lock().unwrap().renewing.take() {
             task.abort();
         }
     }
@@ -293,14 +312,7 @@ impl<C: Chain> Drop for ChainLogStore<C> {
 
 impl<C: Chain> ChainLogStore<C> {
     pub fn new(chain: Arc<C>) -> Self {
-        Self {
-            chain,
-            lease: None,
-            state: Arc::default(),
-            writing: Default::default(),
-            renewing: Mutex::default(),
-            collecting: Mutex::default(),
-        }
+        Self { chain, lease: None, state: Arc::default(), writing: Default::default(), collecting: Mutex::default() }
     }
 
     /// Hold the log by `lease`.
@@ -312,21 +324,11 @@ impl<C: Chain> ChainLogStore<C> {
         self
     }
 
-    /// The store's time now: the stamp of a probe blob, deleted after.
-    async fn store_now(&self, l: &Leased<C::Id>) -> LogResult<u64> {
-        let probe = self.chain.put_loose(None, "log-probe", Bytes::from_static(&[0])).await?;
-        let now = l.store.stamp_ms(&probe);
-        if let Err(e) = self.chain.delete(&[C::key(&probe)]).await {
-            tracing::debug!(error = %format!("{e:#}"), "a lease probe stays");
-        }
-        Ok(now)
-    }
-
-    /// Return once the store's clock is past `ms`.
+    /// Return once the store's clock ([`LeaseChain::now_ms`]) is past `ms`.
     async fn wait_past(&self, l: &Leased<C::Id>, ms: u64) -> LogResult<()> {
         let mut said = false;
         loop {
-            let now = self.store_now(l).await?;
+            let now = l.store.now_ms().await?;
             if now > ms {
                 return Ok(());
             }
@@ -403,21 +405,24 @@ impl<C: Chain> ChainLogStore<C> {
     /// newest lease record in the background (a thread may wait seconds for
     /// the pacer); once two thirds are gone, wait for that renewal.
     async fn keep_lease(&self, gen: u64, lease: Lease) -> LogResult<()> {
-        let Some((record, sent)) = self.held(gen) else { return Ok(()) };
-        let age = sent.elapsed();
-        if age < lease.duration / 3 {
-            return Ok(());
-        }
         let task = {
-            let mut renewing = self.renewing.lock().unwrap();
-            if renewing.as_ref().is_none_or(|t| t.is_finished()) {
-                *renewing =
-                    Some(tokio::spawn(renew(self.chain.clone(), self.state.clone(), gen, record).in_current_span()));
+            // `held` and `renewing` under one lock: a finished renewal has
+            // moved `held` on before it ended.
+            let mut state = self.state.lock().unwrap();
+            let held = state.owner.as_ref().filter(|o| o.gen == gen).and_then(|o| o.held.clone());
+            let Some((record, sent)) = held else { return Ok(()) };
+            let age = sent.elapsed();
+            if age < lease.duration / 3 {
+                return Ok(());
+            }
+            if state.renewing.as_ref().is_none_or(|t| t.is_finished()) {
+                let task = renew(self.chain.clone(), self.state.clone(), gen, record);
+                state.renewing = Some(tokio::spawn(task.in_current_span()));
             }
             if age < lease.duration * 2 / 3 {
                 return Ok(());
             }
-            renewing.take()
+            state.renewing.take()
         };
         if let Some(task) = task {
             let t0 = Instant::now();
@@ -561,6 +566,30 @@ impl<C: Chain> ChainLogStore<C> {
         }
     }
 
+    /// No newer claim linked after our newest blob of the chain.
+    async fn confirm_no_successor(&self, gen: u64) -> LogResult<()> {
+        let (_, tip) = self.owned(gen)?;
+        // A lease log links only lease records: look from the newest.
+        let Some(mut at) = self.held(gen).map(|(id, _)| id).or_else(|| tip.at.map(|a| a.id)) else {
+            return Err(LogError::Other(anyhow!("generation {gen} holds no blob of the chain")));
+        };
+        // A successor of our own generation is our own append, linked but
+        // not yet in `tip` (only this handle writes `gen`): look past it.
+        loop {
+            match self.chain.successor(&at).await? {
+                None => return Ok(()),
+                Some(next) if label_gen(&next.label) == Some(gen) => at = next.id,
+                Some(next) => {
+                    let e = Self::fenced_by(&next.label, gen);
+                    if let LogError::Fenced { current } = e {
+                        self.fail(Failed::Fenced(current));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     /// Put `w` as generation `gen` after the owner's tip.
     async fn write(&self, gen: u64, w: Write) -> LogResult<Tip<C::Id>> {
         let _one = self.writing.lock().await;
@@ -591,7 +620,7 @@ impl<C: Chain> ChainLogStore<C> {
         let put = match (&self.lease, self.held(gen), prev) {
             (Some(l), Some((_, sent)), Some(prev)) => {
                 // Kept only if the store answered inside the lease.
-                let deadline = sent + l.lease.duration.saturating_sub(l.lease.margin);
+                let deadline = l.lease.deadline(sent);
                 match l.store.put_unlinked(prev, &label(Kind::Batch, gen), Bytes::from(bytes)).await {
                     Ok(_) if Instant::now() >= deadline => {
                         self.fail(Failed::Broken("a batch was answered after the lease's deadline".into()));
@@ -666,9 +695,10 @@ async fn lease_record<C: Chain>(
             o.held = Some((id, sent));
             return true;
         }
-        // Our own renewal, linked by a task cut short: go on after it.
-        Ok(After::Lost(winner)) if label_gen(&winner.label) == Some(gen) && kind == Kind::Release => {
-            o.held = Some((winner.id, sent));
+        // Our own renewal took the place (one cut short by a release, or one
+        // that ended just before this one started): go on after it.
+        Ok(After::Lost(winner)) if own_successor(&winner.label, gen, kind) => {
+            go_on_after::<C>(o, &record, winner.id);
         }
         Ok(After::Lost(winner)) => {
             let failed = match label_gen(&winner.label) {
@@ -682,6 +712,25 @@ async fn lease_record<C: Chain>(
         }
     }
     false
+}
+
+/// Whether a lease record of `kind` that lost to `winner` lost to its own
+/// writer's renewal (and goes on after it); a renewal never goes on after a
+/// release.
+fn own_successor(winner: &str, gen: u64, kind: Kind) -> bool {
+    label_gen(winner) == Some(gen) && (kind == Kind::Release || winner != label(Kind::Release, gen))
+}
+
+/// Hold by `winner`, our own renewal linked after `record`, unless `held`
+/// has already moved on past `record`. Its lease runs from its stamp, which
+/// follows the send of `record` (it was put after `record` linked): that
+/// send time is a safe local bound for it.
+fn go_on_after<C: Chain>(o: &mut Owner<C::Id>, record: &C::Id, winner: C::Id) {
+    if let Some((held, sent)) = &o.held {
+        if C::key(held) == C::key(record) {
+            o.held = Some((winner, *sent));
+        }
+    }
 }
 
 #[async_trait]
@@ -795,27 +844,19 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         self.write(gen, w).await.map(|_| ())
     }
 
-    /// Nothing linked after our tip: no newer claim.
+    /// Nothing linked after our tip: no newer claim. A lease log also keeps
+    /// the lease and checks its local deadline, as an append does: past it
+    /// a claimant may already be reading the tail.
     async fn confirm(&self, gen: u64) -> LogResult<()> {
-        let (_, tip) = self.owned(gen)?;
-        // A lease log links only lease records: look from the newest.
-        let Some(mut at) = self.held(gen).map(|(id, _)| id).or_else(|| tip.at.map(|a| a.id)) else {
-            return Err(LogError::Other(anyhow!("generation {gen} holds no blob of the chain")));
-        };
-        // A successor of our own generation is our own append, linked but
-        // not yet in `tip` (only this handle writes `gen`): look past it.
-        loop {
-            match self.chain.successor(&at).await? {
-                None => return Ok(()),
-                Some(next) if label_gen(&next.label) == Some(gen) => at = next.id,
-                Some(next) => {
-                    let e = Self::fenced_by(&next.label, gen);
-                    if let LogError::Fenced { current } = e {
-                        self.fail(Failed::Fenced(current));
-                    }
-                    return Err(e);
-                }
-            }
+        if let Some(l) = &self.lease {
+            let _one = self.writing.lock().await;
+            self.keep_lease(gen, l.lease).await?;
+        }
+        self.confirm_no_successor(gen).await?;
+        match (&self.lease, self.held(gen)) {
+            (None, _) => Ok(()),
+            (Some(l), Some((_, sent))) if Instant::now() < l.lease.deadline(sent) => Ok(()),
+            (Some(_), _) => Err(LogError::Other(anyhow!("generation {gen}'s lease ran out (confirm)"))),
         }
     }
 
@@ -910,7 +951,8 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             return Ok(());
         }
         let _one = self.writing.lock().await;
-        if let Some(task) = self.renewing.lock().unwrap().take() {
+        let renewing = self.state.lock().unwrap().renewing.take();
+        if let Some(task) = renewing {
             task.abort();
         }
         for _ in 0..4 {

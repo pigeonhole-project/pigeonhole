@@ -254,3 +254,64 @@ async fn confirm_looks_past_our_own_append_in_flight() {
     mem.put_after(Some(&ours), "log-claim-2", Bytes::from_static(b"claim")).await.unwrap();
     assert!(matches!(a.confirm(1).await, Err(LogError::Fenced { current: 2 })));
 }
+
+/// The claim's id, held as a lease log's newest record sent at `sent`.
+fn hold_claim(log: &ChainLogStore<MemoryBlobStore>, sent: Instant) -> <MemoryBlobStore as BlobBackend>::Id {
+    let mut state = log.state.lock().unwrap();
+    let o = state.owner.as_mut().unwrap();
+    let claim = o.tip.at.clone().unwrap().id;
+    o.held = Some((claim.clone(), sent));
+    claim
+}
+
+/// A renewal that loses to our own earlier renewal (one that ended just
+/// before this one was spawned) goes on after it, with the older send time
+/// as its bound; it does not stop the writer.
+#[tokio::test]
+async fn a_renewal_lost_to_our_own_goes_on_after_it() {
+    let mem = Arc::new(MemoryBlobStore::new());
+    let a = store(&mem);
+    a.claim(1).await.unwrap();
+    let sent = Instant::now();
+    let claim = hold_claim(&a, sent);
+    let After::Won(first) = mem.put_after(Some(&claim), "log-renew-1", Bytes::from_static(b"r1")).await.unwrap() else {
+        panic!("the claim has no successor yet")
+    };
+    assert!(!lease_record(a.chain.clone(), a.state.clone(), 1, claim, Kind::Renew).await);
+    assert_eq!(a.held(1), Some((first.clone(), sent)));
+    a.owned(1).expect("not marked failed");
+    // The next renewal links after it.
+    assert!(lease_record(a.chain.clone(), a.state.clone(), 1, first, Kind::Renew).await);
+    a.owned(1).unwrap();
+}
+
+/// A renewal never goes on after our own release: the writer is done.
+#[tokio::test]
+async fn a_renewal_lost_to_our_own_release_stops() {
+    let mem = Arc::new(MemoryBlobStore::new());
+    let a = store(&mem);
+    a.claim(1).await.unwrap();
+    let claim = hold_claim(&a, Instant::now());
+    mem.put_after(Some(&claim), "log-release-1", Bytes::from_static(b"rel")).await.unwrap();
+    assert!(!lease_record(a.chain.clone(), a.state.clone(), 1, claim, Kind::Renew).await);
+    assert!(a.owned(1).is_err());
+}
+
+/// A forged blob whose batch starts at 0 is not a log blob (its head
+/// position would underflow).
+#[test]
+fn a_batch_at_position_zero_is_not_a_log_blob() {
+    let doc = ChainDoc::<u64> {
+        format: LOG_FORMAT,
+        log_id: LogId(1),
+        gen: 1,
+        claim: false,
+        prev: None,
+        base: None,
+        older: Vec::new(),
+        vote: None,
+        head_term: 0,
+        batch: Batch::new(1, 0, Vec::new()),
+    };
+    assert!(matches!(ChainDoc::<u64>::decode(&doc.encode()), Err(LogError::Lost(_))));
+}
