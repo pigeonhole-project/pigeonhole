@@ -187,10 +187,13 @@ const tip = (() => {
 // ---- the loft's panel: a card per task in `box`, updated in place (a
 // poll keeps the focus where it was). onToggle(name, on), onRun(name);
 // `follower`: why the leader's tasks are not here (a follower runs none of
-// them), shown above; its snapshots are its own. Returns update(bg).
+// them; nodes, its links among them), shown above; its snapshots are its
+// own. Returns update(bg).
 export function taskCards(box, {onToggle, onRun, follower = null}) {
   const cards = TASKS.map(name => taskCard(name, onToggle, onRun, !!follower));
-  box.replaceChildren(...(follower ? [h("p", "field-note tasks-ro", follower)] : []), ...cards.map(c => c.el));
+  const note = h("p", "field-note tasks-ro");
+  if (follower) note.append(...follower);
+  box.replaceChildren(...(follower ? [note] : []), ...cards.map(c => c.el));
   return bg => {
     for (const c of cards) c.update(describe(bg, c.name));
   };

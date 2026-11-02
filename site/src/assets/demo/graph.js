@@ -291,6 +291,12 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     }
   }
 
+  // A thing pointed at elsewhere (a link: entities.js), marked; null: none.
+  const highlight = target => {
+    const marked = target && nodeOf(target);
+    for (const n of [client, ...lofts.values(), ...cards.values()]) n?.g.classList.toggle("hl", n === marked);
+  };
+
   const markOpen = target => {
     const open = nodeOf(target);
     for (const n of [client, ...lofts.values(), ...cards.values()]) n?.g.classList.toggle("open", n === open);
@@ -387,6 +393,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     draw,
     setNodes,
     markOpen,
+    highlight,
     focus,
     setTotal,
     setChannels,

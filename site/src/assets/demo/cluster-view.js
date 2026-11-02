@@ -9,8 +9,9 @@
 // on: {restart(text), erase()}.
 // Returns {nodes, update(data), setError(text)}.
 import {h} from "../lib/dom.js";
-import {t, tHtml} from "../lib/i18n.js";
+import {t} from "../lib/i18n.js";
 import {configView} from "./config-view.js";
+import {nodeLink, sentence} from "./entities.js";
 
 export function clusterView(data, on) {
   const table = h("div", "cluster-nodes"),
@@ -25,10 +26,9 @@ export function clusterView(data, on) {
       ...d.chronicle
         .slice()
         .reverse()
-        .map(({at, sentence}) => {
+        .map(({at, sentence: said}) => {
           const li = h("li", "");
-          li.innerHTML = tHtml(...sentence);
-          li.prepend(h("span", "chronicle-at", t("time.ago", {s: Math.round((performance.now() - at) / 1000)})));
+          li.append(h("span", "chronicle-at", t("time.ago", {s: Math.round((performance.now() - at) / 1000)})), ...sentence(said));
           return li;
         }),
     );
@@ -56,13 +56,18 @@ function nodesTable({nodes, own, leader, cut}) {
       fromLeader = leader?.nodes.find(n => n.id === id);
     const role = cut.has(id) ? t("nodes.role_cut") : me?.role ? t(`nodes.role_${me.role}`) : "…";
     const quorum = me?.role === "leader" && v.read_only ? ` (${t("cluster.no_quorum")})` : "";
-    const links = (leader?.links || v?.links || [])
-      .filter(l => l.a === id || l.b === id)
-      .map(l => `${l.a === id ? l.b : l.a}: ${l.via === "chat" ? t("cluster.via_chat") : "gRPC"}`)
-      .join(", ");
+    const peers = (leader?.links || v?.links || []).filter(l => l.a === id || l.b === id);
     const row = h("tr", me?.role === "leader" && !cut.has(id) ? "leading" : "");
-    for (const cell of [t("nodes.node", {n: id}), role + quorum, v?.term ?? "…", me?.applied ?? "…", fromLeader?.lag ?? "—", links || "—"])
-      row.append(h("td", "", String(cell)));
+    const links = h("td", "");
+    for (const [i, l] of peers.entries()) {
+      if (i) links.append(", ");
+      links.append(nodeLink(l.a === id ? l.b : l.a), ` ${l.via === "chat" ? t("cluster.via_chat") : "gRPC"}`);
+    }
+    if (!peers.length) links.textContent = "—";
+    const cell = text => h("td", "", String(text));
+    const name = h("td", "");
+    name.append(nodeLink(id));
+    row.append(name, cell(role + quorum), cell(v?.term ?? "…"), cell(me?.applied ?? "…"), cell(fromLeader?.lag ?? "—"), links);
     tbl.append(row);
   }
   return tbl;

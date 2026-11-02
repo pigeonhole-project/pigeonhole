@@ -2,12 +2,14 @@
 // node, read-only; a cluster's is in the cluster's panel).
 //
 // on: {restart(text), erase(), toggle(task, on), run(task), isolate(node, cut)}.
+// own: the stores of its own channels (linked).
 // cluster: {node, cut, leader}, the node of a cluster this panel is: it can
 // be cut off; a follower runs none of the leader's tasks, only its snapshots.
 // Returns {nodes, setCounters({objects, dataChannels, log}), setBackground(bg), setError(text)}.
 import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
 import {configView} from "./config-view.js";
+import {channelLink, sentence} from "./entities.js";
 import {taskCards} from "./tasks.js";
 
 export function loftView(props, on) {
@@ -31,6 +33,14 @@ export function loftView(props, on) {
   };
   setCounters(counts);
 
+  // Its own channels: its log, its snapshots, its outbox.
+  if (props.own?.length) {
+    const row = h("p", "own-channels");
+    row.append(t("demo.own_channels"), " ");
+    for (const [i, store] of props.own.entries()) row.append(...(i ? [", "] : []), channelLink(store));
+    counters.after(row);
+  }
+
   if (cluster) {
     const {node, cut} = cluster;
     const row = h("div", "row node-cut");
@@ -42,7 +52,7 @@ export function loftView(props, on) {
   }
 
   const follower = cluster && cluster.leader !== cluster.node;
-  const note = follower ? t("nodes.tasks_leader", {n: cluster.leader ?? "?"}) : null;
+  const note = follower ? sentence(["nodes.tasks_leader", {n: cluster.leader ?? "?"}]) : null;
   const setBackground = taskCards($("bg"), {onToggle: on.toggle, onRun: on.run, follower: note});
   setBackground(bg);
 
