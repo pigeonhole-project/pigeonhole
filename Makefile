@@ -85,8 +85,11 @@ metrics-demo:
 metrics-demo-down:
 	./scripts/metrics-demo.sh down
 
+# cargo-nextest runs the tests of every binary at once (cargo test runs one
+# binary after another): ~30 s instead of ~100 s, most tests wait on timers.
+# No doctests here: the workspace has none. `cargo install --locked cargo-nextest`.
 test:
-	cargo test --workspace
+	cargo nextest run --workspace
 
 check-deps:
 	./scripts/check-deps.sh --strict

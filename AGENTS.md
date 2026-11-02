@@ -30,8 +30,9 @@ once wait on each other (and a compiler cache such as sccache keys on it).
 
 Run what the branch touches:
 
-- Rust: `make lint` (rustfmt check, clippy with `-D warnings`), `cargo test`
-  for the changed crates (`--workspace` if shared ones changed),
+- Rust: `make lint` (rustfmt check, clippy with `-D warnings`), `make test`
+  (cargo-nextest: every test binary at once, ~30 s for the workspace;
+  `cargo install --locked cargo-nextest`),
   `./scripts/check-deps.sh --strict`, and `make sim` for meta, blob, storage
   or sim changes.
 - The site's JavaScript: `make lint-js`, `make test-js`.
@@ -39,10 +40,17 @@ Run what the branch touches:
 
 ## Merging: one session at a time
 
-1. Get the user's go to merge.
-2. Tell the other sessions "merging <branch>" and wait if one of them is
+The others wait while one session merges, so keep that short: the slow
+checks come before it.
+
+1. Rebase on the latest local main and run the checks above in your
+   worktree. Nobody waits on these.
+2. Get the user's go to merge.
+3. Tell the other sessions "merging <branch>" and wait if one of them is
    merging.
-3. Rebase on the latest local main, run the checks above, `git merge --no-ff`.
-4. Tell them "merged <branch> as <hash>", then `scripts/wt done <branch>`.
+4. Rebase again. If main moved since step 1, run `make lint` and `make test`
+   again (and `make sim` or `make web-smoke` only if the new commits in main
+   touch what they check); if it didn't, nothing to run. `git merge --no-ff`.
+5. Tell them "merged <branch> as <hash>", then `scripts/wt done <branch>`.
 
 Nobody pushes without the user asking.

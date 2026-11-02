@@ -20,9 +20,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: Check workspace dependency layers
         run: ./scripts/check-deps.sh --strict
-      - run: cargo test --workspace
+      - run: make test
 
   clippy:
     name: clippy and rustfmt
