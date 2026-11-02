@@ -5,7 +5,9 @@ Status (2026-11-02):
 - two nodes talk over gRPC, or over chat channels (Telegram outboxes);
 - the leader does all the work;
 - tested: in process over every transport, under madsim over a lossy chat,
-  and as three processes on localhost (`make cluster-smoke`).
+  and as three processes on localhost (`make cluster-smoke`);
+- three nodes run in the browser demo over `Direct` and fake Telegram
+  outboxes.
 
 Left (§ Status): a live run on real Telegram channels, a Discord outbox,
 outbox housekeeping, membership changes.
@@ -421,6 +423,8 @@ them.
 - **The binary** (`tests/raft_telegram.rs`): two gRPC nodes and one on
   `TelegramMailbox` over fake Telegram channels, through the leader's
   death.
+- **The demo's node** (`pigeonhole-web` `tests/cluster.rs`): three nodes in
+  one process, over `Direct` and fake Telegram outboxes, one config for all.
 - **Simulation** (`pigeonhole-sim/tests/cluster.rs`, madsim): three nodes
   over a `FakeChat` that delays, loses and doubles posts, while a node at a
   time is cut off and healed. Every acknowledged command survives, and the
@@ -462,7 +466,9 @@ Done:
 - gRPC, `Direct` and per-pair transports;
 - `[cluster]` / `[[node]]`;
 - the Telegram outbox;
-- the cluster view and the graph's log lines.
+- the cluster view and the graph's log lines;
+- one `pigeonhole.toml` for the whole cluster;
+- a cluster of three in the demo.
 
 Left:
 1. A live run of three nodes, one of them on real Telegram channels

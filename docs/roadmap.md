@@ -47,8 +47,9 @@ this repository (worktrees, checks, merging) is in
   - an admin API and UI, with a CLI (`pigeonhole config`, `pigeonhole run`);
   - metrics with a Grafana dashboard, logs and request spans.
 - **Site.** The home page, and pigeonhole itself running in the browser
-  (wasm) on fake Telegram and Discord channels, published on GitHub Pages.
-  A setup wizard; the admin UI, served by a real node too.
+  (wasm) on fake Telegram and Discord channels, one node or a cluster of
+  three, published on GitHub Pages. A setup wizard; the admin UI, served by
+  a real node too.
 - **Testing.** madsim simulation, fault injection, client suites
   (ceph/s3-tests, s3s, rclone), live tests against real bots, CI gates
   (rustfmt, clippy `-D warnings`, a complexity cap, layering), demos (etcd
@@ -75,7 +76,7 @@ this repository (worktrees, checks, merging) is in
 | A store's owner: owner bits in blob ids, a marker on the channel | [store-owner.md](store-owner.md) |
 | The dynamic config, the admin API and CLI | [dynamic-config.md](dynamic-config.md) |
 | The site, the wasm demo on fake channels, the wizard, the admin UI | [site/README.md](../site/README.md), [crates/web](../crates/web/README.md) |
-| The cluster: openraft over chat and gRPC, per-pair transports, the leader does the work, snapshot catch-up, the Telegram outbox | [cluster.md](cluster.md) |
+| The cluster: openraft over chat and gRPC, per-pair transports, the leader does the work, snapshot catch-up, the Telegram outbox, one config for every node, three nodes in the demo | [cluster.md](cluster.md) |
 
 ## Left
 
@@ -89,8 +90,6 @@ this repository (worktrees, checks, merging) is in
 4. Membership changes and learners through the admin API.
 5. A snapshot sent as a reference to the leader's snapshot store; a margin
    of log kept behind a snapshot.
-6. A cluster in the demo: three nodes in the browser, over the chat and
-   `Direct`.
 
 ### Single node
 
@@ -120,11 +119,10 @@ this repository (worktrees, checks, merging) is in
 ## Order
 
 1. The cluster's live run (1).
-2. The cluster in the demo (6).
-3. The Discord outbox (2).
-4. The cluster's other items.
-5. OpenDAL.
-6. Turso.
+2. The Discord outbox (2).
+3. The cluster's other items.
+4. OpenDAL.
+5. Turso.
 
 The single-node items when they block something or come cheap.
 

@@ -7,7 +7,8 @@ a log fenced by the order of messages, snapshots, Raft between nodes.
 **Try it in the browser:**
 [pigeonhole-project.github.io/pigeonhole](https://pigeonhole-project.github.io/pigeonhole/).
 The real code is built for wasm and runs on fake Telegram and Discord
-channels, and you watch the messages it posts. **Docs:**
+channels, one node or a cluster of three, and you watch the messages it
+posts. **Docs:**
 [docs/README.md](docs/README.md). **Roadmap:** [docs/roadmap.md](docs/roadmap.md).
 
 > **⚠️ Educational project.** A learning exercise in building a storage
@@ -126,7 +127,8 @@ id = 3
 outbox = -1003333333333               # no address: reached through a Telegram channel
 ```
 
-Each node has its own metadata log; the blob stores are shared.
+The same file serves every node; a `[[node]]` may also name its own
+metadata `log` and `snapshot` stores, and the blob stores are shared.
 
 - The leader serves S3 and runs the background work. A follower answers 503.
 - `GET /_pigeonhole/leader` is 200 on the leader only: point a load
@@ -192,7 +194,7 @@ A Cargo workspace under `crates/`, by role:
 |---|---|
 | `core/`: `types`, `codec`, `storage-api`, `limits` | shared types, block codecs, what a store implements (`BlobBackend`, `Chain`), rate limiters |
 | `meta/pigeonhole-meta` | the tablet: commands, states, the log, snapshots, openraft |
-| `net/`: `openraft-chat`, `openraft-grpc` | Raft transports: chat channels (standalone crate), gRPC, `Direct` in memory, per-pair `Mixed` |
+| `net/`: `openraft-chat`, `openraft-grpc`, `pigeonhole-raft-telegram` | Raft transports: chat channels (standalone crate), gRPC, `Direct` in memory, per-pair `Mixed`; a Telegram channel as an outbox |
 | `blob/`: `pigeonhole-blob`, `pigeonhole-chunk-store` | stores behind one face, replication; the chunk store, ingest, sweeper, repair |
 | `storage/` | Telegram (MTProto client + store), Discord (HTTP + store), disk, memory |
 | `gateway/` | S3 and REAPI |
