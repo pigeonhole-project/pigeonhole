@@ -6,6 +6,7 @@
 //   {type: "call_failed", store, op}
 //   {type: "repair_pass", repaired}
 //   {type: "claimed", generation}                              the node took the metadata log
+//   {type: "lease_wait", ms}                                   it waits out the lease another held on it
 //   {type: "s3", op, ...fields}                                an S3 call that succeeded
 //   {type: "raft", from, to, via, kind, at}                    a Raft request between nodes:
 //       via "grpc" (direct), or "chat" through the sender's outbox; `at`
@@ -39,6 +40,8 @@ export function readEvents(lines) {
       out.push({type: "call_failed", store: f.instance, op: "get"});
     } else if (msg === "repair pass complete") {
       out.push({type: "repair_pass", repaired: +f.repaired});
+    } else if (msg === "waiting out the lease") {
+      out.push({type: "lease_wait", ms: +f.wait_ms});
     } else if (msg === "claimed the metadata log") {
       out.push({type: "claimed", generation: f.generation});
     } else if (msg === "raft frame sent" && f.reply === false) {

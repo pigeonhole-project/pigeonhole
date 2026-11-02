@@ -168,7 +168,7 @@ async function background(events) {
 // A call that is not an op of yours (a list, the log): what the node
 // logged meanwhile is its own doing (its timers ran), drawn as such.
 async function call(request, body) {
-  const r = await node.call(onNode(request), body);
+  const r = await node.call(onNode(request), body, events => background(events));
   if (r.events.length) background(r.events);
   return r;
 }
@@ -178,8 +178,10 @@ async function call(request, body) {
 async function op(request, body) {
   setBusy(true);
   for (const c of state.channels) for (const m of c.messages) m.fresh = false;
-  const {reply, events} = await node.call(onNode(request), body);
-  const said = apply(readEvents(events));
+  // Its flights fly as the node logs them: a slow op shows its progress.
+  const said = [];
+  const {reply, events} = await node.call(onNode(request), body, evs => said.push(...apply(readEvents(evs))));
+  said.push(...apply(readEvents(events)));
   if (reply?.error?.startsWith("not the leader")) {
     // You knocked on a follower: your pigeon turns back at its door.
     graph.fly(refused(shown()));
@@ -537,7 +539,7 @@ function openWizard() {
 // error, if one does not.
 async function startFromWizard(text) {
   const t0 = performance.now();
-  const {reply, events} = await node.call({op: "open", config: text});
+  const {reply, events} = await open({op: "open", config: text});
   const ms = performance.now() - t0;
   if (reply?.error) return reply.error;
   Object.assign(state, {config: text, nodes: reply.nodes});
@@ -550,6 +552,18 @@ async function startFromWizard(text) {
   await firstBoot(events);
   ready(ms);
   return null;
+}
+
+// A boot: its events, and the wait it says it is in (the lease the page
+// before held on a lease log, when it could not release it).
+async function open(request) {
+  const seen = [];
+  const r = await node.call(request, null, events => {
+    seen.push(...events);
+    const wait = readEvents(events).find(e => e.type === "lease_wait");
+    if (wait) status(t("try.lease_wait", {s: Math.ceil(wait.ms / 1000)}));
+  });
+  return {...r, events: [...seen, ...r.events]};
 }
 
 // The first boot, as it happens: the client, the node, each channel it
@@ -608,7 +622,7 @@ async function startDemo() {
     return;
   }
   const t0 = performance.now();
-  const booted = await node.call({op: "open"});
+  const booted = await open({op: "open"});
   if (booted.reply?.error) {
     bootFailed(booted.reply.error);
     return;
@@ -643,5 +657,6 @@ addEventListener("pageshow", e => {
   if (e.persisted) location.reload();
 });
 node.onTick(background);
+node.onWaiting(() => status(t("try.files_wait")));
 if (node.admin) startAdmin();
 else startDemo();

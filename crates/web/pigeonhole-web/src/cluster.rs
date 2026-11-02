@@ -117,8 +117,13 @@ impl Nodes {
         }
         let configs = ids.iter().map(|&id| crate::parse_config_as(text, id)).collect::<Result<Vec<_>>>()?;
         let cluster = configs[0].cluster.clone();
-        let opened = futures::future::join_all(configs.iter().map(|cfg| crate::Node::open_in(world, cfg, &net))).await;
-        let nodes = ids.into_iter().zip(opened).map(|(id, n)| Ok((id, n?))).collect::<Result<_>>()?;
+        // The lowest id starts a fresh cluster's first election: polled
+        // last, it finds the others serving already. Polled first, its votes
+        // went to nodes not up yet, and a lost first election costs an
+        // election timeout (seconds).
+        let opened =
+            futures::future::join_all(configs.iter().rev().map(|cfg| crate::Node::open_in(world, cfg, &net))).await;
+        let nodes = ids.into_iter().zip(opened.into_iter().rev()).map(|(id, n)| Ok((id, n?))).collect::<Result<_>>()?;
         Ok(Self { nodes, net, cluster })
     }
 

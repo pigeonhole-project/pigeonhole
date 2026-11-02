@@ -198,6 +198,10 @@ export class Wasi {
     this.partial = []; // stdout after its last newline
     this.lines = [];
     this.memory = null;
+    // Where the module's yield flag is (ph_yield_flag), and when its next
+    // timer is due (performance.now(); Infinity: none) as of its last park.
+    this.yieldFlag = 0;
+    this.nextWake = Infinity;
   }
 
   setStdin(bytes) {
@@ -297,8 +301,14 @@ export class Wasi {
           const ns = abs ? Number(t - now(id)) : Number(t);
           wake = Math.min(wake, performance.now() + Math.max(0, ns) / 1e6);
         }
-        // A worker may block: spin until the earliest timer.
-        if (wake !== Infinity)
+        // The module is giving the thread back (ph_run): note when it
+        // wants to run again, say so (the flag's second byte), wait for
+        // nothing. Else (a module that blocks,
+        // as the smoke binary does) spin until the earliest timer.
+        if (this.yieldFlag && b()[this.yieldFlag]) {
+          this.nextWake = wake;
+          b()[this.yieldFlag + 1] = 1;
+        } else if (wake !== Infinity)
           while (performance.now() < wake) {
             /* spin */
           }

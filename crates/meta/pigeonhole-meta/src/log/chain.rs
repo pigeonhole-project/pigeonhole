@@ -324,10 +324,14 @@ impl<C: Chain> ChainLogStore<C> {
 
     /// Return once the store's clock is past `ms`.
     async fn wait_past(&self, l: &Leased<C::Id>, ms: u64) -> LogResult<()> {
+        let mut said = false;
         loop {
             let now = self.store_now(l).await?;
             if now > ms {
                 return Ok(());
+            }
+            if !std::mem::replace(&mut said, true) {
+                tracing::info!(wait_ms = ms - now, "waiting out the lease");
             }
             tokio::time::sleep(Duration::from_millis(ms - now + 1)).await;
         }

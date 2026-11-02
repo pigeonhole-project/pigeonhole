@@ -21,8 +21,10 @@ cluster-smoke:
 # clang on Linux has no WASI headers and picks up glibc's (CI does this).
 WASM_AR = $(shell rustc --print sysroot)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar
 WASM_CC_ENV = $(if $(WASI_SDK),CC_wasm32_wasip1=$(WASI_SDK)/bin/clang AR_wasm32_wasip1=$(WASI_SDK)/bin/llvm-ar,AR_wasm32_wasip1=$(WASM_AR))
+# Without symbols: 3 MB less to download (the name section; panics still
+# say where).
 web:
-	$(WASM_CC_ENV) cargo build --release --target wasm32-wasip1 -p pigeonhole-web
+	$(WASM_CC_ENV) CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --target wasm32-wasip1 -p pigeonhole-web
 
 # The smoke under Node's WASI, then under the site's own shim (its file pool
 # on buffers), then a page load and a reload on one pool.
