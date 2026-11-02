@@ -114,7 +114,8 @@ function apply(events) {
       if (snap) said.push(["say.snapshot", {at: +snap[1]}]);
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly({...f, onLand: () => landed(c.store)});
     } else if (e.type === "deleted" && c) {
-      for (const m of c.messages) if (e.ids.includes(String(m.id))) m.gone = true;
+      // Gone from the channel, as from a messenger's: no trace left.
+      c.messages = c.messages.filter(m => !e.ids.includes(String(m.id)));
       c.total = Math.max(0, c.total - e.ids.length);
       graph.setTotal(c.store, c.total);
       if (panelShows(c.store)) renderPanel();

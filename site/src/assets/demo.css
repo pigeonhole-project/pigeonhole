@@ -112,7 +112,6 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .pane { fill: var(--pane); stroke: var(--pane-frame); stroke-width: .8; } .pane.lit { fill: var(--pane-lit); }
 /* a channel's windows: a chunk warm, a small text cool, the channel's own notes dim, a deleted message shut */
 .pane.lit.text { fill: var(--pane-text); } .pane.lit.svc { fill: var(--pane-svc); }
-.pane.gone { fill: var(--seam); } .pane-shut { stroke: var(--wall); stroke-width: 1; }
 .pane.new { animation: lit .9s ease-out; }
 @keyframes lit { 0% { fill: #fff; } }
 .pin-flag { fill: var(--eye); stroke: var(--wing-2); stroke-width: .8; }

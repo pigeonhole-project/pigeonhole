@@ -80,7 +80,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     activate(g, () => onOpen(target));
     return {g};
   }
-  // A frame round a block, shown when it is hovered, focused or open.
+  // A frame round a block's walls (not the letters on its roof), shown when it is hovered, focused or open.
   const ring = (n, x, top, w, ground) => svg("rect", {class: "ring", x: x - 5, y: top - 5, width: w + 10, height: ground - top + 10, rx: 4}, n.g);
 
   // A channel's block: its windows, the letters on its roof.
@@ -106,7 +106,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.tip.textContent = role;
     n.older = svg("text", {class: "older", x: at.x + at.w / 2, y: at.ground - 4, "text-anchor": "middle"}, n.g);
     n.queue = svg("g", {class: "queue", transform: `translate(${cx},${b.roof - 40})`}, n.g);
-    ring(n, at.x, b.roof - 50, at.w, at.ground);
+    ring(n, at.x, b.roof + 8, at.w, at.ground);
     n.shown = 0;
     fill(n, false);
     return n;
@@ -122,10 +122,9 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.win.replaceChildren();
     for (const [i, s] of n.slots.entries()) {
       const m = i < shown && skip + i >= older ? list[skip + i - older] : null;
-      let cls = i >= shown ? "pane" : m?.gone ? "pane gone" : m?.kind === "text" ? "pane lit text" : m?.kind === "other" ? "pane lit svc" : "pane lit";
+      let cls = i >= shown ? "pane" : m?.kind === "text" ? "pane lit text" : m?.kind === "other" ? "pane lit svc" : "pane lit";
       if (fresh && i >= n.shown && i < shown) cls += " new";
       svg("rect", {class: cls, x: s.x, y: s.y, width: s.w, height: s.h}, n.win);
-      if (m?.gone) svg("path", {class: "pane-shut", d: `M${s.x + s.w / 2},${s.y} L${s.x + s.w / 2},${s.y + s.h}`}, n.win);
       if (m && pins.has(String(m.id)))
         svg("path", {class: "pin-flag", d: `M${s.x + s.w},${s.y + 1} L${s.x + s.w},${s.y - 9} L${s.x + s.w + 8},${s.y - 6} L${s.x + s.w},${s.y - 3}`}, n.win);
     }
@@ -152,7 +151,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.sub = roofLetters(n.g, at.x + at.w / 2, b.roof, t("demo.you"), {size: 13});
     n.perch = [at.x + at.w - 14, b.roof - 6];
     perched(n.g, {transform: `translate(${at.x + at.w + 2},${b.roof - 12}) scale(1.3)`});
-    ring(n, at.x, b.roof - 56, at.w, at.ground);
+    ring(n, at.x, b.roof + 8, at.w, at.ground);
     return n;
   }
   function setObjects(count) {

@@ -38,7 +38,7 @@ function ownerNote(m) {
 // `canDelete`: the page lets a reader delete a data channel's messages.
 // {earlier: posts before the shown ones, pinned: the first pin's name or
 // null, messages: [{id, kind: "text" | "file" | "service", text, name,
-// size, at, pinned, notes, gone, fresh, quiet, deletable}]}
+// size, at, pinned, notes, fresh, quiet, deletable}]}
 export function chatModel(c, canDelete = false) {
   const live = c.messages.slice(-SHOWN);
   const pins = new Set((c.pinned || []).map(p => String(p.id)));
@@ -52,15 +52,14 @@ export function chatModel(c, canDelete = false) {
     at: postedAt(c, m),
     pinned: pins.has(String(m.id)),
     notes: [logNote(m.log), ownerNote(m)].filter(Boolean),
-    gone: !!m.gone,
     fresh: !!m.fresh,
     // The log's own posts (its claim, probes): not its entries.
     quiet: !!m.log && m.log.what !== "batch",
     // Anyone in a data channel could delete a message, behind the node's back.
-    deletable: canDelete && c.role === "data" && !m.gone,
+    deletable: canDelete && c.role === "data",
   }));
   return {
-    earlier: c.total - live.filter(m => !m.gone).length,
+    earlier: c.total - live.length,
     pinned: c.pinned?.length ? (c.pinned[0].name ?? null) : null,
     pins: c.pinned?.length || 0,
     messages,
