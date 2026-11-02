@@ -219,7 +219,7 @@ people work in this repository (a worktree per task, checks, merging):
 
 ```bash
 make lint                # rustfmt --check, clippy -D warnings
-cargo test --workspace   # or: make test
+make test                # cargo nextest run --workspace
 make sim                 # the simulation under madsim (docs/simulation.md)
 make web-smoke           # the wasm build, run under Node
 make lint-js test-js     # the site's JavaScript
