@@ -47,6 +47,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         stores: pigeonhole_admin::stores::of(&cfg),
         config_text: std::fs::read_to_string(&cfg.config_path).ok(),
         cluster: cfg.cluster.clone(),
+        limiters: vec![("telegram", cfg.limiters.clone()), ("discord", cfg.discord_limiters.clone())],
     });
     spawn_admin(&cfg, &rt, admin).await?;
 
