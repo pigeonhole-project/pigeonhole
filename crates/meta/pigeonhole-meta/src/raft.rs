@@ -13,7 +13,7 @@
 
 use crate::log::{Base, Entry, Head, LogError, LogId as HistoryId, LogStore, Position};
 use crate::snapshot::{SnapshotRef, SnapshotStore, StoredSnapshot};
-use crate::{apply_command, take_snapshot, Command, States, Stop, TabletSnapshot};
+use crate::{apply_group, take_snapshot, Applied, Group, States, Stop, TabletSnapshot};
 use anyhow::Context;
 use futures::TryStreamExt;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
@@ -37,11 +37,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::Instrument;
 
 openraft::declare_raft_types!(
-    /// The tablet's Raft types: a batch of commands in, their encoded
-    /// outcomes out.
+    /// The tablet's Raft types: a batch of proposals in, what became of each
+    /// of their commands out.
     pub TypeConfig:
-        D = Vec<Command>,
-        R = Vec<Vec<u8>>,
+        D = Vec<Group>,
+        R = Vec<Applied>,
         NodeId = u64,
         Node = BasicNode,
         AsyncRuntime = Runtime,
@@ -561,7 +561,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         Ok((self.last_applied, self.membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Vec<Vec<u8>>>, SErr>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Vec<Applied>>, SErr>
     where
         I: IntoIterator<Item = RaftEntry> + Send,
         I::IntoIter: Send,
@@ -572,10 +572,13 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             let reply = match entry.payload {
                 EntryPayload::Blank => Vec::new(),
                 EntryPayload::Normal(batch) => {
-                    let mut replies = Vec::with_capacity(batch.len());
-                    for cmd in &batch {
-                        match apply_command(&self.states, pos, cmd) {
-                            Ok(reply) => replies.push(reply),
+                    let mut replies = Vec::with_capacity(batch.iter().map(|g| g.commands.len()).sum());
+                    let term = entry.log_id.leader_id.get_term();
+                    for group in &batch {
+                        match apply_group(&self.states, pos, term, group) {
+                            Ok(applied) => replies.extend(applied),
+                            // Not a proposal's doing (StateMachine::apply):
+                            // a bug or a binary that cannot read its log.
                             Err(e) => {
                                 let msg = format!("{e:#}");
                                 self.shared.stop(Stop::Failed(msg.clone()));

@@ -164,12 +164,12 @@ impl Admin {
             }
             return Ok(());
         }
-        let leader = self.meta.leader();
-        tracing::info!(op, leader, "not the leader");
-        match leader {
-            Some(id) => bail!("not the leader; node {id} is"),
-            None => bail!("not the leader; no leader known"),
-        }
+        let why = match self.meta.serving_term() {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => "not the leader".to_string(),
+        };
+        tracing::info!(op, leader = self.meta.leader(), why, "not serving");
+        bail!(why)
     }
 
     /// Runs `r` (with `body`, an upload's bytes).

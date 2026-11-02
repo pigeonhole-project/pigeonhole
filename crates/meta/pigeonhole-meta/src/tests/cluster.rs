@@ -564,3 +564,44 @@ async fn a_cluster_of_one_is_never_read_only() {
     assert!(solo.has_quorum() && !solo.is_read_only());
     solo.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_new_leader_serves_only_with_its_predecessors_commits_applied() {
+    let chat = FakeChat::new();
+    let mut nodes = three(&chat).await;
+    let old = agreed_leader(&nodes).await;
+    for i in 0..5 {
+        nodes[&old].propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    chat.isolate(old, true);
+    drop(nodes.remove(&old));
+    // Watch the survivors: whenever one serves, it applied all its
+    // predecessor committed; while it is elected but catching up, it gives
+    // out no term to prepare writes in.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let new = loop {
+        assert!(tokio::time::Instant::now() < deadline, "never a new leader");
+        if let Some((&id, n)) = nodes.iter().find(|(_, n)| n.is_leader()) {
+            assert_eq!(value(n), 5, "node {id} serves before applying its predecessor's commits");
+            break id;
+        }
+        for n in nodes.values() {
+            if let Some(term) = n.catching_up() {
+                let refused = match n.serving_term() {
+                    // Or it lost the lead since.
+                    Err(e) => e.downcast_ref::<CatchingUp>().is_some_and(|c| c.term == term) || e.is::<NotLeader>(),
+                    Ok(_) => n.is_leader(),
+                };
+                assert!(refused, "a leader catching up in term {term} handed its term out");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert_eq!(nodes[&new].raft_state(), openraft::ServerState::Leader);
+    let term = nodes[&new].serving_term().unwrap();
+    let follower = nodes.keys().copied().find(|&id| id != new).unwrap();
+    let err = nodes[&follower].serving_term().unwrap_err();
+    assert!(err.downcast_ref::<NotLeader>().is_some(), "{err:#}");
+    assert!(term > 1);
+    nodes[&new].propose::<Counter>(op(5, 1)).await.unwrap().unwrap();
+}
