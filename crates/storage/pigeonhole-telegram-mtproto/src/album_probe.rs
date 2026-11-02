@@ -137,9 +137,7 @@ async fn delete(ch: &MtprotoChannel, ids: &[i32]) {
     }
 }
 
-#[tokio::test]
-#[ignore = "posts and deletes messages in the real blobs channel"]
-async fn album_probe() {
+async fn connect() -> MtprotoChannel {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     dotenvy::from_path(root.join(".env")).ok();
     let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
@@ -151,12 +149,12 @@ async fn album_probe() {
     };
     let tg = TelegramMtproto::connect(&cfg).await.unwrap();
     let limiter = Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits()));
-    let ch = tg.channel(chat_id, Lane::Blobs, limiter).await.unwrap();
-    let mut posted: Vec<i32> = Vec::new();
-    let phases = std::env::var("PROBE").unwrap_or_else(|_| "shape,rate".into());
+    tg.channel(chat_id, Lane::Blobs, limiter).await.unwrap()
+}
 
-    // 10 small documents, uploaded once; uploadMedia turns each into an
-    // InputMediaDocument that can be sent again and again.
+/// 10 small documents, uploaded once; uploadMedia turns each into an
+/// InputMediaDocument that can be sent again and again.
+async fn documents(ch: &MtprotoChannel) -> Vec<enums::InputMedia> {
     let mut docs = Vec::new();
     let mut upload_waits = Vec::new();
     let t = Instant::now();
@@ -169,7 +167,7 @@ async fn album_probe() {
             peer: ch.input_peer(),
             media: uploaded(file, &name),
         };
-        let (m, w) = raw(&ch, "uploadMedia", &req).await;
+        let (m, w) = raw(ch, "uploadMedia", &req).await;
         upload_waits.extend(w);
         let enums::MessageMedia::Document(types::MessageMediaDocument {
             document: Some(enums::Document::Document(d)),
@@ -188,80 +186,86 @@ async fn album_probe() {
         }));
     }
     println!("10 uploads + uploadMedia in {:?}, flood waits {upload_waits:?}", t.elapsed());
+    docs
+}
 
+/// An album of `media` that may be refused: what came of it.
+async fn try_album(ch: &MtprotoChannel, label: &str, media: Vec<enums::InputMedia>, posted: &mut Vec<i32>) {
+    match raw(ch, label, &multi(ch, media)).await.0 {
+        Ok(u) => {
+            let p = posts(&u);
+            println!("{label}: ok {p:?}");
+            posted.extend(p.iter().map(|p| p.0));
+        }
+        Err(e) => println!("{label}: {e}"),
+    }
+}
+
+/// What an album is: the refused shapes, then a proper one read back and
+/// one of its messages deleted.
+async fn shape(ch: &MtprotoChannel, docs: &[enums::InputMedia], posted: &mut Vec<i32>) {
+    // Uploaded files straight into an album (no uploadMedia).
+    let mut media = Vec::new();
+    for i in 0..2 {
+        let name = format!("ph-album-direct-{i}.bin");
+        let data = Bytes::from(vec![7u8; 1000 + i]);
+        media.push(uploaded(ch.upload(&name, &data).await.unwrap(), &name));
+    }
+    try_album(ch, "direct album (InputMediaUploadedDocument)", media, posted).await;
+    let mut eleven = docs.to_vec();
+    eleven.push(docs[0].clone());
+    try_album(ch, "11-album", eleven, posted).await;
+    // A proper 10-album: ids, grouped_id, names; then as read back.
+    let (r, _) = raw(ch, "album", &multi(ch, docs.to_vec())).await;
+    let p = posts(&r.unwrap());
+    println!("10-album: {p:?}");
+    posted.extend(p.iter().map(|p| p.0));
+    let ids: Vec<i64> = p.iter().map(|p| i64::from(p.0)).collect();
+    let documents =
+        |back: &[ChannelMessage]| back.iter().filter(|m| matches!(m, ChannelMessage::Document { .. })).count();
+    println!("read back: {} documents", documents(&ch.get_messages(&ids).await.unwrap()));
+    // Delete one of the album's messages: the rest stay?
+    delete(ch, &[p[3].0]).await;
+    println!("after deleting {}: documents left {}", p[3].0, documents(&ch.get_messages(&ids).await.unwrap()));
+}
+
+/// Albums back to back, then as many single sends: does one album spend 1
+/// or 10 sends?
+async fn rate(ch: &MtprotoChannel, docs: &[enums::InputMedia], posted: &mut Vec<i32>) {
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let t = Instant::now();
+    for k in 0..8 {
+        let at = t.elapsed();
+        let (r, w) = raw(ch, &format!("album {k}"), &multi(ch, docs.to_vec())).await;
+        let p = posts(&r.unwrap());
+        posted.extend(p.iter().map(|p| p.0));
+        println!("album {k}: {} posts at {at:.1?}, waits {w:?}", p.len());
+    }
+    println!("8 albums (80 messages) in {:.1?}", t.elapsed());
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    let t = Instant::now();
+    for k in 0..16 {
+        let at = t.elapsed();
+        let (r, w) = raw(ch, &format!("single {k}"), &single(ch, docs[k % 10].clone())).await;
+        posted.extend(posts(&r.unwrap()).iter().map(|p| p.0));
+        println!("single {k}: at {at:.1?}, waits {w:?}");
+    }
+    println!("16 singles in {:.1?}", t.elapsed());
+}
+
+#[tokio::test]
+#[ignore = "posts and deletes messages in the real blobs channel"]
+async fn album_probe() {
+    let ch = connect().await;
+    let phases = std::env::var("PROBE").unwrap_or_else(|_| "shape,rate".into());
+    let docs = documents(&ch).await;
+    let mut posted: Vec<i32> = Vec::new();
     let result = std::panic::AssertUnwindSafe(Box::pin(async {
         if phases.contains("shape") {
-            // Uploaded files straight into an album (no uploadMedia).
-            let mut media = Vec::new();
-            for i in 0..2 {
-                let name = format!("ph-album-direct-{i}.bin");
-                let data = Bytes::from(vec![7u8; 1000 + i]);
-                media.push(uploaded(ch.upload(&name, &data).await.unwrap(), &name));
-            }
-            let (r, _) = raw(&ch, "direct", &multi(&ch, media)).await;
-            match r {
-                Ok(u) => {
-                    let p = posts(&u);
-                    println!("direct album (InputMediaUploadedDocument): ok {p:?}");
-                    posted.extend(p.iter().map(|p| p.0));
-                }
-                Err(e) => println!("direct album (InputMediaUploadedDocument): {e}"),
-            }
-            // 11 in one album.
-            let mut eleven = docs.clone();
-            eleven.push(docs[0].clone());
-            let (r, _) = raw(&ch, "eleven", &multi(&ch, eleven)).await;
-            match r {
-                Ok(u) => {
-                    let p = posts(&u);
-                    println!("11-album: ok, {} posts", p.len());
-                    posted.extend(p.iter().map(|p| p.0));
-                }
-                Err(e) => println!("11-album: {e}"),
-            }
-            // A proper 10-album: ids, grouped_id, names; then as read back.
-            let (r, _) = raw(&ch, "album", &multi(&ch, docs.clone())).await;
-            let p = posts(&r.unwrap());
-            println!("10-album: {p:?}");
-            posted.extend(p.iter().map(|p| p.0));
-            let ids: Vec<i64> = p.iter().map(|p| i64::from(p.0)).collect();
-            let back = ch.get_messages(&ids).await.unwrap();
-            println!(
-                "read back: {:?}",
-                back.iter().map(|m| matches!(m, ChannelMessage::Document { .. })).collect::<Vec<_>>()
-            );
-            // Delete one of the album's messages: the rest stay?
-            delete(&ch, &[p[3].0]).await;
-            let back = ch.get_messages(&ids).await.unwrap();
-            println!(
-                "after deleting {}: documents left {}",
-                p[3].0,
-                back.iter().filter(|m| matches!(m, ChannelMessage::Document { .. })).count()
-            );
+            shape(&ch, &docs, &mut posted).await;
         }
         if phases.contains("rate") {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            // Albums back to back: does one album spend 1 or 10 sends?
-            let t = Instant::now();
-            for k in 0..8 {
-                let at = t.elapsed();
-                let (r, w) = raw(&ch, &format!("album {k}"), &multi(&ch, docs.clone())).await;
-                let p = posts(&r.unwrap());
-                posted.extend(p.iter().map(|p| p.0));
-                println!("album {k}: {} posts at {at:.1?}, waits {w:?}", p.len());
-            }
-            println!("8 albums (80 messages) in {:.1?}", t.elapsed());
-            tokio::time::sleep(Duration::from_secs(90)).await;
-            // The same number of sends, one document each.
-            let t = Instant::now();
-            for k in 0..16 {
-                let at = t.elapsed();
-                let (r, w) = raw(&ch, &format!("single {k}"), &single(&ch, docs[k % 10].clone())).await;
-                let p = posts(&r.unwrap());
-                posted.extend(p.iter().map(|p| p.0));
-                println!("single {k}: at {at:.1?}, waits {w:?}");
-            }
-            println!("16 singles in {:.1?}", t.elapsed());
+            rate(&ch, &docs, &mut posted).await;
         }
     }))
     .catch_unwind()
