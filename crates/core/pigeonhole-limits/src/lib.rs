@@ -631,11 +631,17 @@ mod tests {
         let send = l.budgets()[0].1;
         assert_eq!((send.tokens, send.capacity, send.per_sec, send.waiting), (1.0, 3.0, 1.0, 0));
         assert_eq!(l.bot_budget().tokens, 8.0, "the bot's own budget took both");
-        tokio::time::advance(Duration::from_millis(1500)).await;
-        assert_eq!(l.budgets()[0].1.tokens, 2.5, "refilled to now");
+        tokio::time::sleep(Duration::from_millis(1500)).await; // paused: the clock jumps (advance() is not async under madsim)
+        let refilled = l.budgets()[0].1.tokens;
+        assert!((refilled - 2.5).abs() < 0.01, "refilled to now: {refilled}");
         l.cool(Spend::Class(Class("send")), Level::Class, Duration::from_secs(4));
         let cooled = l.budgets()[0].1;
-        assert_eq!((cooled.tokens, cooled.cooling), (0.0, Duration::from_secs(4)));
+        assert_eq!(cooled.tokens, 0.0);
+        assert!(
+            cooled.cooling > Duration::from_millis(3990) && cooled.cooling <= Duration::from_secs(4),
+            "{:?}",
+            cooled.cooling
+        );
         assert_eq!(reg.chats().iter().map(|(b, c, _)| (b.as_str(), c.as_str())).collect::<Vec<_>>(), [("7", "-100")]);
     }
 
