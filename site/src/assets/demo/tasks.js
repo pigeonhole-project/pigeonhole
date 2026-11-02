@@ -3,12 +3,15 @@
 // run now. They live in the dovecote's windows and in the loft's panel.
 //
 // The op's reply: {tasks: [{task, every: "10s" | "off", next_in_ms, work: [...]}],
-//                  snapshot: {head, base, every}}.
+//                  snapshot: {head, base, at: the newest snapshot's position, every}}.
 import {activate, button, h, svg} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {boarded, perched} from "./art.js";
 
 export const TASKS = ["repair", "sweep", "cool", "snapshot"];
+// The tasks only the leader runs (the chunk stores are its); every node
+// takes snapshots of its own state.
+export const LEADER_TASKS = new Set(["repair", "sweep", "cool"]);
 // The dynamic key that sets a task's period; the period "on" means when the file has it off.
 export const TASK_KEY = {repair: "repair.interval", sweep: "sweep.interval", cool: "inline.cool_every", snapshot: "meta.snapshot_every"};
 export const TASK_ON = {repair: "10s", sweep: "30s", cool: "30s", snapshot: "1m"};
@@ -40,7 +43,8 @@ export function describe(bg, name) {
   const toNext = period && task.next_in_ms != null ? 1 - Math.min(1, task.next_in_ms / period) : 0;
   let n, of, work, base;
   if (name === "snapshot") {
-    base = bg.snapshot.base;
+    // Counted from the newest snapshot (a hand-run one too), not the log's start.
+    base = bg.snapshot.at ?? bg.snapshot.base;
     n = Math.max(0, bg.snapshot.head - base);
     of = bg.snapshot.every || undefined;
     work = t(of ? "bg.entries_short" : "bg.entries_since", {n, of});
@@ -74,11 +78,16 @@ export function workLabel(name, item) {
 // The light rises as the next pass nears (a snapshot: as entries pile up,
 // too); a pigeon sits in while work waits, a badge counts it; a task that
 // is off has its shutters closed. The windows no task lives in are boarded
-// up. onOpen(task): a window was clicked. Returns update(bg).
-export function taskWindows(g, entrances, onOpen) {
+// up, and on a `follower` the leader's tasks' too. onOpen(task): a window
+// was clicked. Returns update(bg).
+export function taskWindows(g, entrances, onOpen, {follower = false} = {}) {
   const windows = {};
   for (const name of TASKS) {
     const w = entrances[TASK_WINDOW[name]];
+    if (follower && LEADER_TASKS.has(name)) {
+      boarded(g, w);
+      continue;
+    }
     const win = svg("g", {class: "win", tabindex: 0, role: "button", "aria-label": t(`bg.${name}`)}, g);
     const clip = svg("clipPath", {id: `win-${name}`}, win);
     svg("path", {d: w.d}, clip);
@@ -114,7 +123,7 @@ export function taskWindows(g, entrances, onOpen) {
     for (const name of TASKS) {
       const d = describe(bg, name),
         win = windows[name];
-      if (!d) continue;
+      if (!d || !win) continue;
       const lit = d.of ? Math.max(d.toNext, Math.min(1, d.n / d.of)) : d.toNext;
       const height = Math.round(24 * lit);
       win.light.setAttribute("y", String(win.w.y + 14 - height));
@@ -176,31 +185,32 @@ const tip = (() => {
 })();
 
 // ---- the loft's panel: a card per task in `box`, updated in place (a
-// poll keeps the focus where it was). onToggle(name, on), onRun(name).
-// Returns update(bg).
-export function taskCards(box, {onToggle, onRun}) {
-  const cards = TASKS.map(name => taskCard(name, onToggle, onRun));
-  box.replaceChildren(...cards.map(c => c.el));
+// poll keeps the focus where it was). onToggle(name, on), onRun(name);
+// `follower`: why the leader's tasks are not here (a follower runs none of
+// them), shown above; its snapshots are its own. Returns update(bg).
+export function taskCards(box, {onToggle, onRun, follower = null}) {
+  const cards = TASKS.map(name => taskCard(name, onToggle, onRun, !!follower));
+  box.replaceChildren(...(follower ? [h("p", "field-note tasks-ro", follower)] : []), ...cards.map(c => c.el));
   return bg => {
     for (const c of cards) c.update(describe(bg, c.name));
   };
 }
 
-function taskCard(name, onToggle, onRun) {
+function taskCard(name, onToggle, onRun, follower) {
+  // A follower's view of a task only the leader runs: no clock, no queue.
+  const away = follower && LEADER_TASKS.has(name);
   const el = h("div", "task");
   el.id = `task-${name}`;
   let on = false;
   const sw = button("switch", null, () => onToggle(name, !on));
   sw.setAttribute("role", "switch");
   sw.setAttribute("aria-label", t("bg.on_off", {task: t(`bg.${name}`)}));
+  const run = button("mini", t("bg.run_now"), () => onRun(name));
+  // Not this node's task at all: nothing to switch or run here.
+  sw.hidden = run.hidden = away;
   const every = h("span", "task-every");
   const head = h("div", "task-head");
-  head.append(
-    h("b", "", t(`bg.${name}`)),
-    sw,
-    every,
-    button("mini", t("bg.run_now"), () => onRun(name)),
-  );
+  head.append(h("b", "", t(`bg.${name}`)), sw, every, run);
   const meter = cls => {
     const m = h("div", "meter"),
       fill = h("div", cls);
@@ -221,8 +231,14 @@ function taskCard(name, onToggle, onRun) {
     el.hidden = !d;
     if (!d) return;
     on = !!d.period;
-    el.classList.toggle("off", !on && !d.of);
+    el.classList.toggle("off", away || (!on && !d.of));
     sw.setAttribute("aria-checked", String(on));
+    if (away) {
+      every.textContent = t("bg.on_leader");
+      clock.m.hidden = jobs.hidden = true;
+      clockText.textContent = t("bg.not_here");
+      return;
+    }
     every.textContent = on ? t("bg.every", {every: d.task.every}) : d.of ? t("bg.every_entries", {of: d.of}) : t("bg.off");
     // No timer, no clock: a snapshot by entries has its own meter.
     clock.m.hidden = !on;

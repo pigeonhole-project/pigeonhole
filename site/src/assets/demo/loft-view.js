@@ -2,7 +2,8 @@
 // node, read-only).
 //
 // on: {restart(text), erase(), toggle(task, on), run(task), isolate(node, cut)}.
-// cluster: {node, cut}, the node of a cluster this panel is: it can be cut off.
+// cluster: {node, cut, leader}, the node of a cluster this panel is: it can
+// be cut off; a follower runs none of the leader's tasks, only its snapshots.
 // Returns {nodes, setCounters({objects, dataChannels, log}), setBackground(bg), setError(text)}.
 import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
@@ -38,7 +39,9 @@ export function loftView({counters: counts, config, demo, admin, bg, cluster}, o
     counters.after(row);
   }
 
-  const setBackground = taskCards($("bg"), {onToggle: on.toggle, onRun: on.run});
+  const follower = cluster && cluster.leader !== cluster.node;
+  const note = follower ? t("nodes.tasks_leader", {n: cluster.leader ?? "?"}) : null;
+  const setBackground = taskCards($("bg"), {onToggle: on.toggle, onRun: on.run, follower: note});
   setBackground(bg);
 
   const editor = $("config-text"),

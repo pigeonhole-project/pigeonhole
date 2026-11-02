@@ -92,10 +92,12 @@ pub struct Request {
 }
 
 impl Request {
-    /// The op as the S3 request it stands for, if it is one: a follower
-    /// turns those away, as the binary's S3 port does (and the chunk
-    /// store's own ops, verify and repair: the stores are the leader's).
-    fn s3(&self) -> Option<String> {
+    /// The op as the request it stands for, if only the leader serves it: a
+    /// follower turns those away, as the binary's S3 port does. S3's; the
+    /// chunk store's own ops (verify, repair: the stores are the leader's);
+    /// the dynamic config's changes and its tasks' runs (entries in the
+    /// tablet's log, work the leader does).
+    fn leader_only(&self) -> Option<String> {
         let (b, k) = (&self.bucket, &self.key);
         Some(match self.op.as_str() {
             "put" => format!("PUT /{b}/{k}"),
@@ -105,13 +107,17 @@ impl Request {
             "list" => format!("GET /{b}"),
             "buckets" => "GET /".to_string(),
             "verify" | "repair" => format!("{} (the chunk store)", self.op),
+            "dynamic_set" | "dynamic_unset" => format!("{} {} (the dynamic config)", self.op, self.key),
+            // A snapshot is every node's own; the other tasks are the leader's work.
+            "run_task" if self.task != "snapshot" => format!("run_task {} (a background task)", self.task),
             _ => return None,
         })
     }
 
     /// Whether it writes to the tablet: a read-only leader turns it away.
     fn writes(&self) -> bool {
-        matches!(self.op.as_str(), "put" | "copy" | "delete" | "verify" | "repair")
+        matches!(self.op.as_str(), "put" | "copy" | "delete" | "verify" | "repair" | "dynamic_set" | "dynamic_unset")
+            || (self.op == "run_task" && self.task != "snapshot")
     }
 }
 
@@ -165,7 +171,7 @@ impl Admin {
 
     /// Runs `r` (with `body`, an upload's bytes).
     pub async fn handle(&self, r: &Request, body: Bytes) -> Result<Value> {
-        if let Some(op) = r.s3() {
+        if let Some(op) = r.leader_only() {
             self.only_on_the_leader(&op, r.writes())?;
         }
         Ok(match r.op.as_str() {
