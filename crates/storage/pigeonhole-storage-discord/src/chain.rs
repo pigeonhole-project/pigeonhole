@@ -194,6 +194,13 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
             ThreadStart::Taken => {
                 let winner =
                     self.link_of(from).await?.with_context(|| format!("message {from} has an unreadable link"))?;
+                // Our own link: an attempt of this start made the thread, but
+                // its answer was lost and the client's retry was told 160004.
+                if winner.id.message_id == b {
+                    tracing::debug!(%store, label, from, message_id = b, "linked (thread taken by our own retried start)");
+                    self.archive_later(from);
+                    return Ok(After::Won(DiscordId { message_id: b }));
+                }
                 tracing::debug!(%store, label, from, message_id = b, winner = winner.id.message_id, winner_label = %winner.label, "lost the link (thread taken)");
                 Ok(After::Lost(winner))
             }

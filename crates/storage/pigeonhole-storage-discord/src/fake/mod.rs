@@ -31,6 +31,7 @@ pub struct Calls {
 struct Knobs {
     calls: Calls,
     lose_next_answer: bool,
+    lose_next_thread_answer: bool,
     /// The next send's answer comes this much later (it lands at once).
     delay_next_answer: Option<std::time::Duration>,
 }
@@ -120,6 +121,13 @@ impl<H> FakeDiscord<H> {
     /// The next send posts, but the sender learns nothing.
     pub fn lose_next_answer(&self) {
         self.knobs.lock().unwrap().lose_next_answer = true;
+    }
+
+    /// The next thread start is made, but its answer is lost and the start
+    /// sent again, as the HTTP client retries a lost answer: the caller sees
+    /// the repeat's answer (160004, taken: by its own first attempt).
+    pub fn lose_next_thread_answer(&self) {
+        self.knobs.lock().unwrap().lose_next_thread_answer = true;
     }
 
     /// The next send lands at once, but its answer comes `after` later (a
@@ -212,6 +220,10 @@ impl<H: FakeHost<DiscordChannelState>> DiscordApi for FakeDiscord<H> {
     async fn start_thread(&self, message_id: u64, name: &str) -> Result<ThreadStart> {
         check_thread_name(name)?;
         self.count(|c| c.start_thread += 1);
+        if std::mem::take(&mut self.knobs.lock().unwrap().lose_next_thread_answer) {
+            self.count(|c| c.start_thread += 1);
+            self.host.apply(Command::StartThread { id: message_id, name: name.into() }).await?;
+        }
         match self.host.apply(Command::StartThread { id: message_id, name: name.into() }).await? {
             Reply::Thread(start) => Ok(start),
             other => bail!("a thread start answered {other:?}"),

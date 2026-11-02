@@ -103,6 +103,32 @@ async fn an_unlinked_batch_is_not_in_the_log() {
     assert_eq!(history(b.as_ref()).await, vec![1, 3]);
 }
 
+/// A thread start whose answer was lost and whose retry was told 160004:
+/// the thread names our own blob, so the link is ours.
+#[tokio::test]
+async fn a_link_taken_by_our_own_retried_start_is_a_win() {
+    let channel = Arc::new(FakeDiscord::new(77));
+    let s = channel_store(&channel);
+    let first = match s.put_after(None, "log-claim-1", bytes::Bytes::from_static(b"c")).await.unwrap() {
+        After::Won(id) => id,
+        other => panic!("{other:?}"),
+    };
+    channel.lose_next_thread_answer();
+    let next = s.put_after(Some(&first), "log-batch-1", bytes::Bytes::from_static(b"b")).await.unwrap();
+    let After::Won(next) = next else { panic!("our own link taken for a loss: {next:?}") };
+    assert_eq!(s.successor(&first).await.unwrap().map(|l| l.id), Some(next));
+
+    // Through the log: the append is committed, not fenced by itself.
+    let channel = Arc::new(FakeDiscord::new(77));
+    let a = store(&channel);
+    a.claim(1).await.unwrap();
+    a.append(1, &[entry(1)]).await.unwrap();
+    channel.lose_next_thread_answer();
+    a.append(1, &[entry(2)]).await.unwrap();
+    a.append(1, &[entry(3)]).await.unwrap();
+    assert_eq!(history(store(&channel).as_ref()).await, vec![1, 2, 3]);
+}
+
 #[tokio::test]
 async fn racing_claims_leave_one_writer() {
     let channel = Arc::new(FakeDiscord::new(77));
