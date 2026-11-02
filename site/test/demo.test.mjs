@@ -186,25 +186,24 @@ test("chatModel: what each message is, and the posts not shown", () => {
   const c = {
     kind: "discord",
     role: "data",
-    total: 5,
+    total: 4,
     pinned: [{id: "11", name: "owner-0a1b2c3d.bin"}],
     messages: [
       {id: "11", kind: "document", name: "owner-0a1b2c3d.bin", size: 59},
       {id: "12", kind: "text", name: "ph-1.bin", size: 461, preview: "漢"},
       {id: "13", kind: "other"},
-      {id: "14", kind: "document", name: "ph-2.bin", size: 9, gone: true},
     ],
   };
   const model = chatModel(c, true);
-  assert.equal(model.earlier, 2);
+  assert.equal(model.earlier, 1);
   assert.equal(model.pins, 1);
-  const [owner, text, service, gone] = model.messages;
+  const [owner, text, service] = model.messages;
   assert.ok(owner.pinned);
   assert.deepEqual(owner.notes, ["demo.owner_marker"]);
   assert.equal(text.kind, "text");
   assert.equal(text.text, "ph-1.bin 461\n漢…");
   assert.equal(service.kind, "service");
-  assert.ok(!gone.deletable && text.deletable);
+  assert.ok(text.deletable);
   assert.ok(chatModel(c).messages.every(m => !m.deletable));
   // A Discord id carries its time: 2015-01-01 plus the high bits, in ms.
   assert.equal(chatModel({...c, messages: [{id: String(1000n << 22n), kind: "other"}]}).messages[0].at.getTime(), 1420070401000);

@@ -16,10 +16,10 @@ const MIN_FLOORS = 6,
   HEADROOM = 2; // a block's floors at least; empty floors over its last message
 
 // What a channel's windows hold, oldest first: as many unnamed messages as
-// its total has beyond the ones it lists, then those (the deleted too).
+// its total has beyond the ones it lists, then those.
 export function contents(c) {
   const list = c.messages || [];
-  const older = Math.max(0, (c.total ?? 0) - list.filter(m => !m.gone).length);
+  const older = Math.max(0, (c.total ?? 0) - list.length);
   return {older, list, count: older + list.length};
 }
 // A block's floors for so many windows, `cols` to a floor (`least`: at least).

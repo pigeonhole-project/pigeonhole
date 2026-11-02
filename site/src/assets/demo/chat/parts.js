@@ -43,4 +43,4 @@ export function scrolledDown(chat) {
   });
 }
 
-export const flags = m => (m.gone ? " gone" : "") + (m.fresh ? " fresh" : "") + (m.quiet ? " service" : "");
+export const flags = m => (m.fresh ? " fresh" : "") + (m.quiet ? " service" : "");
