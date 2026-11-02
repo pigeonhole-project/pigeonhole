@@ -127,7 +127,7 @@ test("tomlOf: the log and snapshots on the node's disk, one store for both", () 
     sketched.slice(1).map(c => [c.store, c.kind]),
     [
       ["meta-log", "local_disk"],
-      ["tg-snapshots", "telegram"],
+      ["tg-snap", "telegram"],
     ],
   );
 });
@@ -142,7 +142,7 @@ test("sketch: each data channel's place; the log and snapshots last", () => {
       ["tg-2", "data", "1/0"],
       ["dc-2", "data", "1/1"],
       ["tg-log", "log", undefined],
-      ["dc-snapshots", "snapshots", undefined],
+      ["dc-snap", "snapshots", undefined],
     ],
   );
   assert.ok(chans.every(c => c.total === undefined));

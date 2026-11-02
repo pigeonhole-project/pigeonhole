@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 /// The ids of a node's own stores in `channels`.
 pub const LOG_STORE: &str = "meta-log";
-pub const SNAPSHOT_STORE: &str = "meta-snapshots";
+pub const SNAPSHOT_STORE: &str = "meta-snap";
 
 /// A node's Raft outbox as `channels` lists it.
 pub fn outbox_store(node: u64) -> String {

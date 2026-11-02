@@ -160,12 +160,10 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.slots = b.slots;
     n.win = svg("g", {}, n.g);
     // The letters on its roof, kept inside the view.
-    // (a long name shortened there: tg-snapshots → tg-snap)
-    const name = c.store.replace(/snapshots?$/, "snap"),
-      size = at.w < 70 ? 12 : 15,
-      half = (name.length * size * 0.62 + size * 2.6 + 4) / 2,
+    const size = at.w < 70 ? 12 : 15,
+      half = (c.store.length * size * 0.62 + size * 2.6 + 4) / 2,
       cx = Math.max(half + 4, Math.min(viewWidth - half - 4, at.x + at.w / 2));
-    n.count = roofLetters(n.g, cx, b.roof, name, {kind: c.kind, app: appOf(c.kind), size});
+    n.count = roofLetters(n.g, cx, b.roof, c.store, {kind: c.kind, app: appOf(c.kind), size});
     n.sign = [cx, b.roof - 26];
     n.tip = svg("title", {}, n.g);
     n.tip.textContent = role;

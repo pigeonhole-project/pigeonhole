@@ -134,7 +134,7 @@ async fn open_log(world: &World, cfg: &Config) -> Result<Arc<dyn LogStore>> {
 
 async fn open_snapshots(world: &World, cfg: &Config) -> Result<Arc<dyn SnapshotStore>> {
     Ok(match &cfg.meta.snapshot {
-        SnapshotSettings::Memory => Arc::new(BlobSnapshotStore::new(world.memory("meta-snapshots", None))),
+        SnapshotSettings::Memory => Arc::new(BlobSnapshotStore::new(world.memory("meta-snap", None))),
         SnapshotSettings::Fake(f) if f.kind == InstanceKind::Telegram => {
             let info = meta_info(f);
             Arc::new(BlobSnapshotStore::new(Arc::new(world.fakes.telegram_store(cfg, f, info).await?)))

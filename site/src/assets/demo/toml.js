@@ -32,11 +32,12 @@ function dataChannels(w) {
 const NODE_DISK = {id: "node-disk", path: "/data/node"};
 
 // The log's and the snapshots' store: a channel, or the node's disk (as
-// the node lists it: meta-log, meta-snapshots).
+// the node lists it: meta-log, meta-snap).
 function metaStore(kind, what) {
-  if (kind === "local_disk") return {id: `meta-${what}`, kind, scope: `${NODE_DISK.path}/${what}`, disk: true};
+  const name = what === "snapshots" ? "snap" : what;
+  if (kind === "local_disk") return {id: `meta-${name}`, kind, scope: `${NODE_DISK.path}/${what}`, disk: true};
   const tail = what === "log" ? "01" : "02";
-  return {id: `${short(kind)}-${what}`, kind, scope: kind === "telegram" ? `-10010000001${tail}` : `10000000000000001${tail}`};
+  return {id: `${short(kind)}-${name}`, kind, scope: kind === "telegram" ? `-10010000001${tail}` : `10000000000000001${tail}`};
 }
 
 export function tomlOf(w) {
