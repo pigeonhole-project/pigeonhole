@@ -1,5 +1,5 @@
 //! Three tablets as one Raft cluster over openraft-chat on a fake chat
-//! (docs/raft-over-chat.md): election, commits applied everywhere, writes
+//! (docs/cluster.md): election, commits applied everywhere, writes
 //! to a follower, a killed leader, a partitioned leader that heals, and the
 //! Raft gauges.
 

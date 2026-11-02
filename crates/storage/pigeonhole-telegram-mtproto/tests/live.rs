@@ -371,7 +371,7 @@ async fn bench_window() {
     }
 }
 
-/// docs/raft-over-chat.md § What has to be true (1, 4): the bot of
+/// docs/cluster.md § What has to be true (1, 4): the bot of
 /// `TG_BOT_TOKEN_2` sees a post the bot of `TG_BOT_TOKEN` made in the
 /// channel TG_BLOBS_CHAT_ID, by id and as a pushed update. Both bots must be
 /// admins there. Deletes its post.

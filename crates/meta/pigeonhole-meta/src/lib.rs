@@ -347,7 +347,7 @@ pub struct MetaOptions {
     pub heartbeat: Duration,
     /// A follower that hears no leader for a random time in this range
     /// campaigns. Over a chat transport both are seconds
-    /// (docs/raft-over-chat.md § Timing).
+    /// (docs/cluster.md § Timing).
     pub election_timeout: (Duration, Duration),
 }
 

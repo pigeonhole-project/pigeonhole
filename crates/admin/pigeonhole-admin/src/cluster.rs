@@ -1,5 +1,5 @@
 //! The `cluster` op: the tablet's Raft cluster as this node sees it, with
-//! what the config says of each node (docs/raft-over-chat.md).
+//! what the config says of each node (docs/cluster.md).
 
 use crate::Admin;
 use serde_json::{json, Value};

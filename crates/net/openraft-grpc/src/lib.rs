@@ -12,7 +12,7 @@
 //!   one hands out a client of one network for some peers and of the other
 //!   for the rest (gRPC to most, the chat to a node that only has channels).
 //!
-//! Design: pigeonhole's docs/raft-over-chat.md § Transports.
+//! Design: pigeonhole's docs/cluster.md § Transports.
 
 mod direct;
 #[cfg(feature = "transport")]

@@ -13,7 +13,7 @@ ROLE = {
     "pigeonhole-codec": "codec",
     "pigeonhole-storage-api": "storage-api",
     "pigeonhole-limits": "limits",
-    # Standalone: no pigeonhole crate at all (docs/raft-over-chat.md).
+    # Standalone: no pigeonhole crate at all (docs/cluster.md).
     "openraft-chat": "standalone",
     # Raft over gRPC: the chat crate's frames, still no pigeonhole crate.
     "openraft-grpc": "raft-net",

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Three pigeonhole processes as one Raft cluster over gRPC on localhost
-# (docs/raft-over-chat.md § Transports): each with a metadata log of its own,
+# (docs/cluster.md § Transports): each with a metadata log of its own,
 # one shared local_disk blob store. Writes go to the leader, found by
 # GET /_pigeonhole/leader; the leader is killed with -9, a new one serves
 # what the old one wrote, and the killed node rejoins as a follower.

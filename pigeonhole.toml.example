@@ -229,7 +229,7 @@ every = "5s"                  # how often the tablet's gauges are set
 # (python3 site/build.py builds it into target/site).
 # ui_dir = "target/site"
 
-# The metadata tablet as one node of a Raft cluster (docs/raft-over-chat.md
+# The metadata tablet as one node of a Raft cluster (docs/cluster.md
 # § Configuration, § Transports). Without [[node]]s: a cluster of one.
 # Every node has the same [cluster], [[node]]s and blob stores, and a [meta]
 # log of its own. A follower answers S3 with 503; GET /_pigeonhole/leader

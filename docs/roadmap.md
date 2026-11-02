@@ -246,7 +246,7 @@ Design: meta-backends.md § Raft between nodes. Sub-steps:
    in memory, since openraft reads every entry it applies back from the log
    (sweep_stress 37 s, as before Raft).
 3. A network and in-process multi-node tests. Partly done: the network over
-   chat channels (crate `openraft-chat`, [raft-over-chat.md](raft-over-chat.md)
+   chat channels (crate `openraft-chat`, [cluster.md](cluster.md)
    § Steps) and `MetaStore::open_in`, with 3-node tests over a fake chat
    (election, failover, partitions) and Raft metrics. Left: chat mailboxes
    and live runs, snapshot catch-up, leader-only side effects, forwarding;
