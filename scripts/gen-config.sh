@@ -16,6 +16,12 @@
 
 set -euo pipefail
 
+# A bot's id from its token (an id is no secret: the config names bots by
+# it, a node checks its tokens against it): a Telegram token's part before
+# ':', a Discord token's first part, in base64.
+tg_bot_id() { echo "${1%%:*}"; }
+dc_bot_id() { local p="${1%%.*}"; while (( ${#p} % 4 )); do p+="="; done; printf '%s' "$p" | base64 --decode; }
+
 : "${CONFIG_OUT:?CONFIG_OUT required}"
 
 INSTANCE="${CONFIG_INSTANCE:-memory}"
@@ -41,6 +47,8 @@ id = \"tgm\"
 kind = \"telegram\"
 chat_id = ${CONFIG_SCOPE_ID}
 bot_token_envs = [\"${CONFIG_BOT_TOKEN_ENV:-BOT_TOKEN}\"]"
+    TOKEN_ENV="${CONFIG_BOT_TOKEN_ENV:-BOT_TOKEN}"
+    INSTANCE_BLOCK+=$'\n'"bot_ids = [$(tg_bot_id "${!TOKEN_ENV:?$TOKEN_ENV is not set}")]"
     if [[ -n "${CONFIG_SESSION:-}" ]]; then
       INSTANCE_BLOCK+=$'\n'"session = \"${CONFIG_SESSION}\""
     fi
@@ -51,7 +59,8 @@ bot_token_envs = [\"${CONFIG_BOT_TOKEN_ENV:-BOT_TOKEN}\"]"
     INSTANCE_BLOCK="[[store]]
 id = \"dc\"
 kind = \"discord\"
-channel_id = ${CONFIG_SCOPE_ID}"
+channel_id = ${CONFIG_SCOPE_ID}
+bot_ids = [$(dc_bot_id "${DISCORD_BOT_TOKEN:?DISCORD_BOT_TOKEN is not set}")]"
     ;;
   *)
     echo "unknown CONFIG_INSTANCE=$INSTANCE (memory|telegram|discord)" >&2

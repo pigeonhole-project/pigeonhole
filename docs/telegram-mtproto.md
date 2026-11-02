@@ -67,6 +67,7 @@ Rejected alternatives:
 id = "tg-main"
 kind = "telegram"
 chat_id = -1001234567890
+bot_ids = [7012345678]             # the bot's id: its token starts with it
 # bot_token_envs = ["BOT_TOKEN"]   # default; several bots: docs/shared-limiter.md
 # api_id_env = "TG_API_ID"         # my.telegram.org, in .env
 # api_hash_env = "TG_API_HASH"

@@ -134,6 +134,7 @@ bot_token_envs = ["RAFT_BOT_TOKEN"]   # this node's bots; each host sets its own
 id = 1
 grpc = "10.0.0.1:7001"          # serves Raft here; the others call it here
 outbox = -1001111111111         # the channel it posts its frames into
+bot_ids = [7011111111]          # its bots, by id: the tokens on its host must be these
 log = "log-1"                   # its [meta] log and snapshots: [[store]] ids
 snapshot = "snapshots-1"
 # Any [meta] knob, for this node alone (unset: [meta]'s): snapshot_every_entries,
@@ -143,12 +144,14 @@ snapshot = "snapshots-1"
 id = 2
 grpc = "10.0.0.2:7001"
 outbox = -1002222222222
+bot_ids = [7022222222]
 log = "log-2"
 snapshot = "snapshots-2"
 
 [[node]]
 id = 3
 outbox = -1003333333333         # only a channel: 1 and 2 reach it over the chat
+bot_ids = [7033333333]
 log = "log-3"
 snapshot = "snapshots-3"
 snapshot_every_entries = 50000  # its log is a chat: snapshots and collection cost messages
@@ -161,6 +164,21 @@ own outbox and reads its chat peers' outboxes through its own bots (several:
 a pool, as a store's). So every node's bots are admins of every outbox it
 uses: its own, to post, and its chat peers', to read and be pushed their
 posts. Only nodes with a chat link log in.
+
+The bots' ids are no secret, so the file names them: `[[node]] bot_ids`
+for a node on the chat (required), `[[store]] bot_ids` for every chat
+store. Every node checks the whole file before it starts:
+- no bot is in two nodes' `bot_ids`: two nodes on one bot share its budget
+  (~25 calls a second, every chat), and their Raft frames queue behind each
+  other's reads until heartbeats time out;
+- no node's bot is a store's, for the same reason;
+- its own tokens are the bots the file says, one id per env var in order
+  (a Telegram token starts with its bot's id; a Discord token's first part
+  is its id in base64). An error names the env var and both ids, never a
+  token.
+
+A bot may serve several stores: a store's channel is its own budget there,
+and the bot's own limit is shared fairly by the limiter.
 
 A fresh cluster is initialized by the member with the lowest id. The others
 wait for its leader. Membership is fixed by the `[[node]]` list.
@@ -532,7 +550,8 @@ them.
 - **Processes** (`make cluster-smoke`): three on localhost, a write through
   the leader, `kill -9` of the leader, a read and a write through the new
   one, the old one back as a follower. `CHAT=telegram` puts node 3 on
-  Telegram outboxes (`TG_RAFT_OUTBOX_1..3` in `.env`).
+  Telegram outboxes (`TG_RAFT_OUTBOX_1..3` in `.env`, and a bot of its own
+  per node: `RAFT_BOT_TOKEN_3`, nodes 1 and 2 fall back to the test bots).
 
 ## Checks (2026-10-30)
 

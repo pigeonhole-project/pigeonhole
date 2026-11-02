@@ -16,7 +16,9 @@ region = "us-east-1"
 # (chat_id) | discord (channel_id). Every kind holds blobs; the log and
 # snapshots go to local_disk, memory (tests: no fsync, gone with the process),
 # telegram or discord (each its own channel). Secrets come from env vars named in the store (defaults:
-# BOT_TOKEN, TG_API_ID, TG_API_HASH / DISCORD_BOT_TOKEN), never inline. A store
+# BOT_TOKEN, TG_API_ID, TG_API_HASH / DISCORD_BOT_TOKEN), never inline; the
+# bots' ids are no secret and go in the file (bot_ids, required: a node starts
+# only if its tokens are those bots'). A store
 # serves one purpose (the blob sweeper deletes our blobs it does not know; the
 # log's fence reads its channel's message order); only a local_disk or memory
 # store holds both the log and the snapshots.
@@ -33,10 +35,12 @@ path = "pigeonhole-meta"
 id = "tg-main"
 kind = "telegram"
 chat_id = -1001234567890
+bot_ids = [7012345678]   # the bots' ids, one per token (a token starts with its bot's id)
 # Several bots (each an admin of the channel) multiply its sends a minute;
 # the first is the primary: it reads, and names the store
 # (docs/shared-limiter.md).
 # bot_token_envs = ["BOT_TOKEN", "BOT_TOKEN_2"]   # default ["BOT_TOKEN"]
+# bot_ids = [7012345678, 7023456789]              # then one id per token, in order
 # api_id_env = "TG_API_ID"
 # api_hash_env = "TG_API_HASH"
 # session = "pigeonhole-tg-<bot id>.session"   # with one bot only
@@ -45,6 +49,7 @@ chat_id = -1001234567890
 # id = "dc-backup"
 # kind = "discord"
 # channel_id = 123456789012345678
+# bot_ids = [1234567890]     # a Discord token's first part is its bot's id, in base64
 # max_blob_size = "20 MiB"   # optional, the default (more on boosted servers)
 
 # Local runs / tests without any chat:
@@ -250,9 +255,11 @@ every = "5s"                  # how often the tablet's gauges are set
 # grpc = "10.0.0.3:7001"
 #
 # A node with only a Telegram channel: give each node an outbox, and the
-# nodes that talk to it the chat's bots (their tokens per host):
+# nodes that talk to it the chat's bots (their tokens per host, their ids
+# here: no two nodes share a bot, and none is a store's):
 # [cluster]
 # bot_token_envs = ["RAFT_BOT_TOKEN"]
 # [[node]]
 # id = 3
 # outbox = -1003333333333
+# bot_ids = [7034567890]

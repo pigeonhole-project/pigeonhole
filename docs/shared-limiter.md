@@ -119,6 +119,7 @@ id = "tg-log"
 kind = "telegram"
 chat_id = -1001234567890
 bot_token_envs = ["BOT_A", "BOT_B", "BOT_C"]   # all admins of the channel
+bot_ids = [7011111111, 7022222222, 7033333333]  # their ids, in the same order
 ```
 
 `pool.begin(call)` computes when the call's plan would be ready for every
@@ -270,8 +271,9 @@ burst = 3.0
 
 Unset values keep the service's defaults; a class the service does not have
 is refused. A `[[store]]` takes `bot_token_envs` (a list, the primary
-first; default `["BOT_TOKEN"]` / `["DISCORD_BOT_TOKEN"]`), and with it the
-pool (step 4). Two stores on one chat stay refused: one store, many bots.
+first; default `["BOT_TOKEN"]` / `["DISCORD_BOT_TOKEN"]`) and `bot_ids`
+(their ids, in the same order: checked against the tokens at start), and
+with them the pool (step 4). Two stores on one chat stay refused: one store, many bots.
 
 ## Metrics
 

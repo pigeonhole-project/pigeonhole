@@ -7,8 +7,9 @@
 #
 # CHAT=telegram: node 3 has no gRPC, only a Telegram outbox; 1 and 2 reach
 # it over the chat (live: channels TG_RAFT_OUTBOX_1..3 from .env, each
-# node's bot RAFT_BOT_TOKEN_<n> or else TG_BOT_TOKEN[_2], admin of all
-# three). Telegram paces the whole cluster: elections take a minute or two.
+# node's own bot RAFT_BOT_TOKEN_<n>, or for nodes 1 and 2 TG_BOT_TOKEN[_2],
+# admin of all three; no two nodes may share one). Telegram paces the whole
+# cluster: elections take a minute or two.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,6 +33,18 @@ cleanup() {
 trap cleanup EXIT
 
 s3_port() { echo $((18330 + $1)); }
+# A bot's id from its token (an id is no secret: the config names bots by
+# it, a node checks its tokens against it): a Telegram token's part before
+# ':', a Discord token's first part, in base64.
+tg_bot_id() { echo "${1%%:*}"; }
+dc_bot_id() { local p="${1%%.*}"; while (( ${#p} % 4 )); do p+="="; done; printf '%s' "$p" | base64 --decode; }
+bot_of() { # node $1's Raft bot: RAFT_BOT_TOKEN_<n>, else a test bot (1, 2); each node its own
+  local var="RAFT_BOT_TOKEN_$1" fallback=""
+  case $1 in 1) fallback="${TG_BOT_TOKEN:-}" ;; 2) fallback="${TG_BOT_TOKEN_2:-}" ;; esac
+  local token="${!var:-$fallback}"
+  [[ -n "$token" ]] || { echo "set $var in .env: node $1 needs a Raft bot of its own" >&2; exit 1; }
+  echo "$token"
+}
 node_conf() { # $1: node id
   local grpc outbox
   for m in 1 2 3; do
@@ -39,7 +52,8 @@ node_conf() { # $1: node id
     outbox=""
     if [[ "$CHAT" == telegram ]]; then
       local var="TG_RAFT_OUTBOX_$m"
-      outbox="outbox = ${!var:?set $var in .env: the Raft outbox channel of node $m}"
+      outbox="outbox = ${!var:?set $var in .env: the Raft outbox channel of node $m}
+bot_ids = [$(tg_bot_id "$(bot_of "$m")")]"
       [[ $m == 3 ]] && grpc=""
     fi
     printf '\n[[node]]\nid = %s\n%s\n%s\n' "$m" "$grpc" "$outbox"
@@ -75,14 +89,9 @@ $(node_conf "$n")
 TOML
 done
 
-bot_of() { # this node's bot token: RAFT_BOT_TOKEN_<n>, else one of the test bots
-  local var="RAFT_BOT_TOKEN_$1" fallback
-  case $1 in 2) fallback="${TG_BOT_TOKEN_2:-}" ;; *) fallback="${TG_BOT_TOKEN:-}" ;; esac
-  echo "${!var:-$fallback}"
-}
 start() {
   # Its own directory: the bots' session files.
-  (cd "$DIR/run$1" && PIGEONHOLE_CONFIG="$DIR/node$1.toml" RAFT_BOT_TOKEN="$(bot_of "$1")" RUST_LOG=info \
+  (cd "$DIR/run$1" && PIGEONHOLE_CONFIG="$DIR/node$1.toml" RAFT_BOT_TOKEN="$( [[ "$CHAT" == telegram ]] && bot_of "$1" )" RUST_LOG=info \
     exec "$BIN" >"$DIR/node$1.log" 2>&1) &
   PID[$1]=$!
 }

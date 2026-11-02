@@ -8,10 +8,12 @@
 //! nodes talk over gRPC when both have `grpc`, else over the chat when both
 //! have an `outbox`: a channel each posts its frames into, and every other
 //! node reads, all with their own bots (`[cluster] bot_token_envs`, its
-//! values set on each host apart).
+//! values set on each host apart). The file names every node's bots by id
+//! (`[[node]] bot_ids`): no two nodes share one, none is a store's, and a
+//! node starts only if its tokens are the bots the file says.
 
 use crate::instances::TelegramLogin;
-use crate::stores::{FakeBacking, FakeChannel, TelegramBots};
+use crate::stores::{check_bot_ids, telegram_bot_id, FakeBacking, FakeChannel, TelegramBots};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +44,15 @@ pub struct NodeSettings {
     pub grpc: Option<String>,
     /// The channel it posts its Raft frames into (`-100…`).
     pub outbox: Option<i64>,
+    /// Its bots in the chat of the outboxes, by id (fake outboxes: its
+    /// fake bots, by default one of its own, [`fake_raft_bot`]).
+    pub bot_ids: Vec<u64>,
+}
+
+/// A node's fake bot on the fake outboxes when `bot_ids` names none: one
+/// per node, far from a fake channel's (1, 2, …).
+pub fn fake_raft_bot(node: u64) -> u64 {
+    1_000_000 + node
 }
 
 /// The chat the outboxes are in, and this node's bots there.
@@ -79,7 +90,8 @@ impl ClusterSettings {
     /// Node `node`'s outbox as a fake Telegram channel, with `[cluster] fake`.
     pub fn outbox_channel(&self, node: u64) -> Option<FakeChannel> {
         let fake = self.fake.as_ref()?;
-        let chat = self.nodes.iter().find(|n| n.id == node)?.outbox?;
+        let owner = self.nodes.iter().find(|n| n.id == node)?;
+        let chat = owner.outbox?;
         let backing = match fake {
             FakeBacking::Dir(dir) => FakeBacking::Dir(dir.join(format!("telegram-{chat}"))),
             other => other.clone(),
@@ -89,7 +101,8 @@ impl ClusterSettings {
             kind: crate::instances::InstanceKind::Telegram,
             scope: chat.to_string(),
             backing,
-            bots: 1,
+            bots: owner.bot_ids.len(),
+            bot_ids: owner.bot_ids.clone(),
         })
     }
 
@@ -160,6 +173,11 @@ pub(crate) struct FileNode {
     grpc: Option<String>,
     /// A channel's id (`-100…`).
     outbox: Option<i64>,
+    /// Its bots in the chat (`[cluster] bot_token_envs` on its host), by
+    /// id: required for a node on the chat. No bot is two nodes' or a
+    /// store's too (they would share one budget); checked by every node,
+    /// and against its own tokens by the node itself.
+    pub(crate) bot_ids: Option<Vec<u64>>,
     /// Its own log and snapshots (store ids, as `[meta]` names them): one
     /// file serves the whole cluster, each node finds its own here.
     log: Option<String>,
@@ -236,6 +254,24 @@ pub(crate) fn node_stores(nodes: &[FileNode], me: Option<u64>) -> Result<NodeSto
     Ok(out)
 }
 
+/// No node's bot is a store's: the store's posts and the node's Raft
+/// frames would share one budget. Checked on the file as written, every
+/// node's and every store's, before anything is resolved.
+pub(crate) fn check_bots_apart(nodes: &[FileNode], stores: &[crate::stores::FileStore]) -> Result<()> {
+    for s in stores {
+        for bot in s.declared_bot_ids() {
+            if let Some(n) = nodes.iter().find(|n| n.bot_ids.as_deref().unwrap_or_default().contains(&bot)) {
+                bail!(
+                    "bot {bot} is in the bot_ids of [[node]] {} and of [[store]] {}: a node's Raft bots must be its own (they would share one budget)",
+                    n.id,
+                    s.store_id()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Timing for the slowest link: heartbeat, election timeout, tick, poll
 /// (docs/cluster.md § Timing).
 struct Timing(Duration, (Duration, Duration), Duration, Duration);
@@ -261,7 +297,23 @@ fn read_nodes(nodes: Vec<FileNode>) -> Result<Vec<NodeSettings>> {
         if !ids.insert(n.id) {
             bail!("[[node]] id {} twice", n.id);
         }
-        settings.push(NodeSettings { id: n.id, grpc: n.grpc, outbox: n.outbox });
+        settings.push(NodeSettings {
+            id: n.id,
+            grpc: n.grpc,
+            outbox: n.outbox,
+            bot_ids: n.bot_ids.unwrap_or_default(),
+        });
+    }
+    let mut owner = BTreeMap::new();
+    for n in &settings {
+        for &bot in &n.bot_ids {
+            if let Some(other) = owner.insert(bot, n.id) {
+                bail!(
+                    "bot {bot} is in the bot_ids of [[node]] {other} and {}: each node needs bots of its own (they would share one budget)",
+                    n.id
+                );
+            }
+        }
     }
     for a in &settings {
         for b in settings.iter().filter(|b| b.id > a.id) {
@@ -298,10 +350,26 @@ impl FileCluster {
             }
             Some(under) => Some(fake_base(under).context("[cluster] fake")?),
         };
+        let mut nodes = nodes;
+        let on_chat =
+            |n: &NodeSettings, all: &[NodeSettings]| all.iter().any(|m| m.id != n.id && link(n, m) == Some(Link::Chat));
+        if fake.is_some() {
+            for n in &mut nodes {
+                if n.bot_ids.is_empty() {
+                    n.bot_ids = vec![fake_raft_bot(n.id)];
+                }
+            }
+        } else {
+            let all = nodes.clone();
+            if let Some(n) = all.iter().find(|n| on_chat(n, &all) && n.bot_ids.is_empty()) {
+                bail!("[[node]] {}: bot_ids = [...] is required for a node on the chat: its bots' ids", n.id);
+            }
+        }
+        let me = nodes.iter().find(|n| n.id == node).expect("checked above");
         let chat = match (chat_link, &fake) {
             (false, _) => None,
             (true, Some(_)) => Some(ChatSettings::Fake),
-            (true, None) => Some(self.chat_settings()?),
+            (true, None) => Some(self.chat_settings(me)?),
         };
         let key_env = self.key_env.context("[cluster] key_env: the env var with the cluster's key")?;
         let key = parse_key(&std::env::var(&key_env).with_context(|| format!("{key_env} is not set"))?)
@@ -327,8 +395,9 @@ impl FileCluster {
         }))
     }
 
-    /// This node's bots in the chat of the outboxes.
-    fn chat_settings(&self) -> Result<ChatSettings> {
+    /// This node's bots in the chat of the outboxes: its tokens must be
+    /// the bots its `[[node]] bot_ids` names.
+    fn chat_settings(&self, me: &NodeSettings) -> Result<ChatSettings> {
         match self.chat.as_deref().unwrap_or("telegram") {
             "telegram" => {
                 let envs = self.bot_token_envs.clone().unwrap_or_else(|| vec!["RAFT_BOT_TOKEN".into()]);
@@ -341,7 +410,11 @@ impl FileCluster {
                     api_hash_env: self.api_hash_env.clone(),
                     session: None,
                 };
-                Ok(ChatSettings::Telegram { logins: bots.logins("[cluster]")? })
+                let logins = bots.logins("[cluster]")?;
+                let tokens: Vec<&str> = logins.iter().map(|l| l.bot_token.as_str()).collect();
+                let what = format!("[cluster] bot_token_envs of [[node]] {}", me.id);
+                check_bot_ids(&what, &envs, &tokens, telegram_bot_id, Some(&me.bot_ids))?;
+                Ok(ChatSettings::Telegram { logins })
             }
             other => bail!("[cluster] chat = {other:?}: only \"telegram\" for now"),
         }

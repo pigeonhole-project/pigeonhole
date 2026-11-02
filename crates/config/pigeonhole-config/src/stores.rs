@@ -32,6 +32,11 @@ pub(crate) enum FileStore {
         /// names the store); more bots, more sends a minute
         /// (docs/shared-limiter.md). Default `["BOT_TOKEN"]`.
         bot_token_envs: Option<Vec<String>>,
+        /// The bots' ids, one per `bot_token_envs` entry and in its order
+        /// (a Telegram token starts with its bot's id): no secret, so the
+        /// file can say whose bots post where; checked against the tokens
+        /// at start. A fake channel's: its fake bots (default 1, 2, …).
+        bot_ids: Option<Vec<u64>>,
         /// Env var with the app's api id (my.telegram.org).
         api_id_env: Option<String>,
         /// Env var with the app's api hash.
@@ -50,6 +55,9 @@ pub(crate) enum FileStore {
         channel_id: u64,
         /// As for telegram; default `["DISCORD_BOT_TOKEN"]`.
         bot_token_envs: Option<Vec<String>>,
+        /// As for telegram (a Discord token's first part is its bot's id,
+        /// in base64).
+        bot_ids: Option<Vec<u64>>,
         #[serde(default, deserialize_with = "crate::units::opt_size")]
         max_blob_size: Option<usize>,
         /// A fake channel instead of Discord (builds with feature `fake`).
@@ -78,16 +86,27 @@ impl FileStore {
         Ok(match self {
             FileStore::LocalDisk { path, .. } => Store::LocalDisk { path },
             FileStore::Memory { .. } => Store::Memory,
-            FileStore::Telegram { chat_id, bot_token_envs, api_id_env, api_hash_env, session, .. } => {
+            FileStore::Telegram { chat_id, bot_token_envs, bot_ids, api_id_env, api_hash_env, session, .. } => {
                 let bot_token_envs = token_envs(&id, bot_token_envs, "BOT_TOKEN")?;
                 let bots = TelegramBots { envs: &bot_token_envs, api_id_env, api_hash_env, session };
-                let logins = bots.logins(&format!("[[store]] {id}"))?;
+                let what = format!("[[store]] {id}");
+                let logins = bots.logins(&what)?;
+                let tokens: Vec<&str> = logins.iter().map(|l| l.bot_token.as_str()).collect();
+                check_bot_ids(&what, &bot_token_envs, &tokens, telegram_bot_id, bot_ids.as_deref())?;
                 Store::Telegram { chat_id: chat_id.to_string(), bot_token_envs, logins }
             }
-            FileStore::Discord { channel_id, bot_token_envs, max_blob_size, .. } => {
+            FileStore::Discord { channel_id, bot_token_envs, bot_ids, max_blob_size, .. } => {
                 let bot_token_envs = token_envs(&id, bot_token_envs, "DISCORD_BOT_TOKEN")?;
                 let bot_tokens = bot_token_envs.iter().map(|env| token(&id, env)).collect::<Result<Vec<_>>>()?;
                 distinct_bots(&id, bot_tokens.iter().map(|t| t.split('.').next().unwrap_or_default()))?;
+                let tokens: Vec<&str> = bot_tokens.iter().map(String::as_str).collect();
+                check_bot_ids(
+                    &format!("[[store]] {id}"),
+                    &bot_token_envs,
+                    &tokens,
+                    discord_bot_id,
+                    bot_ids.as_deref(),
+                )?;
                 Store::Discord { channel_id: channel_id.to_string(), bot_token_envs, bot_tokens, max_blob_size }
             }
         })
@@ -95,19 +114,51 @@ impl FileStore {
 }
 
 impl FileStore {
+    /// The bots it says it posts with (a fake channel's too: its default
+    /// ones unless named), before anything is resolved: what the file
+    /// checks the cluster's bots against.
+    pub(crate) fn declared_bot_ids(&self) -> Vec<u64> {
+        let (fake, ids, bots) = match self {
+            FileStore::Telegram { fake, bot_ids, bots, .. } | FileStore::Discord { fake, bot_ids, bots, .. } => {
+                (fake.is_some(), bot_ids, bots)
+            }
+            _ => return Vec::new(),
+        };
+        match (ids, fake) {
+            (Some(ids), _) => ids.clone(),
+            (None, true) => (1..=bots.unwrap_or(1) as u64).collect(),
+            (None, false) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn store_id(&self) -> &str {
+        self.id()
+    }
+
     /// A telegram or discord store with `fake`: a channel without the
     /// service, no bots and no secrets.
     fn fake_channel(&self, id: &str) -> Result<Option<Store>> {
-        let (kind, scope, fake, real_bots, bots) = match self {
-            FileStore::Telegram { chat_id, fake, bot_token_envs, api_id_env, api_hash_env, session, bots, .. } => (
+        let (kind, scope, fake, real_bots, bots, bot_ids) = match self {
+            FileStore::Telegram {
+                chat_id,
+                fake,
+                bot_token_envs,
+                api_id_env,
+                api_hash_env,
+                session,
+                bots,
+                bot_ids,
+                ..
+            } => (
                 InstanceKind::Telegram,
                 chat_id.to_string(),
                 fake,
                 bot_token_envs.is_some() || api_id_env.is_some() || api_hash_env.is_some() || session.is_some(),
                 bots,
+                bot_ids,
             ),
-            FileStore::Discord { channel_id, fake, bot_token_envs, bots, .. } => {
-                (InstanceKind::Discord, channel_id.to_string(), fake, bot_token_envs.is_some(), bots)
+            FileStore::Discord { channel_id, fake, bot_token_envs, bots, bot_ids, .. } => {
+                (InstanceKind::Discord, channel_id.to_string(), fake, bot_token_envs.is_some(), bots, bot_ids)
             }
             _ => return Ok(None),
         };
@@ -127,11 +178,18 @@ impl FileStore {
             "memory" => FakeBacking::Memory,
             store => FakeBacking::Store(store.to_string()),
         };
-        let bots = bots.unwrap_or(1);
-        if bots == 0 {
+        if let (Some(n), Some(ids)) = (bots, bot_ids) {
+            if *n != ids.len() {
+                bail!("[[store]] {id}: bots = {n} but bot_ids names {}: give one of them", ids.len());
+            }
+        }
+        let bot_ids = self.declared_bot_ids();
+        if bot_ids.is_empty() {
             bail!("[[store]] {id}: a fake channel needs at least one bot");
         }
-        Ok(Some(Store::Fake(FakeChannel { id: id.to_string(), kind, scope, backing, bots })))
+        distinct_bots(id, bot_ids.iter().map(|b| b.to_string()).collect::<Vec<_>>().iter().map(String::as_str))?;
+        let bots = bot_ids.len();
+        Ok(Some(Store::Fake(FakeChannel { id: id.to_string(), kind, scope, backing, bots, bot_ids })))
     }
 }
 
@@ -146,6 +204,8 @@ pub struct FakeChannel {
     pub backing: FakeBacking,
     /// How many bots post to it, the primary first.
     pub bots: usize,
+    /// Their ids (`bot_ids`, else 1, 2, …): each its own budget.
+    pub bot_ids: Vec<u64>,
 }
 
 /// Where a fake channel keeps its messages (its tablet: log, snapshots,
@@ -207,6 +267,50 @@ impl TelegramBots<'_> {
         }
         Ok(logins)
     }
+}
+
+/// A Telegram token's bot: the number before its `:`.
+pub(crate) fn telegram_bot_id(token: &str) -> Option<u64> {
+    token.split(':').next()?.trim().parse().ok()
+}
+
+/// A Discord token's bot: its first part, the bot's id in base64.
+pub(crate) fn discord_bot_id(token: &str) -> Option<u64> {
+    use base64::Engine as _;
+    let first = token.split('.').next()?.trim();
+    let raw = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(first.trim_end_matches('='))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(first.trim_end_matches('=')))
+        .ok()?;
+    String::from_utf8(raw).ok()?.parse().ok()
+}
+
+/// The bots `bot_ids` names are the ones the tokens in `envs` belong to,
+/// one per env var and in its order: what the file says is what runs.
+/// Errors name the env var and the ids, never a token.
+pub(crate) fn check_bot_ids(
+    what: &str,
+    envs: &[String],
+    tokens: &[&str],
+    id_of: fn(&str) -> Option<u64>,
+    declared: Option<&[u64]>,
+) -> Result<()> {
+    let Some(declared) = declared else {
+        bail!("{what}: bot_ids = [...] is required: the bots' ids, one per bot_token_envs entry, in its order (a Telegram token starts with its bot's id)");
+    };
+    if declared.len() != envs.len() {
+        bail!("{what}: bot_ids names {} bots, bot_token_envs {}: one id per env var", declared.len(), envs.len());
+    }
+    for ((env, token), want) in envs.iter().zip(tokens).zip(declared) {
+        match id_of(token) {
+            None => bail!("{what}: env {env} holds no bot token (no bot id in it)"),
+            Some(got) if got != *want => {
+                bail!("{what}: env {env} holds bot {got}'s token, bot_ids says bot {want}")
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// No bot twice in one store (one bot cannot add to its own budget).
