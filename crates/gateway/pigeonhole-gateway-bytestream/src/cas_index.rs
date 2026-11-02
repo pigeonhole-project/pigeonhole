@@ -39,9 +39,10 @@ impl CasIndex {
         namespaces.with::<CasState>()
     }
 
-    /// Whether this node leads the tablet's cluster (only the leader GCs).
-    pub fn is_leader(&self) -> bool {
-        self.meta.is_leader()
+    /// Whether this node leads the tablet's cluster with a quorum (only
+    /// such a leader GCs).
+    pub fn can_write(&self) -> bool {
+        self.meta.has_quorum()
     }
 
     /// Use `meta`, which must have been opened with [`Self::register`].

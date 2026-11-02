@@ -427,3 +427,62 @@ async fn each_node_sees_the_cluster_and_the_leader_sees_lags() {
     })
     .await;
 }
+
+/// The followers `leader` has, cut off from everyone.
+fn cut_off_followers(chat: &FakeChat, leader: u64) -> Vec<u64> {
+    let followers: Vec<u64> = MEMBERS.into_iter().filter(|&m| m != leader).collect();
+    for &f in &followers {
+        chat.isolate(f, true);
+    }
+    followers
+}
+
+#[tokio::test]
+async fn a_leader_left_alone_is_read_only_until_a_quorum_is_back() {
+    let chat = FakeChat::new();
+    let nodes = three(&chat).await;
+    let leader = agreed_leader(&nodes).await;
+    nodes[&leader].propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
+    assert!(nodes[&leader].has_quorum() && !nodes[&leader].is_read_only());
+
+    let followers = cut_off_followers(&chat, leader);
+    let l = &nodes[&leader];
+    eventually("the leader alone turns read-only", || l.is_read_only()).await;
+    assert!(l.is_leader() && !l.has_quorum(), "it still leads, without a quorum");
+    let t = std::time::Instant::now();
+    let err = l.propose::<Counter>(op(2, 1)).await.unwrap_err();
+    assert!(err.downcast_ref::<NoQuorum>().is_some(), "{err:#}");
+    assert!(t.elapsed() < Duration::from_millis(100), "refused at once, not after a wait");
+    assert_eq!(value(l), 1, "reads go on");
+    assert!(followers.iter().all(|f| !nodes[f].is_read_only()), "only a leader is ever read-only");
+
+    chat.isolate(followers[0], false);
+    eventually("a quorum again: writable", || nodes.values().any(|n| n.has_quorum())).await;
+    let writer = nodes.values().find(|n| n.has_quorum()).unwrap();
+    writer.propose::<Counter>(op(3, 1)).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_write_in_flight_when_the_quorum_goes_has_an_unknown_outcome() {
+    let chat = FakeChat::new();
+    let nodes = three(&chat).await;
+    let leader = agreed_leader(&nodes).await;
+    nodes[&leader].propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
+
+    cut_off_followers(&chat, leader);
+    let t = std::time::Instant::now();
+    let err = nodes[&leader].propose::<Counter>(op(2, 1)).await.unwrap_err();
+    assert!(err.downcast_ref::<CommitUnknown>().is_some(), "{err:#}");
+    let lease = opts().election_timeout.1;
+    assert!(t.elapsed() < lease * 2, "answered once read-only, in {:?}", t.elapsed());
+}
+
+#[tokio::test]
+async fn a_cluster_of_one_is_never_read_only() {
+    let log = Arc::new(crate::ChainLogStore::new(Arc::new(MemoryBlobStore::new())));
+    let snapshots = Arc::new(crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())));
+    let solo = MetaStore::open(log, snapshots, counter(), opts()).await.unwrap();
+    tokio::time::sleep(opts().election_timeout.1 * 3).await;
+    assert!(solo.has_quorum() && !solo.is_read_only());
+    solo.propose::<Counter>(op(1, 1)).await.unwrap().unwrap();
+}

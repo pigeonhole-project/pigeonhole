@@ -26,12 +26,18 @@ Only the leader writes, and only the leader serves:
   `ServiceUnavailable`, naming the leader. Writes would fail there, and
   reads would see a state that may lag the leader's. There is no proxy
   between nodes and no follower read.
-- **Finding the leader.** `GET /_pigeonhole/leader` answers on every node:
-  200 on the leader, 503 elsewhere, with `{node, leader, leading}`. A load
-  balancer's health check on it sends clients to the leader. `/metrics`
-  answers on every node.
+- **Finding the leader.** Two checks answer on every node with
+  `{node, leader, leading, read_only}`:
+  - `GET /_pigeonhole/leader`: 200 on the leader with its quorum, 503
+    elsewhere. A load balancer's health check on it sends clients where
+    writes work.
+  - `GET /_pigeonhole/readable`: 200 on the leader, read-only or not (§
+    Losing the quorum), 503 elsewhere: for a balancer that should keep
+    reads going while writes cannot be.
+
+  `/metrics` answers on every node.
 - **Background work.** Sweeper, repair, cooler and the CAS GC skip their
-  passes unless `MetaStore::is_leader`. A new leader takes the work over
+  passes unless `MetaStore::has_quorum` (the leader, not read-only). A new leader takes the work over
   with its next pass. Each node's snapshot ticker runs on its own:
   snapshots are per node.
 - **Taking over** (`ChunkStore::take_over`, on boot when leading and again
@@ -52,6 +58,52 @@ sweeper is the only one that deletes, so they need not travel. When the
 leader changes, its uploads in flight can no longer commit. The new
 leader's horizon starts below them, so they are left alone for now and
 swept as orphans once its own uploads pass them.
+
+## Losing the quorum
+
+openraft 0.9 keeps a leader that no quorum answers any more a leader: it
+learns of a new term only from a node that has one. Until then it would
+take writes that cannot commit. So the tablet watches how long ago a
+quorum last acknowledged the leader (openraft's `millis_since_quorum_ack`,
+the gauge `pigeonhole_meta_raft_quorum_ack_age_seconds`). Past the lease,
+`election_timeout.1`, the leader is **read-only**: the other nodes may have
+elected another leader by then. Over gRPC that is 3 s, over a chat 90 s
+(§ Timing). It is never read-only in a cluster of one.
+
+What each node does (three nodes, two of them gone or cut off):
+
+| | the leader left alone | a follower left alone |
+|---|---|---|
+| S3 reads (GET, HEAD) | served, from what it applied | 503 |
+| S3 writes (PUT, POST, DELETE) | 503, before reading the body | 503 |
+| `/_pigeonhole/leader` | 503, `read_only: true` | 503, `leader: null` |
+| `/_pigeonhole/readable` | 200 | 503 |
+| background passes | skipped | skipped |
+
+- **Reads** on a read-only leader show its state as of its last commit.
+  If the other nodes are alive, only cut off, they may have elected a
+  leader and committed since: those reads may be stale.
+- **Writes** are refused before anything is uploaded:
+  - the S3 port's gate answers 503 `ServiceUnavailable` (`Retry-After: 1`);
+  - inside, `MetaStore::propose_all` refuses with `NoQuorum` before a
+    proposal reaches Raft;
+  - the admin API and the demo's admin refuse too, with 503 and an error;
+  - REAPI answers `UNAVAILABLE`.
+- **A write in flight** when the quorum goes ends with `CommitUnknown`
+  (503) once the node turns read-only, not when the client's timeout runs
+  out. Proposals still queued are dropped, so they never commit. The
+  entry Raft already holds is different. It commits if this node still
+  leads when a quorum is back, and it is lost if another node took over.
+  A PUT is safe to send again. A conditional one (`If-None-Match: *`) may
+  get 412 for its own earlier attempt.
+- **Back:** once a quorum acknowledges the leader again, the node is
+  writable at the next check (a quarter of the lease). A leader that
+  meanwhile lost to a newer term follows instead.
+- Logs: `no quorum: read-only`, then `quorum back (or not leading):
+  writable`. Gauge: `pigeonhole_meta_read_only`.
+
+A follower with no leader stays as it was: 503 on everything. Serving
+possibly stale reads there is a separate choice.
 
 ## Configuration
 
@@ -433,13 +485,17 @@ them.
 - **The tablet** (`pigeonhole-meta` `tests/cluster.rs`):
   - over `FakeChat`: election, commits everywhere, a write to a follower,
     a killed leader, a partitioned leader that heals, gauges and lag, the
-    cluster view, a follower that catches up from a snapshot;
+    cluster view, a follower that catches up from a snapshot, a leader left
+    alone (read-only, `NoQuorum`, back with a quorum), a write in flight as
+    the quorum goes (`CommitUnknown`), a cluster of one never read-only;
   - over gRPC alone;
   - two gRPC nodes and a chat node;
   - a `Direct` pair and a chat node (this one under madsim too).
-- **The binary** (`tests/raft_telegram.rs`): two gRPC nodes and one on
-  `TelegramMailbox` over fake Telegram channels, through the leader's
-  death.
+- **The binary**:
+  - `tests/raft_telegram.rs`: two gRPC nodes and one on `TelegramMailbox`
+    over fake Telegram channels, through the leader's death;
+  - `tests/leader_http.rs`: the S3 gate and both health checks on a
+    leader left alone (writes 503 with their bodies unread, reads 200).
 - **The demo's node** (`pigeonhole-web` `tests/cluster.rs`): three nodes in
   one process, over `Direct` and fake Telegram outboxes, one config for all.
 - **Simulation** (`pigeonhole-sim/tests/cluster.rs`, madsim): three nodes
@@ -480,6 +536,7 @@ Done:
 - metrics and the Grafana row;
 - snapshot catch-up;
 - leader-only work, `DynConfig::follow`, 503 on followers;
+- read-only without a quorum (§ Losing the quorum);
 - gRPC, `Direct` and per-pair transports;
 - `[cluster]` / `[[node]]`;
 - the Telegram outbox;

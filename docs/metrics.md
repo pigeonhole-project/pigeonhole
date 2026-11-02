@@ -145,6 +145,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_meta_raft_last_applied_index` | gauge |  | Index of the last entry this node applied |
 | `pigeonhole_meta_raft_replication_lag` | gauge | `peer` | On the leader: entries a peer's log is behind the leader's (NaN on a follower) |
 | `pigeonhole_meta_raft_quorum_ack_age_seconds` | gauge |  | On the leader: time since a quorum last acknowledged it (NaN on a follower); grows when the leader is cut off |
+| `pigeonhole_meta_read_only` | gauge |  | 1 while this node leads without a quorum (read-only: writes answer 503), else 0 |
 
 ### openraft-chat
 

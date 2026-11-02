@@ -165,13 +165,14 @@ impl S3Gateway {
         outcomes.take(slot).map_err(Self::map_err)
     }
 
-    /// An error of the layers below: on a node that does not lead the
-    /// tablet's cluster, `ServiceUnavailable` (503: ask the leader, or again
-    /// once one is elected); anything else as [`Self::internal`].
+    /// An error of the layers below: on a node that cannot write now (not
+    /// the leader, read-only without a quorum, the quorum lost mid-commit),
+    /// `ServiceUnavailable` (503: ask the leader, or again once one is
+    /// elected or the quorum is back); anything else as [`Self::internal`].
     fn map_err(e: impl Into<anyhow::Error>) -> s3s::S3Error {
         let e = e.into();
-        if let Some(not) = e.chain().find_map(|c| c.downcast_ref::<pigeonhole_meta::NotLeader>()) {
-            return s3_error!(ServiceUnavailable, "{not}");
+        if pigeonhole_meta::unavailable(&e) {
+            return s3_error!(ServiceUnavailable, "{e:#}");
         }
         Self::internal(e)
     }

@@ -185,6 +185,12 @@ impl BlobDb {
         self.meta.is_leader()
     }
 
+    /// Whether this node leads with a quorum: background passes, which
+    /// write, run only then (a read-only leader's writes are refused).
+    pub fn can_write(&self) -> bool {
+        self.meta.has_quorum()
+    }
+
     /// Whether the tablet has stopped (fenced or failed): background work ends.
     pub fn tablet_stopped(&self) -> bool {
         self.meta.is_stopped()

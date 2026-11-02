@@ -98,7 +98,7 @@ async fn cooler(
         if meta.is_stopped() {
             return;
         }
-        if !meta.is_leader() {
+        if !meta.has_quorum() {
             schedule.done();
             continue;
         }
