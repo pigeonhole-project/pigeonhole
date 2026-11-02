@@ -7,6 +7,7 @@
 import {activate, button, h, svg} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {boarded, perched} from "./art.js";
+import {sentence} from "./entities.js";
 
 export const TASKS = ["repair", "sweep", "cool", "snapshot"];
 // The tasks only the leader runs (the chunk stores are its); every node
@@ -65,6 +66,14 @@ export function describe(bg, name) {
     next: period ? t("bg.next", {when: soon(task.next_in_ms)}) : of ? t("bg.at_entries", {of}) : t("bg.parked"),
     work,
   };
+}
+
+// A piece of work as a tile; a repair job's channel, a link to it.
+function jobTile(name, item) {
+  const li = h("li", "job-tile");
+  if (name === "repair") li.append(...sentence(["demo.job", {chunk: item.chunk, store: item.store}]));
+  else li.textContent = workLabel(name, item);
+  return li;
 }
 
 // One piece of a task's work, in words.
@@ -187,10 +196,13 @@ const tip = (() => {
 // ---- the loft's panel: a card per task in `box`, updated in place (a
 // poll keeps the focus where it was). onToggle(name, on), onRun(name);
 // `follower`: why the leader's tasks are not here (a follower runs none of
-// them), shown above; its snapshots are its own. Returns update(bg).
+// them; nodes, its links among them), shown above; its snapshots are its
+// own. Returns update(bg).
 export function taskCards(box, {onToggle, onRun, follower = null}) {
   const cards = TASKS.map(name => taskCard(name, onToggle, onRun, !!follower));
-  box.replaceChildren(...(follower ? [h("p", "field-note tasks-ro", follower)] : []), ...cards.map(c => c.el));
+  const note = h("p", "field-note tasks-ro");
+  if (follower) note.append(...follower);
+  box.replaceChildren(...(follower ? [note] : []), ...cards.map(c => c.el));
   return bg => {
     for (const c of cards) c.update(describe(bg, c.name));
   };
@@ -253,7 +265,7 @@ function taskCard(name, onToggle, onRun, follower) {
       return;
     }
     const work = d.task.work;
-    jobs.replaceChildren(...work.slice(0, JOBS_SHOWN).map(item => h("li", "job-tile", workLabel(name, item))));
+    jobs.replaceChildren(...work.slice(0, JOBS_SHOWN).map(item => jobTile(name, item)));
     if (work.length > JOBS_SHOWN) jobs.append(h("li", "job-tile more", `+${work.length - JOBS_SHOWN}`));
     if (!work.length) jobs.append(h("li", "empty", t("bg.idle")));
   }

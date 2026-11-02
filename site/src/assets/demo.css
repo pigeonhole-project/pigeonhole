@@ -143,6 +143,14 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .node.down .cote { fill: var(--cote-off); }
 .node.down .sign-sub { fill: var(--eye); }
 .flight { pointer-events: none; }
+/* a thing pointed at elsewhere (a link: entities.js) */
+.node.hl .ring { stroke: var(--eye); stroke-width: 3; animation: hl 1.2s ease-in-out infinite; }
+@keyframes hl { 50% { stroke-opacity: .35; } }
+.ref { border: 0; background: none; padding: 0 1px; font: inherit; color: var(--teal); cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+.ref:hover, .ref:focus-visible { color: var(--eye); outline: none; }
+.cluster-pick.hl { border-color: var(--eye); }
+.own-channels, .channel-kin { margin: 4px 0 10px; color: var(--wing-2); }
+.send-to h3 { margin-top: 0; }
 /* a cluster: the leader's flag, a node cut off dark, Raft's traffic */
 .flag-pole { stroke: var(--seam); stroke-width: 3; } .flag { fill: var(--eye); }
 .post { fill: var(--seam); }

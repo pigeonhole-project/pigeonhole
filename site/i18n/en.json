@@ -88,6 +88,7 @@
   "js.say.welcome_back": "Welcome back. Nothing here was kept by the page: the node booted from its channels on this browser's disk, claimed the log's next generation and replayed {n} entries — as a server does after a restart.",
   "js.try.no_objects": "Empty: upload a file.",
   "demo.nodes": "The cluster's nodes",
+  "demo.send_to": "Your requests go to",
   "demo.title": "The loft",
   "demo.graph_label": "pigeonhole and its channels",
   "demo.hint": "Click a node to look inside. Start with you: upload a file.",
@@ -253,7 +254,7 @@
   "js.nodes.loft_sub": "A node of the cluster: S3 in front, its copy of the metadata tablet (its own log and snapshots), the chunk store; only the leader writes.",
   "js.nodes.tasks_leader": "Repair, the sweeper and the cooler run on the leader only (node {n}); this node takes its own snapshots. Their settings are entries in the log: the leader writes them.",
   "js.nodes.loft_title": "pigeonhole · node {n}",
-  "js.nodes.looking": "You look at <b>node {n}</b> now: its log, its channels, and your requests go to it.",
+  "js.nodes.looking": "You look at <b>node {n}</b>: its log, its channels, its tasks. Your requests go where they went (your panel).",
   "js.nodes.following": "You follow the leader: your requests go to whichever node leads (★).",
   "js.nodes.new_leader": "<b>Node {n}</b> leads now (term {term}): the others voted it in.",
   "js.nodes.cut_off": "Cut node {n} off",
@@ -421,5 +422,13 @@
   "js.cluster.chronicle": "Raft, as it went",
   "js.cluster.quiet": "Nothing yet: the leader leads, the others follow.",
   "js.time.ago": "{s} s ago",
-  "js.nodes.config_in_cluster": "The config is the cluster's, one file for every node: in the Cluster panel."
+  "js.nodes.config_in_cluster": "The config is the cluster's, one file for every node: in the Cluster panel.",
+  "js.demo.send_leader": "the leader",
+  "js.demo.send_now": "Now that is",
+  "js.demo.send_fixed": "Only the leader serves: a follower turns your requests away and names the leader.",
+  "js.nodes.sending": "Your requests go to <b>node {n}</b> now; you look at it too.",
+  "js.demo.own_channels": "Its own channels:",
+  "js.demo.kin_node": "Node:",
+  "js.demo.kin_copies": "Other copies:",
+  "js.demo.kin_shards": "Other shards:"
 }

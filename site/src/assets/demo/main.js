@@ -3,13 +3,14 @@
 // panel. This module keeps the page's state and wires the views (pure: data
 // and callbacks in, elements out) to the node's ops.
 import {button, h, reducedMotion} from "../lib/dom.js";
-import {bytes, t, tHtml} from "../lib/i18n.js";
+import {bytes, t} from "../lib/i18n.js";
 import {s3Sentence} from "../lib/say.js";
-import {appOf} from "./channels.js";
+import {appOf, kinOf} from "./channels.js";
 import {chatView} from "./chat/index.js";
 import {forgetPlaces} from "./chat/scroll.js";
 import {clientView} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
+import {ref, sentence, setLinks} from "./entities.js";
 import {readEvents} from "./events.js";
 import {faultsView} from "./faults-view.js";
 import {flightsOf, refused} from "./flights.js";
@@ -29,7 +30,8 @@ const state = {
   demo: "", // the demo's own config (the loft's "reset")
   config: "", // the pigeonhole.toml the node runs (a cluster's: every node's)
   nodes: [1], // the nodes' ids: one, or a cluster's
-  node: null, // the node the page looks at and sends to; null: whichever leads
+  node: null, // the node your requests go to (your panel); null: whichever leads
+  look: null, // the node on screen (its panel, log, tasks); null: the one your requests go to
   cluster: null, // the `cluster` op's: {leader, term, nodes}
   term: null, // the newest term seen: a new leader is told once
   timing: null, // the cluster's clocks (ms): {heartbeat, election: [min, max]}
@@ -48,10 +50,14 @@ const state = {
   wizard: false, // the first visit's setup is on screen
 };
 const channel = store => state.channels.find(c => c.store === store);
-// The node on screen: the one picked, else the leader, else the first.
-const shown = () => state.node ?? state.cluster?.leader ?? state.nodes[0];
-// A request for the node the page talks to (the server picks the leader without one).
+// The node your requests go to: the one you picked, else the leader, else the first.
+const target = () => state.node ?? state.cluster?.leader ?? state.nodes[0];
+// The node on screen: the one you look at, else the one your requests go to.
+const shown = () => state.look ?? target();
+// Your request, for the node it goes to (the server picks the leader without one).
 const onNode = request => (state.node == null || request.node != null ? request : {...request, node: state.node});
+// A look at the node on screen (its channels, log, tasks).
+const onShown = request => (request.node != null || state.look == null ? onNode(request) : {...request, node: state.look});
 // The log the `log` op reads: the node on screen's.
 const logChannel = () => state.channels.find(c => c.role === "log" && (c.node == null || c.node === shown()));
 // The node on screen follows a leader it knows: the leader's tasks are not its.
@@ -90,6 +96,18 @@ const scene = () => ({
   links: state.cluster?.links || [],
   every: state.bg?.snapshot?.every ?? 0,
 });
+// A mention anywhere (entities.js) marks its thing on the graph (the
+// cluster: its chip) and opens its panel.
+setLinks({
+  mark: r => {
+    graph.highlight(r?.kind === "cluster" ? null : r);
+    $("nodes")
+      .querySelector(".cluster-pick")
+      ?.classList.toggle("hl", r?.kind === "cluster");
+  },
+  open: r => openPanel(r),
+});
+
 function redraw() {
   drawnLeader = state.cluster?.leader ?? null;
   drawnLinks = state.cluster?.links?.length ?? 0;
@@ -101,8 +119,8 @@ function redraw() {
 
 // ------------------------------------------------------------ captions
 // The sentence under the graph: a say.* string ([key, vars]; the values are escaped).
-function say(sentence) {
-  $("caption").innerHTML = sentence ? tHtml(...sentence) : "";
+function say(said) {
+  $("caption").replaceChildren(...(said ? sentence(said) : []));
 }
 const sayError = error => $("caption").replaceChildren(h("b", "", t("try.error", {error})));
 const status = text => {
@@ -188,7 +206,7 @@ async function background(events) {
 // A call that is not an op of yours (a list, the log): what the node
 // logged meanwhile is its own doing (its timers ran), drawn as such.
 async function call(request, body) {
-  const r = await node.call(onNode(request), body, events => background(events));
+  const r = await node.call(onShown(request), body, events => background(events));
   if (r.events.length) background(r.events);
   return r;
 }
@@ -204,8 +222,8 @@ async function op(request, body) {
   said.push(...apply(readEvents(events)));
   if (reply?.error?.startsWith("not the leader")) {
     // You knocked on a follower: your pigeon turns back at its door.
-    graph.fly(refused(shown()));
-    say(["say.not_leader", {n: shown(), error: reply.error}]);
+    graph.fly(refused(target()));
+    say(["say.not_leader", {n: target(), error: reply.error}]);
   } else if (reply?.error && state.channels.some(c => c.down)) say([request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: reply.error}]);
   else if (reply?.error) sayError(reply.error);
   else if (said.length) say(said.at(-1));
@@ -221,9 +239,11 @@ function setBusy(on) {
   for (const b of document.querySelectorAll(".panel button, .panel input")) if (!b.classList.contains("back")) b.disabled = on;
 }
 
+// Your objects: the bucket's, as the leader lists it (a follower turns S3
+// away, whichever node is on screen); kept as they were when none answers.
 async function refreshObjects() {
-  const {reply} = await call({op: "list", bucket: state.bucket});
-  state.objects = reply?.objects || [];
+  const {reply} = await call({op: "list", bucket: state.bucket, node: state.cluster?.leader ?? undefined});
+  if (ok(reply)) state.objects = reply.objects || [];
   graph.setObjects(state.objects.length);
   view?.setObjects?.(state.objects);
   view?.setCounters?.(counters());
@@ -308,26 +328,32 @@ async function pollCluster() {
 // The nodes in the bar: which leads (★), which is cut off; the one on
 // screen pressed. Picking a node shows it and sends to it; picking it
 // again follows the leader.
+// The bar: the cluster's chip (it has no place on the graph). Which node
+// your requests go to is yours to pick: in your panel.
 function renderNodes() {
   const bar = $("nodes");
   bar.hidden = state.nodes.length < 2;
-  const all = button("node-pick cluster-pick", t("cluster.title"), () => openPanel({kind: "cluster"}));
+  const all = button("node-pick cluster-pick", t("cluster.title"), () => openPanel(ref.cluster()));
   all.setAttribute("aria-pressed", String(isOpen("cluster")));
-  bar.replaceChildren(
-    all,
-    ...state.nodes.map(id => {
-      const marks = `${id === state.cluster?.leader ? " ★" : ""}${state.cut.has(id) ? " ✂" : ""}`;
-      const b = button("node-pick", `${t("nodes.node", {n: id})}${marks}`, () => pickNode(state.node === id ? null : id));
-      b.setAttribute("aria-pressed", String(state.node === id));
-      b.classList.toggle("following", state.node == null && id === shown());
-      return b;
-    }),
-  );
+  bar.replaceChildren(all);
+  if (isOpen("client")) view?.setCluster?.(clientCluster());
 }
+const clientCluster = () => (state.nodes.length > 1 ? {nodes: state.nodes, node: state.node, leader: state.cluster?.leader ?? null, cut: state.cut} : null);
 
+// Your requests go to node `id` (null: the leader); you look at it too.
 async function pickNode(id) {
   state.node = id;
-  say(id == null ? ["nodes.following", {}] : ["nodes.looking", {n: id}]);
+  state.look = null;
+  say(id == null ? ["nodes.following", {}] : ["nodes.sending", {n: id}]);
+  await showNode();
+}
+// You look at node `id` (its panel, log, tasks); your requests go where they went.
+async function lookAt(id) {
+  state.look = id === target() ? null : id;
+  say(["nodes.looking", {n: id}]);
+  await showNode();
+}
+async function showNode() {
   renderNodes();
   await refreshChannels();
   await refreshObjects();
@@ -439,10 +465,10 @@ let view = null; // the open panel's view, for updates in place
 async function openPanel(target) {
   if (state.wizard) return;
   // Another node's dovecote: that node on screen, then its panel.
-  if (target.kind === "loft" && target.node != null && target.node !== shown()) await pickNode(target.node);
+  if (target.kind === "loft" && target.node != null && target.node !== shown()) await lookAt(target.node);
   // A log: that node's, read on it.
   const log = target.kind === "store" && channel(target.store)?.role === "log" ? channel(target.store) : null;
-  if (log?.node != null && log.node !== shown()) await pickNode(log.node);
+  if (log?.node != null && log.node !== shown()) await lookAt(log.node);
   if (log) target = {kind: "log"};
   state.open = target;
   forgetPlaces();
@@ -480,14 +506,15 @@ function renderPanel() {
     view = v;
   };
   if (open.kind === "client") {
-    const v = clientView(state, clientOps);
+    const v = clientView({...state, cluster: clientCluster()}, clientOps);
     show(t("demo.you"), t("demo.you_sub"), v.nodes, v);
   } else if (open.kind === "loft") {
     const id = shown();
     const cluster = state.nodes.length > 1 ? {node: id, cut: state.cut.has(id), leader: state.cluster?.leader ?? null} : null;
     // A cluster's "reset" is its own config back: the demo's is one node's.
     const demo = cluster ? state.config : state.demo;
-    const v = loftView({counters: counters(), ...state, demo, cluster}, loftOps);
+    const own = state.channels.filter(c => c.role !== "data" && (c.node == null || c.node === id)).map(c => c.store);
+    const v = loftView({counters: counters(), ...state, demo, cluster, own}, loftOps);
     show(cluster ? t("nodes.loft_title", {n: id}) : "pigeonhole", t(cluster ? "nodes.loft_sub" : "demo.loft_sub"), v.nodes, v);
     if (!state.log) loadLog();
   } else if (open.kind === "cluster") {
@@ -507,6 +534,8 @@ function renderPanel() {
     if (!c) return;
     const nodes = [chatView(c, m => deleteMessage(c, m))];
     if (c.role === "data") nodes.unshift(faultsView(c, state.admin, faultOps(c)));
+    const kin = kinOf(c, state.channels);
+    if (kin) nodes.unshift(kin);
     show(c.store, t(`demo.channel_sub_${c.role}`, {app: appOf(c.kind), scope: c.scope}), nodes);
   }
 }
@@ -528,6 +557,11 @@ const clientOps = {
   },
   copy: key => op({op: "copy", bucket: state.bucket, key, to: key.replace(/(\.[^.]*)?$/, ext => `-copy${ext}`)}),
   remove: key => op({op: "delete", bucket: state.bucket, key}),
+  // In a cluster: the leader (null) or a node of yours.
+  async sendTo(id) {
+    await pickNode(id);
+    renderPanel();
+  },
 };
 
 // The node: its config, its background tasks.

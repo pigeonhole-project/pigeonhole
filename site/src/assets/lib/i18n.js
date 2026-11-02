@@ -15,6 +15,12 @@ export function tHtml(key, vars = {}) {
   return fill(key, vars, esc);
 }
 
+// The same, a value for which `raw(name, value)` gives a string put in as
+// it is (a placeholder the caller swaps for an element), the rest escaped.
+export function tHtmlWith(key, vars, raw) {
+  return fill(key, vars, (v, k) => raw(k, v) ?? esc(v));
+}
+
 function fill(key, vars, value) {
   let s = globalThis.I18N?.[key];
   if (s == null) return key;
@@ -22,7 +28,7 @@ function fill(key, vars, value) {
     if (plurals?.resolvedOptions().locale !== lang()) plurals = new Intl.PluralRules(lang());
     s = s[plurals.select(vars.n)] ?? s.other;
   }
-  return s.replace(/\{(\w+)\}/g, (_, k) => (vars[k] == null ? `{${k}}` : value(vars[k])));
+  return s.replace(/\{(\w+)\}/g, (_, k) => (vars[k] == null ? `{${k}}` : value(vars[k], k)));
 }
 
 export const esc = v => String(v).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"})[c]);

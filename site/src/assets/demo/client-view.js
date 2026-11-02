@@ -1,18 +1,41 @@
-// Your panel: uploads (files, or samples made here) and the bucket's
-// objects, each with read, copy and delete. On a real node, a bucket picker.
+// Your panel: in a cluster, which node your requests go to; uploads (files,
+// or samples made here) and the bucket's objects, each with read, copy and
+// delete. On a real node, a bucket picker.
 //
+// cluster: {nodes: [id], node: the one picked or null (the leader), leader, cut: Set}.
 // on: {bucket(name), upload(name, ArrayBuffer), tooBig(), read(key, size),
-// copy(key), remove(key)}. Returns {nodes, setObjects([[key, size]])}.
+// copy(key), remove(key), sendTo(id | null)}. Returns {nodes, setObjects([[key, size]])}.
 import {button, h} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
+import {nodeLink} from "./entities.js";
 
 export const MAX_UPLOAD = 64 << 20; // it all lives in the tab's memory
 
-export function clientView({buckets, bucket, objects, admin}, on) {
+export function clientView({buckets, bucket, objects, admin, cluster}, on) {
   const view = document.getElementById("tpl-client").content.cloneNode(true);
   const drop = view.querySelector("#drop"),
     rows = view.querySelector("#objects");
   let current = objects;
+
+  // A cluster: the leader, whichever it is, or a node of your choosing (a
+  // follower turns you away: only the leader serves).
+  if (cluster) {
+    view.querySelector("#send-to").hidden = false;
+    const pick = (label, id) => {
+      const b = button("btn node-pick", label, () => on.sendTo(id));
+      b.setAttribute("aria-pressed", String(cluster.node === id));
+      return b;
+    };
+    view
+      .querySelector("#send-to-picks")
+      .replaceChildren(
+        pick(t("demo.send_leader"), null),
+        ...cluster.nodes.map(id => pick(`${t("nodes.node", {n: id})}${id === cluster.leader ? " ★" : ""}${cluster.cut.has(id) ? " ✂" : ""}`, id)),
+      );
+    const note = view.querySelector("#send-to-note");
+    if (cluster.node == null && cluster.leader != null) note.append(t("demo.send_now"), " ", nodeLink(cluster.leader));
+    else note.textContent = cluster.node == null ? "" : t("demo.send_fixed");
+  }
 
   if (admin) {
     const pick = h("select", "bucket-pick");
