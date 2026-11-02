@@ -144,6 +144,39 @@ async fn discover_reads_only_the_tail() {
     assert_eq!((d.head, d.gen, d.vote.as_deref()), (Head { position: 1, ..head }, 1, Some(&b"v"[..])));
 }
 
+/// openraft reads the log at boot in short ranges from its end: each read
+/// starts where the last one stopped, so the blobs read grow with the log,
+/// not with its square.
+#[tokio::test]
+async fn reads_back_from_the_end_walk_the_chain_once() {
+    let mem = Arc::new(MemoryBlobStore::new());
+    let a = store(&mem);
+    a.claim(1).await.unwrap();
+    let n = 1000;
+    for i in 1..=n {
+        a.append(1, &[entry(i)]).await.unwrap();
+    }
+    let b = store(&mem);
+    let head = b.discover().await.unwrap().unwrap().head;
+    let mut got = Vec::new();
+    let mut to = head.position;
+    while to > 0 {
+        let from = to.saturating_sub(64);
+        let part: Vec<_> = b.read(from, Head { position: to, ..head }).try_collect().await.unwrap();
+        got.splice(0..0, part.into_iter().map(|(_, e)| u64::from_le_bytes(e.payload.try_into().unwrap())));
+        to = from;
+    }
+    assert_eq!(got, (1..=n).collect::<Vec<_>>());
+    // One read of a single entry near the end, then near the start.
+    for p in [n - 3, 5] {
+        let one: Vec<_> = b.read(p - 1, Head { position: p, ..head }).try_collect().await.unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(u64::from_le_bytes(one[0].1.payload.clone().try_into().unwrap()), p);
+    }
+    let followed = b.walk.lock().unwrap().followed;
+    assert!(followed < 2 * n + 100, "{followed} blobs read for {n} entries");
+}
+
 mod disk {
     use super::*;
     use pigeonhole_storage_disk::DiskBlobStore;
