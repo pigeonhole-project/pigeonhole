@@ -6,7 +6,7 @@ import {chatModel} from "../src/assets/demo/chat/model.js";
 import {readEvents} from "../src/assets/demo/events.js";
 import {summary} from "../src/assets/demo/log-view.js";
 import {describe, ms} from "../src/assets/demo/tasks.js";
-import {divisors, sketch, tomlOf} from "../src/assets/demo/toml.js";
+import {divisors, sketch, tomlOf, tomlsOf} from "../src/assets/demo/toml.js";
 
 beforeEach(() => {
   globalThis.LANG = "en";
@@ -130,6 +130,27 @@ test("tomlOf: the log and snapshots on the node's disk, one store for both", () 
       ["tg-snap", "telegram"],
     ],
   );
+});
+
+test("tomlsOf: one file per node of a cluster, each its own log and node", () => {
+  const others = [
+    {log: "discord", snapshots: "discord"},
+    {log: "local_disk", snapshots: "local_disk"},
+  ];
+  assert.equal(tomlsOf(setup(["telegram"], 1)).length, 1, "no cluster: one file");
+  const files = tomlsOf(setup(["telegram", "discord"], 2, {nodes: 3, links: "mixed", others}));
+  assert.equal(files.length, 3);
+  for (const [i, f] of files.entries()) {
+    assert.match(f, new RegExp(`\\[cluster\\]\\nid = 1\\nnode = ${i + 1}\\n`));
+    assert.match(f, /\[\[node\]\]\nid = 3\noutbox = -1001000009003\n/, "node 3 over the chat only");
+    assert.match(f, /\[\[node\]\]\nid = 1\ngrpc = "node-1:7001"\noutbox = -1001000009001/);
+    assert.match(f, /members = \["tg-1", "dc-1"\]/, "the chunk channels are the same for all");
+  }
+  assert.match(files[0], /log = "tg-log-1"/);
+  assert.match(files[1], /log = "dc-log-2"\n[\s\S]*lease = "5s"/, "a Discord log takes a lease");
+  assert.match(files[2], /path = "\/data\/node-3"\n[\s\S]*log = "node-disk"/);
+  const direct = tomlsOf(setup(["telegram"], 1, {nodes: 3, links: "direct", others}));
+  assert.doesNotMatch(direct[0], /outbox/);
 });
 
 test("sketch: each data channel's place; the log and snapshots last", () => {

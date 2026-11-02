@@ -1,21 +1,34 @@
 // The first visit: the setup step by step, the graph sketching it as it
-// grows, then the pigeonhole.toml it makes. Start boots a node on it.
+// grows, then the pigeonhole.toml it makes (one per node of a cluster).
+// Start boots the node, or every node, on them.
 //
-// makeWizard(panel, {sketch(channels), start(toml) → error | null}):
+// makeWizard(panel, {sketch(channels), start([toml, …]) → error | null}):
 // panel: {title, sub, body} elements. Returns {render()}.
 import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
 import {appOf} from "./channels.js";
-import {divisors, perMinute, STEPS, sketch, tomlOf} from "./toml.js";
+import {divisors, perMinute, STEPS, sketch, tomlsOf} from "./toml.js";
 
 const MAX_CHANNELS = 4,
   MAX_BOTS = 4;
 const numbers = n => Array.from({length: n}, (_, i) => [i + 1, String(i + 1)]);
 
 export function makeWizard(panel, on) {
-  const setup = {channels: ["telegram", "discord"], copies: 2, quorum: 2, log: "telegram", snapshots: "telegram", every: 50, bots: 1, pace: "demo"};
+  const setup = {
+    ...{channels: ["telegram", "discord"], copies: 2, quorum: 2, log: "telegram", snapshots: "telegram", every: 50, bots: 1, pace: "demo"},
+    // A cluster: nodes 2 and 3's own log and snapshots (the third on its disk).
+    ...{
+      nodes: 1,
+      links: "mixed",
+      others: [
+        {log: "discord", snapshots: "discord"},
+        {log: "local_disk", snapshots: "local_disk"},
+      ],
+    },
+  };
   let step = 0;
-  let edited = null; // the toml as the reader changed it on the last step
+  let edited = []; // each node's toml as the reader changed it on the last step
+  let shown = 0; // the node whose toml the last step shows
   // A choice's effect: setup[key] = the value picked.
   const set = key => v => {
     setup[key] = v;
@@ -144,13 +157,39 @@ export function makeWizard(panel, on) {
         field(t("wiz.every"), every, t("wiz.every_note")),
       ];
     },
+    nodes() {
+      const out = [h("p", "lede", t("wiz.nodes_lede"))];
+      const count = choices(
+        t("wiz.nodes"),
+        [
+          [1, "1"],
+          [3, "3"],
+        ],
+        setup.nodes,
+        set("nodes"),
+      );
+      out.push(field(t("wiz.nodes"), count, t(setup.nodes > 1 ? "wiz.nodes_note_many" : "wiz.nodes_note_one")));
+      if (setup.nodes === 1) return out;
+      const links = ["mixed", "direct", "chat"].map(l => [l, t(`wiz.links_${l}`)]);
+      out.push(field(t("wiz.links"), choices(t("wiz.links"), links, setup.links, set("links")), t(`wiz.links_${setup.links}_note`)));
+      // Each node keeps its own log and snapshots, in one place.
+      setup.others.forEach((place, i) => {
+        const label = t("wiz.node_place", {n: i + 2});
+        const pick = v => {
+          setup.others[i] = {log: v, snapshots: v};
+        };
+        out.push(field(label, metaChoices(label, place.log, pick, true), i === 0 ? t("wiz.node_place_note") : null));
+      });
+      return out;
+    },
     bots() {
       const pace = [
         ["real", t("wiz.pace_real")],
         ["demo", t("wiz.pace_demo")],
       ];
       const rates = h("ul", "rates");
-      for (const k of new Set([...setup.channels, setup.log, setup.snapshots].filter(k => k !== "local_disk"))) {
+      const metas = [setup, ...(setup.nodes > 1 ? setup.others : [])].flatMap(p => [p.log, p.snapshots]);
+      for (const k of new Set([...setup.channels, ...metas].filter(k => k !== "local_disk"))) {
         rates.append(h("li", "", t("wiz.rate", {app: appOf(k), n: perMinute(k, setup.pace) * setup.bots})));
       }
       return [
@@ -161,14 +200,29 @@ export function makeWizard(panel, on) {
       ];
     },
     review() {
-      const text = h("textarea", "toml");
-      text.wrap = "off";
-      Object.assign(text, {spellcheck: false, value: edited ?? tomlOf(setup)});
-      text.setAttribute("aria-label", "pigeonhole.toml");
-      text.addEventListener("input", () => {
-        edited = text.value;
+      const made = tomlsOf(setup);
+      const texts = made.map((toml, i) => {
+        const text = h("textarea", "toml");
+        text.wrap = "off";
+        Object.assign(text, {spellcheck: false, value: edited[i] ?? toml, hidden: i !== shown});
+        text.setAttribute("aria-label", made.length > 1 ? t("wiz.review_node", {n: i + 1}) : "pigeonhole.toml");
+        text.addEventListener("input", () => {
+          edited[i] = text.value;
+        });
+        return text;
       });
-      return [h("p", "lede", t("wiz.review_lede")), text, h("p", "error", "")];
+      const lede = h("p", "lede", t(made.length > 1 ? "wiz.review_lede_many" : "wiz.review_lede"));
+      if (made.length === 1) return [lede, ...texts, h("p", "error", "")];
+      // One file per node: a tab each.
+      const tabs = choices(
+        t("wiz.review_nodes"),
+        made.map((_, i) => [i, t("wiz.review_node", {n: i + 1})]),
+        shown,
+        i => {
+          shown = i;
+        },
+      );
+      return [lede, tabs, ...texts, h("p", "error", "")];
     },
   };
 
@@ -196,14 +250,15 @@ export function makeWizard(panel, on) {
     const next = button("btn primary", last ? t("wiz.start") : t("wiz.next"), async () => {
       if (!last) {
         step++;
-        if (STEPS[step] === "review") edited = null;
+        if (STEPS[step] === "review") [edited, shown] = [[], 0];
         render();
         return;
       }
-      const [text, error] = [panel.body.querySelector("textarea"), panel.body.querySelector(".error")];
+      const texts = [...panel.body.querySelectorAll("textarea")].map(text => text.value);
+      const error = panel.body.querySelector(".error");
       next.disabled = true;
       error.textContent = "";
-      const failed = await on.start(text.value);
+      const failed = await on.start(texts);
       if (failed) {
         error.textContent = failed;
         next.disabled = false;
