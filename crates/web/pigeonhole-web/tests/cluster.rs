@@ -2,6 +2,12 @@
 //! them: nodes 1 and 2 linked directly (gRPC's place), node 3 over the
 //! chat (fake Telegram outboxes). One leader writes; every node applies;
 //! the leader cut off, another takes over.
+//!
+//! On tokio's paused clock: nothing here waits on the outside world, so
+//! the runtime skips ahead to the next timer and an election takes no
+//! wall time. That makes generous timings free: the chat link's round
+//! trip (a post, the peer's next read, its reply, our next read) is about
+//! a second, so a heartbeat (openraft's RPC timeout) of 1 s would race it.
 
 use bytes::Bytes;
 use pigeonhole_admin::Request;
@@ -28,7 +34,7 @@ fn config() -> String {
     }
     text.push_str(
         "\n[cluster]\nid = 7\nkey_env = \"PH_DEMO_CLUSTER_KEY\"\nfake = \"memory\"\n\
-         heartbeat = \"1s\"\nelection_timeout_min = \"4s\"\nelection_timeout_max = \"8s\"\ntick = \"100ms\"\npoll = \"200ms\"\n\
+         heartbeat = \"2s\"\nelection_timeout_min = \"8s\"\nelection_timeout_max = \"16s\"\ntick = \"100ms\"\npoll = \"200ms\"\n\
          [[node]]\nid = 1\ngrpc = \"node-1\"\noutbox = -1001000000101\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n\
          [[node]]\nid = 2\ngrpc = \"node-2\"\noutbox = -1001000000102\nlog = \"tg-log-2\"\nsnapshot = \"tg-snap-2\"\n\
          [[node]]\nid = 3\noutbox = -1001000000103\nlog = \"tg-log-3\"\nsnapshot = \"tg-snap-3\"\n",
@@ -37,7 +43,7 @@ fn config() -> String {
 }
 
 async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
-    for _ in 0..600 {
+    for _ in 0..2400 {
         if ok() {
             return;
         }
@@ -52,7 +58,7 @@ async fn op(nodes: &Nodes, node: Option<u64>, json: &str) -> anyhow::Result<serd
     nodes.node(node)?.admin.handle(&Request { node, ..r }, Bytes::from(vec![5u8; 3000])).await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn three_nodes_in_one_process_elect_write_and_fail_over() {
     std::env::set_var("PH_DEMO_CLUSTER_KEY", KEY);
     let _ = tracing_subscriber::fmt()
@@ -112,7 +118,7 @@ async fn three_nodes_in_one_process_elect_write_and_fail_over() {
     world.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_frame_posted_to_a_fake_outbox_is_read_back() {
     use openraft_chat::Mailbox;
     std::env::set_var("PH_DEMO_CLUSTER_KEY", KEY);
@@ -133,7 +139,7 @@ async fn a_frame_posted_to_a_fake_outbox_is_read_back() {
 /// The dynamic config seen from the leader: where each value comes from,
 /// and whether the last change reached each node; a node cut off has not
 /// got it until it is back, then runs with it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_leader_shows_where_each_node_stands_on_a_config_change() {
     std::env::set_var("PH_DEMO_CLUSTER_KEY", KEY);
     let world = Arc::new(World::default());

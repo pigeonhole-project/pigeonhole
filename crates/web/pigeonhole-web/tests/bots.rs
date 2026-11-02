@@ -1,8 +1,11 @@
 //! A fake channel is paced like the service, per bot: more bots, more sends.
+//! Timed on tokio's paused clock: the pacing is its timers, so the wait
+//! takes no wall time and the durations are exact.
 
 use bytes::Bytes;
 use pigeonhole_web::{parse_config, Node, World, DEMO_CONFIG};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// The demo on memory, 4 sends a second per bot and chat, `bots` bots on
 /// every channel; how long `n` small puts take.
@@ -25,7 +28,7 @@ async fn puts_with(bots: usize, n: usize) -> Duration {
     took
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn three_bots_post_faster_than_one() {
     let one = puts_with(1, 8).await;
     let three = puts_with(3, 8).await;
