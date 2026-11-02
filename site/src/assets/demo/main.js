@@ -7,6 +7,7 @@ import {bytes, t, tHtml} from "../lib/i18n.js";
 import {s3Sentence} from "../lib/say.js";
 import {appOf} from "./channels.js";
 import {chatView} from "./chat/index.js";
+import {forgetPlaces} from "./chat/parts.js";
 import {clientView} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {readEvents} from "./events.js";
@@ -444,6 +445,7 @@ async function openPanel(target) {
   if (log?.node != null && log.node !== shown()) await pickNode(log.node);
   if (log) target = {kind: "log"};
   state.open = target;
+  forgetPlaces();
   $("loft").classList.add("zoomed");
   $("panel").hidden = false;
   graph.markOpen(nodeOf(target));

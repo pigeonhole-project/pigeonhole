@@ -58,7 +58,7 @@ export function makeStage(stage, {entries, logChannel, logPosts, at}) {
     setTimeout(() => tag.remove(), 600);
   }
 
-  const drawLane = lane => lane.el.replaceChildren(chatView(lane.channel));
+  const drawLane = lane => lane.el.replaceChildren(chatView(lane.channel, null, {follow: true}));
 
   // A post in a channel, the newest one marked.
   function post(e) {
