@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 pigeonhole-admin = { workspace = true }
+pigeonhole-raft-telegram = { workspace = true }
 pigeonhole-fake-channels = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

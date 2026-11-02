@@ -313,7 +313,7 @@ async fn telegram_outbox(
     logins: &[TelegramLogin],
     chat: i64,
 ) -> anyhow::Result<Arc<dyn openraft_chat::Mailbox>> {
-    use pigeonhole::raft_mailbox::TelegramMailbox;
+    use pigeonhole_raft_telegram::TelegramMailbox;
     let channel = telegram_channel(cfg, logins, &chat.to_string(), Lane::Meta)
         .await
         .with_context(|| format!("Raft outbox {chat}"))?;

@@ -364,7 +364,7 @@ the defaults follow the slowest link. Commits stay fast all the same. Two
 nodes on gRPC are a quorum of three, and the chat node catches up behind
 them.
 
-**The Telegram outbox** (`pigeonhole::raft_mailbox::TelegramMailbox`)
+**The Telegram outbox** (`pigeonhole_raft_telegram::TelegramMailbox`, crates/net/pigeonhole-raft-telegram)
 works as follows:
 - a frame is a message named `raft.bin`: inline text when it fits
   (~7.5 KB), a document otherwise; its position is the message id;

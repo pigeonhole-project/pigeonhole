@@ -8,6 +8,7 @@ members = [
     "crates/meta/pigeonhole-meta",
     "crates/net/openraft-chat",
     "crates/net/openraft-grpc",
+    "crates/net/pigeonhole-raft-telegram",
     "crates/blob/pigeonhole-blob",
     "crates/blob/pigeonhole-chunk-store",
     "crates/storage/pigeonhole-storage-telegram",
@@ -94,6 +95,7 @@ pigeonhole-config = { path = "crates/config/pigeonhole-config" }
 pigeonhole-admin = { path = "crates/admin/pigeonhole-admin" }
 openraft-chat = { path = "crates/net/openraft-chat" }
 openraft-grpc = { path = "crates/net/openraft-grpc" }
+pigeonhole-raft-telegram = { path = "crates/net/pigeonhole-raft-telegram" }
 pigeonhole-types = { path = "crates/core/pigeonhole-types" }
 pigeonhole-storage-api = { path = "crates/core/pigeonhole-storage-api" }
 pigeonhole-limits = { path = "crates/core/pigeonhole-limits" }
