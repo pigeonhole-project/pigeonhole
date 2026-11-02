@@ -1,14 +1,17 @@
 //! The fake channels as the admin's UI sees them: what each holds, read
 //! from its state (the last messages, the pinned ones, the log's posts
-//! decoded), and the faults only fakes allow (down, wiped).
+//! and an outbox's Raft frames decoded), and the faults only fakes allow
+//! (down, wiped).
 
 use crate::world::World;
 use anyhow::Result;
+use openraft_chat::Key;
 use pigeonhole_admin::stores::{log_post, StoreRef};
 use pigeonhole_admin::Channels;
 use pigeonhole_config::instances::InstanceKind;
 use pigeonhole_config::stores::FakeChannel;
 use pigeonhole_meta::log::chain::summarize;
+use pigeonhole_meta::raft::TypeConfig;
 use pigeonhole_storage_api::fake::FakeHost;
 use pigeonhole_storage_discord::fake::state::{DiscordChannelState, Message as DcMessage};
 use pigeonhole_storage_telegram::fake::state::{Message as TgMessage, TelegramChannelState};
@@ -19,11 +22,13 @@ pub struct FakeView {
     pub world: Arc<World>,
     /// The fake channels among the node's stores.
     stores: Vec<StoreRef>,
+    /// The cluster's key, to open the outboxes' frames with.
+    key: Option<Key>,
 }
 
 impl FakeView {
-    pub fn new(world: Arc<World>, stores: &[StoreRef]) -> Self {
-        Self { world, stores: stores.iter().filter(|s| s.fake.is_some()).cloned().collect() }
+    pub fn new(world: Arc<World>, stores: &[StoreRef], key: Option<Key>) -> Self {
+        Self { world, stores: stores.iter().filter(|s| s.fake.is_some()).cloned().collect(), key }
     }
 
     fn find(&self, store: &str) -> Result<&FakeChannel> {
@@ -41,7 +46,13 @@ impl FakeView {
             InstanceKind::Telegram => {
                 let ch = self.world.telegram(&f.scope, &f.backing).await?;
                 ch.host().read(|st: &TelegramChannelState| {
-                    let one = |(id, m): (i64, &TgMessage)| telegram(id, st.date_ms(id), m, s.role);
+                    let one = |(id, m): (i64, &TgMessage)| {
+                        let mut v = telegram(id, st.date_ms(id), m, s.role);
+                        if s.role == "outbox" {
+                            v["frame"] = frame(m, self.key.as_ref());
+                        }
+                        v
+                    };
                     let all: Vec<Value> = st.messages().map(one).collect();
                     let pinned = st.pinned().and_then(|p| st.message(p).map(|m| one((p, m)))).into_iter().collect();
                     (all.len(), all[all.len().saturating_sub(limit)..].to_vec(), pinned)
@@ -118,6 +129,25 @@ fn text(content: &str, role: &str, kind: InstanceKind) -> Value {
         v["log"] = log_post(name, summary);
     }
     v
+}
+
+/// An outbox's message as the Raft frame it holds (openraft_chat::view):
+/// `{error}` when it holds none, or one of another key.
+fn frame(m: &TgMessage, key: Option<&Key>) -> Value {
+    let bytes = match m {
+        TgMessage::Text(t) => pigeonhole_storage_api::text::decode(t).map(|(_, b)| b.to_vec()),
+        TgMessage::Doc { blob, .. } => Some(blob.clone()),
+        TgMessage::Other => None,
+    };
+    let opened = match (bytes, key) {
+        (Some(b), Some(key)) => openraft_chat::view::inspect::<TypeConfig>(&b, key).map_err(|e| format!("{e:#}")),
+        (None, _) => Err("not a frame".into()),
+        (_, None) => Err("no cluster key".into()),
+    };
+    match opened {
+        Ok(view) => serde_json::to_value(view).expect("a frame view encodes"),
+        Err(error) => json!({ "error": error }),
+    }
 }
 
 /// Message `id`, posted at `at` (ms since the epoch).

@@ -258,7 +258,7 @@ impl Node {
         let view: Arc<dyn pigeonhole_admin::Channels> = Arc::new(Views {
             order: stores.clone(),
             views: vec![
-                Arc::new(FakeView::new(world.fakes.clone(), &stores)),
+                Arc::new(FakeView::new(world.fakes.clone(), &stores, cfg.cluster.as_ref().map(|c| c.key))),
                 Arc::new(DiskView::<DiskId>::new(&stores, pigeonhole_storage_disk::inspect_dir)),
             ],
         });

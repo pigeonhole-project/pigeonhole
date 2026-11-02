@@ -98,6 +98,9 @@ async fn three_nodes_in_one_process_elect_write_and_fail_over() {
     let channels = op(&nodes, None, r#"{"op":"channels","limit":5}"#).await.unwrap();
     let outbox = channels["channels"].as_array().unwrap().iter().find(|c| c["role"] == "outbox").unwrap();
     assert!(outbox["total"].as_u64().unwrap() > 0, "{outbox}");
+    // Each opened with the cluster's key: who sent it, to whom, what for.
+    let frame = &outbox["messages"][0]["frame"];
+    assert!(frame["seq"].is_u64() && frame["envelopes"][0]["kind"].is_string(), "{frame}");
 
     // The leader cut off: the other two elect one of themselves and go on.
     nodes.isolate(&world, first, true).unwrap();

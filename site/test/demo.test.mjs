@@ -2,6 +2,7 @@
 // tasks, the wizard's config, a channel as a chat, the log's lines.
 import assert from "node:assert/strict";
 import {beforeEach, test} from "node:test";
+import {frameModel} from "../src/assets/demo/chat/frame.js";
 import {chatModel} from "../src/assets/demo/chat/model.js";
 import {readEvents} from "../src/assets/demo/events.js";
 import {flightsOf, ownerOf} from "../src/assets/demo/flights.js";
@@ -220,6 +221,60 @@ test("chatModel: what each message is, and the posts not shown", () => {
   assert.ok(chatModel(c).messages.every(m => !m.deletable));
   // A Discord id carries its time: 2015-01-01 plus the high bits, in ms.
   assert.equal(chatModel({...c, messages: [{id: String(1000n << 22n), kind: "other"}]}).messages[0].at.getTime(), 1420070401000);
+});
+
+test("frameModel: an outbox post, a line per envelope and its fields", () => {
+  globalThis.I18N = {
+    "frame.heartbeat": "heartbeat",
+    "frame.append": "entries {entries}",
+    "frame.vote": "vote for {by}?",
+    "frame.term": "term {term}",
+    "frame.commit": "commit {n}",
+    "frame.last": "last {n}",
+    "frame.reply_append": "answers append:",
+    "frame.reply_vote": "answers vote:",
+    "frame.result_ok": "ok",
+    "frame.result_granted": "granted",
+    "frame.result_error": "error: {error}",
+    "frame.unreadable": "unreadable: {error}",
+  };
+  const f = {
+    from: 1,
+    seq: 812,
+    envelopes: [
+      {to: 2, rpc: 10, kind: "heartbeat", reply: false, term: 3, by: 1, committed: true, commit: 41},
+      {to: 3, rpc: 11, kind: "append", reply: false, term: 3, prev: 41, entries: [42, 44], commit: 41},
+      {to: 2, rpc: 12, kind: "vote", reply: false, term: 4, by: 1, last: 44},
+      {to: 3, rpc: 13, kind: "append", reply: true, result: "ok"},
+      {to: 2, rpc: 14, kind: "vote", reply: true, term: 4, result: "granted", last: 44},
+      {to: 2, rpc: 15, kind: "append", reply: true, result: "error", error: "stopped"},
+    ],
+  };
+  const m = frameModel(f);
+  assert.equal(m.head, null);
+  assert.deepEqual(m.lines, [
+    "→ 2: heartbeat, term 3, commit 41",
+    "→ 3: entries 42–44, term 3, commit 41",
+    "→ 2: vote for 1?, term 4, last 44",
+    "→ 3: answers append: ok",
+    "→ 2: answers vote: granted, term 4",
+    "→ 2: answers append: error: stopped",
+  ]);
+  assert.deepEqual(m.fields[0], [
+    ["from", 1],
+    ["seq", 812],
+  ]);
+  // In the view's order, not the JSON's (sorted by name).
+  const sorted = {commit: 4, kind: "append", rpc: 11, term: 3, to: 3};
+  assert.deepEqual(
+    frameModel({...f, envelopes: [sorted]}).fields[1].map(([k]) => k),
+    ["to", "rpc", "kind", "term", "commit"],
+  );
+  assert.deepEqual(frameModel({error: "bad mac"}), {head: "unreadable: bad mac", lines: [], fields: []});
+  assert.equal(frameModel(undefined), null);
+  // The chat's model carries it.
+  const c = {kind: "telegram", role: "outbox", total: 1, messages: [{id: 1, kind: "text", frame: f}]};
+  assert.equal(chatModel(c).messages[0].frame.lines.length, 6);
 });
 
 test("chatModel: the log's own posts are quiet; nothing to delete outside data channels", () => {

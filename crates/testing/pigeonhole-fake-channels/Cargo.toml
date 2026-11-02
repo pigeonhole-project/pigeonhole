@@ -9,6 +9,7 @@ description = "Fake Telegram and Discord channels kept by a metadata tablet: a l
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+openraft-chat = { workspace = true }
 pigeonhole-admin = { workspace = true }
 pigeonhole-blob = { workspace = true }
 pigeonhole-config = { workspace = true, features = ["discord", "fake"] }

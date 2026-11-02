@@ -89,7 +89,8 @@ fn channels_view(cfg: &Config) -> std::sync::Arc<dyn pigeonhole_admin::Channels>
     use pigeonhole_admin::{stores, DiskView, ListedStores, Views};
     use std::sync::Arc;
     let order = stores::of(cfg);
-    let mut views: Vec<Arc<dyn pigeonhole_admin::Channels>> = crate::fakes::view(&order).into_iter().collect();
+    let mut views: Vec<Arc<dyn pigeonhole_admin::Channels>> =
+        crate::fakes::view(&order, cfg.cluster.as_ref().map(|c| c.key)).into_iter().collect();
     views
         .push(Arc::new(DiskView::<pigeonhole_storage_disk::DiskId>::new(&order, pigeonhole_storage_disk::inspect_dir)));
     views.push(Arc::new(ListedStores(order.clone())));

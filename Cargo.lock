@@ -2716,6 +2716,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "madsim-tokio",
+ "openraft-chat",
  "pigeonhole-admin",
  "pigeonhole-blob",
  "pigeonhole-config",

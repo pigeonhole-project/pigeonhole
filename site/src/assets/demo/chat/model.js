@@ -1,6 +1,7 @@
 // A channel's messages as a chat app shows them, the same for every app:
 // the views (telegram.js, discord.js) only draw this.
 import {t} from "../../lib/i18n.js";
+import {frameModel} from "./frame.js";
 
 export const SHOWN = 200; // the `channels` op returns the last 200
 const DISCORD_EPOCH = 1420070400000n;
@@ -38,7 +39,8 @@ function ownerNote(m) {
 // `canDelete`: the page lets a reader delete a data channel's messages.
 // {earlier: posts before the shown ones, pinned: the first pin's name or
 // null, messages: [{id, kind: "text" | "file" | "service", text, name,
-// size, at, pinned, notes, fresh, quiet, deletable}]}
+// size, at, pinned, notes, frame, fresh, quiet, deletable}]}; frame: an
+// outbox's post opened (frame.js), else null
 export function chatModel(c, canDelete = false) {
   const live = c.messages.slice(-SHOWN);
   const pins = new Set((c.pinned || []).map(p => String(p.id)));
@@ -52,6 +54,7 @@ export function chatModel(c, canDelete = false) {
     at: postedAt(c, m),
     pinned: pins.has(String(m.id)),
     notes: [logNote(m.log), ownerNote(m)].filter(Boolean),
+    frame: frameModel(m.frame),
     fresh: !!m.fresh,
     // The log's own posts (its claim, probes): not its entries.
     quiet: !!m.log && m.log.what !== "batch",

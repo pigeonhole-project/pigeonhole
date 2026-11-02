@@ -2,7 +2,7 @@
 
 import {h, icon} from "../../lib/dom.js";
 import {bytes, t} from "../../lib/i18n.js";
-import {chatStart, deletable, flags, hhmm, ICON_DOWN, ICON_EYE, ICON_PIN, notes, scrolledDown} from "./parts.js";
+import {chatStart, deletable, flags, frameNotes, hhmm, ICON_DOWN, ICON_EYE, ICON_PIN, notes, scrolledDown} from "./parts.js";
 
 export function telegramView(c, model, onDelete) {
   const head = h("div", "tg-head");
@@ -12,7 +12,7 @@ export function telegramView(c, model, onDelete) {
 
   const chat = h("div", "tg-chat");
   chatStart(chat, model, "tg");
-  for (const m of model.messages) chat.append(m.kind === "service" ? service() : post(m, onDelete));
+  for (const m of model.messages) chat.append(m.kind === "service" ? service() : post(c, m, onDelete));
 
   const app = h("div", "app tg");
   app.append(head);
@@ -38,7 +38,7 @@ function service() {
   return line;
 }
 
-function post(m, onDelete) {
+function post(c, m, onDelete) {
   const b = h("div", `tg-post${flags(m)}`);
   if (m.kind === "text") b.append(h("div", "tg-text cjk", m.text));
   else {
@@ -50,7 +50,7 @@ function post(m, onDelete) {
     doc.append(ic, col);
     b.append(doc);
   }
-  b.append(...notes(m));
+  b.append(...notes(m), ...frameNotes(b, m.frame, `${c.store}/${m.id}`));
   // Pinned, one view (the bot's), the time.
   const foot = h("div", "tg-meta");
   if (m.pinned) foot.append(icon(ICON_PIN, "pin"));

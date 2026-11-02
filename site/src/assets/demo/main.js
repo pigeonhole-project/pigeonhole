@@ -141,6 +141,7 @@ function apply(events) {
       if (box) {
         box.total = (box.total ?? 0) + 1;
         graph.setTotal(box.store);
+        if (panelShows(box.store)) outboxChanged();
       }
     } else if (e.type === "repair_pass" && e.repaired > 0) {
       said.push(["say.repair_pass", {n: e.repaired}]);
@@ -152,6 +153,19 @@ function apply(events) {
     }
   }
   return said;
+}
+
+// An open outbox's frames are read from the node: its posts are not
+// logged one by one. Read a second after a frame, one read at a time.
+let outboxReading = false;
+function outboxChanged() {
+  if (outboxReading) return;
+  outboxReading = true;
+  setTimeout(async () => {
+    await loadChannels();
+    outboxReading = false;
+    renderPanel();
+  }, 1000);
 }
 
 // A pigeon landed on a channel.
@@ -434,6 +448,7 @@ async function openPanel(target) {
   $("panel").hidden = false;
   graph.markOpen(nodeOf(target));
   if (target.kind === "log") loadLog();
+  if (target.kind === "store" && channel(target.store)?.role === "outbox") outboxChanged();
   renderPanel();
   $("panel-close").focus();
 }
