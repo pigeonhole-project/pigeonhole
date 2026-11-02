@@ -45,7 +45,7 @@ instead of to the wasm in a worker (`assets/demo/node.js`).
 
 ```
 make lint-js                   # biome (biome.json): lint, format, imports
-make test-js                   # node --test site/test/: the modules without DOM
+make test-js                   # node --test site/test/*.test.mjs: the modules without DOM
 make web-smoke                 # build the wasm and run it under Node (crates/web)
 ```
 

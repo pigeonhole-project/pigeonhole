@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
-use tokio::time::Instant;
 
 /// One outbox as a node sees it: its own, to post into, or a peer's, to read.
 /// Positions are the chat's message ids: increasing, in posting order.
@@ -58,10 +57,41 @@ struct Chat {
     posted: Notify,
 }
 
+/// One outbox: its posts, and how many of them readers see.
+#[derive(Default)]
+struct Outbox {
+    frames: Vec<Bytes>,
+    /// Whether each post's delay is over.
+    ready: Vec<bool>,
+    /// Posts readers see: the ready ones up to the first that is not (a
+    /// chat shows an outbox in order).
+    shown: usize,
+    /// Posts pruned: the first this many are gone.
+    pruned: usize,
+}
+
+impl Outbox {
+    fn push(&mut self, frame: Bytes, ready: bool) -> usize {
+        self.frames.push(frame);
+        self.ready.push(ready);
+        self.advance();
+        self.frames.len() - 1
+    }
+
+    fn advance(&mut self) {
+        while self.shown < self.ready.len() && self.ready[self.shown] {
+            self.shown += 1;
+        }
+    }
+
+    fn shown(&self) -> &[Bytes] {
+        &self.frames[..self.shown]
+    }
+}
+
 #[derive(Default)]
 struct State {
-    /// Each post, and when readers first see it.
-    outboxes: HashMap<u64, Vec<(Instant, Bytes)>>,
+    outboxes: HashMap<u64, Outbox>,
     isolated: HashSet<u64>,
     lose_every: Option<u64>,
     duplicate_every: Option<u64>,
@@ -70,8 +100,6 @@ struct State {
     posts: u64,
     /// Posts made, per outbox, including lost ones.
     attempts: HashMap<u64, u64>,
-    /// Posts pruned, per outbox: the first this many are gone.
-    pruned: HashMap<u64, usize>,
 }
 
 impl FakeChat {
@@ -108,7 +136,8 @@ impl FakeChat {
     }
 
     /// Show each post after up to `max` (`None`: at once), later posts of
-    /// an outbox never before earlier ones.
+    /// an outbox never before earlier ones. Needs a runtime (a timer per
+    /// delayed post).
     pub fn set_delay(&self, max: Option<Duration>) {
         self.inner.state.lock().unwrap().delay = max;
     }
@@ -121,8 +150,7 @@ impl FakeChat {
     /// Frames still in node `owner`'s outbox (not pruned).
     pub fn kept(&self, owner: u64) -> u64 {
         let s = self.inner.state.lock().unwrap();
-        let all = s.outboxes.get(&owner).map_or(0, Vec::len);
-        (all - s.pruned.get(&owner).copied().unwrap_or(0)) as u64
+        s.outboxes.get(&owner).map_or(0, |o| (o.frames.len() - o.pruned) as u64)
     }
 }
 
@@ -149,17 +177,33 @@ impl Mailbox for FakeMailbox {
         let twice = s.duplicate_every.is_some_and(|k| n.is_multiple_of(k));
         let delay = s.delay.map_or(Duration::ZERO, |max| spread(n, max));
         let outbox = s.outboxes.entry(self.owner).or_default();
-        // Not before the post ahead of it: a chat shows an outbox in order.
-        let after = outbox.last().map_or_else(Instant::now, |(at, _)| *at);
-        let shown = (Instant::now() + delay).max(after);
+        let ready = delay.is_zero();
+        let mut placed = Vec::new();
         if !lost {
-            outbox.push((shown, frame.clone()));
+            placed.push(outbox.push(frame.clone(), ready));
             if twice {
-                outbox.push((shown, frame));
+                placed.push(outbox.push(frame, ready));
             }
         }
-        let pos = outbox.len() as u64;
+        let pos = outbox.frames.len() as u64;
         drop(s);
+        if !ready && !placed.is_empty() {
+            // Shown by a timer, not by reading the clock: the simulation's
+            // clock, read as an `Instant`, rounds differently from run to run
+            // on some platforms, and a read at a post's due time would too.
+            let (chat, owner) = (self.chat.clone(), self.owner);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let mut s = chat.state.lock().unwrap();
+                let outbox = s.outboxes.get_mut(&owner).expect("posted into");
+                for i in placed {
+                    outbox.ready[i] = true;
+                }
+                outbox.advance();
+                drop(s);
+                chat.posted.notify_waiters();
+            });
+        }
         self.chat.posted.notify_waiters();
         Ok(pos)
     }
@@ -169,13 +213,13 @@ impl Mailbox for FakeMailbox {
         if s.isolated.contains(&self.viewer) || s.isolated.contains(&self.owner) {
             bail!("node {} cannot reach node {}'s outbox", self.viewer, self.owner);
         }
-        let shown = shown(&s.outboxes[&self.owner]);
-        let from = (after as usize).max(s.pruned.get(&self.owner).copied().unwrap_or(0));
-        Ok(shown.iter().enumerate().skip(from).take(limit).map(|(i, (_, f))| (i as u64 + 1, f.clone())).collect())
+        let outbox = &s.outboxes[&self.owner];
+        let from = (after as usize).max(outbox.pruned);
+        Ok(outbox.shown().iter().enumerate().skip(from).take(limit).map(|(i, f)| (i as u64 + 1, f.clone())).collect())
     }
 
     async fn head(&self) -> Result<u64> {
-        Ok(shown(&self.chat.state.lock().unwrap().outboxes[&self.owner]).len() as u64)
+        Ok(self.chat.state.lock().unwrap().outboxes[&self.owner].shown as u64)
     }
 
     async fn wait(&self, after: u64, timeout: Duration) {
@@ -185,13 +229,7 @@ impl Mailbox for FakeMailbox {
         if self.head().await.unwrap_or(0) > after {
             return;
         }
-        // A post made but not shown yet wakes nobody when it shows: wait
-        // until then at most.
-        let next = self.chat.state.lock().unwrap().outboxes[&self.owner]
-            .iter()
-            .map(|(at, _)| *at)
-            .find(|at| *at > Instant::now());
-        let timeout = next.map_or(timeout, |at| timeout.min(at.saturating_duration_since(Instant::now())));
+        // A post that shows later wakes its waiters then.
         let _ = tokio::time::timeout(timeout, posted).await;
     }
 
@@ -200,23 +238,15 @@ impl Mailbox for FakeMailbox {
             bail!("node {} cannot prune node {}'s outbox", self.viewer, self.owner);
         }
         let mut s = self.chat.state.lock().unwrap();
-        let State { outboxes, pruned, .. } = &mut *s;
-        let outbox = outboxes.get_mut(&self.owner).expect("made with the mailbox");
-        let done = pruned.entry(self.owner).or_default();
+        let outbox = s.outboxes.get_mut(&self.owner).expect("made with the mailbox");
         // Positions start at 1: keep_from is the frame at index keep_from - 1.
-        let gone = (keep_from.saturating_sub(1) as usize).min(outbox.len());
-        for (_, f) in &mut outbox[(*done).min(gone)..gone] {
+        let gone = (keep_from.saturating_sub(1) as usize).min(outbox.frames.len());
+        for f in &mut outbox.frames[outbox.pruned.min(gone)..gone] {
             *f = Bytes::new();
         }
-        *done = (*done).max(gone);
+        outbox.pruned = outbox.pruned.max(gone);
         Ok(())
     }
-}
-
-/// The posts of an outbox readers see now: those shown already.
-fn shown(outbox: &[(Instant, Bytes)]) -> &[(Instant, Bytes)] {
-    let now = Instant::now();
-    &outbox[..outbox.partition_point(|(at, _)| *at <= now)]
 }
 
 /// Post `n`'s share of `max`: spread over it, the same for the same `n`.

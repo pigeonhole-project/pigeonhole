@@ -568,6 +568,45 @@ async fn a_boot_falls_back_to_an_older_base_when_the_newest_snapshot_is_unreadab
     }
 }
 
+/// A follower starts building a snapshot of its own (at 4), then installs a
+/// newer one from its leader (at 8) before the build is stored: the build
+/// comes too late to be current, and the leader's stays stored.
+#[tokio::test]
+async fn a_build_stored_after_an_install_of_a_newer_snapshot_stays_out() {
+    use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+    let snapshots: Arc<dyn SnapshotStore> = Arc::new(crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())));
+    let (stop, _) = watch::channel(None);
+    let shared = Arc::new(raft::Shared {
+        stop,
+        applied: AtomicU64::new(0),
+        based: AtomicU64::new(0),
+        current: Mutex::new(None),
+        kept: tokio::sync::Notify::new(),
+        base: Mutex::new(None),
+    });
+    // Raft's index 3 is position 4, 7 is 8.
+    let (at4, at8) = (raft::solo_meta(3), raft::solo_meta(7));
+    let mut sm = raft::StateMachine {
+        states: Arc::new(collect_states(counter()).unwrap()),
+        snapshots: snapshots.clone(),
+        history: crate::log::LogId(1),
+        last_applied: at4.last_log_id,
+        membership: at4.last_membership.clone(),
+        shared: shared.clone(),
+    };
+    let mut build = sm.get_snapshot_builder().await;
+
+    let leaders = raft::RaftSnapshot { meta: at8.clone(), tablet: take_snapshot(&sm.states, 8) };
+    sm.install_snapshot(&at8, Box::new(std::io::Cursor::new(leaders.encode()))).await.unwrap();
+    let built = build.build_snapshot().await.unwrap();
+
+    assert_eq!(built.meta.last_log_id, at8.last_log_id, "the build answers with the newer one");
+    let current = shared.current.lock().unwrap().clone().unwrap();
+    assert_eq!(current.meta.last_log_id, at8.last_log_id, "the leader's is current");
+    let stored = snapshots.get(&current.snapshot).await.unwrap();
+    assert_eq!(stored.at, 8, "the leader's snapshot is still stored");
+}
+
 #[tokio::test]
 async fn a_local_log_restores_from_snapshots_in_a_blob_store() {
     let dir = tempfile::tempdir().unwrap();

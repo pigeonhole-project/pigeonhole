@@ -40,6 +40,7 @@ What wasm needed from the rest of the workspace:
 
 - tokio with only `io-util`, `macros`, `rt`, `sync`, `time` (the workspace
   default now; the binary and the ByteStream gateway add the rest);
-- openraft without `rt-multi-thread` (vendor/openraft/VENDORED.md);
+- openraft without `rt-multi-thread` (a fork: `[patch.crates-io]` in the
+  workspace `Cargo.toml`);
 - compression through `pigeonhole_codec::blocking`, which runs inline where
   there are no threads.

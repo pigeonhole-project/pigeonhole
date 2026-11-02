@@ -97,6 +97,13 @@ pub(crate) struct CurrentSnapshot {
     pub(crate) snapshot: SnapshotRef,
 }
 
+impl CurrentSnapshot {
+    /// The position it holds the tablet at.
+    pub(crate) fn at(&self) -> u64 {
+        self.meta.last_log_id.as_ref().map_or(0, position)
+    }
+}
+
 /// State the adapters share with [`crate::MetaStore`].
 pub(crate) struct Shared {
     pub(crate) stop: watch::Sender<Option<Stop>>,
@@ -114,6 +121,11 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// The current snapshot if it holds position `at` or later.
+    fn current_from(&self, at: u64) -> Option<CurrentSnapshot> {
+        self.current.lock().unwrap().clone().filter(|c| c.at() >= at)
+    }
+
     fn stop(&self, stop: Stop) {
         self.stop.send_if_modified(|s| {
             if s.is_none() {
@@ -492,7 +504,10 @@ pub(crate) struct StateMachine {
 }
 
 impl StateMachine {
-    /// Store `snap` in the node's snapshot store and make it current.
+    /// Store `snap` in the node's snapshot store and make it current; the
+    /// current one instead if that is as new already. A follower's own build
+    /// can end after it installed a newer one from its leader: made current,
+    /// it would take the place of the one the log is purged behind.
     async fn keep(
         snapshots: &dyn SnapshotStore,
         history: HistoryId,
@@ -500,8 +515,12 @@ impl StateMachine {
         snap: &RaftSnapshot,
     ) -> Result<CurrentSnapshot, SErr> {
         let t0 = std::time::Instant::now();
-        let data = snap.encode();
         let at = snap.meta.last_log_id.as_ref().map_or(0, position);
+        if let Some(newer) = shared.current_from(at) {
+            tracing::info!(at, current = newer.at(), "snapshot not stored: the current one is as new");
+            return Ok(newer);
+        }
+        let data = snap.encode();
         let stored = StoredSnapshot { log_id: history, at, data: data.clone() };
         // The newest one stored: the last kept, else the one the log starts from.
         let after = shared.current.lock().unwrap().as_ref().map(|c| c.snapshot.clone());
@@ -513,17 +532,25 @@ impl StateMachine {
         crate::telemetry::record_snapshot(data.len(), t0.elapsed());
         tracing::info!(at, bytes = data.len(), ms = t0.elapsed().as_millis() as u64, "snapshot stored");
         let current = CurrentSnapshot { meta: snap.meta.clone(), data, snapshot };
-        let old = shared.current.lock().unwrap().replace(current.clone());
+        // A newer one may have become current while this one was stored.
+        let (kept, unused) = {
+            let mut slot = shared.current.lock().unwrap();
+            match slot.as_ref().filter(|c| c.at() >= at) {
+                Some(newer) => (newer.clone(), Some(current)),
+                None => (current.clone(), slot.replace(current)),
+            }
+        };
         shared.kept.notify_waiters();
-        // A newer one replaced it before the log moved onto it: unused (the
-        // one the node starts from stays until the log drops it).
+        // The one replaced (or this one, if late) is unused: the log never
+        // moves back onto it. The one the node starts from stays until the
+        // log drops it.
         let base_ref = shared.base.lock().unwrap().as_ref().map(|b| b.snapshot.clone());
-        if let Some(old) = old.filter(|o| o.snapshot != current.snapshot && Some(&o.snapshot) != base_ref.as_ref()) {
-            if let Err(e) = snapshots.remove(&old.snapshot).await {
-                tracing::warn!(snapshot = %old.snapshot.0, error = %format!("{e:#}"), "removing an unused snapshot failed");
+        if let Some(unused) = unused.filter(|u| u.snapshot != kept.snapshot && Some(&u.snapshot) != base_ref.as_ref()) {
+            if let Err(e) = snapshots.remove(&unused.snapshot).await {
+                tracing::warn!(snapshot = %unused.snapshot.0, error = %format!("{e:#}"), "removing an unused snapshot failed");
             }
         }
-        Ok(current)
+        Ok(kept)
     }
 }
 

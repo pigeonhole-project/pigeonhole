@@ -108,10 +108,23 @@ Everything nondeterministic must come from the simulator:
 - `HashMap` iteration order depends on a random seed per map: maps whose
   order can reach a decision (not just a lookup) become `BTreeMap`; the
   determinism check finds the rest.
-- `tokio::select!` in openraft picks a ready branch at random through tokio's
-  own generator: whether madsim-tokio's re-export covers it for a crate that
-  depends on plain `tokio` is a spike question (else a `[patch.crates-io]`
-  of tokio with madsim's fork, as RisingWave does).
+- tokio's per-thread generator: `select!` picks its first branch with it and
+  `watch`/`Notify` the shard a waiter goes to (so the order waiters wake
+  in); madsim-tokio re-exports both from real tokio. tokio seeds it from
+  `RandomState` (the simulator's) and a process-wide counter (not), so two
+  runs of one seed, or a test beside others, scheduled differently. tokio
+  comes from a fork (github.com/pigeonhole-project/tokio, branch
+  `pigeonhole`, `[patch.crates-io]`) that leaves the counter out under
+  `cfg(madsim)`.
+- `tempfile`'s names repeat from one process to the next (its generator is
+  seeded from the virtual clock): next to a dir an earlier run left it
+  retries, and its fourth try reads getrandom, a draw only one of the two
+  runs of a seed makes. `make sim` and `make sim-all` run the tests in a
+  fresh `TMPDIR` (after building outside it: an sccache server started there
+  would outlive it).
+- Nothing reads the clock to decide what to do next: `FakeChat` shows a
+  delayed post by a timer, not by comparing `Instant`s, whose reads round
+  differently from run to run on some platforms.
 
 ## Scenarios
 

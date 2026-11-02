@@ -40,7 +40,7 @@ lint-js:
 	$(BIOME) ci
 
 test-js:
-	node --test site/test/
+	node --test site/test/*.test.mjs
 
 # Curated ceph/s3-tests (see compat/known-good.txt)
 compat:
@@ -98,13 +98,23 @@ test-all: check-deps test smoke
 
 # Deterministic simulation (docs/simulation.md). MADSIM_TEST_SEED=<seed>
 # replays one run; MADSIM_TEST_NUM=<n> runs n seeds.
+#
+# The tests run in an empty TMPDIR of their own, removed after them. In the
+# simulator temp dir names repeat from one process to the next (tempfile's
+# fastrand is seeded from the virtual clock and the thread id): next to a
+# dir an earlier run left, tempfile retries and then reads getrandom, which
+# the simulator answers and MADSIM_TEST_CHECK_DETERMINISM counts — the two
+# runs of a seed differ. The build comes first, outside it: an sccache
+# server started under that TMPDIR would keep it after it is gone.
+SIM_CARGO = RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test
+SIM = $(SIM_CARGO) --no-run $(1) && t=$$(mktemp -d) && TMPDIR=$$t $(SIM_CARGO) $(1); s=$$?; rm -rf $$t; exit $$s
 sim:
-	RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test -p pigeonhole-sim
+	$(call SIM,-p pigeonhole-sim)
 
 # Every library's tests under the simulator (the binary and its servers are
 # not built there).
 sim-all:
-	RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test --workspace --exclude pigeonhole
+	$(call SIM,--workspace --exclude pigeonhole)
 
 # rustfmt and clippy as CI runs them: every warning fails (lints: [workspace.lints] in Cargo.toml).
 lint:
