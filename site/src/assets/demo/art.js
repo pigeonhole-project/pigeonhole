@@ -68,6 +68,12 @@ export function dovecote(g) {
   return windows;
 }
 
+// The leader's flag, on the dovecote's turret.
+export function flag(g) {
+  svg("path", {class: "flag-pole", d: "M0,-172 L0,-222"}, g);
+  svg("path", {class: "flag", d: "M0,-222 L30,-213 L0,-203 Z"}, g);
+}
+
 // An entrance no task lives in: shuttered.
 export function boarded(parent, w) {
   const g = svg("g", {class: "win-boarded"}, parent);

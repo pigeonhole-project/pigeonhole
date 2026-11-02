@@ -4,7 +4,7 @@
 use crate::Admin;
 use serde_json::{json, Value};
 
-/// The ids of a node's own stores in `channels`.
+/// The ids of a node's own stores in `channels` (a cluster's node's: `-{id}` after).
 pub const LOG_STORE: &str = "meta-log";
 pub const SNAPSHOT_STORE: &str = "meta-snap";
 

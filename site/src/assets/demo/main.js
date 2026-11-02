@@ -66,8 +66,14 @@ const graph = makeGraph($("graph"), {
     });
   },
 });
+// The cluster as the graph draws it: who leads, who is cut off, which node is on screen.
+let drawnLeader = null,
+  drawnLinks = 0; // the cluster drawn last
+const scene = () => ({leader: state.cluster?.leader ?? null, cut: state.cut, shown: shown(), links: state.cluster?.links || []});
 function redraw() {
-  graph.draw(state.channels, state.objects.length);
+  drawnLeader = state.cluster?.leader ?? null;
+  drawnLinks = state.cluster?.links?.length ?? 0;
+  graph.draw(state.channels, state.objects.length, scene());
   graph.markOpen(nodeOf(state.open));
   renderBackground();
 }
@@ -105,6 +111,14 @@ function apply(events) {
       graph.fly(c.store, {back: true, size: e.op === "get" ? e.bytes || 4096 : 512});
     } else if (e.type === "call_failed" && c) {
       graph.fly(c.store, {size: 2048, failed: true});
+    } else if (e.type === "raft") {
+      graph.flyRaft(e);
+      // Over the chat, a frame is a post in the sender's outbox.
+      const box = e.via === "chat" && e.at === "sent" && channel(`outbox-${e.from}`);
+      if (box) {
+        box.total = (box.total ?? 0) + 1;
+        graph.setTotal(box.store);
+      }
     } else if (e.type === "repair_pass" && e.repaired > 0) {
       said.push(["say.repair_pass", {n: e.repaired}]);
     } else if (e.type === "s3") {
@@ -149,8 +163,11 @@ async function op(request, body) {
   for (const c of state.channels) for (const m of c.messages) m.fresh = false;
   const {reply, events} = await node.call(onNode(request), body);
   const said = apply(readEvents(events));
-  if (reply?.error?.startsWith("not the leader")) say(["say.not_leader", {n: shown(), error: reply.error}]);
-  else if (reply?.error && state.channels.some(c => c.down)) say([request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: reply.error}]);
+  if (reply?.error?.startsWith("not the leader")) {
+    // You knocked on a follower: your pigeon turns back at its door.
+    graph.fly("", {failed: true});
+    say(["say.not_leader", {n: shown(), error: reply.error}]);
+  } else if (reply?.error && state.channels.some(c => c.down)) say([request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: reply.error}]);
   else if (reply?.error) sayError(reply.error);
   else if (said.length) say(said.at(-1));
   await graph.landed();
@@ -175,10 +192,17 @@ async function refreshObjects() {
 
 // The channels as the node has them now; the posts seen arriving stay
 // marked. A local disk has files, not messages.
+// In a cluster, each other node's own log and snapshots too: the node on
+// screen lists only its own.
 async function loadChannels() {
   const {reply} = await call({op: "channels"});
   const fresh = new Set(state.channels.flatMap(c => c.messages.filter(m => m.fresh).map(m => `${c.store}/${m.id}`)));
-  state.channels = (reply?.channels || []).map(c => ({...c, messages: (c.messages || []).map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
+  const listed = [...(reply?.channels || [])];
+  for (const id of state.nodes.length > 1 ? state.nodes.filter(id => id !== shown()) : []) {
+    const other = await call({op: "channels", node: id});
+    listed.push(...(other.reply?.channels || []).filter(c => c.node === id && c.role !== "outbox"));
+  }
+  state.channels = listed.map(c => ({...c, messages: (c.messages || []).map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
 }
 
 // The channels anew, drawn (a fault changes them behind the events).
@@ -215,10 +239,13 @@ async function pollCluster() {
   if (!ok(reply)) return;
   // A newer term only: a node cut off still thinks it leads, in its old term.
   const seen = state.term;
-  state.cluster = reply;
+  // A node back from a cut still names itself in its old term: the newer word stands.
+  state.cluster = seen != null && reply.term < seen ? {...reply, leader: state.cluster?.leader ?? null} : reply;
   state.term = Math.max(seen ?? 0, reply.term);
   if (seen != null && reply.term > seen && reply.leader != null) say(["nodes.new_leader", {n: reply.leader, term: reply.term}]);
   renderNodes();
+  // A new leader: its flag, its ways to the data channels.
+  if (graph.drawn() && !state.wizard && (reply.leader !== drawnLeader || reply.links.length !== drawnLinks)) redraw();
 }
 
 // The nodes in the bar: which leads (★), which is cut off; the one on
@@ -303,8 +330,10 @@ async function runTask(task) {
 // ------------------------------------------------------------ panels
 let view = null; // the open panel's view, for updates in place
 
-function openPanel(target) {
+async function openPanel(target) {
   if (state.wizard) return;
+  // Another node's dovecote: that node on screen, then its panel.
+  if (target.kind === "loft" && target.node != null && target.node !== shown()) await pickNode(target.node);
   if (target.kind === "store" && channel(target.store)?.role === "log") target = {kind: "log"};
   state.open = target;
   $("loft").classList.add("zoomed");
@@ -348,7 +377,7 @@ function renderPanel() {
     // A cluster's "reset" is its own config back: the demo's is one node's.
     const demo = cluster ? state.config : state.demo;
     const v = loftView({counters: counters(), ...state, demo, cluster}, loftOps);
-    show(cluster ? t("nodes.loft_title", {n: id}) : "pigeonhole", t("demo.loft_sub"), v.nodes, v);
+    show(cluster ? t("nodes.loft_title", {n: id}) : "pigeonhole", t(cluster ? "nodes.loft_sub" : "demo.loft_sub"), v.nodes, v);
     if (!state.log) loadLog();
   } else if (open.kind === "log") {
     const c = logChannel();

@@ -144,6 +144,14 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .node.down .cote { fill: var(--cote-off); }
 .node.down .sign-sub { fill: var(--eye); }
 .flight { pointer-events: none; }
+/* a cluster: the leader's flag, a node cut off dark, Raft's traffic */
+.flag-pole { stroke: var(--seam); stroke-width: 3; } .flag { fill: var(--eye); }
+.node-role { font-size: 11px; } .node-role.leading { fill: var(--teal); font-weight: 600; }
+.node.cut .cote, .node.cut .cote-roof { fill: var(--cote-off); } .node.cut .pane.lit { fill: var(--pane); }
+.node.cut .letters { fill: var(--seam); filter: none; } .node.cut .node-role { fill: var(--eye); }
+.edge.raft { stroke: var(--teal); stroke-dasharray: 2 5; opacity: .6; }
+.flight.raft { opacity: .85; }
+.spark { fill: var(--teal); pointer-events: none; }
 .failed-mark { fill: var(--eye); }
 @keyframes arrive { 30% { transform: scale(1.06); } }
 

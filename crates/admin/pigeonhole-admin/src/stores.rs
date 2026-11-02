@@ -118,7 +118,9 @@ pub fn of(cfg: &Config) -> Vec<StoreRef> {
             })
         })
         .collect();
-    // This node's own log and snapshots: under its dovecote in a cluster's graph.
+    // This node's own log and snapshots: under its dovecote in a cluster's
+    // graph, by names no other node's have (meta-log-2; a fake channel's
+    // id is its own already).
     let me = cfg.cluster.as_ref().map(|c| c.node);
     for (role, place) in [("log", cfg.meta.log.place()), ("snapshots", cfg.meta.snapshot.place())] {
         let s = match place {
@@ -126,6 +128,13 @@ pub fn of(cfg: &Config) -> Vec<StoreRef> {
             MetaPlace::LocalDisk(path) => StoreRef::disk(role, path),
             MetaPlace::Chat { kind, scope } => StoreRef::meta(role, kind, scope.to_string()),
             MetaPlace::Memory => StoreRef::meta(role, "memory", String::new()),
+        };
+        let s = match me {
+            Some(node) if s.fake.is_none() => {
+                let store = format!("{}-{node}", s.store);
+                s.named(store)
+            }
+            _ => s,
         };
         out.push(StoreRef { node: me, ..s });
     }
