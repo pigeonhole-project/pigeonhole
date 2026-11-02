@@ -202,6 +202,21 @@ impl Config {
         Some(v.as_str().map_or_else(|| v.to_string(), str::to_string))
     }
 
+    /// Where `key`'s value comes from, `overridden(key)` saying whether an
+    /// override of it is taken (see [`KeyView::from`]).
+    fn source(&self, key: &str, overridden: impl Fn(&str) -> bool) -> String {
+        if overridden(key) {
+            return "override".into();
+        }
+        if self.file_value(key).is_some() {
+            return "file".into();
+        }
+        match node_key(key) {
+            Some((_, name)) => format!("inherited: {}", self.source(&format!("meta.{name}"), overridden)),
+            None => "default".into(),
+        }
+    }
+
     /// The `[[node]]`s' ids.
     fn member_ids(&self) -> Vec<u64> {
         self.cluster.as_ref().map(|c| c.nodes.iter().map(|n| n.id).collect()).unwrap_or_default()
@@ -308,6 +323,22 @@ pub struct KeyView {
     pub overridden: Option<String>,
     /// Why the override is not taken (the file no longer allows it).
     pub refused: Option<String>,
+    /// Where `value` comes from: `override`, `file`, `default`; a node's
+    /// key that sets none, `meta.<name>`'s, as `inherited: <its from>`.
+    pub from: String,
+}
+
+/// Whether the last config change reached a node, as [`DynConfig::nodes`]
+/// shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NodeSync {
+    pub id: u64,
+    pub role: &'static str,
+    /// Position its log holds up to: known on the leader.
+    pub matched: Option<u64>,
+    /// Its log holds the last change (`changed_at`); `None` where not known
+    /// (another node, seen from a follower).
+    pub synced: Option<bool>,
 }
 
 /// A background loop as [`DynConfig::tasks`] shows it.
@@ -329,6 +360,9 @@ pub struct DynConfig {
     refused: Mutex<BTreeMap<String, String>>,
     /// One change at a time: each is checked against the ones before it.
     writes: tokio::sync::Mutex<()>,
+    /// Position of the last change to the overrides, at most: exact for
+    /// one written here, else the position applied when this node saw it.
+    changed_at: std::sync::atomic::AtomicU64,
     pub sweep: Control<SweepConfig>,
     pub repair: Control<RepairConfig>,
     pub cool: Control<Cooling>,
@@ -352,11 +386,13 @@ impl DynConfig {
             tracing::warn!(key, why, "a config override is refused; the file's value holds");
         }
         meta.snapshot_schedule().set(knobs.snapshot_every);
+        let changed_at = meta.applied_position().into();
         Self {
             config,
             meta,
             refused: Mutex::new(refused),
             writes: tokio::sync::Mutex::new(()),
+            changed_at,
             sweep: Control::new(knobs.sweep),
             repair: Control::new(knobs.repair),
             cool: Control::new(knobs.cool),
@@ -396,7 +432,8 @@ impl DynConfig {
         taken.insert(key.to_string(), value.to_string());
         let knobs = self.config.dynamic_with(&taken)?;
         let set = OverrideCommand::Set { key: key.to_string(), value: value.to_string() };
-        let Ok(()) = self.meta.propose::<Overrides>(set).await.context("write the override")?;
+        let (at, Ok(())) = self.meta.propose_at::<Overrides>(set).await.context("write the override")?;
+        self.changed(at);
         self.refused.lock().unwrap().remove(key);
         self.apply(knobs);
         tracing::info!(key, value, "config override set");
@@ -412,7 +449,8 @@ impl DynConfig {
             return Ok(false);
         }
         let unset = OverrideCommand::Unset { key: key.to_string() };
-        let Ok(()) = self.meta.propose::<Overrides>(unset).await.context("drop the override")?;
+        let (at, Ok(())) = self.meta.propose_at::<Overrides>(unset).await.context("drop the override")?;
+        self.changed(at);
         let (knobs, refused) = self.config.dynamic_lenient(&self.overrides());
         *self.refused.lock().unwrap() = refused;
         self.apply(knobs);
@@ -432,11 +470,34 @@ impl DynConfig {
             }
             let _one = self.writes.lock().await;
             seen = self.overrides();
+            self.changed(self.meta.applied_position());
             let (knobs, refused) = self.config.dynamic_lenient(&seen);
             *self.refused.lock().unwrap() = refused;
             self.apply(knobs);
             tracing::info!(overrides = seen.len(), "config overrides changed by replication");
         }
+    }
+
+    fn changed(&self, at: u64) {
+        self.changed_at.fetch_max(at, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Position of the last change to the overrides (at most).
+    pub fn changed_at(&self) -> u64 {
+        self.changed_at.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Every node of the cluster, and whether the last change reached its
+    /// log: known for all on the leader, for itself on a follower.
+    pub fn nodes(&self) -> Vec<NodeSync> {
+        let (view, at) = (self.meta.cluster_view(), self.changed_at());
+        view.nodes
+            .iter()
+            .map(|n| {
+                let holds = n.matched.or_else(|| n.applied.filter(|_| n.id == view.me));
+                NodeSync { id: n.id, role: n.role, matched: n.matched, synced: holds.map(|p| p >= at) }
+            })
+            .collect()
     }
 
     fn apply(&self, knobs: DynamicConfig) {
@@ -468,6 +529,7 @@ impl DynConfig {
     pub fn keys(&self) -> Vec<KeyView> {
         let (knobs, overrides) = (self.knobs(), self.overrides());
         let refused = self.refused.lock().unwrap();
+        let taken: BTreeMap<_, _> = overrides.iter().filter(|(k, _)| !refused.contains_key(*k)).collect();
         self.config
             .dynamic_keys()
             .into_iter()
@@ -476,6 +538,7 @@ impl DynConfig {
                 file: self.config.file_value(&key),
                 overridden: overrides.get(&key).cloned(),
                 refused: refused.get(&key).cloned(),
+                from: self.config.source(&key, |k| taken.contains_key(&k.to_string())),
                 key,
             })
             .collect()
@@ -605,6 +668,20 @@ mod tests {
             assert!(err.contains(want), "{key}: {err}");
         }
         assert!(config("").dynamic_with(&one("node.1.snapshot_every", "1h")).is_err(), "no cluster, no nodes");
+    }
+
+    #[test]
+    fn each_value_says_where_it_comes_from() {
+        let n1 = cluster(1);
+        let none = |_: &str| false;
+        assert_eq!(n1.source("node.2.snapshot_every", none), "file");
+        assert_eq!(n1.source("node.1.snapshot_every", none), "inherited: file");
+        assert_eq!(n1.source("sweep.interval", none), "default");
+        let meta = |k: &str| k == "meta.snapshot_every";
+        assert_eq!(n1.source("node.1.snapshot_every", meta), "inherited: override");
+        assert_eq!(n1.source("node.2.snapshot_every", meta), "file", "a node's own value beats [meta]'s override");
+        assert_eq!(n1.source("node.2.snapshot_every", |k: &str| k == "node.2.snapshot_every"), "override");
+        assert_eq!(config("").source("meta.snapshot_every", none), "default");
     }
 
     #[tokio::test]
