@@ -10,7 +10,7 @@
 // {kind: "store", store}. Clicking one calls onOpen(target).
 import {activate, reducedMotion, svg} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
-import {beat, birdDefs, block, dovecote, FLOOR, flying, glide, perched, plaque, roofSign, tower} from "./art.js";
+import {beat, birdDefs, block, dovecote, FLOOR, flying, glide, perched, roofLetters, tower} from "./art.js";
 import {appOf, placeNote} from "./channels.js";
 
 const QUEUE_SHOWN = 12; // repair jobs drawn over a block; the rest as "+n"
@@ -70,7 +70,7 @@ function wide(channels, height) {
     width: 1200,
     height,
     client: {x: 30, w: 3 * COL, cols: 3, ground, most, deep: 2000},
-    loft: {x: 150, w: 220, floors: 9, ground, scale: 0.9, deep: 2000},
+    loft: {x: 150, w: 230, floors: 9, ground, scale: 0.8, deep: 2000, cote: 60, letters: 54, size: 13},
     stores: at,
     lift: 80,
   };
@@ -104,7 +104,7 @@ function tall(channels) {
     width: 400,
     height: second + 8,
     client: {x: 6, w: 2 * COL, cols: 2, ground: first, most, deep: 0},
-    loft: {x: 66, w: 150, floors: 7, ground: first, scale: 0.55, deep: 0},
+    loft: {x: 66, w: 150, floors: 7, ground: first, scale: 0.5, deep: 0, cote: 38, letters: 38, size: 10},
     stores: at,
     lift: 40,
   };
@@ -159,16 +159,18 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     const b = tower(n.g, at.x, at.ground, at.w, n.floors, at.cols, {shade: c.role === "data" ? 1 : 3, deep: at.deep});
     n.slots = b.slots;
     n.win = svg("g", {}, n.g);
-    // The letters over the block, kept inside the view.
-    const signW = Math.max(at.w + 10, c.store.length * 8.4 + 62),
-      cx = Math.max(signW / 2 + 4, Math.min(viewWidth - signW / 2 - 4, at.x + at.w / 2));
-    const withRole = role.length * 5.6 + 34 <= signW;
-    n.count = roofSign(n.g, cx, b.roof, signW, c.kind, appOf(c.kind), c.store, withRole ? role : null);
-    n.sign = [cx, b.roof - 40];
+    // The letters on its roof, kept inside the view.
+    // (a long name shortened there: tg-snapshots → tg-snap)
+    const name = c.store.replace(/snapshots?$/, "snap"),
+      size = at.w < 70 ? 12 : 15,
+      half = (name.length * size * 0.62 + size * 2.6 + 4) / 2,
+      cx = Math.max(half + 4, Math.min(viewWidth - half - 4, at.x + at.w / 2));
+    n.count = roofLetters(n.g, cx, b.roof, name, {kind: c.kind, app: appOf(c.kind), size});
+    n.sign = [cx, b.roof - 26];
     n.tip = svg("title", {}, n.g);
     n.tip.textContent = role;
     n.older = svg("text", {class: "older", x: at.x + at.w / 2, y: at.ground - 4, "text-anchor": "middle"}, n.g);
-    n.queue = svg("g", {class: "queue", transform: `translate(${cx},${b.roof - (withRole ? 58 : 48)})`}, n.g);
+    n.queue = svg("g", {class: "queue", transform: `translate(${cx},${b.roof - 40})`}, n.g);
     ring(n, at.x, b.roof - 50, at.w, at.ground);
     n.shown = 0;
     fill(n, false);
@@ -212,16 +214,16 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     const b = tower(n.g, at.x, at.ground, at.w, n.floors, at.cols, {shade: 2, deep: at.deep});
     n.slots = b.slots;
     n.win = svg("g", {}, n.g);
-    n.sub = plaque(n.g, at.x - 6, b.roof - 54, t("demo.you"), t("demo.objects", {n: 9999}));
+    n.sub = roofLetters(n.g, at.x + at.w / 2, b.roof, t("demo.you"), {size: 13});
     n.perch = [at.x + at.w - 14, b.roof - 6];
-    perched(n.g, {transform: `translate(${at.x + 12},${b.roof - 12}) scale(1.3)`});
+    perched(n.g, {transform: `translate(${at.x + at.w + 2},${b.roof - 12}) scale(1.3)`});
     ring(n, at.x, b.roof - 56, at.w, at.ground);
     return n;
   }
   function setObjects(count) {
     if (!client) return;
     client.objects = count;
-    client.sub.textContent = t("demo.objects", {n: count});
+    client.sub.textContent = String(count);
     client.g.setAttribute("aria-label", `${t("demo.you")}: ${t("demo.objects", {n: count})}`);
     client.win.replaceChildren();
     for (const [i, s] of client.slots.entries()) svg("rect", {class: i < count ? "pane lit" : "pane", x: s.x, y: s.y, width: s.w, height: s.h}, client.win);
@@ -278,11 +280,11 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     const L = at.loft,
       roof = L.ground - L.floors * 26 - 14;
     block(loft.g, L.x, roof, L.w, L.ground - roof + L.deep, rnd, {shade: 2, loggias: [2, 5], aerials: 1});
-    const cx = L.x + L.w / 2;
+    const cx = L.x + L.cote;
     const cote = svg("g", {transform: `translate(${cx},${roof - 4}) scale(${L.scale})`}, loft.g);
     onLoft(cote, dovecote(cote));
     loft.door = [cx, roof - 4 - 150 * L.scale];
-    plaque(loft.g, L.x + 14, roof + 24, "pigeonhole", t("demo.loft_role"));
+    roofLetters(loft.g, L.x + L.w - L.letters, roof, "pigeonhole", {size: L.size}).remove();
     ring(loft, L.x, roof - 4 - 175 * L.scale, L.w, L.ground);
 
     cards = new Map(channels.map(c => [c.store, card(c, at.stores.get(c.store), town)]));

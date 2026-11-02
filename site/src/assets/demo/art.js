@@ -99,23 +99,28 @@ export function tower(parent, x, ground, w, floors, cols, {shade = 1, deep = 200
   return {roof, slots, g};
 }
 
-// The letters on a block's roof (as on a Soviet one's: a slogan on a
-// lattice): the app's logo and the channel's name, and its count; `sub` a
-// second, smaller line. Returns the count's text.
-export function roofSign(parent, cx, roof, w, kind, app, name, sub) {
-  const h = sub ? 34 : 24,
-    top = roof - 10 - h;
-  const g = svg("g", {class: "roof-sign"}, parent);
-  svg(
-    "path",
-    {class: "sign-post", d: `M${cx - w / 2 + 8},${roof - 4} L${cx - w / 2 + 8},${top + h} M${cx + w / 2 - 8},${roof - 4} L${cx + w / 2 - 8},${top + h}`},
-    g,
-  );
-  svg("rect", {class: "sign-board", x: cx - w / 2, y: top, width: w, height: h, rx: 2}, g);
-  logo(kind, g, cx - w / 2 + 12, top + 12, app, 7.5);
-  svg("text", {class: "sign-name", x: cx - w / 2 + 24, y: top + 16}, g).textContent = name;
-  if (sub) svg("text", {class: "sign-role", x: cx - w / 2 + 24, y: top + 29}, g).textContent = sub;
-  return svg("text", {class: "sign-count", x: cx + w / 2 - 6, y: top + 16, "text-anchor": "end"}, g);
+// Letters on a roof, as on a Soviet block's (a slogan on a lattice), red by
+// day, neon by night: a name, the app's emblem before it if `kind`, a
+// count after it. `x` the letters' middle; returns the count's text.
+export function roofLetters(parent, x, roof, name, {kind = null, app = "", size = 15} = {}) {
+  const g = svg("g", {class: "roof-letters"}, parent);
+  const w = name.length * size * 0.62 + (kind ? size + 4 : 0) + size * 1.6,
+    left = x - w / 2,
+    base = roof - 9;
+  // the lattice the letters stand on
+  let d = `M${left},${base + 2} L${left + w},${base + 2} M${left},${roof - 4} L${left + w},${roof - 4}`;
+  for (let i = 0; i <= Math.ceil(w / 12); i++) {
+    const a = Math.min(left + i * 12, left + w);
+    d += ` M${a},${roof - 4} L${Math.min(a + 6, left + w)},${base + 2}`;
+  }
+  svg("path", {class: "lattice", d}, g);
+  let at = left;
+  if (kind) {
+    logo(kind, g, at + size / 2, base - size * 0.36, app, size / 2);
+    at += size + 4;
+  }
+  svg("text", {class: "letters", x: at, y: base, "font-size": size}, g).textContent = name;
+  return svg("text", {class: "letters count", x: left + w, y: base, "font-size": size * 0.8, "text-anchor": "end"}, g);
 }
 
 // ---- a Soviet block of flats: concrete panels and their seams, a window to
@@ -164,18 +169,6 @@ export function block(parent, x, y, w, h, rnd, {shade = 1, loggias = [], room = 
   }
   svg("path", {class: "seam", d: seams}, g);
   return g;
-}
-
-// A blue plaque on a block (as a Soviet one's: the street, the number):
-// its title and, under it, a line that can change (returned).
-export function plaque(parent, x, y, title, sub, {center = false} = {}) {
-  const w = Math.max(title.length * 8.4, (sub || "").length * 6.4) + 24;
-  const g = svg("g", {class: "plaque", transform: `translate(${center ? x - w / 2 : x},${y})`}, parent);
-  svg("rect", {class: "plaque-board", width: w, height: sub == null ? 26 : 42, rx: 3}, g);
-  svg("text", {class: "plaque-title", x: 12, y: 18}, g).textContent = title;
-  const line = svg("text", {class: "plaque-sub", x: 12, y: 34}, g);
-  if (sub != null) line.textContent = sub;
-  return line;
 }
 
 // A store's mark: the app's logo (simplified), a drive for a local disk, else a dot.

@@ -18,7 +18,7 @@
   --wall: #c4c8c7; --wall-2: #b5babb; --wall-3: #a9afb1; --seam: #9aa2a6;
   --pane: #e1e6e9; --pane-frame: #9aa3a8; --pane-lit: #ffd88a; --pane-text: #a9d8f0; --pane-svc: #cfd6db;
   --screen-a: #93b2c8; --screen-b: #a3c6b8; --screen-c: #d9dcd8;
-  --plaque: #2f4a6b; --plaque-ink: #f4f6f8; --path: #6f7c87;
+  --plaque: #2f4a6b; --plaque-ink: #f4f6f8; --path: #6f7c87; --letters: #b8322a;
   --cote: #f4f5f6; --cote-off: #c3cbd1; --cote-roof: #4f5961; --cote-hole: #2e3439;
   --wide: 125;
   --sans: "Archivo", system-ui, sans-serif;
@@ -38,7 +38,7 @@
     --wall: #2d3439; --wall-2: #282f34; --wall-3: #333b41; --seam: #20262b;
     --pane: #39434b; --pane-frame: #262d32; --pane-lit: #f2c46b; --pane-text: #7fc4e6; --pane-svc: #56626c; --pane-text: #7fc4e6; --pane-svc: #56626c;
     --screen-a: #34495a; --screen-b: #35504a; --screen-c: #3a4248;
-    --plaque: #24384f; --plaque-ink: #dfe6ec; --path: #64727e;
+    --plaque: #24384f; --plaque-ink: #dfe6ec; --path: #64727e; --letters: #ff6a52;
     --cote: #c9d1d7; --cote-off: #4f5a63; --cote-roof: #6a7782; --cote-hole: #0d1114;
   }
 }
@@ -48,7 +48,7 @@
   --wall: #2d3439; --wall-2: #282f34; --wall-3: #333b41; --seam: #20262b;
   --pane: #39434b; --pane-frame: #262d32; --pane-lit: #f2c46b; --pane-text: #7fc4e6; --pane-svc: #56626c;
   --screen-a: #34495a; --screen-b: #35504a; --screen-c: #3a4248;
-  --plaque: #24384f; --plaque-ink: #dfe6ec; --path: #64727e;
+  --plaque: #24384f; --plaque-ink: #dfe6ec; --path: #64727e; --letters: #ff6a52;
   --cote: #c9d1d7; --cote-off: #4f5a63; --cote-roof: #6a7782; --cote-hole: #0d1114;
 
   --feather: #171b1f;
@@ -113,19 +113,18 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .pane.new { animation: lit .9s ease-out; }
 @keyframes lit { 0% { fill: #fff; } }
 .pin-flag { fill: var(--eye); stroke: var(--wing-2); stroke-width: .8; }
-.node.down .pane.lit { fill: var(--pane); } .node.down .sign-board { fill: var(--seam); }
+.node.down .pane.lit { fill: var(--pane); } .node.down .letters { fill: var(--seam); filter: none; }
 .older { font: 600 11px var(--mono); fill: var(--wing); paint-order: stroke; stroke: var(--wall); stroke-width: 3px; }
-.sign-post { stroke: var(--seam); stroke-width: 2; }
-.sign-board { fill: var(--plaque); }
-.sign-name { font-weight: 800; font-stretch: 112%; font-size: 13px; fill: var(--plaque-ink); }
-.sign-role { font-size: 10.5px; fill: var(--plaque-ink); opacity: .8; }
-.sign-count { font: 500 11.5px var(--mono); fill: var(--plaque-ink); }
 .way { fill: none; stroke: none; }
+/* letters on the roofs: red by day, neon by night */
+.lattice { fill: none; stroke: var(--seam); stroke-width: 1.2; }
+.letters { font-weight: 800; font-stretch: 75%; text-transform: uppercase; letter-spacing: .02em; fill: var(--letters); }
+.letters.count { font-family: var(--mono); font-weight: 500; letter-spacing: 0; text-transform: none; }
+:root[data-theme="dark"] .letters { filter: drop-shadow(0 0 3px var(--letters)); }
+@media (prefers-color-scheme: dark) { :root:where(:not([data-theme="light"])) .letters { filter: drop-shadow(0 0 3px var(--letters)); } }
+.node:hover .letters, .node.open .letters, .node:focus-visible .letters { fill: var(--teal); }
 .screen-0 { fill: var(--screen-a); } .screen-1 { fill: var(--screen-b); } .screen-2 { fill: var(--screen-c); }
 .aerial { fill: none; stroke: var(--seam); stroke-width: 1.3; }
-.plaque-board { fill: var(--plaque); }
-.plaque-title { font-weight: 700; font-size: 13px; font-stretch: 112%; fill: var(--plaque-ink); }
-.plaque-sub { font-size: 11.5px; fill: var(--plaque-ink); opacity: .8; }
 .sign, .sign-sub, .count { paint-order: stroke; stroke: var(--wall); stroke-width: 3px; stroke-linejoin: round; }
 .sign { font-weight: 600; font-size: 13px; fill: var(--wing); }
 .sign-sub { font-size: 12px; fill: var(--wing-2); }
@@ -137,8 +136,8 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .node { cursor: pointer; }
 .node:focus { outline: none; }
 .ring { fill: none; stroke: transparent; stroke-width: 2.5; stroke-linejoin: round; transition: stroke .15s; }
-.node:hover .ring, .node:hover .plaque-board { stroke: var(--slate); }
-.node:focus-visible .ring, .node.open .ring, .node:focus-visible .plaque-board, .node.open .plaque-board { stroke: var(--teal); stroke-width: 2.5; }
+.node:hover .ring { stroke: var(--slate); }
+.node:focus-visible .ring, .node.open .ring { stroke: var(--teal); stroke-width: 2.5; }
 .node.down .cote { fill: var(--cote-off); }
 .node.down .sign-sub { fill: var(--eye); }
 .flight { pointer-events: none; }
