@@ -8,6 +8,7 @@ import {s3Sentence} from "../lib/say.js";
 import {appOf} from "./channels.js";
 import {chatView} from "./chat/index.js";
 import {clientView} from "./client-view.js";
+import {clusterView} from "./cluster-view.js";
 import {readEvents} from "./events.js";
 import {faultsView} from "./faults-view.js";
 import {flightsOf, refused} from "./flights.js";
@@ -273,6 +274,7 @@ async function pollCluster() {
   }
   const reply = replies.get(shown()) ?? [...replies.values()][0];
   if (!reply) return;
+  state.views = replies;
   state.timing = reply.timing;
   // A newer term only: a node cut off still thinks it leads, in its old term.
   const seen = state.term;
@@ -282,6 +284,7 @@ async function pollCluster() {
   if (told.length) say(told.at(-1));
   renderNodes();
   showNodes();
+  if (isOpen("cluster")) await updateCluster();
   // A new leader: its flag, its ways to the data channels.
   if (graph.drawn() && !state.wizard && (reply.leader !== drawnLeader || reply.links.length !== drawnLinks)) redraw();
 }
@@ -292,7 +295,10 @@ async function pollCluster() {
 function renderNodes() {
   const bar = $("nodes");
   bar.hidden = state.nodes.length < 2;
+  const all = button("node-pick cluster-pick", t("cluster.title"), () => openPanel({kind: "cluster"}));
+  all.setAttribute("aria-pressed", String(isOpen("cluster")));
   bar.replaceChildren(
+    all,
     ...state.nodes.map(id => {
       const marks = `${id === state.cluster?.leader ? " ★" : ""}${state.cut.has(id) ? " ✂" : ""}`;
       const b = button("node-pick", `${t("nodes.node", {n: id})}${marks}`, () => pickNode(state.node === id ? null : id));
@@ -311,6 +317,27 @@ async function pickNode(id) {
   await refreshObjects();
   await loadLog();
   await pollBackground();
+}
+
+// The cluster's panel: what every node says, the leader's word on the dynamic config.
+const clusterData = (dynamic = null) => {
+  const leader = state.cluster?.leader;
+  return {
+    nodes: state.nodes,
+    own: state.views ?? new Map(),
+    leader: state.views?.get(leader) ?? null,
+    cut: state.cut,
+    dynamic,
+    chronicle: raft.chronicle(),
+    config: state.config,
+    demo: state.config,
+    admin: state.admin,
+  };
+};
+async function updateCluster() {
+  const leader = state.cluster?.leader;
+  const dynamic = leader == null ? null : (await call({op: "dynamic", node: leader})).reply;
+  if (isOpen("cluster")) view?.update?.(clusterData(ok(dynamic) ? dynamic : null));
 }
 
 // The nodes as they say now, on the graph: roles, terms, election clocks.
@@ -445,6 +472,10 @@ function renderPanel() {
     const v = loftView({counters: counters(), ...state, demo, cluster}, loftOps);
     show(cluster ? t("nodes.loft_title", {n: id}) : "pigeonhole", t(cluster ? "nodes.loft_sub" : "demo.loft_sub"), v.nodes, v);
     if (!state.log) loadLog();
+  } else if (open.kind === "cluster") {
+    const v = clusterView(clusterData(), loftOps);
+    show(t("cluster.title"), t("cluster.sub", {n: state.nodes.length}), v.nodes, v);
+    updateCluster();
   } else if (open.kind === "log") {
     const c = logChannel();
     const setView = v => {

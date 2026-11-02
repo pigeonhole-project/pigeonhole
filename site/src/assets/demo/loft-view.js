@@ -1,5 +1,5 @@
 // The node's panel: counters, the background tasks, the config (on a real
-// node, read-only).
+// node, read-only; a cluster's is in the cluster's panel).
 //
 // on: {restart(text), erase(), toggle(task, on), run(task), isolate(node, cut)}.
 // cluster: {node, cut, leader}, the node of a cluster this panel is: it can
@@ -7,9 +7,11 @@
 // Returns {nodes, setCounters({objects, dataChannels, log}), setBackground(bg), setError(text)}.
 import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
+import {configView} from "./config-view.js";
 import {taskCards} from "./tasks.js";
 
-export function loftView({counters: counts, config, demo, admin, bg, cluster}, on) {
+export function loftView(props, on) {
+  const {counters: counts, bg, cluster} = props;
   const view = document.getElementById("tpl-node").content.cloneNode(true);
   const $ = id => view.querySelector(`#${id}`);
 
@@ -44,30 +46,15 @@ export function loftView({counters: counts, config, demo, admin, bg, cluster}, o
   const setBackground = taskCards($("bg"), {onToggle: on.toggle, onRun: on.run, follower: note});
   setBackground(bg);
 
-  const editor = $("config-text"),
-    error = $("config-error");
-  editor.value = config;
-  editor.readOnly = admin;
-  const restart = () => on.restart(editor.value);
-  $("config-reset").addEventListener("click", () => {
-    editor.value = demo;
-    error.textContent = "";
-  });
-  $("config-apply").addEventListener("click", restart);
-  editor.addEventListener("keydown", e => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-      e.preventDefault();
-      restart();
-    }
-  });
-  $("erase").addEventListener("click", on.erase);
+  // One node's config is its own; a cluster's is every node's: in the cluster's panel.
+  const config = cluster ? null : configView(props, on);
+  if (config) $("config-slot").replaceWith(...config.nodes);
+  else $("config-slot").replaceWith(h("p", "field-note", t("nodes.config_in_cluster")));
 
   return {
     nodes: [...view.childNodes],
     setCounters,
     setBackground,
-    setError: text => {
-      error.textContent = text;
-    },
+    setError: text => config?.setError(text),
   };
 }
