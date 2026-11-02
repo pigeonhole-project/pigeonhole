@@ -321,7 +321,7 @@
   "js.bg.next": "the next pass in {when}",
   "js.bg.parked": "off: parked until turned on or run by hand",
   "js.bg.entries": "{n} of {of} entries since the last snapshot (at {at}): at {of} the tablet takes one",
-  "js.bg.idle": "Nothing to do.",
+  "js.bg.idle": "The last pass found nothing to do.",
   "js.bg.sweep_item": "chunk {chunk}: no object uses it",
   "js.bg.cool_item": "{key}, {size}: {reason}",
   "js.bg.reason_age": "not rewritten for long",
@@ -329,10 +329,10 @@
   "js.bg.asked": "Asked the {task} for a pass now.",
   "js.bg.turned_on": "The {task} is on: <code>{key}</code> back on, an entry in the log.",
   "js.bg.turned_off": "The {task} is off: <code>{key} = off</code>, an entry in the log; it survives a restart.",
-  "js.bg.repair_note": "Copies back what a read or a check found missing, from the other copies.",
-  "js.bg.sweep_note": "Deletes the posts no chunk uses: chunks no object needs any more, and orphans of failed uploads.",
-  "js.bg.cool_note": "Moves small objects kept in the log itself (inline) out to chunks once they go cold.",
-  "js.bg.snapshot_note": "Writes the whole state as one file, so that a restart replays only what came after: by time, and every so many entries.",
+  "js.bg.repair_note": "Copies back what a read or a check found missing, from the other copies. A pass looks at the metadata only; it calls the channels just to copy.",
+  "js.bg.sweep_note": "Deletes the posts no chunk uses: chunks no object needs any more, and orphans of failed uploads. A pass finds them in the metadata; it calls the channels just to delete.",
+  "js.bg.cool_note": "Moves small objects kept in the log itself (inline) out to chunks once they go cold. A pass looks at the metadata only.",
+  "js.bg.snapshot_note": "Writes the whole state as one file, so that a restart replays only what came after: every so many entries, and by time if that is on.",
   "js.demo.pinned_message": "Pinned message",
   "js.demo.pinned": "📌 Pinned",
   "js.demo.pinned_n": {
@@ -361,5 +361,7 @@
     "other": "{n} entries since the last snapshot"
   },
   "js.time.s": "{n} s",
-  "js.time.min": "{n} min"
+  "js.time.min": "{n} min",
+  "js.bg.at_entries": "at {of} entries since the last one; no timer",
+  "js.bg.every_entries": "every {of} entries"
 }

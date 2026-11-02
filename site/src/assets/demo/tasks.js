@@ -57,7 +57,8 @@ export function describe(bg, name) {
     of,
     base,
     title: t(`bg.${name}`),
-    next: period ? t("bg.next", {when: soon(task.next_in_ms)}) : t("bg.parked"),
+    // A snapshot without a timer still comes every so many entries.
+    next: period ? t("bg.next", {when: soon(task.next_in_ms)}) : of ? t("bg.at_entries", {of}) : t("bg.parked"),
     work,
   };
 }
@@ -119,9 +120,9 @@ export function taskWindows(g, entrances, onOpen) {
       win.light.setAttribute("y", String(win.w.y + 14 - height));
       win.light.setAttribute("height", String(height));
       win.count.textContent = d.n > 99 ? "99+" : String(d.n);
-      win.win.classList.toggle("off", !d.period);
+      win.win.classList.toggle("off", !d.period && !d.of);
       win.win.classList.toggle("busy", d.n > 0);
-      const when = d.period ? t("bg.tip", {task: d.title, when: soon(d.task.next_in_ms)}) : t("bg.tip_off", {task: d.title});
+      const when = d.period ? t("bg.tip", {task: d.title, when: soon(d.task.next_in_ms)}) : d.of ? `${d.title}: ${d.next}` : t("bg.tip_off", {task: d.title});
       win.title.textContent = name === "snapshot" || d.n > 0 ? `${when}; ${d.work}` : when;
     }
     tip.refresh(bg);
@@ -220,9 +221,11 @@ function taskCard(name, onToggle, onRun) {
     el.hidden = !d;
     if (!d) return;
     on = !!d.period;
-    el.classList.toggle("off", !on);
+    el.classList.toggle("off", !on && !d.of);
     sw.setAttribute("aria-checked", String(on));
-    every.textContent = on ? t("bg.every", {every: d.task.every}) : t("bg.off");
+    every.textContent = on ? t("bg.every", {every: d.task.every}) : d.of ? t("bg.every_entries", {of: d.of}) : t("bg.off");
+    // No timer, no clock: a snapshot by entries has its own meter.
+    clock.m.hidden = !on;
     clock.fill.style.width = `${100 * d.toNext}%`;
     clockText.textContent = d.next;
     if (name === "snapshot") {

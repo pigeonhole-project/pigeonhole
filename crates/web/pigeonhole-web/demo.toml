@@ -46,6 +46,7 @@ path = "/data/channels"
 log = "tg-log"
 snapshot = "tg-snap"
 snapshot_every_entries = 50
+snapshot_every = "off"   # by entries only: no timer in the demo
 
 [chunk]
 store = "channels"

@@ -142,7 +142,7 @@ export function tomlOf(w) {
   // One node: its log and snapshots in [meta]; a cluster's: in each [[node]].
   out.push("[meta]");
   if (!(w.nodes > 1)) out.push(`log = "${storeId(nodes[0].log, 0)}"`, `snapshot = "${storeId(nodes[0].snaps, 0)}"`);
-  out.push(`snapshot_every_entries = ${w.every}`);
+  out.push(`snapshot_every_entries = ${w.every}`, 'snapshot_every = "off"');
   if (nodes.some(m => m.kind === "discord")) out.push(`# ${t("wiz.toml_lease")}`, 'lease = "5s"');
   out.push("");
   out.push("[chunk]", `store = "${chunkStore}"`, 'size = "4 MiB"', 'block_size = "1 MiB"', 'codec = "zstd"', "");
