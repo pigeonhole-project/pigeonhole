@@ -14,6 +14,13 @@
   --eye: #e07a2f;
   --tg: #2a78d6;
   --dc: #5865f2;
+  --sky-top: #c3d2dc; --sky-low: #eceff1; --far: #d6dde2; --far-2: #c9d1d7;
+  --wall: #c4c8c7; --wall-2: #b5babb; --wall-3: #a9afb1; --seam: #9aa2a6;
+  --pane: #e1e6e9; --pane-frame: #9aa3a8; --pane-lit: #ffd88a;
+  --screen-a: #93b2c8; --screen-b: #a3c6b8; --screen-c: #d9dcd8;
+  --plaque: #2f4a6b; --plaque-ink: #f4f6f8; --path: #6f7c87;
+  --cote: #f4f5f6; --cote-off: #c3cbd1; --cote-roof: #4f5961; --cote-hole: #2e3439;
+  --dv-body: #7d8a96; --dv-head: #5d6873; --dv-wing: #a9b4bd; --dv-prim: #4a545d;
   --wide: 125;
   --sans: "Archivo", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
@@ -28,10 +35,25 @@
     --wing: #e7ebee;
     --wing-2: #b4bdc4;
     --line: #2d343b;
+    --sky-top: #090d11; --sky-low: #1a2229; --far: #161d23; --far-2: #1c242b;
+    --wall: #2d3439; --wall-2: #282f34; --wall-3: #333b41; --seam: #20262b;
+    --pane: #39434b; --pane-frame: #262d32; --pane-lit: #f2c46b;
+    --screen-a: #34495a; --screen-b: #35504a; --screen-c: #3a4248;
+    --plaque: #24384f; --plaque-ink: #dfe6ec; --path: #64727e;
+    --cote: #c9d1d7; --cote-off: #4f5a63; --cote-roof: #6a7782; --cote-hole: #0d1114;
+    --dv-body: #8996a2; --dv-head: #5d6873; --dv-wing: #b6c0c8; --dv-prim: #4a545d;
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
+  --sky-top: #090d11; --sky-low: #1a2229; --far: #161d23; --far-2: #1c242b;
+  --wall: #2d3439; --wall-2: #282f34; --wall-3: #333b41; --seam: #20262b;
+  --pane: #39434b; --pane-frame: #262d32; --pane-lit: #f2c46b;
+  --screen-a: #34495a; --screen-b: #35504a; --screen-c: #3a4248;
+  --plaque: #24384f; --plaque-ink: #dfe6ec; --path: #64727e;
+  --cote: #c9d1d7; --cote-off: #4f5a63; --cote-roof: #6a7782; --cote-hole: #0d1114;
+  --dv-body: #8996a2; --dv-head: #5d6873; --dv-wing: #b6c0c8; --dv-prim: #4a545d;
+
   --feather: #171b1f;
   --plume: #1f2429;
   --slate: #8995a0;
@@ -73,7 +95,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .loft.zoomed { grid-template-columns: minmax(220px, 26%) 1fr; }
 .sky { position: relative; min-height: 0; display: flex; flex-direction: column; }
 #graph { flex: 1; width: 100%; height: 100%; min-height: 320px; transition: opacity .2s; }
-.hint { position: absolute; left: 24px; bottom: 12px; margin: 0; color: var(--slate); font-size: 14px; }
+.hint { position: absolute; left: 24px; bottom: 12px; margin: 0; padding: 4px 10px; border-radius: 6px; background: var(--plume); color: var(--wing-2); font-size: 14px; }
 .loft.zoomed .hint { display: none; }
 .caption {
   margin: 0; padding: 12px 24px 16px; min-height: 52px; border-top: 1px solid var(--line);
@@ -81,23 +103,44 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 }
 .caption b { color: var(--wing); font-weight: 600; }
 
-/* graph */
-.edge { fill: none; stroke: var(--slate-2); stroke-width: 1.5; }
-.edge.live { stroke: var(--slate); }
+/* graph: the town (graph.js, art.js) */
+.sky-top { stop-color: var(--sky-top); } .sky-low { stop-color: var(--sky-low); }
+.far { fill: var(--far); } .far-2 { fill: var(--far-2); }
+.wall-1 { fill: var(--wall); } .wall-2 { fill: var(--wall-2); } .wall-3 { fill: var(--wall-3); }
+.parapet, .vent { fill: var(--seam); }
+.seam { fill: none; stroke: var(--seam); stroke-width: .8; }
+.pane { fill: var(--pane); stroke: var(--pane-frame); stroke-width: .8; } .pane.lit { fill: var(--pane-lit); }
+.screen-0 { fill: var(--screen-a); } .screen-1 { fill: var(--screen-b); } .screen-2 { fill: var(--screen-c); }
+.aerial { fill: none; stroke: var(--seam); stroke-width: 1.3; }
+.plaque-board { fill: var(--plaque); }
+.plaque-title { font-weight: 700; font-size: 13px; font-stretch: 112%; fill: var(--plaque-ink); }
+.plaque-sub { font-size: 11.5px; fill: var(--plaque-ink); opacity: .8; }
+.sign, .sign-sub, .count { paint-order: stroke; stroke: var(--wall); stroke-width: 3px; stroke-linejoin: round; }
+.sign { font-weight: 600; font-size: 13px; fill: var(--wing); }
+.sign-sub { font-size: 12px; fill: var(--wing-2); }
+.count { font-family: var(--mono); font-size: 12px; fill: var(--wing); }
+.cote { fill: var(--cote); } .cote-roof { fill: var(--cote-roof); } .cote-hole { fill: var(--cote-hole); } .cote-board { fill: var(--seam); }
+.shutter { fill: var(--seam); stroke: var(--cote); stroke-width: .8; }
+.edge { fill: none; stroke: var(--path); stroke-width: 1.2; stroke-dasharray: 1 6; stroke-linecap: round; }
+.edge.own { stroke-dasharray: 1 4; opacity: .75; }
 .node { cursor: pointer; }
 .node:focus { outline: none; }
-.node:focus-visible .shape, .node.open .shape { stroke: var(--teal); stroke-width: 2.5; }
-.node .shape { fill: var(--plume); stroke: var(--slate); stroke-width: 1.5; transition: stroke .15s; }
-.node:hover .shape { stroke: var(--wing-2); }
-.node .name { font-weight: 700; font-size: 15px; fill: var(--wing); }
-.node .role { font-size: 12.5px; fill: var(--slate); }
-.node .count { font-family: var(--mono); font-size: 12px; fill: var(--wing-2); }
-.node .badge { stroke: none; }
-.node.down .shape { stroke: var(--eye); stroke-dasharray: 4 4; }
-.loft-title { font-weight: 800; font-stretch: 125%; font-size: 17px; fill: var(--wing); }
+.ring { fill: none; stroke: transparent; stroke-width: 2.5; stroke-linejoin: round; transition: stroke .15s; }
+.node:hover .ring, .node:hover .plaque-board { stroke: var(--slate); }
+.node:focus-visible .ring, .node.open .ring, .node:focus-visible .plaque-board, .node.open .plaque-board { stroke: var(--teal); stroke-width: 2.5; }
+.node.down .cote { fill: var(--cote-off); }
+.node.down .sign-sub { fill: var(--eye); }
 .flight { pointer-events: none; }
-.node.landed .shape { animation: landed .6s ease-out; }
-@keyframes landed { 25% { stroke: var(--teal); stroke-width: 3; } }
+.failed-mark { fill: var(--eye); }
+.hutch { transform-box: fill-box; transform-origin: 50% 100%; }
+.node.landed .hutch { animation: landed .45s ease-out; }
+@keyframes landed { 35% { transform: scale(1.08, .94); } }
+@keyframes arrive { 30% { transform: scale(1.06); } }
+/* rock doves, whatever the theme */
+.dv-body { fill: var(--dv-body); } .dv-head { fill: var(--dv-head); } .dv-wing { fill: var(--dv-wing); } .dv-prim { fill: var(--dv-prim); }
+.dv-bar { fill: none; stroke: #23292e; stroke-linecap: round; } .dv-band { fill: #23292e; }
+.dv-neck { fill: url(#dv-iris); } .dv-eye { fill: #e8892f; } .dv-pupil { fill: #1b1f22; } .dv-cere { fill: #eef0f2; } .dv-beak { fill: #3b3f43; }
+.dv-feet { fill: none; stroke: #c9524a; stroke-linecap: round; }
 
 /* the panel */
 .panel {
@@ -149,7 +192,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
   .panel { border-left: 0; border-top: 1px solid var(--line); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .node.landed .shape { animation: none; }
+  .node.landed .hutch { animation: none; }
 }
 .panel[hidden] { display: none; }
 
@@ -186,9 +229,6 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 @media (prefers-reduced-motion: reduce) { .booting .node, .booting .edge { transition: none; } }
 
 /* faults: a channel down, a failed call */
-.node.down .shape { stroke: var(--eye); stroke-dasharray: 6 5; }
-.node.down .role { fill: var(--eye); }
-.flight.failed path { fill: var(--eye); }
 .faults { border: 1px dashed var(--slate-2); border-radius: 12px; padding: 12px 14px; margin: 0 0 16px; }
 .faults-note { margin: 0; font-size: 14px; color: var(--wing-2); max-width: 70ch; }
 .faults .row { margin-bottom: 0; }
@@ -207,27 +247,15 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .meter .fill.amethyst { background: var(--amethyst); }
 .jobs { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 10px 0 0; }
 .job-tile { font: 12px var(--mono); padding: 3px 8px; border-radius: 6px; border: 1px solid var(--eye); color: var(--eye); }
-/* the graph's two groups of channels */
-.group { fill: none; stroke: var(--line); stroke-width: 1.5; }
-.group.meta { stroke-dasharray: 5 5; }
-.group-label { font-size: 13px; font-weight: 600; fill: var(--slate); }
-.edge.meta { stroke-dasharray: 4 5; }
-.node .shape.meta { fill: var(--feather); }
 
 /* the node's background tasks: in the dovecote's windows, cards in its panel */
 .win { cursor: pointer; }
 .win-light { fill: var(--teal); opacity: .85; transition: y 1s linear, height 1s linear; }
 .win-glow { fill: var(--teal); opacity: .22; }
 .win-frame { fill: none; stroke: var(--teal); stroke-width: 1.6; opacity: .75; }
-.win-boarded .win-board-back { fill: var(--plume); stroke: var(--slate-2); stroke-width: 1.2; }
-.win-plank { stroke: var(--slate); stroke-width: 3; stroke-linecap: round; }
 .win:hover .win-frame, .win:focus-visible .win-frame { stroke-width: 2.6; opacity: 1; }
 .win:focus-visible { outline: none; }
 .win-bird { opacity: 0; transition: opacity .3s; }
-/* a rock dove's grey whatever the theme */
-.win-bird .bird-body { fill: #d9dee3; stroke: #2e3439; stroke-width: 1; }
-.win-bird .bird-lines { fill: none; stroke: #2e3439; stroke-width: 1; stroke-linecap: round; }
-.win-bird .bird-eye { fill: #2e3439; }
 .win.busy .win-bird { opacity: 1; }
 .win.busy .win-light { fill: var(--eye); }
 .win-badge { opacity: 0; transition: opacity .3s; }
