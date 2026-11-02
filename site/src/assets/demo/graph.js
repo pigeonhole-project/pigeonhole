@@ -9,42 +9,92 @@ import {t} from "../lib/i18n.js";
 import {dovecote, FLY_BODY, FLY_WING, logo} from "./art.js";
 import {appOf, placeNote} from "./channels.js";
 
-const W = 1000;
 const STEP = 96,
   GAP = 64,
   HEAD = 34; // a channel's row, between groups, a group's title
 const QUEUE_SHOWN = 12; // repair jobs drawn under a card; the rest as "+n"
+// A phone's screen: the graph top to bottom, scrolled.
+const NARROW = "(max-width: 640px)";
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// An S-curve between two points, leaving and arriving level.
 const curve = ([x1, y1], [x2, y2]) => {
   const mx = (x1 + x2) / 2;
   return `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
 };
 
-// Where everything goes for these channels: the view's height, each node's
-// centre (client, loft, then stores by id) and the groups' boxes.
-function layout(channels) {
+// The channels in their two groups: the data channels (the chunks) and the
+// node's own (its log, its snapshots). Each group: a box over a column of
+// cards, starting at `top`; returns the boxes, each card's centre and where
+// the column ends.
+function column(channels, x, top) {
   const data = channels.filter(c => c.role === "data");
-  const meta = channels.filter(c => c.role !== "data");
-  const groups = [data, meta].filter(g => g.length);
-  const tall = groups.reduce((a, g) => a + HEAD + g.length * STEP, 0) + GAP * (groups.length - 1);
-  const height = Math.max(480, tall + 80);
-  const client = [120, height / 2],
-    loft = [440, height / 2],
-    stores = new Map(),
+  const groups = [data, channels.filter(c => c.role !== "data")].filter(g => g.length);
+  const stores = new Map(),
     boxes = [];
-  let y = (height - tall) / 2;
+  let y = top;
   for (const g of groups) {
-    boxes.push({role: g === data ? "data" : "meta", top: y, height: HEAD + g.length * STEP});
-    for (const [i, c] of g.entries()) stores.set(c.store, [790, y + HEAD + STEP / 2 + i * STEP]);
+    boxes.push({role: g === data ? "data" : "meta", x: x - 148, top: y, height: HEAD + g.length * STEP});
+    for (const [i, c] of g.entries()) stores.set(c.store, [x, y + HEAD + STEP / 2 + i * STEP]);
     y += HEAD + g.length * STEP + GAP;
   }
-  return {height, client, loft, stores, boxes};
+  return {stores, boxes, bottom: y - GAP};
+}
+
+// Where everything goes: the view's size, each node's centre (client,
+// loft, the stores by id), the groups' boxes and the edges (`links`: the
+// client's, then each store's), left to right…
+function wide(channels) {
+  const rows = column(channels, 790, 0);
+  const height = Math.max(480, rows.bottom + 80),
+    shift = (height - rows.bottom) / 2;
+  const stores = new Map([...rows.stores].map(([id, [x, y]]) => [id, [x, y + shift]]));
+  const client = [120, height / 2],
+    loft = [440, height / 2];
+  return {
+    width: 1000,
+    height,
+    client,
+    loft,
+    stores,
+    boxes: rows.boxes.map(b => ({...b, top: b.top + shift})),
+    links: {
+      client: curve([166, client[1]], [345, loft[1]]),
+      stores: new Map([...stores].map(([id, [, y]]) => [id, curve([535, loft[1]], [660, y])])),
+    },
+  };
+}
+
+// …or top to bottom, for a phone: you, the node under you, the channels
+// under it; their edges run down a rail on the left, clear of the cards.
+function tall(channels) {
+  const client = [200, 60],
+    loft = [200, 316];
+  const rows = column(channels, 222, 470);
+  const rail = 36,
+    from = [loft[0] - 70, loft[1] + 54];
+  const toCard = ([x, y]) =>
+    `M${from[0]},${from[1]} C${rail},${from[1]} ${rail},${from[1]} ${rail},${from[1] + 50} L${rail},${y - 16} Q${rail},${y} ${rail + 16},${y} L${x - 130},${y}`;
+  return {
+    width: 400,
+    height: rows.bottom + 24,
+    client,
+    loft,
+    stores: rows.stores,
+    boxes: rows.boxes,
+    links: {
+      client: `M${client[0]},${client[1] + 98} L${loft[0]},${loft[1] - 140}`, // from under its label
+      stores: new Map([...rows.stores].map(([id, p]) => [id, toCard(p)])),
+    },
+  };
 }
 
 // onLoft(g, windows): the loft was drawn, its entrances are free to dress.
-export function makeGraph(el, {onOpen, onLoft}) {
+// onRelayout(): the screen turned narrow or wide: draw again.
+export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   const reduced = reducedMotion();
+  const narrow = matchMedia(NARROW);
+  narrow.addEventListener("change", onRelayout);
   let client = null,
     loft = null;
   let cards = new Map(); // store id → its card
@@ -88,23 +138,23 @@ export function makeGraph(el, {onOpen, onLoft}) {
   // as in the wizard's sketch) and this many objects.
   function draw(channels, objects) {
     el.replaceChildren();
-    const at = layout(channels);
-    el.setAttribute("viewBox", `0 0 ${W} ${at.height}`);
-    el.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    const at = (narrow.matches ? tall : wide)(channels);
+    el.classList.toggle("tall", narrow.matches);
+    el.setAttribute("viewBox", `0 0 ${at.width} ${at.height}`);
+    el.setAttribute("preserveAspectRatio", narrow.matches ? "xMidYMin meet" : "xMidYMid meet");
     // The two groups of channels, under everything else.
     for (const b of at.boxes) {
-      svg("rect", {class: `group ${b.role}`, x: 642, y: b.top, width: 296, height: b.height - 8, rx: 18}, el);
-      svg("text", {class: "group-label", x: 660, y: b.top + 22}, el).textContent = t(`demo.group_${b.role}`);
+      svg("rect", {class: `group ${b.role}`, x: b.x, y: b.top, width: 296, height: b.height - 8, rx: 18}, el);
+      svg("text", {class: "group-label", x: b.x + 18, y: b.top + 22}, el).textContent = t(`demo.group_${b.role}`);
     }
     const iris = svg("linearGradient", {id: "iris", x1: "0", y1: "0", x2: "1", y2: "1"}, svg("defs", {}, el));
     svg("stop", {offset: "0", "stop-color": "var(--teal)"}, iris);
     svg("stop", {offset: "1", "stop-color": "var(--amethyst)"}, iris);
 
     const edgeLayer = svg("g", {}, el);
-    edges = new Map([["", svg("path", {class: "edge live", d: curve([166, at.client[1]], [345, at.loft[1]])}, edgeLayer)]]);
+    edges = new Map([["", svg("path", {class: "edge live", d: at.links.client}, edgeLayer)]]);
     for (const c of channels) {
-      const d = curve([535, at.loft[1]], [660, at.stores.get(c.store)[1]]);
-      edges.set(c.store, svg("path", {class: `edge${c.role === "data" ? "" : " meta"}`, d}, edgeLayer));
+      edges.set(c.store, svg("path", {class: `edge${c.role === "data" ? "" : " meta"}`, d: at.links.stores.get(c.store)}, edgeLayer));
     }
 
     client = node({kind: "client"}, at.client, t("demo.you"), t("demo.objects", {n: objects}));

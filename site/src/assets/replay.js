@@ -21,7 +21,11 @@ function sentence(events, cmdText) {
 }
 
 function play(root, trace) {
-  const stage = makeStage(root);
+  // The trace is stamped when the recording ended: its steps' times count back from there.
+  const end = Date.parse(trace.recorded),
+    last = trace.steps.at(-1)?.t ?? 0;
+  const logPosts = new Set(trace.steps.filter(s => s.type === "log").map(s => s.msg));
+  const stage = makeStage(root, {entries: trace.log || [], logChannel: trace.log_channel, logPosts, at: t => new Date(end - last + t)});
   const playBtn = root.querySelector('[data-act="play"]');
   const speedBtn = root.querySelector('[data-act="speed"]');
 

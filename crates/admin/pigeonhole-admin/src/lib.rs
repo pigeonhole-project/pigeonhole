@@ -22,6 +22,9 @@ mod background;
 mod cluster;
 pub mod log_view;
 mod s3;
+pub mod stores;
+
+pub use stores::{DiskView, ListedStores, StoreRef, Views};
 
 pub use cluster::{outbox_store, LOG_STORE, SNAPSHOT_STORE};
 
@@ -30,6 +33,9 @@ pub use cluster::{outbox_store, LOG_STORE, SNAPSHOT_STORE};
 pub trait Channels: Send + Sync {
     /// Every channel the node uses: its messages (the last `limit`), its pins.
     async fn describe(&self, limit: usize) -> Result<Value>;
+
+    /// Whether `store` is one of the stores this view draws.
+    fn holds(&self, store: &str) -> bool;
 
     /// Deletes message `id` (a string: Discord's exceed JS numbers) of
     /// `store`'s channel, as someone in the app would.
@@ -106,21 +112,6 @@ pub struct Admin {
     pub config_text: Option<String>,
     /// The tablet's Raft cluster as the config has it; `None`: of one.
     pub cluster: Option<pigeonhole_config::cluster::ClusterSettings>,
-}
-
-/// The node's stores as the config names them, without their messages:
-/// what a node whose channels are not read shows.
-pub struct ListedStores(pub Vec<Value>);
-
-#[async_trait]
-impl Channels for ListedStores {
-    async fn describe(&self, _limit: usize) -> Result<Value> {
-        Ok(json!({ "channels": self.0 }))
-    }
-
-    async fn delete_message(&self, store: &str, _id: &str) -> Result<()> {
-        bail!("{store}: this node does not read its channels")
-    }
 }
 
 impl Admin {

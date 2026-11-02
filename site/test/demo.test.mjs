@@ -117,6 +117,21 @@ test("tomlOf: the log on Discord takes a lease; the real pace has no fast sends"
   assert.doesNotMatch(toml, /rate_per_sec/);
 });
 
+test("tomlOf: the log and snapshots on the node's disk, one store for both", () => {
+  const toml = tomlOf(setup(["telegram"], 1, {log: "local_disk", snapshots: "local_disk"}));
+  assert.match(toml, /id = "node-disk"\nkind = "local_disk"\npath = "\/data\/node"/);
+  assert.match(toml, /log = "node-disk"\nsnapshot = "node-disk"/);
+  assert.doesNotMatch(toml, /tg-log|lease/);
+  const sketched = sketch(setup(["telegram"], 1, {log: "local_disk", snapshots: "telegram"}));
+  assert.deepEqual(
+    sketched.slice(1).map(c => [c.store, c.kind]),
+    [
+      ["meta-log", "local_disk"],
+      ["tg-snapshots", "telegram"],
+    ],
+  );
+});
+
 test("sketch: each data channel's place; the log and snapshots last", () => {
   const chans = sketch(setup(["telegram", "discord", "telegram", "discord"], 2));
   assert.deepEqual(
@@ -131,6 +146,22 @@ test("sketch: each data channel's place; the log and snapshots last", () => {
     ],
   );
   assert.ok(chans.every(c => c.total === undefined));
+  // The wizard's sketch grows with its steps.
+  const w = setup(["telegram", "discord"], 2, {bots: 3});
+  assert.deepEqual(
+    sketch(w, "channels").map(c => [c.store, c.place, c.bots]),
+    [
+      ["tg-1", null, 1],
+      ["dc-1", null, 1],
+    ],
+  );
+  assert.equal(sketch(w, "copies")[1].place.copy, 1);
+  assert.equal(sketch(w, "copies").length, 2, "no log yet");
+  assert.deepEqual(
+    sketch(w, "meta").map(c => c.role),
+    ["data", "data", "log", "snapshots"],
+  );
+  assert.ok(sketch(w, "meta").every(c => c.bots === 1) && sketch(w, "bots").every(c => c.bots === 3));
   assert.deepEqual(divisors(4), [1, 2, 4]);
 });
 
@@ -147,7 +178,7 @@ test("chatModel: what each message is, and the posts not shown", () => {
       {id: "14", kind: "document", name: "ph-2.bin", size: 9, gone: true},
     ],
   };
-  const model = chatModel(c);
+  const model = chatModel(c, true);
   assert.equal(model.earlier, 2);
   assert.equal(model.pins, 1);
   const [owner, text, service, gone] = model.messages;
@@ -157,6 +188,7 @@ test("chatModel: what each message is, and the posts not shown", () => {
   assert.equal(text.text, "ph-1.bin 461\n漢…");
   assert.equal(service.kind, "service");
   assert.ok(!gone.deletable && text.deletable);
+  assert.ok(chatModel(c).messages.every(m => !m.deletable));
   // A Discord id carries its time: 2015-01-01 plus the high bits, in ms.
   assert.equal(chatModel({...c, messages: [{id: String(1000n << 22n), kind: "other"}]}).messages[0].at.getTime(), 1420070401000);
 });
@@ -171,7 +203,7 @@ test("chatModel: the log's own posts are quiet; nothing to delete outside data c
       {id: 2, kind: "text", log: {what: "batch", gen: 1, first: 3, last: 4}},
     ],
   };
-  const [claim, batch] = chatModel(c).messages;
+  const [claim, batch] = chatModel(c, true).messages;
   assert.ok(claim.quiet && !batch.quiet);
   assert.deepEqual(batch.notes, ["demo.post_batch"]);
   assert.ok(!claim.deletable);

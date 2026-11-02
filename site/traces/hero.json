@@ -1,7 +1,7 @@
 {
  "name": "hero",
- "recorded": "2026-10-31T01:16:05+00:00",
- "commit": "b62c80f",
+ "recorded": "2026-11-01T23:50:40+00:00",
+ "commit": "612fcac",
  "config": {
   "chunk": "4 MiB",
   "cache": "true"
@@ -13,85 +13,81 @@
    "text": "aws s3 mb s3://demo"
   },
   {
-   "t": 227.7,
+   "t": 183.9,
    "type": "log",
-   "first": 4,
-   "last": 4,
-   "bytes": 98
+   "first": 5,
+   "last": 5,
+   "bytes": 92,
+   "msg": "10",
+   "commands": 1
   },
   {
-   "t": 228.1,
-   "type": "commit",
-   "position": 4,
-   "entries": 1
-  },
-  {
-   "t": 228.6,
+   "t": 184.0,
    "type": "s3",
    "op": "CreateBucket",
    "bucket": "demo"
   },
   {
-   "t": 266.7,
+   "t": 214.4,
    "type": "out",
    "text": "make_bucket: demo"
   },
   {
-   "t": 571.7,
+   "t": 523.1,
    "type": "cmd",
    "text": "aws s3 cp photo.jpg s3://demo/"
   },
   {
-   "t": 818.5,
-   "type": "blob",
-   "store": "telegram",
-   "op": "put",
-   "bytes": 4194304,
-   "msg": 1,
-   "name": "ph-5e9a0ef4d5f941389ff3eacb1d2192ca.bin"
-  },
-  {
-   "t": 818.9,
+   "t": 750.6,
    "type": "blob",
    "store": "discord",
    "op": "put",
    "bytes": 4194304,
-   "msg": 1,
-   "name": "ph-c36dbc8322ff45cb8db2d98195a6915f.bin"
+   "msg": "1566600385127251968",
+   "name": "ph-47daf81a0f0e4eefbfbea62187184325.bin",
+   "kind": "attachment"
   },
   {
-   "t": 825.9,
+   "t": 750.7,
+   "type": "blob",
+   "store": "telegram",
+   "op": "put",
+   "bytes": 4194304,
+   "msg": "3",
+   "name": "ph-47daf81ad0f54e53bcc4bd6fc7d141ec.bin",
+   "kind": "document"
+  },
+  {
+   "t": 755.0,
    "type": "blob",
    "store": "telegram",
    "op": "put",
    "bytes": 3145728,
-   "msg": 2,
-   "name": "ph-1a8f01a2ee6e456db9c149972b42e0b3.bin"
+   "msg": "4",
+   "name": "ph-47daf81ac79244e2a5679e0265e0aa4f.bin",
+   "kind": "document"
   },
   {
-   "t": 826.2,
+   "t": 755.0,
    "type": "blob",
    "store": "discord",
    "op": "put",
    "bytes": 3145728,
-   "msg": 2,
-   "name": "ph-fb83cbd4e4a2421a983e17cd8f51632e.bin"
+   "msg": "1566600385144029184",
+   "name": "ph-47daf81a12bd4122a0986c032748fb02.bin",
+   "kind": "attachment"
   },
   {
-   "t": 826.3,
+   "t": 755.1,
    "type": "log",
-   "first": 5,
-   "last": 5,
-   "bytes": 652
+   "first": 6,
+   "last": 6,
+   "bytes": 639,
+   "msg": "11",
+   "commands": 3
   },
   {
-   "t": 826.4,
-   "type": "commit",
-   "position": 5,
-   "entries": 3
-  },
-  {
-   "t": 826.4,
+   "t": 755.1,
    "type": "s3",
    "op": "PutObject",
    "bucket": "demo",
@@ -101,94 +97,135 @@
    "inline": false
   },
   {
-   "t": 869.9,
+   "t": 790.7,
    "type": "out",
    "text": "upload: ./photo.jpg to s3://demo/photo.jpg"
   },
   {
-   "t": 1172.7,
+   "t": 1100.1,
    "type": "cmd",
    "text": "aws s3 cp notes.md s3://demo/"
   },
   {
-   "t": 1416.3,
-   "type": "blob",
-   "store": "telegram",
-   "op": "put",
-   "bytes": 352172,
-   "msg": 3,
-   "name": "ph-d602131c8cec43f68163884b6e0d62bb.bin"
-  },
-  {
-   "t": 1416.3,
+   "t": 1322.1,
    "type": "blob",
    "store": "discord",
    "op": "put",
-   "bytes": 352172,
-   "msg": 3,
-   "name": "ph-da292850ca074b0f8f1e7808726adde9.bin"
+   "bytes": 378137,
+   "msg": "1566600387522199552",
+   "name": "ph-47daf81abf0949a49f38d71b49052079.bin",
+   "kind": "attachment"
   },
   {
-   "t": 1416.4,
+   "t": 1322.1,
+   "type": "blob",
+   "store": "telegram",
+   "op": "put",
+   "bytes": 378137,
+   "msg": "5",
+   "name": "ph-47daf81a4123415c96fbd46ed946c148.bin",
+   "kind": "document"
+  },
+  {
+   "t": 1322.2,
    "type": "log",
-   "first": 6,
-   "last": 6,
-   "bytes": 435
+   "first": 7,
+   "last": 7,
+   "bytes": 424,
+   "msg": "12",
+   "commands": 2
   },
   {
-   "t": 1416.5,
-   "type": "commit",
-   "position": 6,
-   "entries": 2
-  },
-  {
-   "t": 1416.5,
+   "t": 1322.3,
    "type": "s3",
    "op": "PutObject",
    "bucket": "demo",
    "key": "notes.md",
-   "size": 3163709,
+   "size": 3162743,
    "extents": 1,
    "inline": false
   },
   {
-   "t": 1461.5,
+   "t": 1356.2,
    "type": "out",
    "text": "upload: ./notes.md to s3://demo/notes.md"
   },
   {
-   "t": 1766.6,
+   "t": 1658.1,
+   "type": "cmd",
+   "text": "aws s3 cp settings.json s3://demo/"
+  },
+  {
+   "t": 1870.9,
+   "type": "blob",
+   "store": "discord",
+   "op": "put",
+   "bytes": 223,
+   "msg": "1566600389824872448",
+   "name": "ph-47daf81a497146b8a558d00c378fd0c1.bin",
+   "kind": "text",
+   "preview": "𡑚𤯿𢰑𦀪𦠰𠅉𡈼𡹐𤚹𥵜𢧅𠱧𢶋𥸌𦡤𢂪𡔺𣤭𤨡𢷦𠼣𡂘𤰐𠏕"
+  },
+  {
+   "t": 1870.9,
+   "type": "blob",
+   "store": "telegram",
+   "op": "put",
+   "bytes": 223,
+   "msg": "6",
+   "name": "ph-47daf81a7ad944dba276462c5bf30a6b.bin",
+   "kind": "text",
+   "preview": "𡑚𤯿𢰑𦀪𦠰𠅉𡈼𡹐𤚹𥵜𢧅𠱧𢶋𥸌𦡤𢂪𡔺𣤭𤨡𢷦𠼣𡂘𤰐𠏕"
+  },
+  {
+   "t": 1871.0,
+   "type": "log",
+   "first": 8,
+   "last": 8,
+   "bytes": 357,
+   "msg": "13",
+   "commands": 2
+  },
+  {
+   "t": 1871.0,
+   "type": "s3",
+   "op": "PutObject",
+   "bucket": "demo",
+   "key": "settings.json",
+   "size": 910,
+   "extents": 1,
+   "inline": false
+  },
+  {
+   "t": 1905.4,
+   "type": "out",
+   "text": "upload: ./settings.json to s3://demo/settings.json"
+  },
+  {
+   "t": 2214.8,
    "type": "cmd",
    "text": "aws s3 cp s3://demo/photo.jpg s3://demo/photo-copy.jpg"
   },
   {
-   "t": 2000.2,
+   "t": 2429.4,
    "type": "log",
-   "first": 7,
-   "last": 7,
-   "bytes": 66
+   "first": 9,
+   "last": 9,
+   "bytes": 59,
+   "msg": "14",
+   "commands": 1
   },
   {
-   "t": 2000.2,
-   "type": "commit",
-   "position": 7,
-   "entries": 1
-  },
-  {
-   "t": 2000.2,
+   "t": 2429.5,
    "type": "log",
-   "first": 8,
-   "last": 8,
-   "bytes": 211
+   "first": 10,
+   "last": 10,
+   "bytes": 204,
+   "msg": "15",
+   "commands": 1
   },
   {
-   "t": 2000.3,
-   "type": "commit",
-   "position": 8,
-   "entries": 1
-  },
-  {
-   "t": 2000.3,
+   "t": 2429.6,
    "type": "s3",
    "op": "CopyObject",
    "from": "demo/photo.jpg",
@@ -197,19 +234,856 @@
    "extents": 2
   },
   {
-   "t": 2038.1,
+   "t": 2461.5,
    "type": "out",
    "text": "copy: s3://demo/photo.jpg to s3://demo/photo-copy.jpg"
   },
   {
-   "t": 2341.6,
+   "t": 2769.8,
    "type": "cmd",
    "text": "aws s3 ls s3://demo/"
   },
   {
-   "t": 2604.9,
+   "t": 3011.2,
    "type": "out",
-   "text": "2026-10-31 02:16:04    3163709 notes.md\n2026-10-31 02:16:05    7340032 photo-copy.jpg\n2026-10-31 02:16:03    7340032 photo.jpg"
+   "text": "2026-11-02 00:50:38    3162743 notes.md\n2026-11-02 00:50:39    7340032 photo-copy.jpg\n2026-11-02 00:50:37    7340032 photo.jpg\n2026-11-02 00:50:38        910 settings.json"
   }
- ]
+ ],
+ "log": [
+  {
+   "commands": [],
+   "kind": "membership",
+   "position": 1,
+   "term": 0
+  },
+  {
+   "commands": [],
+   "kind": "blank",
+   "position": 2,
+   "term": 1
+  },
+  {
+   "commands": [
+    {
+     "command": {
+      "SyncInstances": {
+       "instances": [
+        [
+         "telegram",
+         {
+          "fingerprint": "fake:telegram:-1001000000001",
+          "kind": "telegram",
+          "location": "fake:telegram:-1001000000001",
+          "state": "read-write"
+         }
+        ],
+        [
+         "discord",
+         {
+          "fingerprint": "fake:discord:1000000000000000001",
+          "kind": "discord",
+          "location": "fake:discord:1000000000000000001",
+          "state": "read-write"
+         }
+        ]
+       ]
+      }
+     },
+     "namespace": "chunk",
+     "version": 5
+    }
+   ],
+   "kind": "commands",
+   "position": 3,
+   "term": 1
+  },
+  {
+   "commands": [
+    {
+     "command": {
+      "SetOwner": {
+       "owner": 1205532698
+      }
+     },
+     "namespace": "chunk",
+     "version": 5
+    }
+   ],
+   "kind": "commands",
+   "position": 4,
+   "term": 1
+  },
+  {
+   "commands": [
+    {
+     "command": {
+      "CreateBucket": {
+       "created_at": "2026-11-01T23:50:37.275770+00:00",
+       "name": "demo"
+      }
+     },
+     "namespace": "s3",
+     "version": 5
+    }
+   ],
+   "kind": "commands",
+   "position": 5,
+   "term": 1
+  },
+  {
+   "commands": [
+    {
+     "command": {
+      "PutObject": {
+       "body": {
+        "Chunks": [
+         {
+          "chunk": 1,
+          "len": 4194304,
+          "offset": 0
+         },
+         {
+          "chunk": 2,
+          "len": 3145728,
+          "offset": 0
+         }
+        ]
+       },
+       "bucket": "demo",
+       "checksums_json": "{\"crc64nvme\":\"bj6q3sCZKUY=\"}",
+       "content_type": "image/jpeg",
+       "etag": "c888c41c4d9e8a1a7d7c3511936cefee",
+       "expect": null,
+       "key": "photo.jpg",
+       "mtime": "2026-11-01T23:50:37.846985+00:00",
+       "size": 7340032,
+       "tags": [],
+       "user_meta": []
+      }
+     },
+     "namespace": "s3",
+     "version": 5
+    },
+    {
+     "command": {
+      "CommitChunk": {
+       "blocks": [
+        {
+         "block_no": 0,
+         "codec": "raw",
+         "crc32": 2820595583,
+         "logical_len": 1048576,
+         "logical_off": 0,
+         "stored_len": 1048576
+        },
+        {
+         "block_no": 1,
+         "codec": "raw",
+         "crc32": 3245853840,
+         "logical_len": 1048576,
+         "logical_off": 1048576,
+         "stored_len": 1048576
+        },
+        {
+         "block_no": 2,
+         "codec": "raw",
+         "crc32": 2860794440,
+         "logical_len": 1048576,
+         "logical_off": 2097152,
+         "stored_len": 1048576
+        },
+        {
+         "block_no": 3,
+         "codec": "raw",
+         "crc32": 2859542331,
+         "logical_len": 1048576,
+         "logical_off": 3145728,
+         "stored_len": 1048576
+        }
+       ],
+       "chunk_id": 1,
+       "crc32": 2036215289,
+       "created_at": "2026-11-01T23:50:37.846410+00:00",
+       "logical_size": 4194304,
+       "replicas": [
+        {
+         "instance": "telegram",
+         "parts": [
+          {
+           "blob_id": "ph-47daf81ad0f54e53bcc4bd6fc7d141ec.bin",
+           "block_count": 4,
+           "first_block": 0,
+           "locator": [
+            6
+           ],
+           "sort_key": [
+            128,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3
+           ]
+          }
+         ]
+        },
+        {
+         "instance": "discord",
+         "parts": [
+          {
+           "blob_id": "ph-47daf81a0f0e4eefbfbea62187184325.bin",
+           "block_count": 4,
+           "first_block": 0,
+           "locator": [
+            128,
+            128,
+            128,
+            164,
+            128,
+            216,
+            235,
+            222,
+            21
+           ],
+           "sort_key": [
+            21,
+            189,
+            174,
+            192,
+            4,
+            128,
+            0,
+            0
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     },
+     "namespace": "chunk",
+     "version": 5
+    },
+    {
+     "command": {
+      "CommitChunk": {
+       "blocks": [
+        {
+         "block_no": 0,
+         "codec": "raw",
+         "crc32": 1557253343,
+         "logical_len": 1048576,
+         "logical_off": 0,
+         "stored_len": 1048576
+        },
+        {
+         "block_no": 1,
+         "codec": "raw",
+         "crc32": 3672275151,
+         "logical_len": 1048576,
+         "logical_off": 1048576,
+         "stored_len": 1048576
+        },
+        {
+         "block_no": 2,
+         "codec": "raw",
+         "crc32": 1031972892,
+         "logical_len": 1048576,
+         "logical_off": 2097152,
+         "stored_len": 1048576
+        }
+       ],
+       "chunk_id": 2,
+       "crc32": 2122402151,
+       "created_at": "2026-11-01T23:50:37.846962+00:00",
+       "logical_size": 3145728,
+       "replicas": [
+        {
+         "instance": "telegram",
+         "parts": [
+          {
+           "blob_id": "ph-47daf81ac79244e2a5679e0265e0aa4f.bin",
+           "block_count": 3,
+           "first_block": 0,
+           "locator": [
+            8
+           ],
+           "sort_key": [
+            128,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            4
+           ]
+          }
+         ]
+        },
+        {
+         "instance": "discord",
+         "parts": [
+          {
+           "blob_id": "ph-47daf81a12bd4122a0986c032748fb02.bin",
+           "block_count": 3,
+           "first_block": 0,
+           "locator": [
+            128,
+            128,
+            128,
+            172,
+            128,
+            216,
+            235,
+            222,
+            21
+           ],
+           "sort_key": [
+            21,
+            189,
+            174,
+            192,
+            5,
+            128,
+            0,
+            0
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     },
+     "namespace": "chunk",
+     "version": 5
+    }
+   ],
+   "kind": "commands",
+   "position": 6,
+   "term": 1
+  },
+  {
+   "commands": [
+    {
+     "command": {
+      "PutObject": {
+       "body": {
+        "Chunks": [
+         {
+          "chunk": 3,
+          "len": 3162743,
+          "offset": 0
+         }
+        ]
+       },
+       "bucket": "demo",
+       "checksums_json": "{\"crc64nvme\":\"SEb0K5xVgKc=\"}",
+       "content_type": "text/markdown",
+       "etag": "b3e2731f8be930d45c412855b238744e",
+       "expect": null,
+       "key": "notes.md",
+       "mtime": "2026-11-01T23:50:38.414139+00:00",
+       "size": 3162743,
+       "tags": [],
+       "user_meta": []
+      }
+     },
+     "namespace": "s3",
+     "version": 5
+    },
+    {
+     "command": {
+      "CommitChunk": {
+       "blocks": [
+        {
+         "block_no": 0,
+         "codec": "zstd",
+         "crc32": 1398301829,
+         "logical_len": 1048576,
+         "logical_off": 0,
+         "stored_len": 122068
+        },
+        {
+         "block_no": 1,
+         "codec": "zstd",
+         "crc32": 1069980573,
+         "logical_len": 1048576,
+         "logical_off": 1048576,
+         "stored_len": 127041
+        },
+        {
+         "block_no": 2,
+         "codec": "zstd",
+         "crc32": 2657116448,
+         "logical_len": 1048576,
+         "logical_off": 2097152,
+         "stored_len": 121120
+        },
+        {
+         "block_no": 3,
+         "codec": "zstd",
+         "crc32": 1805877436,
+         "logical_len": 17015,
+         "logical_off": 3145728,
+         "stored_len": 7908
+        }
+       ],
+       "chunk_id": 3,
+       "crc32": 3608359291,
+       "created_at": "2026-11-01T23:50:38.414112+00:00",
+       "logical_size": 3162743,
+       "replicas": [
+        {
+         "instance": "telegram",
+         "parts": [
+          {
+           "blob_id": "ph-47daf81a4123415c96fbd46ed946c148.bin",
+           "block_count": 4,
+           "first_block": 0,
+           "locator": [
+            10
+           ],
+           "sort_key": [
+            128,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            5
+           ]
+          }
+         ]
+        },
+        {
+         "instance": "discord",
+         "parts": [
+          {
+           "blob_id": "ph-47daf81abf0949a49f38d71b49052079.bin",
+           "block_count": 4,
+           "first_block": 0,
+           "locator": [
+            128,
+            128,
+            128,
+            154,
+            137,
+            216,
+            235,
+            222,
+            21
+           ],
+           "sort_key": [
+            21,
+            189,
+            174,
+            192,
+            147,
+            64,
+            0,
+            0
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     },
+     "namespace": "chunk",
+     "version": 5
+    }
+   ],
+   "kind": "commands",
+   "position": 7,
+   "term": 1
+  },
+  {
+   "commands": [
+    {
+     "command": {
+      "PutObject": {
+       "body": {
+        "Chunks": [
+         {
+          "chunk": 4,
+          "len": 910,
+          "offset": 0
+         }
+        ]
+       },
+       "bucket": "demo",
+       "checksums_json": "{\"crc64nvme\":\"2sGuolNa5to=\"}",
+       "content_type": "application/json",
+       "etag": "484686b777fd87254f4ba9ae82ae4509",
+       "expect": null,
+       "key": "settings.json",
+       "mtime": "2026-11-01T23:50:38.962883+00:00",
+       "size": 910,
+       "tags": [],
+       "user_meta": []
+      }
+     },
+     "namespace": "s3",
+     "version": 5
+    },
+    {
+     "command": {
+      "CommitChunk": {
+       "blocks": [
+        {
+         "block_no": 0,
+         "codec": "zstd",
+         "crc32": 5921921,
+         "logical_len": 910,
+         "logical_off": 0,
+         "stored_len": 223
+        }
+       ],
+       "chunk_id": 4,
+       "crc32": 3919983771,
+       "created_at": "2026-11-01T23:50:38.962860+00:00",
+       "logical_size": 910,
+       "replicas": [
+        {
+         "instance": "telegram",
+         "parts": [
+          {
+           "blob_id": "ph-47daf81a7ad944dba276462c5bf30a6b.bin",
+           "block_count": 1,
+           "first_block": 0,
+           "locator": [
+            12
+           ],
+           "sort_key": [
+            128,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            6
+           ]
+          }
+         ]
+        },
+        {
+         "instance": "discord",
+         "parts": [
+          {
+           "blob_id": "ph-47daf81a497146b8a558d00c378fd0c1.bin",
+           "block_count": 1,
+           "first_block": 0,
+           "locator": [
+            128,
+            128,
+            128,
+            228,
+            145,
+            216,
+            235,
+            222,
+            21
+           ],
+           "sort_key": [
+            21,
+            189,
+            174,
+            193,
+            28,
+            128,
+            0,
+            0
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     },
+     "namespace": "chunk",
+     "version": 5
+    }
+   ],
+   "kind": "commands",
+   "position": 8,
+   "term": 1
+  },
+  {
+   "commands": [
+    {
+     "command": {
+      "Retain": {
+       "chunk_ids": [
+        1,
+        2
+       ]
+      }
+     },
+     "namespace": "chunk",
+     "version": 5
+    }
+   ],
+   "kind": "commands",
+   "position": 9,
+   "term": 1
+  },
+  {
+   "commands": [
+    {
+     "command": {
+      "PutObject": {
+       "body": {
+        "Chunks": [
+         {
+          "chunk": 1,
+          "len": 4194304,
+          "offset": 0
+         },
+         {
+          "chunk": 2,
+          "len": 3145728,
+          "offset": 0
+         }
+        ]
+       },
+       "bucket": "demo",
+       "checksums_json": "{\"crc64nvme\":\"bj6q3sCZKUY=\"}",
+       "content_type": "image/jpeg",
+       "etag": "c888c41c4d9e8a1a7d7c3511936cefee",
+       "expect": null,
+       "key": "photo-copy.jpg",
+       "mtime": "2026-11-01T23:50:39.521460+00:00",
+       "size": 7340032,
+       "tags": [],
+       "user_meta": []
+      }
+     },
+     "namespace": "s3",
+     "version": 5
+    }
+   ],
+   "kind": "commands",
+   "position": 10,
+   "term": 1
+  }
+ ],
+ "log_channel": {
+  "bots": 1,
+  "down": false,
+  "kind": "telegram",
+  "messages": [
+   {
+    "at": 1793577037044,
+    "id": 1,
+    "kind": "text",
+    "log": {
+     "what": "probe"
+    },
+    "name": "chain-probe.bin",
+    "preview": "𠀀",
+    "size": 1
+   },
+   {
+    "at": 1793577037044,
+    "id": 2,
+    "kind": "text",
+    "log": {
+     "what": "probe"
+    },
+    "name": "chain-probe.bin",
+    "preview": "𠀀",
+    "size": 1
+   },
+   {
+    "at": 1793577037044,
+    "id": 3,
+    "kind": "text",
+    "log": {
+     "gen": 1,
+     "what": "claim"
+    },
+    "name": "log-claim-1~root.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀐𠀀𠀀𠀈𠄁𠀀",
+    "size": 31
+   },
+   {
+    "at": 1793577037044,
+    "id": 4,
+    "kind": "text",
+    "log": {
+     "first": 1,
+     "gen": 1,
+     "last": 1,
+     "what": "batch"
+    },
+    "name": "log-batch-1~3.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠠴𤟷𦤲𠼀𠀀𠀁𠀠𡀐𠁐𠀀𠀄𠄁",
+    "size": 49
+   },
+   {
+    "at": 1793577037044,
+    "id": 5,
+    "kind": "text",
+    "log": {
+     "first": 2,
+     "gen": 1,
+     "what": "barrier"
+    },
+    "name": "log-batch-1~4.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠡄𢍳𡼌𠨀𠀀𤃀𢀠𠀀𢀈𠠀",
+    "size": 41
+   },
+   {
+    "at": 1793577037044,
+    "id": 6,
+    "kind": "text",
+    "log": {
+     "first": 2,
+     "gen": 1,
+     "what": "barrier"
+    },
+    "name": "log-batch-1~5.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠡖𧨖𠽀𠘀𠀀𤃀𢀠𡀀𢀈𠠀",
+    "size": 41
+   },
+   {
+    "at": 1793577037044,
+    "id": 7,
+    "kind": "text",
+    "log": {
+     "first": 2,
+     "gen": 1,
+     "last": 2,
+     "what": "batch"
+    },
+    "name": "log-batch-1~6.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠡥𣉖𣞎𠼀𠀀𤃀𢀠𡀐𢀈𠠄𠈈𠄁",
+    "size": 47
+   },
+   {
+    "at": 1793577037045,
+    "id": 8,
+    "kind": "text",
+    "log": {
+     "first": 3,
+     "gen": 1,
+     "last": 3,
+     "what": "batch"
+    },
+    "name": "log-batch-1~7.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠡵𣍯𣴼𠔀𠀀𤃀𢀠𡀐𢀈𠰄𠎈𠄁",
+    "size": 240
+   },
+   {
+    "at": 1793577037045,
+    "id": 9,
+    "kind": "text",
+    "log": {
+     "first": 4,
+     "gen": 1,
+     "last": 4,
+     "what": "batch"
+    },
+    "name": "log-batch-1~8.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠢄𡚎𢏪𠨀𠀀𤃀𢀠𡀐𢀈𡀄𠈦𠄁",
+    "size": 62
+   },
+   {
+    "at": 1793577037275,
+    "id": 10,
+    "kind": "text",
+    "log": {
+     "first": 5,
+     "gen": 1,
+     "last": 5,
+     "what": "batch"
+    },
+    "name": "log-batch-1~9.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠢖𧮫𡶖𠤀𠀀𤃀𢀠𡀐𢀈𡐄𠉢𠄁",
+    "size": 92
+   },
+   {
+    "at": 1793577037847,
+    "id": 11,
+    "kind": "text",
+    "log": {
+     "first": 6,
+     "gen": 1,
+     "last": 6,
+     "what": "batch"
+    },
+    "name": "log-batch-1~10.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠢦𢨫𤾚𠨀𠀀𤃀𢀠𡀐𢀈𡠄𠎦𠐁",
+    "size": 639
+   },
+   {
+    "at": 1793577038414,
+    "id": 12,
+    "kind": "text",
+    "log": {
+     "first": 7,
+     "gen": 1,
+     "last": 7,
+     "what": "batch"
+    },
+    "name": "log-batch-1~11.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠢷𡨢𠎶𠸀𠀀𤃀𢀠𡀐𢀈𡰄𠏸𠈁",
+    "size": 424
+   },
+   {
+    "at": 1793577038962,
+    "id": 13,
+    "kind": "text",
+    "log": {
+     "first": 8,
+     "gen": 1,
+     "last": 8,
+     "what": "batch"
+    },
+    "name": "log-batch-1~12.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠣄𠿣𧲸𠀀𠂁𤁀𢀠𡁀𠡀𠐆𧐄𠄁",
+    "size": 357
+   },
+   {
+    "at": 1793577039521,
+    "id": 14,
+    "kind": "text",
+    "log": {
+     "first": 9,
+     "gen": 1,
+     "last": 9,
+     "what": "batch"
+    },
+    "name": "log-batch-1~13.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠣗𧪚𧸌𠀀𠂁𤁀𢀠𡁀𠡈𠐄𢈂𠄈",
+    "size": 59
+   },
+   {
+    "at": 1793577039521,
+    "id": 15,
+    "kind": "text",
+    "log": {
+     "first": 10,
+     "gen": 1,
+     "last": 10,
+     "what": "batch"
+    },
+    "name": "log-batch-1~14.bin",
+    "preview": "𠉫𣘪𣜞𤬺𡽝𡛾𥌵𠎟𥕌𣼺𠁀𡀀𠣥𥾎𥵤𠐀𠀀𤃀𢀠𡀐𢀈𢠄𠍀𠄁",
+    "size": 204
+   }
+  ],
+  "node": null,
+  "pinned": [],
+  "place": null,
+  "role": "log",
+  "scope": "-1001000000002",
+  "store": "tg-log",
+  "total": 15
+ }
 }

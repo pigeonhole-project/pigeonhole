@@ -223,7 +223,42 @@ pub enum LogSettings {
     Fake(crate::stores::FakeChannel),
 }
 
+/// Where the log or the snapshots live, for listing them (the admin's UI).
+#[derive(Clone, Copy, Debug)]
+pub enum MetaPlace<'a> {
+    LocalDisk(&'a Path),
+    Memory,
+    /// A real channel: `telegram` or `discord`, and its id.
+    Chat {
+        kind: &'static str,
+        scope: &'a str,
+    },
+    Fake(&'a crate::stores::FakeChannel),
+}
+
+impl SnapshotSettings {
+    pub fn place(&self) -> MetaPlace<'_> {
+        match self {
+            SnapshotSettings::LocalDisk { path } => MetaPlace::LocalDisk(path),
+            SnapshotSettings::Memory => MetaPlace::Memory,
+            SnapshotSettings::Telegram { chat_id, .. } => MetaPlace::Chat { kind: "telegram", scope: chat_id },
+            SnapshotSettings::Discord { channel_id, .. } => MetaPlace::Chat { kind: "discord", scope: channel_id },
+            SnapshotSettings::Fake(f) => MetaPlace::Fake(f),
+        }
+    }
+}
+
 impl LogSettings {
+    pub fn place(&self) -> MetaPlace<'_> {
+        match self {
+            LogSettings::LocalDisk { path } => MetaPlace::LocalDisk(path),
+            LogSettings::Memory => MetaPlace::Memory,
+            LogSettings::Telegram { chat_id, .. } => MetaPlace::Chat { kind: "telegram", scope: chat_id },
+            LogSettings::Discord { channel_id, .. } => MetaPlace::Chat { kind: "discord", scope: channel_id },
+            LogSettings::Fake(f) => MetaPlace::Fake(f),
+        }
+    }
+
     /// The log lives off this host (a chat), so its snapshots must too.
     fn off_host(&self) -> bool {
         matches!(self, LogSettings::Telegram { .. } | LogSettings::Discord { .. } | LogSettings::Fake(_))

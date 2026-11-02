@@ -43,7 +43,7 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         dynamic: rt.dynamic.clone(),
         inline_on: cfg.inline.max_object_size.is_some(),
         snapshot_every: cfg.meta.snapshot_every_entries,
-        channels: Some(std::sync::Arc::new(pigeonhole_admin::ListedStores(listed_stores(&cfg)))),
+        channels: Some(channels_view(&cfg)),
         config_text: std::fs::read_to_string(&cfg.config_path).ok(),
         cluster: cfg.cluster.clone(),
     });
@@ -82,48 +82,17 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The stores as the config names them, for the admin UI's graph: the data
-/// stores with their place in the placement, the log's and the snapshots'.
-fn listed_stores(cfg: &Config) -> Vec<serde_json::Value> {
-    use pigeonhole::config::{LogSettings, SnapshotSettings};
-    let shards = &cfg.placement.shards;
-    let mut out: Vec<serde_json::Value> = cfg
-        .instances
-        .iter()
-        .map(|i| {
-            let place = shards.iter().enumerate().find_map(|(shard, s)| {
-                let copy = s.group.iter().position(|m| *m == i.info.id)?;
-                Some(serde_json::json!({ "shard": shard, "shards": shards.len(), "copy": copy, "copies": s.group.len() }))
-            });
-            let bots = i.bot_token_envs.len().max(1);
-            serde_json::json!({ "store": i.info.id, "role": "data", "kind": i.kind.as_str(), "scope": i.scope_id, "bots": bots, "place": place, "messages": [] })
-        })
-        .collect();
-    let kind = |log: bool| match (log, &cfg.meta.log, &cfg.meta.snapshot) {
-        (true, LogSettings::Telegram { .. }, _) | (false, _, SnapshotSettings::Telegram { .. }) => Some("telegram"),
-        (true, LogSettings::Discord { .. }, _) | (false, _, SnapshotSettings::Discord { .. }) => Some("discord"),
-        (true, LogSettings::LocalDisk { .. }, _) | (false, _, SnapshotSettings::LocalDisk { .. }) => Some("local_disk"),
-        (true, LogSettings::Memory, _) | (false, _, SnapshotSettings::Memory) => Some("memory"),
-        _ => None,
-    };
-    // This node's own stores: under its dovecote in a cluster's graph.
-    let me = cfg.cluster.as_ref().map(|c| c.node);
-    for (store, role, log) in
-        [(pigeonhole_admin::LOG_STORE, "log", true), (pigeonhole_admin::SNAPSHOT_STORE, "snapshots", false)]
-    {
-        if let Some(kind) = kind(log) {
-            out.push(serde_json::json!({ "store": store, "role": role, "kind": kind, "node": me, "messages": [] }));
-        }
-    }
-    for node in cfg.cluster.iter().flat_map(|c| &c.nodes) {
-        if let Some(chat) = node.outbox {
-            let store = pigeonhole_admin::outbox_store(node.id);
-            out.push(serde_json::json!({
-                "store": store, "role": "outbox", "kind": "telegram", "scope": chat.to_string(), "node": node.id, "messages": [],
-            }));
-        }
-    }
-    out
+/// The node's stores as the admin's UI sees them: fake channels with what
+/// they hold (feature `fake`), local disks with their files, the rest listed.
+fn channels_view(cfg: &Config) -> std::sync::Arc<dyn pigeonhole_admin::Channels> {
+    use pigeonhole_admin::{stores, DiskView, ListedStores, Views};
+    use std::sync::Arc;
+    let order = stores::of(cfg);
+    let mut views: Vec<Arc<dyn pigeonhole_admin::Channels>> = crate::fakes::view(&order).into_iter().collect();
+    views
+        .push(Arc::new(DiskView::<pigeonhole_storage_disk::DiskId>::new(&order, pigeonhole_storage_disk::inspect_dir)));
+    views.push(Arc::new(ListedStores(order.clone())));
+    Arc::new(Views { order, views })
 }
 
 /// The REAPI / ByteStream server on its own port, if enabled.

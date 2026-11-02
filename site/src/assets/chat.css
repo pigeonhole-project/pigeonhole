@@ -1,0 +1,148 @@
+/* A channel as its app shows it (demo/chat): Telegram's channel view and
+   Discord's text channel, in their own light and dark themes, on the demo's
+   panels and on the home page's stage. Uses --line and --teal of the page. */
+@keyframes arrive { 30% { transform: scale(1.06); } }
+
+.app {
+  --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font-family: var(--ui); font-stretch: 100%;
+  display: flex; flex-direction: column; height: min(72vh, 680px);
+  border-radius: 14px; overflow: hidden; border: 1px solid var(--line);
+}
+.app .cjk {
+  font-family: "PingFang SC", "Hiragino Sans", "Songti SC", "Noto Sans CJK SC", "SimSun-ExtB", var(--ui);
+  word-break: break-all; white-space: pre-line;
+}
+.app .gone { opacity: .35; }
+.app .fresh { animation: arrive .45s ease-out; }
+
+/* Telegram, a channel */
+.app.tg {
+  --tg-bar: #ffffff; --tg-ink: #000000; --tg-sub: #707579; --tg-bubble: #ffffff; --tg-accent: #3390ec;
+  --tg-meta: #a0acb6; --tg-wall: linear-gradient(140deg, #dbddbb 0%, #a6c48c 35%, #d5d88d 65%, #88b884 100%);
+}
+:root[data-theme="dark"] .app.tg {
+  --tg-bar: #212121; --tg-ink: #ffffff; --tg-sub: #aaaaaa; --tg-bubble: #212121; --tg-accent: #8774e1;
+  --tg-meta: #8b8b8b; --tg-wall: linear-gradient(140deg, #0f0f0f 0%, #1a2026 60%, #10151a 100%);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .app.tg {
+    --tg-bar: #212121; --tg-ink: #ffffff; --tg-sub: #aaaaaa; --tg-bubble: #212121; --tg-accent: #8774e1;
+    --tg-meta: #8b8b8b; --tg-wall: linear-gradient(140deg, #0f0f0f 0%, #1a2026 60%, #10151a 100%);
+  }
+}
+.tg-head { display: flex; gap: 12px; align-items: center; padding: 8px 16px; background: var(--tg-bar); color: var(--tg-ink); }
+.tg-head b { display: block; font-size: 16px; font-weight: 600; }
+.tg-head small { color: var(--tg-sub); font-size: 14px; }
+.tg-ava {
+  width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; flex: none;
+  color: #fff; font-weight: 600; font-size: 16px; background: linear-gradient(#72d5fd, #2a9ef1);
+}
+.tg-chat { flex: 1; overflow: auto; background: var(--tg-wall); padding: 14px 18px; display: flex; flex-direction: column; gap: 6px; }
+.tg-empty { margin: auto; padding: 6px 12px; border-radius: 12px; background: rgba(0,0,0,.25); color: #fff; font-size: 14px; }
+.tg-post {
+  align-self: flex-start; max-width: min(440px, 88%); background: var(--tg-bubble); color: var(--tg-ink);
+  border-radius: 12px 12px 12px 4px; padding: 6px 10px 5px; box-shadow: 0 1px 2px rgba(0,0,0,.13);
+  position: relative;
+}
+.tg-author { color: var(--tg-accent); font-size: 14px; font-weight: 600; margin-bottom: 2px; }
+.tg-text { font-size: 15px; line-height: 1.35; }
+.tg-doc { display: flex; gap: 10px; align-items: center; padding: 2px 0; }
+.tg-doc-ic { width: 46px; height: 46px; border-radius: 50%; background: var(--tg-accent); display: grid; place-items: center; flex: none; }
+.tg-doc-ic .ic { width: 24px; height: 24px; fill: none; stroke: #fff; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.tg-doc-name { font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
+.tg-doc-size { color: var(--tg-sub); font-size: 14px; }
+.tg-meta { display: flex; justify-content: flex-end; align-items: center; gap: 3px; color: var(--tg-meta); font-size: 12px; margin-top: 2px; }
+.tg-meta .eye { width: 15px; height: 15px; fill: currentColor; }
+.tg-input { background: var(--tg-bar); color: var(--tg-sub); padding: 14px 18px; font-size: 15px; border-top: 1px solid rgba(0,0,0,.06); }
+
+/* Discord, a text channel */
+.app.dc {
+  --dc-bg: #ffffff; --dc-ink: #313338; --dc-head: #060607; --dc-muted: #5c5e66; --dc-line: #e1e2e4;
+  --dc-card: #f2f3f5; --dc-link: #006ce7; --dc-input: #ebedef; --dc-hover: #f2f3f5;
+}
+:root[data-theme="dark"] .app.dc {
+  --dc-bg: #313338; --dc-ink: #dbdee1; --dc-head: #f2f3f5; --dc-muted: #949ba4; --dc-line: #3f4147;
+  --dc-card: #2b2d31; --dc-link: #00a8fc; --dc-input: #383a40; --dc-hover: #2e3035;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .app.dc {
+    --dc-bg: #313338; --dc-ink: #dbdee1; --dc-head: #f2f3f5; --dc-muted: #949ba4; --dc-line: #3f4147;
+    --dc-card: #2b2d31; --dc-link: #00a8fc; --dc-input: #383a40; --dc-hover: #2e3035;
+  }
+}
+.app.dc { background: var(--dc-bg); color: var(--dc-ink); }
+.dc-head { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--dc-line); box-shadow: 0 1px 0 rgba(0,0,0,.04); }
+.dc-head b { color: var(--dc-head); font-size: 16px; }
+.dc-hash { color: var(--dc-muted); font-size: 24px; line-height: 1; font-weight: 400; }
+.dc-topic { color: var(--dc-muted); font-size: 14px; padding-left: 10px; margin-left: 4px; border-left: 1px solid var(--dc-line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dc-chat { flex: 1; overflow: auto; padding: 8px 0 16px; }
+.dc-empty { color: var(--dc-muted); padding: 16px; }
+.dc-day { display: flex; align-items: center; gap: 8px; color: var(--dc-muted); font-size: 12px; font-weight: 600; margin: 8px 16px; }
+.dc-day::before, .dc-day::after { content: ""; flex: 1; height: 1px; background: var(--dc-line); }
+.dc-msg { position: relative; display: grid; grid-template-columns: 40px 1fr; column-gap: 16px; padding: 2px 16px 2px; margin-top: 14px; }
+.dc-msg.grouped { margin-top: 0; }
+.dc-msg:hover { background: var(--dc-hover); }
+.dc-ava { grid-row: span 2; width: 40px; height: 40px; border-radius: 50%; background: #5865f2; display: grid; place-items: center; font-size: 20px; }
+.dc-msg.grouped .dc-body { grid-column: 2; }
+.dc-top { display: flex; align-items: baseline; gap: 6px; }
+.dc-name { color: var(--dc-head); font-weight: 600; font-size: 16px; }
+.dc-tag { background: #5865f2; color: #fff; font-size: 10px; font-weight: 600; padding: 1px 4px; border-radius: 3px; position: relative; top: -2px; }
+.dc-time { color: var(--dc-muted); font-size: 12px; }
+.dc-text { font-size: 16px; line-height: 1.375; }
+.dc-file {
+  display: flex; gap: 10px; align-items: center; margin: 4px 0; max-width: 420px;
+  background: var(--dc-card); border: 1px solid var(--dc-line); border-radius: 8px; padding: 10px;
+}
+.dc-file .doc { width: 30px; height: 40px; fill: #e3e5e8; stroke: #949ba4; stroke-width: 1.2; flex: none; }
+.dc-file-name { color: var(--dc-link); font-size: 16px; overflow-wrap: anywhere; }
+.dc-file-size { color: var(--dc-muted); font-size: 12px; }
+.dc-input { margin: 0 16px 16px; padding: 11px 16px; border-radius: 8px; background: var(--dc-input); color: var(--dc-muted); font-size: 16px; }
+.tg-day { align-self: center; padding: 2px 10px; border-radius: 12px; background: rgba(0,0,0,.22); color: #fff; font-size: 13px; font-weight: 500; margin: 4px 0; }
+
+/* the node's notes on a post; the log's own posts, dimmed */
+.post-log { margin-top: 4px; font-size: 12.5px; color: var(--teal); font-weight: 500; }
+.app .service { opacity: .62; }
+
+/* a reader's delete: a trash button on the line's top right */
+.deletable { position: relative; }
+/* The delete button: the same place in both apps, the line's top right. */
+.msg-del {
+  position: absolute; top: 2px; right: 8px; width: 28px; height: 28px; border-radius: 8px; border: 0;
+  display: grid; place-items: center; cursor: pointer; opacity: 0; background: rgba(0,0,0,.45); color: #fff;
+}
+.tg-line { position: relative; display: flex; flex-direction: column; align-items: flex-start; padding-right: 44px; }
+.dc-msg.deletable { padding-right: 44px; }
+.dc-gutter-time { position: absolute; left: 4px; top: 5px; width: 64px; text-align: center; white-space: nowrap; font-size: 10.5px; color: var(--dc-muted); opacity: 0; }
+.dc-msg:hover .dc-gutter-time { opacity: 1; }
+.msg-del .ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.deletable:hover .msg-del, .msg-del:focus-visible { opacity: 1; }
+@media (hover: none) { .msg-del { opacity: .8; } }
+
+/* pins: Telegram's bar under the header, Discord's count in it */
+.tg-pinbar { display: flex; gap: 10px; align-items: center; padding: 6px 14px; background: var(--tg-bar); color: var(--tg-ink); border-top: 1px solid rgba(127,127,127,.18); font-size: 13px; }
+.tg-pinbar b { color: #3390ec; font-weight: 600; }
+.tg-pinbar-text { opacity: .8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60ch; }
+.tg-pinbar .ic, .dc-pins .ic, .tg-meta .pin { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.tg-pinbar .ic { color: #3390ec; }
+.tg-service-line { align-items: center; padding-right: 0; }
+.dc-pins { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--dc-muted); font-size: 13px; }
+.dc-pinned { font-size: 12px; color: var(--dc-muted); margin-bottom: 2px; }
+@media (prefers-reduced-motion: reduce) { .app .fresh { animation: none; } }
+
+/* A local disk, as a file manager: its directory, segment files, records */
+.app.disk { background: var(--plume, var(--surface)); color: inherit; font-size: 14px; }
+.disk-head { display: flex; align-items: baseline; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.disk-path { font-family: var(--mono); font-size: 12.5px; opacity: .7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.disk-tree { flex: 1; overflow: auto; padding: 8px 12px; }
+.disk-empty { opacity: .7; padding: 8px 4px; }
+.disk-file > summary { display: flex; gap: 10px; align-items: baseline; padding: 6px 4px; cursor: pointer; font-family: var(--mono); font-weight: 600; }
+.disk-file > summary::before { content: "▸"; opacity: .6; }
+.disk-file[open] > summary::before { content: "▾"; }
+.disk-records { list-style: none; margin: 0 0 6px 18px; padding: 0 0 0 10px; border-left: 1px dashed var(--line); }
+.disk-record { padding: 4px 0; display: grid; grid-template-columns: 1fr auto; column-gap: 12px; }
+.disk-record .post-log { grid-column: 1 / -1; margin-top: 0; }
+.disk-record.chained .disk-name::before { content: "⛓ "; opacity: .6; }
+.disk-name { font-family: var(--mono); font-size: 12.5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.disk-size { font-size: 12.5px; opacity: .7; font-variant-numeric: tabular-nums; }
+.disk-foot { padding: 8px 16px; border-top: 1px solid var(--line); font-size: 12.5px; opacity: .7; }

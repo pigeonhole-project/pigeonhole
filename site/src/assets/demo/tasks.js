@@ -90,12 +90,17 @@ export function taskWindows(g, entrances, onOpen) {
     svg("circle", {cx: w.x + 11, cy: w.y - 9, r: 7}, badge);
     const count = svg("text", {x: w.x + 11, y: w.y - 6, "text-anchor": "middle"}, badge);
     const title = svg("title", {}, win);
-    win.addEventListener("mouseenter", () => tip.show(name, win));
+    win.addEventListener("mouseenter", () => canHover() && tip.show(name, win));
     win.addEventListener("focus", () => tip.show(name, win));
     win.addEventListener("mouseleave", tip.hide);
     win.addEventListener("blur", tip.hide);
+    // Without hover (a phone) a tap shows the tooltip first, the next one opens.
     activate(win, e => {
       e.stopPropagation();
+      if (!canHover() && !tip.showing(name)) {
+        tip.show(name, win);
+        return;
+      }
       tip.hide();
       onOpen(name);
     });
@@ -123,8 +128,11 @@ export function taskWindows(g, entrances, onOpen) {
   };
 }
 
+const canHover = () => matchMedia("(hover: hover)").matches;
+
 // A window's tooltip: what the task is, when it passes next, what waits;
-// it follows the background while it is up.
+// it follows the background while it is up. Beside the window, kept on the
+// screen; a tap elsewhere puts it away.
 const tip = (() => {
   let box = null,
     shown = null,
@@ -141,14 +149,20 @@ const tip = (() => {
         box = h("div", "tip");
         box.setAttribute("role", "tooltip");
         document.body.append(box);
+        document.addEventListener("pointerdown", e => {
+          if (shown && !e.target.closest?.(".win")) this.hide();
+        });
       }
       shown = name;
       fill();
       box.hidden = false;
-      const r = el.getBoundingClientRect();
-      box.style.left = `${Math.round(r.right + 12)}px`;
-      box.style.top = `${Math.round(r.top - 8)}px`;
+      const r = el.getBoundingClientRect(),
+        room = document.documentElement.clientWidth - box.offsetWidth - 8;
+      box.style.left = `${Math.round(Math.max(8, Math.min(r.right + 12, room)))}px`;
+      const below = r.top - 8 + box.offsetHeight > innerHeight;
+      box.style.top = `${Math.round(below ? r.top - box.offsetHeight - 8 : r.top - 8)}px`;
     },
+    showing: name => shown === name,
     hide() {
       shown = null;
       if (box) box.hidden = true;

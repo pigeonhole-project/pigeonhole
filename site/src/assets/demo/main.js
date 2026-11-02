@@ -46,8 +46,10 @@ const nodeOf = open => (open?.kind === "log" ? {kind: "store", store: logChannel
 const node = await connect(new URL(`../web-worker.js${new URL(import.meta.url).search}`, import.meta.url));
 
 let updateWindows = () => {};
+let relayout = () => redraw(); // the screen turned narrow or wide: what is on the graph, again
 const graph = makeGraph($("graph"), {
   onOpen: openPanel,
+  onRelayout: () => relayout(),
   onLoft: (g, entrances) => {
     updateWindows = taskWindows(g, entrances, task => {
       openPanel({kind: "loft"});
@@ -161,11 +163,12 @@ async function refreshObjects() {
   view?.setCounters?.(counters());
 }
 
-// The channels as the node has them now; the posts seen arriving stay marked.
+// The channels as the node has them now; the posts seen arriving stay
+// marked. A local disk has files, not messages.
 async function loadChannels() {
   const {reply} = await call({op: "channels"});
   const fresh = new Set(state.channels.flatMap(c => c.messages.filter(m => m.fresh).map(m => `${c.store}/${m.id}`)));
-  state.channels = (reply?.channels || []).map(c => ({...c, messages: c.messages.map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
+  state.channels = (reply?.channels || []).map(c => ({...c, messages: (c.messages || []).map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
 }
 
 // The channels anew, drawn (a fault changes them behind the events).
@@ -287,7 +290,8 @@ function renderPanel() {
       state.logView = v;
       renderPanel();
     };
-    show(t("demo.log_title"), t("demo.log_sub", {store: c?.store, app: appOf(c?.kind)}), logView(state.log, c, state.logView, setView));
+    const sub = c?.kind === "local_disk" ? "demo.log_sub_disk" : "demo.log_sub";
+    show(t("demo.log_title"), t(sub, {store: c?.store, app: appOf(c?.kind)}), logView(state.log, c, state.logView, setView));
   } else {
     const c = channel(open.store);
     if (!c) return;
@@ -393,7 +397,9 @@ function openWizard() {
   $("panel").hidden = false;
   $("panel-close").hidden = true;
   const panel = {title: $("panel-title"), sub: $("panel-sub"), body: $("panel-body")};
-  makeWizard(panel, {sketch: channels => graph.draw(channels, 0), start: startFromWizard}).render();
+  const wizard = makeWizard(panel, {sketch: channels => graph.draw(channels, 0), start: startFromWizard});
+  relayout = wizard.render;
+  wizard.render();
   say(["wiz.caption", {}]);
 }
 
@@ -405,6 +411,7 @@ async function startFromWizard(text) {
   if (reply?.error) return reply.error;
   state.config = text;
   state.wizard = false;
+  relayout = redraw;
   $("loft").classList.remove("zoomed", "wizard");
   $("panel").hidden = true;
   $("panel-close").hidden = false;

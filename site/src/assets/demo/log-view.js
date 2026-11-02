@@ -9,16 +9,23 @@ import {chatView} from "./chat/index.js";
 
 export const VIEWS = ["readable", "channel"];
 
-export function logView(log, channel, view, onView) {
+// The two views' tabs, `view` on; onView(v): another picked. `kind`: the
+// log's store (on a local disk, its records are files, not posts).
+export function logTabs(view, onView, kind) {
   const tabs = h("div", "tabs");
   tabs.setAttribute("role", "tablist");
   for (const v of VIEWS) {
-    const b = button("tab", t(`demo.log_view_${v}`), () => onView(v));
+    const label = v === "channel" && kind === "local_disk" ? "disk" : v;
+    const b = button("tab", t(`demo.log_view_${label}`), () => onView(v));
     b.setAttribute("role", "tab");
     b.setAttribute("aria-selected", String(view === v));
     tabs.append(b);
   }
-  const out = [tabs, h("p", "log-note", t("demo.log_note"))];
+  return tabs;
+}
+
+export function logView(log, channel, view, onView) {
+  const out = [logTabs(view, onView, channel?.kind), h("p", "log-note", t("demo.log_note"))];
   if (view === "channel") {
     if (channel) out.push(chatView(channel));
   } else if (!log) {
@@ -39,26 +46,26 @@ function entries(log, channel) {
   const head = h("div", "log-head");
   head.append(h("span", "", t("demo.log_head", {n: log.head})), h("span", "", log.base ? t("demo.log_base", {n: log.base.at}) : t("demo.log_nobase")));
   const list = h("ol", "entries");
-  for (const e of [...log.entries].reverse()) list.append(entry(e, log.base, postOf.get(e.position)));
+  for (const e of [...log.entries].reverse()) list.append(entryView(e, {base: log.base, post: postOf.get(e.position)}));
   return [head, list];
 }
 
-// An entry: its position, what it holds, where it is (the post, or its
-// term); it opens into its commands.
-function entry(e, base, post) {
+// An entry: its position, what it holds, where it is (the post that holds
+// it, or its term); it opens into its commands. `base`: the snapshot's.
+export function entryView(e, {base = null, post = null, open = false} = {}) {
   const li = h("li", `entry${base && e.position === base.at + 1 ? " base" : ""}`);
   const what = e.kind === "commands" ? e.commands.map(c => `${c.namespace} ${summary(c).verb}`).join("; ") : t(`demo.entry_${e.kind}`);
   const where = post != null ? t("demo.in_post", {id: String(post).length > 8 ? `…${String(post).slice(-6)}` : post}) : t("demo.term", {n: e.term});
   const cmds = h("ul", "cmds");
-  cmds.hidden = true;
+  cmds.hidden = !open;
   for (const c of e.commands) cmds.append(command(c));
   if (!e.commands.length) cmds.append(h("li", "cmd", t(`demo.entry_${e.kind}_long`)));
   const btn = button("", null, () => {
     cmds.hidden = !cmds.hidden;
     btn.setAttribute("aria-expanded", String(!cmds.hidden));
   });
-  btn.setAttribute("aria-expanded", "false");
-  btn.append(h("span", "pos", String(e.position)), h("span", "what", what), h("span", "term", where));
+  btn.setAttribute("aria-expanded", String(open));
+  btn.append(h("span", "pos", String(e.position)), h("span", "what", what), h("span", "where", where));
   li.append(btn, cmds);
   return li;
 }

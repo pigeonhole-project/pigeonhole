@@ -25,6 +25,7 @@
 
 use crate::io::{DirLock, Fs, FsFile};
 use anyhow::{anyhow, bail, Context, Result};
+use pigeonhole_storage_api::inspect::{RecordView, SegmentView};
 use pigeonhole_storage_api::{BlobId, NotFound, Owner};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -441,6 +442,49 @@ fn read_record(file: &dyn FsFile, pos: u64, size: u64, last: bool) -> Result<Fou
         }
     }
     Ok(Found::Record(header, label))
+}
+
+/// [`inspect`] on the real file system: what the admin's view of a disk reads.
+pub fn inspect_dir(dir: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<SegmentView>> {
+    inspect(&crate::StdFs, dir, want)
+}
+
+/// What a directory of segments holds, for showing it: read without the
+/// lock and without changing anything, so a writer may be at work; a
+/// record still being written ends the scan of its segment.
+pub fn inspect(fs: &dyn Fs, dir: &Path, want: impl Fn(&str) -> bool) -> Result<Vec<SegmentView>> {
+    let mut names: Vec<String> = fs.list(dir).with_context(|| format!("read {}", dir.display()))?;
+    names.retain(|n| n.strip_prefix("seg-").is_some_and(|s| s.parse::<u64>().is_ok()));
+    names.sort();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let seq: u64 = name["seg-".len()..].parse().expect("checked above");
+        let file = fs.open(&dir.join(&name), false).with_context(|| format!("open {name}"))?;
+        let size = file.len()?;
+        let (mut pos, mut records) = (0, Vec::new());
+        while pos < size {
+            let Ok(Found::Record(header, label)) = read_record(file.as_ref(), pos, size, false) else { break };
+            let label = String::from_utf8_lossy(&label).into_owned();
+            let data = (!header.dead() && want(&label))
+                .then(|| {
+                    let mut buf = vec![0; header.data_len as usize];
+                    file.read_exact_at(&mut buf, pos + HEADER + header.label_len as u64).map(|()| buf)
+                })
+                .transpose()?;
+            let chained = header.flags & CHAINED != 0;
+            records.push(RecordView {
+                key: key_of(seq, pos),
+                label,
+                size: header.data_len,
+                dead: header.dead(),
+                chained,
+                data,
+            });
+            pos += header.record_len();
+        }
+        out.push(SegmentView { name, size, records });
+    }
+    Ok(out)
 }
 
 /// Free the blocks fully inside `[off, off + len)`; the file keeps its size.

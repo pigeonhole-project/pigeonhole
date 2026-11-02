@@ -8,6 +8,9 @@
 //!
 //! The tablet's own work runs in a `fake_channel` span, so a subscriber can
 //! tell it from the node's (the site hides it).
+//!
+//! [`World`] holds a process's fake channels and builds the node's stores on
+//! them; [`FakeView`] shows them to the admin's UI.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -143,6 +146,12 @@ pub async fn telegram(chat: i64, stores: Stores) -> Result<TelegramChannel> {
 pub async fn discord(channel: u64, stores: Stores) -> Result<DiscordChannel> {
     Ok(FakeDiscord::on(channel, TabletHost::open(stores, &format!("discord:{channel}")).await?))
 }
+
+pub mod view;
+pub mod world;
+
+pub use view::FakeView;
+pub use world::World;
 
 #[cfg(test)]
 mod tests;

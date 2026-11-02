@@ -1,6 +1,8 @@
 use super::*;
+use pigeonhole_storage_api::inspect::RecordView;
 use pigeonhole_storage_api::{collect_stream, BlobId};
 use std::fs;
+use std::io::Write;
 
 fn small(dir: &Path, segment_bytes: u64) -> DiskBlobStore {
     DiskBlobStore::with_segment_bytes(dir, segment_bytes).unwrap()
@@ -202,4 +204,35 @@ mod sim {
         a.put(Bytes::from_static(b"one"), &BlobId::random().name()).await.unwrap();
         assert!(t.elapsed() >= Duration::from_millis(4), "{:?}", t.elapsed());
     }
+}
+
+#[tokio::test]
+async fn inspect_shows_segments_and_records_without_touching_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = small(dir.path(), 100);
+    let a = store.put(Bytes::from_static(b"alpha"), "a.bin").await.unwrap();
+    let names: Vec<String> = (0..4).map(|i| format!("b{i}.bin")).collect();
+    for n in &names {
+        store.put(Bytes::from(vec![7; 40]), n).await.unwrap();
+    }
+    store.delete(&[a.key]).await.unwrap();
+    // A torn record at the end, as a writer caught mid-append would leave it.
+    let last = segment_files(dir.path()).pop().unwrap();
+    let path = dir.path().join(&last);
+    let before = fs::metadata(&path).unwrap().len();
+    fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&[0x47, 0x53, 0x48]).unwrap();
+
+    let segs = inspect(&StdFs, dir.path(), |label| label == "b0.bin").unwrap();
+    assert_eq!(segs.iter().map(|s| s.name.clone()).collect::<Vec<_>>(), segment_files(dir.path()));
+    let records: Vec<&RecordView> = segs.iter().flat_map(|s| &s.records).collect();
+    assert_eq!(
+        records.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
+        ["a.bin", "b0.bin", "b1.bin", "b2.bin", "b3.bin"]
+    );
+    assert!(records[0].dead && records[0].data.is_none(), "deleted, so no data");
+    assert_eq!(records[0].key, a.key);
+    assert_eq!(records[1].data.as_deref(), Some(&[7u8; 40][..]), "asked for");
+    assert!(records[2].data.is_none() && records[2].size == 40);
+    assert!(records.iter().all(|r| !r.chained));
+    assert_eq!(fs::metadata(&path).unwrap().len(), before + 3, "the torn tail is left alone");
 }

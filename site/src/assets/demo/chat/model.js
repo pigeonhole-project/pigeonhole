@@ -21,7 +21,7 @@ function postedAt(c, m) {
 }
 
 // What a post of the log's channel is to the log (m.log, decoded by the node).
-function logNote(l) {
+export function logNote(l) {
   if (!l) return null;
   if (l.what === "batch" && l.first != null) {
     return l.first === l.last ? t("demo.post_entry", {gen: l.gen, n: l.first}) : t("demo.post_batch", {gen: l.gen, first: l.first, last: l.last});
@@ -35,10 +35,11 @@ function ownerNote(m) {
   return owner ? t("demo.owner_marker", {owner}) : null;
 }
 
+// `canDelete`: the page lets a reader delete a data channel's messages.
 // {earlier: posts before the shown ones, pinned: the first pin's name or
 // null, messages: [{id, kind: "text" | "file" | "service", text, name,
 // size, at, pinned, notes, gone, fresh, quiet, deletable}]}
-export function chatModel(c) {
+export function chatModel(c, canDelete = false) {
   const live = c.messages.slice(-SHOWN);
   const pins = new Set((c.pinned || []).map(p => String(p.id)));
   const messages = live.map(m => ({
@@ -56,7 +57,7 @@ export function chatModel(c) {
     // The log's own posts (its claim, probes): not its entries.
     quiet: !!m.log && m.log.what !== "batch",
     // Anyone in a data channel could delete a message, behind the node's back.
-    deletable: c.role === "data" && !m.gone,
+    deletable: canDelete && c.role === "data" && !m.gone,
   }));
   return {
     earlier: c.total - live.filter(m => !m.gone).length,
