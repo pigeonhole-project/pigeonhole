@@ -20,7 +20,6 @@
   --screen-a: #93b2c8; --screen-b: #a3c6b8; --screen-c: #d9dcd8;
   --plaque: #2f4a6b; --plaque-ink: #f4f6f8; --path: #6f7c87;
   --cote: #f4f5f6; --cote-off: #c3cbd1; --cote-roof: #4f5961; --cote-hole: #2e3439;
-  --dv-body: #7d8a96; --dv-head: #5d6873; --dv-wing: #a9b4bd; --dv-prim: #4a545d;
   --wide: 125;
   --sans: "Archivo", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
@@ -41,7 +40,6 @@
     --screen-a: #34495a; --screen-b: #35504a; --screen-c: #3a4248;
     --plaque: #24384f; --plaque-ink: #dfe6ec; --path: #64727e;
     --cote: #c9d1d7; --cote-off: #4f5a63; --cote-roof: #6a7782; --cote-hole: #0d1114;
-    --dv-body: #8996a2; --dv-head: #5d6873; --dv-wing: #b6c0c8; --dv-prim: #4a545d;
   }
 }
 :root[data-theme="dark"] {
@@ -52,7 +50,6 @@
   --screen-a: #34495a; --screen-b: #35504a; --screen-c: #3a4248;
   --plaque: #24384f; --plaque-ink: #dfe6ec; --path: #64727e;
   --cote: #c9d1d7; --cote-off: #4f5a63; --cote-roof: #6a7782; --cote-hole: #0d1114;
-  --dv-body: #8996a2; --dv-head: #5d6873; --dv-wing: #b6c0c8; --dv-prim: #4a545d;
 
   --feather: #171b1f;
   --plume: #1f2429;
@@ -147,11 +144,6 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .flight { pointer-events: none; }
 .failed-mark { fill: var(--eye); }
 @keyframes arrive { 30% { transform: scale(1.06); } }
-/* rock doves, whatever the theme */
-.dv-body { fill: var(--dv-body); } .dv-head { fill: var(--dv-head); } .dv-wing { fill: var(--dv-wing); } .dv-prim { fill: var(--dv-prim); }
-.dv-bar { fill: none; stroke: #23292e; stroke-linecap: round; } .dv-band { fill: #23292e; }
-.dv-neck { fill: url(#dv-iris); } .dv-eye { fill: #e8892f; } .dv-pupil { fill: #1b1f22; } .dv-cere { fill: #eef0f2; } .dv-beak { fill: #3b3f43; }
-.dv-feet { fill: none; stroke: #c9524a; stroke-linecap: round; }
 
 /* the panel */
 .panel {

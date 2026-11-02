@@ -397,7 +397,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
         const tilt = Math.max(-35, Math.min(35, (Math.atan2(p1.y - p0.y, (p1.x - p0.x) * face) * 180) / Math.PI));
         bird.g.setAttribute("transform", `translate(${pt.x.toFixed(1)},${pt.y.toFixed(1)}) scale(${face * scale},${scale}) rotate(${tilt.toFixed(1)})`);
         // Flapping off and in to land, on a long way gliding a while between.
-        const phase = Math.max(0, now - t0) / 300;
+        const phase = Math.max(0, now - t0) / 450;
         if (dur > 1000 && e > 0.3 && e < 0.72 && Math.floor(phase) % 3) glide(bird);
         else beat(bird, phase % 1);
         if (returning && !mark) mark = svg("circle", {class: "failed-mark", cx: 14, cy: -16, r: 3.4}, bird.g);
