@@ -40,7 +40,7 @@ lint-js:
 	$(BIOME) ci
 
 test-js:
-	node --test site/test/
+	node --test site/test/*.test.mjs
 
 # Curated ceph/s3-tests (see compat/known-good.txt)
 compat:
