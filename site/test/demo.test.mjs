@@ -242,7 +242,7 @@ test("flightsOf: a node's own channel is its; a data channel the leader's; Raft 
   assert.equal(flightsOf({type: "call_failed", store: "tg-1"}, channel, ctx)[0].failed, true);
   assert.deepEqual(flightsOf({type: "posted", store: "nope"}, channel, ctx), [], "a channel not drawn: nothing flies");
   const read = flightsOf({type: "raft", from: 3, to: 1, via: "chat", kind: "append", at: "read"}, channel, ctx)[0];
-  assert.deepEqual([read.from, read.to, read.traffic], [{store: "outbox-3", at: "new"}, {node: 1}, "raft"]);
+  assert.deepEqual([read.from, read.to, read.lane], [{store: "outbox-3", at: "new"}, {node: 1}, "raft"]);
   assert.equal(flightsOf({type: "raft", from: 1, to: 2, via: "grpc", kind: "heartbeat", at: "sent"}, channel, ctx)[0].spark, true);
   assert.equal(ownerOf({node: null}, {leader: null, shown: 3}), 3, "no leader known: the node on screen");
 });

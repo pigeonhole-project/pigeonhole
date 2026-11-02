@@ -8,8 +8,9 @@
 //                                   window, "any" a lit one, "free" the next
 //                                   empty one, "sign" its roof
 // A flight: {from, to, size: bytes (a bigger pigeon), failed: it turns back
-//            short of `to`, traffic: "raft" (the cluster's own: not queued
-//            behind yours) | undefined, spark: a heartbeat, not a pigeon}
+//            short of `to`, lane: "raft" (the cluster's own: not queued
+//            behind yours; pigeons/model.js) or none (yours), spark: a
+//            heartbeat, not a pigeon, onLand?: what its landing changes}
 //
 // Who sends: a node's log, snapshots and outbox are its own, so their
 // posts are its; the data channels are written and read by the leader
@@ -17,13 +18,13 @@
 // the one the page last saw leading.
 
 // The node a channel's traffic comes from: its own node, else the leader.
-// ctx: {leader: id | null, shown: the node on screen}.
+// ctx: {leader: id | null, shown: the node on screen, cut: Set of the nodes cut off}.
 export const ownerOf = (c, ctx) => c.node ?? ctx.leader ?? ctx.shown;
 
 // The flights for event `e`; `channel(store)` finds a channel. None for an
 // event that is not traffic, or a channel not on the graph.
 export function flightsOf(e, channel, ctx) {
-  if (e.type === "raft") return raft(e);
+  if (e.type === "raft") return raft(e, ctx);
   const c = e.store == null ? null : channel(e.store);
   if (!c) return [];
   const node = {node: ownerOf(c, ctx)};
@@ -36,8 +37,10 @@ export function flightsOf(e, channel, ctx) {
 
 // A Raft request: over a direct link, dovecote to dovecote; over the chat,
 // into the sender's outbox ("sent"), or out of it to the reader ("read").
-function raft(e) {
-  const base = {traffic: "raft", size: 1024, spark: e.kind === "heartbeat", kind: e.kind};
+// Nothing gets to or from a node cut off.
+function raft(e, ctx) {
+  if (ctx.cut?.has(e.from) || ctx.cut?.has(e.to)) return [];
+  const base = {lane: "raft", size: 1024, spark: e.kind === "heartbeat", kind: e.kind};
   if (e.via !== "chat") return [{...base, from: {node: e.from}, to: {node: e.to}}];
   const outbox = `outbox-${e.from}`;
   if (e.at === "sent") return [{...base, from: {node: e.from}, to: {store: outbox, at: "new"}}];
