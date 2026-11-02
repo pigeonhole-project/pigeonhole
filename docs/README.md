@@ -67,3 +67,6 @@ What is built and what is next: the [roadmap](roadmap.md).
   2026-10-29 bench, with later updates; raw numbers in [bench/](bench/).
 - [proposals/turso-replica.md](proposals/turso-replica.md): a Turso database
   replicated into pigeonhole (not built).
+- [proposals/albums.md](proposals/albums.md): several files in one send —
+  Discord messages of up to 10 attachments, Telegram albums; live spikes
+  (not built).
