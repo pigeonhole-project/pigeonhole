@@ -28,11 +28,28 @@ async fn node(chat: FakeChat, id: u64) -> Arc<MetaStore> {
 }
 
 async fn node_with(chat: FakeChat, id: u64, opts: MetaOptions) -> Arc<MetaStore> {
+    node_on(chat, id, opts, &Stores::new()).await
+}
+
+/// A node's log and snapshots, in memory: they outlive it, to restart it.
+#[derive(Clone)]
+struct Stores {
+    log: Arc<MemoryBlobStore>,
+    snapshots: Arc<MemoryBlobStore>,
+}
+
+impl Stores {
+    fn new() -> Self {
+        Self { log: Arc::new(MemoryBlobStore::new()), snapshots: Arc::new(MemoryBlobStore::new()) }
+    }
+}
+
+async fn node_on(chat: FakeChat, id: u64, opts: MetaOptions, stores: &Stores) -> Arc<MetaStore> {
     let peers: HashMap<u64, Arc<dyn Mailbox>> =
         MEMBERS.iter().filter(|&&m| m != id).map(|&m| (m, chat.mailbox(id, m))).collect();
     let net = ChatNetwork::<TypeConfig>::new(id, settings(), chat.mailbox(id, id), peers);
-    let log = Arc::new(crate::ChainLogStore::new(Arc::new(MemoryBlobStore::new())));
-    let snapshots = Arc::new(crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())));
+    let log = Arc::new(crate::ChainLogStore::new(stores.log.clone()));
+    let snapshots = Arc::new(crate::BlobSnapshotStore::new(stores.snapshots.clone()));
     let serving = net.clone();
     let cluster = Cluster {
         node: id,
@@ -223,6 +240,67 @@ async fn a_follower_behind_the_purged_log_catches_up_from_a_snapshot() {
     chat.isolate(behind, false);
     eventually("the follower caught up", || value(&nodes[&behind]) == 20).await;
     assert!(nodes[&behind].base_position() > applied_then, "from a snapshot, not entry by entry");
+}
+
+/// Position of the snapshot `node` holds now (0: none).
+fn snapshot_at(node: &MetaStore) -> Position {
+    node.shared.current.lock().unwrap().as_ref().map_or(0, |c| c.at())
+}
+
+#[tokio::test]
+async fn a_follower_behind_by_less_than_the_kept_log_catches_up_from_it() {
+    let chat = FakeChat::new();
+    let kept = MetaOptions { snapshot_every: Some(4), keep_log: Some(1000), ..opts() };
+    let started = futures::future::join_all(MEMBERS.map(|id| node_with(chat.clone(), id, kept.clone()))).await;
+    let nodes: HashMap<u64, Arc<MetaStore>> = MEMBERS.into_iter().zip(started).collect();
+    let leader = agreed_leader(&nodes).await;
+    let behind = *MEMBERS.iter().find(|&&m| m != leader).unwrap();
+    nodes[&leader].propose::<Counter>(op(0, 1)).await.unwrap().unwrap();
+    eventually("all applied the first commit", || nodes.values().all(|n| value(n) == 1)).await;
+
+    chat.isolate(behind, true);
+    let applied_then = nodes[&behind].applied_position();
+    for i in 1..20 {
+        nodes[&leader].propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    eventually("the leader snapshots past the cut-off follower", || snapshot_at(&nodes[&leader]) > applied_then).await;
+    assert!(nodes[&leader].base_position() <= applied_then, "the leader keeps the log the follower lacks");
+
+    chat.isolate(behind, false);
+    eventually("the follower caught up", || value(&nodes[&behind]) == 20).await;
+    assert!(nodes[&behind].base_position() <= applied_then, "from the log, not a snapshot");
+}
+
+/// A node whose log starts behind its snapshot (the log a cluster keeps)
+/// boots from the snapshot and replays only what follows it.
+#[tokio::test]
+async fn a_node_restarts_from_a_base_behind_its_snapshot() {
+    let chat = FakeChat::new();
+    let kept = MetaOptions { snapshot_every: Some(4), keep_log: Some(3), ..opts() };
+    let stores: HashMap<u64, Stores> = MEMBERS.into_iter().map(|id| (id, Stores::new())).collect();
+    let started =
+        futures::future::join_all(MEMBERS.map(|id| node_on(chat.clone(), id, kept.clone(), &stores[&id]))).await;
+    let mut nodes: HashMap<u64, Arc<MetaStore>> = MEMBERS.into_iter().zip(started).collect();
+    let leader = agreed_leader(&nodes).await;
+    for i in 0..20 {
+        nodes[&leader].propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    let follower = *MEMBERS.iter().find(|&&m| m != leader).unwrap();
+    eventually("the follower's log starts behind its snapshot", || {
+        let n = &nodes[&follower];
+        value(n) == 20 && n.base_position() > 0 && n.base_position() < snapshot_at(n)
+    })
+    .await;
+    let (base, snapshot) = (nodes[&follower].base_position(), snapshot_at(&nodes[&follower]));
+
+    nodes.remove(&follower).unwrap().close().await.unwrap();
+    let again = node_on(chat.clone(), follower, kept.clone(), &stores[&follower]).await;
+    assert_eq!((again.base_position(), snapshot_at(&again)), (base, snapshot));
+    assert!(value(&again) <= 20, "from the snapshot on, nothing applied twice");
+    eventually("the restarted node replays what follows its snapshot", || value(&again) == 20).await;
+    nodes.insert(follower, again);
+    nodes[&leader].propose::<Counter>(op(99, 1)).await.unwrap().unwrap();
+    eventually("the restarted node follows on", || value(&nodes[&follower]) == 21).await;
 }
 
 /// gRPC between nodes 1 and 2 (or all, with `chat_only` empty), the chat

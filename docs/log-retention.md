@@ -175,6 +175,10 @@ list, every object whole.
   (`LOG_FORMAT` 4).
 - `[meta] keep_snapshots` (default 2) → `MetaOptions::keep_snapshots`; the
   write loop removes dropped bases' snapshots.
+- In a cluster, `[meta] keep_log_entries` → `MetaOptions::keep_log`: a base
+  lands that many entries short of its snapshot, so the log behind every
+  kept base reaches back that much further (cluster.md § Snapshots and the
+  kept log).
 - Fallback boot in `MetaStore::open` (`load_some_base`).
 - Idle-only pacing: `ChatLimiter::wait_idle`, `StoreLimiter` for disk and
   memory; `Chain::prune` on every store waits for idle per batch. The

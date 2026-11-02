@@ -183,6 +183,10 @@ pub struct MetaSettings {
     pub snapshot_interval: Option<Duration>,
     /// The newest snapshots kept, with the log from the oldest of them (≥ 1).
     pub keep_snapshots: usize,
+    /// Entries a cluster's leader keeps behind its newest snapshot, so a
+    /// follower that fell behind by fewer catches up from the log, not a
+    /// whole snapshot; `None` = none. Unset: `snapshot_every_entries`.
+    pub keep_log_entries: Option<u64>,
     /// A Discord log's lease (docs/discord-lease.md): batches without a
     /// thread each; a new writer waits it out after a crash. `None` = a
     /// thread per batch.
@@ -692,6 +696,9 @@ struct FileMeta {
     #[serde(deserialize_with = "units::duration_or_off")]
     snapshot_every: Option<Duration>,
     keep_snapshots: usize,
+    /// Unset (`None`): as many as `snapshot_every_entries`.
+    #[serde(deserialize_with = "units::count_or_off_set")]
+    keep_log_entries: Option<Option<u64>>,
     /// A Discord log's lease; `"off"` = a thread per batch.
     #[serde(deserialize_with = "units::duration_or_off")]
     lease: Option<Duration>,
@@ -705,6 +712,7 @@ impl Default for FileMeta {
             snapshot_every_entries: Some(10_000),
             snapshot_every: Some(Duration::from_secs(600)),
             keep_snapshots: 2,
+            keep_log_entries: None,
             lease: Some(Duration::from_secs(45)),
         }
     }
@@ -765,6 +773,7 @@ impl FileMeta {
             snapshot_every_entries: self.snapshot_every_entries,
             snapshot_interval: self.snapshot_every,
             keep_snapshots: self.keep_snapshots,
+            keep_log_entries: self.keep_log_entries.unwrap_or(self.snapshot_every_entries),
             lease: self.lease,
             log,
             snapshot,
@@ -1257,9 +1266,19 @@ rate_per_sec = 20.0
         assert_eq!(cfg.meta.snapshot_every_entries, Some(10_000));
         assert_eq!(cfg.meta.snapshot_interval, Some(Duration::from_secs(600)));
         assert_eq!(cfg.meta.keep_snapshots, 2);
+        assert_eq!(cfg.meta.keep_log_entries, Some(10_000), "as many as between snapshots");
         assert_eq!(cfg.meta.log, LogSettings::LocalDisk { path: "pigeonhole-meta".into() });
         assert_eq!(cfg.meta.snapshot, SnapshotSettings::LocalDisk { path: "pigeonhole-meta".into() });
         assert!(!cfg.meta.snapshots_outlive_log(), "same directory, same disk");
+    }
+
+    #[test]
+    fn keep_log_entries_set_or_off() {
+        for (line, want) in [("keep_log_entries = 500", Some(500)), ("keep_log_entries = \"off\"", None)] {
+            let cfg = load_mem(&format!("[meta]\n{line}\n")).unwrap();
+            assert_eq!(cfg.meta.keep_log_entries, want, "{line}");
+            assert_eq!(cfg.meta.snapshot_every_entries, Some(10_000));
+        }
     }
 
     #[test]
@@ -1272,6 +1291,7 @@ rate_per_sec = 20.0
         ))
         .unwrap();
         assert_eq!(cfg.meta.keep_snapshots, 3);
+        assert_eq!(cfg.meta.keep_log_entries, None, "follows snapshot_every_entries: off");
         assert_eq!(cfg.meta.lease, None);
         assert_eq!(cfg.meta.snapshot_every_entries, None);
         assert_eq!(cfg.meta.snapshot_interval, Some(Duration::from_secs(60)));

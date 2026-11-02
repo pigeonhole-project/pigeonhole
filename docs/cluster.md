@@ -417,22 +417,35 @@ and fake ones in the demo):
   never meets a run of 100 deleted ids. The node's bot needs the right to
   pin messages in its outbox.
 
-## Snapshots
+## Snapshots and the kept log
 
-A follower behind the leader's purged log gets the leader's snapshot through
+A follower catches up from the leader's log as far as the log reaches back,
+and from the leader's snapshot behind that. A leader keeps
+`[meta] keep_log_entries` entries behind its newest snapshot (default: as
+many as `snapshot_every_entries`, so about one interval; `"off"`: none) —
+openraft's `max_in_snapshot_log_to_keep`, which purges by count and does not
+wait for a follower. A cluster of one keeps none. So a follower that was cut
+off for less than an interval gets the entries it lacks; one that was gone
+longer, or a new node, gets a snapshot.
+
+The base then lags the snapshot: the log starts at the purge point, and the
+snapshot it names holds a later position (`log::Base`). A boot loads the
+snapshot and replays what follows it; the entries between the base and the
+snapshot are there for followers only. The cost is chat messages: those
+behind the snapshot are collected one interval later.
+
+A follower behind the kept log gets the leader's snapshot through
 `install_snapshot`: openraft sends it in chunks, each a request over the
-link (a chat frame, a document when large). Two things this needed:
+link (a chat frame, a document when large). Three things this needed:
 - the send timeout above;
 - a follower's purge waits for the snapshot it installs, since Raft asks
-  to purge while the state machine is still storing it.
+  to purge while the state machine is still storing it;
+- a snapshot of the follower's own, built before the install and stored
+  after it, does not take the installed one's place.
 
 Not built: a snapshot as a reference. The snapshot already sits in the
 leader's `SnapshotStore`, often a chat, and the envelope could carry its
-`SnapshotRef` for the follower to read there. The leader purges its log
-right after a snapshot (`max_in_snapshot_log_to_keep: 0`), so even a short
-lag costs a whole snapshot. A margin of log behind the snapshot is an open
-question: boot replays from the base, and a base below the snapshot needs
-care.
+`SnapshotRef` for the follower to read there.
 
 ## Security
 
@@ -485,9 +498,11 @@ them.
 - **The tablet** (`pigeonhole-meta` `tests/cluster.rs`):
   - over `FakeChat`: election, commits everywhere, a write to a follower,
     a killed leader, a partitioned leader that heals, gauges and lag, the
-    cluster view, a follower that catches up from a snapshot, a leader left
-    alone (read-only, `NoQuorum`, back with a quorum), a write in flight as
-    the quorum goes (`CommitUnknown`), a cluster of one never read-only;
+    cluster view, a follower that catches up from a snapshot or from the
+    kept log, a node that restarts from a base behind its snapshot, a
+    leader left alone (read-only, `NoQuorum`, back with a quorum), a write
+    in flight as the quorum goes (`CommitUnknown`), a cluster of one never
+    read-only;
   - over gRPC alone;
   - two gRPC nodes and a chat node;
   - a `Direct` pair and a chat node (this one under madsim too).
@@ -534,7 +549,7 @@ application, not the account.
 Done:
 - the chat transport (`openraft-chat`) and `MetaStore::open_in`;
 - metrics and the Grafana row;
-- snapshot catch-up;
+- snapshot catch-up, and catch-up from the kept log;
 - leader-only work, `DynConfig::follow`, 503 on followers;
 - read-only without a quorum (§ Losing the quorum);
 - gRPC, `Direct` and per-pair transports;
@@ -552,7 +567,7 @@ Left:
 2. A Discord outbox (check 3 first).
 3. `seq` restored from the node's own outbox rather than the clock; the
    poster's bot checked against the node.
-4. A snapshot as a reference (§ Snapshots).
+4. A snapshot as a reference (§ Snapshots and the kept log).
 5. Membership changes (add or remove a node, learners) through the admin
    API, instead of a fixed `[[node]]` list.
 6. Maybe: a status message per node in its outbox (role, term, leader,

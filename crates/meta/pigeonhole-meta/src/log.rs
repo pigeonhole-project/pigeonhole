@@ -95,8 +95,10 @@ pub struct Head {
     pub position: Position,
 }
 
-/// Where the log starts: the state as of `at` is the stored snapshot
-/// `snapshot`; entries ≤ `at` may be gone.
+/// Where the log starts: entries ≤ `at` may be gone, and the stored
+/// snapshot `snapshot` holds the state as of `at` or later (a cluster keeps
+/// some log behind its snapshot for followers: `MetaOptions::keep_log`); a
+/// boot loads it and replays what follows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Base {
     pub at: Position,
