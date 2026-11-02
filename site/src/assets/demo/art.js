@@ -110,7 +110,7 @@ function wingPaths(w) {
 }
 const smooth = x => x * x * (3 - 2 * x);
 function frameAt(k) {
-  const x = (k % 1) * FRAMES.length,
+  const x = (((k % 1) + 1) % 1) * FRAMES.length,
     i = Math.floor(x),
     t = smooth(x - i);
   const a = FRAMES[i],
@@ -199,20 +199,47 @@ export function boarded(parent, w) {
   svg("rect", {class: "shutter", x: w.x, y: w.y - 8, width: 11, height: 22, rx: 1}, g);
 }
 
-// ---- a channel: a hutch on a roof, its foot at y 0, the app's logo on
-// its gable; `shut`: the channel is down. Returns its door's y and the
-// gable's top (for a count over it).
-export function hutch(g, kind, title, shut) {
-  svg("rect", {class: "cote", x: -22, y: -32, width: 44, height: 32}, g);
-  svg("path", {class: "cote-roof", d: "M-27,-30 L0,-50 L27,-30 Z"}, g);
-  logo(kind, g, 0, -36, title, 6.5);
-  svg("path", {class: "cote-hole", d: "M-8,-2 L-8,-14 A8,8 0 0 1 8,-14 L8,-2 Z"}, g);
-  if (shut) {
-    svg("rect", {class: "shutter", x: -9, y: -22, width: 9, height: 20}, g);
-    svg("rect", {class: "shutter", x: 0, y: -22, width: 9, height: 20}, g);
+// ---- a channel: a whole block of flats, a window to a message. Its floors
+// from `ground` up, `cols` windows to a floor; returns its roof's y and
+// each window's box ({x, y, w, h}), the ground floor's first, row by row.
+// (The windows' panes are the caller's to draw: what each holds.)
+export const FLOOR = 22;
+export function tower(parent, x, ground, w, floors, cols, {shade = 1, deep = 2000} = {}) {
+  const g = svg("g", {class: "block"}, parent);
+  const roof = ground - floors * FLOOR - 12,
+    pw = w / cols;
+  svg("rect", {class: `wall-${shade}`, x, y: roof, width: w, height: ground - roof + deep}, g);
+  svg("rect", {class: "parapet", x: x - 2, y: roof - 4, width: w + 4, height: 5}, g);
+  for (let c = 0; c < cols; c++) svg("rect", {class: "vent", x: x + c * pw + pw / 2 - 4, y: roof + 4, width: 8, height: 4, rx: 1}, g);
+  let seams = "";
+  for (let c = 1; c < cols; c++) seams += `M${n2(x + c * pw)},${roof + 12} L${n2(x + c * pw)},${ground + deep} `;
+  const slots = [];
+  for (let r = 0; r < floors; r++) {
+    const fy = ground - (r + 1) * FLOOR;
+    seams += `M${x},${fy + FLOOR} L${x + w},${fy + FLOOR} `;
+    for (let c = 0; c < cols; c++) slots.push({x: x + c * pw + pw / 2 - 6, y: fy + 5, w: 12, h: 13});
   }
-  svg("rect", {class: "cote-board", x: -26, y: -1, width: 52, height: 4, rx: 1}, g);
-  return {door: -8, top: -50};
+  svg("path", {class: "seam", d: seams}, g);
+  return {roof, slots, g};
+}
+
+// The letters on a block's roof (as on a Soviet one's: a slogan on a
+// lattice): the app's logo and the channel's name, and its count; `sub` a
+// second, smaller line. Returns the count's text.
+export function roofSign(parent, cx, roof, w, kind, app, name, sub) {
+  const h = sub ? 34 : 24,
+    top = roof - 10 - h;
+  const g = svg("g", {class: "roof-sign"}, parent);
+  svg(
+    "path",
+    {class: "sign-post", d: `M${cx - w / 2 + 8},${roof - 4} L${cx - w / 2 + 8},${top + h} M${cx + w / 2 - 8},${roof - 4} L${cx + w / 2 - 8},${top + h}`},
+    g,
+  );
+  svg("rect", {class: "sign-board", x: cx - w / 2, y: top, width: w, height: h, rx: 2}, g);
+  logo(kind, g, cx - w / 2 + 12, top + 12, app, 7.5);
+  svg("text", {class: "sign-name", x: cx - w / 2 + 24, y: top + 16}, g).textContent = name;
+  if (sub) svg("text", {class: "sign-role", x: cx - w / 2 + 24, y: top + 29}, g).textContent = sub;
+  return svg("text", {class: "sign-count", x: cx + w / 2 - 6, y: top + 16, "text-anchor": "end"}, g);
 }
 
 // ---- a Soviet block of flats: concrete panels and their seams, a window to

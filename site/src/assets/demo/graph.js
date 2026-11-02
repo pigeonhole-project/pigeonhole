@@ -1,21 +1,27 @@
-// The graph, drawn as a town of Soviet blocks of flats: you on yours, the
-// node a dovecote on its block's roof with its own channels (its log, its
-// snapshots) in hutches beside it, the data channels in hutches on another
-// roof; pigeons fly between the roofs.
+// The graph, drawn as a town of Soviet blocks of flats. Each channel is a
+// block and each of its windows a message, filled from the ground floor up:
+// a chunk's window lit warm, a small text's cool, a deleted message's
+// shuttered, the pinned owner marker's flagged; the block grows a floor as
+// it fills (up to a height, then "+n" older ones under). You live on a
+// block whose windows are your objects; the node is a dovecote on its
+// block's roof. Pigeons fly from the dovecote into the windows.
 //
 // A node of the graph is a target: {kind: "client"}, {kind: "loft"} or
 // {kind: "store", store}. Clicking one calls onOpen(target).
 import {activate, reducedMotion, svg} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
-import {beat, birdDefs, block, dovecote, flying, glide, hutch, perched, plaque} from "./art.js";
+import {beat, birdDefs, block, dovecote, FLOOR, flying, glide, perched, plaque, roofSign, tower} from "./art.js";
 import {appOf, placeNote} from "./channels.js";
 
-const QUEUE_SHOWN = 12; // repair jobs drawn under a hutch; the rest as "+n"
+const QUEUE_SHOWN = 12; // repair jobs drawn over a block; the rest as "+n"
+const COL = 26; // a window's column
+const MIN_FLOORS = 6,
+  HEADROOM = 2; // a block's floors at least; empty floors over its last message
 // A phone's screen: the town top to bottom, scrolled.
 const NARROW = "(max-width: 640px)";
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-// A pigeon's way from one roof to another: up over the roofs and down.
+// A pigeon's way from one place to another: up over the roofs and down.
 const arc = ([x1, y1], [x2, y2], lift) => {
   const top = Math.min(y1, y2) - lift;
   return `M${x1},${y1} C${x1 + (x2 - x1) * 0.25},${top} ${x1 + (x2 - x1) * 0.75},${top} ${x2},${y2}`;
@@ -26,78 +32,87 @@ const seeded = seed => () => {
   return seed / 233280;
 };
 
-// Where everything goes. Each layout gives the view's size, the blocks
-// (back to front: {x, roof, w, shade, loggias, room, aerials}), where you
-// are (`client`: your plaque, `perch`: where your pigeons leave from,
-// `bird`: one sitting on your roof), the loft (its foot, its scale, its
-// plaque), each store's hutch ({x, roof, scale, short: its label without
-// the role}), the data's sign, and how high the pigeons' arcs rise.
-// Left to right: you, the node, the data channels on the tallest block;
-// `height`: the view's, from the screen's shape (the roofs a little lower
-// on a taller one, the blocks taller)…
+// What a channel's windows hold, oldest first: as many unnamed messages as
+// its total has beyond the ones it lists, then those (the deleted too).
+function contents(c) {
+  const list = c.messages || [];
+  const older = Math.max(0, (c.total ?? 0) - list.filter(m => !m.gone).length);
+  return {older, list, count: older + list.length};
+}
+// A block's floors for so many windows, `cols` to a floor.
+const floorsFor = (count, cols, most) => Math.max(MIN_FLOORS, Math.min(most, Math.ceil(count / cols) + HEADROOM));
+
+// Where everything goes: the view's size, the town's streets, and on them
+// (left to right) you, the node's block, then each channel's block:
+// {x, w, cols, ground, most: floors at most, deep: its wall under the ground}.
+// Wide: one street, the view as tall as the screen's shape asks…
 function wide(channels, height) {
-  const data = channels.filter(c => c.role === "data"),
-    own = channels.filter(c => c.role !== "data");
-  const n = data.length,
-    step = n <= 3 ? 140 : Math.max(64, 520 / n),
-    scale = n <= 3 ? 1.3 : n <= 5 ? 1 : 0.8;
-  const dw = Math.max(320, n * step + 40),
-    dx = 1170 - dw,
-    down = (height - 640) * 0.3;
-  const dataRoof = 250 + down,
-    yours = 290 + down,
-    nodes = 400 + down;
-  const stores = new Map();
-  for (const [i, c] of data.entries()) stores.set(c.store, {x: dx + 20 + step / 2 + i * step, roof: dataRoof, scale, short: n > 3});
-  for (const [i, c] of own.entries()) stores.set(c.store, {x: 530 + i * 140, roof: nodes, scale: 1, short: false});
+  const own = channels.filter(c => c.role !== "data"),
+    data = channels.filter(c => c.role === "data");
+  const ground = height - 6,
+    most = Math.floor((ground - 12 - 70 - height * 0.12) / FLOOR);
+  const at = new Map();
+  let x = 390;
+  for (const c of own) {
+    const cols = c.role === "log" ? 3 : 4;
+    at.set(c.store, {x, w: cols * COL, cols, ground, most, deep: 2000});
+    x += cols * COL + 18;
+  }
+  x += 24;
+  const gap = 14,
+    each = (1180 - x - (data.length - 1) * gap) / Math.max(1, data.length);
+  for (const c of data) {
+    const cols = Math.max(2, Math.min(6, Math.floor(each / COL)));
+    at.set(c.store, {x: x + (each - cols * COL) / 2, w: cols * COL, cols, ground, most, deep: 2000});
+    x += each + gap;
+  }
   return {
     width: 1200,
     height,
-    blocks: [
-      {x: dx, roof: dataRoof, w: dw, shade: 1, loggias: [2, 6], room: dw - 60, aerials: 0},
-      {x: 30, roof: yours, w: 170, shade: 1, loggias: [1, 4], room: 100, aerials: 1},
-      {x: 270, roof: nodes, w: 450, shade: 2, loggias: [2, 5, 11], aerials: 1},
-    ],
-    client: {plaque: [44, yours + 40], perch: [150, yours - 26], bird: [60, yours - 4]},
-    loft: {foot: [380, nodes - 4], scale: 0.95, plaque: [300, nodes + 40]},
-    stores,
-    sign: {x: dx + 16, y: dataRoof + 80},
-    lift: 90,
+    client: {x: 30, w: 3 * COL, cols: 3, ground, most, deep: 2000},
+    loft: {x: 150, w: 220, floors: 9, ground, scale: 0.9, deep: 2000},
+    stores: at,
+    lift: 80,
   };
 }
 
-// …or top to bottom, for a phone: you and the node, the data channels on
-// the roofs in front, two or three to a roof.
+// …or two streets top to bottom, for a phone: you, the node and its own
+// channels on the first, the data channels on the one in front of it.
 function tall(channels) {
-  const data = channels.filter(c => c.role === "data"),
-    own = channels.filter(c => c.role !== "data");
-  const per = data.length > 4 ? 3 : 2,
-    rows = Math.max(1, Math.ceil(data.length / per)),
-    step = 388 / per;
-  const roofOf = r => 500 + r * 150;
-  const stores = new Map();
-  for (const [i, c] of data.entries())
-    stores.set(c.store, {x: 6 + step / 2 + (i % per) * step, roof: roofOf(Math.floor(i / per)), scale: per === 3 ? 0.8 : 0.95, short: per === 3});
-  for (const [i, c] of own.entries()) stores.set(c.store, {x: 262 + i * 92, roof: 300, scale: 0.65, short: true});
-  const blocks = [
-    {x: 8, roof: 120, w: 130, shade: 1, loggias: [1], room: 70, aerials: 0},
-    {x: 4, roof: 300, w: 392, shade: 2, loggias: [2, 6, 11], aerials: 0},
-  ];
-  for (let r = 0; r < rows; r++) blocks.push({x: 4, roof: roofOf(r), w: 392, shade: r % 2 ? 3 : 1, loggias: [3, 9], aerials: 0});
+  const own = channels.filter(c => c.role !== "data"),
+    data = channels.filter(c => c.role === "data");
+  const first = 400,
+    most = 12;
+  const at = new Map();
+  let x = 226;
+  for (const c of own) {
+    const cols = c.role === "log" ? 2 : 3;
+    at.set(c.store, {x, w: cols * COL, cols, ground: first, most, deep: 0});
+    x += cols * COL + 10;
+  }
+  const gap = 10,
+    each = (388 - (data.length - 1) * gap) / Math.max(1, data.length);
+  const cols = data.map(() => Math.max(2, Math.min(8, Math.floor(each / COL))));
+  const floors = Math.max(MIN_FLOORS, ...data.map((c, i) => floorsFor(contents(c).count, cols[i], most)));
+  const second = first + 70 + floors * FLOOR + 12;
+  x = 6;
+  for (const [i, c] of data.entries()) {
+    at.set(c.store, {x: x + (each - cols[i] * COL) / 2, w: cols[i] * COL, cols: cols[i], ground: second, most, deep: 2000});
+    x += each + gap;
+  }
   return {
     width: 400,
-    height: roofOf(rows - 1) + 170,
-    blocks,
-    client: {plaque: [18, 140], perch: [104, 94], bird: [116, 116]},
-    loft: {foot: [118, 296], scale: 0.62, plaque: [20, 340]},
-    stores,
-    sign: {x: 16, y: roofOf(rows - 1) + 76},
-    lift: 50,
+    height: second + 8,
+    client: {x: 6, w: 2 * COL, cols: 2, ground: first, most, deep: 0},
+    loft: {x: 66, w: 150, floors: 7, ground: first, scale: 0.55, deep: 0},
+    stores: at,
+    lift: 40,
   };
 }
 
 // onLoft(g, windows): the loft was drawn, its entrances are free to dress.
-// onRelayout(): the screen turned narrow or wide: draw again.
+// onRelayout(): the screen turned narrow or wide, or a block needs another
+// floor: draw again.
 export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   const reduced = reducedMotion();
   const narrow = matchMedia(NARROW);
@@ -112,12 +127,14 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   new ResizeObserver(() => {
     if (!narrow.matches && client && Math.abs(wideHeight() - lastHeight) > 40) onRelayout();
   }).observe(el);
+
+  let viewWidth = 1200;
   let client = null,
     loft = null,
     air = null,
-    tallNow = false;
-  let cards = new Map(); // store id → its hutch
-  let edges = new Map(); // store id → the way to it; "" → the client's
+    lift = 80;
+  let cards = new Map(); // store id → its block
+  let edges = new Map(); // store id → the way to its block; "" → the client's
 
   const nodeOf = target => (target?.kind === "client" ? client : target?.kind === "loft" ? loft : target?.kind === "store" ? cards.get(target.store) : null);
 
@@ -127,37 +144,100 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     activate(g, () => onOpen(target));
     return {g};
   }
+  // A frame round a block, shown when it is hovered, focused or open.
+  const ring = (n, x, top, w, ground) => svg("rect", {class: "ring", x: x - 5, y: top - 5, width: w + 10, height: ground - top + 10, rx: 4}, n.g);
 
-  // A channel's hutch on its roof, its name (and what it is for) on the
-  // wall under it, repair jobs under that.
+  // A channel's block: its windows, the letters on its roof.
   function card(c, at, parent) {
     const role = placeNote(c) + (c.bots > 1 ? `, ${t("demo.bots", {n: c.bots})}` : "") + (c.down ? `, ${t("demo.down")}` : "");
     const n = node({kind: "store", store: c.store}, parent, `${c.store}: ${role}`);
     n.g.classList.toggle("down", !!c.down);
-    const place = svg("g", {transform: `translate(${at.x},${at.roof - 4})`}, n.g);
-    n.body = svg("g", {class: "hutch"}, svg("g", {transform: `scale(${at.scale})`}, place));
-    svg("path", {class: "ring", d: "M-30,4 L-30,-34 L0,-56 L30,-34 L30,4 Z"}, n.body);
-    const parts = hutch(n.body, c.kind, appOf(c.kind), c.down);
-    n.door = [at.x, at.roof - 4 + parts.door * at.scale];
-    n.count = svg("text", {class: "count", x: 0, y: parts.top - 8, "text-anchor": "middle"}, n.body);
+    n.c = c;
+    n.cols = at.cols;
+    n.most = at.most;
+    n.floors = floorsFor(contents(c).count, at.cols, at.most);
+    const b = tower(n.g, at.x, at.ground, at.w, n.floors, at.cols, {shade: c.role === "data" ? 1 : 3, deep: at.deep});
+    n.slots = b.slots;
+    n.win = svg("g", {}, n.g);
+    // The letters over the block, kept inside the view.
+    const signW = Math.max(at.w + 10, c.store.length * 8.4 + 62),
+      cx = Math.max(signW / 2 + 4, Math.min(viewWidth - signW / 2 - 4, at.x + at.w / 2));
+    const withRole = role.length * 5.6 + 34 <= signW;
+    n.count = roofSign(n.g, cx, b.roof, signW, c.kind, appOf(c.kind), c.store, withRole ? role : null);
+    n.sign = [cx, b.roof - 40];
     n.tip = svg("title", {}, n.g);
-    svg("text", {class: "sign", x: 0, y: 22, "text-anchor": "middle"}, place).textContent = c.store;
-    const sub = at.short ? (c.down ? t("demo.down") : "") : role;
-    if (sub) svg("text", {class: "sign-sub", x: 0, y: 37, "text-anchor": "middle"}, place).textContent = sub;
-    n.queue = svg("g", {class: "queue", transform: `translate(0,${sub ? 44 : 30})`}, place);
+    n.tip.textContent = role;
+    n.older = svg("text", {class: "older", x: at.x + at.w / 2, y: at.ground - 4, "text-anchor": "middle"}, n.g);
+    n.queue = svg("g", {class: "queue", transform: `translate(${cx},${b.roof - (withRole ? 58 : 48)})`}, n.g);
+    ring(n, at.x, b.roof - 50, at.w, at.ground);
+    n.shown = 0;
+    fill(n, false);
     return n;
+  }
+
+  // A channel's windows, from what it holds now; `fresh`: light the new ones up.
+  function fill(n, fresh) {
+    const {older, list, count} = contents(n.c);
+    const room = n.slots.length - (count > n.slots.length ? n.cols : 0);
+    const shown = Math.min(count, room),
+      skip = count - shown;
+    const pins = new Set((n.c.pinned || []).map(p => String(p.id)));
+    n.win.replaceChildren();
+    for (const [i, s] of n.slots.entries()) {
+      const m = i < shown && skip + i >= older ? list[skip + i - older] : null;
+      let cls = i >= shown ? "pane" : m?.gone ? "pane gone" : m?.kind === "text" ? "pane lit text" : m?.kind === "other" ? "pane lit svc" : "pane lit";
+      if (fresh && i >= n.shown && i < shown) cls += " new";
+      svg("rect", {class: cls, x: s.x, y: s.y, width: s.w, height: s.h}, n.win);
+      if (m?.gone) svg("path", {class: "pane-shut", d: `M${s.x + s.w / 2},${s.y} L${s.x + s.w / 2},${s.y + s.h}`}, n.win);
+      if (m && pins.has(String(m.id)))
+        svg("path", {class: "pin-flag", d: `M${s.x + s.w},${s.y + 1} L${s.x + s.w},${s.y - 9} L${s.x + s.w + 8},${s.y - 6} L${s.x + s.w},${s.y - 3}`}, n.win);
+    }
+    n.shown = shown;
+    n.older.textContent = skip ? `+${skip}` : "";
+    n.count.textContent = String(n.c.total ?? count);
+    // Full to its last free floor: draw again with a floor more.
+    if (count + n.cols > n.floors * n.cols && n.floors < n.most) onRelayout();
+  }
+  // Where a window is, by its place among the shown.
+  const windowAt = (n, i) => {
+    const s = n.slots[Math.max(0, Math.min(n.slots.length - 1, i))];
+    return [s.x + s.w / 2, s.y + s.h / 2];
+  };
+
+  // You: a block whose windows are your objects, a pigeon on its roof.
+  function you(at, objects, parent) {
+    const n = node({kind: "client"}, parent, "");
+    n.floors = floorsFor(objects, at.cols, at.most);
+    n.at = at;
+    const b = tower(n.g, at.x, at.ground, at.w, n.floors, at.cols, {shade: 2, deep: at.deep});
+    n.slots = b.slots;
+    n.win = svg("g", {}, n.g);
+    n.sub = plaque(n.g, at.x - 6, b.roof - 54, t("demo.you"), t("demo.objects", {n: 9999}));
+    n.perch = [at.x + at.w - 14, b.roof - 6];
+    perched(n.g, {transform: `translate(${at.x + 12},${b.roof - 12}) scale(1.3)`});
+    ring(n, at.x, b.roof - 56, at.w, at.ground);
+    return n;
+  }
+  function setObjects(count) {
+    if (!client) return;
+    client.objects = count;
+    client.sub.textContent = t("demo.objects", {n: count});
+    client.g.setAttribute("aria-label", `${t("demo.you")}: ${t("demo.objects", {n: count})}`);
+    client.win.replaceChildren();
+    for (const [i, s] of client.slots.entries()) svg("rect", {class: i < count ? "pane lit" : "pane", x: s.x, y: s.y, width: s.w, height: s.h}, client.win);
+    if (count + client.at.cols > client.floors * client.at.cols && client.floors < client.at.most) onRelayout();
   }
 
   // The sky, and the town far off: wider and taller than the view, so that
   // on a screen of another shape they fill it still.
-  function backdrop(at, rnd) {
+  function backdrop(at, rnd, tallNow) {
     const sky = svg("linearGradient", {id: "sky", x1: 0, y1: 0, x2: 0, y2: at.height, gradientUnits: "userSpaceOnUse"}, el.querySelector("defs"));
     svg("stop", {offset: 0, class: "sky-top"}, sky);
     svg("stop", {offset: 1, class: "sky-low"}, sky);
     svg("rect", {x: -2000, y: -2000, width: at.width + 4000, height: at.height + 4000, fill: "url(#sky)"}, el);
     for (const [cls, base] of [
-      ["far", at.height * (tallNow ? 0.12 : 0.36)],
-      ["far-2", at.height * (tallNow ? 0.2 : 0.5)],
+      ["far", at.height * (tallNow ? 0.12 : 0.4)],
+      ["far-2", at.height * (tallNow ? 0.2 : 0.56)],
     ]) {
       let d = `M-2000,${at.height + 2000} L-2000,${base}`;
       for (let x = -2000; x < at.width + 2000; ) {
@@ -175,47 +255,42 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   // as in the wizard's sketch) and this many objects.
   function draw(channels, objects) {
     el.replaceChildren();
-    tallNow = narrow.matches;
+    const tallNow = narrow.matches;
     lastHeight = wideHeight();
     const at = tallNow ? tall(channels) : wide(channels, lastHeight);
+    lift = at.lift;
+    viewWidth = at.width;
     el.classList.toggle("tall", tallNow);
     el.setAttribute("viewBox", `0 0 ${at.width} ${at.height}`);
     el.setAttribute("preserveAspectRatio", tallNow ? "xMidYMin meet" : "xMidYMax meet");
     birdDefs(el);
     const rnd = seeded(11);
-    backdrop(at, rnd);
+    backdrop(at, rnd, tallNow);
     const routes = svg("g", {}, el),
       town = svg("g", {}, el);
     air = svg("g", {}, el);
-    // The blocks, back to front, down past the view's bottom.
-    for (const b of at.blocks) block(town, b.x, b.roof, b.w, at.height - b.roof + 2000, rnd, b);
 
-    // You: a plaque on your block, a pigeon on its roof.
-    client = node({kind: "client"}, town, `${t("demo.you")}: ${t("demo.objects", {n: objects})}`);
-    client.sub = plaque(client.g, ...at.client.plaque, t("demo.you"), t("demo.objects", {n: objects}));
-    perched(town, {transform: `translate(${at.client.bird[0]},${at.client.bird[1] - 8}) scale(1.4)`});
+    client = you(at.client, objects, town);
+    setObjects(objects);
 
-    // The node: the dovecote on its roof, its plaque under it.
+    // The node: the dovecote on its block's roof, its plaque on the wall.
     loft = node({kind: "loft"}, town, `pigeonhole: ${t("demo.loft_role")}`);
-    const [lx, ly] = at.loft.foot,
-      s = at.loft.scale;
-    const cote = svg("g", {transform: `translate(${lx},${ly}) scale(${s})`}, loft.g);
-    svg("rect", {class: "ring", x: -80, y: -180, width: 160, height: 186, rx: 10}, cote);
+    const L = at.loft,
+      roof = L.ground - L.floors * 26 - 14;
+    block(loft.g, L.x, roof, L.w, L.ground - roof + L.deep, rnd, {shade: 2, loggias: [2, 5], aerials: 1});
+    const cx = L.x + L.w / 2;
+    const cote = svg("g", {transform: `translate(${cx},${roof - 4}) scale(${L.scale})`}, loft.g);
     onLoft(cote, dovecote(cote));
-    loft.door = [lx, ly - 150 * s];
-    plaque(loft.g, ...at.loft.plaque, "pigeonhole", t("demo.loft_role"));
+    loft.door = [cx, roof - 4 - 150 * L.scale];
+    plaque(loft.g, L.x + 14, roof + 24, "pigeonhole", t("demo.loft_role"));
+    ring(loft, L.x, roof - 4 - 175 * L.scale, L.w, L.ground);
 
-    // The channels' hutches; the data's sign on its block.
-    if (channels.some(c => c.role === "data")) plaque(town, at.sign.x, at.sign.y, t("demo.group_data"), null);
     cards = new Map(channels.map(c => [c.store, card(c, at.stores.get(c.store), town)]));
-    for (const c of channels) setTotal(c.store, c.total);
 
-    // The ways: you to the node, the node to each channel.
-    edges = new Map([["", svg("path", {class: "edge live", d: arc(at.client.perch, loft.door, at.lift * 0.8)}, routes)]]);
-    for (const c of channels) {
-      const own = c.role !== "data";
-      edges.set(c.store, svg("path", {class: `edge${own ? " own" : ""}`, d: arc(loft.door, cards.get(c.store).door, own ? at.lift * 0.4 : at.lift)}, routes));
-    }
+    // The ways: you to the node, the node to each channel's roof.
+    edges = new Map([["", svg("path", {class: "edge live", d: arc(client.perch, loft.door, lift * 0.8)}, routes)]]);
+    for (const c of channels)
+      edges.set(c.store, svg("path", {class: `edge${c.role === "data" ? "" : " own"}`, d: arc(loft.door, cards.get(c.store).sign, lift * 0.6)}, routes));
   }
 
   const markOpen = target => {
@@ -224,19 +299,22 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   };
   const focus = target => nodeOf(target)?.g.focus();
 
-  function setTotal(store, total) {
+  // A channel's count changed (a post landed, one was deleted): its windows anew.
+  function setTotal(store) {
     const n = cards.get(store);
-    if (!n || total == null) return;
-    n.count.textContent = String(total);
-    n.tip.textContent = t("demo.messages", {n: total});
+    if (n) fill(n, true);
   }
-  const setObjects = n => {
-    if (!client) return;
-    client.sub.textContent = t("demo.objects", {n});
-    client.g.setAttribute("aria-label", `${t("demo.you")}: ${t("demo.objects", {n})}`);
-  };
+  // The channels as the node has them now (the same ones, read again).
+  function setChannels(channels) {
+    for (const c of channels) {
+      const n = cards.get(c.store);
+      if (!n) continue;
+      n.c = c;
+      fill(n, false);
+    }
+  }
 
-  // Repair jobs waiting for a channel ({chunk}), a square each; `title(job)` names one.
+  // Repair jobs waiting for a channel ({chunk}), a square each over its roof; `title(job)` names one.
   function setQueue(store, jobs, title) {
     const q = cards.get(store)?.queue;
     if (!q) return;
@@ -253,16 +331,17 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   // ---- pigeons
   const flights = new Set();
   let lastStart = Promise.resolve();
-  // A pigeon from the loft to a channel (or back), bigger for a bigger
-  // payload; a failed call reaches the channel and turns back. Pigeons
-  // leave 70 ms apart, in the order the node logged them; resolves when
-  // this one lands.
+  // A pigeon from the dovecote into a channel's window (the newest
+  // message's), or out of a lit one back; bigger for a bigger payload. A
+  // failed call reaches the block's next free window and turns back.
+  // Pigeons leave 70 ms apart, in the order the node logged them; resolves
+  // when this one lands. "" is the client's: between your roof and the node.
   function fly(store, {back = false, size = 4096, failed = false} = {}) {
-    const path = edges.get(store);
-    if (!path || reduced) return Promise.resolve();
+    const n = cards.get(store);
+    if (!(n || (store === "" && client)) || reduced) return Promise.resolve();
     const start = lastStart.then(() => sleep(70));
     lastStart = start;
-    const flight = start.then(() => flight1(path, back, size, failed));
+    const flight = start.then(() => flight1(n, back, size, failed));
     flights.add(flight);
     flight.finally(() => flights.delete(flight));
     return flight;
@@ -270,10 +349,26 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   // Every pigeon in the air has landed.
   const landed = () => Promise.all([...flights]);
 
-  function flight1(path, back, size, failed) {
+  // The way for one pigeon: to the window it is after.
+  function way(n, back, failed) {
+    if (!n) return edges.get("");
+    const {count} = contents(n.c);
+    const shown = Math.min(count, n.slots.length - (count > n.slots.length ? n.cols : 0));
+    const i = failed ? shown : back ? Math.floor(Math.random() * Math.max(1, shown)) : shown - 1;
+    return svg("path", {class: "way", d: arc(loft.door, windowAt(n, i), lift)}, air);
+  }
+
+  function flight1(n, back, size, failed) {
     return new Promise(done => {
+      const path = way(n, back, failed),
+        own = n ? path : null;
+      const end = () => {
+        own?.remove();
+        bird.g.remove();
+        done();
+      };
       const len = path.getTotalLength();
-      const scale = (0.5 + Math.min(0.35, Math.log2(1 + size / 4096) / 12)) * (tallNow ? 0.8 : 1);
+      const scale = (0.5 + Math.min(0.35, Math.log2(1 + size / 4096) / 12)) * (el.classList.contains("tall") ? 0.8 : 1);
       const bird = flying(air, {class: `flight${failed ? " failed" : ""}`});
       const t0 = performance.now(),
         dur = Math.min(1400, 450 + len * 1.1);
@@ -283,14 +378,13 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
       const facing = (b.x - a.x) * (back ? -1 : 1) < 0 ? -1 : 1;
       let mark = null;
       const step = now => {
-        // Redrawn under it: the way is gone, so is the pigeon.
-        if (!path.isConnected) {
-          bird.g.remove();
-          done();
+        // Redrawn under it: its place is gone, so is the pigeon.
+        if (!path.isConnected || !air.isConnected) {
+          end();
           return;
         }
         // A soft start and landing.
-        const k = Math.min(1, (now - t0) / dur),
+        const k = Math.max(0, Math.min(1, (now - t0) / dur)),
           e = k - (Math.sin(2 * Math.PI * k) / (2 * Math.PI)) * 0.5;
         const pos = failed ? 0.88 * (1 - Math.abs(1 - 2 * e)) : e;
         const along = len * (back ? 1 - pos : pos),
@@ -303,31 +397,19 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
         const tilt = Math.max(-35, Math.min(35, (Math.atan2(p1.y - p0.y, (p1.x - p0.x) * face) * 180) / Math.PI));
         bird.g.setAttribute("transform", `translate(${pt.x.toFixed(1)},${pt.y.toFixed(1)}) scale(${face * scale},${scale}) rotate(${tilt.toFixed(1)})`);
         // Flapping off and in to land, on a long way gliding a while between.
-        const phase = (now - t0) / 300;
+        const phase = Math.max(0, now - t0) / 300;
         if (dur > 1000 && e > 0.3 && e < 0.72 && Math.floor(phase) % 3) glide(bird);
         else beat(bird, phase % 1);
         if (returning && !mark) mark = svg("circle", {class: "failed-mark", cx: 14, cy: -16, r: 3.4}, bird.g);
         if (k < 1) requestAnimationFrame(step);
-        else {
-          bird.g.remove();
-          done();
-        }
+        else end();
       };
       requestAnimationFrame(step);
     });
   }
 
-  // A hutch's little jump where a pigeon landed (demo.css: .landed), from
-  // the start again for each pigeon.
-  function bump(store) {
-    const n = cards.get(store);
-    if (!n || reduced) return;
-    n.g.classList.add("landed");
-    for (const a of n.body.getAnimations()) {
-      a.cancel();
-      a.play();
-    }
-  }
+  // A pigeon landed: its window lights up as the count comes (setTotal).
+  function bump() {}
 
   // ---- the first boot: nodes and ways come up one by one
   function hideAll() {
@@ -354,5 +436,5 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     }
   }
 
-  return {draw, markOpen, focus, setTotal, setObjects, setQueue, fly, landed, bump, hideAll, reveal, showAll, drawn: () => !!loft};
+  return {draw, markOpen, focus, setTotal, setChannels, setObjects, setQueue, fly, landed, bump, hideAll, reveal, showAll, drawn: () => !!loft};
 }
