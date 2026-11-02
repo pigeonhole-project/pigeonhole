@@ -21,7 +21,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The site counts commits and days from the history.
           fetch-depth: 0
@@ -36,17 +36,17 @@ jobs:
           echo "WASI_SDK=$RUNNER_TEMP/wasi-sdk-25.0-x86_64-linux" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       # Node 22's WASI segfaults on the smoke; 24 runs it.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Build the wasm, smoke it under Node
         run: make web-smoke
       - name: Build the site
         run: python3 site/build.py -o _site
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
@@ -58,4 +58,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
