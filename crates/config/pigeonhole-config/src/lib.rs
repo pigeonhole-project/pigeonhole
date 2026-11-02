@@ -459,6 +459,7 @@ impl Config {
         // In a cluster, this node's own log and snapshots replace [meta]'s;
         // the other nodes' are checked, not opened.
         let me = file.cluster.this_node(&file.node, as_node)?;
+        cluster::check_bots_apart(&file.node, &file.store)?;
         let own = cluster::node_stores(&file.node, me)?;
         if own.log.is_some() {
             file.meta.log = own.log;
@@ -1372,7 +1373,7 @@ rate_per_sec = 20.0
 
     fn tgm_store(id: &str, chat: i64) -> String {
         format!(
-            "[[store]]\nid = \"{id}\"\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_envs = [\"PH_TEST_TGM_TOKEN\"]\n\
+            "[[store]]\nid = \"{id}\"\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_envs = [\"PH_TEST_TGM_TOKEN\"]\nbot_ids = [42]\n\
              api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n"
         )
     }
@@ -1421,7 +1422,7 @@ rate_per_sec = 20.0
                  api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n{extra}"
             )
         };
-        let cfg = load(&store("[\"PH_TEST_TGM_TOKEN\", \"PH_TEST_TGM_TOKEN_2\"]", "")).unwrap();
+        let cfg = load(&store("[\"PH_TEST_TGM_TOKEN\", \"PH_TEST_TGM_TOKEN_2\"]", "bot_ids = [42, 43]\n")).unwrap();
         let inst = cfg.primary_instance().unwrap();
         assert_eq!(inst.bot_tokens, vec!["42:secret".to_string(), "43:other".to_string()]);
         let sessions: Vec<_> = inst.telegram.iter().map(|l| l.session.display().to_string()).collect();
@@ -1473,12 +1474,12 @@ rate_per_sec = 20.0
         assert!(format!("{:#}", load(twice).unwrap_err()).contains("same place"));
 
         // A discord log needs its snapshots in a channel too.
-        set_env("DISCORD_BOT_TOKEN", "discord-test-token");
-        let dc = "[meta]\nlog = \"dc\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\n";
+        set_env("DISCORD_BOT_TOKEN", "MTIzNDU2Nzg5MA.x.y");
+        let dc = "[meta]\nlog = \"dc\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\nbot_ids = [1234567890]\n";
         let err = load_mem(dc).unwrap_err();
         assert!(format!("{err:#}").contains("snapshot is required"), "{err:#}");
-        let both = "[meta]\nlog = \"dc\"\nsnapshot = \"dc-snap\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\n\
-                    [[store]]\nid = \"dc-snap\"\nkind = \"discord\"\nchannel_id = 2\n";
+        let both = "[meta]\nlog = \"dc\"\nsnapshot = \"dc-snap\"\n[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\nbot_ids = [1234567890]\n\
+                    [[store]]\nid = \"dc-snap\"\nkind = \"discord\"\nchannel_id = 2\nbot_ids = [1234567890]\n";
         let cfg = load_mem(both).unwrap();
         assert!(matches!(cfg.meta.log, LogSettings::Discord { ref channel_id, .. } if channel_id == "1"));
         assert!(matches!(cfg.meta.snapshot, SnapshotSettings::Discord { ref channel_id, .. } if channel_id == "2"));
@@ -1559,7 +1560,7 @@ rate_per_sec = 20.0
     #[test]
     fn example_config_loads() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../pigeonhole.toml.example");
-        set_env("BOT_TOKEN", "123:example");
+        set_env("BOT_TOKEN", "7012345678:example");
         set_env("TG_API_ID", "1");
         set_env("TG_API_HASH", "example");
         let cfg = {
@@ -1611,7 +1612,7 @@ rate_per_sec = 20.0
 
     #[test]
     fn parses_discord_store() {
-        set_env("DISCORD_BOT_TOKEN", "discord-test-token");
+        set_env("DISCORD_BOT_TOKEN", "MTIzNDU2Nzg5MA.x.y");
         let cfg = load(
             r#"
 [chunk]
@@ -1620,6 +1621,7 @@ store = "dc"
 id = "dc"
 kind = "discord"
 channel_id = 123456789
+bot_ids = [1234567890]
 max_blob_size = "8 MiB"
 "#,
         )
@@ -1772,7 +1774,7 @@ max_batch_total_size = "8 MiB"
             let err = format!("{:#}", load_mem(bad).unwrap_err());
             assert!(err.contains("decimal units are refused"), "{bad:?}: {err}");
         }
-        set_env("DISCORD_BOT_TOKEN", "discord-test-token");
+        set_env("DISCORD_BOT_TOKEN", "MTIzNDU2Nzg5MA.x.y");
         let dc = "[[store]]\nid = \"dc\"\nkind = \"discord\"\nchannel_id = 1\nmax_blob_size = \"25MB\"\n";
         let err = format!("{:#}", load(&format!("[chunk]\nstore = \"dc\"\n{dc}")).unwrap_err());
         assert!(err.contains("decimal units are refused"), "{err}");
@@ -1857,9 +1859,10 @@ max_batch_total_size = "8 MiB"
         let cluster = "[cluster]\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n\
              bot_token_envs = [\"PH_TEST_RAFT_BOT_A\", \"PH_TEST_RAFT_BOT_B\"]\n\
              api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n";
-        let nodes = "[[node]]\nid = 1\ngrpc = \"10.0.0.1:7001\"\noutbox = -1001\n\
-             [[node]]\nid = 2\ngrpc = \"10.0.0.2:7001\"\noutbox = -1002\n\
-             [[node]]\nid = 3\noutbox = -1003\n";
+        // Each node its own bots; this host's tokens are node 2's, then node 3's.
+        let nodes = "[[node]]\nid = 1\ngrpc = \"10.0.0.1:7001\"\noutbox = -1001\nbot_ids = [71]\n\
+             [[node]]\nid = 2\ngrpc = \"10.0.0.2:7001\"\noutbox = -1002\nbot_ids = [51, 52]\n\
+             [[node]]\nid = 3\noutbox = -1003\nbot_ids = [61, 62]\n";
         let on = |node: u64| load_mem(&format!("{cluster}node = {node}\n{nodes}")).unwrap().cluster.unwrap();
         let two = on(2);
         assert_eq!((two.node, two.id, two.key[0], two.key[31]), (2, 9, 0x00, 0xff));
@@ -1868,7 +1871,14 @@ max_batch_total_size = "8 MiB"
         assert_eq!(logins.iter().map(|l| l.bot_token.as_str()).collect::<Vec<_>>(), ["51:secret", "52:secret"]);
         // A chat link sets the pace of the whole cluster.
         assert_eq!((two.heartbeat, two.election_timeout.0), (Duration::from_secs(10), Duration::from_secs(45)));
+        // Node 2's tokens are not node 3's bots.
+        let err = format!("{:#}", load_mem(&format!("{cluster}node = 3\n{nodes}")).unwrap_err());
+        assert!(err.contains("env PH_TEST_RAFT_BOT_A holds bot 51's token, bot_ids says bot 61"), "{err}");
+        set_env("PH_TEST_RAFT_BOT_A", "61:secret");
+        set_env("PH_TEST_RAFT_BOT_B", "62:secret");
         assert_eq!(on(3).links(), [(1, Link::Chat), (2, Link::Chat)].into());
+        set_env("PH_TEST_RAFT_BOT_A", "51:secret");
+        set_env("PH_TEST_RAFT_BOT_B", "52:secret");
     }
 
     #[cfg(feature = "fake")]
@@ -1902,6 +1912,44 @@ max_batch_total_size = "8 MiB"
     }
 
     #[test]
+    fn every_bot_is_named_by_id_and_each_node_has_its_own() {
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        set_env("PH_TEST_TGM_TOKEN", "42:secret");
+        set_env("PH_TEST_TGM_API_ID", "12345");
+        set_env("PH_TEST_TGM_API_HASH", "hash");
+        let cluster = "[cluster]\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\nnode = 1\n\
+             bot_token_envs = [\"PH_TEST_TGM_TOKEN\"]\n\
+             api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n";
+        let nodes = |one: &str, two: &str| {
+            format!("[[node]]\nid = 1\noutbox = -1001\nbot_ids = {one}\n[[node]]\nid = 2\noutbox = -1002\nbot_ids = {two}\n")
+        };
+        assert!(load_mem(&format!("{cluster}{}", nodes("[42]", "[43]"))).is_ok());
+        for (text, want) in [
+            (format!("{cluster}{}", nodes("[42]", "[42]")), "bot 42 is in the bot_ids of [[node]] 1 and 2"),
+            (format!("{cluster}{}", nodes("[42]", "[]")), "[[node]] 2: bot_ids = [...] is required"),
+            (format!("{cluster}{}", nodes("[44]", "[43]")), "holds bot 42's token, bot_ids says bot 44"),
+            (
+                format!("{cluster}{}{}", nodes("[42]", "[43]"), tgm_store("tg", -5).replace("[42]", "[43]")),
+                "bot 43 is in the bot_ids of [[node]] 2 and of [[store]] tg",
+            ),
+        ] {
+            let err = format!("{:#}", load_mem(&text).unwrap_err());
+            assert!(err.contains(want), "want {want:?} in {err}");
+        }
+        // A store's bots are named too, and two stores may share one.
+        let err = format!("{:#}", load_mem(&tgm_store("tg", -5).replace("bot_ids = [42]\n", "")).unwrap_err());
+        assert!(err.contains("[[store]] tg: bot_ids = [...] is required"), "{err}");
+        let err = format!("{:#}", load_mem(&tgm_store("tg", -5).replace("[42]", "[7]")).unwrap_err());
+        assert!(err.contains("env PH_TEST_TGM_TOKEN holds bot 42's token, bot_ids says bot 7"), "{err}");
+        let two = format!("[meta]\nlog = \"a\"\nsnapshot = \"b\"\n{}{}", tgm_store("a", -6), tgm_store("b", -7));
+        assert!(load_mem(&two).is_ok(), "one bot in two channels");
+        // A Discord token's first part is its bot's id, in base64.
+        assert_eq!(crate::stores::discord_bot_id("MTIzNDU2Nzg5MA.x.y"), Some(1_234_567_890));
+        assert_eq!(crate::stores::telegram_bot_id("7012345678:AAH"), Some(7_012_345_678));
+        assert_eq!(crate::stores::discord_bot_id("not a token"), None);
+    }
+
+    #[test]
     fn one_file_for_the_cluster_each_node_its_own_log() {
         set_env("PH_TEST_CLUSTER_KEY", KEY);
         let file = "[cluster]\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n\
@@ -1910,8 +1958,8 @@ max_batch_total_size = "8 MiB"
              [[node]]\nid = 3\ngrpc = \"c:1\"\n\
              [chunk]\nstore = \"blobs\"\n[[store]]\nid = \"blobs\"\nkind = \"memory\"\n\
              [[store]]\nid = \"disk-1\"\nkind = \"local_disk\"\npath = \"node-1\"\n\
-             [[store]]\nid = \"dc-log-2\"\nkind = \"discord\"\nchannel_id = 21\nbot_token_envs = [\"PH_TEST_NODE2_BOT\"]\n\
-             [[store]]\nid = \"dc-snap-2\"\nkind = \"discord\"\nchannel_id = 22\nbot_token_envs = [\"PH_TEST_NODE2_BOT\"]\n";
+             [[store]]\nid = \"dc-log-2\"\nkind = \"discord\"\nchannel_id = 21\nbot_token_envs = [\"PH_TEST_NODE2_BOT\"]\nbot_ids = [99]\n\
+             [[store]]\nid = \"dc-snap-2\"\nkind = \"discord\"\nchannel_id = 22\nbot_token_envs = [\"PH_TEST_NODE2_BOT\"]\nbot_ids = [99]\n";
         let path = Path::new("pigeonhole.toml");
         assert_eq!(Config::node_ids(file).unwrap(), [1, 2, 3]);
         // Node 1 never reads node 2's bot token: it is on node 2's host.

@@ -75,7 +75,8 @@ function clusterToml(w, nodes) {
   for (const m of nodes) {
     out.push("[[node]]", `id = ${m.node}`);
     if (direct(m.node)) out.push(`grpc = "node-${m.node}:7001"`);
-    if (chat()) out.push(`outbox = -100100000900${m.node}`);
+    // Its own bot on the chat, by id (a fake one here): no two nodes share one.
+    if (chat()) out.push(`outbox = -100100000900${m.node}`, `bot_ids = [${100 + m.node}]`);
     out.push(`log = "${storeId(m.log, m.node)}"`, `snapshot = "${storeId(m.snaps, m.node)}"`, "");
   }
   return out;

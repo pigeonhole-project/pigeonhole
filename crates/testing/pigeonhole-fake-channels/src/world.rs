@@ -44,9 +44,9 @@ fn channel_stores(backing: &FakeBacking) -> Result<Stores> {
     }
 }
 
-/// Fake bot `i`'s name: its budget is shared by every channel it posts to.
-fn fake_bot(i: usize) -> String {
-    format!("fake-bot-{}", i + 1)
+/// Fake bot `id`'s name: its budget is shared by every channel it posts to.
+fn fake_bot(id: u64) -> String {
+    format!("fake-bot-{id}")
 }
 
 /// The store of the log or the snapshots in fake channel `f`, by its id.
@@ -141,11 +141,12 @@ impl World {
         }
     }
 
-    /// One fake bot on Telegram channel `f`, behind the channel's down
-    /// switch: a node's poster and reader of a Raft outbox.
-    pub async fn telegram_bot(&self, cfg: &Config, f: &FakeChannel) -> Result<TelegramBot<TelegramChannel>> {
+    /// Fake bot `bot` on Telegram channel `f`, behind the channel's down
+    /// switch: a node posting to its Raft outbox, or reading another's,
+    /// with its own bot.
+    pub async fn telegram_bot(&self, cfg: &Config, f: &FakeChannel, bot: u64) -> Result<TelegramBot<TelegramChannel>> {
         let channel = self.telegram(&f.scope, &f.backing).await?;
-        let limiter = cfg.chat_limiter(InstanceKind::Telegram, &fake_bot(0), &f.scope);
+        let limiter = cfg.chat_limiter(InstanceKind::Telegram, &fake_bot(bot), &f.scope);
         Ok(TelegramBot::new(channel, limiter, 0).with_switch(self.outage(f.kind, &f.scope)))
     }
 
@@ -153,9 +154,9 @@ impl World {
     /// its own budget (`[telegram.send]` is per bot and chat), as a server's.
     pub async fn telegram_store(&self, cfg: &Config, f: &FakeChannel, info: InstanceInfo) -> Result<TelegramStore> {
         let channel = self.telegram(&f.scope, &f.backing).await?;
-        let bots = (0..f.bots)
-            .map(|i| {
-                let limiter = cfg.chat_limiter(InstanceKind::Telegram, &fake_bot(i), &f.scope);
+        let bots = (f.bot_ids.iter().enumerate())
+            .map(|(i, &id)| {
+                let limiter = cfg.chat_limiter(InstanceKind::Telegram, &fake_bot(id), &f.scope);
                 (
                     TelegramBot::new(channel.clone(), limiter.clone(), i).with_switch(self.outage(f.kind, &f.scope)),
                     limiter,
@@ -176,9 +177,9 @@ impl World {
         info: InstanceInfo,
     ) -> Result<DiscordStore> {
         let channel = self.discord(&f.scope, &f.backing).await?;
-        let bots = (0..f.bots)
-            .map(|i| {
-                let limiter = cfg.chat_limiter(InstanceKind::Discord, &fake_bot(i), &f.scope);
+        let bots = (f.bot_ids.iter().enumerate())
+            .map(|(i, &id)| {
+                let limiter = cfg.chat_limiter(InstanceKind::Discord, &fake_bot(id), &f.scope);
                 (
                     DiscordBot::new(channel.clone(), limiter.clone(), i).with_switch(self.outage(f.kind, &f.scope)),
                     limiter,

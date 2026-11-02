@@ -2,7 +2,8 @@
 //! one process, as the binary runs one per host. Their gRPC links are
 //! openraft-grpc's [`Direct`] (no network in a browser), their chat links
 //! the fake Telegram outboxes, read through pigeonhole-raft-telegram's
-//! mailbox as a server reads real ones. A node can be cut off.
+//! mailbox as a server reads real ones, each node with bots of its own
+//! (`[[node]] bot_ids`, else one each). A node can be cut off.
 
 use crate::World;
 use anyhow::{Context, Result};
@@ -10,11 +11,53 @@ use openraft_chat::{ChatNetwork, FakeChat, Mailbox, Settings};
 use openraft_grpc::{Direct, DirectNetwork, Mixed};
 use pigeonhole_config::cluster::{ClusterSettings, Link};
 use pigeonhole_config::Config;
+use pigeonhole_fake_channels::TelegramChannel;
 use pigeonhole_meta::raft::TypeConfig;
 use pigeonhole_meta::{Cluster, Serve};
 use pigeonhole_raft_telegram::TelegramMailbox;
+use pigeonhole_storage_telegram::fake::bot::FakeBot;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+type Outbox = TelegramMailbox<FakeBot<TelegramChannel>>;
+/// Every node's copy of one outbox.
+type Copies = Arc<Mutex<Vec<Arc<Outbox>>>>;
+/// The outboxes as each node sees them, by `(owner, user)`; and by owner,
+/// every node's copy.
+type Outboxes = (HashMap<(u64, u64), Arc<dyn Mailbox>>, HashMap<u64, Copies>);
+
+/// One outbox as one node sees it, through that node's bot. A post through
+/// any node's copy wakes the readers of the others at once, as Telegram
+/// pushes a new post to every bot in the channel.
+struct Copy {
+    own: Arc<Outbox>,
+    /// Every node's copy of this outbox (this one too).
+    all: Copies,
+}
+
+#[async_trait::async_trait]
+impl Mailbox for Copy {
+    async fn post(&self, frame: bytes::Bytes) -> Result<u64> {
+        let at = self.own.post(frame).await?;
+        for copy in self.all.lock().unwrap().iter() {
+            copy.seen(at as i64);
+        }
+        Ok(at)
+    }
+    async fn read_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, bytes::Bytes)>> {
+        self.own.read_after(after, limit).await
+    }
+    async fn head(&self) -> Result<u64> {
+        self.own.head().await
+    }
+    async fn wait(&self, after: u64, timeout: Duration) {
+        self.own.wait(after, timeout).await;
+    }
+    async fn prune(&self, keep_from: u64) -> Result<()> {
+        self.own.prune(keep_from).await
+    }
+}
 
 /// A node's network: Direct to the nodes it has a gRPC link with, the chat to the rest.
 pub type Network = Mixed<DirectNetwork<TypeConfig>, ChatNetwork<TypeConfig>, u64>;
@@ -22,9 +65,8 @@ pub type Network = Mixed<DirectNetwork<TypeConfig>, ChatNetwork<TypeConfig>, u64
 /// The links between the nodes of one boot.
 pub struct Net {
     direct: Direct<TypeConfig>,
-    /// Each node's outbox, one mailbox for the process: a post wakes its
-    /// readers at once. Made under the lock: the nodes boot at once.
-    outboxes: tokio::sync::Mutex<HashMap<u64, Arc<dyn Mailbox>>>,
+    /// Made under the lock: the nodes boot at once.
+    outboxes: tokio::sync::Mutex<Outboxes>,
 }
 
 impl Default for Net {
@@ -34,23 +76,32 @@ impl Default for Net {
 }
 
 impl Net {
+    /// Node `owner`'s outbox as node `user` sees it: through `user`'s bot.
     async fn outbox(
         &self,
         world: &World,
         cfg: &Config,
         cluster: &ClusterSettings,
-        node: u64,
+        owner: u64,
+        user: u64,
     ) -> Result<Arc<dyn Mailbox>> {
         let mut made = self.outboxes.lock().await;
-        if let Some(m) = made.get(&node) {
+        let (copies, all) = &mut *made;
+        if let Some(m) = copies.get(&(owner, user)) {
             return Ok(m.clone());
         }
-        let channel = cluster.outbox_channel(node).with_context(|| format!("[[node]] {node}: no fake outbox"))?;
-        let bot = world.fakes.telegram_bot(cfg, &channel).await?;
-        let mailbox: Arc<dyn Mailbox> =
-            Arc::new(TelegramMailbox::new(Arc::new(bot)).named(pigeonhole_admin::outbox_store(node)));
-        made.insert(node, mailbox.clone());
-        Ok(mailbox)
+        let channel = cluster.outbox_channel(owner).with_context(|| format!("[[node]] {owner}: no fake outbox"))?;
+        let bot = cluster.nodes.iter().find(|n| n.id == user).and_then(|n| n.bot_ids.first().copied());
+        let bot = bot.with_context(|| format!("[[node]] {user}: no bot"))?;
+        let own = Arc::new(
+            TelegramMailbox::new(Arc::new(world.fakes.telegram_bot(cfg, &channel, bot).await?))
+                .named(pigeonhole_admin::outbox_store(owner)),
+        );
+        let all = all.entry(owner).or_default().clone();
+        all.lock().unwrap().push(own.clone());
+        let copy: Arc<dyn Mailbox> = Arc::new(Copy { own, all });
+        copies.insert((owner, user), copy.clone());
+        Ok(copy)
     }
 
     /// Node `cluster.node`'s side of the cluster, for its tablet.
@@ -71,9 +122,9 @@ impl Net {
         } else {
             let mut peers = HashMap::new();
             for &peer in &via_chat {
-                peers.insert(peer, self.outbox(world, cfg, cluster, peer).await?);
+                peers.insert(peer, self.outbox(world, cfg, cluster, peer, me).await?);
             }
-            ChatNetwork::new(me, settings, self.outbox(world, cfg, cluster, me).await?, peers)
+            ChatNetwork::new(me, settings, self.outbox(world, cfg, cluster, me, me).await?, peers)
         };
         let (hub, serving) = (self.direct.clone(), chat.clone());
         let serve: Serve = Box::new(move |raft| {

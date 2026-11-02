@@ -168,23 +168,32 @@ store = "blobs"
 EOF
 }
 
+# A bot's id from its token (an id is no secret: the config names bots by
+# it, a node checks its tokens against it): a Telegram token's part before
+# ':', a Discord token's first part, in base64.
+tg_bot_id() { echo "${1%%:*}"; }
+dc_bot_id() { local p="${1%%.*}"; while (( ${#p} % 4 )); do p+="="; done; printf '%s' "$p" | base64 --decode; }
+
 # Metadata in the Discord log and snapshot channels; objects in `$1`
 # (telegram | discord).
 write_chats_config() {
   : "${DISCORD_LOG_CHANNEL_ID:?set in .env}" "${DISCORD_SNAP_CHANNEL_ID:?set in .env}"
-  local blobs
+  local blobs DC_BOT_ID
+  DC_BOT_ID="$(dc_bot_id "${DISCORD_BOT_TOKEN:?set in .env}")"
   if [[ "$1" == telegram ]]; then
     : "${TG_BLOBS_CHAT_ID:?set in .env}"
     blobs="id = \"blobs\"
 kind = \"telegram\"
 chat_id = $TG_BLOBS_CHAT_ID
 bot_token_envs = [\"TG_BOT_TOKEN\"]
+bot_ids = [$(tg_bot_id "${TG_BOT_TOKEN:?set in .env}")]
 session = \"$ROOT/.cache/demos/tg.session\""
   else
     : "${DISCORD_BLOBS_CHANNEL_ID:?set in .env}"
     blobs="id = \"blobs\"
 kind = \"discord\"
-channel_id = $DISCORD_BLOBS_CHANNEL_ID"
+channel_id = $DISCORD_BLOBS_CHANNEL_ID
+bot_ids = [$DC_BOT_ID]"
   fi
   cat >"$STATE/pigeonhole.toml" <<EOF
 listen_addr = "$S3_ADDR"
@@ -193,11 +202,13 @@ listen_addr = "$S3_ADDR"
 id = "dc-log"
 kind = "discord"
 channel_id = $DISCORD_LOG_CHANNEL_ID
+bot_ids = [$DC_BOT_ID]
 
 [[store]]
 id = "dc-snap"
 kind = "discord"
 channel_id = $DISCORD_SNAP_CHANNEL_ID
+bot_ids = [$DC_BOT_ID]
 
 [[store]]
 $blobs
