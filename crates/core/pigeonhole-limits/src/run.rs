@@ -58,10 +58,16 @@ pub struct Retry {
 /// How a call failed for good.
 #[derive(Debug)]
 pub enum Failed<E> {
-    /// Still rate limited: the last wait did not fit, or attempts ran out on one.
+    /// Still rate limited: the last wait did not fit, or attempts ran out on
+    /// one. No attempt of the call failed transiently, so none was applied:
+    /// a pool may move the operation to another bot.
     RateLimited { retry_after: Duration, last: E },
-    /// Still failing transiently when the deadline or the attempts ran out.
-    Unavailable { last: E, after: Duration },
+    /// An attempt failed transiently, and the deadline or the attempts ran
+    /// out before one succeeded (`last` may be a rate limit after it). The
+    /// outcome is unknown: the call may have been applied, so it must not
+    /// move to another bot (whose `random_id` / nonce would not
+    /// deduplicate). `elapsed`: since the first attempt.
+    Unavailable { last: E, elapsed: Duration },
     /// The service refused the call ([`Verdict::Fatal`]).
     Fatal(E),
 }
@@ -108,8 +114,11 @@ where
                 if let (Some(limiter), Some(level)) = (limiter, level.or(call.cools)) {
                     limiter.cool(call.spend, level, after);
                 }
-                let give_way = retry.give_way && !pinned;
-                if give_way || last_try || tokio::time::Instant::now() + after >= deadline {
+                let ends = last_try || tokio::time::Instant::now() + after >= deadline;
+                if pinned && ends {
+                    return Err(Failed::Unavailable { last: err, elapsed: started.elapsed() });
+                }
+                if (retry.give_way && !pinned) || ends {
                     return Err(Failed::RateLimited { retry_after: after, last: err });
                 }
                 limited_at = Some(tokio::time::Instant::now());
@@ -120,7 +129,7 @@ where
                 let wait = backoff;
                 backoff = (backoff * 2).min(retry.max_backoff);
                 if last_try || tokio::time::Instant::now() + wait >= deadline {
-                    return Err(Failed::Unavailable { last: err, after: started.elapsed() });
+                    return Err(Failed::Unavailable { last: err, elapsed: started.elapsed() });
                 }
                 warn!(service = call.service, what = call.what, ?wait, error = %err, "call failed; retrying");
                 wait
@@ -299,5 +308,20 @@ mod tests {
         .unwrap();
         assert_eq!((v, tries.load(Ordering::SeqCst)), (7, 3));
         assert!(t0.elapsed() >= Duration::from_secs(40));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limit_after_a_lost_answer_ends_unknown_not_rate_limited() {
+        // Out of attempts, or a wait past the deadline: either way the first
+        // attempt may have landed, so the call is not one a pool may move.
+        for retry in [Retry { attempts: 2, give_way: true, ..RETRY }, Retry { give_way: true, ..RETRY }] {
+            let tries = AtomicU32::new(0);
+            let r = run(None, &CALL, &retry, classify, || {
+                let n = tries.fetch_add(1, Ordering::SeqCst);
+                async move { Err::<(), _>(if n == 0 { E::Lost } else { E::Flood(90) }) }
+            })
+            .await;
+            assert!(matches!(r, Err(Failed::Unavailable { last: E::Flood(90), .. })), "{retry:?}: {r:?}");
+        }
     }
 }

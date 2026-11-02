@@ -57,7 +57,7 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::counter(
         "pigeonhole_pool_calls_total",
         &["chat", "member"],
-        "Operations a pool of bots ran, by the member (0 = the primary) they ran on",
+        "Operations a pool of bots ran (once each, however many attempts), by the member (0 = the primary) they ended on",
     ),
     MetricDoc::counter(
         "pigeonhole_pool_moves_total",

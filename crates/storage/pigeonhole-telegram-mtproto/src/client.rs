@@ -422,8 +422,8 @@ where
     let what = call.what;
     pigeonhole_limits::run(limiter, call, retry, classify, attempt).await.map_err(|f| match f {
         Failed::RateLimited { retry_after, .. } => anyhow::Error::new(RateLimited { method: what, retry_after }),
-        Failed::Unavailable { last, after } => anyhow::Error::new(Unavailable(what.to_string()))
-            .context(format!("{what}: {last} (still failing after {after:?})")),
+        Failed::Unavailable { last, elapsed } => anyhow::Error::new(Unavailable(what.to_string()))
+            .context(format!("{what}: {last} (still failing after {elapsed:?})")),
         Failed::Fatal(err) => map_fatal(what, err),
     })
 }

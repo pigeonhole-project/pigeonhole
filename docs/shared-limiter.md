@@ -154,7 +154,8 @@ may land on another account: this is where the pool spreads load.
 **One exception: a rate limit moves.** A `FLOOD_WAIT` or a 429
 (`Verdict::Wait`) guarantees the call was not applied. So when another
 account of the pool would be ready sooner than the wait, the operation takes
-a new ticket there, with a new `random_id` / nonce, and the first account's
+a new ticket there, with the same `random_id` / nonce (the other account
+never saw it, and the first did not apply it), and the first account's
 bucket stays cooled. Telegram gives a bot a 35–40 s wait every ~18 sends,
 and the log is written one entry after another: without moving, an entry
 would wait that out while another bot is free, and a pool would not give
@@ -162,6 +163,19 @@ would wait that out while another bot is free, and a pool would not give
 moves: the outcome is unknown, and only the same account with the same
 `random_id` deduplicates. A read with per-account handles resolves the
 message again on the new account. (Decided with the user, 2026-10-30.)
+
+**A pinned call never moves.** Once an attempt failed transiently, the
+call is pinned to its account: a rate limit after that is waited out there
+(the member does not give way), and when it does not fit (the attempts or
+the deadline ran out) the call ends `Failed::Unavailable`, an unknown
+outcome, never `Failed::RateLimited`. The services report that as
+`Unavailable`, not `RateLimited`, so the pool hands it up instead of moving:
+another bot's send could post the batch a second time.
+
+**The pool's deadline bounds moves too.** `Pool::run` gives up when the
+next try, here or on another member, would start past its deadline: a move
+to a member ready only after it is not made. `pigeonhole_pool_calls_total`
+counts each operation once, by the member it ended on.
 
 ### Penalties
 

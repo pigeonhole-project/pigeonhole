@@ -3,7 +3,11 @@
 //! ready soonest. When it comes back rate limited (not applied: the member
 //! gave way, see [`Retry::give_way`](crate::Retry::give_way)), it moves to
 //! another member if one is ready before the wait is over, and else waits
-//! it out and runs on the same member again.
+//! it out and runs on the same member again. Only a rate limit moves: a
+//! call whose outcome is unknown (an attempt failed transiently) ends
+//! [`Failed::Unavailable`](crate::Failed::Unavailable) in its member, which
+//! the services do not report as a rate limit. Nothing moves or waits past
+//! the operation's deadline.
 
 use crate::{ChatLimiter, Spend};
 use std::future::Future;
@@ -34,8 +38,9 @@ impl Pool {
         self.members.len()
     }
 
+    /// Never true: [`Self::new`] refuses a pool of no bots.
     pub fn is_empty(&self) -> bool {
-        false
+        self.members.is_empty()
     }
 
     pub fn member(&self, i: usize) -> &Arc<ChatLimiter> {
@@ -55,8 +60,6 @@ impl Pool {
 
     fn picked(&self, i: usize) {
         self.last_picked.lock().unwrap()[i] = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
-        metrics::counter!("pigeonhole_pool_calls_total", "chat" => self.chat.clone(), "member" => i.to_string())
-            .increment(1);
     }
 
     /// Run `op` on a member until it succeeds, fails for good, or stays rate
@@ -92,7 +95,8 @@ impl Pool {
         self.drive(member, None, deadline, rate_limited, op).await
     }
 
-    /// Run from `member`, moving (with `spend` to compare by) or not.
+    /// Run from `member`, moving (with `spend` to compare by) or not. One
+    /// operation: counted once, by the member it ended on.
     async fn drive<T, E, Fut>(
         &self,
         mut member: usize,
@@ -105,26 +109,30 @@ impl Pool {
         Fut: Future<Output = Result<T, E>>,
     {
         let give_up = Instant::now() + deadline;
-        loop {
+        let result = loop {
             self.picked(member);
             let err = match op(member).await {
-                Ok(v) => return Ok(v),
+                Ok(v) => break Ok(v),
                 Err(e) => e,
             };
-            let Some(after) = rate_limited(&err) else { return Err(err) };
+            let Some(after) = rate_limited(&err) else { break Err(err) };
+            let now = Instant::now();
             if let Some((other, ready)) = moves.and_then(|spend| self.pick(spend, Some(member))) {
-                if ready < after {
+                if ready < after && now + ready < give_up {
                     metrics::counter!("pigeonhole_pool_moves_total", "chat" => self.chat.clone()).increment(1);
                     tracing::debug!(chat = %self.chat, from = member, to = other, ?after, "rate limited: moving to another bot");
                     member = other;
                     continue;
                 }
             }
-            if Instant::now() + after >= give_up {
-                return Err(err);
+            if now + after >= give_up {
+                break Err(err);
             }
             tokio::time::sleep(after).await;
-        }
+        };
+        metrics::counter!("pigeonhole_pool_calls_total", "chat" => self.chat.clone(), "member" => member.to_string())
+            .increment(1);
+        result
     }
 }
 
@@ -217,6 +225,80 @@ mod tests {
             .unwrap();
         assert_eq!((ran_on, tries), (0, vec![0, 0]), "b is cooled for longer than a's 10 s");
         assert!(t0.elapsed() >= Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_of_unknown_outcome_never_moves() {
+        use crate::{Call, Failed, Retry, Verdict};
+        const CALL: Call = Call { service: "test", what: "send", spend: Spend::Class(SEND), cools: Some(Level::Class) };
+        let retry = Retry {
+            deadline: Duration::from_secs(60),
+            attempts: 2,
+            backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(16),
+            give_way: true,
+        };
+        #[derive(Debug)]
+        enum Answer {
+            Lost,
+            Flood(u64),
+        }
+        impl std::fmt::Display for Answer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{self:?}")
+            }
+        }
+        let classify = |e: &Answer| match e {
+            Answer::Flood(secs) => Verdict::Wait { after: Duration::from_secs(*secs), level: None },
+            Answer::Lost => Verdict::Transient,
+        };
+        let rate_limited = |f: &Failed<Answer>| match f {
+            Failed::RateLimited { retry_after, .. } => Some(*retry_after),
+            _ => None,
+        };
+        let reg = registry();
+        let pool = Pool::new("-1", vec![reg.chat("a", "-1"), reg.chat("b", "-1")]);
+        let ran = std::sync::Mutex::new(Vec::new());
+        let r = pool
+            .run(Spend::Class(SEND), Duration::from_secs(300), rate_limited, |m| {
+                let ran = &ran;
+                let limiter = pool.member(m).clone();
+                async move {
+                    crate::run(Some(&limiter), &CALL, &retry, classify, || {
+                        let mut ran = ran.lock().unwrap();
+                        ran.push(m);
+                        let answer = if ran.len() == 1 { Answer::Lost } else { Answer::Flood(40) };
+                        async move { Err::<usize, _>(answer) }
+                    })
+                    .await
+                }
+            })
+            .await;
+        assert!(matches!(r, Err(Failed::Unavailable { last: Answer::Flood(40), .. })), "{r:?}");
+        assert_eq!(*ran.lock().unwrap(), vec![0, 0], "the flood after a lost answer stayed on the first bot");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_move_past_the_deadline_is_not_made() {
+        let reg = registry();
+        let pool = Pool::new("-1", vec![reg.chat("a", "-1"), reg.chat("b", "-1")]);
+        pool.member(1).cool(Spend::Class(SEND), Level::Class, Duration::from_secs(50));
+        let mut tries = Vec::new();
+        let t0 = Instant::now();
+        let r = pool
+            .run(
+                Spend::Class(SEND),
+                Duration::from_secs(30),
+                |e: &u64| Some(Duration::from_secs(*e)),
+                |m| {
+                    tries.push(m);
+                    attempt(&pool, m, Some(100))
+                },
+            )
+            .await;
+        assert_eq!(r, Err(100));
+        assert_eq!(tries, vec![0], "b is ready in 50 s, past the 30 s deadline");
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
     }
 
     #[tokio::test(start_paused = true)]
