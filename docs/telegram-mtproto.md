@@ -114,7 +114,7 @@ chat_id = -1001234567890
   the horizon with `channels.getMessages` and keeping only documents named
   `ph-<32 hex>.bin`; `can_list = true`. Update sweep-invariants.md: this
   backend, like Discord, never deletes what is not ours.
-- `BackendLimits::telegram_mtproto()`: `max_blob_size` = what the chunk store
+- `BackendLimits::telegram()` (planned as `telegram_mtproto()`): `max_blob_size` = what the chunk store
   allows (`MAX_LOGICAL_CHUNK`, 256 MiB) or less if the spike shows a lower
   bot limit; exact range support.
 - Rate limits: `FLOOD_WAIT_X` becomes the shared rate-limited error (see
@@ -150,7 +150,7 @@ batches it replays; the document repeats them and a mismatch is `Lost`.
 
 - `Claim { log_id, gen }`
 - `Batch { log_id, gen, prev, base, vote, head_term, first, entries }` — as
-  `LogDoc` today; `prev` links the previous batch of the chain (for the first
+  `LogDoc` was then (now `ChainDoc`, chain-log.md); `prev` links the previous batch of the chain (for the first
   batch of a generation, its zero entry: the previous head, and it names its
   own claim).
 

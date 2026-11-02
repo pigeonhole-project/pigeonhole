@@ -184,7 +184,16 @@ Everything else: [cluster.md](docs/cluster.md).
 | Object tagging, user metadata, Content-MD5 / CRC32 checks | yes |
 | Presigned URLs / ACLs / versioning | no |
 
-One access key pair, no ACLs: a single tenant.
+## Limitations
+
+- **A single tenant**: one access key pair, no ACLs.
+- **One process per log.** A process booting on the same `[meta] log`
+  claims a newer generation and fences the running one, which exits. A
+  `local_disk` log fences only processes on the same host.
+- **Blobs are bot-bound.** A Telegram store's fingerprint includes its
+  primary bot, so changing that bot is refused at startup.
+- **No TLS or auth between nodes** beyond the HMAC on Raft frames, and no
+  auth on the admin API: keep both on a private network or loopback.
 
 ## Development
 
