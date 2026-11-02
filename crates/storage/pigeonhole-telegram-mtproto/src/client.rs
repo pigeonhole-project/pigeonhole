@@ -157,7 +157,7 @@ impl TelegramMtproto {
 
     /// [`Self::connect`], keeping the updates Telegram pushes to this
     /// session (both connection pools merged into one receiver), and asking
-    /// for them (`updates.getState`). For docs/raft-over-chat.md: a channel's
+    /// for them (`updates.getState`). For docs/cluster.md: a channel's
     /// new posts arrive as `updateNewChannelMessage`.
     pub async fn connect_with_updates(cfg: &MtprotoConfig) -> Result<(Self, UpdatesRx)> {
         let (this, rxs) = Self::open(cfg, true).await?;

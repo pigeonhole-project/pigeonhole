@@ -1,7 +1,8 @@
 # Deterministic simulation (madsim)
 
-Status: **implemented** (steps 0–5; scenarios 4 and 5 left); spike findings
-below. Read [fault-injection.md](fault-injection.md) first: this
+Status: **implemented** (steps 0–5; scenario 4 left, 5 in part: a
+three-node Raft cluster over a fake chat, `tests/cluster.rs`); spike
+findings below. Read [fault-injection.md](fault-injection.md) first: this
 design takes its fault model and decorator and makes the rest of the run —
 task order, time, randomness, crashes — reproducible from one seed too.
 
@@ -135,8 +136,13 @@ replayed with `MADSIM_TEST_SEED`.
 4. **Snapshots and restore**: crashes while a snapshot is stored, while the
    log is rebased, after the old snapshot is removed; boot always finds the
    snapshot its log names; `restore --lossy` after a lost log.
-5. Later, **Raft between nodes** over madsim's network: partitions, a slow
-   node's store, leader changes (the step that motivates the most).
+5. **Raft between nodes**: partitions, a slow node's store, leader changes
+   (the step that motivates the most). Done in part: `cluster.rs` runs three
+   tablets as one cluster over openraft-chat's `FakeChat` (not madsim's
+   network) that delays (`set_delay`), loses (`set_loss`) and doubles
+   (`set_duplication`) posts while one node at a time is cut off and healed
+   (`isolate`); every command a leader acknowledged survives and the nodes
+   end up equal. A slow node's store is not covered yet.
 
 ## Build and CI
 
@@ -179,9 +185,12 @@ intercepts entropy).
 - openraft runs on `MadsimRuntime` (`pigeonhole-meta/src/sim_runtime.rs`).
 - Gated out under `cfg(madsim)`: the REAPI ephemeral server and its tests,
   the binary, one test that builds its own runtime.
-- Scenarios 1–3 are in `crates/testing/pigeonhole-sim/tests` (`log_model`,
-  `takeover`, `disk`, `s3_stress`); processes are tasks on one node so far,
-  crashes are dropped handles plus `SimFs::crash`.
+- Scenarios are in `crates/testing/pigeonhole-sim/tests`: 1–3 in
+  `log_model`, `takeover`, `disk`, `s3_stress`; `retention` (a takeover,
+  then the newest base's snapshot damaged: a third boot replays from an
+  older base, [log-retention.md](log-retention.md)); `cluster` (scenario 5
+  in part). Processes are tasks on one madsim node, crashes are dropped
+  handles plus `SimFs::crash`.
 
 ## Spike findings (2026-10-29, madsim 0.2.34, madsim-tokio 0.2.30, macOS arm64)
 
@@ -252,8 +261,9 @@ where entropy is intercepted, and add Linux with the patched `getrandom`.
   openraft's own `tokio::select!` and `tokio::sync` are linked from plain
   tokio. Is madsim's tokio fork via `[patch.crates-io]` needed, and does it
   keep the normal build identical?
-- **macOS**: does the simulation build and run on macOS as on Linux, or is it
-  a Linux-only CI job?
+- **macOS**: answered: the CI job runs on macOS (`macos-latest` in
+  `.github/workflows/ci.yml`), where madsim makes entropy deterministic by
+  symbol overrides; on Linux the `getrandom` syscall is not intercepted.
 - **Maintenance**: every new dependency that does I/O must have a sim story;
   is a CI job that fails on such a dependency enough?
 - **turmoil instead** for the multi-node network later? It simulates hosts

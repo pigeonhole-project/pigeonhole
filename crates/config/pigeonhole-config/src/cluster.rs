@@ -1,5 +1,5 @@
 //! `[cluster]` and `[[node]]`: the metadata tablet as one node of a Raft
-//! cluster (docs/raft-over-chat.md § Transports). Without them a process is
+//! cluster (docs/cluster.md § Transports). Without them a process is
 //! a cluster of one.
 //!
 //! Every node runs with the same `[cluster]` and `[[node]]` list (and the
@@ -226,7 +226,7 @@ pub(crate) fn node_stores(nodes: &[FileNode], me: Option<u64>) -> Result<NodeSto
 }
 
 /// Timing for the slowest link: heartbeat, election timeout, tick, poll
-/// (docs/raft-over-chat.md § Timing).
+/// (docs/cluster.md § Timing).
 struct Timing(Duration, (Duration, Duration), Duration, Duration);
 
 const fn ms(n: u64) -> Duration {

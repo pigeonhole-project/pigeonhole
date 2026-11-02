@@ -1,38 +1,40 @@
 # A shared limiter: budgets in levels, a pool of bots, sticky retries
 
-Status: **design**; the spike is done (§ Spike findings: send limits are
-per bot on both services). Nothing else is implemented yet. Read
-[bench-discord-vs-telegram.md](bench-discord-vs-telegram.md) (what limits
-us today) and [telegram-mtproto.md](telegram-mtproto.md) (the order fence,
+Status: **implemented**: steps 1–5 of § Plan (plans taken at once, one
+retry loop, pools of bots, the bench); step 6 waits for a need. Read
+[bench/discord-vs-telegram.md](bench/discord-vs-telegram.md) (what limited
+us on 2026-10-29) and [telegram-mtproto.md](telegram-mtproto.md) (the order fence,
 which does not care which bot posts) first.
 
 ## Why
 
-Today every chat service call is paced by `pigeonhole-limits`: a
-`ChatLimiter` per (bot, chat), with a bucket per class of call (send, info,
-get_file, delete), and a `BotLimiter` per bot that all its chats share. It
-works for one bot per store. It does not take us further:
+Before this work every chat service call was paced by `pigeonhole-limits`:
+a `ChatLimiter` per (bot, chat), with a bucket per class of call (send,
+info, get_file, delete), and a `BotLimiter` per bot that all its chats
+shared. It worked for one bot per store. It did not take us further:
 
-- **One bot per store.** A store has one `bot_token_env`, so a channel's send
-  budget is one bot's (~20 messages a minute on Telegram, 5 per 5 s on
-  Discord). The log's 3.3 s per entry on Telegram is exactly that budget
-  (`send_rate_per_sec = 0.3`), not the network. Two stores on one chat are
-  refused ("same place"), so a second bot cannot help.
+- **One bot per store.** A store had one `bot_token_env`, so a channel's
+  send budget was one bot's (~20 messages a minute on Telegram, 5 per 5 s
+  on Discord). The log's 3.3 s per entry on Telegram was exactly that
+  budget (`send_rate_per_sec = 0.3`), not the network. Two stores on one
+  chat are refused ("same place"), so a second bot could not help. Now a
+  store takes `bot_token_envs`, a pool of bots (§ Choosing the account).
 - **Wired by hand.** Each method of `MtprotoChannel` and `DiscordClient`
-  calls `acquire_*` and `penalize_*` itself; a new call gets no limit unless
-  someone remembers it. Discord's thread `Pacer` is a separate mechanism.
-- **Buckets are taken one after another.** `ChatLimiter::take` waits for the
-  chat bucket, takes its token, then waits for the bot's. A call that then
-  waits on the bot holds a chat token nobody else can use, and the order of
-  waiting is not the order of calls.
+  called `acquire_*` and `penalize_*` itself; a new call got no limit unless
+  someone remembered it. Discord's thread `Pacer` is still a separate
+  mechanism.
+- **Buckets were taken one after another.** `ChatLimiter::take` waited for
+  the chat bucket, took its token, then waited for the bot's. A call that
+  then waited on the bot held a chat token nobody else could use, and the
+  order of waiting was not the order of calls.
 - **Nothing above the bot.** Several bots in one process share one IP, and
   some limits are per IP: Cloudflare in front of Discord bans an address
   after 10 000 invalid requests in 10 minutes, whatever the token; Telegram
   limits connections and logins per address. Neither is a rate of calls,
   and neither has been seen yet, so the model leaves them out until a live
   run shows one (§ Levels and buckets).
-- **Bound to this program.** The classes are ours (send / info / get_file /
-  delete for a channel used as storage). A bot that talks to people needs
+- **Bound to this program.** The classes were ours (send / info / get_file
+  / delete for a channel used as storage). A bot that talks to people needs
   others (private chats, edits, callback answers) and could not reuse it.
 
 The goal: **one limiter for the process**. Each call takes its budget from
@@ -231,7 +233,8 @@ pigeonhole_limits::run(Some(&limiter), &call, &RETRY, classify, || attempt()).aw
 
 `run` takes the call's tokens before each attempt, asks `classify`, cools
 on a rate limit and retries within `Retry` (a deadline, attempts, a
-backoff). Step 4 puts a pool in front of it:
+backoff). Step 4 put a pool in front of it (the sketch below is the
+design; the pool's operation is `Pool::run`, § Choosing the account):
 
 ```rust
 let mut ticket = pool.begin(&call).await;          // picks the bot, takes its plan
@@ -266,9 +269,9 @@ burst = 3.0
 ```
 
 Unset values keep the service's defaults; a class the service does not have
-is refused. Step 4 adds `bot_token_envs` to a `[[store]]` (a list; one
-entry is today's `bot_token_env`) and with it the pool. Two stores on one
-chat stay refused: one store, many bots.
+is refused. A `[[store]]` takes `bot_token_envs` (a list, the primary
+first; default `["BOT_TOKEN"]` / `["DISCORD_BOT_TOKEN"]`), and with it the
+pool (step 4). Two stores on one chat stay refused: one store, many bots.
 
 ## Metrics
 
@@ -278,7 +281,9 @@ chat stay refused: one store, many bots.
   service asked for (exists).
 - `pigeonhole_limiter_retry_wait_seconds{service, method}`: the wait of a
   retry after a penalty, until its next attempt (§ Fairness).
-- `pigeonhole_pool_calls_total{store, account}`: how the pool spreads load.
+- `pigeonhole_pool_calls_total{chat, member}`: how the pool spreads load.
+- `pigeonhole_pool_moves_total{chat}`: operations moved to another bot
+  after a rate limit.
 
 ## Spike findings (2026-10-30)
 
@@ -286,7 +291,7 @@ Two bots per service, admins of the blobs test channel, the same host and
 IP. Each bot posted text messages one after another, as fast as the server
 let it: first one bot alone, then both at once. Our own limits were set far
 above the server's. Everything was deleted afterwards
-(`crates/storage/pigeonhole-storage-telegram/tests/spike_bots.rs`,
+(`crates/storage/pigeonhole-telegram-mtproto/tests/spike_bots.rs`,
 `scripts/spike-discord-bots.py`).
 
 | | one bot | two bots at once | channel total |
@@ -352,7 +357,7 @@ until the round trip (~0.3–0.5 s per send) is what is left.
 ## Bench (2026-10-31)
 
 `BENCH_BOTS=2 ./scripts/bench.sh telegram discord` (the workload of
-[bench-discord-vs-telegram.md](bench-discord-vs-telegram.md), default
+[bench/discord-vs-telegram.md](bench/discord-vs-telegram.md), default
 limits), one machine on AC power under `caffeinate` (a run on battery was
 spoiled by macOS Maintenance Sleep: 15-minute gaps, then timeouts, and a
 Discord lease running out). Raw data: [bench/2026-10-31-pool](bench/2026-10-31-pool/);
@@ -380,7 +385,9 @@ Telegram's one-bot numbers are those of 2026-10-29 (a one-bot run on
 - **32 MiB PUTs over Telegram answered 500 on a slow link**
   (`UploadStreamError: error reading a body from connection`, the client's
   connection gone ~15 s into the first chunk's upload), on main as often as
-  with the pool (4 vs 4 in interleaved runs): not the pool's, open.
+  with the pool (4 vs 4 in interleaved runs): not the pool's. Fixed by the
+  ingest pipeline (ed5114d): a PUT reads its body while sealed chunks
+  upload, so the client's send no longer times out.
 
 ## Open questions
 

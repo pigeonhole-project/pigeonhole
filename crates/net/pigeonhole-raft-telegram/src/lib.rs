@@ -1,4 +1,4 @@
-//! A node's Raft outbox in a Telegram channel (docs/raft-over-chat.md §
+//! A node's Raft outbox in a Telegram channel (docs/cluster.md §
 //! Topology): openraft-chat's [`Mailbox`] over the store's `ChannelApi`,
 //! the binary's real channels and the demo's fake ones alike.
 //!

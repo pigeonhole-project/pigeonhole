@@ -1,6 +1,6 @@
 //! `GET /_pigeonhole/leader` on the S3 port: whether this node leads its
 //! tablet's cluster. 200 on the leader, 503 elsewhere, so a load balancer's
-//! health check sends clients to the leader (docs/raft-over-chat.md §
+//! health check sends clients to the leader (docs/cluster.md §
 //! Clients). A bucket can't be named `_pigeonhole`: no S3 request lands here.
 
 use axum::extract::State;

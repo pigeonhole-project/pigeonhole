@@ -14,15 +14,22 @@ Terms used in code, comments, and docs (Stage B onward).
 | **Extent** | `(chunk, offset, len)` — logical byte range in a chunk | ≤ chunk | immutable | chunk-store type; held by gateways |
 | **Extent list** | Ordered extents = object bytes | any | replaced as a whole | gateways |
 | **Object** | Gateway entity: S3 object, `CasEntry`, Kafka segment | any | per protocol | gateways |
-| **Tablet** | The metadata state machine: commands → `LogStore` → in-memory `StateMachine`s (`MetaStore`) | — | one active incarnation | `pigeonhole-meta` |
-| **LogStore** | Fencing command log the tablet appends batches to (`local_disk`, `memory`, `telegram`: a channel fenced by the order of message ids) | — | append-only, collected behind its base | `pigeonhole-meta` |
+| **Tablet** | The metadata state machine: commands → `LogStore` → in-memory `StateMachine`s (`MetaStore`) | — | one active incarnation (in a cluster: a copy per node, only the Raft leader writes) | `pigeonhole-meta` |
+| **LogStore** | Fencing command log the tablet appends batches to (`local_disk`, `memory`, `telegram`: a channel fenced by the order of message ids, `discord`: a channel fenced by threads or a lease); one `ChainLogStore` over a **Chain** | — | append-only, collected behind its base | `pigeonhole-meta` |
+| **Chain** | A store's capability to link blobs: of several put after one `prev`, exactly one wins ([chain-log.md](chain-log.md)) | — | links final once won | `Chain` impl per store |
+| **Lease** | A Discord log's hold on its chain for `[meta] lease` (default 45 s): lease records are linked by threads, batches between them are plain posts ([discord-lease.md](discord-lease.md)) | — | renewed while held | `pigeonhole-meta` (`log::chain`) |
 | **Generation** | Number of a tablet incarnation; a newer claim fences every older one (`Fenced`) | u64 | strictly increasing | `LogStore` |
 | **Position** | Index of an entry in the log (1, 2, …) | u64 | — | tablet |
-| **Blob id** | Our id of a blob (`BlobId`), chosen before upload and sent as its file name `ph-<hex>.bin` | 128 bit | immutable | chunk store |
+| **Blob id** | Our id of a blob (`BlobId`), chosen before upload and sent as its file name `ph-<hex>.bin`; the top 32 bits are the **owner** | 128 bit | immutable | chunk store |
+| **Owner** | A deployment's 32 random bits, chosen once and kept in the tablet; in every blob id it mints and in a marker pinned in each channel store, so two deployments never sweep each other's blobs ([store-owner.md](store-owner.md)) | u32 | fixed | tablet + chunk store |
+| **Inline object** | An object of at most `[inline] max_object_size` kept in its metadata record instead of chunks; the cooler moves it out once cold ([inline-objects.md](inline-objects.md)) | ≤ 1 KiB default | until cooled | S3 gateway + tablet |
 | **Upload pin** | Process-local mark of an upload not committed yet; with the others it sets the sweep **horizon** | — | until commit | `UploadPins` |
 | **Read pin** | Process-local mark of a chunk being read; reclaim waits for it | — | for one read | `BlobDb` |
-| **Snapshot** | All namespace states as of a position (`TabletSnapshot`), kept in a **SnapshotStore** (`local_disk`, `memory`, `telegram`) | state size | replaced | tablet |
+| **Snapshot** | All namespace states as of a position (`TabletSnapshot`), kept in a **SnapshotStore** (`local_disk`, `memory`, `telegram`, `discord`) | state size | replaced | tablet |
 | **Base** | The stored snapshot a log starts from (`at` + `SnapshotRef`), set by `rebase`; entries ≤ `at` are dropped | — | moves forward | `LogStore` |
+| **Node** | One process of a Raft cluster, with its own copy of the tablet (its own log and snapshots) and the shared blob stores ([cluster.md](cluster.md)) | — | config | binary |
+| **Leader** | The node Raft elected: the only one that writes, serves S3 and runs background work (`MetaStore::is_leader`) | — | per term | openraft |
+| **Outbox** | A node's own channel, where it posts its Raft frames for the nodes that read it over the chat ([cluster.md](cluster.md)) | — | append-only | `openraft-chat` |
 | **Zero entry** | Empty batch appended on boot: proves the claim and starts the generation | 0 entries | immutable | tablet |
 
 In code, **blob** means only a physical backend message. REAPI CAS “blobs” in the gateway are `CasEntry`.

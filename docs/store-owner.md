@@ -9,7 +9,8 @@ other's blobs for its own garbage and delete them.
 
 A deployment chooses an `Owner` (32 random bits) when its metadata first
 starts, and keeps it in the tablet (`ChunkCommand::SetOwner`: it survives
-snapshots and a lossy restore). Every `BlobId` it mints carries the owner
+snapshots and a lossy restore). A cluster is one deployment: its nodes
+share the tablet, so they share one owner. Every `BlobId` it mints carries the owner
 in its top 32 bits, so a blob's name tells whose it is
 (`ph-<owner 8 hex><24 hex>.bin`). `BlobBackend::candidates` takes the owner
 and returns only its blobs: a sweep never sees another deployment's.
@@ -20,8 +21,9 @@ are `Owner(0)`'s.
 
 That keeps blobs safe, not budgets: two deployments on one channel still
 share its rate limits, quietly. So a store is also marked, and a
-deployment refuses a store marked for another (`ChunkStore::open_replicated`,
-read-write members only):
+deployment refuses a store marked for another (`check_owner`, read-write
+members only). The leader does it in `ChunkStore::take_over`: on boot when
+it leads, and on every gain of leadership ([cluster.md](cluster.md)):
 
 - **Telegram, Discord**: a message `owner-<8 hex>.bin`, pinned. A start
   reads the pin: a marker → whose it is; none (or something else pinned)

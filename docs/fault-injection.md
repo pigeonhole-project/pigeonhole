@@ -53,8 +53,9 @@ must never break an invariant, the second must be reported (an error, a
 
 ## The decorator
 
-A new test-only crate, `testing/pigeonhole-faults` (role `testkit`, never a
-dependency of the binary):
+Test-only, in `testing/pigeonhole-sim` (`pigeonhole_sim::faults`, role
+`testkit`, never a dependency of the binary; planned as a crate
+`pigeonhole-faults` of its own, § Implementation):
 
 ```rust
 /// `B` with faults injected from `plan`; every injected fault is recorded.
@@ -138,7 +139,7 @@ Each step ends with `cargo test --workspace` and
 `./scripts/check-deps.sh --strict` green; bugs the faults find are fixed in
 commits of their own, each with the seed that found it as a regression case.
 
-1. **`pigeonhole-faults`**: `Faulty<B>`, `FaultPlan`, `FaultLog`, counter-based
+1. **`pigeonhole_sim::faults`** (planned as `pigeonhole-faults`): `Faulty<B>`, `FaultPlan`, `FaultLog`, counter-based
    draws; unit tests that each fault does what it says (late landing really
    lands, a lost blob is gone, the same seed draws the same faults).
 2. **Log**: conformance under faults (memory, disk) and the model check; the
@@ -177,20 +178,14 @@ one).
 
 ## Open questions
 
-Settled: interleavings are fixed by the simulator; data blocks carry a crc;
-faults stay test-only (no config knob in the binary); counts, not seconds
-(virtual time makes delays reproducible anyway).
+All settled:
 
-- **Determinism of interleavings.** Seeds fix the faults, not the schedule of
-  a multi-threaded runtime. A current-thread runtime with paused time
-  (`tokio::time::pause`) makes most tests deterministic; `sweep_stress` uses
-  four workers. Accept "same faults, maybe another interleaving", or move the
-  stress test to a simulator (madsim / turmoil) later?
-- **Corrupted data blobs.** Chunk reads trust the backend's bytes (the chunk's
-  `crc32` covers stored lengths and codecs, not data). Add a crc per block
-  (in `StoredBlock`, a `VERSION` bump) so a damaged replica is detected and
-  read around? The fault test would make that a requirement.
-- **Faults in the binary**: a `[[store]] faults = "seed=…,put.fail_after=0.01"`
-  for manual chaos runs against S3 clients, or keep it test-only?
-- **Time-based faults** (outages in seconds) vs counts (after the n-th op):
-  counts are reproducible, seconds are realistic; support both?
+- **Interleavings** are fixed by the simulator: madsim, not turmoil
+  ([simulation.md](simulation.md)); `sweep_stress` runs there too
+  (`s3_stress`).
+- **Corrupted data blobs**: every `StoredBlock` carries the crc32 of its
+  stored bytes; a damaged replica is detected and read around (§ Fault
+  model).
+- **Faults in the binary**: none; faults stay test-only (no config knob).
+- **Time-based faults**: counts, not seconds; virtual time makes delays
+  reproducible anyway.

@@ -8,7 +8,8 @@ and [glossary.md](glossary.md) first.
 
 ## Why
 
-Two things hurt in the Bot API backend (`storage/pigeonhole-storage-telegram`,
+Two things hurt in the Bot API backend (since removed; it lived in
+`storage/pigeonhole-storage-telegram`, a name the MTProto store has now, and
 `bin/pigeonhole/src/telegram_log.rs`):
 
 1. **No way to read a message by id or to list a chat.** The sweeper treats
@@ -41,14 +42,18 @@ Rejected alternatives:
 
 ## Scope
 
-- New crate `storage/pigeonhole-storage-telegram-mtproto`, new
-  `InstanceKind::TelegramMtproto`, `kind = "telegram_mtproto"`. The Bot API
-  backend stays as is (comparison, mixed replicas).
+- Two crates: the client `storage/pigeonhole-telegram-mtproto` (login,
+  sessions, connection pools, `invoke`) and the store
+  `storage/pigeonhole-storage-telegram` (`ChannelApi`, the blob store, the
+  chain); `InstanceKind::Telegram`, `kind = "telegram"`. The design kept the
+  Bot API backend beside it (comparison, mixed replicas), as
+  `kind = "telegram_mtproto"`; the Bot API backend has been removed since and
+  this one renamed.
 - MTProto library: [grammers](https://github.com/Lonami/grammers) (pure Rust,
   tokio, raw `invoke` for any TL function). Pin the exact version; it is pre-1.0.
 - A new chat log over MTProto with no pins and no description: the fence is
-  the order of messages in the channel (below). It needs range reads, so the
-  Bot API `ChatLogStore` cannot use it (see Open questions).
+  the order of messages in the channel (below). It needs range reads, which
+  the Bot API never had. Now the chain log ([chain-log.md](chain-log.md)).
 - Only channels / supergroups are accepted: there message ids are per chat and
   dense. In basic groups and private chats ids are a per-account counter, and
   an id-range sweep would hit other chats' ids. Check the peer type at startup.
@@ -59,8 +64,8 @@ Rejected alternatives:
 
 ```toml
 [[store]]
-id = "tgm-main"
-kind = "telegram_mtproto"
+id = "tg-main"
+kind = "telegram"
 chat_id = -1001234567890
 # bot_token_envs = ["BOT_TOKEN"]   # default; several bots: docs/shared-limiter.md
 # api_id_env = "TG_API_ID"         # my.telegram.org, in .env
@@ -72,11 +77,15 @@ chat_id = -1001234567890
   and snapshots. The session file is only a cache of the auth key and DC: if it
   is missing, log in again with the token (no interaction). Take an exclusive
   `flock` on it so two processes never share one session.
-- Ignore updates (no catch-up, no update loop work).
+- The store ignores updates (no catch-up, no update loop work). The binary
+  connects with updates on (`TelegramMtproto::connect_with_updates`) and
+  hands the posts Telegram pushes (`new_channel_posts`) to whoever waits for
+  a channel's (`channel_log::on_post` in `crates/bin/pigeonhole`): the Raft
+  outboxes ([cluster.md](cluster.md)).
 - Resolve `chat_id` to `InputPeerChannel { channel_id, access_hash }` once at
   startup; check the bot is an admin with post and delete rights.
-- Fingerprint `tgm:{bot_id}:{channel_id}`, location `tg:chat:{chat_id}` (same
-  location as the Bot API backend: one chat must not get two writers).
+- Fingerprint `tg:{bot_id}:{chat_id}`, location `tg:chat:{chat_id}`: one
+  chat must not get two writers (two stores on one chat are refused).
 
 ### Blob backend
 
@@ -105,7 +114,7 @@ chat_id = -1001234567890
   the horizon with `channels.getMessages` and keeping only documents named
   `ph-<32 hex>.bin`; `can_list = true`. Update sweep-invariants.md: this
   backend, like Discord, never deletes what is not ours.
-- `BackendLimits::telegram_mtproto()`: `max_blob_size` = what the chunk store
+- `BackendLimits::telegram()` (planned as `telegram_mtproto()`): `max_blob_size` = what the chunk store
   allows (`MAX_LOGICAL_CHUNK`, 256 MiB) or less if the spike shows a lower
   bot limit; exact range support.
 - Rate limits: `FLOOD_WAIT_X` becomes the shared rate-limited error (see
@@ -123,7 +132,8 @@ store reports by type (`NotFound`, `Unavailable`; `Failure::of` reads them).
 > **Superseded by [chain-log.md](chain-log.md)** (done): the log is
 > `ChainLogStore` over `impl Chain for TelegramBlobStore`. The order fence
 > below became the Telegram store's way to decide "first successor wins";
-> `ChannelApi` / `ChannelLogStore` / `ChannelSnapshotStore` are gone.
+> `pigeonhole-meta`'s `ChannelApi` / `ChannelLogStore` / `ChannelSnapshotStore`
+> are gone (the store's `ChannelApi` below is another trait).
 
 Telegram gives every message in a channel an id, atomically and in increasing
 order: one total order of everything every writer posts. With
@@ -140,7 +150,7 @@ batches it replays; the document repeats them and a mismatch is `Lost`.
 
 - `Claim { log_id, gen }`
 - `Batch { log_id, gen, prev, base, vote, head_term, first, entries }` — as
-  `LogDoc` today; `prev` links the previous batch of the chain (for the first
+  `LogDoc` was then (now `ChainDoc`, chain-log.md); `prev` links the previous batch of the chain (for the first
   batch of a generation, its zero entry: the previous head, and it names its
   own claim).
 
@@ -208,10 +218,12 @@ never acknowledged may survive, which a Raft log allows. A batch is the commit
 point, not an acknowledgement. State it in meta-backends.md; fake-chat tests
 cover it, the straggler cases and two racing claims.
 
-`ChatApi` shrinks to what the protocol uses: `send_document(name, data) ->
-id`, `get_messages(ids) -> [Empty | Other | Doc { name, download_ref }]`,
-`download`, `delete`. `chat/fake.rs` follows (ids grow, a message can be made
-visible late).
+The design shrank the old `ChatApi` to what the protocol uses (it is gone).
+What exists is `ChannelApi` (`storage/pigeonhole-storage-telegram/src/channel.rs`):
+`get_messages(ids)`, `send_document(name, data, random_id)`, `send_text`,
+`get_file`, `delete_messages`, and `pinned` / `pin` for the owner marker
+([store-owner.md](store-owner.md)); its fake (`src/fake`) gives growing ids and can make
+a message visible late.
 
 ### Snapshots
 
@@ -363,7 +375,9 @@ Each step ends with `cargo test --workspace` and
 
 1. ~~**Spike**~~ Done: a throwaway binary against the test channels (not
    merged); results in Spike findings above.
-2. ✅ (without the grammers patch) **Crate** `pigeonhole-storage-telegram-mtproto`. First a patched
+2. ✅ (without the grammers patch) **Crate** `pigeonhole-storage-telegram-mtproto`
+   (since split into `pigeonhole-telegram-mtproto` and
+   `pigeonhole-storage-telegram`). First a patched
    grammers-mtsender (`[patch.crates-io]` to a vendored 0.11.0 copy, and the
    same change offered upstream on codeberg): `try_fill_write` drops requests
    whose result receiver is closed before serializing them, and
@@ -384,19 +398,17 @@ Each step ends with `cargo test --workspace` and
    becoming the head, rebase and collection. Then the MTProto `ChatApi`
    adapter, and a live check that an id below one returned by a send is never
    `messageEmpty` for long.
-4. ✅ **Wiring**: config (`kind = "telegram_mtproto"`, env names, session path),
+4. ✅ **Wiring**: config (`kind = "telegram_mtproto"`, now `telegram`; env
+   names, session path),
    `runtime.rs` (`build_member`, `open_log`, `open_snapshots`), startup checks,
    `pigeonhole.toml.example`, `.env.example`.
-5. **Live run** (smoke ✅, `compat-telegram-mtproto.sh` written): `scripts/compat-telegram-mtproto.sh` modelled on
-   `compat-telegram.sh`; README (backend section, disclaimer still applies),
+5. **Live run** (smoke ✅, `scripts/compat-telegram.sh`, written as
+   `compat-telegram-mtproto.sh` beside the Bot API's and renamed with the
+   backend); README (backend section, disclaimer still applies),
    meta-backends.md, sweep-invariants.md, glossary. Repeated `sweep_stress`
    and the S3 compat suites from the ground rules at the end.
 
 ## Open questions
 
-- The Bot API log cannot read ranges: keep its current pin + description
-  protocol beside the new one, or make the Bot API backend blob-only?
 - Chunk size is global (`[chunk] size`); with ≫ 20 MiB blobs on one store and
-  Discord / Bot API stores beside it, should it become per store?
-- Flood limits: measured, the same ~20–30 sends a minute per channel; keep the
-  `ChatLimiter` send default (18/min) for both transports.
+  Discord stores beside it, should it become per store?

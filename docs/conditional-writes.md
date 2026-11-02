@@ -105,7 +105,9 @@ multi-node mode) against a local pigeonhole, etcdctl v3.7.3 as the client.
   down ("lock taken"): safe, but etcd has no leader for a while. With the
   objects in Discord it does not happen (demos/etcd-on-telegram). On our
   side: a lock-sized object should not wait behind bulk uploads (a priority
-  lane, or small objects through a faster store).
+  lane, or small objects through a faster store). Since then small objects
+  are inline: kept in the metadata, with no upload at all
+  ([inline-objects.md](inline-objects.md)).
 - **Control.** The same run against main before this change: the gateway
   answered 200 to every conditional put (`If-None-Match: *` twice, a stale
   `If-Match`), so two leaders could both "win". T4 v1.1.16 started anyway:

@@ -224,7 +224,7 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
 
 /// The tablet as node `cluster.node` of its cluster: Raft over gRPC to the
 /// nodes both have an address for, over the chat (Telegram outboxes) to the
-/// others (docs/raft-over-chat.md § Transports).
+/// others (docs/cluster.md § Transports).
 async fn open_node(
     cfg: &Config,
     cluster: &ClusterSettings,

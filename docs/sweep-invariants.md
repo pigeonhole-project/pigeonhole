@@ -2,7 +2,10 @@
 
 The sweeper deletes two kinds of backend blobs: parts of **released chunks**
 (reclaim) and **orphans** — blobs no chunk owns (failed or abandoned uploads, a
-dead writer's leftovers). Both run only while the tablet holds its generation.
+dead writer's leftovers). Both run only on the leader: the background loops
+skip their passes unless `MetaStore::is_leader` (a single node always
+leads), and every delete batch is preceded by `MetaStore::confirm_active`
+(below).
 
 ## Orphans: the upload horizon
 
@@ -30,10 +33,19 @@ before deleting:
 
 No grace period and no per-batch in-flight check are needed: a key enters the
 candidate range only after its pin is gone, i.e. after its commit is visible in
-the state. After a restart there are no pins and nothing returned yet;
-`ChunkStore::open` seeds the horizon with the highest committed key, so a dead
-writer's uploads below it are swept right away and the rest after the first new
-upload.
+the state. After a restart or a change of leader there are no pins and
+nothing returned yet; `ChunkStore::take_over`
+(`crates/blob/pigeonhole-chunk-store/src/layer.rs`, run on boot when leading
+and on every gain of leadership) seeds the horizon with the highest committed
+key, so a dead writer's uploads below it are swept right away and the rest
+after the first new upload. Pins live in the leader's process only: its
+sweeper is the only one that deletes.
+
+Only this deployment's blobs are candidates: every `BlobId` carries the
+deployment's owner in its top 32 bits, and `BlobBackend::candidates(owner,
+…)` returns only blobs named with that owner's ids, so a store shared by
+mistake with another deployment never loses the other's blobs to this sweep
+([store-owner.md](store-owner.md)).
 
 What the listing yields per backend:
 

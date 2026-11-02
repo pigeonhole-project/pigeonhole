@@ -9,7 +9,7 @@
 //! a duplicate is dropped by its sequence number.
 //!
 //! The chat itself is behind [`Mailbox`]; [`FakeChat`] is an in-memory one
-//! for tests. Design: pigeonhole's docs/raft-over-chat.md.
+//! for tests. Design: pigeonhole's docs/cluster.md.
 
 pub mod frame;
 mod mailbox;

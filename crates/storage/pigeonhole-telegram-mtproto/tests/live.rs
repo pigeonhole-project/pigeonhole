@@ -1,5 +1,5 @@
 //! Against the channel `TG_BLOBS_CHAT_ID`: `cargo test -p
-//! pigeonhole-storage-telegram --test live -- --ignored --nocapture`
+//! pigeonhole-telegram-mtproto --test live -- --ignored --nocapture`
 //! with it, `TG_BOT_TOKEN`, `TG_API_ID` and `TG_API_HASH` in the workspace `.env`.
 //! Deletes only what it posted.
 
@@ -63,7 +63,7 @@ async fn blob_store_against_a_live_channel() {
 }
 
 /// Print what a channel holds: `TG_LIST_CHAT_ID=-100… TG_LIST_TO=<id>
-/// cargo test -p pigeonhole-storage-telegram --test live list -- --ignored --nocapture`
+/// cargo test -p pigeonhole-telegram-mtproto --test live list -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "needs a Telegram bot, api id and a channel"]
 async fn list() {
@@ -146,7 +146,7 @@ fn uuid_like() -> i64 {
 /// Delete the documents and text blobs of a channel whose names start with one of
 /// `TG_CLEAN_PREFIXES` (comma-separated) in ids `1..=TG_LIST_TO`: test
 /// leftovers. `TG_LIST_CHAT_ID=-100… TG_LIST_TO=<id> TG_CLEAN_PREFIXES=log-
-/// cargo test -p pigeonhole-storage-telegram --test live clean -- --ignored --nocapture`
+/// cargo test -p pigeonhole-telegram-mtproto --test live clean -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "deletes messages in a real channel"]
 async fn clean() {
@@ -306,7 +306,7 @@ async fn chain_names_survive_as_documents() {
 /// records its id; `TG_BENCH=clean` posts a second marker and deletes every
 /// message between the two, both included (never message 208 of the log
 /// channel, which may be the user's).
-/// `TG_BENCH=mark cargo test -p pigeonhole-storage-telegram --test live bench_window -- --ignored --nocapture`
+/// `TG_BENCH=mark cargo test -p pigeonhole-telegram-mtproto --test live bench_window -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "posts and deletes messages in the real test channels"]
 async fn bench_window() {
@@ -371,11 +371,11 @@ async fn bench_window() {
     }
 }
 
-/// docs/raft-over-chat.md § What has to be true (1, 4): the bot of
+/// docs/cluster.md § What has to be true (1, 4): the bot of
 /// `TG_BOT_TOKEN_2` sees a post the bot of `TG_BOT_TOKEN` made in the
 /// channel TG_BLOBS_CHAT_ID, by id and as a pushed update. Both bots must be
 /// admins there. Deletes its post.
-/// `cargo test -p pigeonhole-storage-telegram --test live second_bot_sees -- --ignored --nocapture`
+/// `cargo test -p pigeonhole-telegram-mtproto --test live second_bot_sees -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "needs two Telegram bots in a test channel"]
 async fn second_bot_sees_first_bots_posts() {

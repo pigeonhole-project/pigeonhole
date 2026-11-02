@@ -21,8 +21,8 @@ slow_request = "5s"                     # slower requests are logged at info
   `info,pigeonhole_meta=debug,pigeonhole_storage_telegram=debug`.
 - `RUST_LOG`, when set, replaces `level`. Unless it names them, openraft
   stays at `warn` and s3s at `off` (their `info` / `error` lines are noise
-  for us: openraft logs every Raft step of a cluster of one, s3s logs a
-  refused signature as ERROR). `RUST_LOG=debug` is a fine first try.
+  for us: openraft logs every Raft step it takes, on a single node too, s3s
+  logs a refused signature as ERROR). `RUST_LOG=debug` is a fine first try.
 - `text` uses colours only when stderr is a terminal; `json` writes one
   object per line with the event's fields and its spans (`span`, `spans`),
   for Loki, Elasticsearch and the like.
@@ -43,6 +43,10 @@ slow_request = "5s"                     # slower requests are logged at info
 | `request` | `gateway`, `id`, `method`, `path`, `op` (the S3 operation, once routed) | every S3 request; the id is also sent back as the `x-pigeonhole-request-id` header. The query string is never logged (a presigned URL carries a signature in it). |
 | `store` | `instance`, `op`, `bytes` / `keys` | each blob store call through the placement group (below `request` when a request made it) |
 | `commit` | `entries`, `proposals`, `position` | the tablet's batcher writing one Raft entry |
+
+In a cluster, the lines a node logs about Raft itself (`raft frame sent` /
+`raft frame received` at debug, `leader changed` and `not the leader` at
+info, with their fields) are in [cluster.md](cluster.md) § Observability.
 
 A task spawned while serving a request does not inherit its span by itself;
 where it matters (releasing an overwritten object's chunks after the answer)

@@ -55,7 +55,7 @@ impl<C: RaftTypeConfig> Handler<C> for Raft<C> {
     }
 }
 
-/// The cluster's transport settings (docs/raft-over-chat.md § Timing).
+/// The cluster's transport settings (docs/cluster.md § Timing).
 #[derive(Clone, Debug)]
 pub struct Settings {
     /// Frames of another cluster are dropped.

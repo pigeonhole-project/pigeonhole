@@ -45,6 +45,10 @@ that window — the timing assumption the Telegram design got rid of.
 > In [chain-log.md](chain-log.md) terms this is `impl Chain for
 > DiscordBlobStore`: the protocol below is the generic chain log, the thread
 > is how Discord decides "first successor wins".
+>
+> With the lease (`[meta] lease`, on by default) only lease records (a
+> claim, a renewal) take a thread; batches between them are plain posts:
+> [discord-lease.md](discord-lease.md).
 
 A message can have at most one thread started from it
 (`POST /channels/{c}/messages/{m}/threads`; the thread takes the message's id;
@@ -57,7 +61,9 @@ Messages, all documents named with their kind and generation
 
 - `Claim { log_id, gen }`
 - `Batch { log_id, gen, prev, base, vote, head_term, first, entries }` — as
-  `LogDoc` today.
+  the `LogDoc` of the time (now `ChainDoc` in
+  `crates/meta/pigeonhole-meta/src/log/chain.rs`, one type for claims and
+  batches).
 
 A **link** from `H` to `N` is the thread started from `H`, named
 `next <N.id> g<gen>` (thread names hold 100 characters). The **chain** is what
@@ -304,8 +310,9 @@ Live, on the test guild (a bot with Manage Webhooks):
 So a webhook fence needs a wait after the delete before the claimant reads (a
 straggler window: a bound on Discord's internals that nothing guarantees) —
 the timing assumption the chain log exists to avoid. Not adopted; the thread
-compare-and-set stays. Cheaper Discord appends come from a Discord-specific
-rate limiter and from archiving links off the hot path (roadmap).
+compare-and-set stays. Cheaper Discord appends came from the lease
+([discord-lease.md](discord-lease.md)): the thread compare-and-set only for
+lease records, batches as plain posts.
 
 ## Steps
 

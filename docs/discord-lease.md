@@ -3,7 +3,7 @@
 Status: **implemented** for Discord logs (`[meta] lease`, default `"45s"`). See § Implementation notes for where the code differs from the design.
 Read [discord-log.md](discord-log.md) (the thread fence this changes),
 [chain-log.md](chain-log.md) and
-[bench-discord-vs-telegram.md](bench-discord-vs-telegram.md) first.
+[bench/discord-vs-telegram.md](bench/discord-vs-telegram.md) first.
 
 ## Why
 
@@ -249,25 +249,35 @@ appends sustain ~1/s per channel, against a paced thread every ~6.7 s now.
 
 ## Steps
 
-1. Spike, write findings here.
-2. `Chain` gets a "loose append" (`put_loose`, from log-collect) for batches.
-   `ChainLogStore` learns lease records and the local deadline.
-   `FakeDiscord` gets a clock and a skew knob.
-3. Conformance tests plus simulation: a writer paused past its expiry, a 201
-   after the deadline, a late batch from a deposed writer, two claimants.
-4. Live run and bench: compare with
-   [bench-discord-vs-telegram.md](bench-discord-vs-telegram.md).
+1. ✅ Spike, write findings here.
+2. ✅ `Chain` gets a "loose append" (`put_loose`, from log-collect) for batches.
+   `ChainLogStore` learns lease records and the local deadline
+   (`LeaseChain`, § Implementation notes).
+   `FakeDiscord` gets a clock and a skew knob (not done: the fake runs on
+   the runtime's clock, with no skew).
+3. ✅ in part: Conformance tests plus simulation: a writer paused past its
+   expiry, a 201 after the deadline, a late batch from a deposed writer, two
+   claimants. Done on the fake channel
+   (`storage-discord/tests/chain_log.rs`: the `LogStore` conformance suite
+   on a lease log, renewal, a claimant waiting out the lease, a batch
+   answered after the deadline, release); the simulation is not.
+4. ✅ Live run (`discord-http/tests/live.rs`
+   `lease_log_against_a_live_channel`) and bench:
+   [bench/discord-vs-telegram.md](bench/discord-vs-telegram.md) § Update.
 
 ## Open questions
 
 - `D`: shorter speeds up failover, longer spends fewer threads. 45 s is a
   guess. Restart-heavy tests and the simulation must not pay `D` for every
-  restart. Options: `D` set by config (seconds in tests), the fake's and
-  madsim's virtual clock, and the `flock` shortcut on one host.
+  restart. Answered in part: `D` is set by config (`[meta] lease`, default
+  `"45s"`, `"off"` for a thread per batch), and tests use a short one; the
+  `flock` shortcut on one host is not done.
 - Commit latency now rests on assumption A and the deadline check, not on a
   compare-and-set. A violation of A loses an acknowledged batch silently.
   The simulation should inject a late-visible message and show the deadline
   holds.
 - Whether the lease belongs in `ChainLogStore`, for every store (the memory
   and disk stores do not need it), or only behind the Discord `Chain`.
+  Answered: in `ChainLogStore`, for a store that implements `LeaseChain`
+  (Discord only).
 - An in-flight delete after the expiry (above).
