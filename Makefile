@@ -98,13 +98,21 @@ test-all: check-deps test smoke
 
 # Deterministic simulation (docs/simulation.md). MADSIM_TEST_SEED=<seed>
 # replays one run; MADSIM_TEST_NUM=<n> runs n seeds.
+#
+# Every run gets an empty TMPDIR of its own, removed after it. In the
+# simulator temp dir names repeat from one process to the next (tempfile's
+# fastrand is seeded from the virtual clock and the thread id): next to a
+# dir an earlier run left, tempfile retries and then reads getrandom, which
+# the simulator answers and MADSIM_TEST_CHECK_DETERMINISM counts — the two
+# runs of a seed differ.
+SIM = t=$$(mktemp -d) && TMPDIR=$$t RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test
 sim:
-	RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test -p pigeonhole-sim
+	$(SIM) -p pigeonhole-sim; s=$$?; rm -rf $$t; exit $$s
 
 # Every library's tests under the simulator (the binary and its servers are
 # not built there).
 sim-all:
-	RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test --workspace --exclude pigeonhole
+	$(SIM) --workspace --exclude pigeonhole; s=$$?; rm -rf $$t; exit $$s
 
 # rustfmt and clippy as CI runs them: every warning fails (lints: [workspace.lints] in Cargo.toml).
 lint:
