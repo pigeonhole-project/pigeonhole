@@ -41,6 +41,14 @@ export function makeWizard(panel, on) {
     }
     return row;
   }
+  // A log in a channel needs its snapshots off the node too (a restart
+  // elsewhere must find them): the disk only for a log on the disk.
+  const setLog = v => {
+    setup.log = v;
+    if (v !== "local_disk" && setup.snapshots === "local_disk") setup.snapshots = v;
+  };
+  const metaChoices = (label, value, pick, disk) =>
+    choices(label, [["telegram", "Telegram"], ["discord", "Discord"], ...(disk ? [["local_disk", t("wiz.local_disk")]] : [])], value, pick);
   const kinds = (label, value, pick) =>
     choices(
       label,
@@ -127,8 +135,12 @@ export function makeWizard(panel, on) {
       });
       return [
         h("p", "lede", t("wiz.meta_lede")),
-        field(t("wiz.log"), kinds(t("wiz.log"), setup.log, set("log")), t("wiz.log_note")),
-        field(t("wiz.snapshots"), kinds(t("wiz.snapshots"), setup.snapshots, set("snapshots")), t("wiz.snapshots_note")),
+        field(t("wiz.log"), metaChoices(t("wiz.log"), setup.log, setLog, true), t("wiz.log_note")),
+        field(
+          t("wiz.snapshots"),
+          metaChoices(t("wiz.snapshots"), setup.snapshots, set("snapshots"), setup.log === "local_disk"),
+          t(setup.log === "local_disk" ? "wiz.snapshots_note" : "wiz.snapshots_off_node"),
+        ),
         field(t("wiz.every"), every, t("wiz.every_note")),
       ];
     },
@@ -138,7 +150,7 @@ export function makeWizard(panel, on) {
         ["demo", t("wiz.pace_demo")],
       ];
       const rates = h("ul", "rates");
-      for (const k of new Set([...setup.channels, setup.log, setup.snapshots])) {
+      for (const k of new Set([...setup.channels, setup.log, setup.snapshots].filter(k => k !== "local_disk"))) {
         rates.append(h("li", "", t("wiz.rate", {app: appOf(k), n: perMinute(k, setup.pace) * setup.bots})));
       }
       return [

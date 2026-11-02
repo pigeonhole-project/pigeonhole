@@ -27,8 +27,14 @@ function dataChannels(w) {
   });
 }
 
-// The log's and the snapshots' channel.
+// Where the node keeps its own log and snapshots on a local disk (the
+// browser's storage, in the demo): one store, a directory each.
+const NODE_DISK = {id: "node-disk", path: "/data/node"};
+
+// The log's and the snapshots' store: a channel, or the node's disk (as
+// the node lists it: meta-log, meta-snapshots).
 function metaStore(kind, what) {
+  if (kind === "local_disk") return {id: `meta-${what}`, kind, scope: `${NODE_DISK.path}/${what}`, disk: true};
   const tail = what === "log" ? "01" : "02";
   return {id: `${short(kind)}-${what}`, kind, scope: kind === "telegram" ? `-10010000001${tail}` : `10000000000000001${tail}`};
 }
@@ -85,9 +91,14 @@ export function tomlOf(w) {
 
   const log = metaStore(w.log, "log"),
     snaps = metaStore(w.snapshots, "snapshots");
-  out.push(...store(log, t("wiz.toml_meta")), ...store(snaps, null));
+  const chats = [log, snaps].filter(m => !m.disk);
+  for (const [i, m] of chats.entries()) out.push(...store(m, i === 0 ? t("wiz.toml_meta") : null));
+  if (log.disk || snaps.disk) {
+    out.push(`# ${t("wiz.toml_node_disk")}`, "[[store]]", `id = "${NODE_DISK.id}"`, 'kind = "local_disk"', `path = "${NODE_DISK.path}"`, "");
+  }
   out.push(`# ${t("wiz.toml_disk")}`, "[[store]]", 'id = "channel-data"', 'kind = "local_disk"', 'path = "/data/channels"', "");
-  out.push("[meta]", `log = "${log.id}"`, `snapshot = "${snaps.id}"`, `snapshot_every_entries = ${w.every}`);
+  const id = m => (m.disk ? NODE_DISK.id : m.id);
+  out.push("[meta]", `log = "${id(log)}"`, `snapshot = "${id(snaps)}"`, `snapshot_every_entries = ${w.every}`);
   if (w.log === "discord") out.push(`# ${t("wiz.toml_lease")}`, 'lease = "5s"');
   out.push("");
   out.push("[chunk]", `store = "${chunkStore}"`, 'size = "4 MiB"', 'block_size = "1 MiB"', 'codec = "zstd"', "");
@@ -134,7 +145,7 @@ export function sketch(w, upTo = "review") {
   if (!reached("meta")) return chans;
   for (const role of ["log", "snapshots"]) {
     const m = metaStore(w[role], role);
-    chans.push({store: m.id, role, kind: m.kind, scope: m.scope, bots, messages: []});
+    chans.push({store: m.id, role, kind: m.kind, scope: m.scope, bots: m.disk ? 1 : bots, messages: []});
   }
   return chans;
 }

@@ -85,6 +85,11 @@ export function logo(kind, parent, x, y, title) {
     );
     svg("ellipse", {cx: -2.4, cy: 0.9, rx: 1.3, ry: 1.5, fill: "#5865F2"}, mark);
     svg("ellipse", {cx: 2.4, cy: 0.9, rx: 1.3, ry: 1.5, fill: "#5865F2"}, mark);
+  } else if (kind === "local_disk") {
+    // A drive: its case, a slot, a light.
+    svg("rect", {x: -10, y: -7, width: 20, height: 14, rx: 3, fill: "var(--slate)"}, mark);
+    svg("path", {d: "M-6,3 L3,3", stroke: "var(--plume)", "stroke-width": 1.6, "stroke-linecap": "round"}, mark);
+    svg("circle", {cx: 6, cy: 3, r: 1.4, fill: "var(--teal)"}, mark);
   } else {
     svg("circle", {r: 9, fill: "var(--slate)"}, mark);
   }

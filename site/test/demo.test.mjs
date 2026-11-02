@@ -117,6 +117,21 @@ test("tomlOf: the log on Discord takes a lease; the real pace has no fast sends"
   assert.doesNotMatch(toml, /rate_per_sec/);
 });
 
+test("tomlOf: the log and snapshots on the node's disk, one store for both", () => {
+  const toml = tomlOf(setup(["telegram"], 1, {log: "local_disk", snapshots: "local_disk"}));
+  assert.match(toml, /id = "node-disk"\nkind = "local_disk"\npath = "\/data\/node"/);
+  assert.match(toml, /log = "node-disk"\nsnapshot = "node-disk"/);
+  assert.doesNotMatch(toml, /tg-log|lease/);
+  const sketched = sketch(setup(["telegram"], 1, {log: "local_disk", snapshots: "telegram"}));
+  assert.deepEqual(
+    sketched.slice(1).map(c => [c.store, c.kind]),
+    [
+      ["meta-log", "local_disk"],
+      ["tg-snapshots", "telegram"],
+    ],
+  );
+});
+
 test("sketch: each data channel's place; the log and snapshots last", () => {
   const chans = sketch(setup(["telegram", "discord", "telegram", "discord"], 2));
   assert.deepEqual(
