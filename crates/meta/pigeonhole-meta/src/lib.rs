@@ -643,15 +643,8 @@ impl MetaStore {
             snapshots.clone(),
             keep,
         );
-        let raft = raft::Raft::new(
-            cluster.node,
-            Arc::new(raft_config(&opts, cluster.members.len())?),
-            cluster.network,
-            adapter,
-            sm,
-        )
-        .await
-        .context("start raft")?;
+        let config = Arc::new(raft_config(&opts, cluster.members.len())?);
+        let raft = raft::Raft::new(cluster.node, config, cluster.network, adapter, sm).await.context("start raft")?;
         if let Some(serve) = cluster.serve {
             serve(raft.clone()).await;
         }
