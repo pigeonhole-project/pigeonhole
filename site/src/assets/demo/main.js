@@ -239,9 +239,11 @@ function setBusy(on) {
   for (const b of document.querySelectorAll(".panel button, .panel input")) if (!b.classList.contains("back")) b.disabled = on;
 }
 
+// Your objects: the bucket's, as the leader lists it (a follower turns S3
+// away, whichever node is on screen); kept as they were when none answers.
 async function refreshObjects() {
-  const {reply} = await call({op: "list", bucket: state.bucket});
-  state.objects = reply?.objects || [];
+  const {reply} = await call({op: "list", bucket: state.bucket, node: state.cluster?.leader ?? undefined});
+  if (ok(reply)) state.objects = reply.objects || [];
   graph.setObjects(state.objects.length);
   view?.setObjects?.(state.objects);
   view?.setCounters?.(counters());
