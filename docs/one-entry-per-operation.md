@@ -19,7 +19,8 @@ PutObject
 ```
 
 On a local disk that is a few fsyncs (~5 ms each on macOS). On a Telegram log
-it is the main cost: an entry is a message (plus a pin today), a channel takes
+it is the main cost: an entry is a message (plus a pin over the Bot API,
+since removed; over MTProto no pin), a channel takes
 about 20 messages a minute, and the live run (2026-10-28) measured 8–23 s per
 small PUT. Concurrent requests already share entries (`MetaStore` batches
 whatever is queued), but one request's steps cannot, because each waits for
@@ -75,8 +76,9 @@ the same entry.** Operations where it would have to are split (see `copy`).
 `propose_all`'s commands go into one Raft entry together (and with other
 queued proposals): never split across entries, so they are durable together.
 `MAX_BATCH` counts commands of other proposals only; a prepared batch is
-taken whole. An entry larger than a store can take in one write (a Telegram
-document over the Bot API: 20 MiB; in practice a few MiB of metadata at most)
+taken whole. An entry larger than a store can take in one write (the store's
+`max_blob_size`: a Telegram document over MTProto 256 MiB, a Discord
+attachment 20 MiB by default; in practice a few MiB of metadata at most)
 is refused with an error rather than split.
 
 ### Releases after the answer

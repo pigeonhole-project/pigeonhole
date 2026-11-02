@@ -97,6 +97,10 @@ decimal units are refused. Durations are strings (`"30s"`, `"10m"`).
 `"off"` switches off the two knobs that can be off; `0` / `"0s"` there is
 refused as ambiguous, as everywhere in the config.
 
+Every knob but `max_object_size` is dynamic (`cool_every`, `cool_after`,
+`min_inline`, `cool_batch`, `budget`, `low_watermark`): it can be changed on
+a running node without a restart ([dynamic-config.md](dynamic-config.md)).
+
 ### `max_object_size`
 
 Objects up to this many bytes are stored inline on `PutObject` and
@@ -446,7 +450,7 @@ and metadata in Discord (`DEMO_BACKEND=chats`), 2026-10-30.
   - an inline rewrite releases the chunks it replaces;
   - a cooler pass moves objects out with reads unchanged;
   - the cooler racing rewrites and deletes: no lost write, no leaked chunk.
-- **Config** (`bin/src/config.rs`): units, defaults, `"off"`; `"0s"` and
+- **Config** (`crates/config/pigeonhole-config`): units, defaults, `"off"`; `"0s"` and
   decimal units refused; with inlining off the cooler drains everything
   (`bin/src/background.rs`).
 - **Live:** the T4 demo with objects in Telegram keeps its leader after a
@@ -459,8 +463,8 @@ and metadata in Discord (`DEMO_BACKEND=chats`), 2026-10-30.
   queues with client writes. Until then, keep `cool_batch` small there.
 - **Reads.** The cooler goes by last write. An object that is read often but
   never rewritten still leaves after `cool_after`.
-- **Raft.** With several nodes the cooler must run on the leader only. There
-  is one node today.
+- **Raft.** In a cluster the cooler runs on the leader only: a pass is
+  skipped unless `MetaStore::is_leader` ([cluster.md](cluster.md)).
 - **Per bucket or prefix.** The settings are global (e.g. inlining only
   under `locks/` is not possible yet).
 - **Warming.** A small chunked object becomes inline again only when it is

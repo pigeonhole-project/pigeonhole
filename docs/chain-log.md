@@ -1,20 +1,22 @@
 # The log on top of blob storage: `Chain`
 
-Status: **steps 1–4 implemented** (see Implementation notes). Read [meta-backends.md](meta-backends.md) (the `LogStore`
+Status: **steps 1–5 implemented** (see Implementation notes; Discord in
+[discord-log.md](discord-log.md)). Read [meta-backends.md](meta-backends.md) (the `LogStore`
 and `SnapshotStore` contracts), [telegram-mtproto.md](telegram-mtproto.md) (the
 order-fenced channel log, implemented), [discord-log.md](discord-log.md) (the
-thread-fenced log, proposed) and [sweep-invariants.md](sweep-invariants.md)
+thread-fenced log, implemented) and [sweep-invariants.md](sweep-invariants.md)
 first.
 
 ## Why
 
-Blob storage and the metadata log are independent today. Every place that can
-hold a log has its own implementation: `LocalLogStore` (segment files),
+Blob storage and the metadata log were independent. Every place that could
+hold a log had its own implementation: `LocalLogStore` (segment files),
 `MemoryLogStore`, `ChannelLogStore` over a `ChannelApi` (Telegram), a planned
 `LinkableChat` log (Discord), a planned slot log (OpenDAL); and the same for
 snapshots (`LocalSnapshotStore`, `MemorySnapshotStore`,
-`ChannelSnapshotStore`). `ChannelApi` (`send_document`, `get_messages`,
-`download`, `delete`) is `BlobBackend` again under another name.
+`ChannelSnapshotStore`). That `ChannelApi` (`send_document`, `get_messages`,
+`download`, `delete`) was `BlobBackend` again under another name. All of
+them are gone (§ Steps).
 
 The goal: **blob storage at the bottom, the log on top**. One `LogStore`
 implementation and one `SnapshotStore` implementation, generic over a store;
@@ -35,7 +37,7 @@ Each store has an atomic operation for it:
 | Store | The operation |
 |---|---|
 | Telegram (MTProto) | the order of ids in a channel: the first message naming `prev` wins |
-| Discord | a thread from a message: started once (`160004` after) |
+| Discord | a thread from a message: started once (`160004` after); with the lease (`[meta] lease`, default on, [discord-lease.md](discord-lease.md)) only lease records are linked, batches are plain posts |
 | OpenDAL (s3, gcs, fs) | a write with `if_not_exists` |
 | local disk | an append under `flock` after checking the tail |
 | memory | a mutex |
@@ -144,7 +146,7 @@ and the newest is its tail; on others, a listing.
 | Store | `put_after(prev)` | `successor(id)` | `tail(from)` | `chain_from` |
 |---|---|---|---|---|
 | Telegram | send with `prev` in the name; `Won` iff no message naming `prev` lies in `(prev, b)` — fast path `b == prev + 1` | the first id after `id` whose name names it | top-down from our newest message: the newest message that won its link | `getMessages` pages of 100 |
-| Discord | message, then a thread from `prev` named after it; `160004` → `Lost` | `prev`'s `thread` field | the newest 100 messages with `thread` | listing pages of 100 |
+| Discord | message, then a thread from `prev` named after it; `160004` → `Lost` (with the lease, only lease records; batches are plain posts, [discord-lease.md](discord-lease.md)) | `prev`'s `thread` field | the newest 100 messages with `thread` | listing pages of 100 |
 | OpenDAL | `PUT after/<prev>` with `if_not_exists` (one request) | stat `after/<id>` | `list` from `after/<from>` (keys grow) | `list` + reads |
 | memory | under the mutex | the table | the table | the table |
 | local disk | under `flock`: the tail is `prev`, append a record, one fsync | the next record | the last record | sequential segment reads |
@@ -156,8 +158,8 @@ findings (archive links, delete the message before its thread, 50 links per
 
 ## `DiskBlobStore` on segments
 
-For the disk to cost what `LocalLogStore` costs today (one fsync per append),
-the store itself changes, for data blobs too:
+For the disk to cost what `LocalLogStore` cost (one fsync per append), the
+store itself changed, for data blobs too:
 
 - Blobs are records in append-only segment files (`seg-<seq>`), Haystack /
   Bitcask style: `MAGIC | len | crc | ChainMeta | prev | data`.
@@ -167,7 +169,7 @@ the store itself changes, for data blobs too:
   a `fstat` of the active segment tells whether anyone else appended), append,
   fsync. A segment rolls over at a size limit.
 - A torn record at the end of the last segment was never acknowledged; open
-  truncates it (as `LocalLogStore::claim` does now).
+  truncates it (as `LocalLogStore::claim` did).
 - Delete: a segment whose records are all dead is removed; inside a live
   segment the space is freed by punching a hole (`FALLOC_FL_PUNCH_HOLE` on
   Linux, `F_PUNCHHOLE` on APFS), keys never move. A log store mostly drops
@@ -281,11 +283,14 @@ Each step ends with `cargo test --workspace` and
 3. ✅ **Telegram `impl Chain`** from `ChannelLogStore`'s logic; the fake channel
    becomes a fake `TelegramClient` under `TelegramBlobStore`; live run on the
    test channels. Delete `ChannelApi`, `ChannelLogStore`,
-   `ChannelSnapshotStore`.
+   `ChannelSnapshotStore`. (That was the old trait in `pigeonhole-meta`; the
+   `ChannelApi` of `pigeonhole-storage-telegram` now is a different one, the
+   client under `TelegramBlobStore`.)
 4. ✅ **Segmented `DiskBlobStore`** with `impl Chain`; the benchmark against
    `LocalLogStore`; then delete `LocalLogStore` / `LocalSnapshotStore`.
    Repeated `sweep_stress`.
-5. **Discord `impl Chain`** (discord-log.md).
+5. ✅ **Discord `impl Chain`** (discord-log.md), then the lease
+   (discord-lease.md).
 6. **OpenDAL `impl Chain`** with the OpenDAL blob backend.
 
 ## Open questions

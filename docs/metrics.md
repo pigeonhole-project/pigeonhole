@@ -5,9 +5,11 @@ port or on `[metrics] listen_addr`. Code records through the [`metrics`]
 facade, a no-op until the binary installs its recorder.
 
 Each crate declares the metrics it records in a `METRICS` table
-(`pigeonhole_blob::METRICS`, `pigeonhole_meta::METRICS`,
-`pigeonhole::state_metrics::METRICS`). The help text in the scrape comes from
-it, and so does the list below: `tests/metrics_doc.rs` fails when the list is
+(`pigeonhole_blob::METRICS`, `pigeonhole_limits::METRICS`,
+`pigeonhole_meta::METRICS`, `openraft_chat::telemetry::METRICS`,
+`pigeonhole::state_metrics::METRICS`), collected by
+`pigeonhole::metric_docs()`. The help text in the scrape comes from it, and
+so does the list below: `tests/metrics_doc.rs` fails when the list is
 stale and rewrites it with `UPDATE_METRICS_DOC=1`.
 
 ## Watching them live
@@ -47,8 +49,9 @@ uid `prom`.
 - Buckets: `*_seconds` from 100 µs to 5 min, `*_ratio` 0.01…1.05,
   `*_per_chunk` / `*_per_entry` 1…1024 (`crates/bin/pigeonhole/src/prometheus.rs`).
 - The tablet gauges (`pigeonhole_s3_*`, `pigeonhole_chunk*`,
-  `pigeonhole_meta_*_position`) are refreshed every 5 s, each refresh a pass
-  over the state.
+  `pigeonhole_meta_*_position`) are refreshed every `[metrics] every`
+  (default 5 s, at least 1 s; dynamic, [dynamic-config.md](dynamic-config.md)),
+  each refresh a pass over the state.
 - Label values are bounded: S3 operation names, store ids from the config,
   chat method names.
 
