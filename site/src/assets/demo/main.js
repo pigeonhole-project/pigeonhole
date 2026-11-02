@@ -142,11 +142,14 @@ function apply(events) {
       c.total++;
       const snap = c.role === "snapshots" && /-(\d+)\.snap/.exec(m.name || "");
       if (snap) said.push(["say.snapshot", {at: +snap[1]}]);
-      for (const f of flightsOf(e, channel, flightCtx())) graph.fly({...f, onLand: () => landed(c.store)});
+      const flights = flightsOf(e, channel, flightCtx());
+      for (const f of flights) graph.fly({...f, onLand: () => landed(c.store)});
+      if (!flights.length) landed(c.store);
+      if (c.role === "outbox" && panelShows(c.store)) outboxChanged();
     } else if (e.type === "deleted" && c) {
       // Gone from the channel, as from a messenger's: no trace left.
+      c.total = Math.max(0, c.total - gone(c, e.ids));
       c.messages = c.messages.filter(m => !e.ids.includes(String(m.id)));
-      c.total = Math.max(0, c.total - e.ids.length);
       graph.setTotal(c.store, c.total);
       if (panelShows(c.store)) renderPanel();
     } else if (e.type === "call" || e.type === "call_failed") {
@@ -154,14 +157,6 @@ function apply(events) {
     } else if (e.type === "raft") {
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
       said.push(...raft.frame(e, performance.now()));
-    } else if (e.type === "frame") {
-      // A post in the sender's outbox: responses too, many envelopes in one.
-      const box = channel(`outbox-${e.from}`);
-      if (box) {
-        box.total = (box.total ?? 0) + 1;
-        graph.setTotal(box.store);
-        if (panelShows(box.store)) outboxChanged();
-      }
     } else if (e.type === "repair_pass" && e.repaired > 0) {
       said.push(["say.repair_pass", {n: e.repaired}]);
     } else if (e.type === "s3") {
@@ -174,8 +169,19 @@ function apply(events) {
   return said;
 }
 
-// An open outbox's frames are read from the node: its posts are not
-// logged one by one. Read a second after a frame, one read at a time.
+// How many of message ids `ids` channel `c` held: those it lists, and
+// those below its first listed one, as many as it has unlisted. An outbox's
+// prune deletes a run of ids, some of them empty already.
+function gone(c, ids) {
+  const listed = new Set(c.messages.map(m => String(m.id)));
+  const first = Math.min(...c.messages.map(m => Number(m.id)));
+  const older = Math.max(0, c.total - c.messages.length);
+  const below = ids.filter(id => !listed.has(id) && Number(id) < first).length;
+  return ids.filter(id => listed.has(id)).length + Math.min(older, below);
+}
+
+// An open outbox's posts come from the log without the frames they hold:
+// the node opens those. Read a second after a post, one read at a time.
 let outboxReading = false;
 function outboxChanged() {
   if (outboxReading) return;

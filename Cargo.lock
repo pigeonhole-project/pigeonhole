@@ -2849,6 +2849,7 @@ dependencies = [
  "openraft-chat",
  "pigeonhole-storage-api",
  "pigeonhole-storage-telegram",
+ "tracing",
  "uuid",
 ]
 
