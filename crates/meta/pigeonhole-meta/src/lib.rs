@@ -343,6 +343,10 @@ pub struct MetaOptions {
     /// them, so a boot that cannot load the newest starts from an older one
     /// (docs/log-retention.md).
     pub keep_snapshots: usize,
+    /// Entries a cluster keeps behind its newest snapshot: a follower behind
+    /// by fewer catches up from the log, not from a whole snapshot; `None`
+    /// = none. A cluster of one has no followers and keeps none.
+    pub keep_log: Option<u64>,
     /// How often a Raft leader heartbeats its followers.
     pub heartbeat: Duration,
     /// A follower that hears no leader for a random time in this range
@@ -358,6 +362,7 @@ impl Default for MetaOptions {
             snapshot_interval: None,
             snapshots_outlive_log: false,
             keep_snapshots: 2,
+            keep_log: None,
             heartbeat: Duration::from_millis(50),
             election_timeout: (Duration::from_millis(100), Duration::from_millis(150)),
         }
@@ -638,9 +643,8 @@ impl MetaStore {
             snapshots.clone(),
             keep,
         );
-        let raft = raft::Raft::new(cluster.node, Arc::new(raft_config(&opts)?), cluster.network, adapter, sm)
-            .await
-            .context("start raft")?;
+        let config = Arc::new(raft_config(&opts, cluster.members.len())?);
+        let raft = raft::Raft::new(cluster.node, config, cluster.network, adapter, sm).await.context("start raft")?;
         if let Some(serve) = cluster.serve {
             serve(raft.clone()).await;
         }
@@ -933,7 +937,8 @@ impl MetaStore {
         stop
     }
 
-    /// Position of the snapshot the log now starts from (0: none yet).
+    /// Position the log now starts from (0: none yet); its snapshot holds
+    /// this position or a later one ([`log::Base`]).
     pub fn base_position(&self) -> Position {
         self.shared.based.load(Ordering::SeqCst)
     }
@@ -1093,7 +1098,7 @@ async fn load_base(
     Ok(())
 }
 
-fn raft_config(opts: &MetaOptions) -> Result<openraft::Config> {
+fn raft_config(opts: &MetaOptions, members: usize) -> Result<openraft::Config> {
     openraft::Config {
         cluster_name: "pigeonhole".into(),
         heartbeat_interval: opts.heartbeat.as_millis() as u64,
@@ -1103,7 +1108,9 @@ fn raft_config(opts: &MetaOptions) -> Result<openraft::Config> {
             None => openraft::SnapshotPolicy::Never,
             Some(n) => openraft::SnapshotPolicy::LogsSinceLast(n),
         },
-        max_in_snapshot_log_to_keep: 0,
+        // Purged that many entries short of the snapshot: a base then lags
+        // its snapshot (log::Base).
+        max_in_snapshot_log_to_keep: if members > 1 { opts.keep_log.unwrap_or(0) } else { 0 },
         purge_batch_size: 1,
         // openraft's 200 ms is a LAN's: over a chat one round trip of a
         // snapshot chunk takes longer than that, and every send would time

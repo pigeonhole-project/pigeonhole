@@ -31,6 +31,18 @@ pub(crate) fn count_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64
     d.deserialize_any(CountVisitor)
 }
 
+/// [`count_or_off`] for a field whose absence means something else: set,
+/// `Some` of it.
+pub(crate) fn count_or_off_set<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<u64>>, D::Error> {
+    count_or_off(d).map(Some)
+}
+
+/// [`duration_or_off`] for a field whose absence means something else:
+/// set, `Some` of it.
+pub(crate) fn duration_or_off_set<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<Duration>>, D::Error> {
+    duration_or_off(d).map(Some)
+}
+
 /// A duration, or `"off"`: `None`.
 pub(crate) fn duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
     let text = String::deserialize(d)?;

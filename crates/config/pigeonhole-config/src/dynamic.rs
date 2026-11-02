@@ -41,6 +41,16 @@ pub const KEYS: &[&str] = &[
     "bytestream.upload_gc_every",
 ];
 
+/// The keys each `[[node]]` has of its own: `node.<id>.snapshot_every`
+/// (over `meta.snapshot_every`, which holds for the nodes that set none).
+pub const NODE_KEYS: &[&str] = &["snapshot_every"];
+
+/// `node.<id>.<name>`: the node and the name.
+fn node_key(key: &str) -> Option<(u64, &str)> {
+    let (id, name) = key.strip_prefix("node.")?.split_once('.')?;
+    Some((id.parse().ok()?, name))
+}
+
 /// The background loops a pass can be asked of.
 pub const TASKS: &[&str] = &["sweep", "repair", "cool", "snapshot", "metrics", "cas_gc", "upload_gc"];
 
@@ -50,8 +60,13 @@ pub struct DynamicConfig {
     pub sweep: SweepConfig,
     pub repair: RepairConfig,
     pub cool: Cooling,
-    /// The periodic snapshot (`[meta] snapshot_every`).
+    /// This node's periodic snapshot: its `[[node]] snapshot_every`, else
+    /// `[meta]`'s. Snapshots are every node's own, not the leader's work.
     pub snapshot_every: Option<Duration>,
+    /// `[meta] snapshot_every`: of every node that sets none.
+    pub snapshot_every_default: Option<Duration>,
+    /// Every `[[node]]`'s periodic snapshot, its own or the default.
+    pub node_snapshot_every: BTreeMap<u64, Option<Duration>>,
     /// How often the tablet's gauges are set (`[metrics] every`).
     pub metrics_every: Option<Duration>,
     /// The REAPI CAS GC (`[bytestream] gc_every`, `gc_ttl`).
@@ -69,14 +84,19 @@ pub struct Cooling {
 }
 
 impl DynamicConfig {
-    fn of_file(file: FileConfig) -> Result<Self> {
+    fn of_file(file: FileConfig, me: Option<u64>) -> Result<Self> {
         let inline = file.inline.into_settings()?;
         let bytestream = file.bytestream.into_settings();
+        let default = file.meta.snapshot_every;
+        let nodes: BTreeMap<u64, Option<Duration>> =
+            file.node.iter().map(|n| (n.id(), n.snapshot_every.unwrap_or(default))).collect();
         Ok(Self {
             sweep: file.sweep.into_sweep_config(),
             repair: file.repair.into_repair_config(),
             cool: Cooling { every: inline.cool_every, policy: inline.cool },
-            snapshot_every: file.meta.snapshot_every,
+            snapshot_every: me.and_then(|m| nodes.get(&m).copied()).unwrap_or(default),
+            snapshot_every_default: default,
+            node_snapshot_every: nodes,
             metrics_every: file.metrics.into_settings().every,
             cas_gc: Expiry { every: bytestream.gc_every, ttl: bytestream.gc_ttl },
             upload_gc_every: bytestream.upload_gc_every,
@@ -85,6 +105,9 @@ impl DynamicConfig {
 
     /// `key`'s value, as an override would write it.
     pub fn value(&self, key: &str) -> Option<String> {
+        if let Some((id, name)) = node_key(key) {
+            return (name == "snapshot_every").then(|| self.node_snapshot_every.get(&id).map(|&p| off_or(p)))?;
+        }
         let (r, c) = (&self.repair, &self.cool.policy);
         Some(match key {
             "sweep.interval" => off_or(self.sweep.interval),
@@ -100,7 +123,7 @@ impl DynamicConfig {
             "inline.cool_batch" => c.batch.to_string(),
             "inline.budget" => c.budget_bytes.to_string(),
             "inline.low_watermark" => c.low_watermark.to_string(),
-            "meta.snapshot_every" => off_or(self.snapshot_every),
+            "meta.snapshot_every" => off_or(self.snapshot_every_default),
             "metrics.every" => off_or(self.metrics_every),
             "bytestream.gc_every" => off_or(self.cas_gc.every),
             "bytestream.gc_ttl" => off_or(self.cas_gc.ttl),
@@ -121,11 +144,17 @@ fn off_or(d: Option<Duration>) -> String {
 impl Config {
     /// The dynamic knobs of this config, no overrides.
     pub fn dynamic(&self) -> DynamicConfig {
+        if !self.file.is_empty() {
+            return self.dynamic_with(&BTreeMap::new()).expect("the file was read once already");
+        }
+        // Built in code (Config::for_test): no file, no [[node]]s.
         DynamicConfig {
             sweep: self.sweep.clone(),
             repair: self.repair.clone(),
             cool: Cooling { every: self.inline.cool_every, policy: self.inline.cool.clone() },
             snapshot_every: self.meta.snapshot_interval,
+            snapshot_every_default: self.meta.snapshot_interval,
+            node_snapshot_every: BTreeMap::new(),
             metrics_every: self.metrics.every,
             cas_gc: Expiry { every: self.bytestream.gc_every, ttl: self.bytestream.gc_ttl },
             upload_gc_every: self.bytestream.upload_gc_every,
@@ -137,11 +166,11 @@ impl Config {
     pub fn dynamic_with(&self, overrides: &BTreeMap<String, String>) -> Result<DynamicConfig> {
         let mut table = self.file.clone();
         for (key, value) in overrides {
-            check_key(key)?;
+            self.check_key(key)?;
             set_path(&mut table, key, parse_value(value)).with_context(|| format!("{key} = {value}"))?;
         }
         let file: FileConfig = toml::Value::Table(table).try_into().context("the config with the overrides")?;
-        DynamicConfig::of_file(file)
+        DynamicConfig::of_file(file, self.cluster.as_ref().map(|c| c.node))
     }
 
     /// [`Self::dynamic_with`] of every override it takes, and why it took
@@ -160,19 +189,55 @@ impl Config {
 
     /// `key`'s value in the file, if it sets one.
     fn file_value(&self, key: &str) -> Option<String> {
-        let mut v = self.file.get(key.split('.').next()?)?;
-        for part in key.split('.').skip(1) {
-            v = v.as_table()?.get(part)?;
-        }
+        let v = match node_key(key) {
+            Some((id, name)) => node_table(&self.file, id)?.get(name)?,
+            None => {
+                let mut v = self.file.get(key.split('.').next()?)?;
+                for part in key.split('.').skip(1) {
+                    v = v.as_table()?.get(part)?;
+                }
+                v
+            }
+        };
         Some(v.as_str().map_or_else(|| v.to_string(), str::to_string))
+    }
+
+    /// The `[[node]]`s' ids.
+    fn member_ids(&self) -> Vec<u64> {
+        self.cluster.as_ref().map(|c| c.nodes.iter().map(|n| n.id).collect()).unwrap_or_default()
+    }
+
+    /// Every dynamic key: [`KEYS`], then [`NODE_KEYS`] of each `[[node]]`.
+    pub fn dynamic_keys(&self) -> Vec<String> {
+        let nodes =
+            self.member_ids().into_iter().flat_map(|id| NODE_KEYS.iter().map(move |k| format!("node.{id}.{k}")));
+        KEYS.iter().map(|k| k.to_string()).chain(nodes).collect()
+    }
+
+    fn check_key(&self, key: &str) -> Result<()> {
+        if let Some((id, name)) = node_key(key) {
+            if !self.member_ids().contains(&id) {
+                bail!("{key}: no [[node]] {id}");
+            }
+            if !NODE_KEYS.contains(&name) {
+                bail!("{key}: a node's dynamic keys are node.<id>.{{{}}}", NODE_KEYS.join(", "));
+            }
+            return Ok(());
+        }
+        if !KEYS.contains(&key) {
+            bail!("{key} cannot change while running (a restart reads it); dynamic keys: {}", KEYS.join(", "));
+        }
+        Ok(())
     }
 }
 
-fn check_key(key: &str) -> Result<()> {
-    if !KEYS.contains(&key) {
-        bail!("{key} cannot change while running (a restart reads it); dynamic keys: {}", KEYS.join(", "));
-    }
-    Ok(())
+/// `[[node]]` `id`'s table in the file.
+fn node_table(file: &toml::Table, id: u64) -> Option<&toml::Table> {
+    file.get("node")?.as_array()?.iter().filter_map(toml::Value::as_table).find(|t| is_node(t, id))
+}
+
+fn is_node(t: &toml::Table, id: u64) -> bool {
+    t.get("id").and_then(toml::Value::as_integer) == Some(id as i64)
 }
 
 /// An override's value as TOML (`16`, `true`, `"5s"`), or else the text
@@ -186,6 +251,12 @@ fn parse_value(text: &str) -> toml::Value {
 }
 
 fn set_path(table: &mut toml::Table, key: &str, value: toml::Value) -> Result<()> {
+    if let Some((id, name)) = node_key(key) {
+        let nodes = table.get_mut("node").and_then(toml::Value::as_array_mut).context("no [[node]]s")?;
+        let node = nodes.iter_mut().filter_map(toml::Value::as_table_mut).find(|t| is_node(t, id));
+        node.with_context(|| format!("no [[node]] {id}"))?.insert(name.to_string(), value);
+        return Ok(());
+    }
     let (sections, name) = key.rsplit_once('.').unwrap_or(("", key));
     let mut t = table;
     for part in sections.split('.').filter(|p| !p.is_empty()) {
@@ -227,7 +298,7 @@ impl StateMachine for Overrides {
 /// One dynamic key as [`DynConfig::keys`] shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KeyView {
-    pub key: &'static str,
+    pub key: String,
     /// What the loops run with.
     pub value: String,
     /// What the file says, if it sets the key.
@@ -301,11 +372,14 @@ impl DynConfig {
 
     /// The knobs the loops run with.
     pub fn knobs(&self) -> DynamicConfig {
+        let others = self.config.dynamic_lenient(&self.overrides()).0;
         DynamicConfig {
             sweep: self.sweep.get(),
             repair: self.repair.get(),
             cool: self.cool.get(),
             snapshot_every: self.meta.snapshot_schedule().get(),
+            snapshot_every_default: others.snapshot_every_default,
+            node_snapshot_every: others.node_snapshot_every,
             metrics_every: self.metrics.get(),
             cas_gc: self.cas_gc.get(),
             upload_gc_every: self.upload_gc.get(),
@@ -332,7 +406,7 @@ impl DynConfig {
     /// Drop the override of `key`: the file's value holds again. Whether
     /// there was one.
     pub async fn unset(&self, key: &str) -> Result<bool> {
-        check_key(key)?;
+        self.config.check_key(key)?;
         let _one = self.writes.lock().await;
         if !self.overrides().contains_key(key) {
             return Ok(false);
@@ -394,13 +468,15 @@ impl DynConfig {
     pub fn keys(&self) -> Vec<KeyView> {
         let (knobs, overrides) = (self.knobs(), self.overrides());
         let refused = self.refused.lock().unwrap();
-        KEYS.iter()
-            .map(|&key| KeyView {
+        self.config
+            .dynamic_keys()
+            .into_iter()
+            .map(|key| KeyView {
+                value: knobs.value(&key).unwrap_or_default(),
+                file: self.config.file_value(&key),
+                overridden: overrides.get(&key).cloned(),
+                refused: refused.get(&key).cloned(),
                 key,
-                value: knobs.value(key).unwrap_or_default(),
-                file: self.config.file_value(key),
-                overridden: overrides.get(key).cloned(),
-                refused: refused.get(key).cloned(),
             })
             .collect()
     }
@@ -488,6 +564,47 @@ mod tests {
             let again = cfg.dynamic_with(&one(key, &shown)).unwrap();
             assert_eq!(again.value(key).unwrap(), shown, "{key}");
         }
+    }
+
+    /// Node `me` of three; node 2 snapshots on a period of its own.
+    fn cluster(me: u64) -> Config {
+        std::env::set_var("PH_TEST_DYN_CLUSTER_KEY", "00".repeat(32));
+        let text = "[cluster]\nid = 9\nkey_env = \"PH_TEST_DYN_CLUSTER_KEY\"\n[meta]\nsnapshot_every = \"10m\"\n\
+             [[node]]\nid = 1\ngrpc = \"a:1\"\n[[node]]\nid = 2\ngrpc = \"b:1\"\nsnapshot_every = \"1h\"\n\
+             [[node]]\nid = 3\ngrpc = \"c:1\"\n\
+             [chunk]\nstore = \"mem\"\n[[store]]\nid = \"mem\"\nkind = \"memory\"\n";
+        Config::from_toml_as(text, Path::new("test.toml"), me).unwrap()
+    }
+
+    #[test]
+    fn each_node_snapshots_on_its_own_period() {
+        let m = 60 * S;
+        let (n1, n2) = (cluster(1), cluster(2));
+        assert_eq!((n1.dynamic().snapshot_every, n2.dynamic().snapshot_every), (Some(10 * m), Some(60 * m)));
+        let keys = n1.dynamic_keys();
+        assert!(keys
+            .ends_with(&["node.1.snapshot_every", "node.2.snapshot_every", "node.3.snapshot_every"].map(String::from)));
+
+        // Off on node 3 only: the override reaches every node, node 3 acts on it.
+        let off3 = one("node.3.snapshot_every", "off");
+        assert_eq!(cluster(3).dynamic_with(&off3).unwrap().snapshot_every, None);
+        let seen = n1.dynamic_with(&off3).unwrap();
+        assert_eq!(seen.snapshot_every, Some(10 * m), "node 1 keeps its own");
+        assert_eq!(seen.value("node.3.snapshot_every").as_deref(), Some("off"));
+        // [meta]'s holds for the nodes that set none; node 2 keeps its own.
+        let meta5 = one("meta.snapshot_every", "5m");
+        assert_eq!(n1.dynamic_with(&meta5).unwrap().snapshot_every, Some(5 * m));
+        assert_eq!(n2.dynamic_with(&meta5).unwrap().snapshot_every, Some(60 * m));
+        assert_eq!(n2.file_value("node.2.snapshot_every").as_deref(), Some("1h"));
+        assert_eq!(n2.file_value("node.1.snapshot_every"), None);
+
+        for (key, want) in
+            [("node.4.snapshot_every", "no [[node]] 4"), ("node.1.keep_snapshots", "node.<id>.{snapshot_every}")]
+        {
+            let err = format!("{:#}", n1.dynamic_with(&one(key, "1h")).unwrap_err());
+            assert!(err.contains(want), "{key}: {err}");
+        }
+        assert!(config("").dynamic_with(&one("node.1.snapshot_every", "1h")).is_err(), "no cluster, no nodes");
     }
 
     #[tokio::test]
