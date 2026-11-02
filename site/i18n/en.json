@@ -368,5 +368,15 @@
   "js.bg.at_entries": "at {of} entries since the last one; no timer",
   "js.bg.every_entries": "every {of} entries",
   "js.bg.on_leader": "on the leader",
-  "js.bg.not_here": "Runs on the leader only: this node does not do it."
+  "js.bg.not_here": "Runs on the leader only: this node does not do it.",
+  "js.nodes.role_candidate": "candidate",
+  "js.nodes.role_learner": "learner",
+  "js.nodes.term": "term {n}",
+  "js.raft.candidate": "<b>Node {n}</b> heard no leader for an election's timeout: it stands for leader in term {term} and asks the others for votes.",
+  "js.raft.vote_for": "Node {from} votes for node {to}.",
+  "js.raft.vote_against": "Node {from} votes against node {to}: it has seen a newer term or a longer log.",
+  "js.raft.leader": "<b>Node {n}</b> leads now (term {term}): a majority voted for it.",
+  "js.raft.stepped_down": "Node {n} no longer leads: it heard of term {term}.",
+  "js.raft.cut": "Node {n} is cut off.",
+  "js.raft.back": "Node {n} is back."
 }

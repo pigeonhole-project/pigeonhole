@@ -171,7 +171,12 @@ impl<C: RaftTypeConfig> RaftNetwork<C> for DirectClient<C> {
         option: RPCOption,
     ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
         let size = encoded_len(&rpc);
-        self.call((RPCTypes::Vote, "vote"), option.hard_ttl(), size, |h| async move { h.vote(rpc).await }).await
+        let answer =
+            self.call((RPCTypes::Vote, "vote"), option.hard_ttl(), size, |h| async move { h.vote(rpc).await }).await;
+        if let Ok(r) = &answer {
+            tracing::debug!(node = %self.target, to = %self.me, granted = r.vote_granted, via = "grpc", "raft vote answered");
+        }
+        answer
     }
 }
 

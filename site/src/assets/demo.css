@@ -152,6 +152,14 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .edge.raft { stroke: var(--teal); stroke-dasharray: 2 5; opacity: .6; }
 .flight.raft { opacity: .85; }
 .spark { fill: var(--teal); pointer-events: none; }
+/* Raft: a follower's election clock, a candidate, the votes */
+.election-clock { fill: none; stroke: var(--teal); stroke-width: 3; opacity: .7; pointer-events: none; transition: stroke-dasharray .15s linear; }
+.election-clock.low { stroke: var(--eye); }
+.node.candidate .cote { fill: #f3d27a; } .node.candidate .node-role { fill: var(--eye); font-weight: 600; }
+.node-term { font-weight: 400; fill: var(--wing-2); }
+.flight.raft.vote { filter: hue-rotate(40deg) saturate(1.6); }
+.flight.raft.vote-for .failed-mark, .flight.raft.vote-for { filter: drop-shadow(0 0 3px #3fbf6f); }
+.flight.raft.vote-against { filter: drop-shadow(0 0 3px var(--eye)); }
 .failed-mark { fill: var(--eye); }
 @keyframes arrive { 30% { transform: scale(1.06); } }
 

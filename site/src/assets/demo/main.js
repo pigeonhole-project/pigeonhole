@@ -15,6 +15,7 @@ import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
 import {connect} from "./node.js";
+import {makeRaftWatch} from "./raft.js";
 import {TASK_KEY, TASK_ON, taskWindows} from "./tasks.js";
 import {makeWizard} from "./wizard.js";
 
@@ -29,6 +30,7 @@ const state = {
   node: null, // the node the page looks at and sends to; null: whichever leads
   cluster: null, // the `cluster` op's: {leader, term, nodes}
   term: null, // the newest term seen: a new leader is told once
+  timing: null, // the cluster's clocks (ms): {heartbeat, election: [min, max]}
   cut: new Set(), // the nodes cut off from the others
   persistent: false, // the node's files outlive the page (OPFS)
   admin: false, // a real node's admin, not the demo
@@ -131,6 +133,7 @@ function apply(events) {
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
     } else if (e.type === "raft") {
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
+      said.push(...raft.frame(e, performance.now()));
       // Over the chat, a frame is a post in the sender's outbox.
       const box = e.via === "chat" && e.at === "sent" && channel(`outbox-${e.from}`);
       if (box) {
@@ -255,16 +258,30 @@ async function pollBackground() {
 
 // ------------------------------------------------------------ the cluster
 // Who leads, as the node on screen sees it; a new leader is told.
+// Each node asked for its own word (its role, its term: raft.js tells what
+// changed); the node on screen's view of the cluster kept as the page's.
 async function pollCluster() {
-  const {reply} = await call({op: "cluster"});
-  if (!ok(reply)) return;
+  const now = performance.now(),
+    told = [],
+    replies = new Map();
+  for (const id of state.nodes) {
+    const {reply} = await call({op: "cluster", node: id});
+    if (!ok(reply)) continue;
+    replies.set(id, reply);
+    const own = reply.nodes.find(n => n.id === reply.me);
+    told.push(...raft.view(id, {role: own?.role ?? null, term: reply.term}, now));
+  }
+  const reply = replies.get(shown()) ?? [...replies.values()][0];
+  if (!reply) return;
+  state.timing = reply.timing;
   // A newer term only: a node cut off still thinks it leads, in its old term.
   const seen = state.term;
   // A node back from a cut still names itself in its old term: the newer word stands.
   state.cluster = seen != null && reply.term < seen ? {...reply, leader: state.cluster?.leader ?? null} : reply;
   state.term = Math.max(seen ?? 0, reply.term);
-  if (seen != null && reply.term > seen && reply.leader != null) say(["nodes.new_leader", {n: reply.leader, term: reply.term}]);
+  if (told.length) say(told.at(-1));
   renderNodes();
+  showNodes();
   // A new leader: its flag, its ways to the data channels.
   if (graph.drawn() && !state.wizard && (reply.leader !== drawnLeader || reply.links.length !== drawnLinks)) redraw();
 }
@@ -296,12 +313,26 @@ async function pickNode(id) {
   await pollBackground();
 }
 
+// The nodes as they say now, on the graph: roles, terms, election clocks.
+const raft = makeRaftWatch();
+function showNodes() {
+  if (state.nodes.length < 2 || !graph.drawn() || state.wizard) return;
+  // openraft lets a follower stand only once the leader's lease (an
+  // election's longest timeout) and then its own random timeout have both
+  // gone by without a word: up to twice the longest timeout.
+  const now = performance.now(),
+    timeout = 2 * (state.timing?.election?.[1] ?? 0);
+  graph.setNodes(new Map(state.nodes.map(id => [id, {...raft.of(id), clock: raft.clock(id, now, timeout)}])));
+}
+setInterval(showNodes, 100);
+
 // Node `id` cut off from the others, or back: its links and its outbox.
 async function isolate(id, cut) {
   const {reply} = await node.call({op: "isolate", node: id, down: cut});
   if (!ok(reply)) return sayError(reply?.error);
   if (cut) state.cut.add(id);
   else state.cut.delete(id);
+  raft.cut(id, cut, performance.now());
   say([cut ? "nodes.cut" : "nodes.back", {n: id}]);
   renderNodes();
   await refreshChannels(); // its outbox up or down

@@ -254,8 +254,9 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     const sign = svg("text", {class: "sign node-sign", x: cx, y: deck + 15, "text-anchor": "middle", style: `font-size: ${Math.min(12, L.size + 2)}px`}, n.g);
     sign.textContent = name;
     if (cluster) {
-      const r = svg("tspan", {class: `node-role${id === scene.leader ? " leading" : ""}`}, sign);
-      r.textContent = ` · ${role}`;
+      n.role = svg("tspan", {class: `node-role${id === scene.leader ? " leading" : ""}`}, sign);
+      n.role.textContent = ` · ${role}`;
+      n.term = svg("tspan", {class: "node-term"}, sign);
     }
     const cote = svg("g", {transform: `translate(${cx},${deck - 4}) scale(${L.scale})`}, n.g);
     const entrances = dovecote(cote);
@@ -263,8 +264,31 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     else for (const w of entrances) boarded(cote, w);
     if (cluster && id === scene.leader && !scene.cut.has(id)) flag(cote);
     n.door = [cx, deck - 4 - 150 * L.scale];
+    // Its election clock: an arc round the dovecote, wound up by each word
+    // from a leader, running down to the election's timeout.
+    if (cluster) {
+      const r = 105 * L.scale;
+      n.clockLen = 2 * Math.PI * r;
+      n.clock = svg("circle", {class: "election-clock", cx, cy: deck - 4 - 80 * L.scale, r, transform: `rotate(-90 ${cx} ${deck - 4 - 80 * L.scale})`}, n.g);
+      n.clock.style.display = "none";
+    }
     ring(n, L.x - 4, deck - 4 - 175 * L.scale, L.w + 8, deck + 20);
     return n;
+  }
+
+  // Each node of a cluster as it says now (raft.js): {role, term, clock:
+  // 1…0 or null}; its sign, its colours, its election clock.
+  function setNodes(states) {
+    for (const [id, n] of lofts) {
+      const s = states.get(id);
+      if (!s || !n.role) continue;
+      if (s.role && !scene.cut.has(id)) n.role.textContent = ` · ${t(`nodes.role_${s.role}`)}`;
+      n.term.textContent = s.term ? ` · ${t("nodes.term", {n: s.term})}` : "";
+      n.g.classList.toggle("candidate", s.role === "candidate");
+      n.clock.style.display = s.clock == null || scene.cut.has(id) ? "none" : "";
+      if (s.clock != null) n.clock.setAttribute("stroke-dasharray", `${(s.clock * n.clockLen).toFixed(1)} ${n.clockLen.toFixed(1)}`);
+      n.clock.classList.toggle("low", s.clock != null && s.clock < 0.25);
+    }
   }
 
   const markOpen = target => {
@@ -361,6 +385,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
 
   return {
     draw,
+    setNodes,
     markOpen,
     focus,
     setTotal,
