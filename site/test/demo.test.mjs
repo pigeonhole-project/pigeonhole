@@ -139,7 +139,7 @@ test("tomlOf: one file for a cluster, each [[node]] its own log and snapshots", 
   ];
   const toml = tomlOf(setup(["telegram", "discord"], 2, {nodes: 3, links: "mixed", others}));
   assert.match(toml, /\[cluster\]\nid = 1\nkey_env/, "no `node`: every node runs this file");
-  assert.match(toml, /\[\[node\]\]\nid = 1\ngrpc = "node-1:7001"\noutbox = -1001000009001\nlog = "tg-log-1"\nsnapshot = "dc-snapshots-1"/);
+  assert.match(toml, /\[\[node\]\]\nid = 1\ngrpc = "node-1:7001"\noutbox = -1001000009001\nlog = "tg-log-1"\nsnapshot = "dc-snap-1"/);
   assert.match(toml, /\[\[node\]\]\nid = 2\ngrpc = "node-2:7001"\noutbox = -1001000009002\nlog = "dc-log-2"/);
   assert.match(toml, /\[\[node\]\]\nid = 3\noutbox = -1001000009003\nlog = "node-3-disk"\nsnapshot = "node-3-disk"/, "node 3 over the chat, on its disk");
   assert.match(toml, /id = "node-3-disk"\nkind = "local_disk"\npath = "\/data\/node-3"/);

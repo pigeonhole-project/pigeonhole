@@ -20,18 +20,18 @@ fn config() -> String {
         .replace("fake = \"channel-data\"", "fake = \"memory\"")
         .replace("[[store]]\nid = \"channel-data\"\nkind = \"local_disk\"\npath = \"/data/channels\"\n", "");
     // The demo's log and snapshots channels become node 1's; nodes 2 and 3 get their own.
-    let mut text = data.replace("log = \"tg-log\"\nsnapshot = \"tg-snapshots\"\n", "");
+    let mut text = data.replace("log = \"tg-log\"\nsnapshot = \"tg-snap\"\n", "");
     for node in 2..=3 {
-        for (what, at) in [("log", 2), ("snapshots", 3)] {
+        for (what, at) in [("log", 2), ("snap", 3)] {
             text.push_str(&format!("\n[[store]]\nid = \"tg-{what}-{node}\"\nkind = \"telegram\"\nchat_id = -100100000{at}0{node}\nfake = \"memory\"\n"));
         }
     }
     text.push_str(
         "\n[cluster]\nid = 7\nkey_env = \"PH_DEMO_CLUSTER_KEY\"\nfake = \"memory\"\n\
          heartbeat = \"1s\"\nelection_timeout_min = \"4s\"\nelection_timeout_max = \"8s\"\ntick = \"100ms\"\npoll = \"200ms\"\n\
-         [[node]]\nid = 1\ngrpc = \"node-1\"\noutbox = -1001000000101\nlog = \"tg-log\"\nsnapshot = \"tg-snapshots\"\n\
-         [[node]]\nid = 2\ngrpc = \"node-2\"\noutbox = -1001000000102\nlog = \"tg-log-2\"\nsnapshot = \"tg-snapshots-2\"\n\
-         [[node]]\nid = 3\noutbox = -1001000000103\nlog = \"tg-log-3\"\nsnapshot = \"tg-snapshots-3\"\n",
+         [[node]]\nid = 1\ngrpc = \"node-1\"\noutbox = -1001000000101\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n\
+         [[node]]\nid = 2\ngrpc = \"node-2\"\noutbox = -1001000000102\nlog = \"tg-log-2\"\nsnapshot = \"tg-snap-2\"\n\
+         [[node]]\nid = 3\noutbox = -1001000000103\nlog = \"tg-log-3\"\nsnapshot = \"tg-snap-3\"\n",
     );
     text
 }
