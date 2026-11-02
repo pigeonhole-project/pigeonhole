@@ -129,13 +129,14 @@ pub fn of(cfg: &Config) -> Vec<StoreRef> {
         };
         out.push(StoreRef { node: me, ..s });
     }
-    // Every node's outbox: the channel its Raft frames go through.
-    for node in cfg.cluster.iter().flat_map(|c| &c.nodes) {
+    // Every node's outbox: the channel its Raft frames go through (a fake
+    // one in the demo, read as the other fakes are).
+    for (cluster, node) in cfg.cluster.iter().flat_map(|c| c.nodes.iter().map(move |n| (c, n))) {
         if let Some(chat) = node.outbox {
             let store = crate::outbox_store(node.id);
-            out.push(
-                StoreRef { node: Some(node.id), ..StoreRef::meta("outbox", "telegram", chat.to_string()) }.named(store),
-            );
+            let fake = cluster.outbox_channel(node.id);
+            let outbox = StoreRef::meta("outbox", "telegram", chat.to_string());
+            out.push(StoreRef { node: Some(node.id), fake, ..outbox }.named(store));
         }
     }
     out

@@ -11,7 +11,7 @@
 //! values set on each host apart).
 
 use crate::instances::TelegramLogin;
-use crate::stores::TelegramBots;
+use crate::stores::{FakeBacking, FakeChannel, TelegramBots};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,6 +49,9 @@ pub struct NodeSettings {
 pub enum ChatSettings {
     /// The primary bot first; each reads and posts for the node.
     Telegram { logins: Vec<TelegramLogin> },
+    /// Fake Telegram channels ([`ClusterSettings::outbox_channel`]; the
+    /// feature `fake`): no bots, the site's demo.
+    Fake,
 }
 
 /// The cluster as this node sees it.
@@ -68,9 +71,28 @@ pub struct ClusterSettings {
     /// The chat transport's tick and poll.
     pub tick: Duration,
     pub poll: Duration,
+    /// Where fake outboxes keep themselves (`[cluster] fake`).
+    pub fake: Option<FakeBacking>,
 }
 
 impl ClusterSettings {
+    /// Node `node`'s outbox as a fake Telegram channel, with `[cluster] fake`.
+    pub fn outbox_channel(&self, node: u64) -> Option<FakeChannel> {
+        let fake = self.fake.as_ref()?;
+        let chat = self.nodes.iter().find(|n| n.id == node)?.outbox?;
+        let backing = match fake {
+            FakeBacking::Dir(dir) => FakeBacking::Dir(dir.join(format!("telegram-{chat}"))),
+            other => other.clone(),
+        };
+        Some(FakeChannel {
+            id: format!("outbox-{node}"),
+            kind: crate::instances::InstanceKind::Telegram,
+            scope: chat.to_string(),
+            backing,
+            bots: 1,
+        })
+    }
+
     pub fn me(&self) -> &NodeSettings {
         self.nodes.iter().find(|n| n.id == self.node).expect("checked when read")
     }
@@ -122,6 +144,9 @@ pub(crate) struct FileCluster {
     poll: Option<Duration>,
     /// The chat of the outboxes: `"telegram"` (the default).
     chat: Option<String>,
+    /// Fake outboxes (builds with the feature `fake`): `"memory"`, or the
+    /// local_disk store they keep themselves in; no bots.
+    fake: Option<String>,
     /// Env vars with this node's bots' tokens; default `["RAFT_BOT_TOKEN"]`.
     bot_token_envs: Option<Vec<String>>,
     api_id_env: Option<String>,
@@ -176,7 +201,12 @@ fn read_nodes(nodes: Vec<FileNode>) -> Result<Vec<NodeSettings>> {
 
 impl FileCluster {
     /// `None` without `[[node]]`s: a cluster of one.
-    pub(crate) fn into_settings(self, nodes: Vec<FileNode>) -> Result<Option<ClusterSettings>> {
+    /// `fake_base(store)`: what `[cluster] fake` names, resolved.
+    pub(crate) fn into_settings(
+        self,
+        nodes: Vec<FileNode>,
+        fake_base: impl FnOnce(&str) -> Result<FakeBacking>,
+    ) -> Result<Option<ClusterSettings>> {
         if nodes.is_empty() {
             return Ok(None);
         }
@@ -188,7 +218,21 @@ impl FileCluster {
         let me =
             nodes.iter().find(|n| n.id == node).with_context(|| format!("this node, {node}, is not a [[node]]"))?;
         let chat_link = nodes.iter().any(|n| n.id != node && link(me, n) == Some(Link::Chat));
-        let chat = if chat_link { Some(self.chat_settings()?) } else { None };
+        let fake = match &self.fake {
+            None => None,
+            Some(_) if !cfg!(feature = "fake") => {
+                bail!("[cluster] fake: fake outboxes are only in builds with the `fake` feature")
+            }
+            Some(_) if self.bot_token_envs.is_some() || self.api_id_env.is_some() => {
+                bail!("[cluster] fake outboxes have no real bots: drop bot_token_envs, api_id_env, api_hash_env")
+            }
+            Some(under) => Some(fake_base(under).context("[cluster] fake")?),
+        };
+        let chat = match (chat_link, &fake) {
+            (false, _) => None,
+            (true, Some(_)) => Some(ChatSettings::Fake),
+            (true, None) => Some(self.chat_settings()?),
+        };
         let key_env = self.key_env.context("[cluster] key_env: the env var with the cluster's key")?;
         let key = parse_key(&std::env::var(&key_env).with_context(|| format!("{key_env} is not set"))?)
             .with_context(|| key_env.clone())?;
@@ -209,6 +253,7 @@ impl FileCluster {
             election_timeout,
             tick: self.tick.unwrap_or(tick),
             poll: self.poll.unwrap_or(poll),
+            fake,
         }))
     }
 

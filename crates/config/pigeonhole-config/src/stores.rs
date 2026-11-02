@@ -393,6 +393,19 @@ impl Topology {
         Ok(())
     }
 
+    /// What fake channels named `fake = under` keep themselves in: memory,
+    /// or the directory of a local_disk store (each channel one inside).
+    pub(crate) fn fake_base(&mut self, under: &str) -> Result<FakeBacking> {
+        if under == "memory" {
+            return Ok(FakeBacking::Memory);
+        }
+        Ok(match self.take(under, "fake channels")? {
+            Store::LocalDisk { path } => FakeBacking::Dir(path),
+            Store::Memory => FakeBacking::Memory,
+            _ => bail!("fake = {under:?}: a local_disk or memory store keeps fake channels"),
+        })
+    }
+
     /// Take store `id` for `purpose` (see [`Store::may_share`]).
     fn take(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
         let store = self.stores.get(id).cloned().with_context(|| {

@@ -291,6 +291,9 @@ async fn chat_network(
     let settings =
         openraft_chat::Settings { cluster: cluster.id, key: cluster.key, tick: cluster.tick, poll: cluster.poll };
     let me = cluster.me();
+    if let Some(ChatSettings::Fake) = &cluster.chat {
+        anyhow::bail!("[cluster] fake: fake outboxes run in the site's demo (pigeonhole-web), not in the binary");
+    }
     let Some(ChatSettings::Telegram { logins }) = (!peers.is_empty()).then_some(cluster.chat.as_ref()).flatten() else {
         let idle = FakeChat::new();
         return Ok(openraft_chat::ChatNetwork::new(me.id, settings, idle.mailbox(me.id, me.id), Default::default()));

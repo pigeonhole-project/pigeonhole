@@ -25,10 +25,12 @@ use std::sync::{Arc, Mutex};
 pub type TelegramStore = TelegramBlobStore<PooledChannel<TelegramBot<TelegramChannel>>>;
 pub type DiscordStore = DiscordBlobStore<PooledDiscord<DiscordBot<DiscordChannel>>>;
 
+/// The channels are opened under an async lock: two stores (two nodes)
+/// opening one channel at once must get the same, not two of it.
 #[derive(Default)]
 pub struct World {
-    telegram: Mutex<HashMap<(i64, String), Arc<TelegramChannel>>>,
-    discord: Mutex<HashMap<(u64, String), Arc<DiscordChannel>>>,
+    telegram: tokio::sync::Mutex<HashMap<(i64, String), Arc<TelegramChannel>>>,
+    discord: tokio::sync::Mutex<HashMap<(u64, String), Arc<DiscordChannel>>>,
     /// Channels taken down (`kind:scope`): every bot's call fails.
     outages: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
@@ -62,21 +64,23 @@ pub fn meta_info(f: &FakeChannel) -> InstanceInfo {
 impl World {
     pub async fn telegram(&self, chat: &str, backing: &FakeBacking) -> Result<Arc<TelegramChannel>> {
         let key = (chat.parse().with_context(|| format!("chat id {chat:?}"))?, format!("{backing:?}"));
-        if let Some(c) = self.telegram.lock().unwrap().get(&key) {
+        let mut open = self.telegram.lock().await;
+        if let Some(c) = open.get(&key) {
             return Ok(c.clone());
         }
         let channel = Arc::new(crate::telegram(key.0, channel_stores(backing)?).await?);
-        self.telegram.lock().unwrap().insert(key, channel.clone());
+        open.insert(key, channel.clone());
         Ok(channel)
     }
 
     pub async fn discord(&self, channel: &str, backing: &FakeBacking) -> Result<Arc<DiscordChannel>> {
         let key = (channel.parse().with_context(|| format!("channel id {channel:?}"))?, format!("{backing:?}"));
-        if let Some(c) = self.discord.lock().unwrap().get(&key) {
+        let mut open = self.discord.lock().await;
+        if let Some(c) = open.get(&key) {
             return Ok(c.clone());
         }
         let ch = Arc::new(crate::discord(key.0, channel_stores(backing)?).await?);
-        self.discord.lock().unwrap().insert(key, ch.clone());
+        open.insert(key, ch.clone());
         Ok(ch)
     }
 
@@ -137,6 +141,14 @@ impl World {
         }
     }
 
+    /// One fake bot on Telegram channel `f`, behind the channel's down
+    /// switch: a node's poster and reader of a Raft outbox.
+    pub async fn telegram_bot(&self, cfg: &Config, f: &FakeChannel) -> Result<TelegramBot<TelegramChannel>> {
+        let channel = self.telegram(&f.scope, &f.backing).await?;
+        let limiter = cfg.chat_limiter(InstanceKind::Telegram, &fake_bot(0), &f.scope);
+        Ok(TelegramBot::new(channel, limiter, 0).with_switch(self.outage(f.kind, &f.scope)))
+    }
+
     /// A Telegram store on fake channel `f`, through its bots: each with
     /// its own budget (`[telegram.send]` is per bot and chat), as a server's.
     pub async fn telegram_store(&self, cfg: &Config, f: &FakeChannel, info: InstanceInfo) -> Result<TelegramStore> {
@@ -180,8 +192,8 @@ impl World {
 
     /// Stops every fake channel's tablet (a process exit).
     pub async fn close(&self) -> Result<()> {
-        let tg: Vec<_> = self.telegram.lock().unwrap().drain().map(|(_, c)| c).collect();
-        let dc: Vec<_> = self.discord.lock().unwrap().drain().map(|(_, c)| c).collect();
+        let tg: Vec<_> = self.telegram.lock().await.drain().map(|(_, c)| c).collect();
+        let dc: Vec<_> = self.discord.lock().await.drain().map(|(_, c)| c).collect();
         for c in tg {
             c.host().close().await?;
         }

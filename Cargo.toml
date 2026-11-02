@@ -94,7 +94,7 @@ pigeonhole-meta = { path = "crates/meta/pigeonhole-meta" }
 pigeonhole-config = { path = "crates/config/pigeonhole-config" }
 pigeonhole-admin = { path = "crates/admin/pigeonhole-admin" }
 openraft-chat = { path = "crates/net/openraft-chat" }
-openraft-grpc = { path = "crates/net/openraft-grpc" }
+openraft-grpc = { path = "crates/net/openraft-grpc", default-features = false }
 pigeonhole-raft-telegram = { path = "crates/net/pigeonhole-raft-telegram" }
 pigeonhole-types = { path = "crates/core/pigeonhole-types" }
 pigeonhole-storage-api = { path = "crates/core/pigeonhole-storage-api" }

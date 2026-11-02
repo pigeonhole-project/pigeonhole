@@ -443,7 +443,7 @@ impl Config {
             .as_deref()
             .context("[chunk] store is required: the [[store]] or [[replicas]] id chunks go to")?;
         let (instances, placement) = topology.blob_placement(blob_store)?;
-        let cluster = file.cluster.into_settings(file.node)?;
+        let cluster = file.cluster.into_settings(file.node, |under| topology.fake_base(under))?;
         topology.check_all_used()?;
         check_block_size_against_instances(block_size, &instances)?;
 
@@ -1800,6 +1800,36 @@ max_batch_total_size = "8 MiB"
         // A chat link sets the pace of the whole cluster.
         assert_eq!((two.heartbeat, two.election_timeout.0), (Duration::from_secs(10), Duration::from_secs(45)));
         assert_eq!(on(3).links(), [(1, Link::Chat), (2, Link::Chat)].into());
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn a_cluster_on_fake_outboxes_needs_no_bots() {
+        use crate::cluster::{ChatSettings, Link};
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        let text = |node: u64| {
+            format!(
+                "[cluster]\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\nfake = \"outboxes\"\nnode = {node}\n\
+                 [[node]]\nid = 1\ngrpc = \"node-1:7001\"\noutbox = -1001\n\
+                 [[node]]\nid = 2\ngrpc = \"node-2:7001\"\noutbox = -1002\n\
+                 [[node]]\nid = 3\noutbox = -1003\n\
+                 [[store]]\nid = \"outboxes\"\nkind = \"local_disk\"\npath = \"demo-data\"\n"
+            )
+        };
+        let three = load_mem(&text(3)).unwrap().cluster.unwrap();
+        assert!(matches!(three.chat, Some(ChatSettings::Fake)), "a chat link, on fakes");
+        assert_eq!(three.links(), [(1, Link::Chat), (2, Link::Chat)].into());
+        let outbox = three.outbox_channel(1).unwrap();
+        assert_eq!((outbox.id.as_str(), outbox.scope.as_str()), ("outbox-1", "-1001"));
+        assert_eq!(outbox.backing, stores::FakeBacking::Dir("demo-data/telegram--1001".into()));
+        let one = load_mem(&text(1)).unwrap().cluster.unwrap();
+        assert!(one.outbox_channel(3).is_some(), "every node's outbox, not only its own peers'");
+        let err = format!(
+            "{:#}",
+            load_mem(&text(1).replace("fake = \"outboxes\"", "fake = \"outboxes\"\nbot_token_envs = [\"X\"]"))
+                .unwrap_err()
+        );
+        assert!(err.contains("no real bots"), "{err}");
     }
 
     #[test]
