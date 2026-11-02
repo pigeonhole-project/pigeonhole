@@ -22,13 +22,9 @@ remove another session's worktree: ask it first.
 
 ## Builds
 
-Each worktree has its own `target/`; rustc goes through sccache (set in
-`~/.cargo/config.toml`), so a new worktree gets most crates from its cache.
-Don't set `CARGO_TARGET_DIR` to share builds: it locks one directory for
-every session at once and changes sccache's keys.
-
-macOS has no `timeout`: check a command's exit code, don't only grep its
-output.
+Each worktree has its own `target/`. Don't set `CARGO_TARGET_DIR` to share
+builds between them: cargo locks the directory, so sessions building at
+once wait on each other (and a compiler cache such as sccache keys on it).
 
 ## Before merging into main
 
