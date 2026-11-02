@@ -143,6 +143,7 @@
   "demo.title": "The loft",
   "demo.graph_label": "pigeonhole and its channels",
   "demo.hint": "Click a node to look inside. Start with you: upload a file.",
+  "demo.credit": "Pigeons: <a href=\"https://lottiefiles.com/free-animation/flying-pigeon-jvvifwQyXz\">Itay Alon</a> (LottieFiles)",
   "demo.close": "Back",
   "demo.drop": "Drop files here, or",
   "demo.bucket": "Bucket demo",
@@ -169,7 +170,10 @@
   "js.demo.channel_sub_snapshots": "A fake {app} channel ({scope}) holding snapshots of the metadata.",
   "js.demo.no_messages": "No messages yet.",
   "js.demo.no_files": "No files yet.",
-  "js.demo.disk_records": {"one": "{n} record kept", "other": "{n} records kept"},
+  "js.demo.disk_records": {
+    "one": "{n} record kept",
+    "other": "{n} records kept"
+  },
   "js.demo.earlier": "{n} earlier messages are not shown",
   "js.demo.text_meta": "{name}, {size} as text, message {id}",
   "js.demo.other_meta": "a message that is not ours, {id}",
