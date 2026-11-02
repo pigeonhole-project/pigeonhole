@@ -164,6 +164,17 @@ pub(crate) struct FileNode {
     /// file serves the whole cluster, each node finds its own here.
     log: Option<String>,
     snapshot: Option<String>,
+    /// Its own `[meta]` knobs (`None`: `[meta]`'s): its log may be a disk
+    /// or a chat, so how often it snapshots and how much it keeps is its own.
+    #[serde(default, deserialize_with = "crate::units::count_or_off_set")]
+    pub(crate) snapshot_every_entries: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "crate::units::duration_or_off_set")]
+    pub(crate) snapshot_every: Option<Option<Duration>>,
+    pub(crate) keep_snapshots: Option<usize>,
+    #[serde(default, deserialize_with = "crate::units::count_or_off_set")]
+    pub(crate) keep_log_entries: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "crate::units::duration_or_off_set")]
+    pub(crate) lease: Option<Option<Duration>>,
 }
 
 impl FileNode {

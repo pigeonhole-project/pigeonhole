@@ -466,6 +466,9 @@ impl Config {
         } else if own.snapshot.is_some() {
             file.meta.snapshot = own.snapshot;
         }
+        if let Some(n) = file.node.iter().find(|n| Some(n.id()) == me) {
+            file.meta.take_node(n);
+        }
         let mut topology = Topology::new(file.store, file.replicas, file.shards, own.others)?;
         let meta = file.meta.into_settings(&mut topology)?;
         let blob_store = file
@@ -722,6 +725,25 @@ impl Default for FileMeta {
 const DEFAULT_META_DIR: &str = "pigeonhole-meta";
 
 impl FileMeta {
+    /// The knobs node `n` sets for itself, over `[meta]`'s.
+    fn take_node(&mut self, n: &cluster::FileNode) {
+        if let Some(v) = n.snapshot_every_entries {
+            self.snapshot_every_entries = v;
+        }
+        if let Some(v) = n.snapshot_every {
+            self.snapshot_every = v;
+        }
+        if let Some(v) = n.keep_snapshots {
+            self.keep_snapshots = v;
+        }
+        if let Some(v) = n.keep_log_entries {
+            self.keep_log_entries = Some(v);
+        }
+        if let Some(v) = n.lease {
+            self.lease = v;
+        }
+    }
+
     fn into_settings(self, topology: &mut Topology) -> Result<MetaSettings> {
         let log_store = match &self.log {
             Some(id) => topology.meta_store(id, "[meta] log")?,
@@ -1909,6 +1931,40 @@ max_batch_total_size = "8 MiB"
         let shared = file.replace("log = \"dc-log-2\"", "log = \"disk-1\"");
         let err = format!("{:#}", Config::from_toml_as(&shared, path, 3).unwrap_err());
         assert!(err.contains("is both [[node]] 1 log and [[node]] 2 log"), "{err}");
+    }
+
+    #[test]
+    fn each_node_its_own_meta_knobs() {
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        let file = "[cluster]\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n\
+             [meta]\nsnapshot_every_entries = 1000\nkeep_snapshots = 3\n\
+             [[node]]\nid = 1\ngrpc = \"a:1\"\n\
+             [[node]]\nid = 2\ngrpc = \"b:1\"\nsnapshot_every_entries = 50000\nsnapshot_every = \"off\"\n\
+             keep_snapshots = 1\nlease = \"1m\"\n\
+             [[node]]\nid = 3\ngrpc = \"c:1\"\nkeep_log_entries = \"off\"\n\
+             [chunk]\nstore = \"blobs\"\n[[store]]\nid = \"blobs\"\nkind = \"memory\"\n";
+        let path = Path::new("pigeonhole.toml");
+        let meta = |node| Config::from_toml_as(file, path, node).unwrap().meta;
+        let one = meta(1);
+        assert_eq!((one.snapshot_every_entries, one.keep_log_entries, one.keep_snapshots), (Some(1000), Some(1000), 3));
+        assert_eq!(one.snapshot_interval, Some(Duration::from_secs(600)), "[meta]'s default");
+        let two = meta(2);
+        assert_eq!((two.snapshot_every_entries, two.snapshot_interval), (Some(50_000), None));
+        assert_eq!(two.keep_log_entries, Some(50_000), "follows its own snapshot_every_entries");
+        assert_eq!((two.keep_snapshots, two.lease), (1, Some(Duration::from_secs(60))));
+        let three = meta(3);
+        assert_eq!((three.snapshot_every_entries, three.keep_log_entries), (Some(1000), None));
+
+        let err = format!(
+            "{:#}",
+            Config::from_toml_as(&file.replace("keep_snapshots = 1", "keep_snapshots = 0"), path, 2).unwrap_err()
+        );
+        assert!(err.contains("keep_snapshots: at least 1"), "{err}");
+        let err = format!(
+            "{:#}",
+            Config::from_toml_as(&file.replace("lease = \"1m\"", "leases = \"1m\""), path, 1).unwrap_err()
+        );
+        assert!(err.contains("unknown field `leases`"), "a typo in any node fails every node: {err}");
     }
 
     #[test]

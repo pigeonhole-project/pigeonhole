@@ -11,7 +11,8 @@ else in `pigeonhole.toml` is static: a restart reads it.
 | `sweep.interval`, `sweep.batch_size` | the sweeper (orphans and zero-ref chunks) |
 | `repair.interval`, `repair.batch_size`, `repair.concurrency`, `repair.max_cost_wait`, `repair.scrub` | repair / backfill |
 | `inline.cool_every`, `inline.cool_after`, `inline.min_inline`, `inline.cool_batch`, `inline.budget`, `inline.low_watermark` | the cooler of inline objects |
-| `meta.snapshot_every` | the periodic snapshot (by time; `snapshot_every_entries` is static) |
+| `meta.snapshot_every` | the periodic snapshot (by time; `snapshot_every_entries` is static), of every node that sets none of its own |
+| `node.<id>.snapshot_every` | in a cluster, node `<id>`'s periodic snapshot (`[[node]] snapshot_every`): `off` parks that node's alone |
 | `metrics.every` | how often the tablet's gauges are set |
 | `bytestream.gc_every`, `bytestream.gc_ttl`, `bytestream.upload_gc_every` | the REAPI CAS GC and the drop of stale uploads |
 
@@ -58,7 +59,12 @@ ticker skips its pass on a follower (`MetaStore::is_leader`), so a new
 leader takes the work over with its next pass. Overrides reach the
 followers through replication. `DynConfig::follow` recomputes the knobs
 whenever they change, so a node that takes over runs with the latest
-ones, and each node's snapshot ticker follows `meta.snapshot_every`. On a
+ones. Snapshots are every node's own work: each node's ticker follows
+`node.<id>.snapshot_every` if set (in the file or overridden), else
+`meta.snapshot_every`; the more specific key wins, so overriding
+`meta.snapshot_every` leaves a node with a period of its own alone. The
+override is written on the leader and reaches the node it names by
+replication. `POST /admin/run/snapshot` asks the node it is sent to. On a
 follower, `PUT` and `DELETE` answer 503 (`NotLeader`): ask the leader. The snapshot ticker's
 control lives in the `MetaStore` (`snapshot_schedule()`). The bytestream
 server takes its GC schedules in `Gc`.

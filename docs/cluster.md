@@ -113,6 +113,11 @@ knows which one it is from `PIGEONHOLE_NODE` (or `[cluster] node`). Each
 `[[node]]` names its own log and snapshots stores; a node opens only its
 own and leaves the others' unresolved (their env vars need not be set).
 A store serves one node: two nodes naming the same log is an error.
+Whatever depends on a node's own log is its own too: `[[node]]` sets any
+`[meta]` knob for itself (how often it snapshots, how many snapshots and how
+much log it keeps, a Discord log's lease), `[meta]` gives the rest. In the
+dynamic config a node's periodic snapshot is `node.<id>.snapshot_every`
+(dynamic-config.md).
 
 ```toml
 [cluster]
@@ -131,6 +136,8 @@ grpc = "10.0.0.1:7001"          # serves Raft here; the others call it here
 outbox = -1001111111111         # the channel it posts its frames into
 log = "log-1"                   # its [meta] log and snapshots: [[store]] ids
 snapshot = "snapshots-1"
+# Any [meta] knob, for this node alone (unset: [meta]'s): snapshot_every_entries,
+# snapshot_every, keep_snapshots, keep_log_entries, lease.
 
 [[node]]
 id = 2
@@ -144,6 +151,8 @@ id = 3
 outbox = -1003333333333         # only a channel: 1 and 2 reach it over the chat
 log = "log-3"
 snapshot = "snapshots-3"
+snapshot_every_entries = 50000  # its log is a chat: snapshots and collection cost messages
+keep_log_entries = 50000
 ```
 
 The file is the same on every host. The bots are not: `bot_token_envs`
@@ -422,9 +431,12 @@ and fake ones in the demo):
 A follower catches up from the leader's log as far as the log reaches back,
 and from the leader's snapshot behind that. A leader keeps
 `[meta] keep_log_entries` entries behind its newest snapshot (default: as
-many as `snapshot_every_entries`, so about one interval; `"off"`: none) —
+many as its `snapshot_every_entries`, so about one interval; `"off"`: none;
+per node like every `[meta]` knob) —
 openraft's `max_in_snapshot_log_to_keep`, which purges by count and does not
-wait for a follower. A cluster of one keeps none. So a follower that was cut
+wait for a follower. The leader's value decides how far back followers
+can catch up from its log; each node purges its own log by its own. A
+cluster of one keeps none. So a follower that was cut
 off for less than an interval gets the entries it lacks; one that was gone
 longer, or a new node, gets a snapshot.
 
