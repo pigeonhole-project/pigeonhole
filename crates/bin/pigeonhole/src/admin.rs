@@ -49,6 +49,7 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
         Ok(stats) => info!(
             zero_ref_chunks = stats.zero_ref_chunks,
             keys_deleted = stats.keys_deleted,
+            failed = ?stats.failed,
             "purge sweeper pass complete"
         ),
         Err(e) => warn!(error = %e, "purge sweeper pass failed; background sweeper will retry"),

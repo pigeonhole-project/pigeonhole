@@ -230,7 +230,8 @@ async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) -> Node {
     let live = read_all(&node.s3).await;
     let sw = sweeper(&node);
     for _ in 0..3 {
-        sw.sweep_once().await.unwrap();
+        let stats = sw.sweep_once().await.unwrap();
+        assert!(stats.failed.is_empty(), "a sweep with the faults off left {:?} out", stats.failed);
     }
     assert_eq!(read_all(&node.s3).await, live, "the final sweeps changed objects");
     for (m, backend) in members.iter().zip(&node.backends) {

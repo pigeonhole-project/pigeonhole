@@ -82,7 +82,7 @@ async fn a_channel_down_fails_a_write_of_two_and_takes_one_of_two() {
         node.create_bucket("demo").await.unwrap();
         let dc = fake(&node, "discord");
         world.fakes.set_down(&dc, true);
-        let put = node.put("demo", "k", object(1)).await;
+        let put = node.put("demo", "k", noise(3_000_000)).await;
         assert_eq!(put.is_ok(), quorum == 1, "quorum {quorum}: {put:?}");
         world.fakes.set_down(&dc, false);
         assert_eq!(count(&world, &node, "discord").await, DC_MARKER);
@@ -154,4 +154,29 @@ async fn a_deleted_text_blob_is_still_read_from_the_cache_until_verify() {
     assert_eq!(count(&world, &node, "telegram").await, 1 + TG_MARKER, "repaired in the background");
     node.close().await.unwrap();
     world.close().await.unwrap();
+}
+
+/// A write of two that failed with one channel down leaves its copy on the
+/// other: the sweeper takes it while the channel is still down, whichever
+/// of the two it is (it sweeps them in turn, the one down left for later).
+#[tokio::test]
+async fn a_failed_writes_copy_is_swept_while_the_other_channel_is_down() {
+    for (broken, live) in [("telegram", "discord"), ("discord", "telegram")] {
+        let world = std::sync::Arc::new(World::default());
+        let node = Node::open(&world, &config(2)).await.unwrap();
+        node.create_bucket("demo").await.unwrap();
+        node.put("demo", "ok", object(2)).await.unwrap();
+        let before = count(&world, &node, live).await;
+        let f = fake(&node, broken);
+        world.fakes.set_down(&f, true);
+        assert!(node.put("demo", "k", object(1)).await.is_err());
+        assert_eq!(count(&world, &node, live).await, before + 1, "{broken} down: the orphan on {live}");
+        let stats = node.sweep().await.unwrap();
+        assert_eq!((stats.keys_deleted, stats.failed), (1, vec![broken.to_string()]), "{broken} down");
+        assert_eq!(count(&world, &node, live).await, before, "{broken} down: the orphan gone");
+        world.fakes.set_down(&f, false);
+        assert!(node.sweep().await.unwrap().failed.is_empty());
+        node.close().await.unwrap();
+        world.close().await.unwrap();
+    }
 }

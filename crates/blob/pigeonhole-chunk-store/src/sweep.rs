@@ -7,7 +7,7 @@
 
 use crate::blob_db::BlobDb;
 use anyhow::{Context, Result};
-use pigeonhole_blob::{SharedBackend, UploadPins};
+use pigeonhole_blob::{ReplicaLayout, SharedBackend, UploadPins};
 use pigeonhole_types::schedule::Schedule;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +38,9 @@ pub struct SweepStats {
     pub zero_ref_chunks: u64,
     pub keys_deleted: u64,
     pub keys_skipped_live: u64,
+    /// Instances the pass could not sweep (or delete a reclaimed chunk's
+    /// parts on): down, rate-limited. The others are swept all the same.
+    pub failed: Vec<String>,
 }
 
 /// One sweeper per process; iterates every member of the placement group.
@@ -81,9 +84,13 @@ impl Sweeper {
     async fn background_pass(&self) {
         let t0 = std::time::Instant::now();
         let pass = self.sweep_once().await;
-        pigeonhole_blob::record_background_pass("sweep", pass.is_ok(), t0.elapsed());
+        let ok = pass.as_ref().is_ok_and(|s| s.failed.is_empty());
+        pigeonhole_blob::record_background_pass("sweep", ok, t0.elapsed());
         match pass {
             Ok(stats) => {
+                if !stats.failed.is_empty() {
+                    warn!(failed = ?stats.failed, "sweep pass left instances out");
+                }
                 pigeonhole_blob::record_sweep("deleted", stats.keys_deleted);
                 pigeonhole_blob::record_sweep("skipped_live", stats.keys_skipped_live);
                 pigeonhole_blob::record_sweep("zero_ref", stats.zero_ref_chunks);
@@ -103,19 +110,19 @@ impl Sweeper {
     }
 
     /// Single pass: reclaim `refs = 0` chunks, then range-sweep each instance.
+    /// An instance that fails (down, rate-limited) is left for the next pass
+    /// ([`SweepStats::failed`]); the others are swept all the same.
     pub async fn sweep_once(&self) -> Result<SweepStats> {
-        let mut stats = SweepStats { zero_ref_chunks: self.reclaim_zero_refs().await?, ..Default::default() };
+        let mut stats = SweepStats::default();
+        self.reclaim_zero_refs(&mut stats).await?;
         for member in &self.members {
-            let (deleted, skipped) = self.sweep_instance(member).await?;
-            stats.keys_deleted += deleted;
-            stats.keys_skipped_live += skipped;
+            self.sweep_instance(member, &mut stats).await?;
         }
         Ok(stats)
     }
 
-    async fn reclaim_zero_refs(&self) -> Result<u64> {
+    async fn reclaim_zero_refs(&self, stats: &mut SweepStats) -> Result<()> {
         let chunks = self.db.list_zero_ref_chunks().await?;
-        let mut n = 0u64;
         for chunk_id in chunks {
             if !self.db.try_begin_reclaim(chunk_id).await? {
                 continue;
@@ -134,44 +141,61 @@ impl Sweeper {
                 continue;
             }
             let layouts = self.db.get_replica_layouts(chunk_id).await?;
-            for layout in &layouts {
-                let Some(backend) = self.members.iter().find(|m| m.instance().id == layout.instance) else {
-                    warn!(
-                        chunk_id,
-                        instance = %layout.instance,
-                        "zero-ref reclaim: instance not in placement; leaving parts"
-                    );
-                    continue;
-                };
-                let keys: Vec<Vec<u8>> = layout.parts.iter().map(|p| p.locator.key.clone()).collect();
-                if !keys.is_empty() {
-                    backend.delete(&keys).await.with_context(|| {
-                        format!("delete zero-ref parts chunk={chunk_id} instance={}", layout.instance)
-                    })?;
-                }
+            // A chunk whose parts could not all go keeps its metadata: the
+            // next pass deletes them again.
+            if self.delete_parts(chunk_id, &layouts, stats).await {
+                self.db.delete_chunk_metadata(chunk_id).await?;
+                stats.zero_ref_chunks += 1;
             }
-            self.db.delete_chunk_metadata(chunk_id).await?;
-            n += 1;
         }
-        Ok(n)
+        Ok(())
     }
 
-    async fn sweep_instance(&self, backend: &SharedBackend) -> Result<(u64, u64)> {
+    /// Delete a reclaimed chunk's parts on every instance; whether all went.
+    async fn delete_parts(&self, chunk_id: i64, layouts: &[ReplicaLayout], stats: &mut SweepStats) -> bool {
+        let mut all_gone = true;
+        for layout in layouts {
+            let Some(backend) = self.members.iter().find(|m| m.instance().id == layout.instance) else {
+                warn!(chunk_id, instance = %layout.instance, "zero-ref reclaim: instance not in placement; leaving parts");
+                continue;
+            };
+            let keys: Vec<Vec<u8>> = layout.parts.iter().map(|p| p.locator.key.clone()).collect();
+            if keys.is_empty() {
+                continue;
+            }
+            if let Err(e) = backend.delete(&keys).await {
+                warn!(chunk_id, instance = %layout.instance, error = %format!("{e:#}"), "zero-ref reclaim: parts not deleted; next pass");
+                fail(stats, &layout.instance);
+                all_gone = false;
+            }
+        }
+        all_gone
+    }
+
+    /// Range-sweep one instance up to its horizon. The instance failing (a
+    /// list or a delete) leaves it for the next pass, from where it got to;
+    /// the metadata failing (or the tablet fenced) fails the pass.
+    async fn sweep_instance(&self, backend: &SharedBackend, stats: &mut SweepStats) -> Result<()> {
         let instance_id = backend.instance().id.as_str();
         let Some(upto) = self.pins.horizon(instance_id) else {
-            return Ok((0, 0));
+            return Ok(());
+        };
+        let failed = |stats: &mut SweepStats, what: &str, e: anyhow::Error| {
+            warn!(instance = instance_id, error = %format!("{e:#}"), "sweep: {what} failed; the instance waits for the next pass");
+            fail(stats, instance_id);
         };
 
         let mut after = self.db.get_sweep_cursor(instance_id).await?;
-        let mut deleted = 0u64;
-        let mut skipped = 0u64;
         let batch = self.config.batch_size.max(1);
 
         loop {
-            let keys = backend
-                .candidates(self.pins.owner(), after.as_deref(), &upto, batch)
-                .await
-                .with_context(|| format!("candidates for {instance_id}"))?;
+            let keys = match backend.candidates(self.pins.owner(), after.as_deref(), &upto, batch).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    failed(stats, "listing", e);
+                    return Ok(());
+                }
+            };
             if keys.is_empty() {
                 self.db.set_sweep_cursor(instance_id, None).await?;
                 break;
@@ -179,14 +203,17 @@ impl Sweeper {
 
             // Re-check liveness immediately before delete (never cache across batches).
             let (to_delete, skipped_batch) = self.filter_deletable(instance_id, &keys).await?;
-            skipped += skipped_batch;
+            stats.keys_skipped_live += skipped_batch;
             if !to_delete.is_empty() {
                 // Orphans are judged by this incarnation's state: delete only
                 // while it still holds the generation. (Reclaim needs no check:
                 // its deletes follow a committed BeginReclaim.)
                 self.db.confirm_active().await.context("confirm the tablet's generation before deleting orphans")?;
-                backend.delete(&to_delete).await.with_context(|| format!("batch delete on {instance_id}"))?;
-                deleted += to_delete.len() as u64;
+                if let Err(e) = backend.delete(&to_delete).await {
+                    failed(stats, "delete", e);
+                    return Ok(());
+                }
+                stats.keys_deleted += to_delete.len() as u64;
             }
 
             let last = keys.last().cloned();
@@ -198,7 +225,7 @@ impl Sweeper {
                 break;
             }
         }
-        Ok((deleted, skipped))
+        Ok(())
     }
 
     /// Split a candidate batch (all at or below the horizon) into
@@ -209,6 +236,13 @@ impl Sweeper {
         let to_delete: Vec<Vec<u8>> = keys.iter().filter(|k| !owned.contains(*k)).cloned().collect();
         let skipped = (keys.len() - to_delete.len()) as u64;
         Ok((to_delete, skipped))
+    }
+}
+
+/// Instance `instance` failed this pass (once in the list).
+fn fail(stats: &mut SweepStats, instance: &str) {
+    if !stats.failed.iter().any(|i| i == instance) {
+        stats.failed.push(instance.to_string());
     }
 }
 
@@ -480,5 +514,146 @@ mod tests {
         assert_eq!(a.mem.message_keys(), both);
         assert!(a.db.chunk_meta(id_a).await.unwrap().is_some());
         assert!(db_b.chunk_meta(id_b).await.unwrap().is_some());
+    }
+
+    /// A blob store with a down switch: every call fails while it is down.
+    struct Switch {
+        inner: MemoryBlobStore,
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    impl Switch {
+        fn up(&self) -> Result<()> {
+            match self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                true => anyhow::bail!("{} is down", pigeonhole_blob::BlobBackend::instance(&self.inner).id),
+                false => Ok(()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl pigeonhole_blob::BlobBackend for Switch {
+        type Id = <MemoryBlobStore as pigeonhole_blob::BlobBackend>::Id;
+        type Key = <MemoryBlobStore as pigeonhole_blob::BlobBackend>::Key;
+        fn instance(&self) -> &pigeonhole_blob::InstanceInfo {
+            self.inner.instance()
+        }
+        fn limits(&self) -> &pigeonhole_blob::BackendLimits {
+            self.inner.limits()
+        }
+        fn key(id: &Self::Id) -> Self::Key {
+            MemoryBlobStore::key(id)
+        }
+        fn cost(&self, op: pigeonhole_blob::OpKind, id: Option<&Self::Id>) -> pigeonhole_blob::CostHint {
+            self.inner.cost(op, id)
+        }
+        async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
+            self.up()?;
+            self.inner.put(data, name).await
+        }
+        async fn get(
+            &self,
+            id: &Self::Id,
+            range: Option<pigeonhole_blob::ByteRange>,
+        ) -> Result<pigeonhole_blob::BoxByteStream> {
+            self.up()?;
+            self.inner.get(id, range).await
+        }
+        async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
+            self.up()?;
+            self.inner.delete(keys).await
+        }
+        async fn candidates(
+            &self,
+            owner: pigeonhole_blob::Owner,
+            after: Option<Self::Key>,
+            upto: Self::Key,
+            limit: usize,
+        ) -> Result<Vec<Self::Key>> {
+            self.up()?;
+            self.inner.candidates(owner, after, upto, limit).await
+        }
+    }
+
+    /// Two copies of every chunk: on `first` (with a down switch), then on
+    /// `second` (memory); the sweeper goes through them in that order.
+    struct Pair {
+        _dir: tempfile::TempDir,
+        db: BlobDb,
+        first: Arc<Switch>,
+        second: Arc<MemoryBlobStore>,
+        layer: ChunkStore,
+        members: Vec<SharedBackend>,
+        pins: Arc<UploadPins>,
+    }
+
+    async fn pair() -> Pair {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let first =
+            Arc::new(Switch { inner: MemoryBlobStore::new().with_instance_id("first"), down: Default::default() });
+        let second = Arc::new(MemoryBlobStore::new().with_instance_id("second"));
+        let members: Vec<SharedBackend> = vec![Arc::new(erase(first.clone())), Arc::new(erase(second.clone()))];
+        let replicated =
+            Arc::new(Replicated::new(members.clone(), 2, Arc::new(pigeonhole_blob::CheapestFirst::new())).unwrap());
+        let pins = replicated.pins().clone();
+        let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
+        opts.block_size = 64 * 1024;
+        let layer = ChunkStore::open_replicated(db.clone(), replicated, opts).await.unwrap();
+        Pair { _dir: dir, db, first, second, layer, members, pins }
+    }
+
+    impl Pair {
+        fn sweeper(&self) -> Sweeper {
+            let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: Some(Duration::from_secs(1)) };
+            Sweeper::new(self.db.clone(), self.members.clone(), config, self.pins.clone())
+        }
+
+        fn set_down(&self, down: bool) {
+            self.first.down.store(down, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The first copy down, a write of two fails, its part on the second is
+    /// an orphan: the sweep takes it, past the first's failure, and says so.
+    #[tokio::test]
+    async fn an_instance_down_does_not_keep_the_others_from_being_swept() {
+        let p = pair().await;
+        p.layer.put_small(Bytes::from_static(b"on both")).await.unwrap();
+        let live = p.second.message_keys();
+        p.set_down(true);
+        p.layer.put_small(Bytes::from_static(b"one copy of two")).await.unwrap_err();
+        assert_eq!(p.second.message_keys().len(), live.len() + 1, "the orphan");
+
+        let stats = p.sweeper().sweep_once().await.unwrap();
+        assert_eq!((stats.keys_deleted, stats.failed.clone()), (1, vec!["first".to_string()]));
+        assert_eq!(p.second.message_keys(), live);
+
+        p.set_down(false);
+        let stats = p.sweeper().sweep_once().await.unwrap();
+        assert!(stats.failed.is_empty(), "{:?}", stats.failed);
+    }
+
+    /// A released chunk whose first copy cannot be deleted keeps its
+    /// metadata; its second copy goes, and the first once it is back.
+    #[tokio::test]
+    async fn a_reclaim_that_cannot_reach_a_copy_waits_for_it() {
+        let p = pair().await;
+        let id = p.layer.put_small(Bytes::from_static(b"released")).await.unwrap();
+        p.layer.release(&[id]).await.unwrap();
+        p.set_down(true);
+
+        let stats = p.sweeper().sweep_once().await.unwrap();
+        assert_eq!((stats.zero_ref_chunks, stats.failed.clone()), (0, vec!["first".to_string()]));
+        assert!(p.db.chunk_meta(id).await.unwrap().is_some(), "kept for the next pass");
+        assert!(p.second.message_keys().is_empty(), "the reachable copy went");
+
+        p.set_down(false);
+        let stats = p.sweeper().sweep_once().await.unwrap();
+        assert_eq!((stats.zero_ref_chunks, stats.failed.len()), (1, 0));
+        assert!(p.db.chunk_meta(id).await.unwrap().is_none());
+        assert!(p.first.inner.message_keys().is_empty());
     }
 }

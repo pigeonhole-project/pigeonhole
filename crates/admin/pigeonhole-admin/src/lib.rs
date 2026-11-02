@@ -223,7 +223,7 @@ impl Admin {
             }
             "sweep" => {
                 let s = self.sweep().await?;
-                json!({ "deleted": s.keys_deleted, "zero_ref": s.zero_ref_chunks })
+                json!({ "deleted": s.keys_deleted, "zero_ref": s.zero_ref_chunks, "failed": s.failed })
             }
             "channels" => match &self.channels {
                 Some(c) => c.describe(r.limit.unwrap_or(200)).await?,
