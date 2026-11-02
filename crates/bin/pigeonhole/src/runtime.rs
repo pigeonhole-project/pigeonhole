@@ -309,25 +309,27 @@ async fn chat_network(
         let n = cluster.nodes.iter().find(|n| n.id == node).expect("a member");
         n.outbox.with_context(|| format!("[[node]] {node} has no outbox"))
     };
-    let own = telegram_outbox(cfg, logins, outbox(me.id)?).await?;
+    let own = telegram_outbox(cfg, logins, me.id, outbox(me.id)?).await?;
     let mut others = std::collections::HashMap::new();
     for &peer in peers {
-        others.insert(peer, telegram_outbox(cfg, logins, outbox(peer)?).await?);
+        others.insert(peer, telegram_outbox(cfg, logins, peer, outbox(peer)?).await?);
     }
     Ok(openraft_chat::ChatNetwork::new(me.id, settings, own, others))
 }
 
-/// Raft outbox `chat` through `logins`' bots, woken by its pushed posts.
+/// Node `node`'s Raft outbox `chat` through `logins`' bots, woken by its
+/// pushed posts.
 async fn telegram_outbox(
     cfg: &Config,
     logins: &[TelegramLogin],
+    node: u64,
     chat: i64,
 ) -> anyhow::Result<Arc<dyn openraft_chat::Mailbox>> {
     use pigeonhole_raft_telegram::TelegramMailbox;
     let channel = telegram_channel(cfg, logins, &chat.to_string(), Lane::Meta)
         .await
         .with_context(|| format!("Raft outbox {chat}"))?;
-    let mailbox = Arc::new(TelegramMailbox::new(Arc::new(channel)));
+    let mailbox = Arc::new(TelegramMailbox::new(Arc::new(channel)).named(pigeonhole_admin::outbox_store(node)));
     let pushed = mailbox.clone();
     channel_log::on_post(pigeonhole::telegram::channel_id_of(chat)?, move |id| pushed.seen(id));
     Ok(mailbox)

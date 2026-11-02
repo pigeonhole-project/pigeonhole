@@ -13,6 +13,7 @@ openraft-chat = { workspace = true }
 pigeonhole-storage-api = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

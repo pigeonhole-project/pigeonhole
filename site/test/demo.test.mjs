@@ -50,15 +50,17 @@ test("readEvents: deletions, store calls, repair, the claim, S3", () => {
   ]);
 });
 
-test("readEvents: an outbox post is a frame, responses and all; a response flies no pigeon", () => {
+test("readEvents: an outbox logs its posts and its prunes as a store does; a response flies no pigeon", () => {
   const events = readEvents([
     line("raft frame sent", {node: 2, to: 1, kind: "append", reply: true, via: "chat"}),
     line("raft frame sent", {node: 1, to: 2, kind: "heartbeat", reply: false, via: "chat"}),
-    line("posted a frame", {node: 2, pos: 9, envelopes: 2}),
+    line("posted", {store: "outbox-2", message_id: 9, name: "raft.bin", bytes: "57", kind: "text"}),
+    line("deleted", {store: "outbox-2", messages: "[1, 2, 3]"}),
   ]);
   assert.deepEqual(events, [
     {type: "raft", from: 1, to: 2, via: "chat", kind: "heartbeat", at: "sent"},
-    {type: "frame", from: 2, envelopes: 2},
+    {type: "posted", store: "outbox-2", id: 9, kind: "text", name: "raft.bin", bytes: 57, preview: null},
+    {type: "deleted", store: "outbox-2", ids: ["1", "2", "3"]},
   ]);
 });
 
@@ -299,7 +301,7 @@ test("summary: a command's verb and what it touched", () => {
 });
 
 test("flightsOf: a node's own channel is its; a data channel the leader's; Raft by its frame", () => {
-  const channels = {"tg-log-2": {store: "tg-log-2", node: 2}, "tg-1": {store: "tg-1", node: null}, "outbox-3": {store: "outbox-3", node: 3}};
+  const channels = {"tg-log-2": {store: "tg-log-2", node: 2}, "tg-1": {store: "tg-1", node: null}, "outbox-3": {store: "outbox-3", node: 3, role: "outbox"}};
   const channel = s => channels[s];
   const ctx = {leader: 1, shown: 2};
   assert.deepEqual(flightsOf({type: "posted", store: "tg-log-2", bytes: 300}, channel, ctx), [
@@ -308,6 +310,8 @@ test("flightsOf: a node's own channel is its; a data channel the leader's; Raft 
   assert.deepEqual(flightsOf({type: "call", store: "tg-1", op: "get", bytes: 9}, channel, ctx)[0].to, {node: 1}, "the leader reads the data");
   assert.equal(flightsOf({type: "call_failed", store: "tg-1"}, channel, ctx)[0].failed, true);
   assert.deepEqual(flightsOf({type: "posted", store: "nope"}, channel, ctx), [], "a channel not drawn: nothing flies");
+  // An outbox's post flies no pigeon of its own: the frame's does.
+  assert.deepEqual(flightsOf({type: "posted", store: "outbox-3", bytes: 57}, channel, ctx), []);
   const read = flightsOf({type: "raft", from: 3, to: 1, via: "chat", kind: "append", at: "read"}, channel, ctx)[0];
   assert.deepEqual([read.from, read.to, read.lane], [{store: "outbox-3", at: "new"}, {node: 1}, "raft"]);
   assert.equal(flightsOf({type: "raft", from: 1, to: 2, via: "grpc", kind: "heartbeat", at: "sent"}, channel, ctx)[0].spark, true);

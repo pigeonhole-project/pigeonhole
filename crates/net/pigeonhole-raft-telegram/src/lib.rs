@@ -13,6 +13,9 @@
 //! Pruning deletes the owner's frames below a position; the frame at that
 //! position is pinned first, as an anchor: the lookup of the newest id
 //! starts at the pinned message, above which nothing was deleted.
+//!
+//! A mailbox [named](TelegramMailbox::named) as a store logs its posts and
+//! deletions as the stores do (`posted`, `deleted`, at debug).
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -42,11 +45,18 @@ pub struct TelegramMailbox<C> {
     /// Pruning: the lowest id that may still hold a message below the
     /// anchor (0: not known yet, the pinned anchor's or 1).
     pruned_to: AtomicI64,
+    /// The store it is to the logs; none: it logs nothing.
+    store: Option<String>,
 }
 
 impl<C: ChannelApi> TelegramMailbox<C> {
     pub fn new(channel: Arc<C>) -> Self {
-        Self { channel, top: watch::channel(0).0, pruned_to: AtomicI64::new(0) }
+        Self { channel, top: watch::channel(0).0, pruned_to: AtomicI64::new(0), store: None }
+    }
+
+    /// Logs its posts and deletions as store `store`'s.
+    pub fn named(self, store: impl Into<String>) -> Self {
+        Self { store: Some(store.into()), ..self }
     }
 
     /// Message `id` is in the channel (Telegram pushed it, or we read it):
@@ -131,10 +141,15 @@ impl<C: ChannelApi> TelegramMailbox<C> {
 impl<C: ChannelApi> Mailbox for TelegramMailbox<C> {
     async fn post(&self, frame: Bytes) -> Result<u64> {
         let random_id = uuid::Uuid::new_v4().as_u64_pair().0 as i64;
-        let sent = match text::fits(FRAME_NAME, frame.len(), TEXT_MAX_CHARS) {
+        let (bytes, inline) = (frame.len(), text::fits(FRAME_NAME, frame.len(), TEXT_MAX_CHARS));
+        let sent = match inline {
             true => self.channel.send_text(&text::encode(FRAME_NAME, &frame), random_id).await?,
             false => self.channel.send_document(FRAME_NAME, frame, random_id).await?,
         };
+        if let Some(store) = &self.store {
+            let kind = if inline { "text" } else { "document" };
+            tracing::debug!(%store, message_id = sent.message_id, name = FRAME_NAME, bytes, kind, "posted");
+        }
         self.seen(sent.message_id);
         Ok(sent.message_id as u64)
     }
@@ -203,6 +218,9 @@ impl<C: ChannelApi> Mailbox for TelegramMailbox<C> {
             }
             let ids: Vec<i64> = (low..keep_from.min(low + IDS_PER_CALL as i64)).collect();
             self.channel.delete_messages(&ids).await.context("delete old frames")?;
+            if let Some(store) = &self.store {
+                tracing::debug!(%store, messages = ?ids, "deleted");
+            }
             low += ids.len() as i64;
             self.pruned_to.store(low, Ordering::Relaxed);
         }

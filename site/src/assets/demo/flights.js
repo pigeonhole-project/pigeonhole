@@ -28,7 +28,8 @@ export function flightsOf(e, channel, ctx) {
   const c = e.store == null ? null : channel(e.store);
   if (!c) return [];
   const node = {node: ownerOf(c, ctx)};
-  if (e.type === "posted") return [{from: node, to: {store: c.store, at: "new"}, size: e.bytes}];
+  // An outbox's post is a Raft frame: its pigeon is the frame's (raft below).
+  if (e.type === "posted") return c.role === "outbox" ? [] : [{from: node, to: {store: c.store, at: "new"}, size: e.bytes}];
   if (e.type === "call" && (e.op === "get" || e.op === "exists"))
     return [{from: {store: c.store, at: "any"}, to: node, size: e.op === "get" ? e.bytes || 4096 : 512}];
   if (e.type === "call_failed") return [{from: node, to: {store: c.store, at: "free"}, size: 2048, failed: true}];

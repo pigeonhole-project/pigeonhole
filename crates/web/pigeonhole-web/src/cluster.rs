@@ -47,7 +47,8 @@ impl Net {
         }
         let channel = cluster.outbox_channel(node).with_context(|| format!("[[node]] {node}: no fake outbox"))?;
         let bot = world.fakes.telegram_bot(cfg, &channel).await?;
-        let mailbox: Arc<dyn Mailbox> = Arc::new(TelegramMailbox::new(Arc::new(bot)));
+        let mailbox: Arc<dyn Mailbox> =
+            Arc::new(TelegramMailbox::new(Arc::new(bot)).named(pigeonhole_admin::outbox_store(node)));
         made.insert(node, mailbox.clone());
         Ok(mailbox)
     }
