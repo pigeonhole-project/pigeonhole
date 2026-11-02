@@ -4,7 +4,7 @@ use crate::digest::{digest_hash_hex, verify_sha256};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
-use pigeonhole_chunk_store::ChunkStore;
+use pigeonhole_chunk_store::{ChunkId, ChunkStore, PendingChunks};
 use pigeonhole_meta::Proposal;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -140,9 +140,18 @@ impl CasStore {
 
         // The chunks and the entry: one log entry.
         let entry = CasEntry { hash: hash_hex.to_string(), size, extents: ingested.extents.clone() };
+        let chunks = std::mem::take(&mut ingested.chunks);
+        let this = self.clone();
+        // The commit and the release a duplicate needs: to the end even if
+        // the request is dropped meanwhile.
+        pigeonhole_chunk_store::to_the_end(async move { this.commit(entry, chunks, new_ids).await }).await?
+    }
+
+    /// Commit `entry` with its chunks; if another writer stored the digest
+    /// first, release `new_ids` (ours).
+    async fn commit(&self, entry: CasEntry, chunks: PendingChunks, new_ids: Vec<ChunkId>) -> Result<()> {
         let mut proposal = Proposal::new();
         let slot = proposal.push(self.cas.prepare_store(&entry));
-        let chunks = std::mem::take(&mut ingested.chunks);
         let mut outcomes = self.store.commit_along(chunks, self.cas.meta(), proposal).await?;
         let Ok(reply) = outcomes.take(slot)?;
         match reply {

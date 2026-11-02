@@ -63,7 +63,11 @@ check is only an optimization; the one in `apply` decides.
 A rejected `PutObject` is committed in the same entry as its chunks
 (one entry per operation), so the chunks exist with refs = 1 and nothing
 points at them: the handler releases them, as it already does when the bucket
-disappears under a put. `S3State::VERSION` 3.
+disappears under a put. The S3 write handlers run in a task of their own
+(`S3Gateway::to_the_end`), so that release, and the release of what a
+successful write replaced, happen even when the request is gone before the
+answer (the client hung up, `headers_timeout`); only a crash between the
+entry and the release leaves `refs` one too high. `S3State::VERSION` 3.
 
 ## Not in scope
 
@@ -107,7 +111,9 @@ multi-node mode) against a local pigeonhole, etcdctl v3.7.3 as the client.
   side: a lock-sized object should not wait behind bulk uploads (a priority
   lane, or small objects through a faster store). Since then small objects
   are inline: kept in the metadata, with no upload at all
-  ([inline-objects.md](inline-objects.md)).
+  ([inline-objects.md](inline-objects.md)). A PUT whose client gave up
+  still runs to its end, its commit and the release of the object it
+  replaced included.
 - **Control.** The same run against main before this change: the gateway
   answered 200 to every conditional put (`If-None-Match: *` twice, a stale
   `If-Match`), so two leaders could both "win". T4 v1.1.16 started anyway:
