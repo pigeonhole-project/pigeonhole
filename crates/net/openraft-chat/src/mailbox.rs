@@ -29,6 +29,14 @@ pub trait Mailbox: Send + Sync + 'static {
     async fn wait(&self, _after: u64, timeout: Duration) {
         tokio::time::sleep(timeout).await;
     }
+
+    /// Forget the frames before position `keep_from` (its owner's outbox
+    /// only): they are past any use. Readers past them read on as before; a
+    /// reader below them skips to what is left. A chat that cannot delete
+    /// keeps them.
+    async fn prune(&self, _keep_from: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// An in-memory chat for tests: one outbox per node, with faults.
@@ -62,6 +70,8 @@ struct State {
     posts: u64,
     /// Posts made, per outbox, including lost ones.
     attempts: HashMap<u64, u64>,
+    /// Posts pruned, per outbox: the first this many are gone.
+    pruned: HashMap<u64, usize>,
 }
 
 impl FakeChat {
@@ -106,6 +116,13 @@ impl FakeChat {
     /// Posts node `owner` made, lost ones included.
     pub fn posts_by(&self, owner: u64) -> u64 {
         self.inner.state.lock().unwrap().attempts.get(&owner).copied().unwrap_or(0)
+    }
+
+    /// Frames still in node `owner`'s outbox (not pruned).
+    pub fn kept(&self, owner: u64) -> u64 {
+        let s = self.inner.state.lock().unwrap();
+        let all = s.outboxes.get(&owner).map_or(0, Vec::len);
+        (all - s.pruned.get(&owner).copied().unwrap_or(0)) as u64
     }
 }
 
@@ -153,13 +170,8 @@ impl Mailbox for FakeMailbox {
             bail!("node {} cannot reach node {}'s outbox", self.viewer, self.owner);
         }
         let shown = shown(&s.outboxes[&self.owner]);
-        Ok(shown
-            .iter()
-            .enumerate()
-            .skip(after as usize)
-            .take(limit)
-            .map(|(i, (_, f))| (i as u64 + 1, f.clone()))
-            .collect())
+        let from = (after as usize).max(s.pruned.get(&self.owner).copied().unwrap_or(0));
+        Ok(shown.iter().enumerate().skip(from).take(limit).map(|(i, (_, f))| (i as u64 + 1, f.clone())).collect())
     }
 
     async fn head(&self) -> Result<u64> {
@@ -181,6 +193,23 @@ impl Mailbox for FakeMailbox {
             .find(|at| *at > Instant::now());
         let timeout = next.map_or(timeout, |at| timeout.min(at.saturating_duration_since(Instant::now())));
         let _ = tokio::time::timeout(timeout, posted).await;
+    }
+
+    async fn prune(&self, keep_from: u64) -> Result<()> {
+        if self.viewer != self.owner {
+            bail!("node {} cannot prune node {}'s outbox", self.viewer, self.owner);
+        }
+        let mut s = self.chat.state.lock().unwrap();
+        let State { outboxes, pruned, .. } = &mut *s;
+        let outbox = outboxes.get_mut(&self.owner).expect("made with the mailbox");
+        let done = pruned.entry(self.owner).or_default();
+        // Positions start at 1: keep_from is the frame at index keep_from - 1.
+        let gone = (keep_from.saturating_sub(1) as usize).min(outbox.len());
+        for (_, f) in &mut outbox[(*done).min(gone)..gone] {
+            *f = Bytes::new();
+        }
+        *done = (*done).max(gone);
+        Ok(())
     }
 }
 

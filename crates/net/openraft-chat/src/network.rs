@@ -13,7 +13,7 @@ use openraft::raft::{
     VoteResponse,
 };
 use openraft::{AnyError, Raft, RaftTypeConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -66,6 +66,10 @@ pub struct Settings {
     pub tick: Duration,
     /// How long a reader waits for a push before it reads anyway.
     pub poll: Duration,
+    /// How long a frame stays in the outbox (`None`: forever): older ones
+    /// are pruned, once per `keep`, on a tick with nothing to send. Past
+    /// twice the longest election timeout no call waits for a frame.
+    pub keep: Option<Duration>,
 }
 
 /// openraft's network over chat outboxes, for one node.
@@ -87,14 +91,22 @@ struct Inner<C: RaftTypeConfig> {
     queue: Mutex<Vec<Envelope<C>>>,
     queued: Arc<Notify>,
     /// Calls waiting for their response, by rpc id.
-    waiting: Mutex<HashMap<u64, oneshot::Sender<Body<C>>>>,
+    waiting: Mutex<HashMap<u64, Waiting<C>>>,
     next_rpc: AtomicU64,
     seq: AtomicU64,
     /// The highest seq seen from each peer.
     seen: Mutex<HashMap<C::NodeId, u64>>,
     handler: OnceLock<Arc<dyn Handler<C>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// This run's posts not pruned yet, oldest first: position and when.
+    posted: Mutex<VecDeque<(u64, tokio::time::Instant)>>,
+    /// When the outbox was last pruned (or the run started).
+    pruned_at: Mutex<tokio::time::Instant>,
 }
+
+/// A call waiting for its response: the peer asked (only its response
+/// completes the call) and where the response goes.
+type Waiting<C> = (<C as RaftTypeConfig>::NodeId, oneshot::Sender<Body<C>>);
 
 impl<C: RaftTypeConfig> Drop for Inner<C> {
     fn drop(&mut self) {
@@ -122,7 +134,9 @@ impl<C: RaftTypeConfig> ChatNetwork<C> {
         outbox: Arc<dyn Mailbox>,
         peers: HashMap<C::NodeId, Arc<dyn Mailbox>>,
     ) -> Self {
-        // Seq from the clock: it keeps growing across restarts.
+        // Seq and rpc ids from the clock: they keep growing across restarts,
+        // so a frame or a response meant for an earlier run of this node is
+        // never taken for one of this run.
         let seq = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
         let inner = Arc::new(Inner {
             me,
@@ -132,11 +146,13 @@ impl<C: RaftTypeConfig> ChatNetwork<C> {
             queue: Mutex::default(),
             queued: Arc::new(Notify::new()),
             waiting: Mutex::default(),
-            next_rpc: AtomicU64::new(1),
+            next_rpc: AtomicU64::new(seq),
             seq: AtomicU64::new(seq),
             seen: Mutex::default(),
             handler: OnceLock::new(),
             tasks: Mutex::default(),
+            posted: Mutex::default(),
+            pruned_at: Mutex::new(tokio::time::Instant::now()),
         });
         let sender = tokio::spawn(send_loop(Arc::downgrade(&inner)));
         inner.tasks.lock().unwrap().push(sender);
@@ -163,7 +179,7 @@ impl<C: RaftTypeConfig> ChatNetwork<C> {
         let rpc = self.inner.next_rpc.fetch_add(1, Ordering::Relaxed);
         let (kind, peer, t0) = (body.rpc(), target.to_string(), Instant::now());
         let (tx, rx) = oneshot::channel();
-        self.inner.waiting.lock().unwrap().insert(rpc, tx);
+        self.inner.waiting.lock().unwrap().insert(rpc, (target.clone(), tx));
         self.inner.enqueue(Envelope { to: target, rpc, body });
         let got = tokio::time::timeout(ttl, rx).await;
         self.inner.waiting.lock().unwrap().remove(&rpc);
@@ -181,6 +197,57 @@ impl<C: RaftTypeConfig> ChatNetwork<C> {
 }
 
 impl<C: RaftTypeConfig> Inner<C> {
+    /// Prune the outbox if it is due (once per `keep`) and nothing waits to
+    /// be sent: every frame older than `keep` goes, but the newest frame
+    /// stays (a chat may need one to anchor the rest). The first prune
+    /// comes a `keep` after the run starts, so the frames of the run before
+    /// stay that long for peers to read.
+    async fn prune(&self) {
+        let Some(keep) = self.settings.keep else { return };
+        let now = tokio::time::Instant::now();
+        if now.duration_since(*self.pruned_at.lock().unwrap()) < keep || !self.queue.lock().unwrap().is_empty() {
+            return;
+        }
+        let keep_from = {
+            let mut posted = self.posted.lock().unwrap();
+            let mut last = None;
+            while posted.len() > 1 && posted.front().is_some_and(|(_, at)| now.duration_since(*at) >= keep) {
+                last = posted.pop_front();
+            }
+            match (posted.front(), last) {
+                (Some((pos, _)), _) => *pos,
+                (None, Some((pos, _))) => pos,
+                (None, None) => return,
+            }
+        };
+        *self.pruned_at.lock().unwrap() = now;
+        let t0 = Instant::now();
+        let pruned = self.outbox.prune(keep_from).await;
+        telemetry::record_prune(pruned.is_ok(), t0.elapsed());
+        match pruned {
+            Ok(()) => debug!(node = %self.me, keep_from, "pruned the outbox"),
+            Err(e) => warn!(node = %self.me, keep_from, error = %format!("{e:#}"), "prune failed"),
+        }
+    }
+
+    /// A response from `peer` to call `rpc`: it completes the call if one
+    /// waits for it from that peer. Any other (a late one, one to another
+    /// peer's call, one to an earlier run of this node) is dropped.
+    fn complete(&self, peer: &C::NodeId, rpc: u64, body: Body<C>) {
+        let mut waiting = self.waiting.lock().unwrap();
+        match waiting.get(&rpc) {
+            Some((asked, _)) if asked == peer => {
+                let (_, tx) = waiting.remove(&rpc).expect("just seen");
+                let _ = tx.send(body);
+            }
+            _ => {
+                drop(waiting);
+                telemetry::record_stray(peer.to_string());
+                debug!(node = %self.me, %peer, rpc, "a response no call waits for dropped");
+            }
+        }
+    }
+
     fn enqueue(&self, env: Envelope<C>) {
         self.queue.lock().unwrap().push(env);
         self.queued.notify_one();
@@ -217,13 +284,19 @@ async fn send_loop<C: RaftTypeConfig>(inner: std::sync::Weak<Inner<C>>) {
         let posted = this.outbox.post(sealed).await;
         telemetry::record_post(posted.is_ok(), n, t0.elapsed());
         match posted {
-            Ok(pos) => debug!(node = %this.me, pos, envelopes = n, "posted a frame"),
+            Ok(pos) => {
+                debug!(node = %this.me, pos, envelopes = n, "posted a frame");
+                this.posted.lock().unwrap().push_back((pos, tokio::time::Instant::now()));
+            }
             // The calls time out; openraft retries as on a broken connection.
             Err(e) => warn!(node = %this.me, envelopes = n, error = %format!("{e:#}"), "post failed"),
         }
         let tick = this.settings.tick;
         drop(this);
         tokio::time::sleep(tick).await;
+        if let Some(this) = inner.upgrade() {
+            this.prune().await;
+        }
     }
 }
 
@@ -321,8 +394,8 @@ impl<C: RaftTypeConfig> Inner<C> {
                         this.enqueue(Envelope { to: peer, rpc: env.rpc, body });
                     }
                 });
-            } else if let Some(tx) = self.waiting.lock().unwrap().remove(&env.rpc) {
-                let _ = tx.send(env.body);
+            } else {
+                self.complete(&peer, env.rpc, env.body);
             }
         }
     }

@@ -57,7 +57,13 @@ impl Net {
         let me = cluster.node;
         let via_chat: HashSet<u64> =
             cluster.links().into_iter().filter(|(_, l)| *l == Link::Chat).map(|(id, _)| id).collect();
-        let settings = Settings { cluster: cluster.id, key: cluster.key, tick: cluster.tick, poll: cluster.poll };
+        let settings = Settings {
+            cluster: cluster.id,
+            key: cluster.key,
+            tick: cluster.tick,
+            poll: cluster.poll,
+            keep: Some(2 * cluster.election_timeout.1),
+        };
         let chat = if via_chat.is_empty() {
             let idle = FakeChat::new();
             ChatNetwork::new(me, settings, idle.mailbox(me, me), HashMap::new())

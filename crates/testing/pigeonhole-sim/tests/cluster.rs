@@ -16,8 +16,13 @@ const MEMBERS: [u64; 3] = [1, 2, 3];
 async fn node(chat: FakeChat, id: u64) -> Arc<MetaStore> {
     let peers: HashMap<u64, Arc<dyn Mailbox>> =
         MEMBERS.iter().filter(|&&m| m != id).map(|&m| (m, chat.mailbox(id, m))).collect();
-    let settings =
-        Settings { cluster: 7, key: [5; 32], tick: Duration::from_millis(20), poll: Duration::from_millis(200) };
+    let settings = Settings {
+        cluster: 7,
+        key: [5; 32],
+        tick: Duration::from_millis(20),
+        poll: Duration::from_millis(200),
+        keep: None,
+    };
     let net = ChatNetwork::<TypeConfig>::new(id, settings, chat.mailbox(id, id), peers);
     let serving = net.clone();
     let cluster = Cluster {

@@ -48,6 +48,19 @@ pub const METRICS: &[MetricInfo] = &[
         &["peer", "outcome"],
         "Frames read from a peer's outbox (outcome: ok, duplicate, bad_frame, foreign)",
     ),
+    m(
+        "openraft_chat_prunes_total",
+        MetricKind::Counter,
+        &["outcome"],
+        "Times this node pruned its outbox of frames older than `keep` (outcome: ok, error)",
+    ),
+    m("openraft_chat_prune_seconds", MetricKind::Histogram, &["outcome"], "Time one prune of the outbox took"),
+    m(
+        "openraft_chat_stray_responses_total",
+        MetricKind::Counter,
+        &["peer"],
+        "Responses from a peer that no call to it waits for (late, or to an earlier run of this node), dropped",
+    ),
     m("openraft_chat_read_errors_total", MetricKind::Counter, &["peer"], "Failed reads of a peer's outbox"),
     m(
         "openraft_chat_requests_served_total",
@@ -78,6 +91,15 @@ pub(crate) fn record_call(peer: String, rpc: &'static str, outcome: &'static str
 
 pub(crate) fn record_frame(peer: String, outcome: &'static str) {
     metrics::counter!("openraft_chat_frames_received_total", "peer" => peer, "outcome" => outcome).increment(1);
+}
+
+pub(crate) fn record_prune(ok: bool, took: Duration) {
+    metrics::counter!("openraft_chat_prunes_total", "outcome" => outcome(ok)).increment(1);
+    metrics::histogram!("openraft_chat_prune_seconds", "outcome" => outcome(ok)).record(took.as_secs_f64());
+}
+
+pub(crate) fn record_stray(peer: String) {
+    metrics::counter!("openraft_chat_stray_responses_total", "peer" => peer).increment(1);
 }
 
 pub(crate) fn record_read_error(peer: String) {

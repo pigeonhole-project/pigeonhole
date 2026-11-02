@@ -49,8 +49,13 @@ async fn node(
     };
     let mailbox = |of: u64| -> Arc<dyn Mailbox> { Arc::new(TelegramMailbox::new(outboxes[&of].clone())) };
     let peers = via_chat.iter().map(|&m| (m, mailbox(m))).collect();
-    let settings =
-        Settings { cluster: 5, key: [9; 32], tick: Duration::from_millis(20), poll: Duration::from_millis(100) };
+    let settings = Settings {
+        cluster: 5,
+        key: [9; 32],
+        tick: Duration::from_millis(20),
+        poll: Duration::from_millis(100),
+        keep: None,
+    };
     let chat = ChatNetwork::<TypeConfig>::new(id, settings, mailbox(id), peers);
     let grpc_peers = addrs.iter().filter(|(&m, _)| m != id && !via_chat.contains(&m)).map(|(&m, a)| (m, a.clone()));
     let identity = Identity { me: id, cluster: 5, key: [9; 32] };
