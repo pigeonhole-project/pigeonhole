@@ -13,8 +13,15 @@ use bytes::Bytes;
 
 const BASE: u32 = 0x20000;
 const BITS: u32 = 15;
+/// The longest message any backend takes, in characters (Telegram's 4096;
+/// Discord's is 2000).
+const MAX_CHARS: usize = 4096;
+/// The most bytes a text can carry: what [`MAX_CHARS`] characters of payload
+/// hold. A header naming more is not ours: anyone in a shared chat can post
+/// one, and its `len` must not size an allocation (or overflow `len * 8`).
+const MAX_LEN: usize = MAX_CHARS * BITS as usize / 8;
 
-/// Characters the payload of `len` bytes takes.
+/// Characters the payload of `len` bytes takes (`len` ≤ [`MAX_LEN`]).
 fn payload_chars(len: usize) -> usize {
     (len * 8).div_ceil(BITS as usize)
 }
@@ -27,6 +34,7 @@ fn header(name: &str, len: usize) -> String {
 /// `max_chars` characters.
 pub fn fits(name: &str, len: usize, max_chars: usize) -> bool {
     len > 0
+        && len <= MAX_LEN
         && !name.is_empty()
         && name.chars().all(|c| c.is_ascii_graphic())
         && header(name, len).chars().count() + payload_chars(len) <= max_chars
@@ -56,10 +64,11 @@ pub fn encode(name: &str, data: &[u8]) -> String {
 pub fn decode(text: &str) -> Option<(String, Bytes)> {
     let (head, payload) = text.split_once('\n')?;
     let (name, len) = head.rsplit_once(' ')?;
-    let len: usize = len.parse().ok()?;
+    let len: usize = len.parse().ok().filter(|&len| len <= MAX_LEN)?;
     if name.is_empty() || payload.chars().count() != payload_chars(len) {
         return None;
     }
+    // Sized only now: `len` is bounded and the payload has its characters.
     let mut out = Vec::with_capacity(len);
     let (mut acc, mut nbits) = (0u32, 0u32);
     for c in payload.chars() {
@@ -120,5 +129,19 @@ mod tests {
         for t in ["hello", "x 3\nabc", "x 2\n", "\n", "x 99999999999999999999\n"] {
             assert_eq!(decode(t), None, "{t:?}");
         }
+    }
+
+    #[test]
+    fn a_header_naming_too_many_bytes_is_not_ours() {
+        // 2^61 * 8 overflows; wrapped, it would ask for 0 characters.
+        assert_eq!(decode("x 2305843009213693952\n"), None);
+        assert_eq!(decode(&format!("x {}\n", usize::MAX)), None);
+        // At the bound a full payload decodes; one byte over, the same text does not.
+        let data = vec![0x5a; MAX_LEN];
+        let text = encode("x", &data);
+        assert_eq!(decode(&text).map(|(_, b)| b.len()), Some(MAX_LEN));
+        let (_, payload) = text.split_once('\n').unwrap();
+        assert_eq!(decode(&format!("x {}\n{payload}", MAX_LEN + 1)), None);
+        assert!(!fits("x", MAX_LEN + 1, usize::MAX));
     }
 }
