@@ -430,5 +430,18 @@
   "js.demo.own_channels": "Its own channels:",
   "js.demo.kin_node": "Node:",
   "js.demo.kin_copies": "Other copies:",
-  "js.demo.kin_shards": "Other shards:"
+  "js.demo.kin_shards": "Other shards:",
+  "js.budget.title": "Bots' budgets",
+  "js.budget.none": "No calls yet: a bot's budget shows once it posts or reads here.",
+  "js.budget.bot": "Bot",
+  "js.budget.class": "Calls",
+  "js.budget.left": "Left now",
+  "js.budget.rate": "Refill",
+  "js.budget.waiting": "Waiting",
+  "js.budget.class_send": "sends",
+  "js.budget.class_read": "reads",
+  "js.budget.class_delete": "deletes",
+  "js.budget.class_bot": "the bot, all chats",
+  "js.budget.per_sec": "{n}/s",
+  "js.budget.cooling": "rate-limited {s} s"
 }

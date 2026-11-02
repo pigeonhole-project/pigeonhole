@@ -275,6 +275,7 @@ impl Node {
             config_text: None,
             cluster: cfg.cluster.clone(),
             stores: stores.clone(),
+            limiters: vec![("telegram", cfg.limiters.clone()), ("discord", cfg.discord_limiters.clone())],
         };
         Ok(Self { admin, stores, loops })
     }

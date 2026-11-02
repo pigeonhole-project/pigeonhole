@@ -454,5 +454,18 @@
   "js.demo.own_channels": "Его каналы:",
   "js.demo.kin_node": "Узел:",
   "js.demo.kin_copies": "Другие копии:",
-  "js.demo.kin_shards": "Другие шарды:"
+  "js.demo.kin_shards": "Другие шарды:",
+  "js.budget.title": "Бюджет ботов",
+  "js.budget.none": "Вызовов ещё не было: бюджет бота появится, когда он что-то запостит или прочитает здесь.",
+  "js.budget.bot": "Бот",
+  "js.budget.class": "Вызовы",
+  "js.budget.left": "Осталось",
+  "js.budget.rate": "Пополнение",
+  "js.budget.waiting": "Ждут",
+  "js.budget.class_send": "отправка",
+  "js.budget.class_read": "чтение",
+  "js.budget.class_delete": "удаление",
+  "js.budget.class_bot": "бот целиком, все чаты",
+  "js.budget.per_sec": "{n}/с",
+  "js.budget.cooling": "ограничен ещё {s} с"
 }

@@ -209,6 +209,18 @@ struct TokenBucket {
     waiting: AtomicUsize,
 }
 
+/// A bucket as it stands now: refilled to this moment, nothing taken.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Budget {
+    pub tokens: f64,
+    pub capacity: f64,
+    pub per_sec: f64,
+    /// How much longer it cools down after a 429 / FLOOD_WAIT (zero: not).
+    pub cooling: Duration,
+    /// Calls waiting for a token from it.
+    pub waiting: usize,
+}
+
 /// Counts a caller in [`take_all`] (also when its future is dropped).
 struct Waiting<'a>(&'a AtomicUsize);
 
@@ -240,6 +252,19 @@ impl TokenBucket {
 
     fn peek_wait(&self) -> Duration {
         self.state.lock().unwrap().peek_wait()
+    }
+
+    fn budget(&self) -> Budget {
+        let now = Instant::now();
+        let mut st = self.state.lock().unwrap().clone();
+        st.refill(now);
+        Budget {
+            tokens: st.tokens.max(0.0),
+            capacity: st.capacity,
+            per_sec: st.rate_per_sec,
+            cooling: st.cool_down_until.map_or(Duration::ZERO, |until| until.saturating_duration_since(now)),
+            waiting: self.waiting.load(Ordering::SeqCst),
+        }
     }
 
     fn penalize(&self, retry_after: Duration) {
@@ -378,6 +403,21 @@ impl ChatLimiter {
 
     pub fn bot(&self) -> &Arc<BotLimiter> {
         &self.bot
+    }
+
+    /// The chat it budgets.
+    pub fn chat(&self) -> &str {
+        &self.chat
+    }
+
+    /// Each class's budget in this chat, as it stands.
+    pub fn budgets(&self) -> Vec<(Class, Budget)> {
+        self.classes.iter().map(|(c, b)| (*c, b.budget())).collect()
+    }
+
+    /// The bot's own budget, every chat of it, as it stands.
+    pub fn bot_budget(&self) -> Budget {
+        self.bot.calls.budget()
     }
 
     fn bucket(&self, class: Class) -> &TokenBucket {
@@ -554,6 +594,14 @@ impl LimiterRegistry {
         chats.insert((bot.to_string(), chat.to_string()), l.clone());
         l
     }
+
+    /// Every (bot, chat) it has made a limiter for, by bot then chat.
+    pub fn chats(&self) -> Vec<(String, String, Arc<ChatLimiter>)> {
+        let mut out: Vec<_> =
+            self.chats.lock().unwrap().iter().map(|((b, c), l)| (b.clone(), c.clone(), l.clone())).collect();
+        out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        out
+    }
 }
 
 /// A rate limit the server asked for: `info` when it is long enough for a
@@ -568,6 +616,29 @@ fn cool_down(chat: &str, budget: &str, retry_after: Duration) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_is_what_is_left_now() {
+        let cfg = ChatLimiterConfig {
+            bot: Rate::new(10.0, 10.0),
+            classes: vec![(Class("send"), Rate::new(1.0, 3.0))],
+            upload_concurrency: 1,
+            download_concurrency: 1,
+        };
+        let reg = LimiterRegistry::new(cfg);
+        let l = reg.chat("7", "-100");
+        l.acquire(Spend::Class(Class("send"))).await;
+        l.acquire(Spend::Class(Class("send"))).await;
+        let send = l.budgets()[0].1;
+        assert_eq!((send.tokens, send.capacity, send.per_sec, send.waiting), (1.0, 3.0, 1.0, 0));
+        assert_eq!(l.bot_budget().tokens, 8.0, "the bot's own budget took both");
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        assert_eq!(l.budgets()[0].1.tokens, 2.5, "refilled to now");
+        l.cool(Spend::Class(Class("send")), Level::Class, Duration::from_secs(4));
+        let cooled = l.budgets()[0].1;
+        assert_eq!((cooled.tokens, cooled.cooling), (0.0, Duration::from_secs(4)));
+        assert_eq!(reg.chats().iter().map(|(b, c, _)| (b.as_str(), c.as_str())).collect::<Vec<_>>(), [("7", "-100")]);
+    }
+
     use super::*;
     use std::sync::Arc;
 

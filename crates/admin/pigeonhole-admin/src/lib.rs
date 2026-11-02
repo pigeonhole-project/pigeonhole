@@ -147,6 +147,9 @@ pub struct Admin {
     pub cluster: Option<pigeonhole_config::cluster::ClusterSettings>,
     /// The node's stores as the config names them ([`stores::of`]).
     pub stores: Vec<StoreRef>,
+    /// Each service's rate limiters (`telegram`, `discord`): what op
+    /// `budgets` shows.
+    pub limiters: Vec<(&'static str, Arc<pigeonhole_limits::LimiterRegistry>)>,
 }
 
 impl Admin {
@@ -197,6 +200,7 @@ impl Admin {
             }),
             "log" => self.log_entries(r.from, r.limit.unwrap_or(200)).await?,
             "background" => self.background().await?,
+            "budgets" => self.budgets(),
             "cluster" => self.cluster(),
             "dynamic" => json!({
                 "keys": self.dynamic.keys(),
@@ -236,6 +240,29 @@ impl Admin {
             "outage" | "wipe" => self.channels()?.fault(&r.op, &r.store, r.down).await?,
             other => bail!("unknown op {other:?}"),
         })
+    }
+
+    /// Every bot's budgets as they stand: per chat, each class's (send,
+    /// read, delete) and the bot's own across its chats.
+    fn budgets(&self) -> Value {
+        let view = |b: pigeonhole_limits::Budget| {
+            json!({
+                "tokens": (b.tokens * 100.0).round() / 100.0,
+                "capacity": b.capacity,
+                "per_sec": b.per_sec,
+                "cooling_ms": b.cooling.as_millis() as u64,
+                "waiting": b.waiting,
+            })
+        };
+        let mut out = Vec::new();
+        for (service, registry) in &self.limiters {
+            for (bot, chat, limiter) in registry.chats() {
+                let classes: serde_json::Map<String, Value> =
+                    limiter.budgets().into_iter().map(|(c, b)| (c.0.to_string(), view(b))).collect();
+                out.push(json!({ "service": service, "bot": bot, "chat": chat, "classes": classes, "bot_total": view(limiter.bot_budget()) }));
+            }
+        }
+        json!({ "budgets": out })
     }
 
     fn channels(&self) -> Result<&Arc<dyn Channels>> {

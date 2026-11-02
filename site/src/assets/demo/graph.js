@@ -69,6 +69,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   // The dovecote a channel's way leads from (flights.js: whose traffic it is).
   const homeOf = c => loftOf(ownerOf(c, scene));
   let cards = new Map(); // store id → its block
+  const levels = new Map(); // store id → its bots' send budget (setBudget), kept across redraws
   let edges = new Map(); // store id → the way to its block; "" → the client's
 
   const nodeOf = target =>
@@ -106,6 +107,11 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     n.tip.textContent = role;
     n.older = svg("text", {class: "older", x: at.x + at.w / 2, y: at.ground - 4, "text-anchor": "middle"}, n.g);
     n.queue = svg("g", {class: "queue", transform: `translate(${cx},${b.roof - 40})`}, n.g);
+    // Its bots' send budget left (budgets.js sendLevel): a bar on the roof.
+    n.budget = svg("g", {class: "budget-bar", transform: `translate(${cx - 18},${b.roof + 2})`}, n.g);
+    svg("rect", {class: "budget-bg", width: 36, height: 3, rx: 1.5}, n.budget);
+    n.budgetFill = svg("rect", {class: "budget-fg", width: 0, height: 3, rx: 1.5}, n.budget);
+    setBudgetOf(n, levels.get(c.store) ?? null);
     ring(n, at.x, b.roof + 8, at.w, at.ground);
     n.shown = 0;
     fill(n, false);
@@ -303,6 +309,20 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   };
   const focus = target => nodeOf(target)?.g.focus();
 
+  // A channel's bots' send budget, as budgets.js sendLevel gives it ({frac,
+  // state: ok | low | busy}; null: none known, the bar hidden).
+  function setBudgetOf(n, level) {
+    n.budget.classList.toggle("none", !level);
+    if (!level) return;
+    n.budgetFill.setAttribute("width", String(Math.round(36 * Math.max(0, Math.min(1, level.frac)))));
+    n.budget.setAttribute("data-state", level.state);
+  }
+  function setBudget(store, level) {
+    levels.set(store, level);
+    const n = cards.get(store);
+    if (n) setBudgetOf(n, level);
+  }
+
   // A channel's count changed (a post landed, one was deleted): its windows anew.
   function setTotal(store) {
     const n = cards.get(store);
@@ -390,6 +410,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   }
 
   return {
+    setBudget,
     draw,
     setNodes,
     markOpen,

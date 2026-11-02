@@ -2589,6 +2589,7 @@ dependencies = [
  "pigeonhole-chunk-store",
  "pigeonhole-config",
  "pigeonhole-gateway-s3",
+ "pigeonhole-limits",
  "pigeonhole-meta",
  "pigeonhole-storage-api",
  "postcard",

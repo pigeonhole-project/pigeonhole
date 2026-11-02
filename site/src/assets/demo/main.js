@@ -5,6 +5,7 @@
 import {button, h, reducedMotion} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {s3Sentence} from "../lib/say.js";
+import {budgetsOf, budgetTable, sendLevel} from "./budgets.js";
 import {appOf, kinOf} from "./channels.js";
 import {chatView} from "./chat/index.js";
 import {forgetPlaces} from "./chat/scroll.js";
@@ -30,6 +31,7 @@ const state = {
   demo: "", // the demo's own config (the loft's "reset")
   config: "", // the pigeonhole.toml the node runs (a cluster's: every node's)
   nodes: [1], // the nodes' ids: one, or a cluster's
+  budgets: [], // the bots' budgets as they stood at the last poll (op budgets)
   node: null, // the node your requests go to (your panel); null: whichever leads
   look: null, // the node on screen (its panel, log, tasks); null: the one your requests go to
   cluster: null, // the `cluster` op's: {leader, term, nodes}
@@ -293,6 +295,7 @@ async function pollBackground() {
   const {reply} = await call({op: "background"});
   if (!ok(reply)) return;
   state.bg = reply;
+  await pollBudgets();
   // The log's block is as tall as the entries between two snapshots need.
   if (graph.drawn() && !state.wizard && (reply.snapshot?.every ?? 0) !== drawnEvery) redraw();
   renderBackground();
@@ -502,6 +505,18 @@ document.addEventListener("keydown", e => {
 
 const counters = () => ({objects: state.objects.length, dataChannels: state.channels.filter(c => c.role === "data").length, log: state.log});
 
+// The bots' budgets as they stand: a bar per channel on the graph, the
+// table in the open channel's panel.
+async function pollBudgets() {
+  const {reply} = await call({op: "budgets"});
+  if (!ok(reply)) return;
+  state.budgets = reply.budgets || [];
+  for (const c of state.channels) graph.setBudget(c.store, sendLevel(budgetsOf(c, state.budgets)));
+  const box = document.querySelector("#panel-body .budgets");
+  const c = isOpen("store") && channel(state.open.store);
+  if (box && c) box.replaceWith(budgetTable(budgetsOf(c, state.budgets)));
+}
+
 function renderPanel() {
   const open = state.open;
   if (!open) return;
@@ -538,7 +553,7 @@ function renderPanel() {
   } else {
     const c = channel(open.store);
     if (!c) return;
-    const nodes = [chatView(c, m => deleteMessage(c, m))];
+    const nodes = [budgetTable(budgetsOf(c, state.budgets)), chatView(c, m => deleteMessage(c, m))];
     if (c.role === "data") nodes.unshift(faultsView(c, state.admin, faultOps(c)));
     const kin = kinOf(c, state.channels);
     if (kin) nodes.unshift(kin);
