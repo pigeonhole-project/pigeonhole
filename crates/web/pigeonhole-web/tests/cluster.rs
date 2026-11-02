@@ -118,3 +118,57 @@ async fn a_frame_posted_to_a_fake_outbox_is_read_back() {
     let at = writer.post(Bytes::from_static(b"a frame")).await.unwrap();
     assert_eq!(reader.read_after(0, 10).await.unwrap(), vec![(at, Bytes::from_static(b"a frame"))]);
 }
+
+/// The dynamic config seen from the leader: where each value comes from,
+/// and whether the last change reached each node; a node cut off has not
+/// got it until it is back, then runs with it.
+#[tokio::test]
+async fn the_leader_shows_where_each_node_stands_on_a_config_change() {
+    std::env::set_var("PH_DEMO_CLUSTER_KEY", KEY);
+    let world = Arc::new(World::default());
+    let nodes = Nodes::open(&world, &config()).await.unwrap();
+    eventually("a leader", || nodes.leader().is_some()).await;
+    let leader = nodes.leader().unwrap();
+    let away = *nodes.nodes.keys().find(|&&id| id != leader).unwrap();
+    let dynamic = |node| op(&nodes, Some(node), r#"{"op":"dynamic"}"#);
+    let key = |view: &serde_json::Value, key: &str| {
+        view["keys"].as_array().unwrap().iter().find(|k| k["key"] == key).cloned().unwrap()
+    };
+
+    nodes.isolate(&world, away, true).unwrap();
+    let set = format!(r#"{{"op":"dynamic_set","key":"node.{away}.snapshot_every","value":"5m"}}"#);
+    op(&nodes, Some(leader), &set).await.unwrap();
+    let seen = dynamic(leader).await.unwrap();
+    assert_eq!(key(&seen, &format!("node.{away}.snapshot_every"))["from"], "override", "{seen}");
+    assert_eq!(key(&seen, &format!("node.{leader}.snapshot_every"))["from"], "inherited: file", "{seen}");
+    assert_eq!(key(&seen, "sweep.interval")["from"], "default");
+    let synced = |view: &serde_json::Value, id: u64| {
+        view["nodes"].as_array().unwrap().iter().find(|n| n["id"] == id).unwrap()["synced"].clone()
+    };
+    assert_eq!(synced(&seen, leader), true, "{seen}");
+    assert_eq!(synced(&seen, away), false, "cut off: not yet");
+
+    nodes.isolate(&world, away, false).unwrap();
+    for _ in 0..600 {
+        if synced(&dynamic(leader).await.unwrap(), away) == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let seen = dynamic(leader).await.unwrap();
+    assert_eq!(synced(&seen, away), true, "{seen}");
+    // The node itself runs with it: a snapshot ticker the file has off.
+    for _ in 0..600 {
+        let mine = dynamic(away).await.unwrap();
+        let snapshot = mine["tasks"].as_array().unwrap().iter().find(|t| t["task"] == "snapshot").cloned().unwrap();
+        if snapshot["every"] == "5m" {
+            assert_eq!(synced(&mine, away), true, "{mine}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mine = dynamic(away).await.unwrap();
+    assert_eq!(mine["tasks"].as_array().unwrap().iter().find(|t| t["task"] == "snapshot").unwrap()["every"], "5m");
+    nodes.close().await.unwrap();
+    world.close().await.unwrap();
+}

@@ -192,7 +192,12 @@ impl Admin {
             "log" => self.log_entries(r.from, r.limit.unwrap_or(200)).await?,
             "background" => self.background().await?,
             "cluster" => self.cluster(),
-            "dynamic" => json!({ "keys": self.dynamic.keys(), "tasks": self.dynamic.tasks() }),
+            "dynamic" => json!({
+                "keys": self.dynamic.keys(),
+                "tasks": self.dynamic.tasks(),
+                "changed_at": self.dynamic.changed_at(),
+                "nodes": self.dynamic.nodes(),
+            }),
             "dynamic_set" => {
                 self.dynamic.set(&r.key, &r.value).await?;
                 json!({ "ok": true })

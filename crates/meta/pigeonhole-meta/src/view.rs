@@ -24,6 +24,9 @@ pub struct NodeView {
     pub applied: Option<u64>,
     /// Entries behind the leader's log: known on the leader (0 for itself).
     pub lag: Option<u64>,
+    /// Position its log holds up to (replicated to it, maybe not applied
+    /// yet): known on the leader.
+    pub matched: Option<u64>,
 }
 
 fn role(state: ServerState) -> &'static str {
@@ -42,6 +45,8 @@ impl ClusterView {
         let voters: Vec<NodeId> = membership.voter_ids().collect();
         let learners = membership.learner_ids().filter(|l| !voters.contains(l));
         let last = m.last_log_index.unwrap_or(0);
+        // Raft's index n is position n + 1.
+        let matched = |id: NodeId| Some(m.replication.as_ref()?.get(&id)?.as_ref().map_or(0, |l| l.index + 1));
         let lag = |id: NodeId| {
             let replication = m.replication.as_ref()?;
             match id == m.id {
@@ -59,6 +64,7 @@ impl ClusterView {
             },
             applied: (id == m.id).then_some(applied),
             lag: lag(id),
+            matched: matched(id),
         };
         let mut nodes: Vec<NodeView> = voters.iter().map(|&id| view(id, false)).collect();
         nodes.extend(learners.map(|id| view(id, true)));

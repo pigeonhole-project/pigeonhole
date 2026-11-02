@@ -69,6 +69,24 @@ follower, `PUT` and `DELETE` answer 503 (`NotLeader`): ask the leader. The snaps
 control lives in the `MetaStore` (`snapshot_schedule()`). The bytestream
 server takes its GC schedules in `Gc`.
 
+## Introspection
+
+Each key says where its value comes from (`from`): `override` (in the
+tablet), `file`, or `default`. A node's key that sets nothing takes
+`meta.<name>`'s and says so: `inherited: file`, `inherited: override`,
+`inherited: default`. The node keys of every node are listed on every node,
+so the leader shows the whole cluster's values at once: the file and the
+overrides are the same everywhere.
+
+Whether a change reached a node: `changed_at` is the position of the last
+change to the overrides, and each of `nodes` has `matched` (the position its
+log holds up to) and `synced` (`matched ≥ changed_at`). The leader knows
+both for every node; a follower only for itself (`null` for the others).
+`changed_at` is exact for a change written on this node; for one it saw by
+replication, or one written before it started, it is the position applied
+at the time, an upper bound: a node may show `synced: false` a moment
+longer than it is.
+
 ## The admin API
 
 It is off by default. Turn it on with `[admin] listen_addr = "127.0.0.1:9100"`.
@@ -76,8 +94,10 @@ It has no authentication, so keep it on loopback; any other address logs a
 warning.
 
 - `GET /admin/config`: every dynamic key (its value, the file's, the
-  override, why one is refused) and every task (its period, when it passes
-  next).
+  override, why one is refused, and `from`: where the value comes from),
+  every task (its period, when it passes next), and the cluster's nodes with
+  whether the last change reached them (`changed_at`, `nodes`; see
+  § Introspection).
 - `PUT /admin/config/{key}`: override the key. The body is the value: `5s`,
   `off`, `16`, `true`, or quoted TOML. Answers 204, or 400 with the reason.
 - `DELETE /admin/config/{key}`: back to the file's value. Answers 204, or 404

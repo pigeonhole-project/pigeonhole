@@ -2,7 +2,8 @@
 //! dynamic config and passes of the background loops on demand.
 //!
 //! - `GET /admin/config`: every dynamic key (its value, the file's, the
-//!   override) and every task (its period, when it passes next);
+//!   override, where the value comes from), every task (its period, when it
+//!   passes next), and every node with whether the last change reached it;
 //! - `PUT /admin/config/{key}`, the value as the body (`5s`, `off`, `16`):
 //!   override it; `DELETE /admin/config/{key}`: back to the file's;
 //! - `POST /admin/run/{task}`: a pass now, even while the task is off;
@@ -53,7 +54,7 @@ async fn ops(State(admin): State<Arc<Admin>>, body: Bytes) -> Json<serde_json::V
 }
 
 async fn show(State(d): State<Arc<DynConfig>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "keys": d.keys(), "tasks": d.tasks() }))
+    Json(serde_json::json!({ "keys": d.keys(), "tasks": d.tasks(), "changed_at": d.changed_at(), "nodes": d.nodes() }))
 }
 
 async fn set(State(d): State<Arc<DynConfig>>, Path(key): Path<String>, body: Bytes) -> Response {
