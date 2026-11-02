@@ -93,8 +93,13 @@ if (mode === "smoke") {
       .join("\n"),
   );
 } else if (mode === "snapshot") {
-  // The demo snapshots every 50 entries: 60 puts, then the log's base.
+  // The demo snapshots every 15 entries: 60 puts, then the log's base.
   const m = await node();
+  // A config that does not open is an error, and the module lives on (with
+  // nothing left to run it must not park forever: wasm has no threads).
+  const bad = await m.op({op: "open", config: "[meta]\nkeep_log_entries = 0\n"});
+  if (!bad.reply.error) throw new Error("a bad config opened");
+  await m.idle(50);
   await m.call({op: "open", config: await config()});
   for (let i = 0; i < 60; i++) await m.call({op: "put", key: `k${i}`}, new Uint8Array(2000).fill(i));
   // The worker runs the node between calls: it must run (and not panic).

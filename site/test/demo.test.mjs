@@ -164,7 +164,11 @@ test("tomlOf: one file for a cluster, each [[node]] its own log and snapshots", 
     "node 3 over the chat, on its disk",
   );
   assert.match(toml, /id = "node-3-disk"\nkind = "local_disk"\npath = "\/data\/node-3"/);
-  assert.match(toml, /\[meta\]\nsnapshot_every_entries = \d+\nsnapshot_every = "off"\n# [^\n]*\nlease = "5s"/, "no log in [meta]; a Discord log takes a lease");
+  assert.match(
+    toml,
+    /\[meta\]\nsnapshot_every_entries = \d+\nsnapshot_every = "off"\nkeep_log_entries = "off"\n# [^\n]*\nlease = "5s"/,
+    "no log in [meta], none kept behind a snapshot; a Discord log takes a lease",
+  );
   assert.match(toml, /members = \["tg-1", "dc-1"\]/, "the chunk channels are the same for all");
   assert.doesNotMatch(tomlOf(setup(["telegram"], 1, {nodes: 3, links: "direct", others})), /outbox/);
 });

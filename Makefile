@@ -32,7 +32,7 @@ web-smoke: web
 	node --no-warnings crates/web/run-wasi.mjs target/wasm32-wasip1/release/pigeonhole-web.wasm >/dev/null
 	node --no-warnings crates/web/run-shim.mjs smoke target/wasm32-wasip1/release/pigeonhole-web.wasm 2>&1 | grep -q "smoke ok"
 	node --no-warnings crates/web/run-shim.mjs reload target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep "reload"
-	node --no-warnings crates/web/run-shim.mjs snapshot target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep 'base {"at":50'
+	node --no-warnings crates/web/run-shim.mjs snapshot target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep 'base {"at":60'
 	node --no-warnings crates/web/run-shim.mjs events target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep "events ok"
 
 # The site's JavaScript: biome (biome.json) checks its lint, format and
