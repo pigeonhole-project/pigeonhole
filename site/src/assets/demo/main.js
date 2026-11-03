@@ -195,8 +195,11 @@ async function call(request, body) {
 
 // ------------------------------------------------------------ ops
 // An op from a panel: its flights, its sentence, then the state after it.
-async function op(request, body) {
-  setBusy(true);
+// Null when another runs: one at a time.
+function op(request, body) {
+  return whileBusy(() => runOp(request, body));
+}
+async function runOp(request, body) {
   for (const c of state.channels) for (const m of c.messages) m.fresh = false;
   // Its flights fly as the node logs them: a slow op shows its progress.
   const said = [];
@@ -212,13 +215,24 @@ async function op(request, body) {
   await graph.landed();
   await refreshObjects();
   if (isOpen("log") || isOpen("loft")) await loadLog();
-  setBusy(false);
   return reply;
 }
 
+// An op of yours runs: the panel's controls wait (its fieldset disabled:
+// what a view draws meanwhile waits too), and no other op starts.
 function setBusy(on) {
   state.busy = on;
-  for (const b of document.querySelectorAll(".panel button, .panel input")) if (!b.classList.contains("back")) b.disabled = on;
+  $("panel-body").disabled = on;
+}
+// fn's result, run while busy; null (fn not run) while another runs.
+async function whileBusy(fn) {
+  if (state.busy) return null;
+  setBusy(true);
+  try {
+    return await fn();
+  } finally {
+    setBusy(false);
+  }
 }
 
 // Your objects: the bucket's, as the leader lists it (a follower turns S3
@@ -615,20 +629,19 @@ async function boot() {
 }
 
 // A new config: every node restarts on it.
-async function restart(text) {
-  view?.setError("");
-  setBusy(true);
-  const {reply} = await node.call(ops.restart(text));
-  if (reply?.error) {
-    view?.setError(reply.error);
-    setBusy(false);
-    return;
-  }
-  Object.assign(state, {config: text, nodes: reply.nodes});
-  state.cut.clear();
-  await boot();
-  say(["say.restart", {n: reply.replayed}]);
-  setBusy(false);
+function restart(text) {
+  return whileBusy(async () => {
+    view?.setError("");
+    const {reply} = await node.call(ops.restart(text));
+    if (reply?.error) {
+      view?.setError(reply.error);
+      return;
+    }
+    Object.assign(state, {config: text, nodes: reply.nodes});
+    state.cut.clear();
+    await boot();
+    say(["say.restart", {n: reply.replayed}]);
+  });
 }
 
 // Everything this browser keeps for the demo goes; the page starts over.
