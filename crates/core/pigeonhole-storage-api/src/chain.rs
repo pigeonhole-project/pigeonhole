@@ -40,7 +40,9 @@ pub enum After<Id> {
 pub trait Chain: BlobBackend {
     /// Put `data` as the successor of `prev` (`None`: the first blob of the
     /// chain). `label` is short, readable without the data (a file name):
-    /// readers decide by it what a member is.
+    /// readers decide by it what a member is. Labels and data follow the
+    /// rule of a blob's name and data ([`crate::check_blob`]), on every put
+    /// of a chain.
     ///
     /// `Err`: the outcome is unknown, the blob may still land and win.
     async fn put_after(&self, prev: Option<&Self::Id>, label: &str, data: Bytes) -> Result<After<Self::Id>>;

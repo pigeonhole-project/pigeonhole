@@ -14,6 +14,7 @@ mod error;
 #[cfg(feature = "fake")]
 pub mod fake;
 pub mod inspect;
+mod label;
 mod stream;
 pub mod text;
 
@@ -25,5 +26,6 @@ pub use chain::{
     PUT_AFTER_TAIL_ATTEMPTS,
 };
 pub use error::{Failure, NotFound, RateLimited, Unavailable};
+pub use label::{check_blob, check_label, MAX_LABEL};
 pub use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 pub use stream::{bytes_stream, collect_stream, slice_range, BoxByteStream};

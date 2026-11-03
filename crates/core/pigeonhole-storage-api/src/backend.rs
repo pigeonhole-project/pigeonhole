@@ -217,7 +217,9 @@ pub trait BlobBackend: Send + Sync + 'static {
     /// Peek cost without capturing a limiter token.
     fn cost(&self, op: OpKind, id: Option<&Self::Id>) -> CostHint;
 
-    /// Upload `data` as one blob named `name` (see [`BlobId::name`]).
+    /// Upload `data` as one blob named `name` (see [`BlobId::name`]). A
+    /// store refuses what [`crate::check_blob`] does: a name outside the
+    /// alphabet, empty data, data over `max_blob_size`.
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id>;
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream>;
     /// Batch delete; not-found is ok.

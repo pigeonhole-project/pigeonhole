@@ -1,13 +1,13 @@
 //! In-memory [`BlobBackend`] for tests and `memory = true`.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_limits::StoreLimiter;
 use pigeonhole_storage_api::{
-    bytes_stream, exists_by_get, newest_loose_at_tail, put_after_tail_by_links, put_loose_linked, slice_range, After,
-    BlobBackend, BlobId, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked, MakeAfter, NotFound,
-    OpKind, Unavailable,
+    bytes_stream, check_blob, exists_by_get, newest_loose_at_tail, put_after_tail_by_links, put_loose_linked,
+    slice_range, After, BlobBackend, BlobId, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked,
+    MakeAfter, NotFound, OpKind, Unavailable,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -209,12 +209,7 @@ impl BlobBackend for MemoryBlobStore {
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
         let _op = self.limiter.op().await;
         self.check_available()?;
-        if data.is_empty() {
-            bail!("refusing empty blob upload (Telegram rejects empty documents)");
-        }
-        if data.len() > self.limits.max_blob_size {
-            bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
-        }
+        check_blob(name, &data, &self.limits)?;
         let file_id = format!("mem-{}", self.next_fid.fetch_add(1, Ordering::Relaxed));
         let message_id = self.next_msg.fetch_add(1, Ordering::Relaxed);
         self.files.lock().unwrap().insert(file_id.clone(), data);

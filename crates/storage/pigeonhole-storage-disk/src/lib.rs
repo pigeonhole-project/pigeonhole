@@ -169,14 +169,8 @@ impl DiskBlobStore {
         }
     }
 
-    fn check_size(&self, data: &Bytes) -> Result<()> {
-        if data.is_empty() {
-            bail!("refusing an empty blob");
-        }
-        if data.len() > self.limits.max_blob_size {
-            bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
-        }
-        Ok(())
+    fn check(&self, name: &str, data: &[u8]) -> Result<()> {
+        pigeonhole_storage_api::check_blob(name, data, &self.limits)
     }
 
     fn linked(segments: &Segments, key: u64) -> Linked<DiskId> {
@@ -207,7 +201,7 @@ impl BlobBackend for DiskBlobStore {
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
-        self.check_size(&data)?;
+        self.check(name, &data)?;
         let (bytes, owned) = (data.len(), name.to_string());
         let key = self.locked(move |s| s.append(None, &owned, &data)).await?;
         tracing::debug!(store = %self.instance().id, key, segment = key >> 40, bytes, name, "stored");
@@ -281,7 +275,7 @@ impl BlobBackend for DiskBlobStore {
 #[async_trait]
 impl Chain for DiskBlobStore {
     async fn put_after(&self, prev: Option<&Self::Id>, label: &str, data: Bytes) -> Result<After<Self::Id>> {
-        self.check_size(&data)?;
+        self.check(label, &data)?;
         let prev = prev.map(|p| p.key);
         let (bytes, owned) = (data.len(), label.to_string());
         let after = self
@@ -347,7 +341,7 @@ impl Chain for DiskBlobStore {
             };
             let tail_id = tail.map(|key| DiskId { key });
             let Some(blob) = make(tail_id.as_ref().zip(data.as_deref()))? else { return Ok(None) };
-            self.check_size(&blob)?;
+            self.check(&label, &blob)?;
             let key = s.append(Some((tail, &label)), &label, &blob)?;
             tracing::debug!(store = %self.instance().id, label, ?tail, key, bytes = blob.len(), "linked after the tail");
             Ok(Some(DiskId { key }))

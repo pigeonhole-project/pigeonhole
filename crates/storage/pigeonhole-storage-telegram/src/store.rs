@@ -11,8 +11,8 @@ use futures::StreamExt;
 use lru::LruCache;
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, Failure, InstanceInfo, NotFound, OpKind,
-    Owner,
+    bytes_stream, check_blob, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, Failure, InstanceInfo,
+    NotFound, OpKind, Owner,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -313,12 +313,7 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
-        if data.is_empty() {
-            bail!("refusing empty blob upload (Telegram rejects empty documents)");
-        }
-        if data.len() > self.limits.max_blob_size {
-            bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
-        }
+        check_blob(name, &data, &self.limits)?;
         let random_id = blob_random_id(self.reader.channel.channel_id(), name);
         let message_id = self.post_blob(name, data, random_id).await?;
         Ok(TelegramId { message_id })

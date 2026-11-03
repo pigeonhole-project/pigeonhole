@@ -6,7 +6,8 @@ use pigeonhole_blob::{collect_stream, BlobBackend, BlobId, Owner};
 
 /// Shared suite for [`BlobBackend`].
 ///
-/// Covers: put/get/range/delete, repeat delete, empty rejected, near-`max_blob_size`
+/// Covers: put/get/range/delete, repeat delete, empty data and names outside
+/// the alphabet (`check_blob`) rejected, near-`max_blob_size`
 /// blob, monotonic keys, candidates covering written keys, `exists` before
 /// and after a delete.
 pub async fn run_typed_conformance<B>(backend: &B) -> Result<()>
@@ -15,6 +16,9 @@ where
 {
     // empty rejected
     assert!(backend.put(Bytes::new(), &BlobId::random().name()).await.is_err(), "empty blob must be rejected");
+    for bad in ["a b.bin", "a~b.bin", ""] {
+        assert!(backend.put(Bytes::from_static(b"x"), bad).await.is_err(), "a name outside the alphabet: {bad:?}");
+    }
 
     let id = backend.put(Bytes::from_static(b"hello-typed-conformance"), &BlobId::random().name()).await?;
     let got = collect_stream(backend.get(&id, None).await?).await?;

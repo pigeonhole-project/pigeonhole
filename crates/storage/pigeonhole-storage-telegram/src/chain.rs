@@ -31,7 +31,8 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_storage_api::{
-    newest_loose_at_tail, put_after_tail_by_links, put_loose_linked, After, BlobBackend, Chain, Linked, MakeAfter,
+    check_blob, newest_loose_at_tail, put_after_tail_by_links, put_loose_linked, After, BlobBackend, Chain, Linked,
+    MakeAfter,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -184,12 +185,7 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
 #[async_trait]
 impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
     async fn put_after(&self, prev: Option<&TelegramId>, label: &str, data: Bytes) -> Result<After<TelegramId>> {
-        if label.contains('~') {
-            bail!("a chain label may not contain '~': {label:?}");
-        }
-        if data.is_empty() || data.len() > self.limits().max_blob_size {
-            bail!("chain blob of {} bytes outside (0, {}]", data.len(), self.limits().max_blob_size);
-        }
+        check_blob(label, &data, self.limits())?;
         let prev = prev.map(|p| p.message_id);
         let b = self.post(&chain_name(label, prev), data).await?;
         let lo = prev.unwrap_or(0);

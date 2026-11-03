@@ -31,7 +31,9 @@ use crate::store::{blob_name, DiscordBlobStore, DiscordId};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_storage_api::{put_after_tail_by_links, After, BlobBackend, Chain, LeaseChain, Linked, MakeAfter};
+use pigeonhole_storage_api::{
+    check_blob, put_after_tail_by_links, After, BlobBackend, Chain, LeaseChain, Linked, MakeAfter,
+};
 
 const ANCHOR: &str = "chain-anchor.bin";
 /// The text of a clock probe ([`LeaseChain::now_ms`]).
@@ -171,9 +173,7 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
 #[async_trait]
 impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
     async fn put_after(&self, prev: Option<&DiscordId>, label: &str, data: Bytes) -> Result<After<DiscordId>> {
-        if label.contains(['~', ' ']) {
-            bail!("a chain label may not contain '~' or spaces: {label:?}");
-        }
+        check_blob(label, &data, self.limits())?;
         let prev = prev.map(|p| p.message_id);
         let from = match prev {
             Some(p) => p,
@@ -261,9 +261,7 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
     /// link (whose thread the pacer would hold for seconds): `after` is not
     /// needed.
     async fn put_loose(&self, _after: Option<&DiscordId>, label: &str, data: Bytes) -> Result<DiscordId> {
-        if label.contains(['~', ' ']) {
-            bail!("a loose label may not contain '~' or spaces: {label:?}");
-        }
+        check_blob(label, &data, self.limits())?;
         let m = self.post_blob(label, data, &Self::nonce()).await?;
         Ok(DiscordId { message_id: m.id })
     }
@@ -343,9 +341,7 @@ impl<A: DiscordApi> LeaseChain for DiscordBlobStore<A> {
     /// Named like a member (`<label>~<prev>.bin`), so pruned like one, but
     /// with no thread: one POST.
     async fn put_unlinked(&self, prev: &DiscordId, label: &str, data: Bytes) -> Result<DiscordId> {
-        if label.contains(['~', ' ']) {
-            bail!("a chain label may not contain '~' or spaces: {label:?}");
-        }
+        check_blob(label, &data, self.limits())?;
         let m = self.post_blob(&chain_name(label, Some(prev.message_id)), data, &Self::nonce()).await?;
         tracing::debug!(store = %self.instance().id, label, prev = prev.message_id, message_id = m.id, "put unlinked");
         Ok(DiscordId { message_id: m.id })

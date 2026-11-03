@@ -10,8 +10,8 @@ use lru::LruCache;
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_api::text;
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, Failure, InstanceInfo, NotFound, OpKind,
-    Owner,
+    bytes_stream, check_blob, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, Failure, InstanceInfo,
+    NotFound, OpKind, Owner,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -234,12 +234,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
-        if data.is_empty() {
-            bail!("refusing empty blob upload");
-        }
-        if data.len() > self.limits.max_blob_size {
-            bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
-        }
+        check_blob(name, &data, &self.limits)?;
         let nonce = blob_nonce(self.api.channel_id(), name);
         let m = self.post_blob(name, data, &nonce).await?;
         Ok(DiscordId { message_id: m.id })

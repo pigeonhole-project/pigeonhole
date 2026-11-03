@@ -17,6 +17,8 @@ Terms used in code, comments, and docs (Stage B onward).
 | **Tablet** | The metadata state machine: commands → `LogStore` → in-memory `StateMachine`s (`MetaStore`) | — | one active incarnation (in a cluster: a copy per node, only the Raft leader writes) | `pigeonhole-meta` |
 | **LogStore** | Fencing command log the tablet appends batches to (`local_disk`, `memory`, `telegram`: a channel fenced by the order of message ids, `discord`: a channel fenced by threads or a lease); one `ChainLogStore` over a **Chain** | — | append-only, collected behind its base | `pigeonhole-meta` |
 | **Chain** | A store's capability to link blobs: of several put after one `prev`, exactly one wins ([chain-log.md](chain-log.md)) | — | links final once won | `Chain` impl per store |
+| **Label** | What a chain member is called, readable without its data (`log-claim-7`, `snapshot-1-20.snap`); a blob's name follows the same rule: 1–128 of `[A-Za-z0-9._-]` (`check_blob`) | ≤ 128 chars | immutable | `pigeonhole-storage-api` |
+| **Decorator** | A store wrapped to add a concern (`Arc<B>`, `Faulty<B>`, `Erased<B>`, `MetricsBackend`); it forwards every method of every store trait its store implements ([chain-log.md](chain-log.md)) | — | — | its crate |
 | **Lease** | A Discord log's hold on its chain for `[meta] lease` (default 45 s): lease records are linked by threads, batches between them are plain posts ([discord-lease.md](discord-lease.md)) | — | renewed while held | `pigeonhole-meta` (`log::chain`) |
 | **Generation** | Number of a tablet incarnation; a newer claim fences every older one (`Fenced`) | u64 | strictly increasing | `LogStore` |
 | **Position** | Index of an entry in the log (1, 2, …) | u64 | — | tablet |
