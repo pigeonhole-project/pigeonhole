@@ -149,6 +149,33 @@ test("tomlOf: the log and snapshots on the node's disk, one store for both", () 
   );
 });
 
+test("tomlOf: every channel its own bots, none a node's", () => {
+  const toml = tomlOf(
+    setup(["telegram", "discord"], 2, {
+      bots: 3,
+      nodes: 3,
+      links: "chat",
+      others: [
+        {log: "discord", snapshots: "discord"},
+        {log: "telegram", snapshots: "telegram"},
+      ],
+    }),
+  );
+  const stores = [...toml.matchAll(/\[\[store\]\]\nid = "([^"]+)"[^[]*?bot_ids = \[([\d, ]+)\]/g)].map(m => [m[1], m[2].split(", ").map(Number)]);
+  assert.equal(stores.length, 8, "2 data channels, each node's log and snapshots");
+  const bots = stores.flatMap(([, ids]) => ids);
+  assert.ok(
+    stores.every(([, ids]) => ids.length === 3),
+    "the bots the wizard counts",
+  );
+  assert.equal(new Set(bots).size, bots.length, "no bot in two channels");
+  const nodes = [...toml.matchAll(/^bot_ids = \[(\d+)\]$/gm)]
+    .filter(m => toml.slice(0, m.index).lastIndexOf("[[node]]") > toml.slice(0, m.index).lastIndexOf("[[store]]"))
+    .map(m => +m[1]);
+  assert.deepEqual(nodes, [101, 102, 103]);
+  assert.ok(!bots.some(b => nodes.includes(b)), "no channel's bot is a node's");
+});
+
 test("tomlOf: one file for a cluster, each [[node]] its own log and snapshots", () => {
   const others = [
     {log: "discord", snapshots: "discord"},

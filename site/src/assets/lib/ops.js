@@ -33,8 +33,8 @@ export const ops = {
   info: () => ({op: "info"}),
   channels: node => ({op: "channels", node}),
   log: limit => ({op: "log", limit}),
-  background: () => ({op: "background"}),
-  budgets: () => ({op: "budgets"}),
+  background: node => ({op: "background", node}),
+  budgets: node => ({op: "budgets", node}),
   cluster: node => ({op: "cluster", node}),
   // The dynamic config (an entry in the log, through the leader).
   dynamic: node => ({op: "dynamic", node}),

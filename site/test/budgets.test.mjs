@@ -20,3 +20,9 @@ test("sendLevel: the worst of the channel's bots, the bot's own budget too", () 
   assert.deepEqual(busy, {frac: 0.9, state: "busy"}, "calls waiting outrank a lower bar");
   assert.equal(sendLevel([entry("a", "-1", b(0, 3, {cooling_ms: 4000}), b(9, 10))]).state, "busy", "a rate limit cools it");
 });
+
+test("sendLevel: the bot is busy only when it is out itself, not for a chat's bucket", () => {
+  const reading = entry("a", "-1", b(20, 20), b(27, 30, {waiting: 2}));
+  assert.deepEqual(sendLevel([reading]), {frac: 0.9, state: "ok"}, "its calls wait for another chat's read budget");
+  assert.equal(sendLevel([entry("a", "-1", b(20, 20), b(0.5, 30, {waiting: 2}))]).state, "busy", "out of its own tokens");
+});

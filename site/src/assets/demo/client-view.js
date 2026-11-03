@@ -54,12 +54,7 @@ export function clientView({buckets, bucket, objects, admin, cluster}, on) {
     drop.before(pick);
   }
 
-  async function upload(files) {
-    for (const f of files) {
-      if (f.size > MAX_UPLOAD) on.tooBig();
-      else await on.upload(f.name, await f.arrayBuffer());
-    }
-  }
+  const upload = files => uploadFiles(files, on);
   const file = view.querySelector("#file");
   file.addEventListener("change", async () => {
     await upload([...file.files]);
@@ -75,13 +70,7 @@ export function clientView({buckets, bucket, objects, admin, cluster}, on) {
     drop.classList.remove("over");
     upload([...e.dataTransfer.files]);
   });
-  for (const b of view.querySelectorAll("[data-sample]")) {
-    b.addEventListener("click", () => {
-      const [name, body] =
-        b.dataset.sample === "photo" ? [fresh(current, "photo", ".jpg"), randomBytes(7 << 20)] : [fresh(current, "notes", ".md"), sampleText(3 << 20)];
-      on.upload(name, body);
-    });
-  }
+  for (const b of view.querySelectorAll("[data-sample]")) b.addEventListener("click", () => on.upload(...sample(b.dataset.sample, current)));
 
   function setObjects(objects) {
     current = objects;
@@ -105,6 +94,20 @@ export function clientView({buckets, bucket, objects, admin, cluster}, on) {
   }
   setObjects(objects);
   return {nodes: [...view.childNodes], setObjects, setCluster};
+}
+
+// Your files, one after the other ({upload, tooBig} as clientView's `on`).
+export async function uploadFiles(files, on) {
+  for (const f of files) {
+    if (f.size > MAX_UPLOAD) on.tooBig();
+    else await on.upload(f.name, await f.arrayBuffer());
+  }
+}
+
+// A sample made here, "photo" (random bytes) or "text": [name, bytes], a
+// name not among `objects` yet.
+export function sample(kind, objects) {
+  return kind === "photo" ? [fresh(objects, "photo", ".jpg"), randomBytes(7 << 20)] : [fresh(objects, "notes", ".md"), sampleText(3 << 20)];
 }
 
 // A new object each time: photo-1.jpg, photo-2.jpg… (an upload under a

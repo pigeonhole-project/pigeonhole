@@ -8,7 +8,7 @@ import {ops} from "../lib/ops.js";
 import {budgetsOf, sendLevel} from "./budgets.js";
 import {appOf} from "./channels.js";
 import {forgetPlaces} from "./chat/scroll.js";
-import {clientView} from "./client-view.js";
+import {clientView, sample, uploadFiles} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {ref, sentence, setLinks} from "./entities.js";
 import {readEvents} from "./events.js";
@@ -48,7 +48,8 @@ const state = {
   channels: [], // the `channels` op's, live posts added as they fly
   objects: [], // [[key, size]] in the bucket
   log: null, // the `log` op's: {head, base, entries}
-  bg: null, // the `background` op's (tasks.js)
+  bg: null, // the `background` op's (tasks.js), the node on screen's
+  bgOf: new Map(), // node id (0: the one node) → its `background` op's
   open: null, // the panel: {kind: "client" | "loft" | "log" | "cluster" | "settings"} or {kind: "store", store}
   logView: "readable",
   busy: false, // an op runs: the panels' buttons wait
@@ -65,30 +66,35 @@ const onNode = request => (state.node == null || request.node != null ? request 
 const onShown = request => (request.node != null || state.look == null ? onNode(request) : {...request, node: state.look});
 // The log the `log` op reads: the node on screen's.
 const logChannel = () => state.channels.find(c => c.role === "log" && (c.node == null || c.node === shown()));
-// The node on screen follows a leader it knows: the leader's tasks are not its.
-const following = () => state.nodes.length > 1 && state.cluster?.leader != null && shown() !== state.cluster.leader;
+// Node `id` (0: the one node) follows a leader it knows: the leader's tasks are not its.
+const follows = id => id !== 0 && state.cluster?.leader != null && id !== state.cluster.leader;
 const isOpen = kind => state.open?.kind === kind;
 // The graph's node for a panel: the log's is its channel's card.
 const nodeOf = open => (open?.kind === "log" ? {kind: "store", store: logChannel()?.store} : open);
 
 const node = await connecting;
 
-let updateWindows = () => {};
+// Each dovecote's windows (node id, 0: the one node → their update(bg)),
+// each with its node's background tasks.
+const windows = new Map();
 let relayout = () => redraw(); // the screen turned narrow or wide: what is on the graph, again
 const graph = makeGraph($("graph"), {
   channel,
   onOpen: openPanel,
   onRelayout: () => relayout(),
-  onLoft: (g, entrances) => {
-    updateWindows = taskWindows(
+  onLoft: (g, entrances, id) => {
+    const update = taskWindows(
       g,
       entrances,
       async task => {
-        await openPanel({kind: "loft"});
+        await openPanel(id ? {kind: "loft", node: id} : {kind: "loft"});
         if (isOpen("loft")) view.focus(task);
       },
-      {follower: following()},
+      {follower: follows(id), id},
     );
+    windows.set(id, update);
+    const bg = state.bgOf.get(id);
+    if (bg) update(bg);
   },
 });
 // The cluster as the graph draws it: who leads, who is cut off, which node is on screen.
@@ -225,6 +231,7 @@ async function runOp(request, body) {
 function setBusy(on) {
   state.busy = on;
   $("panel-body").disabled = on;
+  $("city-send").disabled = on;
 }
 // fn's result, run while busy; null (fn not run) while another runs.
 async function whileBusy(fn) {
@@ -284,10 +291,16 @@ async function loadLog() {
 }
 
 // ------------------------------------------------------------ background tasks
+// Every node's background tasks (each dovecote shows its own); the node
+// on screen's are the page's.
 async function pollBackground() {
-  const {reply} = await call(ops.background());
-  if (!ok(reply)) return;
-  state.bg = reply;
+  for (const id of state.nodes.length > 1 ? state.nodes : [0]) {
+    const {reply} = await call(ops.background(id || undefined));
+    if (ok(reply)) state.bgOf.set(id, reply);
+  }
+  const bg = state.bgOf.get(state.nodes.length > 1 ? shown() : 0);
+  if (!bg) return;
+  state.bg = bg;
   await pollBudgets();
   renderBackground();
   if (state.nodes.length > 1) await pollCluster();
@@ -430,7 +443,10 @@ function renderBackground() {
       jobs.filter(j => j.store === c.store),
       j => workLabel("repair", j),
     );
-  updateWindows(bg);
+  for (const [id, update] of windows) {
+    const own = state.bgOf.get(id);
+    if (own) update(own);
+  }
   if (isOpen("loft")) view.setBackground(bg);
 }
 
@@ -506,10 +522,22 @@ const counters = () => ({objects: state.objects.length, dataChannels: state.chan
 
 // The bots' budgets as they stand: a bar per channel on the graph, the
 // table in the open channel's panel.
+// Every node's bots: its own channels' (log, snapshots, outbox) and the
+// outboxes it reads. A bot every node has (a data channel's: each opens
+// the chunk stores) as the one that uses it sees it: the leader, or the
+// node whose channel it is.
 async function pollBudgets() {
-  const {reply} = await call(ops.budgets());
-  if (!ok(reply)) return;
-  state.budgets = reply.budgets || [];
+  const seen = new Map(); // service, bot, chat → entry
+  for (const id of state.nodes.length > 1 ? state.nodes : [undefined]) {
+    const {reply} = await call(ops.budgets(id));
+    if (!ok(reply)) continue;
+    for (const e of reply.budgets || []) {
+      const key = `${e.service} ${e.bot} ${e.chat}`,
+        c = state.channels.find(c => budgetsOf(c, [e]).length);
+      if (!seen.has(key) || id === (c?.node ?? state.cluster?.leader)) seen.set(key, e);
+    }
+  }
+  state.budgets = [...seen.values()];
   for (const c of state.channels) graph.setBudget(c.store, sendLevel(budgetsOf(c, state.budgets)));
   if (isOpen("store")) view?.setBudgets(state.budgets);
 }
@@ -594,6 +622,23 @@ const clientOps = {
     renderPanel();
   },
 };
+
+// Your uploads on the town itself too, its buttons and a drop on it: the
+// pigeons fly them in full view.
+$("city-file").addEventListener("change", async e => {
+  await uploadFiles([...e.target.files], clientOps);
+  e.target.value = "";
+});
+for (const b of $("city-send").querySelectorAll("[data-sample]"))
+  b.addEventListener("click", () => clientOps.upload(...sample(b.dataset.sample, state.objects)));
+$("sky").addEventListener("dragover", e => {
+  if (!$("city-send").hidden && !state.open) e.preventDefault();
+});
+$("sky").addEventListener("drop", e => {
+  if ($("city-send").hidden || state.open) return;
+  e.preventDefault();
+  uploadFiles([...e.dataTransfer.files], clientOps);
+});
 
 // The node: its config, its background tasks.
 const loftOps = {restart, erase, toggle: toggleTask, run: runTask, isolate};
@@ -683,7 +728,10 @@ async function erase() {
   location.reload();
 }
 
-const ready = (ms, why) => status(`${t("try.ready", {ms: Math.round(ms)})} ${state.persistent ? t("try.kept") : t("try.not_kept")}${why ? ` (${why})` : ""}`);
+const ready = (ms, why) => {
+  $("city-send").hidden = false;
+  status(`${t("try.ready", {ms: Math.round(ms)})} ${state.persistent ? t("try.kept") : t("try.not_kept")}${why ? ` (${why})` : ""}`);
+};
 
 function openWizard() {
   state.wizard = true;
