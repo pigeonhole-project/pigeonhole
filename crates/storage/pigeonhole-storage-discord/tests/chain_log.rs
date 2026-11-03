@@ -231,6 +231,27 @@ async fn removed_snapshots_leave_no_links_behind() {
     assert!(dangling.len() <= 1, "{dangling:?}");
 }
 
+/// Snapshots take no thread, so one removed after a restart (a store that
+/// never saw its name) leaves no link behind.
+#[tokio::test]
+async fn snapshots_removed_after_a_restart_leave_no_links() {
+    let channel = Arc::new(FakeDiscord::new(79));
+    let store = BlobSnapshotStore::new(channel_store(&channel));
+    let mut refs = Vec::new();
+    for at in 1..=3u64 {
+        let snap =
+            pigeonhole_meta::StoredSnapshot { log_id: pigeonhole_meta::LogId(1), at, data: vec![at as u8; 9_000] };
+        refs.push(store.put(&snap, refs.last()).await.unwrap());
+    }
+    assert!(channel.thread_ids().is_empty(), "{:?}", channel.thread_ids());
+    let restarted = BlobSnapshotStore::new(channel_store(&channel));
+    for r in &refs[..2] {
+        restarted.remove(r).await.unwrap();
+    }
+    assert!(channel.thread_ids().is_empty(), "{:?}", channel.thread_ids());
+    assert_eq!(restarted.newest().await.unwrap().map(|s| s.at), Some(3));
+}
+
 /// An append is a message and a thread; archiving the link runs after it.
 #[tokio::test]
 async fn links_are_archived_off_the_appends_path() {

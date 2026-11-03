@@ -268,7 +268,12 @@ above, and why:
   the newest members are unlinked batches: a `tail` through 20 of them read
   21 threads before, none now (`tests/chain_log.rs`,
   `the_tail_reads_threads_from_the_listing`).
-- **Links of deleted members**: a thread is deleted only after its message
+- **Links of deleted members** are retired by the process that deletes
+  them, from the names it has seen: `prune` lists the members first, and
+  snapshots are plain posts with no thread, so a restart leaks no link. A
+  `delete` of a member this process never saw (nothing does one) would
+  leave its links rather than read every deleted blob's message first.
+- **Order of deletes**: a thread is deleted only after its message
   (on an existing message one could be started again). When a member goes,
   its incoming link goes once its `prev` is gone too, its outgoing link once
   its successor is gone: of a deleted stretch only the link into the first

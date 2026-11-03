@@ -284,7 +284,14 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
                 self.locations.forget(*id);
             }
         }
-        // Chain members (a removed snapshot): their links go too.
+        // Chain members: their links go too, for the ones whose names this
+        // process saw (it reads no message to learn the rest). That leaks
+        // no thread in practice: snapshots are plain posts here (`put_loose`
+        // links nothing), and `prune`, which deletes the members, learns
+        // their names from its listing first. A member deleted through
+        // `delete` by a process that never saw it would leave its links:
+        // nothing does that, and a GET per deleted blob (the sweeper deletes
+        // data blobs by the hundred) would cost more than such a thread.
         self.retire_links(keys).await
     }
 
