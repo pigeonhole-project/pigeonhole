@@ -88,7 +88,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_instance_rate_limited_total` | counter | `instance`, `op` | Backend calls that failed rate limited (a 429 / FLOOD_WAIT longer than the call's budget) |
 | `pigeonhole_replica_selected_total` | counter | `instance` | Replicas chosen to read from |
 | `pigeonhole_parts_per_chunk` | histogram | `instance` | Backend parts written per chunk replica |
-| `pigeonhole_cache_requests_total` | counter | `level`, `outcome` | Block cache lookups: hit, miss (loaded the block), collapsed (waited for another lookup's load) |
+| `pigeonhole_cache_requests_total` | counter | `level`, `outcome` | Block cache lookups: hit, miss |
 | `pigeonhole_cache_bytes` | gauge | `level` | Bytes held by a block cache level |
 | `pigeonhole_cache_entries` | gauge | `level` | Blocks held by a block cache level |
 | `pigeonhole_compression_ratio` | histogram |  | Stored / logical size of each block written (lower is better) |

@@ -6,15 +6,13 @@ use crate::blob_db::{BlobDb, StoredBlock};
 use crate::block_cache::BlockCache;
 use crate::commands::ChunkState;
 use crate::ingest::IngestOptions;
-use crate::repair::spawn_enqueue_repair;
+use crate::read::{ReadStream, Reader};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use md5::{Digest, Md5};
-use pigeonhole_blob::{
-    collect_stream, erase, BlobBackend, CheapestFirst, EncodedBlock, ReplicaLayout, Replicated, SharedBackend,
-};
-use pigeonhole_codec::{decode_block_slice, encode_block_bytes, ByteBudget, ChunkCodec, DEFAULT_CHUNK_SIZE};
+use pigeonhole_blob::{erase, BlobBackend, CheapestFirst, EncodedBlock, Replicated, SharedBackend};
+use pigeonhole_codec::{encode_block_bytes, ByteBudget, ChunkCodec, DEFAULT_CHUNK_SIZE};
 use pigeonhole_meta::{Outcomes, Prepared, Proposal, Slot};
 use pigeonhole_types::ByteRange;
 use std::collections::{BTreeMap, VecDeque};
@@ -398,225 +396,42 @@ impl ChunkStore {
         Ok(ingested)
     }
 
-    /// Read a logical byte range across extents (None = entire concatenation).
-    ///
-    /// The chunks stay pinned for the whole read, so the sweeper does not
-    /// delete their parts underneath it. A chunk already reclaimed (the object
-    /// was overwritten or deleted after its extents were read) fails with
-    /// [`ChunkGone`](crate::ChunkGone): re-read the extents and retry.
-    pub async fn read(&self, extents: &[Extent], range: Option<ByteRange>) -> Result<Bytes> {
-        let ids: Vec<ChunkId> = extents.iter().map(|e| e.chunk).collect();
-        let _pin = self.db.pin_reads(&ids);
-        for &chunk_id in &ids {
-            if !self.db.chunk_readable(chunk_id) {
-                return Err(anyhow::Error::new(crate::ChunkGone { chunk_id }));
-            }
-        }
-        let mut pieces = Vec::new();
-        let mut cursor = 0u64;
-        for ext in extents {
-            let meta = self.db.chunk_meta(ext.chunk).await?.ok_or(crate::ChunkGone { chunk_id: ext.chunk })?;
-            let chunk_size = meta.0;
-            let ext_off = ext.offset.max(0);
-            let ext_len = if ext.len < 0 {
-                bail!("extent len must be >= 0");
-            } else if ext.len == 0 {
-                continue;
-            } else {
-                ext.len.min(chunk_size.saturating_sub(ext_off))
-            };
-            let logical = ext_len as u64;
-            let start = cursor;
-            let end = cursor + logical;
-            cursor = end;
-
-            let (local_from, local_to) = match &range {
-                None => (0usize, logical as usize),
-                Some(r) => {
-                    if end <= r.start || start >= r.end {
-                        continue;
-                    }
-                    let from = r.start.saturating_sub(start) as usize;
-                    let to = (r.end.saturating_sub(start) as usize).min(logical as usize);
-                    (from, to)
-                }
-            };
-            if local_from >= local_to {
-                continue;
-            }
-            let from = ext_off as usize + local_from;
-            let to = ext_off as usize + local_to;
-            pieces.push(self.read_chunk_range(ext.chunk, from, to).await?);
-        }
-        if pieces.is_empty() {
-            return Ok(Bytes::new());
-        }
-        if pieces.len() == 1 {
-            return Ok(pieces.pop().unwrap());
-        }
-        let mut out = Vec::new();
-        for p in pieces {
-            out.extend_from_slice(&p);
-        }
-        Ok(Bytes::from(out))
+    /// Stream a logical byte range across extents (`None`: all of them):
+    /// see [`crate::read`]. The chunks stay pinned while the stream lives,
+    /// so the sweeper does not delete their parts underneath it. A chunk
+    /// already reclaimed (the object was overwritten or deleted after its
+    /// extents were read) fails the open with [`ChunkGone`](crate::ChunkGone):
+    /// re-read the extents and retry. The first window is loaded before
+    /// this returns, so a read no replica can serve fails here, before any
+    /// byte goes out.
+    pub async fn read_stream(&self, extents: &[Extent], range: Option<ByteRange>) -> Result<ReadStream> {
+        self.reader().open(extents, range).await
     }
 
-    /// Read from a single replica layout (tests: verify each member independently).
+    /// [`Self::read_stream`], collected: for small reads.
+    pub async fn read(&self, extents: &[Extent], range: Option<ByteRange>) -> Result<Bytes> {
+        self.read_stream(extents, range).await?.collect().await
+    }
+
+    /// Read `from..to` of a chunk from `replicas` only, unpinned (tests:
+    /// each member on its own).
     pub async fn read_from_replicas(
         &self,
         chunk_id: ChunkId,
         from: usize,
         to: usize,
-        replicas: &[ReplicaLayout],
+        replicas: &[pigeonhole_blob::ReplicaLayout],
     ) -> Result<Bytes> {
-        self.read_chunk_range_with(chunk_id, from, to, replicas).await
+        self.reader().open_chunk_with(chunk_id, from, to, replicas).await?.collect().await
     }
 
-    async fn read_chunk_range(&self, chunk_id: ChunkId, from: usize, to: usize) -> Result<Bytes> {
-        let replicas = self.db.get_replica_layouts(chunk_id).await?;
-        if replicas.is_empty() {
-            bail!("no parts for chunk {chunk_id}");
+    fn reader(&self) -> Reader {
+        Reader {
+            db: self.db.clone(),
+            replicated: self.replicated.clone(),
+            l1: self.block_cache.clone(),
+            l2: self.compressed_cache.clone(),
         }
-        self.read_chunk_range_with(chunk_id, from, to, &replicas).await
-    }
-
-    async fn read_chunk_range_with(
-        &self,
-        chunk_id: ChunkId,
-        from: usize,
-        to: usize,
-        replicas: &[ReplicaLayout],
-    ) -> Result<Bytes> {
-        if from > to {
-            bail!("invalid range {from}..{to}");
-        }
-        if from == to {
-            return Ok(Bytes::new());
-        }
-        let blocks = self.db.get_blocks(chunk_id).await?;
-        if blocks.is_empty() {
-            // Single raw part covering the whole chunk (put_small).
-            let hook = self.not_found_hook(chunk_id);
-            let stored = collect_stream(
-                self.replicated.read_with_hook(replicas, 0..1, hook).await.context("replicated read raw")?,
-            )
-            .await?;
-            if to > stored.len() {
-                bail!("range {from}..{to} outside raw chunk {}", stored.len());
-            }
-            return Ok(stored.slice(from..to));
-        }
-
-        let mut needed: Vec<&StoredBlock> = Vec::new();
-        for b in &blocks {
-            let start = b.logical_off as usize;
-            let end = start + b.logical_len as usize;
-            if end <= from || start >= to {
-                continue;
-            }
-            needed.push(b);
-        }
-        if needed.is_empty() {
-            return Ok(Bytes::new());
-        }
-        let first_no = needed[0].block_no;
-        let last_no = needed.last().unwrap().block_no + 1;
-
-        let mut out = Vec::with_capacity(to - from);
-        for b in needed {
-            let decoded = self.load_decoded_block(chunk_id, b, replicas, first_no..last_no).await?;
-            let start = b.logical_off as usize;
-            let flen = decoded.len();
-            let local_from = from.saturating_sub(start).min(flen);
-            let local_to = to.saturating_sub(start).min(flen);
-            if local_from < local_to {
-                out.extend_from_slice(&decoded[local_from..local_to]);
-            }
-        }
-        Ok(Bytes::from(out))
-    }
-
-    async fn load_decoded_block(
-        &self,
-        chunk_id: ChunkId,
-        block: &StoredBlock,
-        replicas: &[ReplicaLayout],
-        fetch_range: std::ops::Range<u32>,
-    ) -> Result<Bytes> {
-        let block_no = block.block_no;
-        if let Some(l1) = &self.block_cache {
-            return l1
-                .get_or_load(chunk_id, block_no, || async {
-                    let stored = self.load_compressed_block(chunk_id, block, replicas, fetch_range.clone()).await?;
-                    decode_block_slice(stored.as_ref(), block.codec, block.logical_len as usize)
-                })
-                .await;
-        }
-        let stored = self.load_compressed_block(chunk_id, block, replicas, fetch_range).await?;
-        decode_block_slice(stored.as_ref(), block.codec, block.logical_len as usize)
-    }
-
-    async fn load_compressed_block(
-        &self,
-        chunk_id: ChunkId,
-        block: &StoredBlock,
-        replicas: &[ReplicaLayout],
-        _fetch_range: std::ops::Range<u32>,
-    ) -> Result<Bytes> {
-        let block_no = block.block_no;
-        let loader = || async {
-            let hook = self.not_found_hook(chunk_id);
-            let mut raw = collect_stream(
-                self.replicated
-                    .read_with_hook(replicas, block_no..block_no + 1, hook)
-                    .await
-                    .context("replicated read block")?,
-            )
-            .await?;
-            if crc32fast::hash(&raw) != block.crc32 {
-                raw = self.read_block_around_damage(chunk_id, block, replicas).await?;
-            }
-            if raw.len() < block.stored_len as usize {
-                bail!("block {} stored len {} < expected {}", block_no, raw.len(), block.stored_len);
-            }
-            Ok(raw)
-        };
-        if let Some(l2) = &self.compressed_cache {
-            return l2.get_or_load(chunk_id, block_no, loader).await;
-        }
-        loader().await
-    }
-
-    /// A block failed its checksum: read it from each replica in turn until
-    /// one is intact. The damaged replica stays as it is (repair rewrites
-    /// missing copies, not damaged ones).
-    async fn read_block_around_damage(
-        &self,
-        chunk_id: ChunkId,
-        block: &StoredBlock,
-        replicas: &[ReplicaLayout],
-    ) -> Result<Bytes> {
-        let block_no = block.block_no;
-        for r in replicas {
-            let Ok(stream) =
-                self.replicated.read_with_hook(std::slice::from_ref(r), block_no..block_no + 1, None).await
-            else {
-                continue;
-            };
-            let Ok(raw) = collect_stream(stream).await else { continue };
-            if crc32fast::hash(&raw) == block.crc32 {
-                return Ok(raw);
-            }
-            tracing::error!(chunk_id, block_no, instance = %r.instance, "block fails its checksum on this replica");
-        }
-        bail!("chunk {chunk_id} block {block_no} fails its checksum on every replica")
-    }
-
-    fn not_found_hook(&self, chunk_id: ChunkId) -> Option<pigeonhole_blob::NotFoundHook> {
-        let db = self.db.clone();
-        Some(Arc::new(move |instance_id: &str| {
-            spawn_enqueue_repair(db.clone(), chunk_id, instance_id.to_string());
-        }))
     }
 
     async fn ingest_blocks<S>(&self, stream: &mut S, opts: IngestOptions) -> Result<Ingested>
@@ -1264,6 +1079,95 @@ mod tests {
         async fn exists(&self, id: &Self::Id) -> Result<bool> {
             self.inner.exists(id).await
         }
+    }
+
+    /// A blob store that counts its GETs.
+    struct Counting {
+        inner: MemoryBlobStore,
+        gets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobBackend for Counting {
+        type Id = <MemoryBlobStore as BlobBackend>::Id;
+        type Key = <MemoryBlobStore as BlobBackend>::Key;
+        fn instance(&self) -> &pigeonhole_blob::InstanceInfo {
+            self.inner.instance()
+        }
+        fn limits(&self) -> &BackendLimits {
+            self.inner.limits()
+        }
+        fn key(id: &Self::Id) -> Self::Key {
+            MemoryBlobStore::key(id)
+        }
+        fn cost(&self, op: pigeonhole_blob::OpKind, id: Option<&Self::Id>) -> pigeonhole_blob::CostHint {
+            self.inner.cost(op, id)
+        }
+        async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
+            self.inner.put(data, name).await
+        }
+        async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<pigeonhole_blob::BoxByteStream> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(id, range).await
+        }
+        async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
+            self.inner.delete(keys).await
+        }
+        async fn candidates(
+            &self,
+            owner: pigeonhole_blob::Owner,
+            after: Option<Self::Key>,
+            upto: Self::Key,
+            limit: usize,
+        ) -> Result<Vec<Self::Key>> {
+            self.inner.candidates(owner, after, upto, limit).await
+        }
+        async fn mark_owner(&self, owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
+            self.inner.mark_owner(owner).await
+        }
+        async fn exists(&self, id: &Self::Id) -> Result<bool> {
+            self.inner.exists(id).await
+        }
+    }
+
+    /// A read streams block by block, fetching a part's blocks in one GET,
+    /// and holds its pin for as long as the stream lives.
+    #[tokio::test]
+    async fn a_read_streams_its_blocks_from_one_get_and_holds_its_pin() {
+        const MIB: usize = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = Counting { inner: MemoryBlobStore::new(), gets: gets.clone() };
+        let mut opts = IngestOptions::new(8 * MIB, ChunkCodec::Raw);
+        opts.block_size = MIB;
+        let layer = ChunkStore::open(db, store, opts).await.unwrap();
+        let data = noise(6 * MIB + 100);
+        let ingested =
+            layer.ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data.clone())]), None).await.unwrap();
+        let chunk = ingested.extents[0].chunk;
+        assert_eq!(layer.db().get_replica_layouts(chunk).await.unwrap()[0].parts.len(), 1);
+
+        let mut read = layer.read_stream(&ingested.extents, None).await.unwrap();
+        assert_eq!(gets.load(Ordering::SeqCst), 1, "the window is fetched in one GET");
+        assert!(layer.db().is_read_pinned(chunk));
+        let mut pieces = Vec::new();
+        while let Some(piece) = read.next().await {
+            pieces.push(piece.unwrap());
+        }
+        assert_eq!(pieces.len(), 7, "a block at a time");
+        assert_eq!(Bytes::from(pieces.concat()), data);
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+        assert!(layer.db().is_read_pinned(chunk), "pinned while the stream lives");
+        drop(read);
+        assert!(!layer.db().is_read_pinned(chunk));
+
+        let range = 3 * MIB as u64 - 10..3 * MIB as u64 + 10;
+        let got = layer.read(&ingested.extents, Some(range.clone())).await.unwrap();
+        assert_eq!(got, data.slice(range.start as usize..range.end as usize));
+        assert_eq!(gets.load(Ordering::SeqCst), 2, "two blocks, one GET");
     }
 
     /// A blob store marked as another deployment's (a channel's pinned marker).

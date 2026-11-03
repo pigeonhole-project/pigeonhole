@@ -107,13 +107,27 @@ gone
   A lossy restore from the newest snapshot then has the chunk `reclaiming` or
   gone, never live under an object. Reclaim lags snapshots by up to
   `snapshot_every`.
-- **Read pins.** `ChunkStore::read` pins the chunks it reads
+- **Read pins.** `ChunkStore::read_stream` pins the chunks it reads
   (`BlobDb::pin_reads`, process memory) and then checks they are not
   reclaiming. Reclaim commits `BeginReclaim`, then checks the pins and leaves a
   pinned chunk `reclaiming` for the next pass. One of the two always sees the
   other: parts are never deleted under a read, and a read that starts after
   `BeginReclaim` fails with `ChunkGone`. The S3 GET then looks the key up again
   (the object was overwritten or deleted) — up to `GET_ATTEMPTS` times.
+- **Reads.** A read is a stream (`ChunkStore::read_stream`, used by the S3
+  GET, the copied part's MD5 and the CAS `Read`; `ChunkStore::read` collects
+  it for small callers) that owns its `ReadPin`: the chunks stay pinned
+  until the stream is dropped, however slowly the client reads. It is
+  planned when it opens: the blocks it needs, cut into windows of
+  consecutive blocks of one chunk (`READ_WINDOW`, 32 MiB stored). The
+  blocks of a window that neither cache holds are fetched in one
+  `Replicated::read` (one ranged GET per part, failing over between
+  replicas), split by their stored lengths and checked against their CRCs;
+  each is decoded when the stream gets to it. A read holds one window of
+  stored bytes and one decoded block, whatever its length. The first
+  window is loaded at the open, so a read no replica can serve fails
+  before the response starts (`ChunkGone` too); a store failing later
+  breaks the stream.
 - Chunks left `reclaiming` after a crash or a deferral are finished on the next pass.
 - **Retired instances.** A reclaimed chunk with parts on an instance no
   longer in the placement (taken out of the config) keeps its metadata,

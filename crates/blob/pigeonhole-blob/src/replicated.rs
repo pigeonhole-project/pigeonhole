@@ -342,11 +342,9 @@ impl Replicated {
             bail!("read requires at least one replica layout");
         }
 
-        let costs: Vec<CostHint> = replicas
-            .iter()
-            .map(|r| self.by_id.get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None)))
-            .collect();
-        let order = self.selector.rank(replicas, &costs);
+        // The stream owns what it needs: the backends of these replicas.
+        let backends: Vec<_> = replicas.iter().map(|r| self.by_id.get(&r.instance).cloned()).collect();
+        let order = self.selector.rank(replicas, &get_costs(&backends));
         if let Some(&first) = order.first() {
             if let Some(r) = replicas.get(first) {
                 crate::metrics::record_replica_selected(&r.instance);
@@ -354,7 +352,7 @@ impl Replicated {
         }
 
         let state = ReadState {
-            backends: self.by_id.clone(),
+            backends,
             selector: self.selector.clone(),
             timeout: self.member_timeout,
             replicas: replicas.to_vec(),
@@ -507,8 +505,15 @@ impl ChunkReplicaWriter {
 
 // --- failover read ---
 
+/// What a GET from each backend would cost now (a backend not in the
+/// placement: free, and skipped when tried).
+fn get_costs(backends: &[Option<Arc<dyn DynBlobBackend>>]) -> Vec<CostHint> {
+    backends.iter().map(|b| b.as_ref().map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None))).collect()
+}
+
 struct ReadState {
-    backends: HashMap<InstanceId, Arc<dyn DynBlobBackend>>,
+    /// The backend of each replica, `None` if not in the placement.
+    backends: Vec<Option<Arc<dyn DynBlobBackend>>>,
     selector: Arc<dyn ReplicaSelector>,
     timeout: Duration,
     replicas: Vec<ReplicaLayout>,
@@ -620,12 +625,7 @@ impl ReadState {
             if self.reranked {
                 return Ok(false);
             }
-            let costs: Vec<CostHint> = self
-                .replicas
-                .iter()
-                .map(|r| self.backends.get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None)))
-                .collect();
-            self.order = self.selector.rank(&self.replicas, &costs);
+            self.order = self.selector.rank(&self.replicas, &get_costs(&self.backends));
             self.tried.clear();
             self.reranked = true;
         }
@@ -636,7 +636,7 @@ impl ReadState {
             }
             self.tried.push(ri);
             let layout = &self.replicas[ri];
-            let Some(backend) = self.backends.get(&layout.instance) else {
+            let Some(backend) = &self.backends[ri] else {
                 continue;
             };
             let Some((part, byte_range, block_range, expected_len)) =

@@ -38,7 +38,7 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::counter(
         "pigeonhole_cache_requests_total",
         &["level", "outcome"],
-        "Block cache lookups: hit, miss (loaded the block), collapsed (waited for another lookup's load)",
+        "Block cache lookups: hit, miss",
     ),
     MetricDoc::gauge("pigeonhole_cache_bytes", &["level"], "Bytes held by a block cache level"),
     MetricDoc::gauge("pigeonhole_cache_entries", &["level"], "Blocks held by a block cache level"),

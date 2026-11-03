@@ -408,6 +408,31 @@ impl BlobDb {
         Ok(self.chunk(chunk_id, |c| c.blocks.clone()).unwrap_or_default())
     }
 
+    /// The chunk's logical size; `None` for a missing chunk.
+    pub(crate) fn chunk_meta_size(&self, chunk_id: ChunkId) -> Option<i64> {
+        self.chunk(chunk_id, |c| c.logical_size)
+    }
+
+    /// The chunk's blocks that hold any of its logical bytes `from..to`.
+    pub(crate) fn blocks_overlapping(&self, chunk_id: ChunkId, from: usize, to: usize) -> Vec<StoredBlock> {
+        self.chunk(chunk_id, |c| {
+            c.blocks
+                .iter()
+                .filter(|b| {
+                    let start = b.logical_off as usize;
+                    start < to && start + b.logical_len as usize > from
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// [`Self::get_replica_layouts`], without the `async`.
+    pub(crate) fn get_replica_layouts_now(&self, chunk_id: ChunkId) -> Vec<ReplicaLayout> {
+        self.chunk(chunk_id, ChunkRec::replica_layouts).unwrap_or_default()
+    }
+
     /// The instances the chunk belongs on (see `ChunkRec::shard`); `None`
     /// for a missing chunk.
     pub fn chunk_shard(&self, chunk_id: ChunkId) -> Option<Vec<String>> {
