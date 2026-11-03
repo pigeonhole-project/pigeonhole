@@ -32,11 +32,13 @@ it leads, and on every gain of leadership ([cluster.md](cluster.md)):
 - **Disk, memory**: not marked (a directory or a process is one
   deployment's by setup).
 
-A bot sees only the latest pin on Telegram (`channels.getFullChannel`;
-bots may not search), so of two deployments racing on a new channel the
-last to pin keeps it and the other learns so on its read back or its next
-start; meanwhile their blobs are safe from each other by the owner bits.
-Discord lists every pin: the oldest marker wins.
+The latest pinned marker wins, on both services
+(`pigeonhole_storage_api::located::marked_owner`): a Telegram bot sees
+only the latest pin (`channels.getFullChannel`; bots may not search), and
+Discord lists pins latest first, so one rule serves both. Of two
+deployments racing on a new channel the last to pin keeps it and the other
+learns so on its read back or its next start; meanwhile their blobs are
+safe from each other by the owner bits.
 
 Rights: Telegram needs pin messages (supergroup) or edit messages
 (channel); Discord needs Manage Messages, which deletes already take.

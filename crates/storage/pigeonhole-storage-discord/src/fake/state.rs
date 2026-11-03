@@ -35,8 +35,8 @@ pub struct DiscordChannelState {
     by_nonce: BTreeMap<String, u64>,
     /// Bumped by [`Command::ExpireUrls`]: older URLs fail.
     url_epoch: u32,
-    /// Pinned message ids.
-    pinned: std::collections::BTreeSet<u64>,
+    /// Pinned message ids, the latest pinned first (as Discord lists them).
+    pinned: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +93,7 @@ pub enum Reply {
 
 impl FakeState for DiscordChannelState {
     const NAME: &'static str = "fake-discord";
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     type Command = Command;
     type Reply = Reply;
 
@@ -120,7 +120,8 @@ impl FakeState for DiscordChannelState {
             }
             Command::Pin { id } => {
                 if self.messages.contains_key(&id) {
-                    self.pinned.insert(id);
+                    self.pinned.retain(|p| *p != id);
+                    self.pinned.insert(0, id);
                 }
                 Reply::Done
             }
@@ -155,8 +156,9 @@ impl FakeState for DiscordChannelState {
 }
 
 impl DiscordChannelState {
+    /// The pinned messages, the latest pinned first.
     pub fn pinned(&self) -> Vec<u64> {
-        self.pinned.iter().copied().collect()
+        self.pinned.clone()
     }
 
     /// A snowflake for `now_ms`, above every id so far.

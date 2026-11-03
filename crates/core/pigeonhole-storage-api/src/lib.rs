@@ -8,6 +8,7 @@
 
 mod backend;
 mod chain;
+pub mod chain_name;
 #[cfg(any(test, feature = "conformance"))]
 pub mod conformance;
 mod error;
@@ -15,6 +16,7 @@ mod error;
 pub mod fake;
 pub mod inspect;
 mod label;
+pub mod located;
 mod stream;
 pub mod text;
 

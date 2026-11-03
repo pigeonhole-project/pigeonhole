@@ -7,11 +7,12 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lru::LruCache;
+use pigeonhole_limits::chat::Classes;
 use pigeonhole_limits::ChatLimiter;
+use pigeonhole_storage_api::located::{as_text, marked_owner, owned_by, Located, Locations, OWNER_MARKER};
 use pigeonhole_storage_api::text;
 use pigeonhole_storage_api::{
-    bytes_stream, check_blob, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, Failure, InstanceInfo,
-    NotFound, OpKind, Owner,
+    bytes_stream, check_blob, slice_range, BlobBackend, BoxByteStream, CostHint, Failure, InstanceInfo, OpKind, Owner,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -38,22 +39,16 @@ pub fn discord_location(channel_id: &str) -> String {
 /// Locations of recently seen blobs (saves a fetch per read).
 const LOCATION_CACHE: usize = 4096;
 
-/// Where a blob's bytes are: an attachment, or the bytes themselves (a text
-/// message, [`pigeonhole_storage_api::text`]).
-#[derive(Clone)]
-pub(crate) enum Located {
-    Cdn { url: String, size: u64 },
-    Inline(Bytes),
-}
-
-impl Located {
-    pub(crate) fn of(m: &DcMessage) -> Option<Self> {
-        match &m.attachment {
-            Some(a) => Some(Located::Cdn { url: a.url.clone(), size: a.size }),
-            None => text::decode(&m.content).map(|(_, data)| Located::Inline(data)),
-        }
+/// What message `m` holds, if it is a blob: an attachment's URL, or a text
+/// message's bytes ([`pigeonhole_storage_api::text`]).
+pub(crate) fn located(m: &DcMessage) -> Option<Located<String>> {
+    match &m.attachment {
+        Some(a) => Some(Located::File { size: a.size, file: a.url.clone() }),
+        None => Located::of_text(&m.content),
     }
 }
+
+const CLASSES: Classes = Classes { send: SEND, read: READ, delete: DELETE };
 
 /// The name a blob message was put under. An attachment carries it as the
 /// message's content: Discord rewrites file names (it drops `~`, live check).
@@ -75,15 +70,12 @@ pub fn blob_nonce(channel: u64, name: &str) -> String {
     format!("b{:016x}{:08x}", a, h.finish() as u32)
 }
 
-/// What an owner marker says to a person reading the channel.
-const OWNER_MARKER: &[u8] = b"pigeonhole: the blobs in this channel are this deployment's";
-
 pub struct DiscordBlobStore<A> {
     limits: BackendLimits,
     instance: InstanceInfo,
     pub(crate) api: Arc<A>,
     pub(crate) limiter: Arc<ChatLimiter>,
-    locations: Mutex<LruCache<u64, Located>>,
+    locations: Locations<u64, String>,
     /// Names of recently seen blob messages (a chain member's name tells
     /// what it follows, which deleting it needs).
     pub(crate) names: Mutex<LruCache<u64, String>>,
@@ -102,7 +94,7 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
             instance,
             api,
             limiter,
-            locations: Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())),
+            locations: Locations::new(LOCATION_CACHE),
             names: Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())),
             inline: true,
             anchor: tokio::sync::Mutex::new(None),
@@ -140,27 +132,24 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
     }
 
     pub(crate) fn remember(&self, m: &DcMessage) {
-        if let Some(l) = Located::of(m) {
-            self.locations.lock().unwrap().put(m.id, l);
+        if let Some(l) = located(m) {
+            self.locations.remember(m.id, l);
         }
         if let Some(name) = blob_name(m) {
             self.names.lock().unwrap().put(m.id, name.to_string());
         }
     }
 
-    /// Post blob `name` as text if it fits, else as an attachment; the message.
-    /// The owner the oldest pinned marker marks the channel for.
+    /// The owner the latest pinned marker marks the channel for (Discord
+    /// lists pins latest first, [`marked_owner`]).
     async fn pinned_owner(&self) -> Result<Option<Owner>> {
         let pins = self.api.pinned().await?;
-        Ok(pins
-            .iter()
-            .filter_map(|m| blob_name(m).and_then(Owner::from_marker).map(|o| (m.id, o)))
-            .min()
-            .map(|(_, o)| o))
+        Ok(marked_owner(pins.iter().map(blob_name)))
     }
 
+    /// Post blob `name` as text if it fits, else as an attachment; the message.
     pub(crate) async fn post_blob(&self, name: &str, data: Bytes, nonce: &str) -> Result<DcMessage> {
-        let (bytes, as_text) = (data.len(), self.inline && text::fits(name, data.len(), CONTENT_MAX_CHARS));
+        let (bytes, as_text) = (data.len(), as_text(self.inline, name, data.len(), CONTENT_MAX_CHARS));
         let m = if as_text {
             self.api.send(&text::encode(name, &data), None, nonce).await?
         } else {
@@ -189,18 +178,16 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
 
     /// Where blob `id` is: from the cache, or fetch the message (`fresh`:
     /// always, for a new URL).
-    async fn locate(&self, id: u64, fresh: bool) -> Result<Located> {
-        if !fresh {
-            if let Some(l) = self.locations.lock().unwrap().get(&id) {
-                return Ok(l.clone());
-            }
-        }
-        let Some(m) = self.api.get_message(id).await? else {
-            return Err(NotFound(format!("blob message {id}")).into());
-        };
-        let l = Located::of(&m).with_context(|| format!("message {id} is not a blob"))?;
-        self.locations.lock().unwrap().put(id, l.clone());
-        Ok(l)
+    async fn locate(&self, id: u64, fresh: bool) -> Result<Located<String>> {
+        self.locations
+            .locate(id, fresh, || async move {
+                let Some(m) = self.api.get_message(id).await? else { return Ok(None) };
+                if let Some(name) = blob_name(&m) {
+                    self.names.lock().unwrap().put(id, name.to_string());
+                }
+                located(&m).map(Some).with_context(|| format!("message {id} is not a blob"))
+            })
+            .await
     }
 }
 
@@ -222,15 +209,8 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
     }
 
     fn cost(&self, op: OpKind, id: Option<&Self::Id>) -> CostHint {
-        let wait = match op {
-            OpKind::Put => self.limiter.peek_wait(SEND),
-            OpKind::Get if id.is_some_and(|i| self.locations.lock().unwrap().contains(&i.message_id)) => {
-                std::time::Duration::ZERO
-            }
-            OpKind::Get => self.limiter.peek_wait(READ),
-            OpKind::Delete => self.limiter.peek_wait(DELETE),
-        };
-        CostHint { wait_secs: wait.as_secs_f64() }
+        let cached = id.is_some_and(|i| self.locations.holds(i.message_id));
+        pigeonhole_limits::chat::cost(&self.limiter, CLASSES, op, cached)
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
@@ -240,9 +220,9 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
         Ok(DiscordId { message_id: m.id })
     }
 
-    /// The oldest pinned owner marker if there is one, else ours, posted and
+    /// The latest pinned owner marker if there is one, else ours, posted and
     /// pinned (read again after: of two deployments racing on a new channel,
-    /// the one whose marker is older keeps it).
+    /// the last to pin keeps it, [`marked_owner`]).
     async fn mark_owner(&self, owner: Owner) -> Result<Owner> {
         if let Some(marked) = self.pinned_owner().await? {
             return Ok(marked);
@@ -260,10 +240,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
     async fn exists(&self, id: &Self::Id) -> Result<bool> {
         match self.locate(id.message_id, true).await {
             Ok(_) => Ok(true),
-            Err(e) if Failure::of(&e) == Failure::NotFound => {
-                self.locations.lock().unwrap().pop(&id.message_id);
-                Ok(false)
-            }
+            Err(e) if Failure::of(&e) == Failure::NotFound => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -275,7 +252,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
                 tracing::debug!(store = %self.instance.id, message_id = mid, ?range, kind = "text", "read");
                 return Ok(bytes_stream(slice_range(data, range)?));
             }
-            Located::Cdn { url, size } => (url, size),
+            Located::File { size, file } => (file, size),
         };
         tracing::debug!(store = %self.instance.id, message_id = mid, ?range, size, kind = "attachment", "read");
         let want = match range {
@@ -288,7 +265,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
         };
         let bytes = match self.fetch(&url, want).await {
             Err(e) if e.is::<CdnStale>() => {
-                let Located::Cdn { url, .. } = self.locate(mid, true).await? else {
+                let Located::File { file: url, .. } = self.locate(mid, true).await? else {
                     bail!("blob {mid} is no longer an attachment")
                 };
                 self.fetch(&url, want).await
@@ -303,16 +280,15 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
         for ids in keys.chunks(PAGE) {
             self.api.delete_messages(ids).await?;
             tracing::debug!(store = %self.instance.id, messages = ?ids, "deleted");
-            let mut cache = self.locations.lock().unwrap();
             for id in ids {
-                cache.pop(id);
+                self.locations.forget(*id);
             }
         }
         // Chain members (a removed snapshot): their links go too.
         self.retire_links(keys).await
     }
 
-    /// `owner`'s blobs (attachments or texts named by a [`BlobId`] of its)
+    /// `owner`'s blobs (attachments or texts named by a [`BlobId`](pigeonhole_storage_api::BlobId) of its)
     /// with ids in `(after, upto]`, listed 100 at a time; nothing else is a
     /// candidate.
     async fn candidates(
@@ -331,7 +307,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
                 if m.id > upto {
                     break;
                 }
-                if blob_name(m).and_then(BlobId::from_name).is_some_and(|b| b.owner() == owner) {
+                if owned_by(blob_name(m), owner) {
                     self.remember(m);
                     out.push(m.id);
                 }

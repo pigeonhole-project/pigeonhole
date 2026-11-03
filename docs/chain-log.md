@@ -201,7 +201,8 @@ crate `core/pigeonhole-storage-api` (crates.io only): `BlobBackend` (its
 listing for the sweeper included; `Sweepable` folded into it), `Chain`, `OrderedKey`, `BlobId`, `BackendLimits` and the types
 they need. `pigeonhole-blob`, `pigeonhole-meta` and every storage crate depend
 on it; `scripts/check_deps.py` learns the new layer. A storage crate depends
-on it, `core/pigeonhole-limits` (rate limiters) and `pigeonhole-types` only,
+on it, `core/pigeonhole-limits` (rate limiters, itself on the storage API
+for the error types) and `pigeonhole-types` only,
 never on the blob layer above it. A log or snapshot store
 is configured as any `[[store]]`; one store serves one purpose (blobs, a log,
 or snapshots), as today.
@@ -242,8 +243,14 @@ Where the code differs from the design above:
   tail only. Generations only grow along the chain, so the tail's generation
   is the newest claim and a loser's `Fenced { current }` is the winner's.
 - **`confirm`** = `successor(our tip)` is none.
-- **Telegram**: a member is a document named `<label>~<prev>.bin` (`root`
-  for the first). `put_after` posts with a fresh `random_id` per call (two
+- **Names** (Telegram, Discord: `pigeonhole_storage_api::chain_name`): a
+  member is named `<label>~<prev>.bin` (`root` for the first); a label
+  follows the one rule every store checks (`check_label`: 1 to 128 of
+  `[A-Za-z0-9._-]`, so never a `~` or a space). Both stores share the rest of their blob side too: a
+  blob that fits a text message goes as one, else as a file, with a cache
+  of where recent blobs are (`pigeonhole_storage_api::located`), and the
+  pool of bots (`pigeonhole_limits::chat::Pooled`).
+- **Telegram**: a member is a document or a text named as above. `put_after` posts with a fresh `random_id` per call (two
   writers putting the same name must get two messages), wins iff nothing in
   `(prev, b)` names `prev` or a blob newer than `prev` (no read when
   `b == prev + 1`). The second half fences a writer deposed before a

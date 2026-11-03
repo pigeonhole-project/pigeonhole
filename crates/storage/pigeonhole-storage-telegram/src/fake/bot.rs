@@ -2,15 +2,24 @@
 //! budget from its limiter, as `MtprotoChannel`'s calls do, so a fake
 //! channel is paced like Telegram and several bots go faster than one
 //! ([`crate::pool::PooledChannel`]).
+//!
+//! A document's location is the bot's that read or posted it, as on
+//! Telegram: another bot's download with it answers `FILE_REFERENCE_EXPIRED`
+//! (the bot's number rides on the file reference). Tests can make the next
+//! sends answer a flood wait ([`FakeBot::flood_next`]).
 
+use super::Calls;
 use crate::channel::{ChannelApi, ChannelMessage, FileLocation, Sent};
 use crate::limits::{DELETE, READ, SEND};
+use crate::FileReferenceExpired;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_limits::{ChatLimiter, Spend};
+use pigeonhole_limits::{ChatLimiter, Level, Spend};
+use pigeonhole_storage_api::RateLimited;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Channel `C` through bot number `bot` (0: the primary).
 pub struct FakeBot<C> {
@@ -19,11 +28,19 @@ pub struct FakeBot<C> {
     bot: usize,
     /// While set, every call fails: the channel is down (the site's demo).
     down: Arc<AtomicBool>,
+    knobs: Mutex<Knobs>,
+}
+
+#[derive(Default)]
+struct Knobs {
+    calls: Calls,
+    /// Sends left to answer a flood wait, and the wait.
+    floods: Option<(u32, Duration)>,
 }
 
 impl<C> FakeBot<C> {
     pub fn new(channel: Arc<C>, limiter: Arc<ChatLimiter>, bot: usize) -> Self {
-        Self { channel, limiter, bot, down: Arc::default() }
+        Self { channel, limiter, bot, down: Arc::default(), knobs: Mutex::default() }
     }
 
     /// Fails every call while `down` is set (shared by a channel's bots).
@@ -35,6 +52,23 @@ impl<C> FakeBot<C> {
         &self.limiter
     }
 
+    /// The channel as no bot in particular sees it.
+    pub fn channel(&self) -> &Arc<C> {
+        &self.channel
+    }
+
+    /// This bot's calls that went through (not refused by a flood wait).
+    pub fn calls(&self) -> Calls {
+        self.knobs.lock().unwrap().calls
+    }
+
+    /// The next `sends` sends answer `FLOOD_WAIT` of `wait`: nothing is
+    /// posted, the bot's send budget in the channel is cooled, and the call
+    /// gives way ([`RateLimited`]), as a bot in a pool does.
+    pub fn flood_next(&self, sends: u32, wait: Duration) {
+        self.knobs.lock().unwrap().floods = Some((sends, wait));
+    }
+
     async fn spend(&self, spend: Spend, call: &'static str) -> Result<()> {
         if self.down.load(Ordering::SeqCst) {
             tracing::debug!(bot = self.bot, call, "fake bot call: the channel is down");
@@ -43,6 +77,28 @@ impl<C> FakeBot<C> {
         self.limiter.acquire(spend).await;
         tracing::debug!(bot = self.bot, call, "fake bot call");
         Ok(())
+    }
+
+    /// A send's budget, and a flood wait if one is due.
+    async fn send(&self, call: &'static str) -> Result<()> {
+        self.spend(Spend::Class(SEND), call).await?;
+        let mut k = self.knobs.lock().unwrap();
+        if let Some((left, wait)) = k.floods.filter(|(left, _)| *left > 0) {
+            k.floods = Some((left - 1, wait));
+            self.limiter.cool(Spend::Class(SEND), Level::Class, wait);
+            return Err(RateLimited { method: call, retry_after: wait }.into());
+        }
+        Ok(())
+    }
+
+    fn count(&self, f: impl FnOnce(&mut Calls)) {
+        f(&mut self.knobs.lock().unwrap().calls);
+    }
+
+    /// `file` as this bot holds it.
+    fn ours(&self, mut file: FileLocation) -> FileLocation {
+        file.file_reference.push(self.bot as u8);
+        file
     }
 }
 
@@ -54,26 +110,46 @@ impl<C: ChannelApi> ChannelApi for FakeBot<C> {
 
     async fn get_messages(&self, ids: &[i64]) -> Result<Vec<ChannelMessage>> {
         self.spend(Spend::Class(READ), "get_messages").await?;
-        self.channel.get_messages(ids).await
+        self.count(|c| c.get_messages += 1);
+        let msgs = self.channel.get_messages(ids).await?;
+        Ok(msgs
+            .into_iter()
+            .map(|m| match m {
+                ChannelMessage::Document { name, size, file } => {
+                    ChannelMessage::Document { name, size, file: self.ours(file) }
+                }
+                other => other,
+            })
+            .collect())
     }
 
     async fn send_document(&self, name: &str, data: Bytes, random_id: i64) -> Result<Sent> {
-        self.spend(Spend::Class(SEND), "send_document").await?;
-        self.channel.send_document(name, data, random_id).await
+        self.send("send_document").await?;
+        self.count(|c| c.send_document += 1);
+        let sent = self.channel.send_document(name, data, random_id).await?;
+        Ok(Sent { file: sent.file.map(|f| self.ours(f)), ..sent })
     }
 
     async fn send_text(&self, text: &str, random_id: i64) -> Result<Sent> {
-        self.spend(Spend::Class(SEND), "send_text").await?;
+        self.send("send_text").await?;
+        self.count(|c| c.send_text += 1);
         self.channel.send_text(text, random_id).await
     }
 
+    /// Only with this bot's own location.
     async fn get_file(&self, file: &FileLocation, offset: u64, limit: u64) -> Result<Bytes> {
         self.spend(Spend::Bot, "get_file").await?;
-        self.channel.get_file(file, offset, limit).await
+        let mut theirs = file.clone();
+        if theirs.file_reference.pop() != Some(self.bot as u8) {
+            return Err(FileReferenceExpired.into());
+        }
+        self.count(|c| c.get_file += 1);
+        self.channel.get_file(&theirs, offset, limit).await
     }
 
     async fn delete_messages(&self, ids: &[i64]) -> Result<()> {
         self.spend(Spend::Class(DELETE), "delete_messages").await?;
+        self.count(|c| c.delete_messages += 1);
         self.channel.delete_messages(ids).await
     }
 
@@ -84,6 +160,7 @@ impl<C: ChannelApi> ChannelApi for FakeBot<C> {
 
     async fn pin(&self, id: i64) -> Result<()> {
         self.spend(Spend::Class(SEND), "pin").await?;
+        self.count(|c| c.pin += 1);
         self.channel.pin(id).await
     }
 }

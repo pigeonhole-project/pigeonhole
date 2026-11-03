@@ -259,9 +259,12 @@ let result = ticket.run(&RETRY, classify, |bot| bot.send(…, random_id)).await;
 ## Crates
 
 - **`pigeonhole-limits`**: buckets, plans taken at once, the retry loop,
-  then pools and tickets. It knows no service and depends on tokio (the
-  workspace's `madsim-tokio` alias, so the simulation sees its clock) and
-  metrics.
+  then pools and tickets, and what both chat stores build on
+  (`pigeonhole_limits::chat`: `Pooled`, a channel through several bots;
+  `Member`, a client that can join one; `Failed::into_error`, a failure as
+  the store's error types; `cost`). It knows no service and depends on
+  tokio (the workspace's `madsim-tokio` alias, so the simulation sees its
+  clock), metrics and `pigeonhole-storage-api` (the error types).
 - **The service crates** bring their classes and default rates
   (`limits()`), `classify`, and a `Call` per request (`Budgeted` on
   Telegram, constants on Discord).
@@ -357,12 +360,13 @@ until the round trip (~0.3–0.5 s per send) is what is left.
    member, moves, retry waits. Live, two bots, default limits, sends one
    after another: Telegram 30 in 40 s (44.8/min, one bot's budget 18/min),
    Discord 40 in 16 s (147/min, one bot's 60/min), no rate limit hit.
-   Telegram reads spread too (decided with the user): a location carries
-   its bot (`FileLocation::bot`), a download goes to that bot, and the
-   store's location cache keeps every bot's location of a document
-   (replicas). `ChannelApi::read_via` picks the holder whose budget is ready
-   soonest, or has a freer bot read the message and add its own; an expired
-   location drops that bot's replica only. A send's answer gives the
+   Telegram reads spread too (decided with the user): the pooled channel
+   remembers which bot holds which location of a document (from the reads
+   and sends that went through it; replicas), a download goes to the holder
+   whose budget is ready soonest, or a freer bot reads the message and adds
+   its own; an expired location drops that bot's replica only. The store
+   and `ChannelApi` know nothing of bots: a location is one bot's, as for a
+   channel of one. A send's answer gives the
    sender's location, so a read after write needs no `getMessages` on any
    bot. Live: documents posted through both bots read back after write and
    through a fresh store, no `FILE_REFERENCE_EXPIRED`.

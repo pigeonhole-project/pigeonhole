@@ -16,8 +16,9 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use grammers_mtsender::{ConnectionParams, InvocationError, NoRetries, SenderPool, SenderPoolHandle};
 use grammers_tl_types::{self as tl, enums, functions, types};
-use pigeonhole_limits::{Call, ChatLimiter, Failed, Level, Retry, Spend, Verdict};
-use pigeonhole_storage_api::{RateLimited, Unavailable};
+use pigeonhole_limits::chat::Member;
+use pigeonhole_limits::{Call, ChatLimiter, Level, Retry, Spend, Verdict};
+use pigeonhole_storage_api::RateLimited;
 use pigeonhole_storage_telegram::limits::{DELETE, READ, SEND};
 use pigeonhole_storage_telegram::{
     ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, WINDOW,
@@ -40,7 +41,7 @@ const RETRY: Retry = Retry {
 };
 /// A member of a [`PooledChannel`](crate::PooledChannel): a flood wait ends
 /// the call at once, so that the pool may move it to another bot.
-const RETRY_IN_POOL: Retry = Retry { give_way: true, ..RETRY };
+const RETRY_IN_POOL: Retry = RETRY.giving_way();
 /// How long a file uploaded for a send is kept for a repeat of that send.
 const UPLOAD_KEPT: Duration = Duration::from_secs(300);
 /// Upload parts of one file in flight.
@@ -420,12 +421,9 @@ where
     Fut: std::future::Future<Output = Result<T, InvocationError>>,
 {
     let what = call.what;
-    pigeonhole_limits::run(limiter, call, retry, classify, attempt).await.map_err(|f| match f {
-        Failed::RateLimited { retry_after, .. } => anyhow::Error::new(RateLimited { method: what, retry_after }),
-        Failed::Unavailable { last, elapsed } => anyhow::Error::new(Unavailable(what.to_string()))
-            .context(format!("{what}: {last} (still failing after {elapsed:?})")),
-        Failed::Fatal(err) => map_fatal(what, err),
-    })
+    pigeonhole_limits::run(limiter, call, retry, classify, attempt)
+        .await
+        .map_err(|f| f.into_error(what, |err| map_fatal(what, err)))
 }
 
 fn map_fatal(what: &'static str, err: InvocationError) -> anyhow::Error {
@@ -500,13 +498,6 @@ impl MtprotoChannel {
         Self { lane, ..self.clone() }
     }
 
-    /// The same channel as a member of a [`PooledChannel`](crate::PooledChannel):
-    /// a flood wait ends a call at once instead of being waited out (unless
-    /// the call's outcome is unknown), so the pool can move it to another bot.
-    pub fn in_pool(&self) -> Self {
-        Self { retry: RETRY_IN_POOL, ..self.clone() }
-    }
-
     /// `request` on this channel's lane, metered by its limiter.
     async fn invoke<R: Budgeted>(&self, dc: Option<i32>, request: &R) -> Result<R::Return> {
         self.client.invoke(self.lane, dc, Some(&self.limiter), retry_for(&R::CALL, &self.retry), request).await
@@ -550,6 +541,19 @@ impl MtprotoChannel {
     }
 }
 
+/// A member of a [`PooledChannel`](crate::PooledChannel).
+impl Member for MtprotoChannel {
+    /// A flood wait ends a call at once instead of being waited out (unless
+    /// the call's outcome is unknown), so the pool can move it to another bot.
+    fn in_pool(&self) -> Self {
+        Self { retry: RETRY_IN_POOL, ..self.clone() }
+    }
+
+    fn limiter(&self) -> &Arc<ChatLimiter> {
+        MtprotoChannel::limiter(self)
+    }
+}
+
 fn random_i64() -> i64 {
     uuid::Uuid::new_v4().as_u64_pair().0 as i64
 }
@@ -578,13 +582,8 @@ fn channel_message(m: enums::Message) -> (i64, ChannelMessage) {
                 enums::DocumentAttribute::Filename(f) => Some(f.file_name.clone()),
                 _ => None,
             });
-            let file = FileLocation {
-                id: d.id,
-                access_hash: d.access_hash,
-                file_reference: d.file_reference,
-                dc_id: d.dc_id,
-                bot: 0,
-            };
+            let file =
+                FileLocation { id: d.id, access_hash: d.access_hash, file_reference: d.file_reference, dc_id: d.dc_id };
             let msg = ChannelMessage::Document { name: name.unwrap_or_default(), size: d.size.max(0) as u64, file };
             (m.id as i64, msg)
         }

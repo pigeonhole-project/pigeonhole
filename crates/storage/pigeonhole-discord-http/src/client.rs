@@ -4,8 +4,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_limits::{Call, ChatLimiter, Class, Failed, Level, Retry, Spend, Verdict};
-use pigeonhole_storage_api::{RateLimited, Unavailable};
+use pigeonhole_limits::chat::Member;
+use pigeonhole_limits::{Call, ChatLimiter, Class, Level, Retry, Spend, Verdict};
+use pigeonhole_storage_api::Unavailable;
 use pigeonhole_storage_discord::limits::{DELETE, READ, SEND};
 use pigeonhole_storage_discord::snowflake_bulk_deletable;
 use pigeonhole_storage_discord::{CdnStale, DcAttachment, DcMessage, DiscordApi, ThreadStart, PAGE};
@@ -30,7 +31,7 @@ const RETRY: Retry = Retry {
 };
 /// A member of a [`PooledDiscord`](crate::PooledDiscord): a 429 ends the
 /// call at once, so that the pool may move it to another bot.
-const RETRY_IN_POOL: Retry = Retry { give_way: true, ..RETRY };
+const RETRY_IN_POOL: Retry = RETRY.giving_way();
 
 fn unix_now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
@@ -185,11 +186,7 @@ impl DiscordClient {
             Ok(Answer { status, body, remaining, reset_after })
         })
         .await;
-        answer.map_err(|f| match f {
-            Failed::RateLimited { retry_after, .. } => RateLimited { method: what, retry_after }.into(),
-            Failed::Unavailable { last, .. } => anyhow!("{what}: {last}").context(Unavailable(what.to_string())),
-            Failed::Fatal(last) => anyhow!("{what}: {last}"),
-        })
+        answer.map_err(|f| f.into_error(what, |last| anyhow!("{what}: {last}")))
     }
 
     /// Fail fast unless the bot sees `channel_id` as a text channel and can
@@ -234,13 +231,6 @@ impl DiscordChannel {
         &self.limiter
     }
 
-    /// The same channel as a member of a [`PooledDiscord`](crate::PooledDiscord):
-    /// a 429 ends a call at once instead of being waited out (unless the
-    /// call's outcome is unknown), so the pool can move it to another bot.
-    pub fn in_pool(&self) -> Self {
-        Self { retry: RETRY_IN_POOL, ..self.clone() }
-    }
-
     fn path(&self, rest: &str) -> String {
         format!("channels/{}/{rest}", self.channel_id)
     }
@@ -253,6 +243,19 @@ impl DiscordChannel {
             200..=299 | 404 => Ok(()),
             s => bail!("delete message {id}: {s} {}", a.body),
         }
+    }
+}
+
+/// A member of a [`PooledDiscord`](crate::PooledDiscord).
+impl Member for DiscordChannel {
+    /// A 429 ends a call at once instead of being waited out (unless the
+    /// call's outcome is unknown), so the pool can move it to another bot.
+    fn in_pool(&self) -> Self {
+        Self { retry: RETRY_IN_POOL, ..self.clone() }
+    }
+
+    fn limiter(&self) -> &Arc<ChatLimiter> {
+        DiscordChannel::limiter(self)
     }
 }
 
@@ -538,7 +541,7 @@ mod tests {
                 Err::<(), _>(AttemptFailed::RateLimited { wait: Duration::from_secs(5), global })
             })
             .await;
-            assert!(matches!(failed, Err(Failed::RateLimited { .. })));
+            assert!(matches!(failed, Err(pigeonhole_limits::Failed::RateLimited { .. })));
             assert!(a.peek_wait(READ) > Duration::from_secs(3), "the read's own bucket");
             let other = b.peek_wait(SEND);
             assert_eq!(other > Duration::from_secs(3), global, "another channel's sends (global: {global})");

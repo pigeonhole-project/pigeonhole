@@ -30,6 +30,7 @@ use crate::store::{blob_name, TelegramBlobStore, TelegramId};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use pigeonhole_storage_api::chain_name::{chain_name, parse_chain_name};
 use pigeonhole_storage_api::{
     check_blob, newest_loose_at_tail, put_after_tail_by_links, put_loose_linked, After, BlobBackend, Chain, Linked,
     MakeAfter,
@@ -54,22 +55,6 @@ impl Default for ChainOptions {
 
 const PROBE: &str = "chain-probe.bin";
 
-fn chain_name(label: &str, prev: Option<i64>) -> String {
-    match prev {
-        Some(p) => format!("{label}~{p}.bin"),
-        None => format!("{label}~root.bin"),
-    }
-}
-
-/// A chain blob's label and the id it follows (`None`: the first).
-fn parse_name(name: &str) -> Option<(&str, Option<i64>)> {
-    let (label, prev) = name.strip_suffix(".bin")?.rsplit_once('~')?;
-    match prev {
-        "root" => Some((label, None)),
-        p => p.parse().ok().map(|p| (label, Some(p))),
-    }
-}
-
 /// What a page of the channel says, as far as the chain cares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seen {
@@ -86,7 +71,7 @@ fn seen(msg: &ChannelMessage) -> Seen {
     }
     match blob_name(msg) {
         Some(PROBE) => Seen::Probe,
-        Some(name) => match parse_name(name) {
+        Some(name) => match parse_chain_name(name) {
             Some((label, prev)) => Seen::Member(label.to_string(), prev),
             None => Seen::Foreign,
         },
@@ -274,20 +259,5 @@ impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
 
     async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<TelegramId>>> {
         newest_loose_at_tail(self, prefix).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn names_roundtrip() {
-        assert_eq!(chain_name("log-batch-3", Some(41)), "log-batch-3~41.bin");
-        assert_eq!(parse_name("log-batch-3~41.bin"), Some(("log-batch-3", Some(41))));
-        assert_eq!(parse_name("log-claim-1~root.bin"), Some(("log-claim-1", None)));
-        for foreign in ["ph-00.bin", "photo.jpg", "x~y.bin", PROBE] {
-            assert_eq!(parse_name(foreign), None, "{foreign}");
-        }
     }
 }

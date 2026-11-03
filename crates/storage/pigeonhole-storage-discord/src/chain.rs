@@ -31,6 +31,7 @@ use crate::store::{blob_name, DiscordBlobStore, DiscordId};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use pigeonhole_storage_api::chain_name::{chain_name, label_of, parse_chain_name};
 use pigeonhole_storage_api::{
     check_blob, put_after_tail_by_links, After, BlobBackend, Chain, LeaseChain, Linked, MakeAfter,
 };
@@ -41,25 +42,9 @@ const PROBE: &str = "clock probe";
 /// Thread names hold 100 characters.
 const THREAD_NAME_MAX: usize = 100;
 
-fn chain_name(label: &str, prev: Option<u64>) -> String {
-    match prev {
-        Some(p) => format!("{label}~{p}.bin"),
-        None => format!("{label}~root.bin"),
-    }
-}
-
 /// A chain blob's label and what it follows (`None`: the anchor).
 fn parse_name(name: &str) -> Option<(&str, Option<u64>)> {
-    let (label, prev) = name.strip_suffix(".bin")?.rsplit_once('~')?;
-    match prev {
-        "root" => Some((label, None)),
-        p => p.parse().ok().map(|p| (label, Some(p))),
-    }
-}
-
-/// A chain blob's label (`None` for anything else).
-fn label_of(name: &str) -> Option<&str> {
-    parse_name(name).map(|(label, _)| label)
+    parse_chain_name(name)
 }
 
 fn thread_name(next: u64, label: &str) -> String {
@@ -74,7 +59,7 @@ fn parse_thread(name: &str) -> Option<(u64, &str)> {
 }
 
 fn is_member(m: &DcMessage) -> bool {
-    blob_name(m).and_then(label_of).is_some()
+    blob_name(m).and_then(parse_name).is_some()
 }
 
 fn is_anchor(m: &DcMessage) -> bool {
@@ -273,7 +258,7 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
             let page = self.api.list(before, None, PAGE).await?;
             for m in page.iter().rev() {
                 let Some(name) = blob_name(m).filter(|n| n.starts_with(prefix)) else { continue };
-                let label = label_of(name).unwrap_or(name).to_string();
+                let label = label_of(name).to_string();
                 self.remember(m);
                 return Ok(Some(Linked { id: DiscordId { message_id: m.id }, label }));
             }
@@ -354,7 +339,7 @@ impl<A: DiscordApi> LeaseChain for DiscordBlobStore<A> {
             let page = self.api.list(None, Some(after), PAGE).await?;
             for m in &page {
                 let Some(name) = blob_name(m).filter(|n| n.starts_with(prefix)) else { continue };
-                let label = label_of(name).unwrap_or(name).to_string();
+                let label = label_of(name).to_string();
                 self.remember(m);
                 out.push(Linked { id: DiscordId { message_id: m.id }, label });
             }
@@ -372,10 +357,7 @@ mod tests {
 
     #[test]
     fn names_and_threads_roundtrip() {
-        assert_eq!(label_of(&chain_name("log-batch-3", Some(41))), Some("log-batch-3"));
-        assert_eq!(label_of(&chain_name("log-claim-1", None)), Some("log-claim-1"));
-        assert_eq!(label_of("ph-00.bin"), None);
-        assert_eq!(label_of(ANCHOR), None);
+        assert_eq!(parse_name(ANCHOR), None);
         assert_eq!(parse_thread(&thread_name(77, "log-batch-2")), Some((77, "log-batch-2")));
         assert_eq!(parse_thread("hello"), None);
     }
