@@ -121,8 +121,11 @@ impl Sweeper {
 
     /// Single pass: reclaim `refs = 0` chunks, then range-sweep each instance.
     /// An instance that fails (down, rate-limited) is left for the next pass
-    /// ([`SweepStats::failed`]); the others are swept all the same.
+    /// ([`SweepStats::failed`]); the others are swept all the same. One pass
+    /// at a time per tablet: a pass asked for while another runs (any
+    /// sweeper's) waits for it.
     pub async fn sweep_once(&self) -> Result<SweepStats> {
+        let _pass = self.db.sweep_pass().await;
         let mut stats = SweepStats::default();
         self.reclaim_zero_refs(&mut stats).await?;
         for member in &self.members {
@@ -769,5 +772,22 @@ mod tests {
         assert_eq!((stats.zero_ref_chunks, stats.retired_left), (1, 0));
         assert!(p.db.chunk_meta(id).await.unwrap().is_none());
         assert!(p.first.inner.message_keys().is_empty());
+    }
+
+    /// Passes asked for at once (the loop's, the admin's: two sweepers of
+    /// one tablet) run one after the other.
+    #[tokio::test]
+    async fn one_sweep_pass_at_a_time() {
+        let f = setup().await;
+        let running = f.db.sweep_pass().await;
+        let other = tokio::spawn({
+            let sweeper = f.layer.sweeper(SweepConfig::default());
+            async move { sweeper.sweep_once().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!other.is_finished(), "waits for the running pass");
+        drop(running);
+        other.await.unwrap().unwrap();
+        f.layer.sweep_now(SweepConfig::default()).await.unwrap();
     }
 }

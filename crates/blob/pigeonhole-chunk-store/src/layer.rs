@@ -7,6 +7,8 @@ use crate::block_cache::BlockCache;
 use crate::commands::ChunkState;
 use crate::ingest::IngestOptions;
 use crate::read::{ReadStream, Reader};
+use crate::repair::{RepairConfig, RepairStats, Repairer};
+use crate::sweep::{SweepConfig, SweepStats, Sweeper};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -287,6 +289,43 @@ impl ChunkStore {
         &self.db
     }
 
+    /// A sweeper of this store's placement (for the background loop).
+    pub fn sweeper(&self, config: SweepConfig) -> Sweeper {
+        let members = self.replicated.members().to_vec();
+        Sweeper::new(self.db.clone(), members, config, self.replicated.pins().clone())
+    }
+
+    /// A repairer of this store's placement (for the background loop).
+    pub fn repairer(&self, config: RepairConfig) -> Repairer {
+        Repairer::new(self.db.clone(), self.replicated.clone(), config)
+    }
+
+    /// One sweep pass now (the admin, a purge); waits for one running.
+    pub async fn sweep_now(&self, config: SweepConfig) -> Result<SweepStats> {
+        self.sweeper(config).sweep_once().await
+    }
+
+    /// One repair pass now (the admin); waits for one running.
+    pub async fn repair_now(&self, config: RepairConfig) -> Result<RepairStats> {
+        self.repairer(config).repair_once().await
+    }
+
+    /// Probe every replica `instance_id` holds; queue a repair for each one
+    /// gone. How many it checked, and how many were gone.
+    pub async fn verify(&self, instance_id: &str) -> Result<(u64, u64)> {
+        self.repairer(RepairConfig::default()).verify_instance(instance_id).await
+    }
+
+    /// Repair jobs given up on (they failed too often).
+    pub fn unrepairable(&self) -> Vec<crate::Unrepairable> {
+        self.db.unrepairable()
+    }
+
+    /// Queue the jobs given up on again; how many.
+    pub fn retry_unrepairable(&self) -> usize {
+        self.db.retry_unrepairable()
+    }
+
     pub fn replicated(&self) -> &Arc<Replicated> {
         &self.replicated
     }
@@ -317,7 +356,7 @@ impl ChunkStore {
             codec: ChunkCodec::Raw,
             crc32: crc,
         }];
-        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts, &sealed.shard)?;
+        let (chunk_id, commit) = self.db.prepare_commit(logical, &blocks, &sealed.layouts, &sealed.shard)?;
         let chunk = PendingChunk::new(chunk_id, commit, sealed);
         self.commit(PendingChunks { chunks: vec![chunk] }).await?;
         Ok(chunk_id)
@@ -535,17 +574,9 @@ impl ChunkStore {
     async fn complete_seal(&self, sealing: Sealing, pending: &mut PendingChunks) -> Result<Extent> {
         let Sealing { upload, blocks, stored, logical } = sealing;
         let sealed = upload.join().await?.context("replicated finish chunk")?;
-        // CRC over stored concatenation is not the object CRC; use logical stream CRC
-        // at ingest level. Per-chunk crc32: hash of block stored bytes.
-        let mut h = crc32fast::Hasher::new();
-        for b in &blocks {
-            h.update(&b.stored_len.to_le_bytes());
-            h.update(b.codec.as_str().as_bytes());
-        }
-        let crc = h.finalize();
         // Committed by the caller, with whatever points at it; the uploads
         // stay pinned until then.
-        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts, &sealed.shard)?;
+        let (chunk_id, commit) = self.db.prepare_commit(logical, &blocks, &sealed.layouts, &sealed.shard)?;
         // A chunk that fails to commit is never asked for here; another
         // leader may commit its id, so a leader clears the caches when it
         // takes over.
@@ -650,7 +681,14 @@ impl<'a> BlockFeeder<'a> {
     async fn feed(&mut self, mut rest: &[u8]) -> Result<()> {
         while !rest.is_empty() {
             self.reserve_chunk().await?;
-            let take = (self.block_size - self.block.len()).min(rest.len());
+            let mut take = (self.block_size - self.block.len()).min(rest.len());
+            if let Some(room) = self.room() {
+                if room == 0 {
+                    self.past_reservation().await?;
+                    continue;
+                }
+                take = take.min(room);
+            }
             self.block.extend_from_slice(&rest[..take]);
             rest = &rest[take..];
             if self.block.len() >= self.block_size {
@@ -661,16 +699,38 @@ impl<'a> BlockFeeder<'a> {
     }
 
     /// The open chunk's reservation, unless it has one: all the chunk can
-    /// hold, or what is left of a body of known length.
+    /// hold, or what is left of a body of known length (all the chunk can
+    /// hold again once the body is longer than it said).
     async fn reserve_chunk(&mut self) -> Result<()> {
         let Some(budget) = &self.budget else { return Ok(()) };
         if self.open.permit.is_some() {
             return Ok(());
         }
         let full = (self.chunk_stored + self.block_size) as u64;
-        let left = self.size_hint.map_or(full, |n| n.saturating_sub(self.sealed_logical));
+        let left = self.size_hint.map(|n| n.saturating_sub(self.sealed_logical)).filter(|&n| n > 0).unwrap_or(full);
         let n = full.min(left).min(budget.capacity() as u64) as usize;
         self.open.permit = Some(budget.acquire(n).await?);
+        Ok(())
+    }
+
+    /// Bytes the open chunk's reservation still covers (its stored blocks
+    /// and the block being filled); `None` without a budget.
+    fn room(&self) -> Option<usize> {
+        let held = self.open.permit.as_ref()?.bytes();
+        Some(held.saturating_sub(self.open.stored_len + self.block.len()))
+    }
+
+    /// The body is longer than its length said, and the open chunk holds
+    /// all its reservation covers: seal it with what it has (the block being
+    /// filled too); the next chunk reserves a whole chunk. Never waits for
+    /// more budget while holding some, so no deadlock.
+    async fn past_reservation(&mut self) -> Result<()> {
+        if !self.block.is_empty() {
+            self.push_block().await?;
+        }
+        if !self.open.blocks.is_empty() {
+            self.seal().await?;
+        }
         Ok(())
     }
 
@@ -1443,6 +1503,37 @@ mod tests {
             assert_eq!(seen.load(Ordering::SeqCst), held, "hint {hint:?}");
             assert_eq!(budget.available_permits(), budget.capacity());
         }
+    }
+
+    /// A body longer than its length said reserves a whole chunk once past
+    /// it (it used to go on under a 1-byte reservation), and its chunks
+    /// stay within what they reserved.
+    #[tokio::test]
+    async fn a_body_past_its_hint_reserves_what_it_holds() {
+        const KIB: usize = 1024;
+        let budget = ByteBudget::new(4 * 1024 * KIB);
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let mut opts = IngestOptions::new(1024 * KIB, ChunkCodec::Zstd);
+        opts.block_size = 64 * KIB;
+        opts.memory_budget = Some(budget.clone());
+        opts.size_hint = Some(100 * KIB as u64);
+        let layer = ChunkStore::open(db, MemoryBlobStore::new(), opts.clone()).await.unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let data = noise(3 * 1024 * KIB);
+        let body = {
+            let (budget, seen) = (budget.clone(), seen.clone());
+            stream::iter(data.chunks(50 * KIB).map(Bytes::copy_from_slice)).map(move |p| {
+                seen.fetch_max(budget.capacity() - budget.available_permits(), Ordering::SeqCst);
+                Ok::<_, anyhow::Error>(p)
+            })
+        };
+        let ingested = layer.ingest_and_commit(body, Some(opts)).await.unwrap();
+        assert!(seen.load(Ordering::SeqCst) >= 1024 * KIB, "a whole chunk reserved past the hint");
+        assert_eq!(layer.read(&ingested.extents, None).await.unwrap(), data);
+        assert_eq!(budget.available_permits(), budget.capacity());
     }
 
     #[tokio::test]

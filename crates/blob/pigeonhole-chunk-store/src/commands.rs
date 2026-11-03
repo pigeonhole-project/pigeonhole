@@ -29,7 +29,6 @@ pub enum ChunkCommand {
     CommitChunk {
         chunk_id: ChunkId,
         logical_size: i64,
-        crc32: u32,
         blocks: Vec<StoredBlock>,
         replicas: Vec<Replica>,
         /// The instances of the shard it was written to (each replica is on
@@ -105,7 +104,6 @@ pub struct PartRec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChunkRec {
     pub logical_size: i64,
-    pub crc32: u32,
     pub refs: i64,
     /// Parts are being deleted; `retain` fails, the sweeper finishes the job.
     pub reclaiming: bool,
@@ -146,7 +144,7 @@ type Applied = std::result::Result<(), ChunkReject>;
 
 impl StateMachine for ChunkState {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 6;
+    const VERSION: u32 = 7;
     type Command = ChunkCommand;
     type Reply = ();
     type Reject = ChunkReject;
@@ -154,10 +152,9 @@ impl StateMachine for ChunkState {
     fn apply(&mut self, command: ChunkCommand) -> Result<Outcome<Self>> {
         Ok(match command {
             ChunkCommand::SyncInstances { instances } => self.sync_instances(instances),
-            ChunkCommand::CommitChunk { chunk_id, logical_size, crc32, blocks, replicas, shard, created_at } => {
+            ChunkCommand::CommitChunk { chunk_id, logical_size, blocks, replicas, shard, created_at } => {
                 let rec = ChunkRec {
                     logical_size,
-                    crc32,
                     refs: 1,
                     reclaiming: false,
                     created_at,
@@ -433,7 +430,7 @@ mod tests {
     fn command_encoding_is_pinned() {
         let cmd = ChunkCommand::Release { chunk_ids: vec![1, 2] };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 2, 2, 4]);
-        assert_eq!(ChunkState::VERSION, 6);
+        assert_eq!(ChunkState::VERSION, 7);
     }
 
     fn instance() -> InstanceRec {
@@ -458,15 +455,7 @@ mod tests {
 
     fn commit(chunk_id: ChunkId, replicas: Vec<Replica>) -> ChunkCommand {
         let shard = replicas.iter().map(|r| r.instance.clone()).collect();
-        ChunkCommand::CommitChunk {
-            chunk_id,
-            logical_size: 1,
-            crc32: 0,
-            blocks: vec![],
-            replicas,
-            shard,
-            created_at: "t".into(),
-        }
+        ChunkCommand::CommitChunk { chunk_id, logical_size: 1, blocks: vec![], replicas, shard, created_at: "t".into() }
     }
 
     /// `command` gets `reject`, from `check` and from `apply`, and the state

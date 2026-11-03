@@ -134,7 +134,10 @@ impl Repairer {
 
     /// Single pass: optional scrub, then up to `batch_size` jobs, copied
     /// `concurrency` at a time; the copies made are committed in one entry.
+    /// One pass at a time per tablet: a pass asked for while another runs
+    /// (any repairer's) waits for it, so no job is copied twice at once.
     pub async fn repair_once(&self) -> Result<RepairStats> {
+        let _pass = self.db.repair_pass().await;
         let mut stats = RepairStats::default();
         if self.config.scrub {
             stats.scrub_enqueued = self.scrub_enqueue().await?;

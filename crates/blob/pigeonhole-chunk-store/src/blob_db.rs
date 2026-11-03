@@ -78,6 +78,13 @@ pub struct StoredBlock {
     pub crc32: u32,
 }
 
+/// A chunk's size and refs ([`BlobDb::chunk_meta`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkMeta {
+    pub logical_size: i64,
+    pub refs: i64,
+}
+
 /// What [`BlobDb::stats`] counts.
 #[derive(Debug, Default, Clone)]
 pub struct ChunkStats {
@@ -159,6 +166,17 @@ pub struct BlobDb {
     /// Next chunk id to hand out; ids are chosen by the proposer (see commands.rs).
     next_chunk_id: Arc<AtomicI64>,
     local: Arc<Mutex<NodeLocal>>,
+    /// One sweep pass at a time, one repair pass at a time, whoever runs
+    /// it (the background loop, the admin, a purge): every clone of this
+    /// view shares them.
+    passes: Arc<Passes>,
+}
+
+/// Held while a pass runs.
+#[derive(Default)]
+struct Passes {
+    sweep: tokio::sync::Mutex<()>,
+    repair: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for BlobDb {
@@ -184,6 +202,7 @@ impl BlobDb {
             read_pins: Arc::default(),
             next_chunk_id: Arc::new(AtomicI64::new(last + 1)),
             local: Arc::default(),
+            passes: Arc::default(),
         })
     }
 
@@ -217,6 +236,16 @@ impl BlobDb {
 
     fn chunk<R>(&self, chunk_id: ChunkId, f: impl FnOnce(&ChunkRec) -> R) -> Option<R> {
         self.read(|s| s.chunks.get(&chunk_id).map(f))
+    }
+
+    /// Held for a sweep pass: another one waits.
+    pub(crate) async fn sweep_pass(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.passes.sweep.lock().await
+    }
+
+    /// Held for a repair pass: another one waits.
+    pub(crate) async fn repair_pass(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.passes.repair.lock().await
     }
 
     /// Prove the tablet still holds its generation (a log round trip); call
@@ -291,20 +320,19 @@ impl BlobDb {
 
     /// Chunk with refs = 1 and no blocks or parts (tests).
     #[cfg(test)]
-    pub(crate) async fn insert_chunk(&self, logical_size: i64, crc32: u32) -> Result<ChunkId> {
-        self.commit_chunk(logical_size, crc32, &[], &[]).await
+    pub(crate) async fn insert_chunk(&self, logical_size: i64) -> Result<ChunkId> {
+        self.commit_chunk(logical_size, &[], &[]).await
     }
 
     /// Atomically record chunk + blocks + parts after a successful quorum write.
     pub async fn commit_chunk(
         &self,
         logical_size: i64,
-        crc32: u32,
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
     ) -> Result<ChunkId> {
         let shard: Vec<String> = replicas.iter().map(|r| r.instance.clone()).collect();
-        let (chunk_id, prepared) = self.prepare_commit(logical_size, crc32, blocks, replicas, &shard)?;
+        let (chunk_id, prepared) = self.prepare_commit(logical_size, blocks, replicas, &shard)?;
         let mut proposal = Proposal::new();
         let slot = proposal.push(prepared);
         match self.meta.propose_all(proposal).await?.take(slot)? {
@@ -339,7 +367,6 @@ impl BlobDb {
     pub fn prepare_commit(
         &self,
         logical_size: i64,
-        crc32: u32,
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
         shard: &[String],
@@ -349,7 +376,6 @@ impl BlobDb {
         let command = ChunkCommand::CommitChunk {
             chunk_id,
             logical_size,
-            crc32,
             blocks: blocks.to_vec(),
             replicas: replicas.iter().map(Replica::from).collect(),
             shard: shard.to_vec(),
@@ -394,9 +420,9 @@ impl BlobDb {
         }
     }
 
-    /// `(logical_size, crc32, refs)`.
-    pub async fn chunk_meta(&self, chunk_id: i64) -> Result<Option<(i64, u32, i64)>> {
-        Ok(self.chunk(chunk_id, |c| (c.logical_size, c.crc32, c.refs)))
+    /// The chunk's size and refs; `None` for a missing chunk.
+    pub async fn chunk_meta(&self, chunk_id: i64) -> Result<Option<ChunkMeta>> {
+        Ok(self.chunk(chunk_id, |c| ChunkMeta { logical_size: c.logical_size, refs: c.refs }))
     }
 
     pub async fn chunk_block_count(&self, chunk_id: i64) -> Result<Option<i64>> {
@@ -758,7 +784,7 @@ mod tests {
         let fps = db.list_instance_fingerprints().await.unwrap();
         assert_eq!(fps, vec![("tg-main".into(), "tg:1:-100".into())]);
 
-        let chunk_id = db.insert_chunk(32, 0xdeadbeef).await.unwrap();
+        let chunk_id = db.insert_chunk(32).await.unwrap();
         let layouts = vec![ReplicaLayout {
             instance: "tg-main".into(),
             parts: vec![PartLayout {
@@ -770,11 +796,11 @@ mod tests {
             }],
         }];
         // Direct part insert via commit of empty blocks + one part.
-        let id2 = db.commit_chunk(32, 1, &[], &layouts).await.unwrap();
+        let id2 = db.commit_chunk(32, &[], &layouts).await.unwrap();
         let _ = chunk_id;
         db.retain(&[id2]).await.unwrap();
         db.release(&[id2]).await.unwrap();
-        assert_eq!(db.chunk_meta(id2).await.unwrap().unwrap().2, 1);
+        assert_eq!(db.chunk_meta(id2).await.unwrap().unwrap().refs, 1);
     }
 
     #[tokio::test]
@@ -810,7 +836,6 @@ mod tests {
         let id = db
             .commit_chunk(
                 8,
-                1,
                 &[],
                 &[ReplicaLayout {
                     instance: "mem".into(),
@@ -833,7 +858,6 @@ mod tests {
         let id2 = db
             .commit_chunk(
                 4,
-                2,
                 &[],
                 &[ReplicaLayout {
                     instance: "mem".into(),
@@ -851,7 +875,7 @@ mod tests {
         let err = db.retain(&[id2, id]).await.unwrap_err();
         assert!(is_chunk_gone(&err), "{err}");
         let meta = db.chunk_meta(id2).await.unwrap().unwrap();
-        assert_eq!(meta.2, 1, "id2 refs must be unchanged after rolled-back retain");
+        assert_eq!(meta.refs, 1, "id2 refs must be unchanged after rolled-back retain");
     }
 
     #[tokio::test]
@@ -861,8 +885,8 @@ mod tests {
         // Two views opened at once: one is this node, the other stands for
         // a leader before it whose commits reach it by replication.
         let (this, before) = (BlobDb::open(meta.clone()).await.unwrap(), BlobDb::open(meta).await.unwrap());
-        let first = before.insert_chunk(8, 1).await.unwrap();
-        let next = this.insert_chunk(8, 1).await.unwrap();
+        let first = before.insert_chunk(8).await.unwrap();
+        let next = this.insert_chunk(8).await.unwrap();
         assert!(next > first, "{next} after {first}");
     }
 
@@ -885,7 +909,6 @@ mod tests {
             async move {
                 db.commit_chunk(
                     8,
-                    1,
                     &[],
                     &[ReplicaLayout {
                         instance: "mem".into(),
@@ -918,7 +941,7 @@ mod tests {
         let replayed = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
             .await
             .unwrap();
-        let after = replayed.insert_chunk(8, 1).await.unwrap();
+        let after = replayed.insert_chunk(8).await.unwrap();
         assert!(after > new, "chunk id {new} reused as {after} after replay");
     }
 
@@ -946,7 +969,7 @@ mod tests {
                 block_stored_lens: vec![],
             };
             let replica = ReplicaLayout { instance: "mem".into(), parts: vec![part] };
-            db.commit_chunk(1, 1, &[], &[replica]).await.unwrap();
+            db.commit_chunk(1, &[], &[replica]).await.unwrap();
         }
         let (bytes, index) = db.read(|s| (pigeonhole_meta::encode_state(s), s.by_key.clone()));
         let decoded = pigeonhole_meta::decode_state::<ChunkState>(&bytes).unwrap();
@@ -963,7 +986,7 @@ mod tests {
         let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
             .await
             .unwrap();
-        let (bad, good) = (db.insert_chunk(1, 0).await.unwrap(), db.insert_chunk(1, 0).await.unwrap());
+        let (bad, good) = (db.insert_chunk(1).await.unwrap(), db.insert_chunk(1).await.unwrap());
         db.enqueue_repair(bad, "b").await.unwrap();
         db.enqueue_repair(good, "b").await.unwrap();
         assert_eq!(db.take_repair_jobs(1).await.unwrap(), vec![(bad, "b".to_string())], "oldest first");
@@ -1012,7 +1035,6 @@ mod tests {
         db.sync_instances(&[info]).await.unwrap();
         let id = db
             .commit_chunk(
-                1,
                 1,
                 &[],
                 &[ReplicaLayout {

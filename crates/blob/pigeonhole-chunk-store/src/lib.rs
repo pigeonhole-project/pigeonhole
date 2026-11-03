@@ -10,8 +10,8 @@ pub mod repair;
 pub mod sweep;
 
 pub use blob_db::{
-    is_chunk_gone, unique_chunk_ids, BlobDb, ChunkGone, ChunkStats, ReadPin, StoredBlock, Unrepairable, REPAIR_BACKOFF,
-    REPAIR_BACKOFF_MAX, REPAIR_MAX_ATTEMPTS,
+    is_chunk_gone, unique_chunk_ids, BlobDb, ChunkGone, ChunkMeta, ChunkStats, ReadPin, StoredBlock, Unrepairable,
+    REPAIR_BACKOFF, REPAIR_BACKOFF_MAX, REPAIR_MAX_ATTEMPTS,
 };
 pub use block_cache::BlockCache;
 pub use commands::{ChunkCommand, ChunkReject, ChunkState, InstanceRec, PartRec, Replica};

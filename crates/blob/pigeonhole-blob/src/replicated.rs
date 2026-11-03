@@ -110,11 +110,6 @@ impl CheapestFirst {
         self.rng.store(x, Ordering::Relaxed);
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
-
-    fn is_unhealthy(&self, instance: &str) -> bool {
-        let g = self.inner.lock().unwrap();
-        matches!(g.unhealthy.get(instance), Some(u) if u.open_until > Self::tick())
-    }
 }
 
 impl Default for CheapestFirst {
@@ -124,30 +119,29 @@ impl Default for CheapestFirst {
 }
 
 impl ReplicaSelector for CheapestFirst {
+    /// Healthy first, then cheapest; scores within `close_epsilon` of each
+    /// other (one bucket) in random order, to spread reads. Keys are
+    /// computed once per replica, so the order is total.
     fn rank(&self, replicas: &[ReplicaLayout], costs: &[CostHint]) -> Vec<usize> {
         debug_assert_eq!(replicas.len(), costs.len());
-        let mut idxs: Vec<usize> = (0..replicas.len()).collect();
-        let eps = self.close_epsilon;
-        idxs.sort_by(|&a, &b| {
-            let ua = self.is_unhealthy(&replicas[a].instance);
-            let ub = self.is_unhealthy(&replicas[b].instance);
-            match (ua, ub) {
-                (true, false) => std::cmp::Ordering::Greater,
-                (false, true) => std::cmp::Ordering::Less,
-                _ => {
-                    let sa = costs[a].wait_secs;
-                    let sb = costs[b].wait_secs;
-                    if (sa - sb).abs() <= eps {
-                        let ra = self.next_rand();
-                        let rb = self.next_rand();
-                        ra.cmp(&rb)
-                    } else {
-                        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-                    }
-                }
-            }
-        });
-        idxs
+        let unhealthy: Vec<bool> = {
+            let now = Self::tick();
+            let g = self.inner.lock().unwrap();
+            replicas.iter().map(|r| g.unhealthy.get(&r.instance).is_some_and(|u| u.open_until > now)).collect()
+        };
+        // Drawn last replica first: two close replicas then come in the
+        // order the comparison sort gave them (the demo's smoke test reads
+        // a wiped copy first by that draw).
+        let mut keyed: Vec<(bool, i64, u64, usize)> = (0..replicas.len())
+            .rev()
+            .map(|i| {
+                let score = costs[i].wait_secs;
+                let bucket = if score.is_finite() { (score / self.close_epsilon).floor() as i64 } else { i64::MAX };
+                (unhealthy[i], bucket, self.next_rand(), i)
+            })
+            .collect();
+        keyed.sort_unstable();
+        keyed.into_iter().map(|(.., i)| i).collect()
     }
 
     fn record_success(&self, instance: &str) {
@@ -1003,5 +997,22 @@ mod tests {
         w.push(block(1, 100)).await.unwrap();
         let err = w.finish().await.unwrap_err();
         assert!(err.to_string().contains("write quorum"), "{err}");
+    }
+
+    #[test]
+    fn rank_puts_healthy_and_cheap_first_and_shuffles_close_ones() {
+        let layout = |id: &str| ReplicaLayout { instance: id.into(), parts: vec![] };
+        let cost = |wait_secs: f64| CostHint { wait_secs };
+        let sel = CheapestFirst::new();
+        let replicas = [layout("slow"), layout("a"), layout("b"), layout("down")];
+        let costs = [cost(10.0), cost(0.0), cost(0.01), cost(0.0)];
+        sel.record_failure("down", Failure::Unavailable);
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let order = sel.rank(&replicas, &costs);
+            assert_eq!(&order[2..], &[0, 3], "the slow one, then the one down");
+            firsts.insert(order[0]);
+        }
+        assert_eq!(firsts.len(), 2, "a and b, close, take turns");
     }
 }

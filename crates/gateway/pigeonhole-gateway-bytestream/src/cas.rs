@@ -228,7 +228,7 @@ mod tests {
         let entry = cas.cas.get(&hash, size).await.unwrap().unwrap();
         assert!(!entry.extents.is_empty());
         let meta = cas.store.db().chunk_meta(entry.extents[0].chunk).await.unwrap().unwrap();
-        assert_eq!(meta.2, 1, "duplicate write must not add a ref");
+        assert_eq!(meta.refs, 1, "duplicate write must not add a ref");
     }
 
     fn digest(data: &[u8]) -> (String, i64) {
@@ -253,7 +253,7 @@ mod tests {
         assert!(is_digest_mismatch(&err), "{err:#}");
         assert_eq!(cas.cas.get(&hash, size).await.unwrap().unwrap().extents, entry.extents);
         assert_eq!(cas.get_bytes(&hash, size).await.unwrap().unwrap(), good);
-        let refs = cas.store.db().chunk_meta(entry.extents[0].chunk).await.unwrap().unwrap().2;
+        let refs = cas.store.db().chunk_meta(entry.extents[0].chunk).await.unwrap().unwrap().refs;
         assert_eq!(refs, 1);
     }
 
