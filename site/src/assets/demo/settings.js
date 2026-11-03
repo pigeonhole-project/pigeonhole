@@ -5,9 +5,12 @@
 // knobs, once the town is drawn again: the panel does that).
 //
 // A knob: {key, group, def: its default, min, max, step, unit?: "ms" |
-// "ms/px", redraw?: the town drawn again, timer?: a page timer restarted}.
+// "ms/px", bool?: on (1) or off (0), redraw?: the town drawn again, timer?:
+// a page timer restarted}.
 // Its label and note are i18n's "set.<key>" and "set.<key>_note".
 export const KNOBS = [
+  {key: "holdMax", group: "time", def: 1500, min: 0, max: 10000, step: 100, unit: "ms"},
+  {key: "holdSparks", group: "time", def: 0, min: 0, max: 1, step: 1, bool: true},
   {key: "spacing", group: "pigeons", def: 70, min: 0, max: 1000, step: 10, unit: "ms"},
   {key: "flightMin", group: "pigeons", def: 450, min: 50, max: 5000, step: 50, unit: "ms"},
   {key: "flightMax", group: "pigeons", def: 1400, min: 50, max: 10000, step: 50, unit: "ms"},
@@ -22,7 +25,7 @@ export const KNOBS = [
   {key: "pollMs", group: "page", def: 1000, min: 200, max: 10000, step: 100, unit: "ms", timer: true},
   {key: "clockMs", group: "page", def: 100, min: 20, max: 2000, step: 10, unit: "ms", timer: true},
 ];
-export const GROUPS = ["pigeons", "town", "page"];
+export const GROUPS = ["time", "pigeons", "town", "page"];
 export const DEFAULTS = Object.freeze(Object.fromEntries(KNOBS.map(k => [k.key, k.def])));
 
 const STORE = "ph-demo-settings";

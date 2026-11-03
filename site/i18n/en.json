@@ -488,5 +488,10 @@
   "js.set.pollMs": "Polling the node",
   "js.set.pollMs_note": "While you do nothing, the page asks the node this often what it did on its own (background work, budgets, who leads).",
   "js.set.clockMs": "Election clocks",
-  "js.set.clockMs_note": "How often the clocks over the dovecotes are drawn."
+  "js.set.clockMs_note": "How often the clocks over the dovecotes are drawn.",
+  "js.set.group_time": "The node's time",
+  "js.set.holdMax": "Wait for the pigeons",
+  "js.set.holdMax_note": "The node's clock stands while the pigeons of what it just did fly, this long at most: its timers (heartbeats, elections, leases, rate limits) wait for the picture. 0: it never waits, the pigeons only follow.",
+  "js.set.holdSparks": "Wait for heartbeats too",
+  "js.set.holdSparks_note": "A cluster sends heartbeats all the time: waiting for every spark slows it down to the sparks' pace."
 }

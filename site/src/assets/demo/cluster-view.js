@@ -5,6 +5,7 @@
 // data: {nodes: [id], own: Map(id → that node's `cluster` op), leader: the
 //        leader's `cluster` op (lag, links, quorum) or null, cut: Set,
 //        dynamic: the leader's `dynamic` op or null, chronicle: [{at, sentence}],
+//        now: the time `at` is on (the node's clock),
 //        config, demo, admin}
 // on: {restart(text), erase()}.
 // Returns {nodes, update(data), setError(text)}.
@@ -28,7 +29,7 @@ export function clusterView(data, on) {
         .reverse()
         .map(({at, sentence: said}) => {
           const li = h("li", "");
-          li.append(h("span", "chronicle-at", t("time.ago", {s: Math.round((performance.now() - at) / 1000)})), ...sentence(said));
+          li.append(h("span", "chronicle-at", t("time.ago", {s: Math.round((d.now - at) / 1000)})), ...sentence(said));
           return li;
         }),
     );

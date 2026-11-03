@@ -148,21 +148,37 @@ function apply(events) {
     said.push(...s);
     if (e.type === "posted" && c) {
       const flights = flightsOf(e, channel, flightCtx());
-      for (const f of flights) graph.fly({...f, onLand: () => landed(c.store)});
+      for (const f of flights) fly({...f, onLand: () => landed(c.store)});
       if (!flights.length) landed(c.store);
       if (c.role === "outbox" && panelShows(c.store)) outboxChanged();
     } else if (e.type === "deleted" && c) {
       graph.setTotal(c.store);
       if (panelShows(c.store)) renderPanel();
     } else if (e.type === "call" || e.type === "call_failed") {
-      for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
+      for (const f of flightsOf(e, channel, flightCtx())) fly(f);
     } else if (e.type === "raft") {
-      for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
-      said.push(...raft.frame(e, performance.now()));
+      for (const f of flightsOf(e, channel, flightCtx())) fly(f);
+      said.push(...raft.frame(e, node.now()));
     }
   }
   return said;
 }
+
+// The node's clock stands while what it did flies (node.js onDrawn): until
+// the flights of a batch land, `settings.holdMax` ms at most (0: it never
+// stands); a heartbeat's spark is waited for only with `settings.holdSparks`.
+let flown = []; // the flights of the batch being drawn, as they will land
+function fly(f) {
+  const landed = graph.fly(f);
+  if (!f.spark || settings.holdSparks) flown.push(landed);
+  return landed;
+}
+node.onDrawn(() => {
+  const all = flown;
+  flown = [];
+  if (!all.length || !settings.holdMax) return null;
+  return Promise.race([Promise.all(all), new Promise(r => setTimeout(r, settings.holdMax))]);
+});
 
 // An open outbox's posts come from the log without the frames they hold:
 // the node opens those. Read a second after a post, one read at a time.
@@ -311,7 +327,7 @@ async function pollBackground() {
 // Each node asked for its own word (its role, its term: raft.js tells what
 // changed); the node on screen's view of the cluster kept as the page's.
 async function pollCluster() {
-  const now = performance.now(),
+  const now = node.now(),
     told = [],
     replies = new Map();
   for (const id of state.nodes) {
@@ -384,6 +400,7 @@ const clusterData = (dynamic = null) => {
     cut: state.cut,
     dynamic,
     chronicle: raft.chronicle(),
+    now: node.now(),
     config: state.config,
     demo: state.config,
     admin: state.admin,
@@ -402,7 +419,7 @@ function showNodes() {
   // openraft lets a follower stand only once the leader's lease (an
   // election's longest timeout) and then its own random timeout have both
   // gone by without a word: up to twice the longest timeout.
-  const now = performance.now(),
+  const now = node.now(),
     timeout = 2 * (state.timing?.election?.[1] ?? 0);
   graph.setNodes(new Map(state.nodes.map(id => [id, {...raft.of(id), clock: raft.clock(id, now, timeout)}])));
 }
@@ -413,7 +430,7 @@ async function isolate(id, cut) {
   if (!ok(reply)) return sayError(reply?.error);
   if (cut) state.cut.add(id);
   else state.cut.delete(id);
-  raft.cut(id, cut, performance.now());
+  raft.cut(id, cut, node.now());
   say([cut ? "nodes.cut" : "nodes.back", {n: id}]);
   renderNodes();
   await refreshChannels(); // its outbox up or down

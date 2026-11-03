@@ -8,12 +8,14 @@
 // in the demo; the demo's worker adds its own (crates/web, web.rs): `open`,
 // `restart` (a config, or the one kept: every node boots on it), `close`
 // (the page is going: the node closes, the worker ends), `isolate` (a node
-// of the cluster cut off); `reset` is the worker's alone (web-worker.js:
-// its files go, no node behind it). A request may name the `node` of a
+// of the cluster cut off); `reset` and `go` are the worker's alone
+// (web-worker.js: its files go, no node behind it; the page drew a batch of
+// the node's events, its clock may go on). A request may name the `node` of a
 // cluster it goes to; none: the leader.
 
 const OP_CLOSE = "close";
 export const OP_RESET = "reset";
+export const OP_GO = "go";
 
 // Each op the page sends, as a request (a body, if any, goes beside it).
 export const ops = {
@@ -22,6 +24,7 @@ export const ops = {
   restart: config => ({op: "restart", config}),
   close: () => ({op: OP_CLOSE}),
   reset: () => ({op: OP_RESET}),
+  go: seq => ({op: OP_GO, seq}),
   isolate: (node, down) => ({op: "isolate", node, down}),
   // S3 (the body: the object's bytes).
   put: (bucket, key) => ({op: "put", bucket, key}),
@@ -50,13 +53,14 @@ export const ops = {
 };
 
 // The worker's messages to the page (web-worker.js → demo/node.js); the
-// page sends {id, ...request, body?}.
+// page sends {id, ...request, body?}. A batch of events (`events`, `tick`)
+// carries a `seq`: the node's clock stands until the page sends `go` for it.
 export const MSG = {
   waiting: "waiting", // the page just left still holds the files
   started: "started", // the module is up: {reply: {config, demo, saved, persistent, why} | {error}, events}
-  events: "events", // what the node logged during call `id`, as it went: {id, events}
+  events: "events", // what the node logged during call `id`, as it went: {id, events, seq}
   reply: "reply", // call `id` answered: {id, reply, events: [], ms}
-  tick: "tick", // what the node logged on its own between calls: {events}
+  tick: "tick", // what the node logged on its own between calls: {events, seq}
 };
 export const msg = {
   waiting: () => ({type: MSG.waiting, why: "files"}),

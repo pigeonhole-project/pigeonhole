@@ -10,8 +10,13 @@
 // The module never blocks: a call is queued (ph_call), then the node runs
 // (ph_run) until it has nothing to do but wait; the shim notes its next
 // timer (wasi.nextWake) and this worker sleeps until then, free meanwhile.
-import {deliver, frame, msg, OP_RESET, unframe} from "./lib/ops.js";
-import {MemoryHandle, Pool, Wasi} from "./wasi.js";
+//
+// The node's time is the shim's clock, held while the page draws what the
+// node did: each batch of its events goes out with a `seq`, and the clock
+// stands until the page has sent `go` for every batch out. Meanwhile a call
+// still runs, at that one instant; only the node's timers wait.
+import {deliver, frame, MSG, msg, OP_GO, OP_RESET, unframe} from "./lib/ops.js";
+import {Clock, MemoryHandle, Pool, Wasi} from "./wasi.js";
 
 // The assets' version (?v=…), the same for the wasm as for this script.
 const V = new URL(import.meta.url).search;
@@ -40,6 +45,10 @@ let wasi,
   why = "";
 // The module's call number → the page's {id, t0}.
 const calls = new Map();
+const clock = new Clock();
+// The batches of events the page has not drawn yet (their seq).
+const drawing = new Set();
+let seq = 0;
 
 async function openFiles(n) {
   const open = async i => (await dir.getFileHandle(`file-${String(opened + i).padStart(5, "0")}`, {create: true})).createSyncAccessHandle();
@@ -93,10 +102,18 @@ async function openPool() {
 }
 
 // The module's output, in order (lib/ops.js deliver): to the page; the
-// worker ends once the node closed.
+// worker ends once the node closed. A batch of events holds the clock
+// until the page has drawn it.
 function post(lines) {
   const {messages, closed} = deliver(lines, calls);
-  for (const m of messages) postMessage(m);
+  for (const m of messages) {
+    if (m.type === MSG.events || m.type === MSG.tick) {
+      m.seq = ++seq;
+      drawing.add(m.seq);
+      clock.hold();
+    }
+    postMessage(m);
+  }
   if (closed) end();
 }
 
@@ -108,8 +125,24 @@ function pump() {
   wasi.setStdin(new Uint8Array(0));
   exports.ph_run();
   post(wasi.takeLines());
-  if (wasi.nextWake !== Infinity) timer = setTimeout(pump, Math.max(0, wasi.nextWake - performance.now()));
+  sleep();
   grow().catch(e => console.warn("no more files:", e));
+}
+
+// Until the node's next timer, on its clock; while held, until the page lets it go.
+function sleep() {
+  clearTimeout(timer);
+  timer = null;
+  if (clock.held || wasi.nextWake === Infinity) return;
+  timer = setTimeout(pump, Math.max(0, wasi.nextWake - clock.now()));
+}
+
+// The page drew batch `n`: once it has drawn every one out, the clock goes on.
+function drawn(n) {
+  drawing.delete(n);
+  if (drawing.size) return;
+  clock.release();
+  sleep();
 }
 
 // The page is gone and the node closed: let go of the files for the next
@@ -142,7 +175,7 @@ async function reset() {
 
 const ready = (async () => {
   pool = await openPool();
-  wasi = new Wasi({pool, preopen: "/data", env: {PH_DEMO_CLUSTER_KEY: DEMO_CLUSTER_KEY}});
+  wasi = new Wasi({pool, preopen: "/data", env: {PH_DEMO_CLUSTER_KEY: DEMO_CLUSTER_KEY}, clock});
   const instance = await WebAssembly.instantiate(await compiled, {wasi_snapshot_preview1: wasi.imports()});
   exports = instance.exports;
   wasi.memory = exports.memory;
@@ -162,6 +195,7 @@ addEventListener("message", ({data}) => {
 
 async function handle({id, body, ...request}) {
   await ready;
+  if (request.op === OP_GO) return drawn(request.seq);
   await grow().catch(e => console.warn("no more files:", e));
   if (request.op === OP_RESET) {
     clearTimeout(timer);
