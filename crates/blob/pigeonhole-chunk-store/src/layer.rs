@@ -50,8 +50,16 @@ pub struct PendingChunks {
 struct PendingChunk {
     chunk_id: ChunkId,
     commit: Prepared<ChunkState>,
-    layouts: Vec<pigeonhole_blob::ReplicaLayout>,
+    /// Members of its shard the write missed: repaired once it commits.
+    missed: Vec<String>,
     pins: Vec<pigeonhole_blob::UploadPin>,
+}
+
+impl PendingChunk {
+    fn new(chunk_id: ChunkId, commit: Prepared<ChunkState>, sealed: pigeonhole_blob::SealedChunk) -> Self {
+        let missed = sealed.shard.into_iter().filter(|i| !sealed.layouts.iter().any(|l| &l.instance == i)).collect();
+        Self { chunk_id, commit, missed, pins: sealed.pins }
+    }
 }
 
 impl std::fmt::Debug for PendingChunks {
@@ -80,7 +88,7 @@ impl PendingChunks {
         for c in self.chunks {
             slots.push(proposal.push(c.commit));
             proposal.hold(c.pins);
-            rest.push((c.chunk_id, c.layouts));
+            rest.push((c.chunk_id, c.missed));
         }
         Committing { slots, chunks: rest }
     }
@@ -90,7 +98,8 @@ impl PendingChunks {
 #[must_use = "finish with done() once the proposal is committed"]
 pub struct Committing {
     slots: Vec<Slot<ChunkState>>,
-    chunks: Vec<(ChunkId, Vec<pigeonhole_blob::ReplicaLayout>)>,
+    /// Each chunk and the members of its shard its write missed.
+    chunks: Vec<(ChunkId, Vec<String>)>,
 }
 
 impl Committing {
@@ -105,8 +114,10 @@ impl Committing {
                 bail!("chunk commit rejected: {reason:?}");
             }
         }
-        for (chunk_id, layouts) in self.chunks {
-            store.enqueue_missing_replicas(chunk_id, &layouts).await?;
+        for (chunk_id, missed) in self.chunks {
+            for instance in missed {
+                store.db.enqueue_repair(chunk_id, &instance).await?;
+            }
         }
         Ok(())
     }
@@ -308,8 +319,8 @@ impl ChunkStore {
             codec: ChunkCodec::Raw,
             crc32: crc,
         }];
-        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts)?;
-        let chunk = PendingChunk { chunk_id, commit, layouts: sealed.layouts, pins: sealed.pins };
+        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts, &sealed.shard)?;
+        let chunk = PendingChunk::new(chunk_id, commit, sealed);
         self.commit(PendingChunks { chunks: vec![chunk] }).await?;
         Ok(chunk_id)
     }
@@ -608,22 +619,6 @@ impl ChunkStore {
         }))
     }
 
-    /// After a quorum write, enqueue backfill for the members of the
-    /// chunk's shard that missed it (the other shards never get a copy).
-    async fn enqueue_missing_replicas(&self, chunk_id: ChunkId, layouts: &[ReplicaLayout]) -> Result<()> {
-        let Some(peers) = layouts.first().and_then(|l| self.replicated.shard_peers(&l.instance)) else {
-            return Ok(());
-        };
-        let have: std::collections::HashSet<&str> = layouts.iter().map(|l| l.instance.as_str()).collect();
-        for m in peers {
-            let id = m.instance().id.as_str();
-            if !have.contains(id) {
-                self.db.enqueue_repair(chunk_id, id).await?;
-            }
-        }
-        Ok(())
-    }
-
     async fn ingest_blocks<S>(&self, stream: &mut S, opts: IngestOptions) -> Result<Ingested>
     where
         S: futures::Stream<Item = Result<Bytes, anyhow::Error>> + Unpin,
@@ -735,7 +730,7 @@ impl ChunkStore {
         let crc = h.finalize();
         // Committed by the caller, with whatever points at it; the uploads
         // stay pinned until then.
-        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts)?;
+        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts, &sealed.shard)?;
         // A chunk that fails to commit is never asked for here; another
         // leader may commit its id, so a leader clears the caches when it
         // takes over.
@@ -744,7 +739,7 @@ impl ChunkStore {
                 l2.insert(chunk_id, block_no as u32, data).await;
             }
         }
-        pending.chunks.push(PendingChunk { chunk_id, commit, layouts: sealed.layouts, pins: sealed.pins });
+        pending.chunks.push(PendingChunk::new(chunk_id, commit, sealed));
         Ok(Extent { chunk: chunk_id, offset: 0, len: logical })
     }
 }

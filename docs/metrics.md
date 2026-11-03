@@ -95,6 +95,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_ingest_budget_wait_seconds` | histogram |  | Time PUTs wait for the ingest memory budget (waits > 0 only) |
 | `pigeonhole_background_pass_seconds` | histogram | `task`, `outcome` | Duration of a sweep / repair pass |
 | `pigeonhole_sweep_keys_total` | counter | `outcome` | Sweeper outcomes: deleted keys, live keys skipped, zero-ref chunks reclaimed |
+| `pigeonhole_sweep_retired_left` | gauge |  | Reclaimed chunks kept because parts of theirs are on stores no longer configured |
 | `pigeonhole_repair_jobs_total` | counter | `outcome` | Repair job outcomes: repaired, scrub_enqueued, skipped_budget, skipped_noop, failed, parked (given up on) |
 | `pigeonhole_repair_queue_depth` | gauge |  | Pending repair jobs |
 | `pigeonhole_repair_unrepairable` | gauge |  | Repair jobs parked as unrepairable: they failed too often |

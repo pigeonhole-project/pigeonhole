@@ -191,6 +191,9 @@ pub struct Replicated {
 #[derive(Debug)]
 pub struct SealedChunk {
     pub layouts: Vec<ReplicaLayout>,
+    /// The members of the shard it was written to (a replica on each but
+    /// those that missed the write).
+    pub shard: Vec<InstanceId>,
     /// Drop only after `commit_chunk` is applied (or on failure → orphans).
     pub pins: Vec<UploadPin>,
 }
@@ -486,6 +489,7 @@ impl ChunkReplicaWriter {
             }
         }
 
+        let shard = self.writers.iter().map(|w| w.instance.clone()).collect();
         let mut ok = Vec::new();
         for w in self.writers {
             if !w.failed {
@@ -497,7 +501,7 @@ impl ChunkReplicaWriter {
             // Dropping the pins makes the parts sweep orphans.
             bail!("write quorum not met: {} successful replicas, need {}", ok.len(), self.write_quorum);
         }
-        Ok(SealedChunk { layouts: ok, pins: self.pins })
+        Ok(SealedChunk { layouts: ok, shard, pins: self.pins })
     }
 }
 

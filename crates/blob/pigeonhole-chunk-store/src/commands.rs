@@ -32,6 +32,9 @@ pub enum ChunkCommand {
         crc32: u32,
         blocks: Vec<StoredBlock>,
         replicas: Vec<Replica>,
+        /// The instances of the shard it was written to (each replica is on
+        /// one of them).
+        shard: Vec<String>,
         created_at: String,
     },
     /// All-or-nothing refs + 1.
@@ -42,7 +45,8 @@ pub enum ChunkCommand {
     BeginReclaim { chunk_id: ChunkId },
     /// Forget a reclaiming chunk after its backend parts are deleted.
     DropChunk { chunk_id: ChunkId },
-    /// Replace one instance's replica of a chunk (repair / backfill).
+    /// Replace one instance's replica of a chunk (repair / backfill); the
+    /// instance joins the chunk's shard.
     AddReplica { chunk_id: ChunkId, replica: Replica },
     /// The deployment's [`Owner`], chosen by the first proposer; kept once set.
     SetOwner { owner: Owner },
@@ -110,6 +114,10 @@ pub(crate) struct ChunkRec {
     pub blocks: Vec<StoredBlock>,
     /// Instance id → parts in order.
     pub replicas: BTreeMap<String, Vec<PartRec>>,
+    /// Where it belongs: the instances of the shard it was written to, and
+    /// those it was copied to since (sorted). Repair copies it among these
+    /// and the members of their shard, never into another shard.
+    pub shard: Vec<String>,
 }
 
 impl ChunkRec {
@@ -138,7 +146,7 @@ type Applied = std::result::Result<(), ChunkReject>;
 
 impl StateMachine for ChunkState {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 5;
+    const VERSION: u32 = 6;
     type Command = ChunkCommand;
     type Reply = ();
     type Reject = ChunkReject;
@@ -146,8 +154,18 @@ impl StateMachine for ChunkState {
     fn apply(&mut self, command: ChunkCommand) -> Result<Outcome<Self>> {
         Ok(match command {
             ChunkCommand::SyncInstances { instances } => self.sync_instances(instances),
-            ChunkCommand::CommitChunk { chunk_id, logical_size, crc32, blocks, replicas, created_at } => {
-                self.commit_chunk(chunk_id, logical_size, crc32, blocks, replicas, created_at)
+            ChunkCommand::CommitChunk { chunk_id, logical_size, crc32, blocks, replicas, shard, created_at } => {
+                let rec = ChunkRec {
+                    logical_size,
+                    crc32,
+                    refs: 1,
+                    reclaiming: false,
+                    created_at,
+                    blocks,
+                    replicas: BTreeMap::new(),
+                    shard,
+                };
+                self.commit_chunk(chunk_id, rec, replicas)
             }
             ChunkCommand::Retain { chunk_ids } => self.retain(&chunk_ids),
             ChunkCommand::Release { chunk_ids } => self.release(&chunk_ids),
@@ -168,7 +186,9 @@ impl StateMachine for ChunkState {
     /// the object that would point at it is not written either.
     fn check(&self, command: &ChunkCommand) -> Option<ChunkReject> {
         match command {
-            ChunkCommand::CommitChunk { chunk_id, replicas, .. } => self.check_commit(*chunk_id, replicas).err(),
+            ChunkCommand::CommitChunk { chunk_id, replicas, shard, .. } => {
+                self.check_commit(*chunk_id, replicas, shard).err()
+            }
             _ => None,
         }
     }
@@ -231,15 +251,19 @@ impl ChunkState {
     }
 
     /// A new chunk: an id never committed, at most one replica per instance,
-    /// each one valid.
-    fn check_commit(&self, chunk_id: ChunkId, replicas: &[Replica]) -> Applied {
+    /// each one valid and in the chunk's shard.
+    fn check_commit(&self, chunk_id: ChunkId, replicas: &[Replica], shard: &[String]) -> Applied {
         if self.chunks.contains_key(&chunk_id) {
             return Err(ChunkReject::ChunkExists(chunk_id));
         }
         let mut instances = HashSet::new();
         for rep in replicas {
+            let bad = |why: String| Err(ChunkReject::BadReplica { chunk_id, why });
             if !instances.insert(rep.instance.as_str()) {
-                return Err(ChunkReject::BadReplica { chunk_id, why: format!("two replicas on {}", rep.instance) });
+                return bad(format!("two replicas on {}", rep.instance));
+            }
+            if !shard.contains(&rep.instance) {
+                return bad(format!("replica on {}, outside the chunk's shard", rep.instance));
             }
             self.check_replica(chunk_id, rep)?;
         }
@@ -251,6 +275,9 @@ impl ChunkState {
             self.by_key.insert((rep.instance.clone(), p.sort_key.clone()), chunk_id);
         }
         let chunk = self.chunks.get_mut(&chunk_id).expect("caller checked the chunk");
+        if let Err(at) = chunk.shard.binary_search(&rep.instance) {
+            chunk.shard.insert(at, rep.instance.clone());
+        }
         chunk.replicas.insert(rep.instance, rep.parts);
     }
 
@@ -262,19 +289,11 @@ impl ChunkState {
         Some(Replica { instance: instance.to_string(), parts })
     }
 
-    fn commit_chunk(
-        &mut self,
-        chunk_id: ChunkId,
-        logical_size: i64,
-        crc32: u32,
-        mut blocks: Vec<StoredBlock>,
-        replicas: Vec<Replica>,
-        created_at: String,
-    ) -> Applied {
-        self.check_commit(chunk_id, &replicas)?;
-        blocks.sort_by_key(|b| b.block_no);
-        let rec =
-            ChunkRec { logical_size, crc32, refs: 1, reclaiming: false, created_at, blocks, replicas: BTreeMap::new() };
+    fn commit_chunk(&mut self, chunk_id: ChunkId, mut rec: ChunkRec, replicas: Vec<Replica>) -> Applied {
+        self.check_commit(chunk_id, &replicas, &rec.shard)?;
+        rec.blocks.sort_by_key(|b| b.block_no);
+        rec.shard.sort();
+        rec.shard.dedup();
         self.chunks.insert(chunk_id, rec);
         self.last_chunk_id = self.last_chunk_id.max(chunk_id);
         for rep in replicas {
@@ -414,7 +433,7 @@ mod tests {
     fn command_encoding_is_pinned() {
         let cmd = ChunkCommand::Release { chunk_ids: vec![1, 2] };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 2, 2, 4]);
-        assert_eq!(ChunkState::VERSION, 5);
+        assert_eq!(ChunkState::VERSION, 6);
     }
 
     fn instance() -> InstanceRec {
@@ -438,12 +457,14 @@ mod tests {
     }
 
     fn commit(chunk_id: ChunkId, replicas: Vec<Replica>) -> ChunkCommand {
+        let shard = replicas.iter().map(|r| r.instance.clone()).collect();
         ChunkCommand::CommitChunk {
             chunk_id,
             logical_size: 1,
             crc32: 0,
             blocks: vec![],
             replicas,
+            shard,
             created_at: "t".into(),
         }
     }
@@ -475,6 +496,11 @@ mod tests {
         rejected(&mut s, commit(8, vec![replica("b", 2)]), why("unknown instance b"));
         rejected(&mut s, commit(8, vec![replica("a", 2), replica("a", 3)]), why("two replicas on a"));
         rejected(&mut s, commit(8, vec![replica("a", 1)]), why("key 01 on a belongs to chunk 7"));
+        let mut outside = commit(8, vec![replica("a", 2)]);
+        if let ChunkCommand::CommitChunk { shard, .. } = &mut outside {
+            *shard = vec!["c".into()];
+        }
+        rejected(&mut s, outside, why("replica on a, outside the chunk's shard"));
         let mut twice = replica("a", 2);
         twice.parts.push(twice.parts[0].clone());
         rejected(&mut s, commit(8, vec![twice]), why("duplicate sort_key on instance a"));

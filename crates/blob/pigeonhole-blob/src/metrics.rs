@@ -46,6 +46,7 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::histogram("pigeonhole_ingest_budget_wait_seconds", &[], "Time PUTs wait for the ingest memory budget (waits > 0 only)"),
     MetricDoc::histogram("pigeonhole_background_pass_seconds", &["task", "outcome"], "Duration of a sweep / repair pass"),
     MetricDoc::counter("pigeonhole_sweep_keys_total", &["outcome"], "Sweeper outcomes: deleted keys, live keys skipped, zero-ref chunks reclaimed"),
+    MetricDoc::gauge("pigeonhole_sweep_retired_left", &[], "Reclaimed chunks kept because parts of theirs are on stores no longer configured"),
     MetricDoc::counter("pigeonhole_repair_jobs_total", &["outcome"], "Repair job outcomes: repaired, scrub_enqueued, skipped_budget, skipped_noop, failed, parked (given up on)"),
     MetricDoc::gauge("pigeonhole_repair_queue_depth", &[], "Pending repair jobs"),
     MetricDoc::gauge("pigeonhole_repair_unrepairable", &[], "Repair jobs parked as unrepairable: they failed too often"),
@@ -227,6 +228,10 @@ pub fn record_repair(outcome: &str, n: u64) {
         "outcome" => outcome.to_owned()
     )
     .increment(n);
+}
+
+pub fn set_sweep_retired_left(n: u64) {
+    metrics::gauge!("pigeonhole_sweep_retired_left").set(n as f64);
 }
 
 pub fn set_repair_queue_depth(n: u64) {

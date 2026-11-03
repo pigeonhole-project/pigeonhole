@@ -115,8 +115,17 @@ gone
   `BeginReclaim` fails with `ChunkGone`. The S3 GET then looks the key up again
   (the object was overwritten or deleted) — up to `GET_ATTEMPTS` times.
 - Chunks left `reclaiming` after a crash or a deferral are finished on the next pass.
+- **Retired instances.** A reclaimed chunk with parts on an instance no
+  longer in the placement (taken out of the config) keeps its metadata,
+  `reclaiming`: the parts it can reach go, the others stay named in it.
+  Dropping it would leave those blobs to nobody; the orphan sweep never
+  lists a store that is not configured. Each pass counts such chunks
+  (`SweepStats::retired_left`, gauge `pigeonhole_sweep_retired_left`, a
+  warning); put the store back in the config and the next pass finishes
+  them.
 
 ## Metrics
 
+- `pigeonhole_sweep_retired_left` — reclaimed chunks kept for parts on a store no longer configured
 - `pigeonhole_chunk_gone_total` — failed `retain` against reclaiming/missing chunks
 - `pigeonhole_double_release_total` — `release` with `refs` already 0

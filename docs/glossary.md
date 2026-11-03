@@ -6,7 +6,7 @@ Terms used in code, comments, and docs (Stage B onward).
 |---|---|---|---|---|
 | **Store** (instance) | Where bytes live, a `[[store]]`: a dir, or bot + chat/channel (`tg-main`, `dc-backup`) | — | config | `storage-*` + config |
 | **Replica group** | `[[replicas]]`: stores that each get a copy of every chunk written to the group | — | config | `Replicated` |
-| **Shard** | One member of `[[shards]]` (a store or replica group); a chunk lives in exactly one shard | — | config | `Replicated` |
+| **Shard** | One member of `[[shards]]` (a store or replica group); a chunk lives in exactly one shard. The chunk records it (`ChunkRec::shard`: the shard's stores at its write, plus those repair copied it to): repair copies a chunk only within the placement shard that holds its recorded stores (a store that joins that shard is backfilled); a re-sharding that puts them in different shards fails the chunk's repair jobs loudly (parked as unrepairable) instead of dropping them | — | config; recorded per chunk | `Replicated` + chunk store |
 | **Blob** | One message in one instance; address is `BlobLocator` | ≤ instance `max_blob_size` | immutable | blob storage (stateless) |
 | **Block** | Chunk slice; unit of compression and Range | ~1 MiB logical | immutable | codec + chunk-store metadata |
 | **Chunk** | Logical immutable storage unit: `ChunkId`, size, CRC, refcount; independent of backend limits | ≤ `chunk.size` stored (19 MiB), ≤ 256 MiB logical | immutable (`refs` / replica set may change) | chunk store |

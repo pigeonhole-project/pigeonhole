@@ -284,14 +284,14 @@ impl Repairer {
             return Ok(Copied::Noop);
         };
 
-        let layouts = self.db.get_replica_layouts(chunk_id).await?;
         // A chunk belongs to the shard it was written to; never copy it into
         // another shard.
-        let peers = self.replicated.shard_peers(instance_id).unwrap_or_default();
-        if !layouts.iter().any(|l| peers.iter().any(|p| p.instance().id == l.instance)) {
+        let shard = self.db.chunk_shard(chunk_id).unwrap_or_default();
+        if !self.shard_admits(chunk_id, &shard, instance_id)? {
             self.db.dequeue_repair(chunk_id, instance_id).await?;
             return Ok(Copied::Noop);
         }
+        let layouts = self.db.get_replica_layouts(chunk_id).await?;
         // A replica recorded there is copied again only if the store says
         // a part of it is gone; a store that cannot answer (rate limited,
         // down) fails the job, it never gets a second copy.
@@ -340,6 +340,28 @@ impl Repairer {
 
         let layout = ReplicaLayout { instance: instance_id.to_string(), parts };
         Ok(Copied::Ready(Ready { chunk_id, layout, pins }))
+    }
+}
+
+impl Repairer {
+    /// Whether a chunk that belongs on `shard` (as recorded in it) belongs
+    /// on `target` too: `target`'s shard in the placement holds every
+    /// instance of `shard` still in it. None of them: a job aimed at another
+    /// shard (`false`). Some, not all: a re-sharding moved the chunk's
+    /// stores apart, and no copy is right; an error, so the job fails (and
+    /// is parked) where it shows, not dropped in silence.
+    fn shard_admits(&self, chunk_id: ChunkId, shard: &[String], target: &str) -> Result<bool> {
+        let peers = self.replicated.shard_peers(target).unwrap_or_default();
+        let placed: Vec<&str> =
+            shard.iter().map(String::as_str).filter(|i| self.replicated.member(i).is_some()).collect();
+        let inside = placed.iter().filter(|&&i| peers.iter().any(|p| p.instance().id == i)).count();
+        if inside > 0 && inside < placed.len() {
+            bail!(
+                "chunk {chunk_id} belongs on {shard:?}, which the placement now splits over several shards; \
+                 put these stores back in one shard"
+            );
+        }
+        Ok(inside > 0)
     }
 }
 
@@ -600,6 +622,35 @@ mod tests {
             let jobs: Vec<_> = db.repair_jobs().await.into_iter().filter(|(c, _)| *c == id).collect();
             assert_eq!(jobs, vec![(id, missed.to_string())], "chunk on {on}");
         }
+    }
+
+    /// A re-sharding that moves a chunk's stores apart fails its repair
+    /// loudly (it used to be dropped as aimed at another shard).
+    #[tokio::test]
+    async fn a_split_shard_fails_the_job_loudly() {
+        let a1 = lim("a1", 4 * MIB);
+        let a2 = MemoryBlobStore::new().with_instance_id("a2").with_unavailable_flag();
+        let a2_down = a2.unavailable_flag();
+        let a2: SharedBackend = Arc::new(erase(a2));
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let rep = Arc::new(Replicated::new(vec![a1.clone(), a2.clone()], 1, Arc::new(CheapestFirst::new())).unwrap());
+        let layer =
+            ChunkStore::open_replicated(db.clone(), rep, IngestOptions::new(MIB, ChunkCodec::Raw)).await.unwrap();
+        a2_down.store(true, std::sync::atomic::Ordering::Relaxed);
+        let id = layer.put_small(Bytes::from_static(b"on a1 only")).await.unwrap();
+        a2_down.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(db.chunk_shard(id).unwrap(), vec!["a1".to_string(), "a2".to_string()]);
+        assert_eq!(db.repair_jobs().await, vec![(id, "a2".to_string())]);
+
+        let split =
+            Arc::new(Replicated::sharded(vec![(vec![a1], 1), (vec![a2], 1)], Arc::new(CheapestFirst::new())).unwrap());
+        let repairer = Repairer::new(db.clone(), split, RepairConfig { scrub: false, ..RepairConfig::default() });
+        let stats = repairer.repair_once().await.unwrap();
+        assert_eq!((stats.repaired, stats.failed), (0, 1));
+        assert_eq!(db.repair_jobs().await, vec![(id, "a2".to_string())], "kept, waiting");
     }
 
     #[tokio::test]

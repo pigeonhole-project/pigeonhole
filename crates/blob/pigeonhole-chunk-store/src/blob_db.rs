@@ -303,7 +303,8 @@ impl BlobDb {
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
     ) -> Result<ChunkId> {
-        let (chunk_id, prepared) = self.prepare_commit(logical_size, crc32, blocks, replicas)?;
+        let shard: Vec<String> = replicas.iter().map(|r| r.instance.clone()).collect();
+        let (chunk_id, prepared) = self.prepare_commit(logical_size, crc32, blocks, replicas, &shard)?;
         let mut proposal = Proposal::new();
         let slot = proposal.push(prepared);
         match self.meta.propose_all(proposal).await?.take(slot)? {
@@ -330,7 +331,8 @@ impl BlobDb {
     }
 
     /// The `CommitChunk` of a new chunk (its id chosen now), to be proposed
-    /// with other commands in one entry. Fenced to the leader's term: the id
+    /// with other commands in one entry; `shard`: the instances of the shard
+    /// it was written to. Fenced to the leader's term: the id
     /// is unique only while this node goes on leading, so a commit written
     /// after the lead changed (even back to this node) is not applied
     /// ([`pigeonhole_meta::NotApplied::Fenced`]). `Err` off the lead.
@@ -340,6 +342,7 @@ impl BlobDb {
         crc32: u32,
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
+        shard: &[String],
     ) -> Result<(ChunkId, Prepared<ChunkState>)> {
         let term = self.meta.serving_term()?;
         let chunk_id = self.next_chunk_id();
@@ -349,6 +352,7 @@ impl BlobDb {
             crc32,
             blocks: blocks.to_vec(),
             replicas: replicas.iter().map(Replica::from).collect(),
+            shard: shard.to_vec(),
             created_at: Utc::now().to_rfc3339(),
         };
         Ok((chunk_id, Prepared::new(&command).fenced(term)))
@@ -402,6 +406,12 @@ impl BlobDb {
     /// Blocks in `block_no` order; empty for a missing chunk.
     pub async fn get_blocks(&self, chunk_id: i64) -> Result<Vec<StoredBlock>> {
         Ok(self.chunk(chunk_id, |c| c.blocks.clone()).unwrap_or_default())
+    }
+
+    /// The instances the chunk belongs on (see `ChunkRec::shard`); `None`
+    /// for a missing chunk.
+    pub fn chunk_shard(&self, chunk_id: ChunkId) -> Option<Vec<String>> {
+        self.chunk(chunk_id, |c| c.shard.clone())
     }
 
     /// Replica layouts for a chunk (for [`pigeonhole_blob::Replicated::read`]),
@@ -634,9 +644,8 @@ impl BlobDb {
         parked.len()
     }
 
-    /// Referenced chunks (`refs > 0`) missing a replica on `instance_id`.
-    /// Live chunks of `instance_id`'s shard (a replica on one of `peers`)
-    /// that have none on `instance_id`.
+    /// Live chunks of `instance_id`'s shard (one that belongs on one of
+    /// `peers`) that have no replica on `instance_id`.
     pub async fn chunks_missing_instance(&self, instance_id: &str, peers: &[&str]) -> Result<Vec<ChunkId>> {
         Ok(self.read(|s| {
             s.chunks
@@ -644,7 +653,7 @@ impl BlobDb {
                 .filter(|(_, c)| {
                     c.refs > 0
                         && !c.replicas.contains_key(instance_id)
-                        && c.replicas.keys().any(|i| peers.contains(&i.as_str()))
+                        && c.shard.iter().any(|i| peers.contains(&i.as_str()))
                 })
                 .map(|(&id, _)| id)
                 .collect()
