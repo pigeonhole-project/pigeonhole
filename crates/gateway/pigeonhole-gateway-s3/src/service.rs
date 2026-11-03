@@ -12,7 +12,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use md5::Digest;
 use pigeonhole_chunk_store::{unique_chunk_ids, ChunkStore, Extent, IngestOptions, Ingested, PendingChunks};
-use pigeonhole_codec::{self as chunker, ByteBudget, ChunkCodec};
 use pigeonhole_meta::{Outcome, Prepared, Proposal};
 use s3s::dto::*;
 use s3s::s3_error;
@@ -38,17 +37,13 @@ pub struct CoolStats {
     pub rejected: u64,
 }
 
-/// What the S3 gateway takes from the configuration.
+/// What the S3 gateway takes from the configuration. How bodies are cut
+/// and encoded (`[chunk]`, `[ingest]`) is the chunk store's
+/// ([`ChunkStore::ingest_options`]).
 #[derive(Clone, Debug)]
 pub struct S3Options {
     /// Answered to GetBucketLocation.
     pub region: String,
-    /// Max on-wire chunk size in bytes.
-    pub chunk_size: usize,
-    pub chunk_codec: ChunkCodec,
-    pub block_size: usize,
-    /// Process-wide ingest buffer budget (shared across PUTs).
-    pub ingest_budget: Option<ByteBudget>,
     /// Objects up to this size are stored inline in the metadata
     /// (docs/inline-objects.md); `None`: never.
     pub inline_max: Option<usize>,
@@ -57,14 +52,7 @@ pub struct S3Options {
 impl S3Options {
     /// The defaults, for in-process tests.
     pub fn for_test() -> Self {
-        Self {
-            region: "us-east-1".into(),
-            chunk_size: chunker::DEFAULT_CHUNK_SIZE,
-            chunk_codec: ChunkCodec::Zstd,
-            block_size: chunker::DEFAULT_BLOCK_SIZE,
-            ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
-            inline_max: None,
-        }
+        Self { region: "us-east-1".into(), inline_max: None }
     }
 }
 
@@ -83,9 +71,7 @@ impl S3Gateway {
     /// `size`: the body's length when known, so its chunks reserve no more
     /// of the ingest budget than it needs.
     fn ingest_options(&self, size: Option<i64>) -> IngestOptions {
-        let mut opts = IngestOptions::new(self.opts.chunk_size, self.opts.chunk_codec);
-        opts.block_size = self.opts.block_size;
-        opts.memory_budget = self.opts.ingest_budget.clone();
+        let mut opts = self.store.ingest_options();
         opts.size_hint = size.and_then(|n| u64::try_from(n).ok());
         opts
     }

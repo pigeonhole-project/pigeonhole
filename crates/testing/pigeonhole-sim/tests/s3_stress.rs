@@ -91,9 +91,9 @@ async fn open_node(
     )
     .await
     .unwrap();
-    let s3_opts = S3Options { chunk_size: 16 * 1024, block_size: 4 * 1024, inline_max, ..S3Options::for_test() };
-    let mut opts = IngestOptions::new(s3_opts.chunk_size, s3_opts.chunk_codec);
-    opts.block_size = s3_opts.block_size;
+    let s3_opts = S3Options { inline_max, ..S3Options::for_test() };
+    let mut opts = IngestOptions::new(16 * 1024, pigeonhole_chunk_store::ChunkCodec::Zstd);
+    opts.block_size = 4 * 1024;
     let backends: Vec<SharedBackend> = members.iter().map(|m| Arc::new(erase(m.clone())) as SharedBackend).collect();
     let rep = Arc::new(Replicated::new(backends.clone(), 1, Arc::new(CheapestFirst::new())).unwrap());
     let store =

@@ -2789,7 +2789,6 @@ dependencies = [
  "madsim-tokio",
  "md-5 0.10.6",
  "pigeonhole-chunk-store",
- "pigeonhole-codec",
  "pigeonhole-meta",
  "pigeonhole-storage-memory",
  "pigeonhole-testkit",
