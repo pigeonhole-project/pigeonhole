@@ -62,7 +62,9 @@ The tablet decides, the log store deletes:
 
 1. `LogStore::rebase(gen, base, keep)` writes the new base with the older
    bases kept (at most `keep - 1`) and returns the ones that fell out.
-2. The tablet removes the snapshots of those, after answering the purge.
+2. The tablet removes the snapshots of those in a task of its own (the
+   remover): removing one may download it to find its parts, and the log's
+   writer, behind which every append and vote queues, only writes the log.
 3. The log store collects below the watermark in the background (one
    collection at a time): it walks back to the oldest blob a reader from the
    watermark needs and prunes the chain below it (`Chain::prune`). Order
@@ -115,7 +117,11 @@ it actually loaded (`Shared::base`), not at the log's newest.
 
 The tablet logs the fallback, counts it
 (`pigeonhole_meta_snapshot_fallbacks_total`) and asks for a snapshot right
-after the boot, so the damaged one stops being the newest base.
+after the boot, so the damaged one stops being the newest base. That rebase
+is told which bases failed (`rebase(.., unusable)`): they are dropped first,
+whatever `keep` says, so the base that loaded stays kept. Counting from the
+log's newest, `keep_snapshots = 2` would otherwise keep the new base and the
+damaged one, and drop the one that worked.
 
 ## Point-in-time restore (later)
 
@@ -174,7 +180,10 @@ list, every object whole.
   `read` down to the watermark. Chain log registers carry `older`
   (`LOG_FORMAT` 4).
 - `[meta] keep_snapshots` (default 2) → `MetaOptions::keep_snapshots`; the
-  write loop removes dropped bases' snapshots.
+  remover task (`raft::spawn_removals`) removes dropped bases' snapshots,
+  off the log writer. A purge is lazy: the writer rebases once a stored
+  snapshot covers it, with no deadline (cluster.md § Snapshots and the
+  kept log).
 - In a cluster, `[meta] keep_log_entries` → `MetaOptions::keep_log`: a base
   lands that many entries short of its snapshot, so the log behind every
   kept base reaches back that much further (cluster.md § Snapshots and the

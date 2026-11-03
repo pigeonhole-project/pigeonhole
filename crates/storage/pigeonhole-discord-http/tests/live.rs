@@ -5,7 +5,6 @@
 //! dedicated: each test empties its channel at the end (messages and links).
 
 use bytes::Bytes;
-use futures::TryStreamExt;
 use pigeonhole_discord_http::{DiscordChannel, DiscordClient};
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_meta::{
@@ -134,7 +133,7 @@ async fn chain_log_against_a_live_channel() {
     let winner = if rb.is_ok() { b } else { c };
     assert!(matches!(a.append(1, &[entry(99)]).await, Err(LogError::Fenced { current: 2 })));
     winner.append(2, &[entry(6)]).await.unwrap();
-    winner.rebase(2, Base { at: 4, term: 1, leader: 0, snapshot: SnapshotRef("s4".into()) }, 1).await.unwrap();
+    winner.rebase(2, Base { at: 4, term: 1, leader: 0, snapshot: SnapshotRef("s4".into()) }, 1, &[]).await.unwrap();
     winner.settle().await; // the collection runs in the background
     winner.append(2, &[entry(7)]).await.unwrap();
 
@@ -143,7 +142,6 @@ async fn chain_log_against_a_live_channel() {
     let d = reader.discover().await.unwrap().unwrap();
     let got: Vec<u64> = reader
         .read(4, d.head)
-        .try_collect::<Vec<_>>()
         .await
         .unwrap()
         .into_iter()
@@ -185,7 +183,6 @@ async fn lease_log_against_a_live_channel() {
     let d = reader.discover().await.unwrap().unwrap();
     let got: Vec<u64> = reader
         .read(0, d.head)
-        .try_collect::<Vec<_>>()
         .await
         .unwrap()
         .into_iter()

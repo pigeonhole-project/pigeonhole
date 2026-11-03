@@ -3,7 +3,6 @@
 //! namespace into JSON: the site's log inspector.
 
 use anyhow::{Context, Result};
-use futures::TryStreamExt;
 use openraft::EntryPayload;
 use pigeonhole_chunk_store::ChunkState;
 use pigeonhole_config::dynamic::Overrides;
@@ -36,7 +35,7 @@ pub async fn read(log: &dyn LogStore, from: Option<u64>, limit: usize) -> Result
     let head = found.head.position;
     let base = found.base.as_ref().map_or(0, |b| b.at);
     let start = from.unwrap_or_else(|| head.saturating_sub(limit as u64)).max(base);
-    let entries: Vec<_> = log.read(start, found.head).try_collect().await.context("read the log")?;
+    let entries: Vec<_> = log.read(start, found.head).await.context("read the log")?;
     let mut out = Vec::new();
     for (position, entry) in entries.into_iter().take(limit) {
         let decoded: RaftEntry = postcard::from_bytes(&entry.payload).with_context(|| format!("entry {position}"))?;

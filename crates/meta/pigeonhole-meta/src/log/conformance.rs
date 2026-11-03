@@ -4,7 +4,6 @@
 
 use super::{Base, Entry, Head, LogError, LogStore, Position};
 use crate::snapshot::SnapshotRef;
-use futures::TryStreamExt;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -21,7 +20,7 @@ fn base(at: Position) -> Base {
 }
 
 async fn read_all(log: &dyn LogStore, from: Position, head: Head) -> Result<Vec<(Position, Entry)>, LogError> {
-    log.read(from, head).try_collect().await
+    log.read(from, head).await
 }
 
 /// Run the whole suite; each case gets fresh logs from `fresh()`, a factory of
@@ -61,7 +60,7 @@ where
     for i in 3..=10 {
         b.append(2, &[entry(i)]).await.unwrap();
     }
-    b.rebase(2, Base { at: 9, term: 1, leader: 0, snapshot: SnapshotRef("s9".into()) }, 1).await.unwrap();
+    b.rebase(2, Base { at: 9, term: 1, leader: 0, snapshot: SnapshotRef("s9".into()) }, 1, &[]).await.unwrap();
     b.settle().await;
     let before = open().await.discover().await.unwrap().map(|d| (d.gen, d.head.position));
     assert_eq!(before, Some((2, 10)), "before the deposed writer wakes");
@@ -83,12 +82,12 @@ where
     let log = open().await;
     let head = log.claim(1).await.unwrap();
     log.append(1, &[entry(1), entry(2)]).await.unwrap();
-    log.rebase(1, Base { at: 10, term: 4, leader: 0, snapshot: SnapshotRef("s10".into()) }, 1).await.unwrap();
+    log.rebase(1, Base { at: 10, term: 4, leader: 0, snapshot: SnapshotRef("s10".into()) }, 1, &[]).await.unwrap();
     assert_eq!(log.append(1, &[termed(5, 11)]).await.unwrap(), 11);
 
     let again = open().await;
     let d = again.discover().await.unwrap().unwrap();
-    assert_eq!((d.base.map(|b| b.at), d.head.position, d.head_term), (Some(10), 11, 5));
+    assert_eq!((d.base.map(|b| b.at), d.head.position), (Some(10), 11));
     assert_eq!(read_all(again.as_ref(), 10, Head { position: 11, ..head }).await.unwrap(), vec![(11, termed(5, 11))]);
     assert!(matches!(read_all(again.as_ref(), 2, Head { position: 11, ..head }).await, Err(LogError::Lost(_))));
 }
@@ -131,7 +130,7 @@ where
     assert!(matches!(b.claim(1).await, Err(LogError::Fenced { current: 1 })));
     assert_eq!(b.claim(2).await.unwrap().position, 1, "acknowledged entries are ≤ the head");
     assert!(matches!(a.append(1, &[entry(2)]).await, Err(LogError::Fenced { current: 2 })));
-    assert!(matches!(a.rebase(1, base(1), 1).await, Err(LogError::Fenced { current: 2 })));
+    assert!(matches!(a.rebase(1, base(1), 1, &[]).await, Err(LogError::Fenced { current: 2 })));
     let head = b.append(2, &[entry(2)]).await.unwrap();
     assert_eq!(head, 2);
     let d = b.discover().await.unwrap().unwrap();
@@ -149,9 +148,9 @@ where
     for i in 1..=4 {
         log.append(1, &[entry(i)]).await.unwrap();
     }
-    log.rebase(1, base(2), 1).await.unwrap();
-    log.rebase(1, base(4), 1).await.unwrap();
-    assert!(log.rebase(1, base(3), 1).await.is_err(), "a base never moves back");
+    log.rebase(1, base(2), 1, &[]).await.unwrap();
+    log.rebase(1, base(4), 1, &[]).await.unwrap();
+    assert!(log.rebase(1, base(3), 1, &[]).await.is_err(), "a base never moves back");
     log.append(1, &[entry(5)]).await.unwrap();
     log.append(1, &[entry(6)]).await.unwrap();
 
@@ -169,7 +168,7 @@ where
 }
 
 /// `keep` bases: the log stays readable from the oldest; a rebase hands
-/// back the bases it no longer keeps.
+/// back the bases it no longer keeps, the unusable ones first.
 pub async fn older_bases_are_kept_and_readable<Open, Fut>(open: Open)
 where
     Open: Fn() -> Fut,
@@ -180,10 +179,10 @@ where
     for i in 1..=6 {
         log.append(1, &[entry(i)]).await.unwrap();
     }
-    assert_eq!(log.rebase(1, base(2), 2).await.unwrap(), vec![]);
-    assert_eq!(log.rebase(1, base(4), 2).await.unwrap(), vec![]);
-    assert_eq!(log.rebase(1, base(5), 2).await.unwrap(), vec![base(2)], "the third newest goes");
-    assert_eq!(log.rebase(1, base(5), 2).await.unwrap(), vec![], "the same base again changes nothing");
+    assert_eq!(log.rebase(1, base(2), 2, &[]).await.unwrap(), vec![]);
+    assert_eq!(log.rebase(1, base(4), 2, &[]).await.unwrap(), vec![]);
+    assert_eq!(log.rebase(1, base(5), 2, &[]).await.unwrap(), vec![base(2)], "the third newest goes");
+    assert_eq!(log.rebase(1, base(5), 2, &[]).await.unwrap(), vec![], "the same base again changes nothing");
     log.settle().await;
 
     let again = open().await;
@@ -196,9 +195,14 @@ where
     );
     assert!(matches!(read_all(again.as_ref(), 2, d.head).await, Err(LogError::Lost(_))), "behind the kept bases");
 
-    // Keeping fewer drops the rest at once.
+    // An unusable base (its snapshot failed to load) goes first, whatever
+    // `keep` says: the older one that loaded stays.
     again.claim(2).await.unwrap();
-    assert_eq!(again.rebase(2, base(6), 1).await.unwrap(), vec![base(5), base(4)]);
+    assert_eq!(again.rebase(2, base(6), 2, &[base(5)]).await.unwrap(), vec![base(5)]);
+    assert_eq!(again.discover().await.unwrap().unwrap().older, vec![base(4)]);
+
+    // Keeping fewer drops the rest at once.
+    assert_eq!(again.rebase(2, base(6), 1, &[]).await.unwrap(), vec![base(4)]);
     assert_eq!(again.discover().await.unwrap().unwrap().older, vec![]);
 }
 
@@ -233,18 +237,18 @@ where
 
     let again = open().await;
     let d = again.discover().await.unwrap().unwrap();
-    assert_eq!((d.head.position, d.head_term), (5, 2));
+    assert_eq!(d.head.position, 5);
     let all = read_all(again.as_ref(), 0, d.head).await.unwrap();
     let want = vec![(1, entry(1)), (2, entry(2)), (3, entry(3)), (4, termed(2, 40)), (5, termed(2, 50))];
     assert_eq!(all, want);
 
     // A truncate right after a rebase may not reach behind it.
     let head = again.claim(2).await.unwrap();
-    again.rebase(2, base(3), 1).await.unwrap();
+    again.rebase(2, base(3), 1, &[]).await.unwrap();
     assert!(again.truncate(2, 3).await.is_err(), "behind the base");
     again.truncate(2, 4).await.unwrap();
     let d = again.discover().await.unwrap().unwrap();
-    assert_eq!((d.head.position, d.head_term), (3, 1), "the head term is the base's");
+    assert_eq!(d.head.position, 3, "the head is the base");
     assert_eq!(again.append(2, &[termed(3, 4)]).await.unwrap(), 4);
     assert_eq!(read_all(again.as_ref(), 3, Head { position: 4, ..head }).await.unwrap(), vec![(4, termed(3, 4))]);
 }

@@ -47,7 +47,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -62,8 +62,8 @@ mod telemetry;
 mod view;
 
 pub use log::{
-    Base, Batch, ChainLogStore, Discovered, Entry, EntryStream, Head, Lease, LogError, LogId, LogResult, LogStore,
-    Position, LOG_FORMAT,
+    Base, Batch, ChainLogStore, Discovered, Entry, Head, Lease, LogError, LogId, LogResult, LogStore, Position,
+    LOG_FORMAT,
 };
 pub use snapshot::{BlobSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 pub use telemetry::METRICS;
@@ -355,6 +355,8 @@ trait AnyState: Send + Sync {
     /// `(VERSION, encode_state)`.
     fn snapshot(&self) -> (u32, Vec<u8>);
     fn restore(&self, version: u32, data: &[u8]) -> Result<()>;
+    /// Back to the empty state.
+    fn reset(&self);
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -390,6 +392,10 @@ impl<S: StateMachine> AnyState for StateCell<S> {
         }
         *self.0.write().unwrap() = decode_state(data)?;
         Ok(())
+    }
+
+    fn reset(&self) {
+        *self.0.write().unwrap() = S::default();
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -705,8 +711,11 @@ impl Drop for MetaStore {
         if let Some(t) = self.ticker.lock().unwrap().take() {
             t.abort();
         }
+        // Outside a runtime (its last Arc dropped after it ended) there is
+        // nothing to shut down on: Raft's tasks went with the runtime.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
         let raft = self.raft.clone();
-        tokio::spawn(
+        runtime.spawn(
             async move {
                 let _ = raft.shutdown().await;
             }
@@ -744,14 +753,7 @@ impl MetaStore {
 
         let (stop_tx, stop) = watch::channel(None);
         report_stop(stop.clone(), gen);
-        let shared = Arc::new(raft::Shared {
-            stop: stop_tx,
-            applied: AtomicU64::new(0),
-            based: AtomicU64::new(0),
-            current: Mutex::new(None),
-            kept: tokio::sync::Notify::new(),
-            base: Mutex::new(None),
-        });
+        let shared = Arc::new(raft::Shared::new(stop_tx, snapshots.clone()));
         let mut sm = raft::StateMachine {
             states: states.clone(),
             snapshots: snapshots.clone(),
@@ -762,10 +764,12 @@ impl MetaStore {
         };
         let fell_back = match &d.base {
             Some(newest) => {
-                let base = load_some_base(&mut sm, snapshots.as_ref(), newest, &d.older, head.log_id).await?;
+                let (base, unusable) =
+                    load_some_base(&mut sm, snapshots.as_ref(), newest, &d.older, head.log_id).await?;
                 shared.based.store(base.at, Ordering::SeqCst);
-                let fell_back = base != *newest;
                 *shared.base.lock().unwrap() = Some(base);
+                let fell_back = !unusable.is_empty();
+                *shared.unusable.lock().unwrap() = unusable;
                 fell_back
             }
             None => false,
@@ -773,15 +777,7 @@ impl MetaStore {
         let fresh = d.head.position == 0 && d.base.is_none() && d.vote.is_none();
 
         let keep = raft::Keep(opts.keep_snapshots.max(1));
-        let adapter = raft::LogAdapter::new(
-            log.clone(),
-            gen,
-            head.log_id,
-            d.head.position,
-            shared.clone(),
-            snapshots.clone(),
-            keep,
-        );
+        let adapter = raft::LogAdapter::new(log.clone(), gen, head.log_id, d.head.position, shared.clone(), keep);
         let config = Arc::new(raft_config(&opts, cluster.members.len())?);
         let raft = raft::Raft::new(cluster.node, config, cluster.network, adapter, sm).await.context("start raft")?;
         if let Some(serve) = cluster.serve {
@@ -966,13 +962,9 @@ impl MetaStore {
     }
 
     /// Generation this tablet claimed on boot.
-    pub fn generation(&self) -> u64 {
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
         self.gen
-    }
-
-    /// The node's Raft: what a network's receiving side hands requests to.
-    pub fn raft(&self) -> &raft::Raft {
-        &self.raft
     }
 
     /// The leader as this node knows it.
@@ -1241,18 +1233,20 @@ fn report_stop(mut stop: watch::Receiver<Option<Stop>>, gen: u64) {
 }
 
 /// Restore the states from the newest base, or else from the newest older
-/// base the log keeps (the log is readable from there): the base loaded.
+/// base the log keeps (the log is readable from there): the base loaded,
+/// and the newer ones that failed (the next rebase drops them).
 async fn load_some_base(
     sm: &mut raft::StateMachine,
     snapshots: &dyn SnapshotStore,
     newest: &Base,
     older: &[Base],
     log_id: LogId,
-) -> Result<Base> {
+) -> Result<(Base, Vec<Base>)> {
     let first = match load_base(sm, snapshots, newest, log_id).await {
-        Ok(()) => return Ok(newest.clone()),
+        Ok(()) => return Ok((newest.clone(), Vec::new())),
         Err(e) => e,
     };
+    let mut failed = vec![newest.clone()];
     for base in older {
         tracing::warn!(
             snapshot = %newest.snapshot.0,
@@ -1265,9 +1259,12 @@ async fn load_some_base(
         match load_base(sm, snapshots, base, log_id).await {
             Ok(()) => {
                 telemetry::record_snapshot_fallback();
-                return Ok(base.clone());
+                return Ok((base.clone(), failed));
             }
-            Err(e) => tracing::warn!(snapshot = %base.snapshot.0, error = %format!("{e:#}"), "older base unusable too"),
+            Err(e) => {
+                tracing::warn!(snapshot = %base.snapshot.0, error = %format!("{e:#}"), "older base unusable too");
+                failed.push(base.clone());
+            }
         }
     }
     Err(first)
@@ -1478,7 +1475,7 @@ pub async fn restore_lossy(log: &dyn LogStore, snapshots: &dyn SnapshotStore) ->
     let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
     let stored = StoredSnapshot { log_id: head.log_id, at: 1, data };
     let snapshot = snapshots.put(&stored, None).await.context("store the restored snapshot")?;
-    log.rebase(gen, raft::base_of(&meta, snapshot), 1).await.context("start the new log from it")?;
+    log.rebase(gen, raft::base_of(&meta, snapshot), 1, &[]).await.context("start the new log from it")?;
     Ok(old_position)
 }
 
@@ -1531,8 +1528,13 @@ pub(crate) fn take_snapshot(states: &States, position: Position) -> TabletSnapsh
     TabletSnapshot { format: SNAPSHOT_FORMAT, position, states: snap }
 }
 
-/// Load every namespace's state from `snap`.
+/// Load every namespace's state from `snap`; one it does not hold starts
+/// empty (a namespace added since): the state comes from the log and the
+/// snapshot only, never from what was in memory before.
 pub(crate) fn restore_states(states: &States, snap: &TabletSnapshot) -> Result<()> {
+    for state in states.values() {
+        state.reset();
+    }
     for (name, version, data) in &snap.states {
         let state = states.get(name.as_str()).with_context(|| format!("snapshot has unknown namespace {name:?}"))?;
         state.restore(*version, data)?;

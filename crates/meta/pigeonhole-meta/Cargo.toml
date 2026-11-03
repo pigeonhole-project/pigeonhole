@@ -32,6 +32,7 @@ metrics-util = { workspace = true }
 pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(madsim)'.dependencies]
 madsim = "0.2"

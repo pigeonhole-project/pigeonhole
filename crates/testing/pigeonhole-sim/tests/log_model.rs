@@ -3,7 +3,6 @@
 //! fenced or until a fault leaves its outcome unknown; afterwards a reader
 //! must find every acknowledged entry where it was acknowledged.
 
-use futures::TryStreamExt;
 use pigeonhole_blob::Chain;
 use pigeonhole_meta::{ChainLogStore, Entry, LogError, LogStore, Position};
 use pigeonhole_sim::faults::{FaultPlan, Faulty};
@@ -79,7 +78,7 @@ async fn check<C: Chain>(chain: Arc<C>, quiesce: impl FnOnce(), floor: &AtomicU6
     let d = log.discover().await.unwrap().unwrap();
     assert_eq!(d.gen, gen);
     let history: BTreeMap<Position, Vec<u8>> =
-        log.read(0, d.head).map_ok(|(p, e)| (p, e.payload)).try_collect().await.expect("the history reads back");
+        log.read(0, d.head).await.expect("the history reads back").into_iter().map(|(p, e)| (p, e.payload)).collect();
     for (pos, (g, payload)) in &acks.at {
         assert_eq!(
             history.get(pos),

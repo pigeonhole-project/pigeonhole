@@ -141,15 +141,17 @@ trait LogStore {
     /// Base + log head + newest generation (bootstrap without local state).
     async fn discover(&self) -> Result<Option<Discovered>>;
 
-    /// Entries after `from` up to `head`, in order (replay); `from` may be
-    /// behind the base, down to the oldest base kept.
-    fn read(&self, from: Position, head: Head) -> EntryStream;
+    /// Entries after `from` up to `head`, in order, all at once (Raft reads
+    /// short ranges); `from` may be behind the base, down to the oldest
+    /// base kept.
+    async fn read(&self, from: Position, head: Head) -> Result<Vec<(Position, Entry)>, LogError>;
 
     /// Start the log from `base` = { at, snapshot: SnapshotRef } (a snapshot
     /// already stored), keeping the `keep` newest bases and the log from the
-    /// oldest; collect the rest in the background. Returns the bases that
-    /// fell out. Fenced like append (log-retention.md).
-    async fn rebase(&self, gen: u64, base: Base, keep: usize) -> Result<Vec<Base>>;
+    /// oldest; collect the rest in the background. `unusable` bases (their
+    /// snapshots failed to load) go first, whatever `keep` says. Returns
+    /// the bases that fell out. Fenced like append (log-retention.md).
+    async fn rebase(&self, gen: u64, base: Base, keep: usize, unusable: &[Base]) -> Result<Vec<Base>>;
 }
 ```
 
@@ -218,7 +220,9 @@ one chain.
    on it, keeping `[meta] keep_snapshots` bases (and the log from the oldest),
    and removes the snapshots of the bases that fell out
    ([log-retention.md](log-retention.md)). A boot that cannot load the newest
-   base's snapshot starts from an older kept one.
+   base's snapshot starts from an older kept one; the next rebase drops the
+   bases that failed, not the one that loaded, so with two kept the log
+   keeps the new base and the one that worked.
    `MetaStore::base_position` is where the log starts now. A failed put or
    rebase keeps the old base; the next snapshot tries again.
 
@@ -345,8 +349,9 @@ gives openraft:
 
 - **Log storage**: each node's own `LogStore`. Entries carry their Raft
   term; `truncate` drops a divergent tail (a record linking to the entry
-  before it); `purge` behind a snapshot is `rebase`; the vote and the head
-  term are registers carried in every record of the chain. A conformance
+  before it); `purge` behind a snapshot is `rebase`; the vote is a register
+  carried in every record of the chain. The head's Raft id (term and
+  leader) is read from the last entry, at boot only. A conformance
   suite runs against every store kind.
 - **Two processes as one node** are fenced as before: every durable change
   (a vote, an acknowledged entry) is a write under the process's

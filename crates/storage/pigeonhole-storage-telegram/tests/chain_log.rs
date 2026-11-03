@@ -1,7 +1,6 @@
 //! The generic chain log and snapshots over a channel (the Telegram
 //! [`Chain`]: first successor by id order), on a fake channel.
 
-use futures::TryStreamExt;
 use pigeonhole_limits::{ChatLimiter, Rate};
 use pigeonhole_meta::log::conformance;
 use pigeonhole_meta::snapshot::conformance as snapshot_conformance;
@@ -38,7 +37,6 @@ fn entry(i: u64) -> Entry {
 async fn history(log: &dyn LogStore) -> Vec<u64> {
     let d = log.discover().await.unwrap().unwrap();
     log.read(0, d.head)
-        .try_collect::<Vec<_>>()
         .await
         .unwrap()
         .into_iter()
@@ -188,7 +186,7 @@ async fn a_changed_log_blob_is_detected() {
     // A new process: nothing cached.
     let fresh = store(&channel);
     let head = fresh.discover().await.unwrap().unwrap().head;
-    let read: Result<Vec<_>, _> = fresh.read(0, head).try_collect().await;
+    let read: Result<Vec<_>, _> = fresh.read(0, head).await;
     assert!(matches!(read, Err(LogError::Lost(_))), "{read:?}");
 }
 
@@ -201,7 +199,7 @@ async fn a_rebase_prunes_our_messages_and_nothing_else() {
     for i in 1..=5 {
         a.append(1, &[entry(i)]).await.unwrap();
     }
-    a.rebase(1, base(3), 1).await.unwrap();
+    a.rebase(1, base(3), 1, &[]).await.unwrap();
     a.settle().await; // the collection runs in the background
     let names = channel.names();
     assert!(names.iter().any(|(id, _)| *id == foreign), "{names:?}");
@@ -214,7 +212,7 @@ async fn a_rebase_prunes_our_messages_and_nothing_else() {
     let b = store(&channel);
     assert_eq!(b.claim(2).await.unwrap().position, 6);
     let head = b.discover().await.unwrap().unwrap().head;
-    let got: Vec<_> = b.read(3, head).try_collect().await.unwrap();
+    let got: Vec<_> = b.read(3, head).await.unwrap();
     assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![4, 5, 6]);
 }
 

@@ -3,7 +3,6 @@
 
 use crate::snapshot::SnapshotRef;
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -15,7 +14,7 @@ pub use chain::{ChainLogStore, Lease};
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.
-pub const LOG_FORMAT: u32 = 5;
+pub const LOG_FORMAT: u32 = 6;
 
 /// One log entry: the Raft term it was written in and an opaque payload (a
 /// tablet command; later an openraft entry).
@@ -119,8 +118,6 @@ pub struct Discovered {
     /// from one of these and replay (docs/log-retention.md).
     pub older: Vec<Base>,
     pub head: Head,
-    /// Term of the entry at the head (the base's if the head is the base).
-    pub head_term: u64,
     /// The last vote saved ([`LogStore::save_vote`]), opaque.
     pub vote: Option<Vec<u8>>,
     /// Newest claimed generation.
@@ -172,9 +169,6 @@ impl From<anyhow::Error> for LogError {
 
 pub type LogResult<T> = Result<T, LogError>;
 
-/// Entries in order with their positions.
-pub type EntryStream = BoxStream<'static, LogResult<(Position, Entry)>>;
-
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
     /// Become generation `gen` (> any earlier claim, else `Fenced { current }`).
@@ -204,18 +198,21 @@ pub trait LogStore: Send + Sync + 'static {
     /// log was never claimed.
     async fn discover(&self) -> LogResult<Option<Discovered>>;
 
-    /// Entries after `from` up to `head`, in order (replay). `from` may lie
-    /// behind the base, down to the oldest base kept ([`Discovered::older`]);
-    /// further back is `Lost`.
-    fn read(&self, from: Position, head: Head) -> EntryStream;
+    /// Entries after `from` up to `head` with their positions, in order
+    /// (replay), all at once: callers read short ranges (openraft asks for
+    /// a few entries at a time). `from` may lie behind the base, down to the
+    /// oldest base kept ([`Discovered::older`]); further back is `Lost`.
+    async fn read(&self, from: Position, head: Head) -> LogResult<Vec<(Position, Entry)>>;
 
     /// Start the log from `base` (a snapshot already stored), keeping the
     /// `keep` newest bases (≥ 1, `base` included) and the entries after the
     /// oldest of them; entries before it are collected in the background.
-    /// Returns the bases no longer kept: nothing starts from their
-    /// snapshots any more. `base.at` may be past the head (a snapshot
-    /// installed from elsewhere): the log is then empty up to it.
-    async fn rebase(&self, gen: u64, base: Base, keep: usize) -> LogResult<Vec<Base>>;
+    /// Bases in `unusable` (their snapshots failed to load: a fallback
+    /// boot) are dropped whatever `keep` says, so they never take the place
+    /// of one that works. Returns the bases no longer kept: nothing starts
+    /// from their snapshots any more. `base.at` may be past the head (a
+    /// snapshot installed from elsewhere): the log is then empty up to it.
+    async fn rebase(&self, gen: u64, base: Base, keep: usize, unusable: &[Base]) -> LogResult<Vec<Base>>;
 
     /// Wait for background work (the collection after a rebase); tests use
     /// it before looking at what a rebase dropped.

@@ -329,3 +329,30 @@ async fn an_outbox_keeps_only_its_recent_frames() {
         assert!(kept <= 25, "node {node} keeps {kept} of {posted} frames");
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_call_dropped_by_an_outer_timeout_stops_waiting_and_counts() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let chat = FakeChat::new();
+    let (mut one, _two) = pair(&chat, KEY, Arc::new(Yes::default())).await;
+    chat.isolate(2, true);
+    // openraft's own timeout around the call, shorter than the call's ttl.
+    for term in 1..=5 {
+        let outer = tokio::time::timeout(Duration::from_secs(1), vote(&mut one, 2, term, Duration::from_secs(60)));
+        assert!(outer.await.is_err(), "the outer timeout fired first");
+    }
+    assert_eq!(one.pending_calls(), 0, "no dropped call is left waiting");
+
+    let timeouts = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find(|(k, ..)| {
+            k.key().name() == "openraft_chat_call_seconds" && k.key().labels().any(|l| l.value() == "timeout")
+        })
+        .map(|(.., v)| v);
+    assert!(matches!(timeouts, Some(DebugValue::Histogram(ref h)) if h.len() == 5), "{timeouts:?}");
+}

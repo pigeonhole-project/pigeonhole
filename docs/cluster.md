@@ -502,7 +502,12 @@ A follower behind the kept log gets the leader's snapshot through
 link (a chat frame, a document when large). Three things this needed:
 - the send timeout above;
 - a follower's purge waits for the snapshot it installs, since Raft asks
-  to purge while the state machine is still storing it;
+  to purge while the state machine is still storing it. Raft's core awaits
+  a purge, so the purge only hands it to the log's writer and returns; the
+  writer rebases once a stored snapshot covers the purge point, with no
+  deadline (a snapshot in many parts on Discord takes minutes), and writes
+  queued behind it wait, in order. Only a stopped tablet ends the wait,
+  and then the writer writes nothing more;
 - a snapshot of the follower's own, built before the install and stored
   after it, does not take the installed one's place.
 

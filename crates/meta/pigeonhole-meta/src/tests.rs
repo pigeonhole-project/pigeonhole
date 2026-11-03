@@ -114,6 +114,12 @@ fn raw_entry(term: u64, position: Position, cmd: Command) -> Entry {
     Entry { term, payload: postcard::to_stdvec(&entry).unwrap() }
 }
 
+/// The term of the entry at `head`.
+async fn head_term(log: &dyn LogStore, head: Head) -> u64 {
+    let last = log.read(head.position - 1, head).await.unwrap();
+    last[0].1.term
+}
+
 /// Wait until `f` holds (a background removal finished).
 async fn eventually(what: &str, f: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -176,6 +182,24 @@ impl StateMachine for Names {
         self.0.push(name);
         Ok(Ok(self.0.len()))
     }
+}
+
+/// A snapshot without a namespace (one added since it was taken) leaves
+/// that namespace empty, whatever it held before the restore.
+#[test]
+fn a_restore_empties_a_namespace_the_snapshot_lacks() {
+    let states = collect_states(counter().with::<Names>()).unwrap();
+    apply_command(&states, 1, &command::<Counter>(&op(1, 5))).unwrap();
+    let snap = take_snapshot(&states, 1);
+    apply_command(&states, 2, &command::<Names>(&"a".to_string())).unwrap();
+    apply_command(&states, 3, &command::<Counter>(&op(2, 1))).unwrap();
+    assert_eq!(snap.states.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["counter", "names"]);
+    let without_names = TabletSnapshot { states: snap.states.into_iter().filter(|s| s.0 != "names").collect(), ..snap };
+
+    restore_states(&states, &without_names).unwrap();
+    let names = states["names"].as_any().downcast_ref::<StateCell<Names>>().unwrap().0.read().unwrap().0.clone();
+    let counter = states["counter"].as_any().downcast_ref::<StateCell<Counter>>().unwrap().0.read().unwrap().v;
+    assert_eq!((names, counter), (Vec::<String>::new(), 5));
 }
 
 #[tokio::test]
@@ -315,6 +339,17 @@ async fn second_incarnation_fences_the_first_without_losing_acknowledged_entries
     b.propose::<Counter>(op(1 << 40, 1)).await.unwrap().unwrap();
 }
 
+/// The last handle to a tablet dropped after its runtime ended (a test's or
+/// a tool's) has nothing to shut down on, and does not panic.
+#[test]
+fn a_tablet_dropped_after_its_runtime_does_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let store = runtime.block_on(open_on(dir.path()));
+    drop(runtime);
+    drop(store);
+}
+
 #[tokio::test]
 async fn crash_between_append_and_apply_is_applied_once_on_boot() {
     let dir = tempfile::tempdir().unwrap();
@@ -325,7 +360,7 @@ async fn crash_between_append_and_apply_is_applied_once_on_boot() {
     // An incarnation that appended an entry and died before committing it.
     let log = log_of(&dir.path().join("log"));
     let head = log.claim(2).await.unwrap();
-    let term = log.discover().await.unwrap().unwrap().head_term;
+    let term = head_term(log.as_ref(), head).await;
     let next = head.position + 1;
     assert_eq!(log.append(2, &[raw_entry(term, next, command::<Counter>(&op(2, 5)))]).await.unwrap(), next);
 
@@ -346,7 +381,7 @@ async fn entries_of_another_command_format_refuse_to_replay() {
     }
     let log = log_of(&dir.path().join("log"));
     let head = log.claim(2).await.unwrap();
-    let term = log.discover().await.unwrap().unwrap().head_term;
+    let term = head_term(log.as_ref(), head).await;
     let mut old = command::<Counter>(&op(2, 1));
     old.version = Counter::VERSION + 1;
     log.append(2, &[raw_entry(term, head.position + 1, old)]).await.unwrap();
@@ -418,7 +453,7 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
     let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
     let stored = StoredSnapshot { log_id: head.log_id, at: head.position, data };
     let snapshot = snaps_of(&log_dir).put(&stored, None).await.unwrap();
-    log.rebase(2, raft::base_of(&meta, snapshot), 1).await.unwrap();
+    log.rebase(2, raft::base_of(&meta, snapshot), 1, &[]).await.unwrap();
     drop(log);
 
     let err = open_dir(&log_dir, counter()).await.err().expect("boot must fail");
@@ -571,6 +606,54 @@ async fn a_boot_falls_back_to_an_older_base_when_the_newest_snapshot_is_unreadab
     }
 }
 
+/// After a fallback boot the next rebase drops the damaged base, not the
+/// one that loaded: with two kept, the log keeps the new base and the one
+/// the boot started from, and the damaged snapshot is removed.
+#[tokio::test]
+async fn after_a_fallback_boot_the_base_that_loaded_is_kept_and_the_damaged_one_dropped() {
+    use crate::{BlobSnapshotStore, ChainLogStore};
+    let (log_chat, snap_chat) = (Arc::new(MemoryBlobStore::new()), Arc::new(MemoryBlobStore::new()));
+    let snapshots = Arc::new(Unreadable { inner: Arc::new(BlobSnapshotStore::new(snap_chat)), bad: Mutex::default() });
+    let opts = MetaOptions { snapshot_every: Some(5), keep_snapshots: 2, ..MetaOptions::default() };
+    let open =
+        || MetaStore::open(Arc::new(ChainLogStore::new(log_chat.clone())), snapshots.clone(), counter(), opts.clone());
+    let a = open().await.unwrap();
+    for i in 0..23u64 {
+        a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    wait_base(&a, 15).await;
+    let d = a.log.discover().await.unwrap().unwrap();
+    let (damaged, good) = (d.base.clone().unwrap(), d.older[0].clone());
+    *snapshots.bad.lock().unwrap() = Some(damaged.snapshot.clone());
+    drop(a);
+
+    let b = open().await.unwrap();
+    // It booted from the older base and asked for a snapshot at once: the
+    // log moves onto it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let d = loop {
+        let d = b.log.discover().await.unwrap().unwrap();
+        if d.base.as_ref().is_some_and(|b| b.snapshot != damaged.snapshot) {
+            break d;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the log never moves off the damaged base");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(d.older, vec![good.clone()], "kept: the new base and the one that loaded");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while snapshots.inner.get(&damaged.snapshot).await.is_ok() {
+        assert!(tokio::time::Instant::now() < deadline, "the damaged snapshot is never removed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    snapshots.inner.get(&good.snapshot).await.expect("the base that loaded stays");
+    drop(b);
+
+    // The new base damaged too: the next boot still has one to fall back on.
+    *snapshots.bad.lock().unwrap() = d.base.map(|b| b.snapshot);
+    let c = open().await.unwrap();
+    assert_eq!(value(&c), 23);
+}
+
 /// A follower starts building a snapshot of its own (at 4), then installs a
 /// newer one from its leader (at 8) before the build is stored: the build
 /// comes too late to be current, and the leader's stays stored.
@@ -579,14 +662,7 @@ async fn a_build_stored_after_an_install_of_a_newer_snapshot_stays_out() {
     use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
     let snapshots: Arc<dyn SnapshotStore> = Arc::new(crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())));
     let (stop, _) = watch::channel(None);
-    let shared = Arc::new(raft::Shared {
-        stop,
-        applied: AtomicU64::new(0),
-        based: AtomicU64::new(0),
-        current: Mutex::new(None),
-        kept: tokio::sync::Notify::new(),
-        base: Mutex::new(None),
-    });
+    let shared = Arc::new(raft::Shared::new(stop, snapshots.clone()));
     // Raft's index 3 is position 4, 7 is 8.
     let (at4, at8) = (raft::solo_meta(3), raft::solo_meta(7));
     let mut sm = raft::StateMachine {
@@ -608,6 +684,79 @@ async fn a_build_stored_after_an_install_of_a_newer_snapshot_stays_out() {
     assert_eq!(current.meta.last_log_id, at8.last_log_id, "the leader's is current");
     let stored = snapshots.get(&current.snapshot).await.unwrap();
     assert_eq!(stored.at, 8, "the leader's snapshot is still stored");
+}
+
+/// A snapshot store whose `put` takes two minutes (a snapshot in many parts
+/// on a chat).
+struct SlowPut(Arc<dyn SnapshotStore>);
+
+#[async_trait::async_trait]
+impl SnapshotStore for SlowPut {
+    async fn put(&self, s: &StoredSnapshot, after: Option<&SnapshotRef>) -> Result<SnapshotRef> {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        self.0.put(s, after).await
+    }
+    async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
+        self.0.get(r).await
+    }
+    async fn newest(&self) -> Result<Option<StoredSnapshot>> {
+        self.0.newest().await
+    }
+    async fn remove(&self, r: &SnapshotRef) -> Result<()> {
+        self.0.remove(r).await
+    }
+}
+
+/// A follower installs its leader's snapshot (at 8, past its empty log)
+/// into a slow store, and Raft asks to purge behind it meanwhile: the purge
+/// returns at once, the log is rebased once the snapshot is stored however
+/// long that takes, and a write queued behind the purge waits for it.
+#[tokio::test(start_paused = true)]
+async fn a_purge_waits_for_a_slow_snapshot_store_without_a_deadline() {
+    use openraft::storage::{RaftLogStorage, RaftStateMachine};
+    let log = Arc::new(crate::ChainLogStore::new(Arc::new(MemoryBlobStore::new())));
+    let head = log.claim(1).await.unwrap();
+    let snapshots: Arc<dyn SnapshotStore> =
+        Arc::new(SlowPut(Arc::new(crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())))));
+    let (stop, stopped) = watch::channel(None);
+    let shared = Arc::new(raft::Shared::new(stop, snapshots.clone()));
+    let mut adapter = raft::LogAdapter::new(log.clone(), 1, head.log_id, 0, shared.clone(), raft::Keep(2));
+    let mut sm = raft::StateMachine {
+        states: Arc::new(collect_states(counter()).unwrap()),
+        snapshots,
+        history: head.log_id,
+        last_applied: None,
+        membership: Default::default(),
+        shared: shared.clone(),
+    };
+    let at8 = raft::solo_meta(7);
+    let data = raft::RaftSnapshot { meta: at8.clone(), tablet: take_snapshot(&sm.states, 8) }.encode();
+    let t0 = tokio::time::Instant::now();
+    let install = tokio::spawn(async move {
+        sm.install_snapshot(&at8, Box::new(std::io::Cursor::new(data))).await.map(|_| sm.last_applied)
+    });
+    tokio::task::yield_now().await;
+
+    adapter.purge(at8_id()).await.unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(1), "the purge does not wait for the store");
+    let vote = openraft::Vote::new(3, raft::SOLO);
+    let mut voter = adapter.clone();
+    let voted = tokio::spawn(async move { voter.save_vote(&vote).await });
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!((shared.based.load(Ordering::SeqCst), voted.is_finished()), (0, false), "nothing before it is stored");
+
+    assert!(install.await.unwrap().is_ok());
+    voted.await.unwrap().unwrap();
+    assert!(t0.elapsed() >= Duration::from_secs(120));
+    assert_eq!(shared.based.load(Ordering::SeqCst), 8);
+    let d = log.discover().await.unwrap().unwrap();
+    assert_eq!((d.base.map(|b| b.at), d.head.position, d.vote.is_some()), (Some(8), 8, true));
+    assert!(stopped.borrow().is_none(), "the tablet goes on");
+}
+
+/// Raft's id of the entry at position 8 in a cluster of one (term 1).
+fn at8_id() -> raft::RaftLogId {
+    raft::solo_meta(7).last_log_id.unwrap()
 }
 
 #[tokio::test]

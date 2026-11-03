@@ -171,8 +171,12 @@ impl pigeonhole_meta::LogStore for GatedLog {
         self.inner.discover().await
     }
 
-    fn read(&self, from: pigeonhole_meta::Position, head: pigeonhole_meta::Head) -> pigeonhole_meta::EntryStream {
-        self.inner.read(from, head)
+    async fn read(
+        &self,
+        from: pigeonhole_meta::Position,
+        head: pigeonhole_meta::Head,
+    ) -> pigeonhole_meta::LogResult<Vec<(pigeonhole_meta::Position, pigeonhole_meta::Entry)>> {
+        self.inner.read(from, head).await
     }
 
     async fn rebase(
@@ -180,8 +184,9 @@ impl pigeonhole_meta::LogStore for GatedLog {
         gen: u64,
         base: pigeonhole_meta::Base,
         keep: usize,
+        unusable: &[pigeonhole_meta::Base],
     ) -> pigeonhole_meta::LogResult<Vec<pigeonhole_meta::Base>> {
-        self.inner.rebase(gen, base, keep).await
+        self.inner.rebase(gen, base, keep, unusable).await
     }
 
     async fn settle(&self) {
