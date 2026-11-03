@@ -29,7 +29,8 @@ before deleting:
 1. drops every key some chunk in the state owns (`owned_part_keys_among`,
    live or released: released parts are reclaim's to delete);
 2. confirms the tablet still holds its generation (`MetaStore::confirm_active`,
-   a round trip through the log); a fenced incarnation deletes nothing.
+   a round trip through the log; on a lease log also inside the lease's
+   local deadline, docs/discord-lease.md); a fenced incarnation deletes nothing.
 
 No grace period and no per-batch in-flight check are needed: a key enters the
 candidate range only after its pin is gone, i.e. after its commit is visible in

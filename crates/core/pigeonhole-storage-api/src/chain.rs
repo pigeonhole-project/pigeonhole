@@ -127,12 +127,23 @@ pub trait Chain: BlobBackend {
 /// A [`Chain`] that can hold a log by a lease (docs/discord-lease.md): its
 /// ids carry the store's time, and it puts and lists blobs outside the
 /// chain. Links there are scarce, so only the lease records are linked.
+///
+/// Its chain holds lease records only: a claim reads the tail as one (it
+/// decodes it). So its [`Chain::put_loose`] must put a plain blob, not a
+/// chain member (the default links one): snapshots in the log's store would
+/// otherwise become the tail and break the next claim. It can, since it
+/// lists ([`Self::list_after`]).
 #[async_trait]
 pub trait LeaseChain: Chain {
     /// When the store stamped blob `id`, in ms of the store's own clock:
     /// the stamps of its blobs, not a reader's clock, tell whether a batch
     /// fell inside a lease.
     fn stamp_ms(&self, id: &Self::Id) -> u64;
+
+    /// The store's clock now, in the ms of [`Self::stamp_ms`]: a claimant
+    /// waits by it until the old lease ran out. Puts nothing in the chain
+    /// and leaves nothing a reader of the log would see.
+    async fn now_ms(&self) -> Result<u64>;
 
     /// Put a blob that names `prev` as a chain member does, without linking
     /// it: nothing decides a winner, and [`Chain::tail`] does not see it. It
@@ -184,6 +195,9 @@ impl<C: Chain> Chain for std::sync::Arc<C> {
 impl<C: LeaseChain> LeaseChain for std::sync::Arc<C> {
     fn stamp_ms(&self, id: &Self::Id) -> u64 {
         (**self).stamp_ms(id)
+    }
+    async fn now_ms(&self) -> Result<u64> {
+        (**self).now_ms().await
     }
     async fn put_unlinked(&self, prev: &Self::Id, label: &str, data: Bytes) -> Result<Self::Id> {
         (**self).put_unlinked(prev, label, data).await

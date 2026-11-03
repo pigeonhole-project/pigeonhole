@@ -436,3 +436,41 @@ async fn a_release_after_a_renewal_in_flight() {
     assert_eq!(b.claim(2).await.unwrap().position, 2);
     assert!(t0.elapsed() < LEASE / 2, "no wait after a release: {:?}", t0.elapsed());
 }
+
+/// `confirm` (before a sweep deletes) keeps the lease as an append does: an
+/// idle writer whose lease ran out renews before it says yes, and says no
+/// when the renewal comes back past the local deadline.
+#[tokio::test]
+async fn confirm_keeps_the_lease_and_its_deadline() {
+    let channel = Arc::new(FakeDiscord::new(89));
+    let a = leased(&channel);
+    a.claim(1).await.unwrap();
+    a.append(1, &[entry(1)]).await.unwrap();
+    tokio::time::sleep(LEASE * 2).await;
+    let threads = channel.calls().start_thread;
+    a.confirm(1).await.unwrap();
+    assert_eq!(channel.calls().start_thread, threads + 1, "renewed before confirming");
+    tokio::time::sleep(LEASE * 2).await;
+    channel.delay_next_answer(LEASE); // the renewal's post
+    let late = a.confirm(1).await;
+    assert!(matches!(late, Err(LogError::Other(_))), "{late:?}");
+    // Not fenced: the next write renews again and goes on.
+    a.append(1, &[entry(2)]).await.unwrap();
+    assert_eq!(history(leased(&channel).as_ref()).await, vec![1, 2]);
+}
+
+/// The clock probe is a plain post, deleted: nothing in the chain, nothing
+/// left in the channel.
+#[tokio::test]
+async fn the_clock_probe_leaves_nothing() {
+    use pigeonhole_storage_api::LeaseChain;
+    let channel = Arc::new(FakeDiscord::new(90));
+    let s = channel_store(&channel);
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let now = s.now_ms().await.unwrap();
+    let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    assert!((before..=after).contains(&now), "{before} <= {now} <= {after}");
+    assert!(channel.message_ids().is_empty(), "{:?}", channel.message_ids());
+    assert!(channel.thread_ids().is_empty());
+    assert_eq!(s.tail().await.unwrap(), None);
+}
