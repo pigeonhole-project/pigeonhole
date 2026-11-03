@@ -78,10 +78,14 @@ garbage, whatever its id and whenever it landed.
    `(log_id, gen, first)`: nonces are per bot across channels; a resend
    deduplicates only within ~3 minutes), get its id `b`.
 2. Start a thread from `head` named `next b g<g>`.
-3. Created: `b` is committed and is the new head, `Ok`. `160004`: someone
-   linked `head` first — a newer generation's claim — `Fenced`; `b` stays
-   garbage. Any other failure: read `head`'s `thread` field; it names `b` (our
-   link went through) or another message (fenced), or there is none (retry).
+3. Created: `b` is committed and is the new head, `Ok`. `160004`: read
+   `head`'s thread. It names `b`: our own link — an earlier attempt of this
+   start made the thread, its answer was lost (a network error, a 5xx after
+   the server applied it) and the client's retry was told 160004 — so `b` is
+   committed, as on Created. It names another message: someone linked `head`
+   first — a newer generation's claim — `Fenced`; `b` stays garbage. Any
+   other failure: read `head`'s `thread` field; it names `b` (our link went
+   through) or another message (fenced), or there is none (retry).
 
 **claim(g)**:
 
