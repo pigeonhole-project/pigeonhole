@@ -12,7 +12,7 @@
 
 use crate::blob_db::{ChunkId, StoredBlock};
 use anyhow::Result;
-use pigeonhole_blob::{BlobId, BlobLocator, Owner, PartLayout, ReplicaLayout};
+use pigeonhole_blob::{BlobId, BlobLocator, InstanceRole, Owner, PartLayout, ReplicaLayout};
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -79,8 +79,8 @@ pub struct InstanceRec {
     pub kind: String,
     pub fingerprint: String,
     pub location: String,
-    /// read-write | read-only | retired
-    pub state: String,
+    /// Retired once the config no longer lists it.
+    pub state: InstanceRole,
 }
 
 /// One instance's copy of a chunk.
@@ -144,7 +144,7 @@ type Applied = std::result::Result<(), ChunkReject>;
 
 impl StateMachine for ChunkState {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 7;
+    const VERSION: u32 = 8;
     type Command = ChunkCommand;
     type Reply = ();
     type Reject = ChunkReject;
@@ -209,13 +209,13 @@ impl ChunkState {
         let ids: HashSet<&str> = configured.iter().map(|(id, _)| id.as_str()).collect();
         for (id, rec) in &mut instances {
             if !ids.contains(id.as_str()) {
-                rec.state = "retired".into();
+                rec.state = InstanceRole::Retired;
             }
         }
         instances.extend(configured);
         let mut locations = HashSet::new();
         for (id, rec) in &instances {
-            if rec.state == "read-write" && !locations.insert(rec.location.as_str()) {
+            if rec.state == InstanceRole::ReadWrite && !locations.insert(rec.location.as_str()) {
                 let why = format!("instance {id}: location {} already has a read-write instance", rec.location);
                 return Err(ChunkReject::BadInstances(why));
             }
@@ -430,7 +430,7 @@ mod tests {
     fn command_encoding_is_pinned() {
         let cmd = ChunkCommand::Release { chunk_ids: vec![1, 2] };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 2, 2, 4]);
-        assert_eq!(ChunkState::VERSION, 7);
+        assert_eq!(ChunkState::VERSION, 8);
     }
 
     fn instance() -> InstanceRec {
@@ -438,7 +438,7 @@ mod tests {
             kind: "memory".into(),
             fingerprint: "f".into(),
             location: "here".into(),
-            state: "read-write".into(),
+            state: InstanceRole::ReadWrite,
         }
     }
 

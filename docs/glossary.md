@@ -1,6 +1,6 @@
 # Glossary
 
-Terms used in code, comments, and docs (Stage B onward).
+Terms used in code, comments, and docs.
 
 | Term | Meaning | Size | Mutability | Owner |
 |---|---|---|---|---|
@@ -26,7 +26,7 @@ Terms used in code, comments, and docs (Stage B onward).
 | **Owner** | A deployment's 32 random bits, chosen once and kept in the tablet; in every blob id it mints and in a marker pinned in each channel store, so two deployments never sweep each other's blobs ([store-owner.md](store-owner.md)) | u32 | fixed | tablet + chunk store |
 | **Inline object** | An object of at most `[inline] max_object_size` kept in its metadata record instead of chunks; the cooler moves it out once cold ([inline-objects.md](inline-objects.md)) | ≤ 1 KiB default | until cooled | S3 gateway + tablet |
 | **Upload pin** | Process-local mark of an upload not committed yet; with the others it sets the sweep **horizon** | — | until commit | `UploadPins` |
-| **Read pin** | Process-local mark of a chunk being read; reclaim waits for it | — | for one read | `BlobDb` |
+| **Read pin** | Process-local mark of a chunk being read; reclaim waits for it | — | while the read's stream lives | `BlobDb` (`ReadStream` holds it) |
 | **Snapshot** | All namespace states as of a position (`TabletSnapshot`), kept in a **SnapshotStore** (`local_disk`, `memory`, `telegram`, `discord`) | state size | replaced | tablet |
 | **Base** | The stored snapshot a log starts from (`at` + `SnapshotRef`), set by `rebase`; entries ≤ `at` are dropped | — | moves forward | `LogStore` |
 | **Node** | One process of a Raft cluster, with its own copy of the tablet (its own log and snapshots) and the shared blob stores ([cluster.md](cluster.md)) | — | config | binary |

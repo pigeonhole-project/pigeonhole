@@ -1,4 +1,4 @@
-//! Multi-instance replication: fan-out writes and failover reads (stage D.2).
+//! Multi-instance replication: fan-out writes and failover reads.
 
 use crate::backend::{bytes_stream, BoxByteStream};
 use crate::erase::DynBlobBackend;
@@ -251,11 +251,6 @@ impl Replicated {
         })
     }
 
-    pub fn with_member_timeout(mut self, timeout: Duration) -> Self {
-        self.member_timeout = timeout;
-        self
-    }
-
     /// Upload pins of this placement group (shared with the sweeper and repair).
     pub fn pins(&self) -> &Arc<UploadPins> {
         &self.pins
@@ -278,10 +273,6 @@ impl Replicated {
 
     pub fn member(&self, instance_id: &str) -> Option<&Arc<dyn DynBlobBackend>> {
         self.by_id.get(instance_id)
-    }
-
-    pub fn selector(&self) -> &Arc<dyn ReplicaSelector> {
-        &self.selector
     }
 
     pub fn max_blob_size(&self) -> usize {
@@ -395,11 +386,6 @@ pub struct ChunkReplicaWriter {
 }
 
 impl ChunkReplicaWriter {
-    /// Sum of unfilled open-part buffers across live members (memory budget).
-    pub fn open_part_bytes(&self) -> usize {
-        self.writers.iter().filter(|w| !w.failed).filter_map(|w| w.packer.as_ref()).map(|p| p.open_bytes()).sum()
-    }
-
     /// Fan-out one encoded block to all live members (`Bytes` clone is refcounted).
     pub async fn push(&mut self, block: EncodedBlock) -> Result<()> {
         let timeout = self.timeout;
@@ -526,8 +512,11 @@ struct ActivePart {
     /// Absolute block range this download covers.
     blocks_left: Range<u32>,
     stream: BoxByteStream,
-    /// Expected stored length for `blocks_left` (`u64::MAX` = read until EOF).
+    /// Stored length of `blocks_left`.
     expected_len: u64,
+    /// Bytes before them in the stream (a store that cannot serve a range
+    /// sends the whole part).
+    skip: u64,
 }
 
 impl ReadState {
@@ -557,9 +546,9 @@ impl ReadState {
             let mut active = self.active.take().expect("active part");
             let mut buf = BytesMut::new();
             let mut failed = false;
+            let want = active.skip + active.expected_len;
             loop {
-                let done = active.expected_len != u64::MAX && (buf.len() as u64) >= active.expected_len;
-                if done {
+                if buf.len() as u64 >= want {
                     break;
                 }
                 match tokio::time::timeout(self.timeout, active.stream.next()).await {
@@ -593,15 +582,13 @@ impl ReadState {
                 continue;
             }
 
-            if active.expected_len != u64::MAX && (buf.len() as u64) < active.expected_len {
+            if (buf.len() as u64) < want {
                 // A replica that ends early serves badly: route around it.
                 self.failed(&active.instance, Failure::Unavailable);
                 continue;
             }
-
-            if active.expected_len != u64::MAX && (buf.len() as u64) > active.expected_len {
-                buf.truncate(active.expected_len as usize);
-            }
+            let mut buf = buf.split_off(active.skip as usize);
+            buf.truncate(active.expected_len as usize);
 
             self.next_block = active.blocks_left.end;
             self.selector.record_success(&active.instance);
@@ -633,15 +620,13 @@ impl ReadState {
             let Some(backend) = &self.backends[ri] else {
                 continue;
             };
-            let Some((part, byte_range, block_range, expected_len)) =
-                plan_part_read(layout, self.next_block, self.end_block)
-            else {
+            let Some((part, byte_range, block_range)) = plan_part_read(layout, self.next_block, self.end_block) else {
                 continue;
             };
-
-            let range = match backend.limits().supports_range {
-                RangeSupport::None => None,
-                RangeSupport::BestEffort => byte_range,
+            let expected_len = byte_range.end - byte_range.start;
+            let (range, skip) = match backend.limits().supports_range {
+                RangeSupport::None => (None, byte_range.start),
+                RangeSupport::BestEffort => (Some(byte_range), 0),
             };
 
             let get = backend.get(&part.locator, range);
@@ -652,6 +637,7 @@ impl ReadState {
                         blocks_left: block_range,
                         stream,
                         expected_len,
+                        skip,
                     });
                     return Ok(true);
                 }
@@ -673,12 +659,9 @@ impl ReadState {
     }
 }
 
-/// Plan a GET covering `[next, end)` starting at `next` within one part.
-fn plan_part_read(
-    layout: &ReplicaLayout,
-    next: u32,
-    end: u32,
-) -> Option<(&PartLayout, Option<ByteRange>, Range<u32>, u64)> {
+/// Plan a GET covering `[next, end)` starting at `next` within one part:
+/// the part, the bytes of it and the blocks they hold.
+fn plan_part_read(layout: &ReplicaLayout, next: u32, end: u32) -> Option<(&PartLayout, ByteRange, Range<u32>)> {
     for part in &layout.parts {
         let part_end = part.first_block + part.block_count;
         if next >= part_end || end <= part.first_block {
@@ -693,15 +676,8 @@ fn plan_part_read(
         let local_from = (from - part.first_block) as usize;
         let local_to = (to - part.first_block) as usize;
         if part.block_stored_lens.len() < local_to {
-            // Missing lens: download whole part from block 0.
-            let total: u64 = part.block_stored_lens.iter().map(|&l| l as u64).sum();
-            let total = if total == 0 {
-                // Unknown size — stream until EOF; expected_len = u64::MAX sentinel handled by EOF.
-                u64::MAX
-            } else {
-                total
-            };
-            return Some((part, None, part.first_block..part_end, total));
+            // Lengths short of its blocks: bad metadata, not a replica to read.
+            return None;
         }
         let mut off = 0u64;
         for len in &part.block_stored_lens[..local_from] {
@@ -711,8 +687,7 @@ fn plan_part_read(
         for len in &part.block_stored_lens[local_from..local_to] {
             need += u64::from(*len);
         }
-        let range = Some(off..(off + need));
-        return Some((part, range, from..to, need));
+        return Some((part, off..off + need, from..to));
     }
     None
 }
@@ -1014,5 +989,19 @@ mod tests {
             firsts.insert(order[0]);
         }
         assert_eq!(firsts.len(), 2, "a and b, close, take turns");
+    }
+
+    /// A store that cannot serve a range sends the whole part: the blocks
+    /// asked for are cut out of it.
+    #[tokio::test]
+    async fn a_store_without_ranges_reads_blocks_inside_a_part() {
+        let mut a = MockMem::new("a", 1000);
+        Arc::get_mut(&mut a).unwrap().limits.supports_range = RangeSupport::None;
+        let rep = Replicated::new(vec![a.erase()], 1, Arc::new(CheapestFirst::new())).unwrap();
+        let blocks = vec![block(1, 100), block(2, 100), block(3, 100)];
+        let layouts = write_blocks(&rep, &blocks).await.unwrap();
+        assert_eq!(layouts[0].parts.len(), 1);
+        let got = collect_stream(rep.read(&layouts, 1..2).await.unwrap()).await.unwrap();
+        assert_eq!(got, Bytes::from(vec![2u8; 100]));
     }
 }

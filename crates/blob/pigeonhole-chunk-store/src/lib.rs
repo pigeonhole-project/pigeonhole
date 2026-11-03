@@ -13,14 +13,13 @@ pub use blob_db::{
     is_chunk_gone, unique_chunk_ids, BlobDb, ChunkGone, ChunkMeta, ChunkStats, ReadPin, StoredBlock, Unrepairable,
     REPAIR_BACKOFF, REPAIR_BACKOFF_MAX, REPAIR_MAX_ATTEMPTS,
 };
-pub use block_cache::BlockCache;
+pub use block_cache::{BlockCache, CacheConfig};
 pub use commands::{ChunkCommand, ChunkReject, ChunkState, InstanceRec, PartRec, Replica};
-pub use ingest::{IngestHasher, IngestOptions};
+pub use ingest::IngestOptions;
 pub use layer::{
     check_block_fits_members, default_layer_opts, to_the_end, ChunkId, ChunkStore, Committing, Extent, Ingested,
     PendingChunks,
 };
-pub use pigeonhole_blob::CacheConfig;
 pub use pigeonhole_blob::{collect_stream, BoxByteStream, UploadPin, UploadPins};
 pub use pigeonhole_codec::{ByteBudget, ChunkCodec};
 pub use read::{ReadStream, READ_WINDOW};

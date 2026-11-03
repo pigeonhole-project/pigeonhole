@@ -1,7 +1,6 @@
 //! Pluggable blob storage.
 
 mod backend;
-pub mod cache;
 pub mod erase;
 pub mod metrics;
 pub mod part_packer;
@@ -9,7 +8,6 @@ pub mod replicated;
 pub mod typed;
 pub mod upload_pins;
 pub use backend::{bytes_stream, collect_stream, slice_range, BoxByteStream};
-pub use cache::CacheConfig;
 pub use erase::{erase, DynBlobBackend, Erased, SharedBackend};
 pub use metrics::{
     describe, inflight_dec, inflight_inc, record_429, record_background_pass, record_bytes_from_backend,

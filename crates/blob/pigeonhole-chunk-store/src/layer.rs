@@ -1,4 +1,5 @@
-//! Gateway-facing blob layer API (stage E: chunks on parts via Replicated).
+//! The chunk store gateways use: ingest a body into chunks (their parts
+//! uploaded through [`Replicated`]), commit them, read extents back.
 //!
 //! Gateways see only [`ChunkId`] / [`Extent`] — not locators or instances.
 
@@ -144,7 +145,8 @@ pub fn to_the_end<T: Send + 'static>(
     }
 }
 
-/// Blob layer: metadata (`blob.db`) + replicated typed backends.
+/// Chunks: their metadata in the tablet ([`BlobDb`]), their parts in the
+/// placement's stores ([`Replicated`]), and the block caches.
 pub struct ChunkStore {
     db: BlobDb,
     replicated: Arc<Replicated>,
@@ -328,15 +330,6 @@ impl ChunkStore {
 
     pub fn replicated(&self) -> &Arc<Replicated> {
         &self.replicated
-    }
-
-    /// First write member (journal helpers / tests).
-    pub fn write_backend(&self) -> SharedBackend {
-        self.replicated.members()[0].clone()
-    }
-
-    pub fn write_instance_id(&self) -> &str {
-        &self.replicated.members()[0].instance().id
     }
 
     pub async fn put_small(&self, data: Bytes) -> Result<ChunkId> {

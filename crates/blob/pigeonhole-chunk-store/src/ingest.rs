@@ -7,17 +7,6 @@ use pigeonhole_codec::{self as chunker, ByteBudget, ChunkCodec};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-/// Optional streaming hasher updated with plaintext body bytes during ingest.
-///
-/// Gateways (e.g. S3 CRC/SHA) can implement this; the layer stays free of protocol crates.
-pub trait IngestHasher: Send {
-    fn update(&mut self, data: &[u8]);
-}
-
-impl IngestHasher for () {
-    fn update(&mut self, _data: &[u8]) {}
-}
-
 #[derive(Clone)]
 pub struct IngestOptions {
     /// Most stored (encoded) bytes in a chunk; 256 MiB logical at most.

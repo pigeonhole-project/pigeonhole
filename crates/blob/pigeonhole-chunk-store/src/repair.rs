@@ -1,4 +1,5 @@
-//! Stage I: replica repair / backfill with re-packing onto the target instance.
+//! Replica repair and backfill: copy a chunk onto a member of its shard
+//! that lacks it, re-packed into that store's blob size.
 
 use crate::blob_db::{BlobDb, ChunkId, StoredBlock};
 use anyhow::{bail, Context, Result};
@@ -416,11 +417,8 @@ async fn read_encoded_blocks(
     blocks: &[StoredBlock],
 ) -> Result<Vec<EncodedBlock>> {
     if blocks.is_empty() {
-        // Raw single-part chunk (no chunk_blocks rows).
-        let raw = collect_stream(replicated.read(sources, 0..1).await.context("repair read raw")?).await?;
-        return Ok(vec![EncodedBlock { stored: raw.clone(), logical_len: raw.len() as u32 }]);
+        bail!("repair: a chunk without blocks");
     }
-
     let end = blocks.len() as u32;
     let blob = collect_stream(replicated.read(sources, 0..end).await.context("repair read blocks")?).await?;
 
@@ -521,7 +519,7 @@ mod tests {
         .with_instance_id("b-10");
         let b: SharedBackend = Arc::new(erase(b_store));
         let rep2 = Arc::new(Replicated::new(vec![a, b.clone()], 1, Arc::new(CheapestFirst::new())).unwrap());
-        // Sync new instance into blob.db.
+        // The new instance, into the tablet.
         layer
             .db()
             .sync_instances(&rep2.members().iter().map(|m| m.instance().clone()).collect::<Vec<_>>())

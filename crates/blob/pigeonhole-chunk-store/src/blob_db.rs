@@ -221,11 +221,7 @@ impl BlobDb {
                     (false, false) => st.unreferenced += 1,
                 }
                 st.logical_bytes += c.logical_size.max(0) as u64;
-                let stored = if c.blocks.is_empty() {
-                    c.logical_size.max(0) as u64
-                } else {
-                    c.blocks.iter().map(|b| u64::from(b.stored_len)).sum()
-                };
+                let stored: u64 = c.blocks.iter().map(|b| u64::from(b.stored_len)).sum();
                 for instance in c.replicas.keys() {
                     *st.stored_bytes.entry(instance.clone()).or_default() += stored;
                 }
@@ -301,7 +297,7 @@ impl BlobDb {
                     kind: i.kind.into(),
                     fingerprint: i.fingerprint.clone(),
                     location: i.location.clone(),
-                    state: i.role.as_str().into(),
+                    state: i.role,
                 };
                 (i.id.clone(), rec)
             })
@@ -311,11 +307,6 @@ impl BlobDb {
 
     pub async fn list_instance_fingerprints(&self) -> Result<Vec<(String, String)>> {
         Ok(self.read(|s| s.instances.iter().map(|(id, i)| (id.clone(), i.fingerprint.clone())).collect()))
-    }
-
-    /// `read-write` / `read-only` / `retired`, or `None` if never configured.
-    pub async fn instance_state(&self, instance_id: &str) -> Result<Option<String>> {
-        Ok(self.read(|s| s.instances.get(instance_id).map(|i| i.state.clone())))
     }
 
     /// Chunk with refs = 1 and no blocks or parts (tests).
@@ -423,10 +414,6 @@ impl BlobDb {
     /// The chunk's size and refs; `None` for a missing chunk.
     pub async fn chunk_meta(&self, chunk_id: i64) -> Result<Option<ChunkMeta>> {
         Ok(self.chunk(chunk_id, |c| ChunkMeta { logical_size: c.logical_size, refs: c.refs }))
-    }
-
-    pub async fn chunk_block_count(&self, chunk_id: i64) -> Result<Option<i64>> {
-        Ok(self.chunk(chunk_id, |c| c.blocks.len() as i64))
     }
 
     /// Blocks in `block_no` order; empty for a missing chunk.
@@ -817,7 +804,7 @@ mod tests {
         };
         db.sync_instances(std::slice::from_ref(&a)).await.unwrap();
         db.sync_instances(&[]).await.unwrap();
-        assert_eq!(db.instance_state("a").await.unwrap().as_deref(), Some("retired"));
+        assert_eq!(db.read(|s| s.instances["a"].state), InstanceRole::Retired);
     }
 
     #[tokio::test]
@@ -925,8 +912,9 @@ mod tests {
                 .unwrap()
             }
         };
-        // Reclaim the highest id: plain INTEGER PRIMARY KEY would hand it out again,
-        // and anything keyed by chunk id (block cache, stale extents) would alias.
+        // Reclaim the highest id: a counter taken from the chunks left would hand
+        // it out again, and anything keyed by chunk id (block cache, stale
+        // extents) would alias.
         let old = commit(1).await;
         db.release(&[old]).await.unwrap();
         assert!(db.try_begin_reclaim(old).await.unwrap());
