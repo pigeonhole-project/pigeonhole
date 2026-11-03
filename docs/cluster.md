@@ -82,6 +82,19 @@ shows `leader` as soon as elected).
   Overrides reach every node by replication, and `DynConfig::follow`
   recomputes the knobs there. On a follower, `PUT`/`DELETE
   /admin/config/…` answer 503.
+- **The admin** (`pigeonhole-admin`: the binary's `/admin/ops`, the
+  demo's node) gates every op as the S3 port does, by the same check
+  (`MetaStore::serves`, the same messages). Each op declares where it
+  runs (`Access`, next to its handler):
+  - the leader that serves: `get`, `list`, `buckets` (they read the
+    leader's state);
+  - the leader that may write, too (not read-only): `put`, `copy`,
+    `delete`, `verify`, `repair`, `sweep` (a sweep deletes by the
+    leader's view), `dynamic_set`, `dynamic_unset`, `run_task` of a
+    leader's task;
+  - any node: what it knows of itself (`info`, with the buckets only
+    where it serves; `log`, `background`, `budgets`, `cluster`,
+    `dynamic`, `channels`), `run_task snapshot`, the demo's faults.
 
 Pins (uploads in flight, reads in flight) live in the leader's process. Its
 sweeper is the only one that deletes, so they need not travel. When the

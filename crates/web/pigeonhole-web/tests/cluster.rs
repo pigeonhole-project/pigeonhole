@@ -91,6 +91,14 @@ async fn three_nodes_in_one_process_elect_write_and_fail_over() {
     let set = r#"{"op":"dynamic_set","key":"repair.interval","value":"off"}"#;
     assert!(op(&nodes, Some(follower), set).await.is_err());
     assert!(op(&nodes, Some(follower), r#"{"op":"run_task","task":"repair"}"#).await.is_err());
+    // A sweep deletes by the leader's view: a follower's would be stale.
+    let sweep = op(&nodes, Some(follower), r#"{"op":"sweep"}"#).await.unwrap_err();
+    assert!(sweep.to_string().starts_with("not the leader"), "{sweep}");
+    // What a follower knows of itself it tells; the buckets are the leader's.
+    let info = op(&nodes, Some(follower), r#"{"op":"info"}"#).await.unwrap();
+    assert!(info["buckets"].is_null(), "{info}");
+    let info = op(&nodes, Some(first), r#"{"op":"info"}"#).await.unwrap();
+    assert_eq!(info["buckets"], serde_json::json!(["demo"]));
     // A snapshot is each node's own: a follower takes one when asked.
     op(&nodes, Some(follower), r#"{"op":"run_task","task":"snapshot"}"#).await.unwrap();
     op(&nodes, Some(first), set).await.unwrap();
