@@ -993,7 +993,3 @@ mod abandoned_send_live {
         println!("abandoned sendMedia posted: {}", !posted.is_empty());
     }
 }
-
-#[cfg(test)]
-#[path = "album_probe.rs"]
-mod album_probe;

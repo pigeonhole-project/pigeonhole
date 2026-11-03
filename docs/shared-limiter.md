@@ -316,8 +316,9 @@ Two bots per service, admins of the blobs test channel, the same host and
 IP. Each bot posted text messages one after another, as fast as the server
 let it: first one bot alone, then both at once. Our own limits were set far
 above the server's. Everything was deleted afterwards
-(`crates/storage/pigeonhole-telegram-mtproto/tests/spike_bots.rs`,
-`scripts/spike-discord-bots.py`).
+(`scripts/spike-discord-bots.py`, and an ignored test
+`pigeonhole-telegram-mtproto/tests/spike_bots.rs`, since deleted: its
+findings are here; at 9ae1d44).
 
 | | one bot | two bots at once | channel total |
 |---|---|---|---|
@@ -365,7 +366,9 @@ until the round trip (~0.3–0.5 s per send) is what is left.
    locations are its own (`FILE_REFERENCE_EXPIRED` for another, measured). Metrics: pool calls by
    member, moves, retry waits. Live, two bots, default limits, sends one
    after another: Telegram 30 in 40 s (44.8/min, one bot's budget 18/min),
-   Discord 40 in 16 s (147/min, one bot's 60/min), no rate limit hit.
+   Discord 40 in 16 s (147/min, one bot's 60/min), no rate limit hit (the
+   ignored tests that measured it, `spike_bots.rs` and `spike_pool.rs`, are
+   deleted; at 9ae1d44).
    Telegram reads spread too (decided with the user): the pooled channel
    remembers which bot holds which location of a document (from the reads
    and sends that went through it; replicas), a download goes to the holder
@@ -404,7 +407,7 @@ Telegram's one-bot numbers are those of 2026-10-29 (a one-bot run on
   (the blob's send and the log's, ~0.8 s), not on the 1/s budget.
 - **Large PUTs** are bound by the link, not by limits.
 - **Ranged GETs on Telegram are not slower**: the bench's six reads were
-  noise. Measured apart (`spike_bots.rs` `ranged_reads_one_bot_against_two`,
+  noise. Measured apart (the deleted `spike_bots.rs`, `ranged_reads_one_bot_against_two`,
   1 MiB at random offsets of a 32 MiB document, warm caches, taking
   turns): p50 174 vs 172 ms over 60 reads each, p95 1207 ms with one bot vs
   497 ms with two (reads spread over the bots' budgets).

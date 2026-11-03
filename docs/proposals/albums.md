@@ -27,10 +27,11 @@ Short answer, from the spikes below:
 ## Spikes
 
 Scripts: [scripts/spike-discord-album.py](../../scripts/spike-discord-album.py)
-and `album_probe` in `pigeonhole-telegram-mtproto` (inside the crate: it uses
-the client's private calls; `cargo test -p pigeonhole-telegram-mtproto --lib
-album_probe -- --ignored --nocapture`). Both post in the test blobs channel
-and delete what they posted. One macOS machine, home internet.
+and `album_probe` in `pigeonhole-telegram-mtproto` (an ignored test inside
+the crate, since deleted: its findings are below; `src/album_probe.rs` at
+9ae1d44). Both posted in the
+test blobs channel and deleted what they posted. One macOS machine, home
+internet.
 
 ### Discord
 

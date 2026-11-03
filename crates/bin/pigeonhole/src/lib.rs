@@ -35,7 +35,7 @@ pub mod discord {
     pub use pigeonhole_discord_http::*;
     pub use pigeonhole_storage_discord::*;
 }
-pub use pigeonhole_storage_memory::{MemoryBackend, MemoryBlobStore};
+pub use pigeonhole_storage_memory::MemoryBlobStore;
 pub use pigeonhole_types::{BackendLimits, RangeSupport};
 
 /// Every metric the binary records, crate by crate (docs/metrics.md).
