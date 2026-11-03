@@ -214,6 +214,11 @@ export class Clock {
     this.lost += performance.now() - this.since;
     this.since = null;
   }
+  // Held, the module's time moved on to `to` at once (a step); never back.
+  advance(to) {
+    const d = to - this.now();
+    if (this.since != null && d > 0) this.lost -= d;
+  }
 }
 
 // The WASI imports, with stdin given per call and stdout cut into lines.

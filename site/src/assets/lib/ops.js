@@ -8,14 +8,17 @@
 // in the demo; the demo's worker adds its own (crates/web, web.rs): `open`,
 // `restart` (a config, or the one kept: every node boots on it), `close`
 // (the page is going: the node closes, the worker ends), `isolate` (a node
-// of the cluster cut off); `reset` and `go` are the worker's alone
-// (web-worker.js: its files go, no node behind it; the page drew a batch of
-// the node's events, its clock may go on). A request may name the `node` of a
+// of the cluster cut off); `reset`, `go`, `pause` and `step` are the
+// worker's alone (web-worker.js: its files go, no node behind it; the page
+// drew a batch of the node's events, its clock may go on; the clock stopped
+// or let go; stopped, on to the node's next timer). A request may name the `node` of a
 // cluster it goes to; none: the leader.
 
 const OP_CLOSE = "close";
 export const OP_RESET = "reset";
 export const OP_GO = "go";
+export const OP_PAUSE = "pause";
+export const OP_STEP = "step";
 
 // Each op the page sends, as a request (a body, if any, goes beside it).
 export const ops = {
@@ -25,6 +28,8 @@ export const ops = {
   close: () => ({op: OP_CLOSE}),
   reset: () => ({op: OP_RESET}),
   go: seq => ({op: OP_GO, seq}),
+  pause: on => ({op: OP_PAUSE, on}),
+  step: () => ({op: OP_STEP}),
   isolate: (node, down) => ({op: "isolate", node, down}),
   // S3 (the body: the object's bytes).
   put: (bucket, key) => ({op: "put", bucket, key}),
@@ -61,6 +66,7 @@ export const MSG = {
   events: "events", // what the node logged during call `id`, as it went: {id, events, seq}
   reply: "reply", // call `id` answered: {id, reply, events: [], ms}
   tick: "tick", // what the node logged on its own between calls: {events, seq}
+  clock: "clock", // after a pause or a step: {paused, now, next} (the node's ms; next: its next timer, null: none)
 };
 export const msg = {
   waiting: () => ({type: MSG.waiting, why: "files"}),
@@ -68,6 +74,7 @@ export const msg = {
   events: (id, events) => ({type: MSG.events, id, events}),
   reply: (id, reply, ms = 0) => ({type: MSG.reply, id, reply, events: [], ms}),
   tick: events => ({type: MSG.tick, events}),
+  clock: (paused, now, next) => ({type: MSG.clock, paused, now, next: next === Infinity ? null : next}),
 };
 
 export function frame(request, body) {

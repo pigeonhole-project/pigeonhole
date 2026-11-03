@@ -27,3 +27,15 @@ test("clock: held, no time passes; released, it goes on as far behind as it stoo
   c.release(); // not held: nothing
   assert.equal(c.held, false);
 });
+
+test("clock: held, advance moves it on at once, never back; not held, it does nothing", () => {
+  const c = new Clock();
+  c.advance(c.now() + 1000);
+  assert.ok(Math.abs(c.now() - performance.now()) < 1, "not held: the wall's");
+  c.hold();
+  const at = c.now();
+  c.advance(at + 250);
+  assert.equal(c.now(), at + 250);
+  c.advance(at);
+  assert.equal(c.now(), at + 250, "never back");
+});

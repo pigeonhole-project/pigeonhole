@@ -22,6 +22,11 @@
   <p class="status" id="status" role="status">{{try.loading}}</p>
   <nav class="nodes" id="nodes" aria-label="{{demo.nodes}}" hidden></nav>
   <nav class="bar-links">
+    <span class="sim" id="sim" hidden>
+      <button class="icon" id="sim-play" type="button">⏸</button>
+      <button class="icon" id="sim-step" type="button" disabled>⏭</button>
+      <span class="sim-next" id="sim-next"></span>
+    </span>
     <a class="lang" href="{{nav.demo_lang_href}}" hreflang="{{nav.lang_code}}">{{nav.lang}}</a>
     <button class="icon" id="settings" type="button" aria-label="{{set.button}}" title="{{set.button}}">⚙</button>
     <button class="icon" id="theme" type="button" aria-label="{{nav.theme}}">◐</button>

@@ -493,5 +493,10 @@
   "js.set.holdMax": "Wait for the pigeons",
   "js.set.holdMax_note": "The node's clock stands while the pigeons of what it just did fly, this long at most: its timers (heartbeats, elections, leases, rate limits) wait for the picture. 0: it never waits, the pigeons only follow.",
   "js.set.holdSparks": "Wait for heartbeats too",
-  "js.set.holdSparks_note": "A cluster sends heartbeats all the time: waiting for every spark slows it down to the sparks' pace."
+  "js.set.holdSparks_note": "A cluster sends heartbeats all the time: waiting for every spark slows it down to the sparks' pace.",
+  "js.sim.pause": "Stop the node's clock",
+  "js.sim.play": "Let the node's clock go",
+  "js.sim.step": "On to the node's next timer",
+  "js.sim.next": "next +{ms} ms",
+  "js.sim.idle": "no timer"
 }

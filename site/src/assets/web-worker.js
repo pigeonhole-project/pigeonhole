@@ -14,8 +14,10 @@
 // The node's time is the shim's clock, held while the page draws what the
 // node did: each batch of its events goes out with a `seq`, and the clock
 // stands until the page has sent `go` for every batch out. Meanwhile a call
-// still runs, at that one instant; only the node's timers wait.
-import {deliver, frame, MSG, msg, OP_GO, OP_RESET, unframe} from "./lib/ops.js";
+// still runs, at that one instant; only the node's timers wait. The page
+// can stop the clock (`pause`) and move it on by hand, one timer at a time
+// (`step`: to the node's next timer, the node run once).
+import {deliver, frame, MSG, msg, OP_GO, OP_PAUSE, OP_RESET, OP_STEP, unframe} from "./lib/ops.js";
 import {Clock, MemoryHandle, Pool, Wasi} from "./wasi.js";
 
 // The assets' version (?v=…), the same for the wasm as for this script.
@@ -48,7 +50,8 @@ const calls = new Map();
 const clock = new Clock();
 // The batches of events the page has not drawn yet (their seq).
 const drawing = new Set();
-let seq = 0;
+let seq = 0,
+  paused = false; // the page stopped the clock
 
 async function openFiles(n) {
   const open = async i => (await dir.getFileHandle(`file-${String(opened + i).padStart(5, "0")}`, {create: true})).createSyncAccessHandle();
@@ -137,12 +140,30 @@ function sleep() {
   timer = setTimeout(pump, Math.max(0, wasi.nextWake - clock.now()));
 }
 
-// The page drew batch `n`: once it has drawn every one out, the clock goes on.
+// The page drew batch `n`: once it has drawn every one out, the clock goes
+// on (unless stopped).
 function drawn(n) {
   drawing.delete(n);
-  if (drawing.size) return;
-  clock.release();
-  sleep();
+  if (!drawing.size && !paused) {
+    clock.release();
+    sleep();
+  }
+}
+
+// The page stops the clock, or lets it go.
+function pause(on) {
+  paused = on;
+  if (on) clock.hold();
+  else drawn(null);
+  postMessage(msg.clock(paused, clock.now(), wasi.nextWake));
+}
+// Stopped: on to the node's next timer (a ms past it: tokio rounds a
+// deadline up to its ms), the node run once.
+function step() {
+  if (!paused) return;
+  if (wasi.nextWake !== Infinity) clock.advance(wasi.nextWake + 1);
+  pump();
+  postMessage(msg.clock(paused, clock.now(), wasi.nextWake));
 }
 
 // The page is gone and the node closed: let go of the files for the next
@@ -196,6 +217,8 @@ addEventListener("message", ({data}) => {
 async function handle({id, body, ...request}) {
   await ready;
   if (request.op === OP_GO) return drawn(request.seq);
+  if (request.op === OP_PAUSE) return pause(!!request.on);
+  if (request.op === OP_STEP) return step();
   await grow().catch(e => console.warn("no more files:", e));
   if (request.op === OP_RESET) {
     clearTimeout(timer);

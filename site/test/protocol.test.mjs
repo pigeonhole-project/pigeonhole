@@ -116,5 +116,5 @@ test("deliver: close's answer ends the worker, and is no reply", () => {
   const {messages, closed} = deliver(['{"call":3,"reply":{"closed":true}}'], calls, 1);
   assert.equal(closed, true);
   assert.deepEqual(messages, []);
-  assert.deepEqual(Object.values(MSG).sort(), ["events", "reply", "started", "tick", "waiting"], "the messages node.js routes");
+  assert.deepEqual(Object.values(MSG).sort(), ["clock", "events", "reply", "started", "tick", "waiting"], "the messages node.js routes");
 });

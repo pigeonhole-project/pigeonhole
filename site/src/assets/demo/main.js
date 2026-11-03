@@ -444,8 +444,40 @@ function startTimers() {
   clearInterval(polls);
   clocks = setInterval(showNodes, settings.clockMs);
   polls = setInterval(() => {
-    if (!state.busy && !state.wizard && !document.hidden && graph.drawn()) pollBackground();
+    if (!state.busy && !state.wizard && !paused && !document.hidden && graph.drawn()) pollBackground();
   }, settings.pollMs);
+}
+
+// ------------------------------------------------------------ the node's clock
+// Stopped (⏸), the node's time moves only by hand: ⏭ on to its next timer,
+// the node run once, then what it did (its flights; the background and the
+// cluster polled again: stopped, nothing polls them).
+let paused = false,
+  stepped = false;
+function setPaused(on) {
+  paused = on;
+  node.pause(on);
+  $("sim").classList.toggle("paused", on);
+  $("sim-play").textContent = on ? "▶" : "⏸";
+  $("sim-play").setAttribute("aria-label", on ? t("sim.play") : t("sim.pause"));
+  $("sim-step").disabled = !on;
+  if (!on) $("sim-next").textContent = "";
+}
+if (!node.admin) {
+  $("sim").hidden = false;
+  $("sim-step").setAttribute("aria-label", t("sim.step"));
+  $("sim-step").title = t("sim.step");
+  setPaused(false);
+  $("sim-play").addEventListener("click", () => setPaused(!paused));
+  $("sim-step").addEventListener("click", () => {
+    stepped = true;
+    node.step();
+  });
+  node.onClock(({paused: on, now, next}) => {
+    if (on) $("sim-next").textContent = next == null ? t("sim.idle") : t("sim.next", {ms: Math.max(0, Math.round(next - now))});
+    if (stepped && graph.drawn() && !state.wizard) pollBackground();
+    stepped = false;
+  });
 }
 startTimers();
 

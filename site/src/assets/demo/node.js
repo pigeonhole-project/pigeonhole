@@ -5,7 +5,7 @@
 //
 // Either way: {admin, call(request, body?, onEvents?) → {reply, events},
 // onTick(fn), onWaiting(fn), onDrawn(fn), now(), close()}; calls run one at
-// a time, in order.
+// a time, in order. The worker's also has pause(on), step(), onClock(fn).
 // With onEvents, a call's events go to it as the node logs them (a slow
 // call's flights fly as they happen), and the reply's events are what is
 // left. The worker's also has `started`: the module up, {reply, events}.
@@ -15,7 +15,9 @@
 // onEvents or onTick is drawn once onDrawn's fn (asked right after) says
 // so: a promise, or nothing for at once; a batch kept for the reply is
 // drawn at once. now(): the node's time as the page reckons it, on
-// performance.now()'s scale (a real node's: the wall's).
+// performance.now()'s scale (a real node's: the wall's). pause(true) stops
+// the clock, step() then moves it on to the node's next timer and runs the
+// node once; onClock's fn hears {paused, now, next} after each.
 import {frame, MSG, ops} from "../lib/ops.js";
 import {Clock} from "../wasi.js";
 
@@ -51,6 +53,8 @@ export function workerNode(worker) {
     tick = () => {},
     onWaiting = () => {},
     drawing = () => null,
+    onClock = () => {},
+    paused = false,
     started;
   // The node's clock as the page holds it: while a batch is out undrawn.
   const clock = new Clock(),
@@ -63,7 +67,7 @@ export function workerNode(worker) {
     Promise.resolve(shown ? drawing() : null).then(() => {
       worker.postMessage(ops.go(seq));
       out.delete(seq);
-      if (!out.size) clock.release();
+      if (!out.size && !paused) clock.release();
     });
   }
   // Each message by its type (lib/ops.js MSG); a call's by its id.
@@ -81,6 +85,9 @@ export function workerNode(worker) {
         if (w?.onEvents) w.onEvents(data.events);
         else w?.events.push(...data.events);
         return batch(data.seq, !!w?.onEvents);
+      case MSG.clock:
+        clock.advance(data.now);
+        return onClock(data);
       case MSG.reply:
         if (!w) return;
         waiting.delete(data.id);
@@ -127,6 +134,16 @@ export function workerNode(worker) {
       drawing = fn;
     },
     now: () => clock.now(),
+    pause(on) {
+      paused = on;
+      if (on) clock.hold();
+      else if (!out.size) clock.release();
+      worker.postMessage(ops.pause(on));
+    },
+    step: () => worker.postMessage(ops.step()),
+    onClock: fn => {
+      onClock = fn;
+    },
   };
 }
 
