@@ -1,13 +1,14 @@
 // The node behind the page: the demo's (pigeonhole compiled to wasm, in a
 // worker: web-worker.js), or a real node when the page is served from its
 // admin address ([admin] ui_dir), over HTTP to /admin/ops. The ops are the
-// same (pigeonhole-admin runs them in both).
+// same (pigeonhole-admin runs them in both; lib/ops.js lists them).
 //
-// Either way: {admin, started, call(request, body?, onEvents?) → {reply,
-// events}, onTick(fn)}; calls run one at a time, in order. With onEvents, a
-// call's events go to it as the node logs them (a slow call's flights fly
-// as they happen), and the reply's events are what is left.
-import {frame} from "../lib/ops.js";
+// Either way: {admin, call(request, body?, onEvents?) → {reply, events},
+// onTick(fn), onWaiting(fn), close()}; calls run one at a time, in order.
+// With onEvents, a call's events go to it as the node logs them (a slow
+// call's flights fly as they happen), and the reply's events are what is
+// left. The worker's also has `started`: the module up, {reply, events}.
+import {frame, MSG, ops} from "../lib/ops.js";
 
 // Served by a node, /admin/config is its API (JSON); on a static site, a 404 page.
 async function isAdmin() {
@@ -20,7 +21,7 @@ async function isAdmin() {
 }
 
 export async function connect(workerUrl) {
-  return (await isAdmin()) ? httpNode() : workerNode(workerUrl);
+  return (await isAdmin()) ? httpNode() : workerNode(new Worker(workerUrl, {type: "module"}));
 }
 
 // fn's calls one after the other: a call starts when the last one is done.
@@ -33,45 +34,61 @@ function serial(fn) {
   };
 }
 
-function workerNode(url) {
-  const worker = new Worker(url, {type: "module"});
+// The node in `worker` (a Worker, or anything with postMessage and onmessage).
+export function workerNode(worker) {
   // id → {done, onEvents, events}
   const waiting = new Map();
   let nextId = 1,
     tick = () => {},
     onWaiting = () => {},
     started;
+  // Each message by its type (lib/ops.js MSG); a call's by its id.
   worker.onmessage = ({data}) => {
     const w = waiting.get(data.id);
-    if (data.type === "started") started(data);
-    else if (data.type === "waiting") onWaiting();
-    else if (data.type === "tick") tick(data.events);
-    else if (data.type === "events") {
-      if (w?.onEvents) w.onEvents(data.events);
-      else w?.events.push(...data.events);
-    } else if (w) {
-      waiting.delete(data.id);
-      w.done({...data, events: [...w.events, ...data.events]});
+    switch (data.type) {
+      case MSG.started:
+        return started({reply: data.reply, events: data.events});
+      case MSG.waiting:
+        return onWaiting();
+      case MSG.tick:
+        return tick(data.events);
+      case MSG.events:
+        if (w?.onEvents) w.onEvents(data.events);
+        else w?.events.push(...data.events);
+        return;
+      case MSG.reply:
+        if (!w) return;
+        waiting.delete(data.id);
+        return w.done({reply: data.reply, events: [...w.events, ...data.events]});
+      default:
+        console.warn("the worker said what the page does not know:", data);
     }
   };
-  // Leaving (a reload, the other language): the node closes as a server
-  // does on SIGTERM, releasing a lease log, then the worker lets go of the
-  // files and ends (web-worker.js), so the next page boots at once.
-  addEventListener("pagehide", () => worker.postMessage({id: 0, op: "close"}));
-  // Back from the back-forward cache: that node is closed; start anew.
-  addEventListener("pageshow", e => e.persisted && location.reload());
+  const send = (request, body) => {
+    const id = nextId++;
+    worker.postMessage({id, ...request, body}, body ? [body] : []);
+    return id;
+  };
   return {
     admin: false,
     // {reply: {config, demo, saved, persistent, why} | {error}, events}
-    started: new Promise(res => (started = res)),
+    started: new Promise(res => {
+      started = res;
+    }),
     call: serial(
       (request, body, onEvents) =>
         new Promise(done => {
-          const id = nextId++;
-          waiting.set(id, {done, onEvents, events: []});
-          worker.postMessage({id, ...request, body}, body ? [body] : []);
+          // The worker answers later (a message): the id is waited on by then.
+          waiting.set(send(request, body), {done, onEvents, events: []});
         }),
     ),
+    // Leaving (a reload, the other language): the node closes as a server
+    // does on SIGTERM, releasing a lease log, then the worker lets go of the
+    // files and ends (web-worker.js), so the next page boots at once. Not
+    // queued behind a call: the page will not wait; nobody waits for its answer.
+    close: () => {
+      send(ops.close());
+    },
     // The worker waits for the files the page just left still holds.
     onWaiting: fn => {
       onWaiting = fn;
@@ -83,11 +100,10 @@ function workerNode(url) {
   };
 }
 
+// A real node: its log stays on the server, so a call has no events.
 function httpNode() {
   return {
     admin: true,
-    started: Promise.resolve({reply: {}, events: []}),
-    // A real node's log stays on the server: no events.
     call: serial(async (request, body) => {
       try {
         const r = await fetch("/admin/ops", {method: "POST", body: frame(request, body)});
@@ -96,6 +112,7 @@ function httpNode() {
         return {reply: {error: String(e)}, events: []};
       }
     }),
+    close: () => {},
     onTick: () => {},
     onWaiting: () => {},
   };

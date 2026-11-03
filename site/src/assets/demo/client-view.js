@@ -4,12 +4,14 @@
 //
 // cluster: {nodes: [id], node: the one picked or null (the leader), leader, cut: Set}.
 // on: {bucket(name), upload(name, ArrayBuffer), tooBig(), read(key, size),
-// copy(key), remove(key), sendTo(id | null)}. Returns {nodes, setObjects([[key, size]])}.
+// copy(key), remove(key), sendTo(id | null)}. Returns {nodes,
+// setObjects([[key, size]]), setCluster(cluster)}: the cluster changed (a
+// new leader, a node cut off), its picks anew.
 import {button, h} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {nodeLink} from "./entities.js";
 
-export const MAX_UPLOAD = 64 << 20; // it all lives in the tab's memory
+const MAX_UPLOAD = 64 << 20; // it all lives in the tab's memory
 
 export function clientView({buckets, bucket, objects, admin, cluster}, on) {
   const view = document.getElementById("tpl-client").content.cloneNode(true);
@@ -19,23 +21,25 @@ export function clientView({buckets, bucket, objects, admin, cluster}, on) {
 
   // A cluster: the leader, whichever it is, or a node of your choosing (a
   // follower turns you away: only the leader serves).
-  if (cluster) {
-    view.querySelector("#send-to").hidden = false;
+  const sendTo = view.querySelector("#send-to"),
+    picks = view.querySelector("#send-to-picks"),
+    note = view.querySelector("#send-to-note");
+  function setCluster(cluster) {
+    sendTo.hidden = !cluster;
+    if (!cluster) return;
     const pick = (label, id) => {
       const b = button("btn node-pick", label, () => on.sendTo(id));
       b.setAttribute("aria-pressed", String(cluster.node === id));
       return b;
     };
-    view
-      .querySelector("#send-to-picks")
-      .replaceChildren(
-        pick(t("demo.send_leader"), null),
-        ...cluster.nodes.map(id => pick(`${t("nodes.node", {n: id})}${id === cluster.leader ? " ★" : ""}${cluster.cut.has(id) ? " ✂" : ""}`, id)),
-      );
-    const note = view.querySelector("#send-to-note");
-    if (cluster.node == null && cluster.leader != null) note.append(t("demo.send_now"), " ", nodeLink(cluster.leader));
+    picks.replaceChildren(
+      pick(t("demo.send_leader"), null),
+      ...cluster.nodes.map(id => pick(`${t("nodes.node", {n: id})}${id === cluster.leader ? " ★" : ""}${cluster.cut.has(id) ? " ✂" : ""}`, id)),
+    );
+    if (cluster.node == null && cluster.leader != null) note.replaceChildren(t("demo.send_now"), " ", nodeLink(cluster.leader));
     else note.textContent = cluster.node == null ? "" : t("demo.send_fixed");
   }
+  setCluster(cluster);
 
   if (admin) {
     const pick = h("select", "bucket-pick");
@@ -100,7 +104,7 @@ export function clientView({buckets, bucket, objects, admin, cluster}, on) {
     }
   }
   setObjects(objects);
-  return {nodes: [...view.childNodes], setObjects};
+  return {nodes: [...view.childNodes], setObjects, setCluster};
 }
 
 // A new object each time: photo-1.jpg, photo-2.jpg… (an upload under a

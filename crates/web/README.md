@@ -33,8 +33,18 @@ config) under Node's WASI (`run-wasi.mjs`), then the library under the
 site's own shim with its file pool on buffers instead of OPFS
 (`run-shim.mjs`), in four modes: `smoke` (the same binary), `reload` (two
 module instances on one pool: a page load, then a reload), `snapshot`
-(enough puts for a snapshot) and `events` (every event the demo draws).
-`cargo run -p pigeonhole-web` runs the smoke natively.
+(enough puts for a snapshot) and `events` (every event the demo draws, from
+the wizard's cluster of three). `cargo run -p pigeonhole-web` runs the smoke
+natively.
+
+The demo draws what the node logs: `site/src/assets/demo/events.js` reads
+the JSON log lines by their message text (its `MESSAGES` table: "posted",
+"store call", "raft frame sent", "waiting out the lease", …) and their
+fields, as logged at the levels `ph_open`'s env filter lets through (most
+are `debug!`). Those strings, their fields and those levels are a contract
+with the tracing sites across the workspace: `make web-smoke`'s `events`
+mode fails when one no longer comes out of a real run, so a reworded or
+quieter line is caught there rather than as pigeons missing on the page.
 
 What wasm needed from the rest of the workspace:
 

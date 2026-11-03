@@ -178,7 +178,7 @@ export function block(parent, x, y, w, h, rnd, {shade = 1, loggias = [], room = 
 }
 
 // A store's mark: the app's logo (simplified), a drive for a local disk, else a dot.
-export function logo(kind, parent, x, y, title, r = 11) {
+function logo(kind, parent, x, y, title, r = 11) {
   const mark = svg("g", {class: "badge", transform: `translate(${x},${y}) scale(${r / 11})`}, parent);
   if (kind === "telegram") {
     svg("circle", {r: 11, fill: "#2AABEE"}, mark);

@@ -1,12 +1,15 @@
 // The node's panel: counters, the background tasks, the config (on a real
 // node, read-only; a cluster's is in the cluster's panel).
 //
+// props: {counters: {objects, dataChannels, log}, bg: the `background` op's,
+// cluster, own, and config-view.js's: config, demo, admin}.
 // on: {restart(text), erase(), toggle(task, on), run(task), isolate(node, cut)}.
 // own: the stores of its own channels (linked).
 // cluster: {node, cut, leader}, the node of a cluster this panel is: it can
 // be cut off; a follower runs none of the leader's tasks, only its snapshots.
-// Returns {nodes, setCounters({objects, dataChannels, log}), setBackground(bg), setError(text)}.
-import {button, h} from "../lib/dom.js";
+// Returns {nodes, setCounters({objects, dataChannels, log}), setBackground(bg),
+// focus(task): its card in view, setError(text)}.
+import {button, h, within} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
 import {configView} from "./config-view.js";
 import {channelLink, sentence} from "./entities.js";
@@ -15,7 +18,7 @@ import {taskCards} from "./tasks.js";
 export function loftView(props, on) {
   const {counters: counts, bg, cluster} = props;
   const view = document.getElementById("tpl-node").content.cloneNode(true);
-  const $ = id => view.querySelector(`#${id}`);
+  const $ = within(view);
 
   const counters = $("counters");
   const setCounters = ({objects, dataChannels, log}) => {
@@ -53,8 +56,8 @@ export function loftView(props, on) {
 
   const follower = cluster && cluster.leader !== cluster.node;
   const note = follower ? sentence(["nodes.tasks_leader", {n: cluster.leader ?? "?"}]) : null;
-  const setBackground = taskCards($("bg"), {onToggle: on.toggle, onRun: on.run, follower: note});
-  setBackground(bg);
+  const tasks = taskCards($("bg"), {onToggle: on.toggle, onRun: on.run, follower: note});
+  tasks.update(bg);
 
   // One node's config is its own; a cluster's is every node's: in the cluster's panel.
   const config = cluster ? null : configView(props, on);
@@ -64,7 +67,8 @@ export function loftView(props, on) {
   return {
     nodes: [...view.childNodes],
     setCounters,
-    setBackground,
+    setBackground: tasks.update,
+    focus: tasks.focus,
     setError: text => config?.setError(text),
   };
 }

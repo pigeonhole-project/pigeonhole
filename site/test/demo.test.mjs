@@ -9,7 +9,7 @@ import {flightsOf, ownerOf} from "../src/assets/demo/flights.js";
 import {summary} from "../src/assets/demo/log-view.js";
 import {makeRaftWatch} from "../src/assets/demo/raft.js";
 import {describe, ms} from "../src/assets/demo/tasks.js";
-import {divisors, sketch, tomlOf} from "../src/assets/demo/toml.js";
+import {divisors, fitCopies, pickLog, sketch, tomlOf} from "../src/assets/demo/toml.js";
 
 beforeEach(() => {
   globalThis.LANG = "en";
@@ -338,4 +338,30 @@ test("raft watch: a heartbeat winds a follower's clock; votes and a candidate ar
   assert.deepEqual(w.view(2, {role: "leader", term: 2}, 5200), [["raft.leader", {n: 2, term: 2}]]);
   assert.equal(w.clock(2, 6000, 1000), null, "a leader runs no election clock");
   assert.equal(w.chronicle().length, 3);
+});
+
+test("fitCopies: copies divide the channels; fewer channels, fewer copies, all of them the quorum", () => {
+  const w = {channels: ["telegram", "discord", "telegram", "discord"], copies: 4, quorum: 3};
+  fitCopies(w);
+  assert.deepEqual([w.copies, w.quorum], [4, 3], "4 divides 4: as it was");
+  w.channels.pop();
+  fitCopies(w);
+  assert.deepEqual([w.copies, w.quorum], [3, 3]);
+  w.channels.pop();
+  fitCopies(w);
+  assert.deepEqual([w.copies, w.quorum], [2, 2]);
+  w.channels.push("telegram");
+  w.copies = 2;
+  fitCopies(w);
+  assert.deepEqual([w.copies, w.quorum], [1, 1], "3 channels: 2 copies do not divide them");
+});
+
+test("pickLog: a log in a channel takes its snapshots off the node's disk too", () => {
+  const w = {log: "local_disk", snapshots: "local_disk"};
+  pickLog(w, "discord");
+  assert.deepEqual(w, {log: "discord", snapshots: "discord"});
+  pickLog(w, "telegram");
+  assert.deepEqual(w, {log: "telegram", snapshots: "discord"}, "snapshots in a channel stay where they are");
+  pickLog(w, "local_disk");
+  assert.deepEqual(w, {log: "local_disk", snapshots: "discord"});
 });

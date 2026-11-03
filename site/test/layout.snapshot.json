@@ -1,0 +1,273 @@
+{
+  "one node, wide": {
+    "width": 1200,
+    "height": 640,
+    "lift": 80,
+    "client": {
+      "x": 30,
+      "w": 78,
+      "cols": 3,
+      "ground": 634,
+      "most": 21,
+      "deep": 2000
+    },
+    "lofts": {
+      "0": {
+        "x": 150,
+        "w": 220.9,
+        "roof": 446,
+        "ground": 634,
+        "scale": 0.8,
+        "size": 15,
+        "alone": false
+      }
+    },
+    "stores": {
+      "tg-log": {
+        "x": 161.4,
+        "w": 78,
+        "cols": 3,
+        "ground": 634,
+        "most": 18,
+        "deep": 2000,
+        "floors": 8,
+        "size": 15
+      },
+      "tg-snap": {
+        "x": 276.9,
+        "w": 78,
+        "cols": 3,
+        "ground": 634,
+        "most": 18,
+        "deep": 2000,
+        "floors": 8,
+        "size": 15
+      },
+      "telegram": {
+        "x": 529.2,
+        "w": 156,
+        "cols": 6,
+        "ground": 634,
+        "most": 21,
+        "deep": 2000
+      },
+      "discord": {
+        "x": 915.7,
+        "w": 156,
+        "cols": 6,
+        "ground": 634,
+        "most": 21,
+        "deep": 2000
+      }
+    }
+  },
+  "one node, tall": {
+    "width": 400,
+    "height": 666,
+    "lift": 40,
+    "client": {
+      "x": 6,
+      "w": 52,
+      "cols": 2,
+      "ground": 400,
+      "most": 12,
+      "deep": 0
+    },
+    "lofts": {
+      "0": {
+        "x": 90,
+        "w": 165.9,
+        "roof": 212,
+        "ground": 400,
+        "scale": 0.6,
+        "size": 11,
+        "alone": false
+      }
+    },
+    "stores": {
+      "tg-log": {
+        "x": 101.8,
+        "w": 52,
+        "cols": 2,
+        "ground": 400,
+        "most": 10,
+        "deep": 0,
+        "floors": 8,
+        "size": 11
+      },
+      "tg-snap": {
+        "x": 188.7,
+        "w": 52,
+        "cols": 2,
+        "ground": 400,
+        "most": 10,
+        "deep": 0,
+        "floors": 8,
+        "size": 11
+      },
+      "telegram": {
+        "x": 9.5,
+        "w": 182,
+        "cols": 7,
+        "ground": 658,
+        "most": 12,
+        "deep": 2000
+      },
+      "discord": {
+        "x": 208.5,
+        "w": 182,
+        "cols": 7,
+        "ground": 658,
+        "most": 12,
+        "deep": 2000
+      }
+    }
+  },
+  "a cluster, wide": {
+    "width": 1289.8,
+    "height": 640,
+    "lift": 80,
+    "client": {
+      "x": 30,
+      "w": 78,
+      "cols": 3,
+      "ground": 634,
+      "most": 21,
+      "deep": 2000
+    },
+    "lofts": {
+      "1": {
+        "x": 140,
+        "w": 173.4,
+        "roof": 446,
+        "ground": 634,
+        "scale": 0.6,
+        "size": 10,
+        "alone": false
+      },
+      "2": {
+        "x": 343.4,
+        "w": 173.4,
+        "roof": 446,
+        "ground": 634,
+        "scale": 0.6,
+        "size": 10,
+        "alone": false
+      },
+      "3": {
+        "x": 546.8,
+        "w": 198.2,
+        "roof": 446,
+        "ground": 634,
+        "scale": 0.6,
+        "size": 10,
+        "alone": false
+      }
+    },
+    "stores": {
+      "tg-log-1": {
+        "x": 154.8,
+        "w": 52,
+        "cols": 2,
+        "ground": 634,
+        "most": 20,
+        "deep": 2000,
+        "floors": 8,
+        "size": 10
+      },
+      "tg-snap-1": {
+        "x": 243.5,
+        "w": 52,
+        "cols": 2,
+        "ground": 634,
+        "most": 20,
+        "deep": 2000,
+        "floors": 8,
+        "size": 10
+      },
+      "dc-log-2": {
+        "x": 358.2,
+        "w": 52,
+        "cols": 2,
+        "ground": 634,
+        "most": 20,
+        "deep": 2000,
+        "floors": 8,
+        "size": 10
+      },
+      "dc-snap-2": {
+        "x": 446.9,
+        "w": 52,
+        "cols": 2,
+        "ground": 634,
+        "most": 20,
+        "deep": 2000,
+        "floors": 8,
+        "size": 10
+      },
+      "meta-log-3": {
+        "x": 567.8,
+        "w": 52,
+        "cols": 2,
+        "ground": 634,
+        "most": 20,
+        "deep": 2000,
+        "floors": 8,
+        "size": 10
+      },
+      "meta-snap-3": {
+        "x": 668.9,
+        "w": 52,
+        "cols": 2,
+        "ground": 634,
+        "most": 20,
+        "deep": 2000,
+        "floors": 8,
+        "size": 10
+      },
+      "outbox-1": {
+        "x": 789.8,
+        "w": 52,
+        "cols": 2,
+        "ground": 634,
+        "most": 21,
+        "deep": 2000,
+        "size": 10
+      },
+      "outbox-2": {
+        "x": 873.4,
+        "w": 52,
+        "cols": 2,
+        "ground": 634,
+        "most": 21,
+        "deep": 2000,
+        "size": 10
+      },
+      "outbox-3": {
+        "x": 957,
+        "w": 52,
+        "cols": 2,
+        "ground": 634,
+        "most": 21,
+        "deep": 2000,
+        "size": 10
+      },
+      "tg-1": {
+        "x": 1047.8,
+        "w": 104,
+        "cols": 4,
+        "ground": 634,
+        "most": 21,
+        "deep": 2000
+      },
+      "dc-1": {
+        "x": 1165.8,
+        "w": 104,
+        "cols": 4,
+        "ground": 634,
+        "most": 21,
+        "deep": 2000
+      }
+    }
+  }
+}

@@ -3,7 +3,7 @@
 import {t} from "../../lib/i18n.js";
 import {frameModel} from "./frame.js";
 
-export const SHOWN = 200; // the `channels` op returns the last 200
+const SHOWN = 200; // the `channels` op returns the last 200
 const DISCORD_EPOCH = 1420070400000n;
 
 // When a message was posted: the channel says (`at`, ms); a post seen

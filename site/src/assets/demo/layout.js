@@ -11,7 +11,7 @@
 // the blocks' roofs, scale: the dovecote's, size: its name's letters}.
 import {FLOOR} from "./art.js";
 
-export const COL = 26; // a window's column
+const COL = 26; // a window's column
 const FLOORS = 8; // every block's: they do not grow; the newest messages show
 
 // What a channel's windows hold, oldest first: as many unnamed messages as
@@ -30,7 +30,7 @@ const dataOf = channels => channels.filter(c => c.role === "data");
 const ownOf = (channels, id = null) => channels.filter(c => (c.role === "log" || c.role === "snapshots") && (id == null || c.node === id));
 const outboxesOf = channels => channels.filter(c => c.role === "outbox");
 // A cluster's nodes, as their channels name them; none: one node.
-export const nodesOf = channels => [...new Set(channels.map(c => c.node).filter(n => n != null))].sort((a, b) => a - b);
+const nodesOf = channels => [...new Set(channels.map(c => c.node).filter(n => n != null))].sort((a, b) => a - b);
 
 // Blocks side by side from `x`, `each` wide with `gap` between, their
 // columns fitting [lo, hi]; returns where the street ends.

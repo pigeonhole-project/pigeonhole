@@ -2,28 +2,28 @@
 // Every flight on it is an event the node logged; clicking a node opens its
 // panel. This module keeps the page's state and wires the views (pure: data
 // and callbacks in, elements out) to the node's ops.
-import {button, h, reducedMotion} from "../lib/dom.js";
+import {button, h, reducedMotion, within} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
-import {s3Sentence} from "../lib/say.js";
-import {budgetsOf, budgetTable, sendLevel} from "./budgets.js";
-import {appOf, kinOf} from "./channels.js";
-import {chatView} from "./chat/index.js";
+import {ops} from "../lib/ops.js";
+import {budgetsOf, sendLevel} from "./budgets.js";
+import {appOf} from "./channels.js";
 import {forgetPlaces} from "./chat/scroll.js";
 import {clientView} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {ref, sentence, setLinks} from "./entities.js";
 import {readEvents} from "./events.js";
-import {faultsView} from "./faults-view.js";
 import {flightsOf, refused} from "./flights.js";
 import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
 import {connect} from "./node.js";
 import {makeRaftWatch} from "./raft.js";
-import {TASK_KEY, TASK_ON, taskWindows} from "./tasks.js";
+import {apply as applyEvent, merge} from "./reduce.js";
+import {storeView} from "./store-view.js";
+import {TASK_KEY, TASK_ON, taskWindows, workLabel} from "./tasks.js";
 import {makeWizard} from "./wizard.js";
 
-const $ = id => document.getElementById(id);
+const $ = within(document);
 const ok = reply => reply && !reply.error;
 const pause = ms => new Promise(r => setTimeout(r, reducedMotion() ? 0 : ms));
 
@@ -35,6 +35,7 @@ const state = {
   node: null, // the node your requests go to (your panel); null: whichever leads
   look: null, // the node on screen (its panel, log, tasks); null: the one your requests go to
   cluster: null, // the `cluster` op's: {leader, term, nodes}
+  views: new Map(), // each node's own `cluster` op, by id
   term: null, // the newest term seen: a new leader is told once
   timing: null, // the cluster's clocks (ms): {heartbeat, election: [min, max]}
   cut: new Set(), // the nodes cut off from the others
@@ -73,15 +74,16 @@ const node = await connect(new URL(`../web-worker.js${new URL(import.meta.url).s
 let updateWindows = () => {};
 let relayout = () => redraw(); // the screen turned narrow or wide: what is on the graph, again
 const graph = makeGraph($("graph"), {
+  channel,
   onOpen: openPanel,
   onRelayout: () => relayout(),
   onLoft: (g, entrances) => {
     updateWindows = taskWindows(
       g,
       entrances,
-      task => {
-        openPanel({kind: "loft"});
-        $(`task-${task}`)?.scrollIntoView({block: "nearest"});
+      async task => {
+        await openPanel({kind: "loft"});
+        if (isOpen("loft")) view.focus(task);
       },
       {follower: following()},
     );
@@ -134,49 +136,24 @@ const flightCtx = () => ({leader: state.cluster?.leader ?? null, shown: shown(),
 function apply(events) {
   const said = [];
   for (const e of events) {
-    const c = channel(e.store);
+    const {channel: c, said: s} = applyEvent(state.channels, e);
+    said.push(...s);
     if (e.type === "posted" && c) {
-      const m = {id: e.id, kind: e.kind, name: e.name, size: e.bytes, preview: e.preview, fresh: true, at: new Date()};
-      c.messages.push(m);
-      c.total++;
-      const snap = c.role === "snapshots" && /-(\d+)\.snap/.exec(m.name || "");
-      if (snap) said.push(["say.snapshot", {at: +snap[1]}]);
       const flights = flightsOf(e, channel, flightCtx());
       for (const f of flights) graph.fly({...f, onLand: () => landed(c.store)});
       if (!flights.length) landed(c.store);
       if (c.role === "outbox" && panelShows(c.store)) outboxChanged();
     } else if (e.type === "deleted" && c) {
-      // Gone from the channel, as from a messenger's: no trace left.
-      c.total = Math.max(0, c.total - gone(c, e.ids));
-      c.messages = c.messages.filter(m => !e.ids.includes(String(m.id)));
-      graph.setTotal(c.store, c.total);
+      graph.setTotal(c.store);
       if (panelShows(c.store)) renderPanel();
     } else if (e.type === "call" || e.type === "call_failed") {
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
     } else if (e.type === "raft") {
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
       said.push(...raft.frame(e, performance.now()));
-    } else if (e.type === "repair_pass" && e.repaired > 0) {
-      said.push(["say.repair_pass", {n: e.repaired}]);
-    } else if (e.type === "s3") {
-      // What one channel got for it: the first data channel's new posts.
-      const first = state.channels.find(x => x.role === "data");
-      const posts = (first?.messages || []).filter(m => m.fresh).map(m => ({kind: m.kind, bytes: m.size}));
-      said.push(s3Sentence(e, posts));
     }
   }
   return said;
-}
-
-// How many of message ids `ids` channel `c` held: those it lists, and
-// those below its first listed one, as many as it has unlisted. An outbox's
-// prune deletes a run of ids, some of them empty already.
-function gone(c, ids) {
-  const listed = new Set(c.messages.map(m => String(m.id)));
-  const first = Math.min(...c.messages.map(m => Number(m.id)));
-  const older = Math.max(0, c.total - c.messages.length);
-  const below = ids.filter(id => !listed.has(id) && Number(id) < first).length;
-  return ids.filter(id => listed.has(id)).length + Math.min(older, below);
 }
 
 // An open outbox's posts come from the log without the frames they hold:
@@ -194,7 +171,7 @@ function outboxChanged() {
 
 // A pigeon landed on a channel.
 function landed(store) {
-  graph.setTotal(store, channel(store)?.total);
+  graph.setTotal(store);
   if (panelShows(store)) renderPanel();
 }
 const panelShows = store => (isOpen("store") && state.open.store === store) || (isOpen("log") && logChannel()?.store === store);
@@ -218,8 +195,11 @@ async function call(request, body) {
 
 // ------------------------------------------------------------ ops
 // An op from a panel: its flights, its sentence, then the state after it.
-async function op(request, body) {
-  setBusy(true);
+// Null when another runs: one at a time.
+function op(request, body) {
+  return whileBusy(() => runOp(request, body));
+}
+async function runOp(request, body) {
   for (const c of state.channels) for (const m of c.messages) m.fresh = false;
   // Its flights fly as the node logs them: a slow op shows its progress.
   const said = [];
@@ -235,38 +215,53 @@ async function op(request, body) {
   await graph.landed();
   await refreshObjects();
   if (isOpen("log") || isOpen("loft")) await loadLog();
-  setBusy(false);
   return reply;
 }
 
+// An op of yours runs: the panel's controls wait (its fieldset disabled:
+// what a view draws meanwhile waits too), and no other op starts.
 function setBusy(on) {
   state.busy = on;
-  for (const b of document.querySelectorAll(".panel button, .panel input")) if (!b.classList.contains("back")) b.disabled = on;
+  $("panel-body").disabled = on;
+}
+// fn's result, run while busy; null (fn not run) while another runs.
+async function whileBusy(fn) {
+  if (state.busy) return null;
+  setBusy(true);
+  try {
+    return await fn();
+  } finally {
+    setBusy(false);
+  }
 }
 
 // Your objects: the bucket's, as the leader lists it (a follower turns S3
 // away, whichever node is on screen); kept as they were when none answers.
 async function refreshObjects() {
-  const {reply} = await call({op: "list", bucket: state.bucket, node: state.cluster?.leader ?? undefined});
+  const {reply} = await call(ops.list(state.bucket, state.cluster?.leader ?? undefined));
   if (ok(reply)) state.objects = reply.objects || [];
   graph.setObjects(state.objects.length);
-  view?.setObjects?.(state.objects);
-  view?.setCounters?.(counters());
+  if (isOpen("client")) view.setObjects(state.objects);
+  if (isOpen("loft")) view.setCounters(counters());
 }
 
-// The channels as the node has them now; the posts seen arriving stay
-// marked. A local disk has files, not messages.
+// The channels as the node has them now, the graph's windows from them;
+// the posts seen arriving stay marked (reduce.js merge: those that came
+// while the channels were read too). A local disk has files, not messages.
 // In a cluster, each other node's own log and snapshots too: the node on
-// screen lists only its own.
+// screen lists only its own. Kept as they were when the node does not answer.
 async function loadChannels() {
-  const {reply} = await call({op: "channels"});
-  const fresh = new Set(state.channels.flatMap(c => c.messages.filter(m => m.fresh).map(m => `${c.store}/${m.id}`)));
-  const listed = [...(reply?.channels || [])];
-  for (const id of state.nodes.length > 1 ? state.nodes.filter(id => id !== shown()) : []) {
-    const other = await call({op: "channels", node: id});
-    listed.push(...(other.reply?.channels || []).filter(c => c.node === id && c.role !== "outbox"));
+  const me = shown();
+  const {reply} = await call(ops.channels());
+  if (!ok(reply)) return;
+  const listed = [...(reply.channels || [])];
+  for (const id of state.nodes.length > 1 ? state.nodes.filter(id => id !== me) : []) {
+    const other = await call(ops.channels(id));
+    const theirs = c => c.node === id && c.role !== "outbox";
+    listed.push(...(ok(other.reply) ? other.reply.channels || [] : state.channels).filter(theirs));
   }
-  state.channels = listed.map(c => ({...c, messages: (c.messages || []).map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
+  state.channels = merge(state.channels, listed);
+  graph.refill();
 }
 
 // The channels anew, drawn (a fault changes them behind the events).
@@ -279,17 +274,16 @@ async function refreshChannels() {
 
 // The log and its channel's posts, decoded.
 async function loadLog() {
-  const {reply} = await call({op: "log", limit: 200});
+  const {reply} = await call(ops.log(200));
   await loadChannels();
-  graph.setChannels(state.channels);
-  state.log = reply;
+  if (ok(reply)) state.log = reply;
   if (isOpen("log")) renderPanel();
-  view?.setCounters?.(counters());
+  if (isOpen("loft")) view.setCounters(counters());
 }
 
 // ------------------------------------------------------------ background tasks
 async function pollBackground() {
-  const {reply} = await call({op: "background"});
+  const {reply} = await call(ops.background());
   if (!ok(reply)) return;
   state.bg = reply;
   await pollBudgets();
@@ -306,7 +300,7 @@ async function pollCluster() {
     told = [],
     replies = new Map();
   for (const id of state.nodes) {
-    const {reply} = await call({op: "cluster", node: id});
+    const {reply} = await call(ops.cluster(id));
     if (!ok(reply)) continue;
     replies.set(id, reply);
     const own = reply.nodes.find(n => n.id === reply.me);
@@ -340,7 +334,7 @@ function renderNodes() {
   const all = button("node-pick cluster-pick", t("cluster.title"), () => openPanel(ref.cluster()));
   all.setAttribute("aria-pressed", String(isOpen("cluster")));
   bar.replaceChildren(all);
-  if (isOpen("client")) view?.setCluster?.(clientCluster());
+  if (isOpen("client")) view.setCluster(clientCluster());
 }
 const clientCluster = () => (state.nodes.length > 1 ? {nodes: state.nodes, node: state.node, leader: state.cluster?.leader ?? null, cut: state.cut} : null);
 
@@ -370,8 +364,8 @@ const clusterData = (dynamic = null) => {
   const leader = state.cluster?.leader;
   return {
     nodes: state.nodes,
-    own: state.views ?? new Map(),
-    leader: state.views?.get(leader) ?? null,
+    own: state.views,
+    leader: state.views.get(leader) ?? null,
     cut: state.cut,
     dynamic,
     chronicle: raft.chronicle(),
@@ -382,14 +376,14 @@ const clusterData = (dynamic = null) => {
 };
 async function updateCluster() {
   const leader = state.cluster?.leader;
-  const dynamic = leader == null ? null : (await call({op: "dynamic", node: leader})).reply;
-  if (isOpen("cluster")) view?.update?.(clusterData(ok(dynamic) ? dynamic : null));
+  const dynamic = leader == null ? null : (await call(ops.dynamic(leader))).reply;
+  if (isOpen("cluster")) view.update(clusterData(ok(dynamic) ? dynamic : null));
 }
 
 // The nodes as they say now, on the graph: roles, terms, election clocks.
 const raft = makeRaftWatch();
 function showNodes() {
-  if (state.nodes.length < 2 || !graph.drawn() || state.wizard) return;
+  if (state.nodes.length < 2 || document.hidden || !graph.drawn() || state.wizard) return;
   // openraft lets a follower stand only once the leader's lease (an
   // election's longest timeout) and then its own random timeout have both
   // gone by without a word: up to twice the longest timeout.
@@ -397,11 +391,11 @@ function showNodes() {
     timeout = 2 * (state.timing?.election?.[1] ?? 0);
   graph.setNodes(new Map(state.nodes.map(id => [id, {...raft.of(id), clock: raft.clock(id, now, timeout)}])));
 }
-setInterval(showNodes, 100);
+const clocks = setInterval(showNodes, 100);
 
 // Node `id` cut off from the others, or back: its links and its outbox.
 async function isolate(id, cut) {
-  const {reply} = await node.call({op: "isolate", node: id, down: cut});
+  const {reply} = await call(ops.isolate(id, cut));
   if (!ok(reply)) return sayError(reply?.error);
   if (cut) state.cut.add(id);
   else state.cut.delete(id);
@@ -411,7 +405,7 @@ async function isolate(id, cut) {
   await refreshChannels(); // its outbox up or down
 }
 // While idle: the worker lets the node's loops run between calls.
-setInterval(() => {
+const polls = setInterval(() => {
   if (!state.busy && !state.wizard && !document.hidden && graph.drawn()) pollBackground();
 }, 1000);
 
@@ -424,10 +418,10 @@ function renderBackground() {
     graph.setQueue(
       c.store,
       jobs.filter(j => j.store === c.store),
-      j => t("demo.job", {chunk: j.chunk, store: c.store}),
+      j => workLabel("repair", j),
     );
   updateWindows(bg);
-  view?.setBackground?.(bg);
+  if (isOpen("loft")) view.setBackground(bg);
 }
 
 // On: back to the file's period (or a default when the file has it off);
@@ -437,19 +431,19 @@ async function toggleTask(task, on) {
   // the dynamic config: an entry in the log) through the leader.
   if (task === "snapshot" && state.nodes.length > 1) {
     const key = `node.${shown()}.snapshot_every`;
-    const r = await call({op: "dynamic_set", key, value: on ? TASK_ON.snapshot : "off", node: state.cluster?.leader ?? undefined});
+    const r = await call(ops.dynamicSet(key, on ? TASK_ON.snapshot : "off", state.cluster?.leader ?? undefined));
     if (r.reply?.error) sayError(r.reply.error);
     else say([on ? "bg.turned_on" : "bg.turned_off", {task: t("bg.snapshot"), key}]);
     return pollBackground();
   }
   const key = TASK_KEY[task];
   let r;
-  if (!on) r = await call({op: "dynamic_set", key, value: "off"});
+  if (!on) r = await call(ops.dynamicSet(key, "off"));
   else {
-    const {reply} = await call({op: "dynamic"});
+    const {reply} = await call(ops.dynamic());
     const k = reply?.keys?.find(x => x.key === key);
     const fromFile = k?.overridden && k.file && k.file !== "off";
-    r = await call(fromFile ? {op: "dynamic_unset", key} : {op: "dynamic_set", key, value: TASK_ON[task]});
+    r = await call(fromFile ? ops.dynamicUnset(key) : ops.dynamicSet(key, TASK_ON[task]));
   }
   if (r.reply?.error) sayError(r.reply.error);
   else say([on ? "bg.turned_on" : "bg.turned_off", {task: t(`bg.${task}`), key}]);
@@ -457,7 +451,7 @@ async function toggleTask(task, on) {
 }
 
 async function runTask(task) {
-  const {reply} = await call({op: "run_task", task});
+  const {reply} = await call(ops.runTask(task));
   if (reply?.error) sayError(reply.error);
   else say(["bg.asked", {task: t(`bg.${task}`)}]);
   await pollBackground();
@@ -503,13 +497,11 @@ const counters = () => ({objects: state.objects.length, dataChannels: state.chan
 // The bots' budgets as they stand: a bar per channel on the graph, the
 // table in the open channel's panel.
 async function pollBudgets() {
-  const {reply} = await call({op: "budgets"});
+  const {reply} = await call(ops.budgets());
   if (!ok(reply)) return;
   state.budgets = reply.budgets || [];
   for (const c of state.channels) graph.setBudget(c.store, sendLevel(budgetsOf(c, state.budgets)));
-  const box = document.querySelector("#panel-body .budgets");
-  const c = isOpen("store") && channel(state.open.store);
-  if (box && c) box.replaceWith(budgetTable(budgetsOf(c, state.budgets)));
+  if (isOpen("store")) view?.setBudgets(state.budgets);
 }
 
 function renderPanel() {
@@ -522,7 +514,8 @@ function renderPanel() {
     view = v;
   };
   if (open.kind === "client") {
-    const v = clientView({...state, cluster: clientCluster()}, clientOps);
+    const {buckets, bucket, objects, admin} = state;
+    const v = clientView({buckets, bucket, objects, admin, cluster: clientCluster()}, clientOps);
     show(t("demo.you"), t("demo.you_sub"), v.nodes, v);
   } else if (open.kind === "loft") {
     const id = shown();
@@ -530,7 +523,8 @@ function renderPanel() {
     // A cluster's "reset" is its own config back: the demo's is one node's.
     const demo = cluster ? state.config : state.demo;
     const own = state.channels.filter(c => c.role !== "data" && (c.node == null || c.node === id)).map(c => c.store);
-    const v = loftView({counters: counters(), ...state, demo, cluster, own}, loftOps);
+    const {bg, config, admin} = state;
+    const v = loftView({counters: counters(), bg, cluster, own, config, demo, admin}, loftOps);
     show(cluster ? t("nodes.loft_title", {n: id}) : "pigeonhole", t(cluster ? "nodes.loft_sub" : "demo.loft_sub"), v.nodes, v);
     if (!state.log) loadLog();
   } else if (open.kind === "cluster") {
@@ -547,12 +541,13 @@ function renderPanel() {
     show(t("demo.log_title"), t(sub, {store: c?.store, app: appOf(c?.kind)}), logView(state.log, c, state.logView, setView));
   } else {
     const c = channel(open.store);
-    if (!c) return;
-    const nodes = [budgetTable(budgetsOf(c, state.budgets)), chatView(c, m => deleteMessage(c, m))];
-    if (c.role === "data") nodes.unshift(faultsView(c, state.admin, faultOps(c)));
-    const kin = kinOf(c, state.channels);
-    if (kin) nodes.unshift(kin);
-    show(c.store, t(`demo.channel_sub_${c.role}`, {app: appOf(c.kind), scope: c.scope}), nodes);
+    if (!c) {
+      view = null;
+      return;
+    }
+    const props = {channel: c, channels: state.channels, budgets: state.budgets, admin: state.admin};
+    const v = storeView(props, {faults: faultOps(c), deleteMessage: m => deleteMessage(c, m)});
+    show(c.store, t(`demo.channel_sub_${c.role}`, {app: appOf(c.kind), scope: c.scope}), v.nodes, v);
   }
 }
 
@@ -562,17 +557,24 @@ const clientOps = {
     state.bucket = name;
     refreshObjects();
   },
-  upload: (name, body) => op({op: "put", bucket: state.bucket, key: name}, body),
+  upload: (name, body) => op(ops.put(state.bucket, name), body),
   tooBig: () => say(["try.too_big", {}]),
   // 100 KB from somewhere in the object: only the blocks that hold it are read.
   async read(key, size) {
     const len = Math.min(size, 100_000),
       first = Math.floor(Math.random() * Math.max(1, size - len));
-    const r = await op({op: "get", bucket: state.bucket, key, range: [first, first + len - 1]});
+    const r = await op(ops.get(state.bucket, key, [first, first + len - 1]));
     if (ok(r)) say(["demo.read_done", {len: bytes(r.len), key}]);
   },
-  copy: key => op({op: "copy", bucket: state.bucket, key, to: key.replace(/(\.[^.]*)?$/, ext => `-copy${ext}`)}),
-  remove: key => op({op: "delete", bucket: state.bucket, key}),
+  copy: key =>
+    op(
+      ops.copy(
+        state.bucket,
+        key,
+        key.replace(/(\.[^.]*)?$/, ext => `-copy${ext}`),
+      ),
+    ),
+  remove: key => op(ops.remove(state.bucket, key)),
   // In a cluster: the leader (null) or a node of yours.
   async sendTo(id) {
     await pickNode(id);
@@ -588,21 +590,21 @@ const faultOps = c => {
   const store = c.store;
   return {
     async outage() {
-      const r = await op({op: "outage", store, down: !c.down});
+      const r = await op(ops.outage(store, !c.down));
       if (ok(r)) say([r.down ? "say.down" : "say.up", {store}]);
       await refreshChannels();
     },
     async wipe() {
-      const r = await op({op: "wipe", store});
+      const r = await op(ops.wipe(store));
       if (ok(r)) say(["say.wiped", {store, n: r.deleted}]);
       await refreshChannels();
     },
     async verify() {
-      const r = await op({op: "verify", store});
+      const r = await op(ops.verify(store));
       if (ok(r)) say([r.gone ? "say.verified" : "say.verified_ok", {store, checked: r.checked, gone: r.gone}]);
     },
     async repair() {
-      const r = await op({op: "repair"});
+      const r = await op(ops.repair());
       if (ok(r)) say(["say.repair", {n: r.repaired}]);
       await refreshChannels();
     },
@@ -612,7 +614,7 @@ const faultOps = c => {
 // A reader deleted a message of a data channel, behind the node's back.
 async function deleteMessage(c, m) {
   if (!confirm(t("demo.delete_confirm"))) return;
-  const r = await op({op: "delete_message", store: c.store, message: String(m.id)});
+  const r = await op(ops.deleteMessage(c.store, String(m.id)));
   if (ok(r)) say(["say.deleted_one", {store: c.store, name: m.name || ""}]);
   await refreshChannels();
 }
@@ -628,26 +630,25 @@ async function boot() {
 }
 
 // A new config: every node restarts on it.
-async function restart(text) {
-  view?.setError("");
-  setBusy(true);
-  const {reply} = await node.call({op: "restart", config: text});
-  if (reply?.error) {
-    view?.setError(reply.error);
-    setBusy(false);
-    return;
-  }
-  Object.assign(state, {config: text, nodes: reply.nodes});
-  state.cut.clear();
-  await boot();
-  say(["say.restart", {n: reply.replayed}]);
-  setBusy(false);
+function restart(text) {
+  return whileBusy(async () => {
+    view?.setError("");
+    const {reply} = await call(ops.restart(text));
+    if (reply?.error) {
+      view?.setError(reply.error);
+      return;
+    }
+    Object.assign(state, {config: text, nodes: reply.nodes});
+    state.cut.clear();
+    await boot();
+    say(["say.restart", {n: reply.replayed}]);
+  });
 }
 
 // Everything this browser keeps for the demo goes; the page starts over.
 async function erase() {
   if (!confirm(t("try.erase_confirm"))) return;
-  await node.call({op: "reset"});
+  await node.call(ops.reset());
   location.reload();
 }
 
@@ -669,7 +670,7 @@ function openWizard() {
 // error, if one does not.
 async function startFromWizard(text) {
   const t0 = performance.now();
-  const {reply, events} = await open({op: "open", config: text});
+  const {reply, events} = await open(ops.open(text));
   const ms = performance.now() - t0;
   if (reply?.error) return reply.error;
   Object.assign(state, {config: text, nodes: reply.nodes});
@@ -700,12 +701,14 @@ async function open(request) {
 // opens, then the posts of its start (the log's claim).
 async function firstBoot(events) {
   await loadChannels();
-  await refreshObjects();
-  // Empty channels: the boot's own posts fill them in, as they fly.
+  // Empty channels: the boot's own posts fill them in, as they fly (the
+  // wizard's sketch stays empty meanwhile: the graph draws from these).
   for (const c of state.channels) {
     c.total = 0;
     c.messages = [];
   }
+  graph.refill();
+  await refreshObjects();
   redraw();
   graph.hideAll();
   graph.reveal({kind: "client"});
@@ -752,7 +755,7 @@ async function startDemo() {
     return;
   }
   const t0 = performance.now();
-  const booted = await open({op: "open"});
+  const booted = await open(ops.open());
   if (booted.reply?.error) {
     bootFailed(booted.reply.error);
     return;
@@ -769,7 +772,7 @@ async function startAdmin() {
   state.admin = true;
   document.body.classList.add("admin");
   const t0 = performance.now();
-  const {reply} = await node.call({op: "info"});
+  const {reply} = await node.call(ops.info());
   if (!ok(reply)) {
     status(t("try.error", {error: reply?.error || "no answer"}));
     return;
@@ -782,6 +785,13 @@ async function startAdmin() {
   say(["admin.caption", {n: state.buckets.length}]);
 }
 
+// Leaving (a reload, the other language): the node closes (node.js close),
+// nothing polls it any more.
+addEventListener("pagehide", () => {
+  clearInterval(clocks);
+  clearInterval(polls);
+  node.close();
+});
 // Back from the browser's page cache, the worker is gone: start again.
 addEventListener("pageshow", e => {
   if (e.persisted) location.reload();

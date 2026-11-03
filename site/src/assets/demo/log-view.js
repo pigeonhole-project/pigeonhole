@@ -7,7 +7,7 @@ import {button, h} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {chatView} from "./chat/index.js";
 
-export const VIEWS = ["readable", "channel"];
+const VIEWS = ["readable", "channel"];
 
 // The two views' tabs, `view` on; onView(v): another picked. `kind`: the
 // log's store (on a local disk, its records are files, not posts).

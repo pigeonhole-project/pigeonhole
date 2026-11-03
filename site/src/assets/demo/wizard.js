@@ -7,7 +7,7 @@
 import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
 import {appOf} from "./channels.js";
-import {divisors, perMinute, STEPS, sketch, tomlOf} from "./toml.js";
+import {divisors, fitCopies, perMinute, pickLog, STEPS, sketch, tomlOf} from "./toml.js";
 
 const MAX_CHANNELS = 4,
   MAX_BOTS = 4;
@@ -53,12 +53,7 @@ export function makeWizard(panel, on) {
     }
     return row;
   }
-  // A log in a channel needs its snapshots off the node too (a restart
-  // elsewhere must find them): the disk only for a log on the disk.
-  const setLog = v => {
-    setup.log = v;
-    if (v !== "local_disk" && setup.snapshots === "local_disk") setup.snapshots = v;
-  };
+  const setLog = v => pickLog(setup, v);
   const metaChoices = (label, value, pick, disk) =>
     choices(label, [["telegram", "Telegram"], ["discord", "Discord"], ...(disk ? [["local_disk", t("wiz.local_disk")]] : [])], value, pick);
   const kinds = (label, value, pick) =>
@@ -77,14 +72,6 @@ export function makeWizard(panel, on) {
     if (note) f.append(h("p", "field-note", note));
     return f;
   };
-
-  // Copies must divide the channels: fewer channels, fewer copies.
-  function fitCopies() {
-    const n = setup.channels.length;
-    if (n % setup.copies === 0) return;
-    setup.copies = Math.max(...divisors(n).filter(d => d <= setup.copies));
-    setup.quorum = setup.copies;
-  }
 
   function copiesNote() {
     const n = setup.channels.length;
@@ -132,7 +119,7 @@ export function makeWizard(panel, on) {
           row.append(
             button("mini", t("wiz.remove"), () => {
               setup.channels.splice(i, 1);
-              fitCopies();
+              fitCopies(setup);
               render();
             }),
           );
@@ -143,7 +130,7 @@ export function makeWizard(panel, on) {
         out.push(
           button("btn", t("wiz.add_channel"), () => {
             setup.channels.push(setup.channels.at(-1) === "telegram" ? "discord" : "telegram");
-            fitCopies();
+            fitCopies(setup);
             render();
           }),
         );

@@ -238,7 +238,6 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
             let text = r.config.unwrap_or_else(|| CONFIG.with(|c| c.borrow().clone()));
             return start(text).await;
         }
-        "config" => return Ok(json!({ "config": CONFIG.with(|c| c.borrow().clone()) })),
         // The page is going (a reload, another page): close as a server does
         // on SIGTERM, so a lease log is released and the next page's claim
         // need not wait the lease out.
