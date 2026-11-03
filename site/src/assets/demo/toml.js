@@ -10,6 +10,22 @@ import {t} from "../lib/i18n.js";
 
 export const divisors = n => Array.from({length: n}, (_, i) => i + 1).filter(d => n % d === 0);
 
+// The setup's rules, as the wizard's choices change it (in place).
+// Copies must divide the channels: fewer channels, fewer copies (a write
+// waits for all of them again).
+export function fitCopies(w) {
+  const n = w.channels.length;
+  if (n % w.copies === 0) return;
+  w.copies = Math.max(...divisors(n).filter(d => d <= w.copies));
+  w.quorum = w.copies;
+}
+// A log in a channel needs its snapshots off the node too (a restart
+// elsewhere must find them): the disk only for a log on the disk.
+export function pickLog(w, kind) {
+  w.log = kind;
+  if (kind !== "local_disk" && w.snapshots === "local_disk") w.snapshots = kind;
+}
+
 // Sends a minute per bot and channel: the services' defaults, or the demo's.
 export const perMinute = (kind, pace) => (pace === "demo" ? 1200 : kind === "telegram" ? 18 : 60);
 
