@@ -1,4 +1,5 @@
-//! Gauges of what the tablet holds and of the process, set every few seconds.
+//! Gauges of what the tablet holds and of the process, set every few
+//! seconds; the cooler's counters (its loop records them, crate::loops).
 
 use pigeonhole_chunk_store::BlobDb;
 use pigeonhole_gateway_s3::Index;
@@ -45,34 +46,33 @@ pub const METRICS: &[MetricDoc] = &[
 ];
 
 /// Set the process gauges once, and the tablet ones now and whenever
-/// `schedule` says (`[metrics] every`; each refresh walks the state).
-pub fn spawn(meta: Arc<MetaStore>, index: Index, chunks: BlobDb, mut schedule: Schedule<Option<Duration>>) {
+/// `schedule` says (`[metrics] every`; each refresh walks the state);
+/// ends once the tablet stops.
+pub async fn run(meta: Arc<MetaStore>, index: Index, chunks: BlobDb, mut schedule: Schedule<Option<Duration>>) {
     metrics::gauge!("pigeonhole_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
     let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     metrics::gauge!("pigeonhole_start_time_seconds").set(started.as_secs_f64());
-    tokio::spawn(async move {
-        loop {
-            meta.record_gauges();
-            let s3 = index.stats();
-            metrics::gauge!("pigeonhole_s3_buckets").set(s3.buckets as f64);
-            metrics::gauge!("pigeonhole_s3_objects").set(s3.objects as f64);
-            metrics::gauge!("pigeonhole_s3_object_bytes").set(s3.object_bytes as f64);
-            metrics::gauge!("pigeonhole_s3_uploads").set(s3.uploads as f64);
-            metrics::gauge!("pigeonhole_inline_objects").set(s3.inline_objects as f64);
-            metrics::gauge!("pigeonhole_inline_bytes").set(s3.inline_bytes as f64);
-            let c = chunks.stats();
-            metrics::gauge!("pigeonhole_chunks", "state" => "live").set(c.live as f64);
-            metrics::gauge!("pigeonhole_chunks", "state" => "unreferenced").set(c.unreferenced as f64);
-            metrics::gauge!("pigeonhole_chunks", "state" => "reclaiming").set(c.reclaiming as f64);
-            metrics::gauge!("pigeonhole_chunk_logical_bytes").set(c.logical_bytes as f64);
-            for (instance, bytes) in c.stored_bytes {
-                metrics::gauge!("pigeonhole_chunk_stored_bytes", "instance" => instance).set(bytes as f64);
-            }
-            if meta.is_stopped() {
-                return;
-            }
-            schedule.done();
-            schedule.next(|every| *every).await;
+    loop {
+        meta.record_gauges();
+        let s3 = index.stats();
+        metrics::gauge!("pigeonhole_s3_buckets").set(s3.buckets as f64);
+        metrics::gauge!("pigeonhole_s3_objects").set(s3.objects as f64);
+        metrics::gauge!("pigeonhole_s3_object_bytes").set(s3.object_bytes as f64);
+        metrics::gauge!("pigeonhole_s3_uploads").set(s3.uploads as f64);
+        metrics::gauge!("pigeonhole_inline_objects").set(s3.inline_objects as f64);
+        metrics::gauge!("pigeonhole_inline_bytes").set(s3.inline_bytes as f64);
+        let c = chunks.stats();
+        metrics::gauge!("pigeonhole_chunks", "state" => "live").set(c.live as f64);
+        metrics::gauge!("pigeonhole_chunks", "state" => "unreferenced").set(c.unreferenced as f64);
+        metrics::gauge!("pigeonhole_chunks", "state" => "reclaiming").set(c.reclaiming as f64);
+        metrics::gauge!("pigeonhole_chunk_logical_bytes").set(c.logical_bytes as f64);
+        for (instance, bytes) in c.stored_bytes {
+            metrics::gauge!("pigeonhole_chunk_stored_bytes", "instance" => instance).set(bytes as f64);
         }
-    });
+        if meta.is_stopped() {
+            return;
+        }
+        schedule.done();
+        schedule.next(|every| *every).await;
+    }
 }

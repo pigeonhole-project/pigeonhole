@@ -135,6 +135,11 @@ impl FileStore {
         self.id()
     }
 
+    /// A telegram or discord store, fake or not: a chat.
+    pub(crate) fn is_chat(&self) -> bool {
+        matches!(self, FileStore::Telegram { .. } | FileStore::Discord { .. })
+    }
+
     /// A telegram or discord store with `fake`: a channel without the
     /// service, no bots and no secrets.
     fn fake_channel(&self, id: &str) -> Result<Option<Store>> {
@@ -529,8 +534,9 @@ impl Topology {
         })
     }
 
-    /// Take store `id` for `purpose` (see [`Store::may_share`]).
-    fn take(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
+    /// Take store `id` for `purpose` (see [`Store::may_share`]): the
+    /// metadata log or snapshots, a blob store, fake channels.
+    pub(crate) fn take(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
         if let Some(whose) = self.others.get(id) {
             bail!("{purpose} = {id:?}: that [[store]] is {whose}; a store serves one node");
         }
@@ -552,12 +558,6 @@ impl Topology {
             }
         }
         Ok(store)
-    }
-
-    /// A store the metadata log or snapshots live in: `local_disk`,
-    /// `memory` or `telegram` (`discord` not yet).
-    pub(crate) fn meta_store(&mut self, id: &str, purpose: &'static str) -> Result<Store> {
-        self.take(id, purpose)
     }
 
     /// `[chunk] store`: a blob store, a `[[replicas]]` group of them, or
@@ -618,7 +618,7 @@ impl Topology {
 /// A blob store as the chunk store sees it.
 fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
     let mut telegram = Vec::new();
-    let (kind, bot_token_envs, bot_tokens, scope_id, fingerprint, location, max_blob_size) = match store {
+    let (kind, bot_token_envs, discord_tokens, scope_id, fingerprint, location, max_blob_size) = match store {
         Store::Memory => (
             InstanceKind::Memory,
             Vec::new(),
@@ -634,7 +634,7 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
             (
                 InstanceKind::Telegram,
                 bot_token_envs.clone(),
-                logins.iter().map(|l| l.bot_token.clone()).collect(),
+                Vec::new(),
                 chat_id.clone(),
                 telegram_fingerprint(&logins[0].bot_token, chat_id)?,
                 telegram_location(chat_id),
@@ -680,7 +680,7 @@ fn blob_instance(id: &str, store: &Store) -> Result<InstanceConfig> {
             role: InstanceRole::ReadWrite,
         },
         bot_token_envs,
-        bot_tokens,
+        discord_tokens,
         scope_id,
         max_blob_size,
         telegram,

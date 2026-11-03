@@ -1,18 +1,20 @@
 //! Binary-only: `pigeonhole` (no subcommand) — run the S3 gateway and optional REAPI / metrics.
 
-use crate::background::{spawn_background_tasks, spawn_cooler};
-use crate::runtime::open_runtime;
+use crate::runtime;
 use anyhow::Context;
 use axum::error_handling::HandleError;
 use axum::http::{Response, StatusCode};
 use axum::Router;
+use pigeonhole::config::dynamic::Task;
 use pigeonhole::config::Config;
 use pigeonhole::gateway_metrics::track_gateway;
 use pigeonhole::http_timeout::with_http_timeouts;
-use pigeonhole::index::Index;
 use pigeonhole::request_log::trace_request;
-use pigeonhole::{build_s3_gateway, build_s3_service, S3Gateway};
+use pigeonhole::{build_s3_service, S3Gateway};
+use pigeonhole_node::Stack;
 use s3s::{Body, HttpError};
+use std::future::IntoFuture;
+use tokio::sync::watch;
 use tracing::info;
 #[cfg(any(feature = "bytestream", not(feature = "metrics-prometheus")))]
 use tracing::warn;
@@ -20,41 +22,18 @@ use tracing::warn;
 pub async fn cmd_serve() -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     info!(path = %cfg.config_path.display(), "loaded config");
-    // Before the runtime: booting the tablet records metrics too.
+    // Before the node: booting the tablet records metrics too.
     let metrics_on_main = setup_metrics(&cfg)?;
-    let rt = open_runtime(&cfg).await.context("open runtime")?;
-    let index = Index::open(rt.meta.clone()).await.context("open s3 index")?;
-
-    let s3_gateway = build_s3_gateway(cfg.s3_options(), index.clone(), rt.store.clone());
-    tokio::spawn(rt.dynamic.clone().follow());
-    tokio::spawn(rt.store.clone().follow_leadership());
-    spawn_background_tasks(&rt);
-    spawn_cooler(&rt, cfg.inline.max_object_size.is_some(), s3_gateway.clone());
-    if cfg.metrics.enabled {
-        let schedule = rt.dynamic.metrics.schedule();
-        pigeonhole::state_metrics::spawn(rt.meta.clone(), index.clone(), rt.store.db().clone(), schedule);
-    }
-    let admin = std::sync::Arc::new(pigeonhole_admin::Admin {
-        meta: rt.meta.clone(),
-        log: rt.log.clone(),
-        store: rt.store.clone(),
-        s3: s3_gateway.clone(),
-        index: index.clone(),
-        dynamic: rt.dynamic.clone(),
-        inline_on: cfg.inline.max_object_size.is_some(),
-        snapshot_every: cfg.meta.snapshot_every_entries,
-        channels: Some(channels_view(&cfg)),
-        stores: pigeonhole_admin::stores::of(&cfg),
-        config_text: std::fs::read_to_string(&cfg.config_path).ok(),
-        cluster: cfg.cluster.clone(),
-        limiters: vec![("telegram", cfg.limiters.clone()), ("discord", cfg.discord_limiters.clone())],
-    });
-    spawn_admin(&cfg, &rt, admin).await?;
+    let mut node = runtime::open(&cfg, namespaces, &extra_loops(&cfg)).await.context("open the node")?;
+    node.start();
+    // Set on SIGINT / SIGTERM: the servers finish their requests in flight and stop.
+    let (stop, stopping) = watch::channel(false);
+    spawn_admin(&cfg, &node, stopping.clone()).await?;
 
     #[cfg(feature = "bytestream")]
-    spawn_bytestream(&cfg, &rt).await?;
+    spawn_bytestream(&cfg, &node).await?;
 
-    let app = s3_app(&cfg, s3_gateway, rt.meta.clone(), metrics_on_main);
+    let app = s3_app(&cfg, node.s3.clone(), node.meta.clone(), metrics_on_main);
 
     let addr = cfg.listen_addr.clone();
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
@@ -72,35 +51,59 @@ pub async fn cmd_serve() -> anyhow::Result<()> {
         max_headers = cfg.http.max_headers,
         "pigeonhole listening on http://{addr}"
     );
+    let mut serving = tokio::spawn(axum::serve(listener, app).with_graceful_shutdown(stopped(stopping)).into_future());
     // A fenced tablet must not answer again: exit and let a restart claim anew.
     tokio::select! {
-        r = axum::serve(listener, app) => r.context("serve")?,
-        stop = rt.meta.stopped() => anyhow::bail!("{stop}"),
+        r = &mut serving => r.context("the S3 server")?.context("serve")?,
+        stop = node.meta.stopped() => anyhow::bail!("{stop}"),
         signal = shutdown_signal() => {
-            info!(%signal, "shutting down: releasing the metadata log");
-            rt.meta.close().await?;
+            info!(%signal, "shutting down: finishing the requests in flight");
+            stop.send_replace(true);
+            match tokio::time::timeout(cfg.http.request_timeout, serving).await {
+                Ok(served) => served.context("the S3 server")?.context("serve")?,
+                Err(_) => tracing::warn!("requests still in flight after the request timeout: dropped"),
+            }
         }
     }
-    Ok(())
+    close(&node).await
 }
 
-/// The node's stores as the admin's UI sees them: fake channels with what
-/// they hold (feature `fake`), local disks with their files, the rest listed.
-fn channels_view(cfg: &Config) -> std::sync::Arc<dyn pigeonhole_admin::Channels> {
-    use pigeonhole_admin::{stores, DiskView, ListedStores, Views};
-    use std::sync::Arc;
-    let order = stores::of(cfg);
-    let mut views: Vec<Arc<dyn pigeonhole_admin::Channels>> =
-        crate::fakes::view(&order, cfg.cluster.as_ref().map(|c| c.key)).into_iter().collect();
-    views
-        .push(Arc::new(DiskView::<pigeonhole_storage_disk::DiskId>::new(&order, pigeonhole_storage_disk::inspect_dir)));
-    views.push(Arc::new(ListedStores(order.clone())));
-    Arc::new(Views { order, views })
+/// The node's tablet released (a lease log given back), then the fake
+/// channels' (feature `fake`).
+async fn close(node: &Stack) -> anyhow::Result<()> {
+    info!("releasing the metadata log");
+    node.close().await?;
+    crate::fakes::close().await
+}
+
+/// Ready once `stopping` turns true (or its sender is gone).
+async fn stopped(mut stopping: watch::Receiver<bool>) {
+    let _ = stopping.wait_for(|&s| s).await;
+}
+
+/// The tablet's namespaces beyond the node's: the REAPI's CAS index.
+fn namespaces(ns: pigeonhole_meta::Namespaces) -> pigeonhole_meta::Namespaces {
+    #[cfg(feature = "bytestream")]
+    let ns = pigeonhole_gateway_bytestream::cas_index::CasIndex::register(ns);
+    ns
+}
+
+/// The loops this process runs beyond the node's own: the tablet's gauges
+/// (`[metrics]`), the REAPI's GCs (`[bytestream]`).
+fn extra_loops(cfg: &Config) -> Vec<Task> {
+    let mut extra = Vec::new();
+    if cfg.metrics.enabled {
+        extra.push(Task::Metrics);
+    }
+    if cfg!(feature = "bytestream") && cfg.bytestream.enabled {
+        extra.extend([Task::CasGc, Task::UploadGc]);
+    }
+    extra
 }
 
 /// The REAPI / ByteStream server on its own port, if enabled.
 #[cfg(feature = "bytestream")]
-async fn spawn_bytestream(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow::Result<()> {
+async fn spawn_bytestream(cfg: &Config, node: &Stack) -> anyhow::Result<()> {
     use pigeonhole_gateway_bytestream::cas_index::CasIndex;
     use pigeonhole_gateway_bytestream::config::{BytestreamConfig, Gc};
     if !cfg.bytestream.enabled {
@@ -113,9 +116,9 @@ async fn spawn_bytestream(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow:
         max_batch_total_size_bytes: cfg.bytestream.max_batch_total_size as i64,
         ..Default::default()
     };
-    let gc = Gc { cas: rt.dynamic.cas_gc.schedule(), uploads: rt.dynamic.upload_gc.schedule() };
-    let cas = CasIndex::open(rt.meta.clone()).await.context("open cas index")?;
-    let bs_store = rt.store.clone();
+    let gc = Gc { cas: node.dynamic.cas_gc.schedule(), uploads: node.dynamic.upload_gc.schedule() };
+    let cas = CasIndex::open(node.meta.clone()).await.context("open cas index")?;
+    let bs_store = node.store.clone();
     tokio::spawn(async move {
         if let Err(e) = pigeonhole_gateway_bytestream::server::serve(bs_cfg, cas, bs_store, gc).await {
             warn!(error = %e, "bytestream server exited");
@@ -125,12 +128,8 @@ async fn spawn_bytestream(cfg: &Config, rt: &crate::runtime::Runtime) -> anyhow:
 }
 
 /// The admin API (`[admin] listen_addr`, off by default): the dynamic
-/// config and passes on demand (docs/dynamic-config.md).
-async fn spawn_admin(
-    cfg: &Config,
-    rt: &crate::runtime::Runtime,
-    admin: std::sync::Arc<pigeonhole_admin::Admin>,
-) -> anyhow::Result<()> {
+/// config and passes on demand (docs/dynamic-config.md), the UI's ops.
+async fn spawn_admin(cfg: &Config, node: &Stack, stopping: watch::Receiver<bool>) -> anyhow::Result<()> {
     let Some(addr) = &cfg.admin.listen_addr else { return Ok(()) };
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind admin {addr}"))?;
     let sock = listener.local_addr()?;
@@ -138,9 +137,9 @@ async fn spawn_admin(
         tracing::warn!(%sock, "the admin API has no authentication and listens beyond this host");
     }
     info!(%sock, "admin API listening");
-    let app = pigeonhole::admin_http::with_ui(rt.dynamic.clone(), admin, cfg.admin.ui_dir.as_deref());
+    let app = pigeonhole::admin_http::with_ui(node.admin.clone(), cfg.admin.ui_dir.as_deref());
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(stopped(stopping)).await {
             tracing::error!(error = %e, "admin API stopped");
         }
     });

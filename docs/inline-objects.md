@@ -452,7 +452,7 @@ and metadata in Discord (`DEMO_BACKEND=chats`), 2026-10-30.
   - the cooler racing rewrites and deletes: no lost write, no leaked chunk.
 - **Config** (`crates/config/pigeonhole-config`): units, defaults, `"off"`; `"0s"` and
   decimal units refused; with inlining off the cooler drains everything
-  (`bin/src/background.rs`).
+  (`crates/node/pigeonhole-node/src/loops.rs`).
 - **Live:** the T4 demo with objects in Telegram keeps its leader after a
   takeover (above).
 

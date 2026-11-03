@@ -30,19 +30,11 @@ pub async fn only_on_the_leader(
     if matches!(req.uri().path(), PATH | READABLE | "/metrics") {
         return next.run(req).await;
     }
-    let op = || format!("{} {}", req.method(), req.uri().path());
-    if !meta.is_leader() {
-        let why = match meta.serving_term() {
-            Err(e) => format!("{e:#}"),
-            Ok(_) => "not the leader".to_string(),
-        };
-        tracing::info!(op = %op(), leader = meta.leader(), why, "not serving");
+    let writes = !matches!(*req.method(), Method::GET | Method::HEAD);
+    if let Err(e) = meta.serves(writes) {
+        let why = format!("{e:#}");
+        tracing::info!(op = %format!("{} {}", req.method(), req.uri().path()), leader = meta.leader(), why, "not serving");
         return unavailable(&why);
-    }
-    let reads = matches!(*req.method(), Method::GET | Method::HEAD);
-    if meta.is_read_only() && !reads {
-        tracing::info!(op = %op(), "read-only: no quorum");
-        return unavailable("read-only: this leader has no quorum; writes wait for one");
     }
     next.run(req).await
 }

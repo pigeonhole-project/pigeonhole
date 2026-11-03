@@ -7,7 +7,7 @@ facade, a no-op until the binary installs its recorder.
 Each crate declares the metrics it records in a `METRICS` table
 (`pigeonhole_blob::METRICS`, `pigeonhole_limits::METRICS`,
 `pigeonhole_meta::METRICS`, `openraft_chat::telemetry::METRICS`,
-`pigeonhole::state_metrics::METRICS`), collected by
+`pigeonhole_node::state_metrics::METRICS`), collected by
 `pigeonhole::metric_docs()`. The help text in the scrape comes from it, and
 so does the list below: `tests/metrics_doc.rs` fails when the list is
 stale and rewrites it with `UPDATE_METRICS_DOC=1`.
@@ -162,7 +162,7 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `openraft_chat_read_errors_total` | counter | `peer` | Failed reads of a peer's outbox |
 | `openraft_chat_requests_served_total` | counter | `peer`, `rpc` | Requests from a peer handed to this node's Raft |
 
-### pigeonhole (binary)
+### pigeonhole-node
 
 | Metric | Kind | Labels | Meaning |
 |---|---|---|---|

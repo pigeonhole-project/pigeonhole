@@ -81,7 +81,21 @@ shows `leader` as soon as elected).
 - **The dynamic config** ([dynamic-config.md](dynamic-config.md)).
   Overrides reach every node by replication, and `DynConfig::follow`
   recomputes the knobs there. On a follower, `PUT`/`DELETE
-  /admin/config/…` answer 503.
+  /admin/config/…` and `POST /admin/run/{task}` (but `snapshot`) answer 503.
+- **The admin** (`pigeonhole-admin`: the binary's `/admin/ops`, the
+  demo's node) gates every op as the S3 port does, by the same check
+  (`MetaStore::serves`, the same messages). Each op declares where it
+  runs (`Access`, next to its handler):
+  - the leader that serves: `get`, `list`, `buckets` (they read the
+    leader's state);
+  - the leader that may write, too (not read-only): `put`, `copy`,
+    `delete`, `verify`, `repair`, `sweep` (a sweep deletes by the
+    leader's view), `dynamic_set`, `dynamic_unset`; `run_task` of a
+    leader's task;
+  - any node: what it knows of itself (`info`, with the buckets only
+    where it serves; `log`, `background`, `budgets`, `cluster`,
+    `dynamic`, `channels`), a snapshot (`run_task snapshot`), the demo's
+    faults.
 
 Pins (uploads in flight, reads in flight) live in the leader's process. Its
 sweeper is the only one that deletes, so they need not travel. When the
@@ -145,7 +159,11 @@ the same `[cluster]`, `[[node]]` list and blob stores on every host. A node
 knows which one it is from `PIGEONHOLE_NODE` (or `[cluster] node`). Each
 `[[node]]` names its own log and snapshots stores; a node opens only its
 own and leaves the others' unresolved (their env vars need not be set).
-A store serves one node: two nodes naming the same log is an error.
+A store serves one node: two nodes naming the same log is an error. A
+`[[node]]` without a `log` (or `snapshot`) of its own takes `[meta]`'s;
+when that is a chat and the cluster has more than one node, the file is
+refused, naming the node: two nodes on one chat log would fence each other
+at every boot.
 Whatever depends on a node's own log is its own too: `[[node]]` sets any
 `[meta]` knob for itself (how often it snapshots, how many snapshots and how
 much log it keeps, a Discord log's lease), `[meta]` gives the rest. In the
@@ -161,7 +179,9 @@ chat = "telegram"               # the outboxes' chat (the default)
 bot_token_envs = ["RAFT_BOT_TOKEN"]   # this node's bots; each host sets its own
 # api_id_env / api_hash_env: TG_API_ID / TG_API_HASH by default
 # heartbeat, election_timeout_min / _max, tick, poll: set for the slowest
-# link unless given (§ Timing)
+# link unless given (§ Timing); never zero, and on a Telegram chat a tick
+# and a poll of 1s at least (each is a call to it). `chat` is checked on
+# every node, a chat link or not.
 
 [[node]]
 id = 1

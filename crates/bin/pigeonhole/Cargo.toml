@@ -11,16 +11,14 @@ path = "src/main.rs"
 
 [dependencies]
 pigeonhole-admin = { workspace = true }
+pigeonhole-node = { workspace = true }
 pigeonhole-raft-telegram = { workspace = true }
 pigeonhole-fake-channels = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
-bytesize = { workspace = true }
-dotenvy = { workspace = true }
 http = { workspace = true }
-humantime-serde = { workspace = true }
 s3s = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,20 +26,16 @@ toml = { workspace = true }
 pigeonhole-blob = { workspace = true }
 pigeonhole-limits = { workspace = true }
 pigeonhole-types = { workspace = true }
-pigeonhole-codec = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
 pigeonhole-meta = { workspace = true }
 openraft-chat = { workspace = true }
 openraft-grpc = { workspace = true, features = ["transport"] }
 pigeonhole-gateway-s3 = { workspace = true }
-pigeonhole-storage-api = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true }
 pigeonhole-telegram-mtproto = { workspace = true }
 pigeonhole-config = { workspace = true }
 uuid = { workspace = true }
-lru = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
-pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-discord = { workspace = true, optional = true }
 pigeonhole-discord-http = { workspace = true, optional = true }
 pigeonhole-gateway-bytestream = { workspace = true, optional = true }
@@ -58,7 +52,7 @@ metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [features]
 default = ["discord", "metrics-prometheus"]
-discord = ["dep:pigeonhole-storage-discord", "dep:pigeonhole-discord-http", "pigeonhole-config/discord"]
+discord = ["dep:pigeonhole-storage-discord", "dep:pigeonhole-discord-http"]
 bytestream = ["dep:pigeonhole-gateway-bytestream"]
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
 # Telegram and Discord stores on fake channels (`fake = …` in a store): the

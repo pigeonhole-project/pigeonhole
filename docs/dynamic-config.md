@@ -16,6 +16,14 @@ else in `pigeonhole.toml` is static: a restart reads it.
 | `metrics.every` | how often the tablet's gauges are set |
 | `bytestream.gc_every`, `bytestream.gc_ttl`, `bytestream.upload_gc_every` | the REAPI CAS GC and the drop of stale uploads |
 
+Only the loops the process runs are there: its root tells `DynConfig::open`
+which (`Task`). Every node runs `sweep`, `repair`, `cool` and its
+`snapshot` ticker (pigeonhole-node); the binary adds `metrics` with
+`[metrics] enabled` and `cas_gc`, `upload_gc` with the REAPI server; the
+site's demo runs no more. The keys, the tasks and the passes on demand are
+those of these loops: a key of a loop the process does not run is not
+listed, and setting it is refused, as is a pass of it.
+
 A period of `"off"` parks its loop. An asked-for pass still runs. Zero is
 refused, as in the file. `inline.max_object_size` is static: the S3 gateway
 reads it when it starts.
@@ -65,7 +73,8 @@ ones. Snapshots are every node's own work: each node's ticker follows
 `meta.snapshot_every` leaves a node with a period of its own alone. The
 override is written on the leader and reaches the node it names by
 replication. `POST /admin/run/snapshot` asks the node it is sent to. On a
-follower, `PUT` and `DELETE` answer 503 (`NotLeader`): ask the leader. The snapshot ticker's
+follower, `PUT`, `DELETE` and a leader's task's `POST /admin/run` answer
+503 (`NotLeader`): ask the leader. The snapshot ticker's
 control lives in the `MetaStore` (`snapshot_schedule()`). The bytestream
 server takes its GC schedules in `Gc`.
 
@@ -102,8 +111,11 @@ warning.
   `off`, `16`, `true`, or quoted TOML. Answers 204, or 400 with the reason.
 - `DELETE /admin/config/{key}`: back to the file's value. Answers 204, or 404
   if the key has no override.
-- `POST /admin/run/{task}`: a pass now. Tasks are `sweep`, `repair`, `cool`,
-  `snapshot`, `metrics`, `cas_gc`, `upload_gc`. Answers 202.
+- `POST /admin/run/{task}`: a pass now. Tasks are those the process runs
+  (§ What is dynamic): `sweep`, `repair`, `cool`, `snapshot`, and maybe
+  `metrics`, `cas_gc`, `upload_gc`. Answers 202, 404 for a task it does not
+  run, and 503 for a leader's task where the node does not serve or is
+  read-only (a follower would skip the pass); `snapshot` runs anywhere.
 - `POST /admin/ops`: the site's UI's ops (crates/admin, `pigeonhole-admin`):
   a JSON line (`{"op": "list", "bucket": "photos"}`), then an upload's bytes;
   the answer is `{"reply": …}`. The demo's node runs the same ops in the

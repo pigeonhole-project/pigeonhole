@@ -91,36 +91,6 @@ pub struct Request {
     pub node: Option<u64>,
 }
 
-impl Request {
-    /// The op as the request it stands for, if only the leader serves it: a
-    /// follower turns those away, as the binary's S3 port does. S3's; the
-    /// chunk store's own ops (verify, repair: the stores are the leader's);
-    /// the dynamic config's changes and its tasks' runs (entries in the
-    /// tablet's log, work the leader does).
-    fn leader_only(&self) -> Option<String> {
-        let (b, k) = (&self.bucket, &self.key);
-        Some(match self.op.as_str() {
-            "put" => format!("PUT /{b}/{k}"),
-            "get" => format!("GET /{b}/{k}"),
-            "copy" => format!("PUT /{b}/{} (copy of {k})", self.to),
-            "delete" => format!("DELETE /{b}/{k}"),
-            "list" => format!("GET /{b}"),
-            "buckets" => "GET /".to_string(),
-            "verify" | "repair" => format!("{} (the chunk store)", self.op),
-            "dynamic_set" | "dynamic_unset" => format!("{} {} (the dynamic config)", self.op, self.key),
-            // A snapshot is every node's own; the other tasks are the leader's work.
-            "run_task" if self.task != "snapshot" => format!("run_task {} (a background task)", self.task),
-            _ => return None,
-        })
-    }
-
-    /// Whether it writes to the tablet: a read-only leader turns it away.
-    fn writes(&self) -> bool {
-        matches!(self.op.as_str(), "put" | "copy" | "delete" | "verify" | "repair" | "dynamic_set" | "dynamic_unset")
-            || (self.op == "run_task" && self.task != "snapshot")
-    }
-}
-
 fn demo() -> String {
     "demo".into()
 }
@@ -152,83 +122,130 @@ pub struct Admin {
     pub limiters: Vec<(&'static str, Arc<pigeonhole_limits::LimiterRegistry>)>,
 }
 
-impl Admin {
-    /// A node that does not lead turns S3 requests away, as the binary's
-    /// S3 port does (pigeonhole::leader_http): the same log lines. A
-    /// read-only leader (no quorum) turns writes away.
-    fn only_on_the_leader(&self, op: &str, writes: bool) -> Result<()> {
-        if self.meta.is_leader() {
-            if writes && self.meta.is_read_only() {
-                tracing::info!(op, "read-only: no quorum");
-                bail!("read-only: this leader has no quorum; writes wait for one");
-            }
-            return Ok(());
-        }
-        let why = match self.meta.serving_term() {
-            Err(e) => format!("{e:#}"),
-            Ok(_) => "not the leader".to_string(),
+/// Where an op runs: on any node, only on the leader that serves (it
+/// reads the state a follower may lag), or only where writes work too
+/// (not read-only). Declared with each op ([`Admin::handle`]); the S3
+/// port's gate checks the same ([`MetaStore::serves`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Any,
+    Leader,
+    Writes,
+}
+
+impl Access {
+    /// Whether `meta`'s node runs an op of this access now: the error
+    /// says why not (`NotLeader`, `CatchingUp`, `NoQuorum`), as the S3
+    /// port's 503 does; `op` names it in the log.
+    pub fn check(self, meta: &MetaStore, op: &str) -> Result<()> {
+        let writes = match self {
+            Access::Any => return Ok(()),
+            Access::Leader => false,
+            Access::Writes => true,
         };
-        tracing::info!(op, leader = self.meta.leader(), why, "not serving");
-        bail!(why)
+        meta.serves(writes).inspect_err(|e| {
+            tracing::info!(op, leader = meta.leader(), why = %format!("{e:#}"), "not serving");
+        })
+    }
+}
+
+/// An op's work, not started.
+type Run<'a> = futures::future::BoxFuture<'a, Result<Value>>;
+
+fn ok() -> Value {
+    json!({ "ok": true })
+}
+
+impl Admin {
+    /// Runs `r` (with `body`, an upload's bytes) where its [`Access`] allows.
+    pub async fn handle(&self, r: &Request, body: Bytes) -> Result<Value> {
+        let (access, run) = match self.s3_op(r, body)? {
+            Some(op) => op,
+            None => self.node_op(r)?,
+        };
+        access.check(&self.meta, &r.op)?;
+        run.await
     }
 
-    /// Runs `r` (with `body`, an upload's bytes).
-    pub async fn handle(&self, r: &Request, body: Bytes) -> Result<Value> {
-        if let Some(op) = r.leader_only() {
-            self.only_on_the_leader(&op, r.writes())?;
-        }
+    /// The S3 calls of the UI's client panel: the leader's.
+    fn s3_op<'a>(&'a self, r: &'a Request, body: Bytes) -> Result<Option<(Access, Run<'a>)>> {
+        use Access::{Leader, Writes};
+        let (b, k) = (&r.bucket, &r.key);
+        Ok(Some(match r.op.as_str() {
+            "put" => (Writes, Box::pin(async move { self.put(b, k, body).await.map(|()| ok()) })),
+            "get" => (Leader, Box::pin(async move { Ok(json!({ "len": self.get(b, k, r.range).await?.len() })) })),
+            "copy" => (Writes, Box::pin(async move { self.copy(b, k, &r.to).await.map(|()| ok()) })),
+            "delete" => (Writes, Box::pin(async move { self.delete(b, k).await.map(|()| ok()) })),
+            "list" => (Leader, Box::pin(async move { Ok(json!({ "objects": self.list(b).await? })) })),
+            "buckets" => (Leader, Box::pin(async move { Ok(json!({ "buckets": self.buckets().await? })) })),
+            _ => return Ok(None),
+        }))
+    }
+
+    /// The node's own ops: what it holds and runs, and its channels.
+    fn node_op<'a>(&'a self, r: &'a Request) -> Result<(Access, Run<'a>)> {
+        use Access::{Any, Writes};
         Ok(match r.op.as_str() {
-            "put" => {
-                self.put(&r.bucket, &r.key, body).await?;
-                json!({ "ok": true })
+            "info" => (Any, Box::pin(self.info())),
+            "log" => (Any, Box::pin(self.log_entries(r.from, r.limit.unwrap_or(200)))),
+            "background" => (Any, Box::pin(self.background())),
+            "budgets" => (Any, Box::pin(async move { Ok(self.budgets()) })),
+            "cluster" => (Any, Box::pin(async move { Ok(self.cluster()) })),
+            "dynamic" => (Any, Box::pin(async move { Ok(self.dynamic_view()) })),
+            "dynamic_set" => (Writes, Box::pin(async move { self.dynamic.set(&r.key, &r.value).await.map(|()| ok()) })),
+            "dynamic_unset" => {
+                (Writes, Box::pin(async move { Ok(json!({ "unset": self.dynamic.unset(&r.key).await? })) }))
             }
-            "get" => json!({ "len": self.get(&r.bucket, &r.key, r.range).await?.len() }),
-            "copy" => {
-                self.copy(&r.bucket, &r.key, &r.to).await?;
-                json!({ "ok": true })
-            }
-            "delete" => {
-                self.delete(&r.bucket, &r.key).await?;
-                json!({ "ok": true })
-            }
-            "list" => json!({ "objects": self.list(&r.bucket).await? }),
-            "buckets" => json!({ "buckets": self.buckets().await? }),
-            "info" => json!({
-                "replayed": self.replayed(),
-                "config": self.config_text,
-                "buckets": self.buckets().await?,
-            }),
-            "log" => self.log_entries(r.from, r.limit.unwrap_or(200)).await?,
-            "background" => self.background().await?,
-            "budgets" => self.budgets(),
-            "cluster" => self.cluster(),
-            "dynamic" => json!({
-                "keys": self.dynamic.keys(),
-                "tasks": self.dynamic.tasks(),
-                "changed_at": self.dynamic.changed_at(),
-                "nodes": self.dynamic.nodes(),
-            }),
-            "dynamic_set" => {
-                self.dynamic.set(&r.key, &r.value).await?;
-                json!({ "ok": true })
-            }
-            "dynamic_unset" => json!({ "unset": self.dynamic.unset(&r.key).await? }),
-            "run_task" => {
-                self.dynamic.run_now(&r.task)?;
-                json!({ "ok": true })
-            }
-            "verify" => {
-                let (checked, gone) = self.verify(&r.store).await?;
-                json!({ "checked": checked, "gone": gone })
-            }
-            "repair" => {
-                let s = self.repair().await?;
-                json!({ "repaired": s.repaired, "failed": s.failed, "queued": s.scrub_enqueued })
-            }
-            "sweep" => {
-                let s = self.sweep().await?;
-                json!({ "deleted": s.keys_deleted, "zero_ref": s.zero_ref_chunks, "failed": s.failed })
-            }
+            // The leader's tasks are refused elsewhere by run_now itself; a snapshot is every node's.
+            "run_task" => (Any, Box::pin(async move { self.dynamic.run_now(&r.task).map(|()| ok()) })),
+            "verify" => (
+                Writes,
+                Box::pin(async move {
+                    let (checked, gone) = self.verify(&r.store).await?;
+                    Ok(json!({ "checked": checked, "gone": gone }))
+                }),
+            ),
+            "repair" => (
+                Writes,
+                Box::pin(async move {
+                    let s = self.repair().await?;
+                    Ok(json!({ "repaired": s.repaired, "failed": s.failed, "queued": s.scrub_enqueued }))
+                }),
+            ),
+            "sweep" => (
+                Writes,
+                Box::pin(async move {
+                    let s = self.sweep().await?;
+                    Ok(json!({ "deleted": s.keys_deleted, "zero_ref": s.zero_ref_chunks, "failed": s.failed }))
+                }),
+            ),
+            "channels" | "delete_message" | "outage" | "wipe" => (Any, Box::pin(self.channel_op(r))),
+            other => bail!("unknown op {other:?}"),
+        })
+    }
+
+    /// `info`: the entries the boot replayed, the config as read, and the
+    /// buckets where this node serves (none known elsewhere).
+    async fn info(&self) -> Result<Value> {
+        let buckets = match self.meta.serves(false) {
+            Ok(()) => Some(self.buckets().await?),
+            Err(_) => None,
+        };
+        Ok(json!({ "replayed": self.replayed(), "config": self.config_text, "buckets": buckets }))
+    }
+
+    fn dynamic_view(&self) -> Value {
+        json!({
+            "keys": self.dynamic.keys(),
+            "tasks": self.dynamic.tasks(),
+            "changed_at": self.dynamic.changed_at(),
+            "nodes": self.dynamic.nodes(),
+        })
+    }
+
+    /// The channels as their apps show them, and what can be done to them.
+    async fn channel_op(&self, r: &Request) -> Result<Value> {
+        Ok(match r.op.as_str() {
             "channels" => match &self.channels {
                 Some(c) => c.describe(r.limit.unwrap_or(200)).await?,
                 None => json!({ "channels": [] }),
@@ -237,8 +254,7 @@ impl Admin {
                 self.channels()?.delete_message(&r.store, &r.message).await?;
                 json!({ "deleted": 1 })
             }
-            "outage" | "wipe" => self.channels()?.fault(&r.op, &r.store, r.down).await?,
-            other => bail!("unknown op {other:?}"),
+            op => self.channels()?.fault(op, &r.store, r.down).await?,
         })
     }
 

@@ -893,6 +893,18 @@ impl MetaStore {
         }
     }
 
+    /// Whether this node serves a request now, before it does any of it:
+    /// it leads and serves ([`Self::is_leader`]; else [`NotLeader`] or
+    /// [`CatchingUp`]), and for one that `writes`, is not read-only (else
+    /// [`NoQuorum`]). The one gate of the S3 port and the admin.
+    pub fn serves(&self, writes: bool) -> Result<()> {
+        self.serving_term()?;
+        if writes && self.is_read_only() {
+            return Err(self.no_quorum().into());
+        }
+        Ok(())
+    }
+
     /// Elected leader but not serving yet ([`Self::is_leader`]): its term.
     pub fn catching_up(&self) -> Option<u64> {
         let metrics = self.raft.metrics();

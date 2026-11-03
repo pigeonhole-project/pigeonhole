@@ -6,7 +6,8 @@
 //!   passes next), and every node with whether the last change reached it;
 //! - `PUT /admin/config/{key}`, the value as the body (`5s`, `off`, `16`):
 //!   override it; `DELETE /admin/config/{key}`: back to the file's;
-//! - `POST /admin/run/{task}`: a pass now, even while the task is off;
+//! - `POST /admin/run/{task}`: a pass now, even while the task is off (the
+//!   leader's work only where it serves: 503 elsewhere);
 //! - `POST /admin/ops`: the UI's ops (pigeonhole-admin), as the site's demo
 //!   sends them to its node: a JSON line, then an upload's bytes;
 //! - `/`: the UI itself (`[admin] ui_dir`), from this address, so that no
@@ -30,9 +31,10 @@ pub fn router(dynamic: Arc<DynConfig>) -> Router {
         .with_state(dynamic)
 }
 
-/// [`router`], the UI's ops on `admin`, and the UI from `ui_dir`.
-pub fn with_ui(dynamic: Arc<DynConfig>, admin: Arc<Admin>, ui_dir: Option<&std::path::Path>) -> Router {
-    let app = router(dynamic).merge(Router::new().route("/admin/ops", post(ops)).with_state(admin));
+/// [`router`] of `admin`'s dynamic config, the UI's ops on `admin`, and
+/// the UI from `ui_dir`.
+pub fn with_ui(admin: Arc<Admin>, ui_dir: Option<&std::path::Path>) -> Router {
+    let app = router(admin.dynamic.clone()).merge(Router::new().route("/admin/ops", post(ops)).with_state(admin));
     match ui_dir {
         Some(dir) => app.fallback_service(tower_http::services::ServeDir::new(dir)),
         None => app,
@@ -88,6 +90,9 @@ async fn unset(State(d): State<Arc<DynConfig>>, Path(key): Path<String>) -> Resp
 async fn run(State(d): State<Arc<DynConfig>>, Path(task): Path<String>) -> Response {
     match d.run_now(&task) {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(e) if pigeonhole_meta::unavailable(&e) => {
+            (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}\n")).into_response()
+        }
         Err(e) => (StatusCode::NOT_FOUND, format!("{e:#}\n")).into_response(),
     }
 }

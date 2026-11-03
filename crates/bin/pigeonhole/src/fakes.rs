@@ -1,7 +1,8 @@
 //! Telegram and Discord stores on fake channels (`fake = …` on a store; the
 //! feature `fake`): channels this process keeps (pigeonhole-fake-channels),
-//! as the site's demo has them. The site's recordings run on them, and so
-//! can a node to play with. Without the feature such a config is refused.
+//! opened as the site's demo opens them. The site's recordings run on them,
+//! and so can a node to play with. Without the feature such a config is
+//! refused.
 
 use pigeonhole::config::stores::FakeChannel;
 use pigeonhole::config::Config;
@@ -14,57 +15,38 @@ use std::sync::Arc;
 #[cfg(feature = "fake")]
 mod on {
     use super::*;
-    use pigeonhole::instances::InstanceKind;
-    use pigeonhole_blob::{erase, MetricsBackend};
-    use pigeonhole_fake_channels::world::meta_info;
-    use pigeonhole_fake_channels::{FakeView, World};
-    use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore};
-    use std::sync::LazyLock;
+    use pigeonhole_fake_channels::Fakes;
+    use std::sync::OnceLock;
 
-    /// The process's fake channels: every store on one shares it.
-    static WORLD: LazyLock<Arc<World>> = LazyLock::new(Default::default);
+    /// The process's fake channels: every store on one shares them.
+    static FAKES: OnceLock<Fakes> = OnceLock::new();
+
+    fn fakes() -> &'static Fakes {
+        FAKES.get_or_init(Fakes::default)
+    }
 
     pub async fn log(cfg: &Config, f: &FakeChannel) -> anyhow::Result<Arc<dyn LogStore>> {
-        Ok(match f.kind {
-            InstanceKind::Telegram => {
-                Arc::new(ChainLogStore::new(Arc::new(WORLD.telegram_store(cfg, f, meta_info(f)).await?)))
-            }
-            InstanceKind::Discord => {
-                let log = ChainLogStore::new(Arc::new(WORLD.discord_store(cfg, f, None, meta_info(f)).await?));
-                Arc::new(match cfg.meta.lease {
-                    Some(lease) => log.with_lease(pigeonhole_meta::Lease::new(lease)),
-                    None => log,
-                })
-            }
-            _ => anyhow::bail!("[meta] log: a fake channel is telegram or discord"),
-        })
+        fakes().log(cfg, f).await
     }
 
     pub async fn snapshots(cfg: &Config, f: &FakeChannel) -> anyhow::Result<Arc<dyn SnapshotStore>> {
-        Ok(match f.kind {
-            InstanceKind::Telegram => {
-                Arc::new(BlobSnapshotStore::new(Arc::new(WORLD.telegram_store(cfg, f, meta_info(f)).await?)))
-            }
-            InstanceKind::Discord => {
-                Arc::new(BlobSnapshotStore::new(Arc::new(WORLD.discord_store(cfg, f, None, meta_info(f)).await?)))
-            }
-            _ => anyhow::bail!("[meta] snapshot: a fake channel is telegram or discord"),
-        })
+        fakes().snapshots(cfg, f).await
     }
 
     pub async fn member(cfg: &Config, inst: &InstanceConfig, f: &FakeChannel) -> anyhow::Result<SharedBackend> {
-        let info = inst.info.clone();
-        Ok(MetricsBackend::wrap(match f.kind {
-            InstanceKind::Telegram => Arc::new(erase(Arc::new(WORLD.telegram_store(cfg, f, info).await?))),
-            InstanceKind::Discord => {
-                Arc::new(erase(Arc::new(WORLD.discord_store(cfg, f, inst.max_blob_size, info).await?)))
-            }
-            _ => anyhow::bail!("store {:?}: a fake channel is telegram or discord", inst.info.id),
-        }))
+        fakes().member(cfg, inst, f).await
     }
 
     pub fn view(stores: &[StoreRef], key: Option<[u8; 32]>) -> Option<Arc<dyn Channels>> {
-        Some(Arc::new(FakeView::new(WORLD.clone(), stores, key)))
+        Some(fakes().view(stores, key))
+    }
+
+    /// Stops the fake channels' tablets, as the process exits.
+    pub async fn close() -> anyhow::Result<()> {
+        match FAKES.get() {
+            Some(fakes) => fakes.0.close().await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -91,6 +73,10 @@ mod on {
     pub fn view(_stores: &[StoreRef], _key: Option<[u8; 32]>) -> Option<Arc<dyn Channels>> {
         None
     }
+
+    pub async fn close() -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-pub use on::{log, member, snapshots, view};
+pub use on::{close, log, member, snapshots, view};

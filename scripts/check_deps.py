@@ -36,6 +36,8 @@ ROLE = {
     "pigeonhole-config": "config",
     # The admin ops over a running node: the binary's admin API and the demo.
     "pigeonhole-admin": "admin",
+    # The node assembled from a Config: what the binary and the web build share.
+    "pigeonhole-node": "node",
     "pigeonhole": "bin",
     # The in-browser build: a composition root like the binary.
     "pigeonhole-web": "bin",
@@ -51,6 +53,12 @@ FORBIDDEN_SOFT = {
 }
 
 CHUNK_STORE_FORBIDDEN_CRATES = {"s3s", "tonic", "axum"}
+
+# What the admin may depend on (it builds for wasm: no store, no network
+# client, no server); the node too, and a little more.
+ADMIN_ALLOWED = {"blob", "chunk-store", "codec", "config", "gateway", "limits", "meta", "storage-api", "types"}
+# The stores the node opens itself: everything else on a channel is the root's.
+NODE_STORES = {"pigeonhole-storage-memory", "pigeonhole-storage-disk"}
 
 # The stores' in-memory channels (feature `fake`) never get into a default
 # build: only these packages turn the feature on outside dev-dependencies.
@@ -180,11 +188,24 @@ def main() -> int:
 
         elif role == "admin":
             # Builds for wasm too: no store, no network client, no server.
-            allowed = {"blob", "chunk-store", "codec", "config", "gateway", "limits", "meta", "storage-api", "types"}
             for dep_name in dep_names:
                 dr = ROLE.get(dep_name)
+                if dr is not None and dr not in ADMIN_ALLOWED:
+                    errors.append(f"{name} (admin) → {dep_name} ({dr}); allowed: {sorted(ADMIN_ALLOWED)}")
+
+        elif role == "node":
+            # As the admin (builds for wasm: no network client, no server),
+            # plus the admin, the Raft networks' shared parts, and the two
+            # stores it opens itself; a channel's store is the root's.
+            allowed = ADMIN_ALLOWED | {"admin", "standalone", "raft-net"}
+            for dep_name in dep_names:
+                dr = ROLE.get(dep_name)
+                if dr == "storage" and dep_name in NODE_STORES:
+                    continue
                 if dr is not None and dr not in allowed:
-                    errors.append(f"{name} (admin) → {dep_name} ({dr}); allowed: {sorted(allowed)}")
+                    errors.append(
+                        f"{name} (node) → {dep_name} ({dr}); allowed: {sorted(allowed)} and {sorted(NODE_STORES)}"
+                    )
 
         elif role == "standalone":
             for dep_name in dep_names:

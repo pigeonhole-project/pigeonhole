@@ -5,6 +5,7 @@
 use crate::Channels;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use pigeonhole_config::instances::InstanceKind;
 use pigeonhole_config::stores::FakeChannel;
 use pigeonhole_config::{Config, MetaPlace};
 use pigeonhole_meta::log::chain::{summarize, BlobSummary};
@@ -56,9 +57,11 @@ impl StoreRef {
         json!({ "store": self.store, "role": self.role, "kind": self.kind, "scope": self.scope, "bots": self.bots, "place": place, "node": self.node })
     }
 
-    fn meta(role: &'static str, kind: &'static str, scope: String) -> Self {
+    /// The log or the snapshots (`role`) in a `kind` store at `scope`,
+    /// posted to by `bots` (a disk or memory: 1, as a data store's).
+    fn meta(role: &'static str, kind: &'static str, scope: String, bots: usize) -> Self {
         let store = if role == "log" { crate::LOG_STORE } else { crate::SNAPSHOT_STORE };
-        Self { store: store.into(), role, kind, scope, bots: 1, place: None, fake: None, dir: None, node: None }
+        Self { store: store.into(), role, kind, scope, bots, place: None, fake: None, dir: None, node: None }
     }
 
     fn fake(f: &FakeChannel, role: &'static str) -> Self {
@@ -83,7 +86,7 @@ impl StoreRef {
     /// or `snapshots/`, one directory each.
     fn disk(role: &'static str, path: &Path) -> Self {
         let dir = path.join(role);
-        Self { scope: dir.display().to_string(), dir: Some(dir), ..Self::meta(role, "local_disk", String::new()) }
+        Self { scope: dir.display().to_string(), dir: Some(dir), ..Self::meta(role, "local_disk", String::new(), 1) }
     }
 }
 
@@ -126,8 +129,8 @@ pub fn of(cfg: &Config) -> Vec<StoreRef> {
         let s = match place {
             MetaPlace::Fake(f) => StoreRef::fake(f, role),
             MetaPlace::LocalDisk(path) => StoreRef::disk(role, path),
-            MetaPlace::Chat { kind, scope } => StoreRef::meta(role, kind, scope.to_string()),
-            MetaPlace::Memory => StoreRef::meta(role, "memory", String::new()),
+            MetaPlace::Chat { kind, scope, bots } => StoreRef::meta(role, kind, scope.to_string(), bots),
+            MetaPlace::Memory => StoreRef::meta(role, "memory", String::new(), 1),
         };
         let s = match me {
             Some(node) if s.fake.is_none() => {
@@ -142,10 +145,18 @@ pub fn of(cfg: &Config) -> Vec<StoreRef> {
     // one in the demo, read as the other fakes are).
     for (cluster, node) in cfg.cluster.iter().flat_map(|c| c.nodes.iter().map(move |n| (c, n))) {
         if let Some(chat) = node.outbox {
-            let store = crate::outbox_store(node.id);
-            let fake = cluster.outbox_channel(node.id);
-            let outbox = StoreRef::meta("outbox", "telegram", chat.to_string());
-            out.push(StoreRef { node: Some(node.id), fake, ..outbox }.named(store));
+            // In the chat of the outboxes (`[cluster] chat`: Telegram), posted to by the node's bots.
+            out.push(StoreRef {
+                store: crate::outbox_store(node.id),
+                role: "outbox",
+                kind: InstanceKind::Telegram.as_str(),
+                scope: chat.to_string(),
+                bots: node.bot_ids.len(),
+                place: None,
+                fake: cluster.outbox_channel(node.id),
+                dir: None,
+                node: Some(node.id),
+            });
         }
     }
     out
@@ -310,4 +321,48 @@ impl Channels for Views {
 fn with(mut v: Value, key: &str, value: Value) -> Value {
     v[key] = value;
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chat_store_says_how_many_bots_post_to_it() {
+        std::env::set_var("PH_TEST_ADMIN_BOT_A", "41:a");
+        std::env::set_var("PH_TEST_ADMIN_BOT_B", "42:b");
+        std::env::set_var("PH_TEST_ADMIN_RAFT", "43:c");
+        std::env::set_var("PH_TEST_ADMIN_API_ID", "1");
+        std::env::set_var("PH_TEST_ADMIN_API_HASH", "h");
+        std::env::set_var("PH_TEST_ADMIN_KEY", "00".repeat(32));
+        let tg = |id: &str, chat: i64, bots: &str| {
+            format!(
+                "[[store]]\nid = \"{id}\"\nkind = \"telegram\"\nchat_id = {chat}\nbot_token_envs = {bots}\n\
+                 api_id_env = \"PH_TEST_ADMIN_API_ID\"\napi_hash_env = \"PH_TEST_ADMIN_API_HASH\"\n"
+            )
+        };
+        let text = format!(
+            "[chunk]\nstore = \"mem\"\n[[store]]\nid = \"mem\"\nkind = \"memory\"\n{}{}\
+             [cluster]\nid = 1\nnode = 1\nkey_env = \"PH_TEST_ADMIN_KEY\"\nbot_token_envs = [\"PH_TEST_ADMIN_RAFT\"]\n\
+             api_id_env = \"PH_TEST_ADMIN_API_ID\"\napi_hash_env = \"PH_TEST_ADMIN_API_HASH\"\n\
+             [[node]]\nid = 1\noutbox = -1001\nbot_ids = [43]\nlog = \"log\"\nsnapshot = \"snap\"\n\
+             [[node]]\nid = 2\noutbox = -1002\nbot_ids = [44, 45]\nlog = \"log-2\"\nsnapshot = \"snap-2\"\n{}{}",
+            tg("log", -11, "[\"PH_TEST_ADMIN_BOT_A\", \"PH_TEST_ADMIN_BOT_B\"]\nbot_ids = [41, 42]"),
+            tg("snap", -12, "[\"PH_TEST_ADMIN_BOT_A\"]\nbot_ids = [41]"),
+            tg("log-2", -21, "[\"NODE_2S\"]\nbot_ids = [46]"),
+            tg("snap-2", -22, "[\"NODE_2S\"]\nbot_ids = [46]"),
+        );
+        let cfg = Config::from_toml(&text, Path::new("test.toml")).unwrap();
+        let bots: Vec<(String, &str, usize)> = of(&cfg).iter().map(|s| (s.store.clone(), s.kind, s.bots)).collect();
+        assert_eq!(
+            bots,
+            [
+                ("mem".to_string(), "memory", 1),
+                ("meta-log-1".into(), "telegram", 2),
+                ("meta-snap-1".into(), "telegram", 1),
+                ("outbox-1".into(), "telegram", 1),
+                ("outbox-2".into(), "telegram", 2),
+            ]
+        );
+    }
 }

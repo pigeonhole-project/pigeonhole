@@ -55,6 +55,16 @@ pub(crate) fn duration_or_off<'de, D: Deserializer<'de>>(d: D) -> Result<Option<
     }
 }
 
+/// A duration that is never zero and cannot be off (a clock, not a loop:
+/// zero would spin), of an optional field (with `#[serde(default)]`).
+pub(crate) fn opt_duration<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+    let text = String::deserialize(d)?;
+    match humantime::parse_duration(&text).map_err(|e| de::Error::custom(format!("{text:?}: {e}")))? {
+        Duration::ZERO => Err(de::Error::custom(format!("{text:?}: must be more than zero"))),
+        d => Ok(Some(d)),
+    }
+}
+
 /// `d` as a humantime string (`"1m 30s"`), as the config reads it.
 pub(crate) fn format_duration(d: Duration) -> String {
     humantime::format_duration(d).to_string()

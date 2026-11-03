@@ -26,6 +26,7 @@ members = [
     "crates/web/pigeonhole-web",
     "crates/config/pigeonhole-config",
     "crates/admin/pigeonhole-admin",
+    "crates/node/pigeonhole-node",
 ]
 default-members = ["crates/bin/pigeonhole"]
 exclude = ["vendor"]
@@ -93,6 +94,7 @@ grammers-tl-types = "=0.11.0"
 pigeonhole-meta = { path = "crates/meta/pigeonhole-meta" }
 pigeonhole-config = { path = "crates/config/pigeonhole-config" }
 pigeonhole-admin = { path = "crates/admin/pigeonhole-admin" }
+pigeonhole-node = { path = "crates/node/pigeonhole-node" }
 openraft-chat = { path = "crates/net/openraft-chat" }
 openraft-grpc = { path = "crates/net/openraft-grpc", default-features = false }
 pigeonhole-raft-telegram = { path = "crates/net/pigeonhole-raft-telegram" }
