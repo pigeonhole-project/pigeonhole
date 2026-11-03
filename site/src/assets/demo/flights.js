@@ -50,5 +50,13 @@ function raft(e, ctx) {
   return [{...base, from: {store: outbox, at: "new"}, to: {node: e.to}}];
 }
 
+// The node a Raft frame (events.js "raft") reaches from a leader, winding
+// its election clock up: a heartbeat's or entries' over a direct link as
+// sent, through the chat as read out of the outbox; null for any other.
+export function reaches(e) {
+  if (e.type !== "raft" || (e.kind !== "heartbeat" && e.kind !== "append")) return null;
+  return (e.via === "chat" ? e.at === "read" : e.at === "sent") ? e.to : null;
+}
+
 // You knocked on a node that does not lead: your pigeon turns back at its door.
 export const refused = node => ({from: {client: true}, to: {node}, failed: true, size: 2048});

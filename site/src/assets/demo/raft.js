@@ -1,6 +1,6 @@
 // A cluster's Raft as the page follows it: each node's own word (its role,
 // its term: the `cluster` op asked of it), when each last heard a leader
-// (the frames the nodes logged, events.js), and a chronicle of what
+// (a leader's frame reaching it, as drawn: its flight landed), and a chronicle of what
 // happened, as say.* sentences ([key, vars]), newest last (the last
 // `settings.chronicle` kept).
 //
@@ -24,14 +24,15 @@ export function makeRaftWatch() {
   }
 
   return {
-    // A frame a node logged (events.js "raft"): a leader's heartbeat or
-    // entries reaching a follower wind its clock up again; an answered vote
-    // is told. Returns the sentences to say.
+    // A frame a node logged (events.js "raft"): an answered vote is told.
+    // Returns the sentences to say.
     frame(e, now) {
-      const reached = e.via === "chat" ? e.at === "read" : e.at === "sent";
-      if ((e.kind === "heartbeat" || e.kind === "append") && reached) node(e.to).heard = now;
       if (e.kind === "voted") return [tell(now, [e.granted ? "raft.vote_for" : "raft.vote_against", {from: e.from, to: e.to}])];
       return [];
+    },
+    // Node `id` heard a leader (its heartbeat or entries reached it): its clock wound up again.
+    heard(id, now) {
+      node(id).heard = now;
     },
     // Node `id`'s own view ({role, term}): standing for leader, or leading
     // in a newer term, is told. Returns the sentences to say.

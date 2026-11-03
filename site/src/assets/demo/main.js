@@ -12,7 +12,7 @@ import {clientView, sample, uploadFiles} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {ref, sentence, setLinks} from "./entities.js";
 import {readEvents} from "./events.js";
-import {flightsOf, refused} from "./flights.js";
+import {flightsOf, reaches, refused} from "./flights.js";
 import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
@@ -157,7 +157,12 @@ function apply(events) {
     } else if (e.type === "call" || e.type === "call_failed") {
       for (const f of flightsOf(e, channel, flightCtx())) fly(f);
     } else if (e.type === "raft") {
-      for (const f of flightsOf(e, channel, flightCtx())) fly(f);
+      // A leader's word reaching a follower winds its clock as it lands.
+      const to = reaches(e);
+      const heard = to == null ? undefined : () => raft.heard(to, node.now());
+      const flights = flightsOf(e, channel, flightCtx());
+      for (const f of flights) fly({...f, onLand: heard});
+      if (!flights.length) heard?.();
       said.push(...raft.frame(e, node.now()));
     }
   }

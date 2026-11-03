@@ -5,7 +5,7 @@ import {beforeEach, test} from "node:test";
 import {frameModel} from "../src/assets/demo/chat/frame.js";
 import {chatModel} from "../src/assets/demo/chat/model.js";
 import {readEvents} from "../src/assets/demo/events.js";
-import {flightsOf, ownerOf} from "../src/assets/demo/flights.js";
+import {flightsOf, ownerOf, reaches} from "../src/assets/demo/flights.js";
 import {summary} from "../src/assets/demo/log-view.js";
 import {makeRaftWatch} from "../src/assets/demo/raft.js";
 import {describe, ms} from "../src/assets/demo/tasks.js";
@@ -353,11 +353,20 @@ test("flightsOf: a node's own channel is its; a data channel the leader's; Raft 
   assert.equal(ownerOf({node: null}, {leader: null, shown: 3}), 3, "no leader known: the node on screen");
 });
 
+test("reaches: a leader's heartbeat or entries reach a follower as sent directly, as read through the chat", () => {
+  const raft = (kind, via, at) => ({type: "raft", kind, via, at, from: 1, to: 2});
+  assert.equal(reaches(raft("heartbeat", "grpc", "sent")), 2);
+  assert.equal(reaches(raft("append", "chat", "read")), 2);
+  assert.equal(reaches(raft("heartbeat", "chat", "sent")), null, "into the outbox only");
+  assert.equal(reaches(raft("vote", "grpc", "sent")), null);
+  assert.equal(reaches({type: "call", store: "tg"}), null);
+});
+
 test("raft watch: a heartbeat winds a follower's clock; votes and a candidate are told", () => {
   const w = makeRaftWatch();
   w.view(2, {role: "follower", term: 1}, 0);
   assert.equal(w.clock(2, 0, 1000), null, "not heard from a leader yet");
-  w.frame({kind: "heartbeat", via: "grpc", at: "sent", from: 1, to: 2}, 100);
+  w.heard(2, 100);
   assert.equal(w.clock(2, 600, 1000), 0.5);
   assert.equal(w.clock(2, 5000, 1000), 0);
   assert.deepEqual(w.view(2, {role: "candidate", term: 2}, 5000), [["raft.candidate", {n: 2, term: 2}]]);
