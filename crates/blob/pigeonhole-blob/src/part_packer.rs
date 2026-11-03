@@ -12,7 +12,6 @@ use std::sync::Arc;
 pub struct EncodedBlock {
     pub stored: Bytes,
     pub logical_len: u32,
-    pub codec: String,
 }
 
 /// Result of uploading one part (one blob / message).
@@ -251,7 +250,7 @@ mod tests {
     }
 
     fn block(n: usize) -> EncodedBlock {
-        EncodedBlock { stored: Bytes::from(vec![7u8; n]), logical_len: n as u32, codec: "raw".into() }
+        EncodedBlock { stored: Bytes::from(vec![7u8; n]), logical_len: n as u32 }
     }
 
     #[tokio::test]

@@ -1,8 +1,9 @@
-//! Independent fixed-size frames packed into Telegram documents.
+//! Independent fixed-size blocks packed into a chunk's parts.
 //!
-//! Each frame compresses exactly once (`BLOCK_SIZE` logical bytes). Frames are
-//! concatenated on the wire; the `chunk_blocks` index table maps stored/logical
-//! ranges so Range reads decompress only the needed frames.
+//! Each block compresses exactly once (`block_size` logical bytes). Blocks
+//! are concatenated on the wire; the chunk's record (the chunk store's
+//! `StoredBlock`s) maps stored and logical ranges, so a range read
+//! decompresses only the blocks it needs.
 
 use crate::chunker::ChunkCodec;
 use anyhow::{bail, Context, Result};
@@ -13,28 +14,6 @@ use flate2::Compression;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-
-/// One independent frame inside a `frames` chunk document.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct BlockRecord {
-    pub block_no: i64,
-    pub stored_off: i64,
-    pub stored_len: i64,
-    pub logical_off: i64,
-    pub logical_len: i64,
-    /// Per-frame codec: `raw`, `gzip`, or `zstd` (never `frames`).
-    pub codec: String,
-}
-
-impl BlockRecord {
-    pub fn block_codec(&self) -> ChunkCodec {
-        match self.codec.as_str() {
-            "gzip" => ChunkCodec::Gzip,
-            "zstd" => ChunkCodec::Zstd,
-            _ => ChunkCodec::Raw,
-        }
-    }
-}
 
 /// Held ingest-budget bytes; returned to the semaphore on drop.
 ///
@@ -117,20 +96,25 @@ impl ByteBudget {
     }
 }
 
-/// Encode one logical block to stored bytes (raw fallback when compression does not shrink).
-pub fn encode_block_bytes(logical: &[u8], policy: ChunkCodec) -> Result<(Bytes, String)> {
+/// Encode one logical block to stored bytes, and the codec they are in
+/// (raw when compression does not shrink it).
+pub fn encode_block_bytes(logical: &[u8], policy: ChunkCodec) -> Result<(Bytes, ChunkCodec)> {
     let (v, c) = encode_block(logical, policy)?;
-    Ok((Bytes::from(v), c.as_str().to_string()))
+    Ok((Bytes::from(v), c))
 }
 
-/// Decode one stored block to logical bytes.
-pub fn decode_block_slice(stored: &[u8], codec: &str, max_logical: usize) -> Result<Bytes> {
-    let c = match codec {
-        "gzip" => ChunkCodec::Gzip,
-        "zstd" => ChunkCodec::Zstd,
-        _ => ChunkCodec::Raw,
-    };
-    Ok(Bytes::from(decode_block(stored, c, max_logical)?))
+/// Decode one stored block of `logical_len` bytes, in `codec` (`raw`,
+/// `gzip` or `zstd`; `blocks` is a chunk's policy, never a block's). A
+/// block that decodes to another length is an error.
+pub fn decode_block_slice(stored: &[u8], codec: ChunkCodec, logical_len: usize) -> Result<Bytes> {
+    if codec == ChunkCodec::Blocks {
+        bail!("a block's codec is raw, gzip or zstd, not {codec}");
+    }
+    let decoded = decode_block(stored, codec, logical_len)?;
+    if decoded.len() != logical_len {
+        bail!("block decodes to {} bytes, its record says {logical_len}", decoded.len());
+    }
+    Ok(Bytes::from(decoded))
 }
 
 fn encode_block(logical: &[u8], policy: ChunkCodec) -> Result<(Vec<u8>, ChunkCodec)> {
@@ -193,79 +177,31 @@ fn gunzip_capped(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decode a byte range `[from, to)` within one `frames` chunk document.
-pub fn decode_blocks_range(stored: &[u8], blocks: &[BlockRecord], from: usize, to: usize) -> Result<Bytes> {
-    if from > to {
-        bail!("invalid frame range {from}..{to}");
-    }
-    if from == to {
-        return Ok(Bytes::new());
-    }
-    let mut out = Vec::with_capacity(to - from);
-    let mut logical_cursor = 0usize;
-    for fr in blocks {
-        let flen = fr.logical_len as usize;
-        let frame_start = logical_cursor;
-        let frame_end = logical_cursor + flen;
-        logical_cursor = frame_end;
-        if frame_end <= from || frame_start >= to {
-            continue;
-        }
-        let soff = fr.stored_off as usize;
-        let slen = fr.stored_len as usize;
-        let end = soff.checked_add(slen).context("frame stored range")?;
-        if end > stored.len() {
-            bail!("frame stored range {}..{} outside blob {}", soff, end, stored.len());
-        }
-        let decoded = decode_block(&stored[soff..end], fr.block_codec(), flen.max(1))?;
-        if decoded.len() != flen {
-            bail!("frame logical length mismatch: index {flen}, decoded {}", decoded.len());
-        }
-        let local_from = from.saturating_sub(frame_start).min(flen);
-        let local_to = to.saturating_sub(frame_start).min(flen);
-        if local_from < local_to {
-            out.extend_from_slice(&decoded[local_from..local_to]);
-        }
-    }
-    if out.len() != to - from {
-        bail!("frames range decode produced {} bytes, expected {}", out.len(), to - from);
-    }
-    Ok(Bytes::from(out))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn range_across_frame_boundary() {
-        let f0 = encode_block(&[1u8; 100], ChunkCodec::Raw).unwrap();
-        let f1 = encode_block(&[2u8; 100], ChunkCodec::Raw).unwrap();
-        let mut stored = f0.0;
-        let off1 = stored.len();
-        stored.extend_from_slice(&f1.0);
-        let frames = vec![
-            BlockRecord {
-                block_no: 0,
-                stored_off: 0,
-                stored_len: off1 as i64,
-                logical_off: 0,
-                logical_len: 100,
-                codec: "raw".into(),
-            },
-            BlockRecord {
-                block_no: 1,
-                stored_off: off1 as i64,
-                stored_len: f1.0.len() as i64,
-                logical_off: 100,
-                logical_len: 100,
-                codec: "raw".into(),
-            },
-        ];
-        let mid = decode_blocks_range(&stored, &frames, 90, 110).unwrap();
-        let mut expect = vec![1u8; 10];
-        expect.extend(std::iter::repeat_n(2u8, 10));
-        assert_eq!(mid.as_ref(), expect.as_slice());
+    fn a_block_decodes_to_its_length_in_its_codec() {
+        let logical = vec![7u8; 4096];
+        for policy in [ChunkCodec::Raw, ChunkCodec::Gzip, ChunkCodec::Zstd, ChunkCodec::Blocks] {
+            let (stored, codec) = encode_block_bytes(&logical, policy).unwrap();
+            assert_ne!(codec, ChunkCodec::Blocks, "{policy}");
+            assert_eq!(decode_block_slice(&stored, codec, logical.len()).unwrap().as_ref(), logical.as_slice());
+            assert!(decode_block_slice(&stored, codec, logical.len() - 1).is_err(), "{policy}: a longer block");
+            assert!(decode_block_slice(&stored, codec, logical.len() + 1).is_err(), "{policy}: a shorter block");
+        }
+        assert!(decode_block_slice(&logical, ChunkCodec::Blocks, logical.len()).is_err());
+        let (stored, codec) = encode_block_bytes(&[1, 2, 3], ChunkCodec::Zstd).unwrap();
+        assert_eq!(codec, ChunkCodec::Raw, "a block that does not shrink is stored raw");
+        assert_eq!(stored.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn a_stored_codec_is_one_of_four_names() {
+        let json = serde_json::to_string(&ChunkCodec::Zstd).unwrap();
+        assert_eq!(json, "\"zstd\"");
+        assert!(serde_json::from_str::<ChunkCodec>("\"lz4\"").is_err(), "an unknown codec is an error");
     }
 
     #[tokio::test]

@@ -416,11 +416,7 @@ impl ChunkReplicaWriter {
             let Some(mut packer) = w.packer.take() else {
                 continue;
             };
-            let blk = EncodedBlock {
-                stored: block.stored.clone(),
-                logical_len: block.logical_len,
-                codec: block.codec.clone(),
-            };
+            let blk = EncodedBlock { stored: block.stored.clone(), logical_len: block.logical_len };
             tasks.push(async move {
                 let result = tokio::time::timeout(timeout, packer.push(blk)).await;
                 (i, packer, result)
@@ -871,7 +867,7 @@ mod tests {
     }
 
     fn block(fill: u8, n: usize) -> EncodedBlock {
-        EncodedBlock { stored: Bytes::from(vec![fill; n]), logical_len: n as u32, codec: "raw".into() }
+        EncodedBlock { stored: Bytes::from(vec![fill; n]), logical_len: n as u32 }
     }
 
     async fn write_blocks(rep: &Replicated, blocks: &[EncodedBlock]) -> Result<Vec<ReplicaLayout>> {

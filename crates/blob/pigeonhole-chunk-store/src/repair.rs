@@ -377,7 +377,7 @@ async fn read_encoded_blocks(
     if blocks.is_empty() {
         // Raw single-part chunk (no chunk_blocks rows).
         let raw = collect_stream(replicated.read(sources, 0..1).await.context("repair read raw")?).await?;
-        return Ok(vec![EncodedBlock { stored: raw.clone(), logical_len: raw.len() as u32, codec: "raw".into() }]);
+        return Ok(vec![EncodedBlock { stored: raw.clone(), logical_len: raw.len() as u32 }]);
     }
 
     let end = blocks.len() as u32;
@@ -386,7 +386,7 @@ async fn read_encoded_blocks(
     let mut out = Vec::with_capacity(blocks.len());
     let mut off = 0usize;
     for b in blocks {
-        let len = b.stored_len.max(0) as usize;
+        let len = b.stored_len as usize;
         if off + len > blob.len() {
             bail!("repair: truncated stored payload at block {} (need {} have {})", b.block_no, off + len, blob.len());
         }
@@ -396,7 +396,7 @@ async fn read_encoded_blocks(
             // Never copy a damaged block onto another member.
             bail!("repair: block {} fails its checksum on the source", b.block_no);
         }
-        out.push(EncodedBlock { stored, logical_len: b.logical_len.max(0) as u32, codec: b.codec.clone() });
+        out.push(EncodedBlock { stored, logical_len: b.logical_len });
     }
     if off != blob.len() {
         bail!("repair: stored payload length mismatch (consumed {off}, got {})", blob.len());

@@ -48,11 +48,13 @@ pub struct Extent {
 /// One stored block (offsets inside a part are derived from `stored_len`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredBlock {
-    pub block_no: i64,
-    pub logical_off: i64,
-    pub logical_len: i64,
-    pub stored_len: i64,
-    pub codec: String,
+    pub block_no: u32,
+    /// Where it starts in the chunk's logical bytes.
+    pub logical_off: u64,
+    pub logical_len: u32,
+    pub stored_len: u32,
+    /// What its stored bytes are in: raw, gzip or zstd.
+    pub codec: pigeonhole_codec::ChunkCodec,
     /// crc32 of the stored bytes: a damaged replica is detected and read
     /// around.
     pub crc32: u32,
@@ -159,7 +161,7 @@ impl BlobDb {
                 let stored = if c.blocks.is_empty() {
                     c.logical_size.max(0) as u64
                 } else {
-                    c.blocks.iter().map(|b| b.stored_len.max(0) as u64).sum()
+                    c.blocks.iter().map(|b| u64::from(b.stored_len)).sum()
                 };
                 for instance in c.replicas.keys() {
                     *st.stored_bytes.entry(instance.clone()).or_default() += stored;
