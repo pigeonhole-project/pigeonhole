@@ -181,11 +181,7 @@ mod tests {
                     location: format!("memory:{id}"),
                     role: InstanceRole::ReadWrite,
                 },
-                limits: BackendLimits {
-                    max_blob_size,
-                    supports_range: pigeonhole_types::RangeSupport::BestEffort,
-                    can_list: false,
-                },
+                limits: BackendLimits { max_blob_size, supports_range: pigeonhole_types::RangeSupport::BestEffort },
                 next: std::sync::atomic::AtomicU64::new(1),
                 data: Mutex::new(HashMap::new()),
             }

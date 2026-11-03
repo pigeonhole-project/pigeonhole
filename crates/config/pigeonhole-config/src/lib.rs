@@ -480,7 +480,6 @@ impl Config {
         let (instances, placement) = topology.blob_placement(blob_store)?;
         let cluster = file.cluster.into_settings(file.node, me, |under| topology.fake_base(under))?;
         topology.check_all_used()?;
-        check_block_size_against_instances(block_size, &instances)?;
 
         Ok(Self {
             listen_addr: file.listen_addr,
@@ -946,32 +945,6 @@ impl FileRepair {
             scrub: self.scrub,
         }
     }
-}
-
-/// `block_size` (+ margin) must fit under every blob store's max_blob_size.
-pub fn check_block_size_against_instances(block_size: usize, instances: &[InstanceConfig]) -> Result<()> {
-    if instances.is_empty() {
-        return Ok(());
-    }
-    let mut min_max = usize::MAX;
-    for inst in instances {
-        let max = match inst.kind {
-            InstanceKind::Memory => pigeonhole_types::BackendLimits::memory().max_blob_size,
-            InstanceKind::LocalDisk => pigeonhole_types::BackendLimits::local_disk().max_blob_size,
-            InstanceKind::Telegram => pigeonhole_types::BackendLimits::telegram().max_blob_size,
-            InstanceKind::Discord => pigeonhole_types::BackendLimits::discord(inst.max_blob_size).max_blob_size,
-        };
-        min_max = min_max.min(max);
-    }
-    if block_size >= min_max {
-        bail!("chunk.block_size ({block_size}) must be < min(max_blob_size) of configured instances ({min_max})");
-    }
-    // Incompressible blocks store raw `block_size`; keep a small header margin.
-    let need = block_size.saturating_add(64);
-    if need >= min_max {
-        bail!("chunk.block_size ({block_size}) with block margin exceeds min(max_blob_size) ({min_max})");
-    }
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

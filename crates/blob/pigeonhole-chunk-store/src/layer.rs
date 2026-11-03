@@ -928,18 +928,16 @@ impl OpenChunk {
     }
 }
 
-/// E.4: block_size (+ margin for incompressible / header) must fit every member.
+/// `chunk.block_size` and its [`pigeonhole_codec::BLOCK_HEADROOM`] fit
+/// every member's message, as the built stores' `limits()` say.
 pub fn check_block_fits_members(block_size: usize, replicated: &Replicated) -> Result<()> {
     let min_max = replicated.max_blob_size();
-    let need = block_size.saturating_add(pigeonhole_codec::COMPRESS_SIZE_MARGIN.min(64 * 1024));
-    // Incompressible path stores raw `block_size` bytes; require block_size < min max.
-    if block_size >= min_max {
-        bail!("chunk.block_size ({block_size}) must be < min(max_blob_size) of placement group ({min_max})");
+    if block_size.saturating_add(pigeonhole_codec::BLOCK_HEADROOM) >= min_max {
+        bail!(
+            "chunk.block_size ({block_size}) + {} must be under the smallest max_blob_size of its stores ({min_max})",
+            pigeonhole_codec::BLOCK_HEADROOM
+        );
     }
-    if need >= min_max && block_size + 64 >= min_max {
-        bail!("chunk.block_size ({block_size}) with margin exceeds min(max_blob_size) ({min_max})");
-    }
-    let _ = need;
     Ok(())
 }
 
@@ -1062,13 +1060,11 @@ mod tests {
         let a = MemoryBlobStore::with_limits(BackendLimits {
             max_blob_size: 19 * MIB,
             supports_range: pigeonhole_types::RangeSupport::BestEffort,
-            can_list: false,
         })
         .with_instance_id("a-19");
         let b = MemoryBlobStore::with_limits(BackendLimits {
             max_blob_size: 10 * MIB,
             supports_range: pigeonhole_types::RangeSupport::BestEffort,
-            can_list: false,
         })
         .with_instance_id("b-10");
         let rep = Arc::new(
@@ -1136,9 +1132,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
-        let a = MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("a").with_unavailable_flag();
+        let a = MemoryBlobStore::new().with_instance_id("a").with_unavailable_flag();
         let flag = a.unavailable_flag();
-        let b = MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("b");
+        let b = MemoryBlobStore::new().with_instance_id("b");
         let rep = Arc::new(
             Replicated::new(
                 vec![Arc::new(erase(a)) as SharedBackend, Arc::new(erase(b)) as SharedBackend],
@@ -1206,7 +1202,7 @@ mod tests {
             let db = BlobDb::open(pigeonhole_testkit::tablet(&dir.path().join("blob.log"), BlobDb::register).await)
                 .await
                 .unwrap();
-            let store = MemoryBlobStore::with_limits(BackendLimits::memory()).with_unavailable_flag();
+            let store = MemoryBlobStore::new().with_unavailable_flag();
             let down = store.unavailable_flag();
             let mut opts = IngestOptions::new(8 * MIB, ChunkCodec::Zstd);
             opts.block_size = MIB;

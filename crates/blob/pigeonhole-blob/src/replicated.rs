@@ -764,7 +764,7 @@ mod tests {
                     location: format!("memory:{id}"),
                     role: InstanceRole::ReadWrite,
                 },
-                limits: BackendLimits { max_blob_size, supports_range: RangeSupport::BestEffort, can_list: false },
+                limits: BackendLimits { max_blob_size, supports_range: RangeSupport::BestEffort },
                 next: AtomicU64::new(1),
                 data: StdMutex::new(HashMap::new()),
                 fail_get_after: StdMutex::new(None),

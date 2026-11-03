@@ -142,7 +142,10 @@ mod tests {
                     location: "tiny".into(),
                     role: crate::typed::InstanceRole::ReadWrite,
                 },
-                limits: BackendLimits::memory(),
+                limits: BackendLimits {
+                    max_blob_size: 1 << 20,
+                    supports_range: pigeonhole_types::RangeSupport::BestEffort,
+                },
                 next: std::sync::atomic::AtomicU64::new(1),
                 data: std::sync::Mutex::new(std::collections::HashMap::new()),
             }

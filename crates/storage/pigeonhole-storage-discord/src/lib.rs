@@ -24,3 +24,16 @@ pub use store::{blob_nonce, discord_fingerprint, discord_location, DiscordBlobSt
 
 /// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
 pub const KIND: &str = "discord";
+
+/// Discord's attachment limit: exactly 20 MiB per file since September
+/// 2026 (more on boosted servers: set `max_blob_size`).
+pub const DEFAULT_MAX_BLOB_SIZE: usize = 20 * 1024 * 1024;
+
+/// What a channel takes: `max_blob_size` (the default when `None`) per
+/// message; any byte range of an attachment.
+pub fn blob_limits(max_blob_size: Option<usize>) -> pigeonhole_types::BackendLimits {
+    pigeonhole_types::BackendLimits {
+        max_blob_size: max_blob_size.unwrap_or(DEFAULT_MAX_BLOB_SIZE),
+        supports_range: pigeonhole_types::RangeSupport::BestEffort,
+    }
+}

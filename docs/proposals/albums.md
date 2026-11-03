@@ -88,7 +88,7 @@ and delete what they posted. One macOS machine, home internet.
 The blob layer keeps "one blob = one message"; the Discord store cuts a blob
 above 20 MiB into attachments of one message itself.
 
-- `BackendLimits::discord`: `max_blob_size = attachments × attachment_size`
+- `pigeonhole_storage_discord::blob_limits`: `max_blob_size = attachments × attachment_size`
   (default 10 × 20 MiB = 200 MiB). A store option
   `attachments_per_message` (1–10, default 10? see Open questions); the
   existing `max_blob_size` becomes the per-attachment size.

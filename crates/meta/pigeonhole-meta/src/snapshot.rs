@@ -332,7 +332,7 @@ mod tests {
     fn small_blobs(max_blob_size: usize) -> pigeonhole_storage_memory::MemoryBlobStore {
         pigeonhole_storage_memory::MemoryBlobStore::with_limits(pigeonhole_types::BackendLimits {
             max_blob_size,
-            ..pigeonhole_types::BackendLimits::memory()
+            ..pigeonhole_storage_memory::BLOB_LIMITS
         })
     }
 

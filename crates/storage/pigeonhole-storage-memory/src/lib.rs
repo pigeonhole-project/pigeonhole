@@ -18,6 +18,11 @@ use std::sync::{Arc, Mutex};
 /// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
 pub const KIND: &str = "memory";
 
+/// Under 20 MiB a blob, as small as the smallest chat's message (tests see
+/// chunks cut into several parts), read at any offset.
+pub const BLOB_LIMITS: BackendLimits =
+    BackendLimits { max_blob_size: 20 * 1024 * 1024 - 1, supports_range: pigeonhole_types::RangeSupport::BestEffort };
+
 /// Typed identity for the memory backend (stage 1.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryId {
@@ -63,7 +68,7 @@ pub type MemoryBackend = MemoryBlobStore;
 
 impl MemoryBlobStore {
     pub fn new() -> Self {
-        Self::with_limits(BackendLimits::memory())
+        Self::with_limits(BLOB_LIMITS)
     }
 
     /// In-memory store with a custom blob size limit (tests / multi-instance groups).

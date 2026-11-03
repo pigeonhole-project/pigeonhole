@@ -127,7 +127,7 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
     pub fn new(channel: Arc<C>, limiter: Arc<ChatLimiter>, instance: InstanceInfo) -> Self {
         let locations = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())));
         Self {
-            limits: BackendLimits::telegram(),
+            limits: crate::BLOB_LIMITS,
             instance,
             reader: Reader { channel, limiter: limiter.clone(), locations },
             limiter,

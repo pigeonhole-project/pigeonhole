@@ -3024,7 +3024,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "madsim-tokio",
- "serde",
 ]
 
 [[package]]

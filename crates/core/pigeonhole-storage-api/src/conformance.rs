@@ -37,11 +37,7 @@ impl Default for Recording {
                 location: "recording".into(),
                 role: InstanceRole::ReadWrite,
             },
-            limits: BackendLimits {
-                max_blob_size: MAX_BLOB_SIZE,
-                supports_range: RangeSupport::BestEffort,
-                can_list: false,
-            },
+            limits: BackendLimits { max_blob_size: MAX_BLOB_SIZE, supports_range: RangeSupport::BestEffort },
             calls: Mutex::default(),
         }
     }

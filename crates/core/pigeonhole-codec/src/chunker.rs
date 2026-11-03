@@ -6,8 +6,12 @@ use serde::{Deserialize, Serialize};
 /// Default `chunk.size`: most stored (on-wire) bytes in a chunk. Under
 /// Discord's 20 MiB attachments, so a chunk is one message there too.
 pub const DEFAULT_CHUNK_SIZE: usize = 19 * 1024 * 1024;
-/// Leave headroom under `chunk.size` so a final encode block fits.
-pub const COMPRESS_SIZE_MARGIN: usize = 256 * 1024;
+/// How far `chunk.block_size` stays under every store's message size: a
+/// block is one message's worth at most, and its stored bytes never exceed
+/// its logical ones (a block is stored raw unless compression shrinks it).
+/// So this is headroom, not a header: it keeps a block size that equals a
+/// store's limit out, whose parts would hold one block each.
+pub const BLOCK_HEADROOM: usize = 64;
 /// Most logical bytes in a chunk, and so the largest `chunk.size`.
 pub const MAX_LOGICAL_CHUNK: usize = 256 * 1024 * 1024;
 /// Default independent block size for `blocks` codec packing.

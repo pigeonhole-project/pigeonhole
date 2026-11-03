@@ -159,7 +159,7 @@ refresh by fetching the message). Changes:
   through `refresh-urls`).
 - Uploads with `enforce_nonce`, nonce derived from the `BlobId` (25 chars:
   base62 of its 128 bits fits in 22): a retried upload never posts twice.
-- `BackendLimits::discord` default to 20 MiB (minus margin); keep the
+- `pigeonhole_storage_discord::blob_limits`: 20 MiB by default; keep the
   `max_blob_size` override for boosted servers. The limit is per file, so a
   message may carry several parts.
 

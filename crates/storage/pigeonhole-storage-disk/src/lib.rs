@@ -31,6 +31,11 @@ pub use segments::{inspect, inspect_dir, DEFAULT_SEGMENT_BYTES};
 /// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
 pub const KIND: &str = "local_disk";
 
+/// Records large enough for any chunk (256 MiB, the codec's
+/// `MAX_LOGICAL_CHUNK`), read at any offset.
+pub const BLOB_LIMITS: BackendLimits =
+    BackendLimits { max_blob_size: 256 * 1024 * 1024, supports_range: pigeonhole_types::RangeSupport::BestEffort };
+
 /// Identity of a blob on disk: its key, the record's position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskId {
@@ -105,7 +110,7 @@ impl DiskBlobStore {
         let segments = Segments::open(fs.clone(), &dir, segment_bytes)?;
         Ok(Self {
             dir,
-            limits: BackendLimits::local_disk(),
+            limits: BLOB_LIMITS,
             segments: Arc::new(Mutex::new(segments)),
             fs,
             limiter: Arc::new(StoreLimiter::new(&info.id)),

@@ -29,3 +29,10 @@ pub use store::{blob_random_id, TelegramBlobStore, TelegramId};
 
 /// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
 pub const KIND: &str = "telegram";
+
+/// MTProto: a bot posts files far larger than any chunk (256 MiB, the
+/// codec's `MAX_LOGICAL_CHUNK`) and reads any 4 KiB-aligned window.
+pub const BLOB_LIMITS: pigeonhole_types::BackendLimits = pigeonhole_types::BackendLimits {
+    max_blob_size: 256 * 1024 * 1024,
+    supports_range: pigeonhole_types::RangeSupport::BestEffort,
+};

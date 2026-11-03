@@ -98,7 +98,7 @@ pub struct DiscordBlobStore<A> {
 impl<A: DiscordApi> DiscordBlobStore<A> {
     pub fn new(api: Arc<A>, limiter: Arc<ChatLimiter>, max_blob_size: Option<usize>, instance: InstanceInfo) -> Self {
         Self {
-            limits: BackendLimits::discord(max_blob_size),
+            limits: crate::blob_limits(max_blob_size),
             instance,
             api,
             limiter,

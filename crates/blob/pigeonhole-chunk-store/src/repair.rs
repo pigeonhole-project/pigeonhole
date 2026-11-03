@@ -434,12 +434,8 @@ mod tests {
 
     fn lim(id: &str, max_blob_size: usize) -> SharedBackend {
         Arc::new(erase(
-            MemoryBlobStore::with_limits(BackendLimits {
-                max_blob_size,
-                supports_range: RangeSupport::BestEffort,
-                can_list: false,
-            })
-            .with_instance_id(id),
+            MemoryBlobStore::with_limits(BackendLimits { max_blob_size, supports_range: RangeSupport::BestEffort })
+                .with_instance_id(id),
         ))
     }
 
@@ -480,7 +476,6 @@ mod tests {
         let b_store = MemoryBlobStore::with_limits(BackendLimits {
             max_blob_size: 10 * MIB,
             supports_range: RangeSupport::BestEffort,
-            can_list: false,
         })
         .with_instance_id("b-10");
         let b: SharedBackend = Arc::new(erase(b_store));
@@ -561,10 +556,8 @@ mod tests {
 
     #[tokio::test]
     async fn lost_part_is_repaired() {
-        let a: SharedBackend =
-            Arc::new(erase(MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("a")));
-        let b: SharedBackend =
-            Arc::new(erase(MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("b")));
+        let a: SharedBackend = Arc::new(erase(MemoryBlobStore::new().with_instance_id("a")));
+        let b: SharedBackend = Arc::new(erase(MemoryBlobStore::new().with_instance_id("b")));
         let (_dir, layer, rep) = open_layer(vec![a.clone(), b], 2, 8 * MIB, MIB).await;
 
         let data = Bytes::from(vec![7u8; 3 * MIB]);
