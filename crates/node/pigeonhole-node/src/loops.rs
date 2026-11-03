@@ -3,7 +3,6 @@
 //! keep the knobs and the chunk stores in step with the tablet.
 
 use pigeonhole_admin::Admin;
-use pigeonhole_chunk_store::{Repairer, Sweeper};
 use pigeonhole_config::Cooling;
 use pigeonhole_gateway_s3::{CoolPolicy, S3Gateway};
 use pigeonhole_meta::MetaStore;
@@ -21,10 +20,8 @@ pub(crate) fn spawn(admin: &Admin, metrics: bool) -> Vec<JoinHandle<()>> {
         tokio::spawn(f.in_current_span())
     }
     let (d, store) = (&admin.dynamic, &admin.store);
-    let replicated = store.replicated();
-    let sweeper =
-        Sweeper::new(store.db().clone(), replicated.members().to_vec(), d.sweep.get(), replicated.pins().clone());
-    let repairer = Repairer::new(store.db().clone(), replicated.clone(), d.repair.get());
+    let sweeper = store.sweeper(d.sweep.get());
+    let repairer = store.repairer(d.repair.get());
     let cooling = d.cool.get();
     info!(
         sweep = ?d.sweep.get().interval,
