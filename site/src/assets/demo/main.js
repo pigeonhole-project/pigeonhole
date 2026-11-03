@@ -701,12 +701,14 @@ async function open(request) {
 // opens, then the posts of its start (the log's claim).
 async function firstBoot(events) {
   await loadChannels();
-  await refreshObjects();
-  // Empty channels: the boot's own posts fill them in, as they fly.
+  // Empty channels: the boot's own posts fill them in, as they fly (the
+  // wizard's sketch stays empty meanwhile: the graph draws from these).
   for (const c of state.channels) {
     c.total = 0;
     c.messages = [];
   }
+  graph.refill();
+  await refreshObjects();
   redraw();
   graph.hideAll();
   graph.reveal({kind: "client"});
