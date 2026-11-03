@@ -196,11 +196,8 @@ impl Admin {
             "dynamic_unset" => {
                 (Writes, Box::pin(async move { Ok(json!({ "unset": self.dynamic.unset(&r.key).await? })) }))
             }
-            // A snapshot is every node's own; the other tasks are the leader's work.
-            "run_task" => {
-                let access = if r.task == "snapshot" { Any } else { Writes };
-                (access, Box::pin(async move { self.dynamic.run_now(&r.task).map(|()| ok()) }))
-            }
+            // The leader's tasks are refused elsewhere by run_now itself; a snapshot is every node's.
+            "run_task" => (Any, Box::pin(async move { self.dynamic.run_now(&r.task).map(|()| ok()) })),
             "verify" => (
                 Writes,
                 Box::pin(async move {

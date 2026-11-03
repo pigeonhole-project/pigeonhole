@@ -13,6 +13,7 @@ use pigeonhole_admin::{stores, Admin, DiskView, StoreRef, Views};
 use pigeonhole_blob::{erase, CheapestFirst, InstanceInfo, MetricsBackend, Replicated, SharedBackend};
 use pigeonhole_chunk_store::{BlobDb, BlockCache, ChunkStore, IngestOptions};
 use pigeonhole_chunk_store::{Repairer, Sweeper};
+use pigeonhole_config::dynamic::Task;
 use pigeonhole_config::instances::{check_fingerprints, InstanceConfig, InstanceKind};
 use pigeonhole_config::{Config, DynConfig, LogSettings, SnapshotSettings};
 use pigeonhole_fake_channels::world::meta_info;
@@ -238,7 +239,9 @@ impl Node {
         let store = Arc::new(store);
         let index = Index::open(meta.clone()).await?;
         let s3 = S3Gateway::new(cfg.s3_options(), index.clone(), store.clone());
-        let dynamic = Arc::new(DynConfig::open(cfg.clone(), meta.clone()));
+        // The loops it runs (below), with the tablet's snapshot ticker.
+        let runs = [Task::Sweep, Task::Repair, Task::Cool];
+        let dynamic = Arc::new(DynConfig::open(cfg.clone(), meta.clone(), &runs));
         let inline_on = cfg.inline.max_object_size.is_some();
         let spawn = |f| tokio::spawn(tracing::Instrument::in_current_span(f));
         let repairer = Repairer::new(store.db().clone(), store.replicated().clone(), dynamic.repair.get());

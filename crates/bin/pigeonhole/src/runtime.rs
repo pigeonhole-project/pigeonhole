@@ -3,6 +3,7 @@
 use crate::channel_log;
 use anyhow::Context;
 use pigeonhole::config::cluster::ClusterSettings;
+use pigeonhole::config::dynamic::Task;
 use pigeonhole::config::Config;
 use pigeonhole::config::{DynConfig, LogSettings, SnapshotSettings};
 use pigeonhole::index::Index;
@@ -219,8 +220,21 @@ pub async fn open_runtime(cfg: &Config) -> anyhow::Result<Runtime> {
 
     let layer = ChunkStore::open_replicated(blob_db, replicated, opts).await.context("open ChunkStore")?;
     let store = Arc::new(with_optional_caches(layer, cfg));
-    let dynamic = Arc::new(DynConfig::open(cfg.clone(), meta.clone()));
+    let dynamic = Arc::new(DynConfig::open(cfg.clone(), meta.clone(), &loops(cfg)));
     Ok(Runtime { meta, store, dynamic, log })
+}
+
+/// The loops `serve` runs: the chunk store's and the cooler, the tablet's
+/// gauges with `[metrics]`, the REAPI's GCs with its server.
+fn loops(cfg: &Config) -> Vec<Task> {
+    let mut loops = vec![Task::Sweep, Task::Repair, Task::Cool];
+    if cfg.metrics.enabled {
+        loops.push(Task::Metrics);
+    }
+    if cfg!(feature = "bytestream") && cfg.bytestream.enabled {
+        loops.extend([Task::CasGc, Task::UploadGc]);
+    }
+    loops
 }
 
 /// The tablet as node `cluster.node` of its cluster: Raft over gRPC to the

@@ -5,9 +5,9 @@ use crate::Admin;
 use anyhow::Result;
 
 impl Admin {
-    /// What runs in the background, task by task (the ones this node runs:
-    /// repair, sweep, cool, snapshot): its period, when it passes next, and
-    /// the work waiting for it.
+    /// What runs in the background, task by task (the loops this node runs,
+    /// `DynConfig::tasks`): its period, when it passes next, and the work
+    /// waiting for it.
     pub async fn background(&self) -> Result<serde_json::Value> {
         use serde_json::json;
         let found = self.log.discover().await?;
@@ -31,7 +31,6 @@ impl Admin {
             .dynamic
             .tasks()
             .into_iter()
-            .filter(|t| ["repair", "sweep", "cool", "snapshot"].contains(&t.task))
             .map(|t| json!({ "task": t.task, "every": t.every, "next_in_ms": t.next_in_ms, "work": work(t.task) }))
             .collect();
         // `at`: the newest snapshot's position (the entries count from it); `base`: where the log starts.

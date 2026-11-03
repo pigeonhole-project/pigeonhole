@@ -51,8 +51,64 @@ fn node_key(key: &str) -> Option<(u64, &str)> {
     Some((id.parse().ok()?, name))
 }
 
-/// The background loops a pass can be asked of.
-pub const TASKS: &[&str] = &["sweep", "repair", "cool", "snapshot", "metrics", "cas_gc", "upload_gc"];
+/// A background loop the dynamic config drives. A root runs some of them
+/// ([`DynConfig::open`]): only those are shown, run on demand, and have
+/// their keys set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Task {
+    Sweep,
+    Repair,
+    Cool,
+    /// Every node's own snapshot ticker (in the `MetaStore`): always run.
+    Snapshot,
+    Metrics,
+    CasGc,
+    UploadGc,
+}
+
+impl Task {
+    pub const ALL: [Task; 7] =
+        [Task::Sweep, Task::Repair, Task::Cool, Task::Snapshot, Task::Metrics, Task::CasGc, Task::UploadGc];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Task::Sweep => "sweep",
+            Task::Repair => "repair",
+            Task::Cool => "cool",
+            Task::Snapshot => "snapshot",
+            Task::Metrics => "metrics",
+            Task::CasGc => "cas_gc",
+            Task::UploadGc => "upload_gc",
+        }
+    }
+
+    pub fn named(name: &str) -> Option<Task> {
+        Task::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// Whether it is the leader's work (the others skip their passes); a
+    /// snapshot is every node's own.
+    pub fn leader_only(self) -> bool {
+        self != Task::Snapshot
+    }
+
+    /// The loop dynamic key `key` drives.
+    fn of_key(key: &str) -> Option<Task> {
+        if node_key(key).is_some() {
+            return Some(Task::Snapshot);
+        }
+        Some(match key.split_once('.')? {
+            ("sweep", _) => Task::Sweep,
+            ("repair", _) => Task::Repair,
+            ("inline", _) => Task::Cool,
+            ("meta", _) => Task::Snapshot,
+            ("metrics", _) => Task::Metrics,
+            ("bytestream", "upload_gc_every") => Task::UploadGc,
+            ("bytestream", _) => Task::CasGc,
+            _ => return None,
+        })
+    }
+}
 
 /// What the dynamic keys come to.
 #[derive(Clone, Debug, PartialEq)]
@@ -142,23 +198,10 @@ fn off_or(d: Option<Duration>) -> String {
 }
 
 impl Config {
-    /// The dynamic knobs of this config, no overrides.
+    /// The dynamic knobs of this config, no overrides: the file's (a
+    /// config built in code has its own, `Config::for_test`).
     pub fn dynamic(&self) -> DynamicConfig {
-        if !self.file.is_empty() {
-            return self.dynamic_with(&BTreeMap::new()).expect("the file was read once already");
-        }
-        // Built in code (Config::for_test): no file, no [[node]]s.
-        DynamicConfig {
-            sweep: self.sweep.clone(),
-            repair: self.repair.clone(),
-            cool: Cooling { every: self.inline.cool_every, policy: self.inline.cool.clone() },
-            snapshot_every: self.meta.snapshot_interval,
-            snapshot_every_default: self.meta.snapshot_interval,
-            node_snapshot_every: BTreeMap::new(),
-            metrics_every: self.metrics.every,
-            cas_gc: Expiry { every: self.bytestream.gc_every, ttl: self.bytestream.gc_ttl },
-            upload_gc_every: self.bytestream.upload_gc_every,
-        }
+        self.dynamic_with(&BTreeMap::new()).expect("the file was read once already")
     }
 
     /// The dynamic knobs with `overrides` (key → value) on top of the file;
@@ -222,7 +265,8 @@ impl Config {
         self.cluster.as_ref().map(|c| c.nodes.iter().map(|n| n.id).collect()).unwrap_or_default()
     }
 
-    /// Every dynamic key: [`KEYS`], then [`NODE_KEYS`] of each `[[node]]`.
+    /// Every dynamic key: [`KEYS`], then [`NODE_KEYS`] of each `[[node]]`
+    /// (the keys of every loop, run or not: [`DynConfig::keys`] has those run).
     pub fn dynamic_keys(&self) -> Vec<String> {
         let nodes =
             self.member_ids().into_iter().flat_map(|id| NODE_KEYS.iter().map(move |k| format!("node.{id}.{k}")));
@@ -356,6 +400,8 @@ pub struct TaskView {
 pub struct DynConfig {
     config: Config,
     meta: Arc<MetaStore>,
+    /// The loops the root runs (the snapshot ticker always).
+    runs: std::collections::BTreeSet<Task>,
     /// The overrides refused (key → why), as of the last change.
     refused: Mutex<BTreeMap<String, String>>,
     /// One change at a time: each is checked against the ones before it.
@@ -378,8 +424,10 @@ impl DynConfig {
     }
 
     /// The knobs of `config` with the overrides `meta` holds; an override
-    /// the file no longer allows is left out (and shown as refused).
-    pub fn open(config: Config, meta: Arc<MetaStore>) -> Self {
+    /// the file no longer allows is left out (and shown as refused). `runs`:
+    /// the loops the root runs, with the tablet's snapshot ticker: only
+    /// those are shown ([`Self::keys`], [`Self::tasks`]), changed and run.
+    pub fn open(config: Config, meta: Arc<MetaStore>, runs: &[Task]) -> Self {
         let overrides = meta.read::<Overrides, _>(|o| o.values.clone());
         let (knobs, refused) = config.dynamic_lenient(&overrides);
         for (key, why) in &refused {
@@ -390,6 +438,7 @@ impl DynConfig {
         Self {
             config,
             meta,
+            runs: runs.iter().copied().chain([Task::Snapshot]).collect(),
             refused: Mutex::new(refused),
             writes: tokio::sync::Mutex::new(()),
             changed_at,
@@ -425,6 +474,7 @@ impl DynConfig {
     /// Override `key` with `value` (`"5s"`, `off`, `16`, `true`): checked
     /// as the file would be, then written to the tablet and applied.
     pub async fn set(&self, key: &str, value: &str) -> Result<()> {
+        self.check_runs(key)?;
         let _one = self.writes.lock().await;
         let refused = self.refused.lock().unwrap().clone();
         let mut taken: BTreeMap<_, _> =
@@ -444,6 +494,7 @@ impl DynConfig {
     /// there was one.
     pub async fn unset(&self, key: &str) -> Result<bool> {
         self.config.check_key(key)?;
+        self.check_runs(key)?;
         let _one = self.writes.lock().await;
         if !self.overrides().contains_key(key) {
             return Ok(false);
@@ -478,6 +529,22 @@ impl DynConfig {
         }
     }
 
+    /// Whether `key` drives a loop this node runs (checked as a key first).
+    fn check_runs(&self, key: &str) -> Result<()> {
+        self.config.check_key(key)?;
+        match Task::of_key(key) {
+            Some(task) if !self.runs.contains(&task) => {
+                bail!("{key}: drives the {} loop, which this node does not run", task.name())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The loops this node runs, in [`Task::ALL`]'s order.
+    pub fn runs(&self) -> impl Iterator<Item = Task> + '_ {
+        self.runs.iter().copied()
+    }
+
     fn changed(&self, at: u64) {
         self.changed_at.fetch_max(at, std::sync::atomic::Ordering::SeqCst);
     }
@@ -510,17 +577,26 @@ impl DynConfig {
         self.upload_gc.set(knobs.upload_gc_every);
     }
 
-    /// Ask `task` (one of [`TASKS`]) for a pass now, even while it is off.
+    /// Ask `task` (one this node runs) for a pass now, even while it is
+    /// off. The leader's work only where it serves and may write
+    /// ([`MetaStore::serves`]: `NotLeader`, `NoQuorum`, …): a follower
+    /// would skip the pass.
     pub fn run_now(&self, task: &str) -> Result<()> {
-        match task {
-            "sweep" => self.sweep.run_now(),
-            "repair" => self.repair.run_now(),
-            "cool" => self.cool.run_now(),
-            "snapshot" => self.meta.snapshot_schedule().run_now(),
-            "metrics" => self.metrics.run_now(),
-            "cas_gc" => self.cas_gc.run_now(),
-            "upload_gc" => self.upload_gc.run_now(),
-            _ => bail!("no task {task:?}; tasks: {}", TASKS.join(", ")),
+        let Some(t) = Task::named(task).filter(|t| self.runs.contains(t)) else {
+            let names: Vec<_> = self.runs().map(Task::name).collect();
+            bail!("no task {task:?} on this node; tasks: {}", names.join(", "))
+        };
+        if t.leader_only() {
+            self.meta.serves(true)?;
+        }
+        match t {
+            Task::Sweep => self.sweep.run_now(),
+            Task::Repair => self.repair.run_now(),
+            Task::Cool => self.cool.run_now(),
+            Task::Snapshot => self.meta.snapshot_schedule().run_now(),
+            Task::Metrics => self.metrics.run_now(),
+            Task::CasGc => self.cas_gc.run_now(),
+            Task::UploadGc => self.upload_gc.run_now(),
         }
         Ok(())
     }
@@ -533,6 +609,7 @@ impl DynConfig {
         self.config
             .dynamic_keys()
             .into_iter()
+            .filter(|key| Task::of_key(key).is_none_or(|t| self.runs.contains(&t)))
             .map(|key| KeyView {
                 value: knobs.value(&key).unwrap_or_default(),
                 file: self.config.file_value(&key),
@@ -544,24 +621,28 @@ impl DynConfig {
             .collect()
     }
 
-    /// Every task: its period and when its next pass is due.
+    /// Every task this node runs: its period and when its next pass is due.
     pub fn tasks(&self) -> Vec<TaskView> {
         let now = tokio::time::Instant::now();
-        let view = |task, due: Option<tokio::time::Instant>, every: Option<Duration>| TaskView {
-            task,
-            every: off_or(every),
-            next_in_ms: due.map(|at| at.saturating_duration_since(now).as_millis() as u64),
-        };
         let snapshots = self.meta.snapshot_schedule();
-        vec![
-            view("sweep", self.sweep.due(|c| c.interval), self.sweep.get().interval),
-            view("repair", self.repair.due(|c| c.interval), self.repair.get().interval),
-            view("cool", self.cool.due(|c| c.every), self.cool.get().every),
-            view("snapshot", snapshots.due(|p| *p), snapshots.get()),
-            view("metrics", self.metrics.due(|p| *p), self.metrics.get()),
-            view("cas_gc", self.cas_gc.due(Expiry::period), self.cas_gc.get().period()),
-            view("upload_gc", self.upload_gc.due(|p| *p), self.upload_gc.get()),
-        ]
+        self.runs()
+            .map(|task| {
+                let (due, every) = match task {
+                    Task::Sweep => (self.sweep.due(|c| c.interval), self.sweep.get().interval),
+                    Task::Repair => (self.repair.due(|c| c.interval), self.repair.get().interval),
+                    Task::Cool => (self.cool.due(|c| c.every), self.cool.get().every),
+                    Task::Snapshot => (snapshots.due(|p| *p), snapshots.get()),
+                    Task::Metrics => (self.metrics.due(|p| *p), self.metrics.get()),
+                    Task::CasGc => (self.cas_gc.due(Expiry::period), self.cas_gc.get().period()),
+                    Task::UploadGc => (self.upload_gc.due(|p| *p), self.upload_gc.get()),
+                };
+                TaskView {
+                    task: task.name(),
+                    every: off_or(every),
+                    next_in_ms: due.map(|at| at.saturating_duration_since(now).as_millis() as u64),
+                }
+            })
+            .collect()
     }
 }
 
@@ -690,7 +771,7 @@ mod tests {
         let cfg = config("[sweep]\ninterval = \"90s\"\n");
         {
             let meta = pigeonhole_testkit::tablet(dir.path(), DynConfig::register).await;
-            let dynamic = DynConfig::open(cfg.clone(), meta.clone());
+            let dynamic = DynConfig::open(cfg.clone(), meta.clone(), &Task::ALL);
             assert_eq!(dynamic.sweep.get().interval, Some(90 * S));
             dynamic.set("sweep.interval", "off").await.unwrap();
             dynamic.set("meta.snapshot_every", "5m").await.unwrap();
@@ -701,7 +782,7 @@ mod tests {
             meta.close().await.unwrap();
         }
         let meta = pigeonhole_testkit::tablet(dir.path(), DynConfig::register).await;
-        let dynamic = DynConfig::open(cfg, meta.clone());
+        let dynamic = DynConfig::open(cfg, meta.clone(), &Task::ALL);
         assert_eq!(dynamic.sweep.get().interval, None, "the override outlives a restart");
         let view = dynamic.keys().into_iter().find(|k| k.key == "sweep.interval").unwrap();
         assert_eq!(
@@ -723,7 +804,7 @@ mod tests {
         meta.propose::<Overrides>(bad).await.unwrap().unwrap();
         let good = OverrideCommand::Set { key: "repair.concurrency".into(), value: "2".into() };
         meta.propose::<Overrides>(good).await.unwrap().unwrap();
-        let dynamic = DynConfig::open(config(""), meta);
+        let dynamic = DynConfig::open(config(""), meta, &Task::ALL);
         assert_eq!((dynamic.repair.get().batch_size, dynamic.repair.get().concurrency), (16, 2));
         let view = dynamic.keys().into_iter().find(|k| k.key == "repair.batch_size").unwrap();
         assert!(view.refused.is_some(), "{view:?}");
@@ -737,7 +818,7 @@ mod tests {
     async fn overrides_by_replication_are_followed() {
         let dir = tempfile::tempdir().unwrap();
         let meta = pigeonhole_testkit::tablet(dir.path(), DynConfig::register).await;
-        let dynamic = Arc::new(DynConfig::open(config(""), meta.clone()));
+        let dynamic = Arc::new(DynConfig::open(config(""), meta.clone(), &Task::ALL));
         let follow = tokio::spawn(dynamic.clone().follow());
         // As the leader's entry would reach a follower: not through `set`.
         let set = OverrideCommand::Set { key: "repair.interval".into(), value: "off".into() };
@@ -756,13 +837,48 @@ mod tests {
     async fn tasks_show_when_they_pass_next() {
         let dir = tempfile::tempdir().unwrap();
         let meta = pigeonhole_testkit::tablet(dir.path(), DynConfig::register).await;
-        let dynamic = DynConfig::open(config("[repair]\ninterval = \"off\"\n"), meta);
+        let dynamic = DynConfig::open(config("[repair]\ninterval = \"off\"\n"), meta, &Task::ALL);
         let tasks = dynamic.tasks();
-        assert_eq!(tasks.iter().map(|t| t.task).collect::<Vec<_>>(), TASKS);
+        assert_eq!(tasks.iter().map(|t| t.task).collect::<Vec<_>>(), Task::ALL.map(Task::name));
         let repair = &tasks[1];
         assert_eq!((repair.every.as_str(), repair.next_in_ms), ("off", None));
         assert!(tasks[0].next_in_ms.unwrap() <= 60_000);
         assert!(dynamic.run_now("repair").is_ok());
         assert!(dynamic.run_now("nap").is_err());
+    }
+
+    #[tokio::test]
+    async fn only_the_loops_the_root_runs_are_shown_set_and_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = pigeonhole_testkit::tablet(dir.path(), DynConfig::register).await;
+        let dynamic = DynConfig::open(config(""), meta, &[Task::Sweep, Task::Repair, Task::Cool]);
+        let tasks: Vec<_> = dynamic.tasks().into_iter().map(|t| t.task).collect();
+        assert_eq!(tasks, ["sweep", "repair", "cool", "snapshot"], "the snapshot ticker is the tablet's own");
+        let keys: Vec<_> = dynamic.keys().into_iter().map(|k| k.key).collect();
+        assert!(keys.contains(&"meta.snapshot_every".to_string()) && keys.contains(&"inline.budget".to_string()));
+        assert!(!keys.iter().any(|k| k.starts_with("metrics.") || k.starts_with("bytestream.")), "{keys:?}");
+        for task in ["metrics", "cas_gc", "upload_gc", "nap"] {
+            let err = format!("{:#}", dynamic.run_now(task).unwrap_err());
+            assert!(err.contains("on this node"), "{task}: {err}");
+        }
+        assert!(dynamic.run_now("snapshot").is_ok());
+        let err = format!("{:#}", dynamic.set("metrics.every", "10s").await.unwrap_err());
+        assert!(err.contains("does not run"), "{err}");
+        assert!(dynamic.unset("bytestream.gc_ttl").await.is_err());
+        dynamic.set("sweep.batch_size", "8").await.unwrap();
+    }
+
+    #[test]
+    fn a_config_built_in_code_has_its_own_knobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::for_test(dir.path());
+        let knobs = cfg.dynamic();
+        assert_eq!((knobs.sweep, knobs.repair), (cfg.sweep.clone(), cfg.repair.clone()));
+        assert_eq!(knobs.cool, Cooling { every: cfg.inline.cool_every, policy: cfg.inline.cool.clone() });
+        assert_eq!(knobs.snapshot_every, cfg.meta.snapshot_interval);
+        assert_eq!(knobs.metrics_every, cfg.metrics.every);
+        assert_eq!(cfg.inline.max_object_size, None, "nothing inline in tests that count chunks");
+        let knobs = cfg.dynamic_lenient(&one("repair.batch_size", "3")).0;
+        assert_eq!(knobs.repair.batch_size, 3);
     }
 }

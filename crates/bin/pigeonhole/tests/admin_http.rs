@@ -2,6 +2,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use pigeonhole::config::dynamic::Task;
 use pigeonhole::config::{Config, DynConfig};
 use std::path::Path;
 use std::sync::Arc;
@@ -22,7 +23,7 @@ async fn the_admin_api_overrides_and_runs() {
     let text = "[repair]\ninterval = \"30s\"\n[chunk]\nstore = \"mem\"\n[[store]]\nid = \"mem\"\nkind = \"memory\"\n";
     let cfg = Config::from_toml(text, Path::new("test.toml")).unwrap();
     let meta = pigeonhole_testkit::tablet(dir.path(), DynConfig::register).await;
-    let dynamic = Arc::new(DynConfig::open(cfg, meta));
+    let dynamic = Arc::new(DynConfig::open(cfg, meta, &Task::ALL));
     let app = pigeonhole::admin_http::router(dynamic.clone());
 
     assert_eq!(call(&app, "PUT", "/admin/config/repair.interval", "off").await.0, StatusCode::NO_CONTENT);
