@@ -21,19 +21,18 @@ cluster-smoke:
 # clang on Linux has no WASI headers and picks up glibc's (CI does this).
 WASM_AR = $(shell rustc --print sysroot)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar
 WASM_CC_ENV = $(if $(WASI_SDK),CC_wasm32_wasip1=$(WASI_SDK)/bin/clang AR_wasm32_wasip1=$(WASI_SDK)/bin/llvm-ar,AR_wasm32_wasip1=$(WASM_AR))
-# Without symbols: 3 MB less to download (the name section; panics still
-# say where).
+# Its own profile (Cargo.toml [profile.web]): built for size.
 web:
-	$(WASM_CC_ENV) CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --target wasm32-wasip1 -p pigeonhole-web
+	$(WASM_CC_ENV) cargo build --profile web --target wasm32-wasip1 -p pigeonhole-web
 
 # The smoke under Node's WASI, then under the site's own shim (its file pool
 # on buffers), then a page load and a reload on one pool.
 web-smoke: web
-	node --no-warnings crates/web/run-wasi.mjs target/wasm32-wasip1/release/pigeonhole-web.wasm >/dev/null
-	node --no-warnings crates/web/run-shim.mjs smoke target/wasm32-wasip1/release/pigeonhole-web.wasm 2>&1 | grep -q "smoke ok"
-	node --no-warnings crates/web/run-shim.mjs reload target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep "reload"
-	node --no-warnings crates/web/run-shim.mjs snapshot target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep 'base {"at":60'
-	node --no-warnings crates/web/run-shim.mjs events target/wasm32-wasip1/release/pigeonhole_web.wasm 2>&1 | grep "events ok"
+	node --no-warnings crates/web/run-wasi.mjs target/wasm32-wasip1/web/pigeonhole-web.wasm >/dev/null
+	node --no-warnings crates/web/run-shim.mjs smoke target/wasm32-wasip1/web/pigeonhole-web.wasm 2>&1 | grep -q "smoke ok"
+	node --no-warnings crates/web/run-shim.mjs reload target/wasm32-wasip1/web/pigeonhole_web.wasm 2>&1 | grep "reload"
+	node --no-warnings crates/web/run-shim.mjs snapshot target/wasm32-wasip1/web/pigeonhole_web.wasm 2>&1 | grep 'base {"at":60'
+	node --no-warnings crates/web/run-shim.mjs events target/wasm32-wasip1/web/pigeonhole_web.wasm 2>&1 | grep "events ok"
 
 # The site's JavaScript: biome (biome.json) checks its lint, format and
 # imports, as `lint` does for Rust; the tests are the modules without DOM.

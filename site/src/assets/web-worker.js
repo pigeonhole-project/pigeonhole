@@ -15,6 +15,9 @@ import {MemoryHandle, Pool, Wasi} from "./wasi.js";
 
 // The assets' version (?v=…), the same for the wasm as for this script.
 const V = new URL(import.meta.url).search;
+// The module downloads and compiles while the files open (below).
+const compiled = WebAssembly.compileStreaming(fetch(`pigeonhole.wasm${V}`));
+compiled.catch(() => {}); // awaited in `ready`, which reports a failure
 
 const POOL_DIR = "pigeonhole";
 // The demo's cluster seals its Raft frames with this key ([cluster]
@@ -140,7 +143,7 @@ async function reset() {
 const ready = (async () => {
   pool = await openPool();
   wasi = new Wasi({pool, preopen: "/data", env: {PH_DEMO_CLUSTER_KEY: DEMO_CLUSTER_KEY}});
-  const {instance} = await WebAssembly.instantiateStreaming(fetch(`pigeonhole.wasm${V}`), {wasi_snapshot_preview1: wasi.imports()});
+  const instance = await WebAssembly.instantiate(await compiled, {wasi_snapshot_preview1: wasi.imports()});
   exports = instance.exports;
   wasi.memory = exports.memory;
   wasi.yieldFlag = exports.ph_yield_flag();

@@ -27,7 +27,7 @@ replays its log.
 ```
 rustup target add wasm32-wasip1
 rustup component add llvm-tools   # llvm-ar: zstd's C objects for wasm
-make web                          # → target/wasm32-wasip1/release/pigeonhole_web.wasm
+make web                          # → target/wasm32-wasip1/web/pigeonhole_web.wasm
 make web-smoke                    # make web, then run it under Node (24: 22's WASI segfaults)
 ```
 

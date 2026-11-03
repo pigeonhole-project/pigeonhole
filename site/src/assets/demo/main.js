@@ -16,11 +16,11 @@ import {flightsOf, refused} from "./flights.js";
 import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
-import {connect} from "./node.js";
 import {makeRaftWatch} from "./raft.js";
 import {apply as applyEvent, merge} from "./reduce.js";
 import {reset as resetSettings, settings, watch} from "./settings.js";
 import {settingsView} from "./settings-view.js";
+import {node as connecting} from "./start.js";
 import {storeView} from "./store-view.js";
 import {TASK_KEY, TASK_ON, taskWindows, workLabel} from "./tasks.js";
 import {makeWizard} from "./wizard.js";
@@ -71,7 +71,7 @@ const isOpen = kind => state.open?.kind === kind;
 // The graph's node for a panel: the log's is its channel's card.
 const nodeOf = open => (open?.kind === "log" ? {kind: "store", store: logChannel()?.store} : open);
 
-const node = await connect(new URL(`../web-worker.js${new URL(import.meta.url).search}`, import.meta.url));
+const node = await connecting;
 
 let updateWindows = () => {};
 let relayout = () => redraw(); // the screen turned narrow or wide: what is on the graph, again
