@@ -140,3 +140,15 @@ async fn a_pinned_marker_tells_whose_channel_it_is() {
     fresh.pin(older).await.unwrap();
     assert_eq!(store_on(&fresh).mark_owner(theirs).await.unwrap(), ours, "the older pinned marker wins");
 }
+
+/// A delete applied whose answer was lost: repeated harmlessly.
+#[tokio::test]
+async fn a_delete_whose_answer_was_lost() {
+    use pigeonhole_storage_discord::fake::Mutation;
+    let (channel, store) = store();
+    let id = store.put(pattern(10), &BlobId::random().name()).await.unwrap();
+    channel.lose_next_answer_of(Mutation::Delete);
+    assert!(store.delete(&[id.message_id]).await.is_err());
+    assert!(!store.exists(&id).await.unwrap(), "deleted all the same");
+    store.delete(&[id.message_id]).await.unwrap();
+}

@@ -28,11 +28,23 @@ pub struct Calls {
     pub pin: usize,
 }
 
+/// A call that changes the channel, whose answer a test can lose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutation {
+    Send,
+    StartThread,
+    Delete,
+    ArchiveThread,
+    DeleteThread,
+    Pin,
+}
+
 /// What tests make a channel do wrong; not part of its state.
 #[derive(Default)]
 struct Knobs {
     calls: Calls,
-    lose_next_answer: bool,
+    /// The next call of each of these is applied but answers an error.
+    lose_next: Vec<Mutation>,
     lose_next_thread_answer: bool,
     /// The next send's answer comes this much later (it lands at once).
     delay_next_answer: Option<std::time::Duration>,
@@ -122,12 +134,31 @@ impl<H> FakeDiscord<H> {
 
     /// The next send posts, but the sender learns nothing.
     pub fn lose_next_answer(&self) {
-        self.knobs.lock().unwrap().lose_next_answer = true;
+        self.lose_next_answer_of(Mutation::Send);
+    }
+
+    /// The next `call` is applied, but its caller gets an error (a lost
+    /// answer: the outcome is unknown to it).
+    pub fn lose_next_answer_of(&self, call: Mutation) {
+        self.knobs.lock().unwrap().lose_next.push(call);
+    }
+
+    /// After `call` was applied: an error if its answer is to be lost.
+    fn answer(&self, call: Mutation) -> Result<()> {
+        let mut k = self.knobs.lock().unwrap();
+        match k.lose_next.iter().position(|c| *c == call) {
+            Some(i) => {
+                k.lose_next.remove(i);
+                bail!("connection reset before the answer to {call:?}")
+            }
+            None => Ok(()),
+        }
     }
 
     /// The next thread start is made, but its answer is lost and the start
     /// sent again, as the HTTP client retries a lost answer: the caller sees
-    /// the repeat's answer (160004, taken: by its own first attempt).
+    /// the repeat's answer (160004, taken: by its own first attempt). (To
+    /// lose the answer for the caller instead: [`Self::lose_next_answer_of`].)
     pub fn lose_next_thread_answer(&self) {
         self.knobs.lock().unwrap().lose_next_thread_answer = true;
     }
@@ -178,13 +209,8 @@ impl<H: FakeHost<DiscordChannelState>> DiscordApi for FakeDiscord<H> {
             let preview: String = content.lines().nth(1).unwrap_or(content).chars().take(24).collect();
             tracing::debug!(message_id = answer.id, chars = content.chars().count(), %preview, "fake channel: text");
         }
-        let delay = {
-            let mut k = self.knobs.lock().unwrap();
-            if std::mem::take(&mut k.lose_next_answer) {
-                bail!("connection reset before the answer");
-            }
-            k.delay_next_answer.take()
-        };
+        self.answer(Mutation::Send)?;
+        let delay = self.knobs.lock().unwrap().delay_next_answer.take();
         if let Some(after) = delay {
             tokio::time::sleep(after).await;
         }
@@ -203,7 +229,7 @@ impl<H: FakeHost<DiscordChannelState>> DiscordApi for FakeDiscord<H> {
     async fn pin(&self, id: u64) -> Result<()> {
         self.count(|c| c.pin += 1);
         self.host.apply(Command::Pin { id }).await?;
-        Ok(())
+        self.answer(Mutation::Pin)
     }
 
     async fn list(&self, before: Option<u64>, after: Option<u64>, limit: usize) -> Result<Vec<DcMessage>> {
@@ -216,7 +242,7 @@ impl<H: FakeHost<DiscordChannelState>> DiscordApi for FakeDiscord<H> {
         if let Reply::Released { blobs } = self.host.apply(Command::Delete { ids: ids.to_vec() }).await? {
             self.host.delete_blobs(&blobs).await?;
         }
-        Ok(())
+        self.answer(Mutation::Delete)
     }
 
     async fn start_thread(&self, message_id: u64, name: &str) -> Result<ThreadStart> {
@@ -227,7 +253,7 @@ impl<H: FakeHost<DiscordChannelState>> DiscordApi for FakeDiscord<H> {
             self.host.apply(Command::StartThread { id: message_id, name: name.into() }).await?;
         }
         match self.host.apply(Command::StartThread { id: message_id, name: name.into() }).await? {
-            Reply::Thread(start) => Ok(start),
+            Reply::Thread(start) => self.answer(Mutation::StartThread).map(|()| start),
             other => bail!("a thread start answered {other:?}"),
         }
     }
@@ -242,12 +268,12 @@ impl<H: FakeHost<DiscordChannelState>> DiscordApi for FakeDiscord<H> {
         if self.host.read(|s| s.thread(message_id).is_none()) {
             bail!("404: no thread {message_id}");
         }
-        Ok(())
+        self.answer(Mutation::ArchiveThread)
     }
 
     async fn delete_thread(&self, message_id: u64) -> Result<()> {
         self.host.apply(Command::DeleteThread { id: message_id }).await?;
-        Ok(())
+        self.answer(Mutation::DeleteThread)
     }
 
     async fn download(&self, url: &str, range: Option<(u64, u64)>) -> Result<Bytes> {

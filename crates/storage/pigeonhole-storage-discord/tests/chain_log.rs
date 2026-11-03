@@ -231,6 +231,28 @@ async fn removed_snapshots_leave_no_links_behind() {
     assert!(dangling.len() <= 1, "{dangling:?}");
 }
 
+/// A link made whose answer was lost: the put's outcome is unknown to its
+/// caller, and the blob won all the same; a put after the same `prev` loses
+/// to it.
+#[tokio::test]
+async fn a_link_whose_answer_was_lost_still_won() {
+    use pigeonhole_storage_discord::fake::Mutation;
+    let channel = Arc::new(FakeDiscord::new(77));
+    let s = channel_store(&channel);
+    let After::Won(claim) = s.put_after(None, "log-claim-1", bytes::Bytes::from_static(b"c")).await.unwrap() else {
+        panic!("the first claim links")
+    };
+    channel.lose_next_answer_of(Mutation::StartThread);
+    assert!(s.put_after(Some(&claim), "log-batch-1", bytes::Bytes::from_static(b"1")).await.is_err());
+    let tail = s.tail().await.unwrap().unwrap();
+    assert_eq!(tail.label, "log-batch-1");
+    let After::Lost(w) = s.put_after(Some(&claim), "log-batch-1", bytes::Bytes::from_static(b"2")).await.unwrap()
+    else {
+        panic!("the lost answer's blob won the link")
+    };
+    assert_eq!(w.id, tail.id);
+}
+
 /// Snapshots take no thread, so one removed after a restart (a store that
 /// never saw its name) leaves no link behind.
 #[tokio::test]

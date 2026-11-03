@@ -26,6 +26,15 @@ pub struct Calls {
     pub pin: usize,
 }
 
+/// A call that changes the channel, whose answer a test can lose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutation {
+    /// `send_document` or `send_text`.
+    Send,
+    Delete,
+    Pin,
+}
+
 /// What tests make a channel do wrong; not part of its state.
 #[derive(Default)]
 struct Knobs {
@@ -34,8 +43,8 @@ struct Knobs {
     hidden: HashMap<i64, u32>,
     /// The next send whose name starts with this is invisible for that many reads.
     hide_next: Option<(String, u32)>,
-    /// The next send posts but answers with an error.
-    lose_next_answer: bool,
+    /// The next call of each of these is applied but answers an error.
+    lose_next: Vec<Mutation>,
 }
 
 /// The host of a fake Telegram channel in memory.
@@ -156,20 +165,37 @@ impl<H> FakeChannel<H> {
 
     /// The next send posts, but the sender learns nothing.
     pub fn lose_next_answer(&self) {
-        self.knobs.lock().unwrap().lose_next_answer = true;
+        self.lose_next_answer_of(Mutation::Send);
+    }
+
+    /// The next `call` is applied, but its caller gets an error (a lost
+    /// answer: the outcome is unknown to it).
+    pub fn lose_next_answer_of(&self, call: Mutation) {
+        self.knobs.lock().unwrap().lose_next.push(call);
+    }
+
+    /// After `call` was applied: an error if its answer is to be lost.
+    fn answer(&self, call: Mutation) -> Result<()> {
+        let mut k = self.knobs.lock().unwrap();
+        match k.lose_next.iter().position(|c| *c == call) {
+            Some(i) => {
+                k.lose_next.remove(i);
+                bail!("connection reset before the answer to {call:?}")
+            }
+            None => Ok(()),
+        }
     }
 
     /// After a send: the hide and lose knobs it triggers.
     fn after_send(&self, id: i64, name: &str) -> Result<()> {
-        let mut k = self.knobs.lock().unwrap();
-        if k.hide_next.as_ref().is_some_and(|(prefix, _)| name.starts_with(prefix.as_str())) {
-            let (_, reads) = k.hide_next.take().unwrap();
-            k.hidden.insert(id, reads);
+        {
+            let mut k = self.knobs.lock().unwrap();
+            if k.hide_next.as_ref().is_some_and(|(prefix, _)| name.starts_with(prefix.as_str())) {
+                let (_, reads) = k.hide_next.take().unwrap();
+                k.hidden.insert(id, reads);
+            }
         }
-        if std::mem::take(&mut k.lose_next_answer) {
-            bail!("connection reset before the answer");
-        }
-        Ok(())
+        self.answer(Mutation::Send)
     }
 }
 
@@ -215,12 +241,17 @@ impl<H: FakeHost<TelegramChannelState>> ChannelApi for FakeChannel<H> {
         let size = data.len() as u64;
         let blob = self.host.put_blob(data).await?;
         let (id, fresh) = self.send(random_id, Message::Doc { name: name.into(), size, blob: blob.clone() }).await?;
+        // A repeat of a send returns the message it posted, its document too.
+        let file = match self.host.read(|s| s.view(self.id, id)) {
+            ChannelMessage::Document { file, .. } => Some(file),
+            _ => None,
+        };
         if !fresh {
             self.host.delete_blobs(&[blob]).await?;
-            return Ok(Sent { message_id: id, file: None });
+            return Ok(Sent { message_id: id, file });
         }
         self.after_send(id, name)?;
-        Ok(Sent { message_id: id, file: Some(self.host.read(|s| s.location(self.id, id))) })
+        Ok(Sent { message_id: id, file })
     }
 
     async fn send_text(&self, text: &str, random_id: i64) -> Result<Sent> {
@@ -251,7 +282,7 @@ impl<H: FakeHost<TelegramChannelState>> ChannelApi for FakeChannel<H> {
         if let Reply::Released { blobs } = self.host.apply(Command::Delete { ids: ids.to_vec() }).await? {
             self.host.delete_blobs(&blobs).await?;
         }
-        Ok(())
+        self.answer(Mutation::Delete)
     }
 
     async fn pinned(&self) -> Result<Option<i64>> {
@@ -261,7 +292,7 @@ impl<H: FakeHost<TelegramChannelState>> ChannelApi for FakeChannel<H> {
     async fn pin(&self, id: i64) -> Result<()> {
         self.knobs.lock().unwrap().calls.pin += 1;
         self.host.apply(Command::Pin { id, now_ms: now_ms() }).await?;
-        Ok(())
+        self.answer(Mutation::Pin)
     }
 }
 
