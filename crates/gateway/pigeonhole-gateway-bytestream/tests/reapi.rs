@@ -1,4 +1,5 @@
 #![cfg(not(madsim))] // talks gRPC over a real TCP listener
+#![allow(clippy::result_large_err)] // tonic::Status
 //! In-process REAPI tests (localhost only, no external network).
 
 use bytes::Bytes;
@@ -9,8 +10,12 @@ use pigeonhole_gateway_bytestream::config::{BytestreamConfig, Gc};
 use pigeonhole_gateway_bytestream::digest::sha256_hex;
 use pigeonhole_gateway_bytestream::google::bytestream::byte_stream_client::ByteStreamClient;
 use pigeonhole_gateway_bytestream::google::bytestream::{ReadRequest, WriteRequest};
+use pigeonhole_gateway_bytestream::reapi::action_cache_client::ActionCacheClient;
 use pigeonhole_gateway_bytestream::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
-use pigeonhole_gateway_bytestream::reapi::{digest_function, Digest, FindMissingBlobsRequest};
+use pigeonhole_gateway_bytestream::reapi::{
+    digest_function, ActionResult, Digest, FindMissingBlobsRequest, GetActionResultRequest, OutputFile,
+    UpdateActionResultRequest,
+};
 use pigeonhole_gateway_bytestream::server::serve_ephemeral;
 use pigeonhole_storage_memory::MemoryBlobStore;
 use std::sync::Arc;
@@ -21,6 +26,18 @@ use tonic::transport::Channel;
 /// whole test (dropping it deletes the databases under the running server).
 async fn test_harness(
 ) -> (ContentAddressableStorageClient<Channel>, ByteStreamClient<Channel>, String, tempfile::TempDir) {
+    let (cas, bs, _ac, inst, dir) = harness().await;
+    (cas, bs, inst, dir)
+}
+
+/// [`test_harness`] with an ActionCache client too.
+async fn harness() -> (
+    ContentAddressableStorageClient<Channel>,
+    ByteStreamClient<Channel>,
+    ActionCacheClient<Channel>,
+    String,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let cas_url = dir.path().join("cas.log");
     let blob_url = dir.path().join("blob.log");
@@ -37,8 +54,9 @@ async fn test_harness(
     let cas = ContentAddressableStorageClient::new(channel.clone())
         .max_decoding_message_size(MAX_MSG)
         .max_encoding_message_size(MAX_MSG);
-    let bs = ByteStreamClient::new(channel).max_decoding_message_size(MAX_MSG).max_encoding_message_size(MAX_MSG);
-    (cas, bs, "pigeonhole".into(), dir)
+    let bs =
+        ByteStreamClient::new(channel.clone()).max_decoding_message_size(MAX_MSG).max_encoding_message_size(MAX_MSG);
+    (cas, bs, ActionCacheClient::new(channel), "pigeonhole".into(), dir)
 }
 
 fn digest_for(data: &[u8]) -> Digest {
@@ -192,4 +210,82 @@ async fn bytestream_read_range() {
     }
     assert_eq!(got, &payload[100..150]);
     let _ = Bytes::new();
+}
+
+/// Write `data` under the digest `d` in one message; the answer.
+async fn write_as(
+    bs: &mut ByteStreamClient<Channel>,
+    inst: &str,
+    d: &Digest,
+    data: Vec<u8>,
+) -> Result<i64, tonic::Status> {
+    let resource = format!("{inst}/uploads/{}/blobs/{}/{}", uuid::Uuid::new_v4(), d.hash, d.size_bytes);
+    let request = WriteRequest { resource_name: resource, write_offset: 0, finish_write: true, data };
+    Ok(bs.write(tokio_stream::iter([request])).await?.into_inner().committed_size)
+}
+
+async fn read_all(bs: &mut ByteStreamClient<Channel>, inst: &str, d: &Digest) -> Vec<u8> {
+    let resource_name = format!("{inst}/blobs/{}/{}", d.hash, d.size_bytes);
+    let mut stream = bs.read(ReadRequest { resource_name, read_offset: 0, read_limit: 0 }).await.unwrap().into_inner();
+    let mut got = Vec::new();
+    while let Some(chunk) = stream.message().await.unwrap() {
+        got.extend_from_slice(&chunk.data);
+    }
+    got
+}
+
+/// A Write of other bytes under a stored digest is refused and leaves the
+/// stored blob as it was; under a new digest it stores nothing.
+#[tokio::test]
+async fn a_write_of_wrong_bytes_changes_nothing() {
+    let (mut cas, mut bs, inst, _dir) = test_harness().await;
+    let good = b"the real bytes".to_vec();
+    let d = digest_for(&good);
+    assert_eq!(write_as(&mut bs, &inst, &d, good.clone()).await.unwrap(), d.size_bytes);
+    let err = write_as(&mut bs, &inst, &d, b"other  bytes!!".to_vec()).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    assert_eq!(read_all(&mut bs, &inst, &d).await, good);
+
+    let fresh = digest_for(b"never stored");
+    let err = write_as(&mut bs, &inst, &fresh, b"never st0red".to_vec()).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    let missing = cas.find_missing_blobs(find_req(&inst, vec![fresh.clone()])).await.unwrap().into_inner();
+    assert_eq!(missing.missing_blob_digests, vec![fresh]);
+}
+
+/// UpdateActionResult / GetActionResult as Bazel uses them: keyed by the
+/// Action's digest, which has nothing to do with the result's bytes.
+#[tokio::test]
+async fn action_cache_round_trip() {
+    let (_cas, _bs, mut ac, inst, _dir) = harness().await;
+    let action = digest_for(b"an Action message");
+    let get = |action: &Digest| GetActionResultRequest {
+        instance_name: inst.clone(),
+        action_digest: Some(action.clone()),
+        ..Default::default()
+    };
+    let missing = ac.get_action_result(get(&action)).await.unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+
+    let result = ActionResult {
+        output_files: vec![OutputFile {
+            path: "out/a.o".into(),
+            digest: Some(digest_for(b"object code")),
+            ..Default::default()
+        }],
+        exit_code: 0,
+        stdout_digest: Some(digest_for(b"")),
+        ..Default::default()
+    };
+    let update = UpdateActionResultRequest {
+        instance_name: inst.clone(),
+        action_digest: Some(action.clone()),
+        action_result: Some(result.clone()),
+        ..Default::default()
+    };
+    let stored = ac.update_action_result(update).await.unwrap().into_inner();
+    assert_eq!(stored, result);
+    assert_eq!(ac.get_action_result(get(&action)).await.unwrap().into_inner(), result);
+    let other = digest_for(b"another Action");
+    assert_eq!(ac.get_action_result(get(&other)).await.unwrap_err().code(), tonic::Code::NotFound);
 }

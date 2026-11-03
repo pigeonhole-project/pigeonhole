@@ -45,6 +45,14 @@ pub struct Extent {
     pub len: i64,
 }
 
+/// The chunks `extents` point into, each once, sorted.
+pub fn unique_chunk_ids<'a>(extents: impl IntoIterator<Item = &'a Extent>) -> Vec<ChunkId> {
+    let mut ids: Vec<ChunkId> = extents.into_iter().map(|e| e.chunk).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// One stored block (offsets inside a part are derived from `stored_len`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredBlock {
@@ -395,6 +403,12 @@ impl BlobDb {
 
     pub fn is_read_pinned(&self, chunk_id: ChunkId) -> bool {
         self.read_pins.lock().unwrap().contains_key(&chunk_id)
+    }
+
+    /// Every chunk of `ids` is referenced and not being reclaimed (a read
+    /// of the state: no log entry, unlike a `retain` + `release`).
+    pub fn are_live(&self, ids: &[ChunkId]) -> bool {
+        self.read(|s| ids.iter().all(|id| s.chunks.get(id).is_some_and(ChunkRec::is_live)))
     }
 
     /// The chunk exists and is not being reclaimed.

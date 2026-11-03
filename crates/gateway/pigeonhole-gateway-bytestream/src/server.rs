@@ -24,7 +24,6 @@ use chrono::{Duration as ChronoDuration, Utc};
 use pigeonhole_chunk_store::ChunkStore;
 use pigeonhole_types::schedule::{Expiry, Schedule};
 use prost::Message;
-use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +34,11 @@ use tracing::{info, warn};
 
 /// gRPC default is 4 MiB; ByteStream / Batch* need headroom above a single write frame.
 const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// An `ActionResult` is kept in the metadata (a log entry, the snapshots):
+/// one larger than this is refused. Output files go to the CAS and are
+/// named by digest, so a result is small unless stdout/stderr are inlined.
+const MAX_ACTION_RESULT_BYTES: usize = 1024 * 1024;
 
 macro_rules! limit_svc {
     ($svc:expr) => {
@@ -154,18 +158,30 @@ async fn cas_gc_pass(state: &ReapiState, ttl: Duration) {
     if !state.cas.cas.can_write() {
         return;
     }
-    let cutoff = Utc::now() - ChronoDuration::seconds(ttl.as_secs() as i64);
     let (cas, store) = (&state.cas.cas, &state.cas.store);
-    let Ok(stale) = cas.stale_before(cutoff).await else { return };
-    for row in stale {
-        match cas.release(&row.hash, row.size).await {
-            Ok(ids) => {
-                if let Err(e) = store.release(&ids).await {
-                    warn!(error = %e, hash = %row.hash, size = row.size, "cas gc chunk release");
-                }
+    // The reads since the last pass: one entry.
+    if let Err(e) = cas.flush_touches().await {
+        warn!(error = %e, "cas gc: last accesses not written");
+        return;
+    }
+    let cutoff = Utc::now() - ChronoDuration::seconds(ttl.as_secs() as i64);
+    // Every stale entry in one entry, then their chunks in one more.
+    match cas.drop_stale(cutoff).await {
+        Ok(ids) => {
+            if let Err(e) = store.release(&ids).await {
+                warn!(error = %e, chunks = ids.len(), "cas gc chunk release");
             }
-            Err(e) => warn!(error = %e, hash = %row.hash, size = row.size, "cas gc release"),
         }
+        Err(e) => warn!(error = %e, "cas gc drop"),
+    }
+}
+
+/// A Write's or an update's failure: `INVALID_ARGUMENT` for bytes that are
+/// not their digest's, else as [`write_status`].
+fn put_status(e: &anyhow::Error) -> tonic::Code {
+    match crate::cas::is_digest_mismatch(e) {
+        true => tonic::Code::InvalidArgument,
+        false => write_status(e),
     }
 }
 
@@ -183,14 +199,11 @@ fn grpc_status(code: tonic::Code, msg: impl Into<String>) -> Status {
 }
 
 /// One ByteStream Write in progress: its bytes go on to the CAS as they come
-/// and are hashed on the way.
+/// (hashed there: nothing is committed unless they are the digest's).
 struct Upload {
     resource_name: String,
     /// The upload id, the key of [`ReapiState::uploads`].
     key: String,
-    hash: String,
-    size: i64,
-    hasher: Sha256,
     committed: i64,
     body: mpsc::Sender<Result<Bytes>>,
     ingest: tokio::task::JoinHandle<Result<()>>,
@@ -212,7 +225,6 @@ impl Upload {
         if req.data.is_empty() {
             return Ok(());
         }
-        self.hasher.update(&req.data);
         self.committed += req.data.len() as i64;
         self.body
             .send(Ok(Bytes::from(req.data)))
@@ -232,16 +244,7 @@ impl ReapiState {
         let ingest = tokio::spawn(async move { cas.put_stream(&hash, size, ReceiverStream::new(rx)).await });
         let pending = PendingUpload { committed_size: 0, complete: false, last_activity: Instant::now() };
         self.uploads.lock().await.insert(parsed.upload_id.clone(), pending);
-        Ok(Upload {
-            resource_name: resource_name.to_string(),
-            key: parsed.upload_id,
-            hash: parsed.hash_hex,
-            size: parsed.size,
-            hasher: Sha256::new(),
-            committed: 0,
-            body,
-            ingest,
-        })
+        Ok(Upload { resource_name: resource_name.to_string(), key: parsed.upload_id, committed: 0, body, ingest })
     }
 
     async fn note_progress(&self, key: &str, committed: i64, finished: bool) {
@@ -252,26 +255,20 @@ impl ReapiState {
         }
     }
 
-    /// End an upload: wait for the ingest, check the bytes against the
-    /// digest they were sent under; the committed size.
+    /// End an upload: wait for the ingest (which checked the bytes against
+    /// the digest they were sent under before committing); the committed
+    /// size.
     async fn finish_upload(&self, upload: Upload, finished: bool) -> Result<i64, Status> {
-        let Upload { key, hash, size, hasher, committed, body, ingest, .. } = upload;
+        let Upload { key, committed, body, ingest, .. } = upload;
         drop(body); // the end of the body: put_stream can finish
         let ingested = ingest.await;
         self.uploads.lock().await.remove(&key);
         if !finished {
             return Err(grpc_status(tonic::Code::InvalidArgument, "finish_write not set"));
         }
-        if hex::encode(hasher.finalize()) != hash || committed != size {
-            // Remove any CAS row written under the claimed digest.
-            if let Ok(ids) = self.cas.cas.release(&hash, size).await {
-                let _ = self.cas.store.release(&ids).await;
-            }
-            return Err(grpc_status(tonic::Code::InvalidArgument, "digest mismatch"));
-        }
         ingested
             .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?
-            .map_err(|e| grpc_status(write_status(&e), e.to_string()))?;
+            .map_err(|e| grpc_status(put_status(&e), e.to_string()))?;
         Ok(committed)
     }
 }
@@ -359,7 +356,7 @@ impl ContentAddressableStorage for ReapiState {
                     if let Err(e) = self.cas.put_bytes(&hash_hex, digest.size_bytes, Bytes::from(r.data)).await {
                         responses.push(batch_update_blobs_response::Response {
                             digest: Some(digest.clone()),
-                            status: Some(google_rpc_status(write_status(&e), e.to_string())),
+                            status: Some(google_rpc_status(put_status(&e), e.to_string())),
                         });
                     } else {
                         responses
@@ -436,9 +433,8 @@ impl ActionCache for ReapiState {
         let hash_hex = digest_hash_hex(digest).map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
         let data = self
             .cas
-            .get_bytes(&hash_hex, digest.size_bytes)
-            .await
-            .map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?
+            .cas
+            .get_action(&hash_hex, digest.size_bytes)
             .ok_or_else(|| grpc_status(tonic::Code::NotFound, "missing action result"))?;
         let result =
             ActionResult::decode(data.as_ref()).map_err(|e| grpc_status(tonic::Code::Internal, e.to_string()))?;
@@ -458,18 +454,19 @@ impl ActionCache for ReapiState {
             .action_result
             .as_ref()
             .ok_or_else(|| grpc_status(tonic::Code::InvalidArgument, "missing action_result"))?;
+        // The digest is the action's, not the result's: nothing to check
+        // the bytes against.
         let bytes = result.encode_to_vec();
-        if bytes.len() as i64 != digest.size_bytes {
+        if bytes.len() > MAX_ACTION_RESULT_BYTES {
             return Err(grpc_status(
                 tonic::Code::InvalidArgument,
-                "action_result encoded size does not match action_digest.size_bytes",
+                format!("action_result of {} bytes (at most {MAX_ACTION_RESULT_BYTES})", bytes.len()),
             ));
         }
         let hash_hex = digest_hash_hex(digest).map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
-        verify_sha256(&bytes, &hash_hex, digest.size_bytes)
-            .map_err(|e| grpc_status(tonic::Code::InvalidArgument, e.to_string()))?;
         self.cas
-            .put_bytes(&hash_hex, digest.size_bytes, Bytes::from(bytes))
+            .cas
+            .put_action(&hash_hex, digest.size_bytes, bytes)
             .await
             .map_err(|e| grpc_status(write_status(&e), e.to_string()))?;
         Ok(Response::new(result.clone()))
