@@ -296,6 +296,8 @@ pub struct ChainLogStore<C: Chain> {
     /// it deletes one message (and thread) at a time, and the log's writer
     /// must not wait for it. Ends with the store.
     collecting: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Where reads found the chain's blobs ([`Walk`]).
+    walk: Arc<Mutex<Walk<C::Id>>>,
 }
 
 impl<C: Chain> Drop for ChainLogStore<C> {
@@ -312,7 +314,14 @@ impl<C: Chain> Drop for ChainLogStore<C> {
 
 impl<C: Chain> ChainLogStore<C> {
     pub fn new(chain: Arc<C>) -> Self {
-        Self { chain, lease: None, state: Arc::default(), writing: Default::default(), collecting: Mutex::default() }
+        Self {
+            chain,
+            lease: None,
+            state: Arc::default(),
+            writing: Default::default(),
+            collecting: Mutex::default(),
+            walk: Arc::default(),
+        }
     }
 
     /// Hold the log by `lease`.
@@ -555,7 +564,7 @@ impl<C: Chain> ChainLogStore<C> {
     }
 
     fn reader(&self) -> Reader<C> {
-        Reader { chain: self.chain.clone() }
+        Reader { chain: self.chain.clone(), walk: self.walk.clone() }
     }
 
     /// The fence a lost link means: the winner's generation.
@@ -973,8 +982,57 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
 }
 
 /// What a read needs, detached from the store's borrow.
-struct Reader<C> {
+struct Reader<C: Chain> {
     chain: Arc<C>,
+    walk: Arc<Mutex<Walk<C::Id>>>,
+}
+
+/// The blobs reads walked past from a tip, so that the next read from the
+/// same tip starts at the blob holding its head, not at the tip, and goes
+/// on where the last walk stopped. openraft reads the log at boot in many
+/// short ranges from its end: a walk from the tip for each made a boot
+/// quadratic in the log's length.
+struct Walk<Id> {
+    /// The tip walked from; another tip starts a new walk.
+    tip: Option<Prev<Id>>,
+    /// The blobs passed, newest first.
+    steps: Vec<Step<Id>>,
+    /// Blobs read by every walk (the tests count them).
+    followed: u64,
+}
+
+impl<Id> Default for Walk<Id> {
+    fn default() -> Self {
+        Self { tip: None, steps: Vec::new(), followed: 0 }
+    }
+}
+
+/// A blob on the walk: the positions it holds for the log are
+/// `[first, limit)`; a newer blob holds the ones from `limit` on.
+#[derive(Clone)]
+struct Step<Id> {
+    link: Prev<Id>,
+    first: Position,
+    limit: Position,
+    prev: Option<Prev<Id>>,
+}
+
+impl<Id> Step<Id> {
+    /// Where the blobs older than this one stop: below this and below what
+    /// a newer one holds.
+    fn below(&self) -> Position {
+        self.limit.min(self.first)
+    }
+}
+
+/// Where a read starts: the known blobs it reads, then the link to go on
+/// from and the limit there.
+struct Plan<Id> {
+    known: Vec<Step<Id>>,
+    next: Option<Prev<Id>>,
+    limit: Position,
+    /// The walk's length when planned: new steps go after it.
+    walked: usize,
 }
 
 impl<C: Chain> Reader<C> {
@@ -1011,27 +1069,72 @@ impl<C: Chain> Reader<C> {
         if from < kept_from {
             return Err(LogError::Lost(format!("entries after {from} collected up to base {kept_from}")));
         }
+        let Plan { known, mut next, mut limit, walked } = self.plan(&tip, from, head.position);
         let mut out = BTreeMap::new();
-        let mut limit = Position::MAX;
-        let mut next = tip.at;
-        while let Some(link) = next {
-            let doc = self.follow(&link).await?;
+        let take = |out: &mut BTreeMap<Position, Entry>, doc: ChainDoc<C::Id>, limit: Position| {
             for (k, entry) in doc.batch.entries.into_iter().enumerate() {
                 let pos = doc.batch.first + k as u64;
                 if pos > from && pos < limit && pos <= head.position {
                     out.insert(pos, entry);
                 }
             }
-            limit = limit.min(doc.batch.first);
-            if limit <= from + 1 {
-                break;
-            }
-            next = doc.prev;
+        };
+        let followed = known.len();
+        for step in known {
+            take(&mut out, self.follow(&step.link).await?, step.limit);
         }
+        let mut steps = Vec::new();
+        while limit > from + 1 {
+            let Some(link) = next else { break };
+            let doc = self.follow(&link).await?;
+            let step = Step { link, first: doc.batch.first, limit, prev: doc.prev.clone() };
+            (limit, next) = (step.below(), doc.prev.clone());
+            take(&mut out, doc, step.limit);
+            steps.push(step);
+        }
+        self.extend(&tip, walked, followed, steps);
         if out.len() as u64 != head.position - from {
             return Err(LogError::Lost(format!("the chain lacks entries in ({from}, {}]", head.position)));
         }
         Ok(out.into_iter().collect())
+    }
+
+    /// The blobs of the walk from `tip` that hold `(from, head]`, and where
+    /// to go on past them.
+    fn plan(&self, tip: &Tip<C::Id>, from: Position, head: Position) -> Plan<C::Id> {
+        let mut walk = self.walk.lock().unwrap();
+        if !Self::same(walk.tip.as_ref(), tip.at.as_ref()) {
+            *walk = Walk { tip: tip.at.clone(), steps: Vec::new(), followed: walk.followed };
+        }
+        // `below` only falls along the walk: the first blob below which
+        // the head lies holds it.
+        let start = walk.steps.partition_point(|s| s.below() > head);
+        let end = walk.steps.partition_point(|s| s.below() > from + 1);
+        let known: Vec<_> = walk.steps[start..(end + 1).min(walk.steps.len())].to_vec();
+        let (next, limit) = match walk.steps.last() {
+            _ if end < walk.steps.len() => (None, from + 1),
+            Some(last) => (last.prev.clone(), last.below()),
+            None => (tip.at.clone(), Position::MAX),
+        };
+        Plan { known, next, limit, walked: walk.steps.len() }
+    }
+
+    /// Whether two tips are the same blob.
+    fn same(a: Option<&Prev<C::Id>>, b: Option<&Prev<C::Id>>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => C::key(&a.id) == C::key(&b.id) && a.crc == b.crc,
+            (a, b) => a.is_none() && b.is_none(),
+        }
+    }
+
+    /// Note the blobs a read walked past the known ones, unless another
+    /// read went on first or the tip moved.
+    fn extend(&self, tip: &Tip<C::Id>, walked: usize, followed: usize, steps: Vec<Step<C::Id>>) {
+        let mut walk = self.walk.lock().unwrap();
+        walk.followed += (followed + steps.len()) as u64;
+        if Self::same(walk.tip.as_ref(), tip.at.as_ref()) && walk.steps.len() == walked {
+            walk.steps.extend(steps);
+        }
     }
 }
 
