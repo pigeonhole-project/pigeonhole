@@ -2,39 +2,25 @@
 //! rebuilds the chunk and s3 state exactly.
 
 use bytes::Bytes;
-use http::{Extensions, HeaderMap, Method, Uri};
-use pigeonhole::config::Config;
-use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
+use pigeonhole::service::S3Options;
 use pigeonhole_chunk_store::ChunkState;
+use pigeonhole_codec::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 use pigeonhole_gateway_s3::S3State;
 use pigeonhole_meta::{decode_state, encode_state, MetaOptions, MetaStore, Namespaces};
+use pigeonhole_testkit::s3::{self as s3kit, req, Node};
 use s3s::dto::*;
-use s3s::{S3Request, S3};
+use s3s::S3;
 use std::path::Path;
 use std::sync::Arc;
-
-fn req<T>(input: T) -> S3Request<T> {
-    S3Request {
-        input,
-        method: Method::GET,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::default(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
+use std::time::Duration;
 
 async fn tablet(dir: &Path, snapshot_every: Option<u64>) -> Arc<MetaStore> {
     let (log, snapshots) = pigeonhole_testkit::disk_meta(dir);
     MetaStore::open(
         log,
         snapshots,
-        Index::register(BlobDb::register(Namespaces::new())),
+        s3kit::register(Namespaces::new()),
         MetaOptions { snapshot_every, ..MetaOptions::default() },
     )
     .await
@@ -59,12 +45,9 @@ async fn snapshot_and_tail_rebuild_chunk_and_s3_state() {
 async fn rebuild(snapshot_every: Option<u64>) {
     let dir = tempfile::tempdir().unwrap();
     let meta = tablet(dir.path(), snapshot_every).await;
-    let cfg = Config::for_test(dir.path());
-    let db = BlobDb::open(meta.clone()).await.unwrap();
-    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    opts.block_size = cfg.block_size;
-    let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
-    let s3 = build_s3_gateway(cfg.s3_options(), Index::open(meta.clone()).await.unwrap(), store);
+    let members = vec![s3kit::member(Arc::new(MemoryBlobStore::new()))];
+    let ingest = s3kit::ingest(DEFAULT_CHUNK_SIZE, DEFAULT_BLOCK_SIZE);
+    let s3 = Node::open(meta.clone(), members, ingest, S3Options::for_test()).await.s3;
 
     s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
     for i in 0..20u8 {
@@ -95,8 +78,8 @@ async fn rebuild(snapshot_every: Option<u64>) {
     let position = meta.applied_position();
     assert!(position > 20, "every metadata change went through the log");
     // Snapshots are stored in the background.
-    while snapshot_every.is_some() && meta.base_position() == 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    if snapshot_every.is_some() {
+        pigeonhole_testkit::eventually("a snapshot", Duration::from_secs(10), || meta.base_position() > 0).await;
     }
     drop(s3);
 

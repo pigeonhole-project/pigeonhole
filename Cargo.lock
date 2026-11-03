@@ -2864,7 +2864,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "http",
  "madsim",
  "madsim-tokio",
  "openraft-chat",
@@ -2875,6 +2874,7 @@ dependencies = [
  "pigeonhole-storage-api",
  "pigeonhole-storage-disk",
  "pigeonhole-storage-memory",
+ "pigeonhole-testkit",
  "s3s",
  "serde",
 ]
@@ -3013,11 +3013,16 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "futures",
+ "http",
  "madsim-tokio",
  "pigeonhole-blob",
+ "pigeonhole-chunk-store",
+ "pigeonhole-gateway-s3",
  "pigeonhole-meta",
  "pigeonhole-storage-disk",
  "pigeonhole-types",
+ "s3s",
 ]
 
 [[package]]

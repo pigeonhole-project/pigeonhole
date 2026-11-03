@@ -9,17 +9,12 @@
 //! - a GET racing an overwrite / delete of the same key returns some whole
 //!   version or NoSuchKey, never an error or a torn body (reads pin chunks).
 
-use bytes::Bytes;
-use futures::StreamExt;
-use http::{Extensions, HeaderMap, Method, Uri};
-use pigeonhole::config::Config;
-use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
-use pigeonhole_blob::{erase, BlobBackend, CheapestFirst, OrderedKey, Replicated, SharedBackend};
-use pigeonhole_chunk_store::{SweepConfig, Sweeper};
+use pigeonhole::service::S3Options;
+use pigeonhole_blob::OrderedKey;
+use pigeonhole_testkit::s3::{self as s3kit, get_object as get, payload, req, verify_payload, Node, HEADER};
 use s3s::dto::*;
-use s3s::{S3ErrorCode, S3Request, S3};
+use s3s::{S3ErrorCode, S3};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,21 +27,6 @@ const OPS_PER_WORKER: u64 = 400;
 const CHUNK_SIZE: usize = 64 * 1024;
 const BLOCK_SIZE: usize = 16 * 1024;
 const MAX_OBJECT: u64 = 200 * 1024;
-const HEADER: usize = 16;
-
-fn req<T>(input: T) -> S3Request<T> {
-    S3Request {
-        input,
-        method: Method::GET,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::default(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
 
 /// xorshift64*: deterministic, dependency-free.
 struct Rng(u64);
@@ -66,91 +46,19 @@ impl Rng {
     }
 }
 
-/// Self-describing payload: `[seed u64 LE][len u64 LE][xorshift(seed) bytes…]`.
-/// Any intact object verifies on its own, whatever interleaving produced it.
-fn payload(seed: u64, len: usize) -> Bytes {
-    let len = len.max(HEADER);
-    let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(&seed.to_le_bytes());
-    out.extend_from_slice(&(len as u64).to_le_bytes());
-    let mut rng = Rng::new(seed);
-    while out.len() < len {
-        out.extend_from_slice(&rng.next().to_le_bytes());
-    }
-    out.truncate(len);
-    Bytes::from(out)
-}
-
-fn verify_payload(data: &[u8]) -> Result<(), String> {
-    if data.len() < HEADER {
-        return Err(format!("short object: {} bytes", data.len()));
-    }
-    let seed = u64::from_le_bytes(data[..8].try_into().unwrap());
-    let len = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
-    if len != data.len() {
-        return Err(format!("length header {len} != body {}", data.len()));
-    }
-    if payload(seed, len).as_ref() != data {
-        return Err(format!("corrupt body (seed {seed}, len {len})"));
-    }
-    Ok(())
-}
-
 fn key(i: u64) -> String {
     format!("obj-{i:02}")
 }
 
-struct Node {
-    s3: pigeonhole::S3Gateway,
-    store: Arc<ChunkStore>,
-    backend: SharedBackend,
-    instance_id: String,
-}
-
+/// The node of the binary over a tablet in `dir` and the one store `mem`;
+/// reopening `dir` replays what is there.
 async fn open_node(dir: &Path, mem: Arc<MemoryBlobStore>) -> Node {
-    let idx_log = dir.join("s3.log");
-    let blob_log = dir.join("blob.log");
-    let mut cfg = Config::for_test(dir);
-    cfg.chunk_size = CHUNK_SIZE;
-    cfg.block_size = BLOCK_SIZE;
-
-    let index = Index::open(pigeonhole_testkit::tablet(&idx_log, Index::register).await).await.unwrap();
-    let db = BlobDb::open(pigeonhole_testkit::tablet(&blob_log, BlobDb::register).await).await.unwrap();
-    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    opts.block_size = cfg.block_size;
-
-    let info = mem.instance().clone();
-    // Same wiring as the binary: uploads are pinned until committed, the
-    // sweeper stops at the pins' horizon.
-    let backend: SharedBackend = Arc::new(erase(mem));
-    let rep = Arc::new(Replicated::new(vec![backend.clone()], 1, Arc::new(CheapestFirst::new())).unwrap());
-    let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
-    let s3 = build_s3_gateway(cfg.s3_options(), index, store.clone());
-    Node { s3, store, backend, instance_id: info.id }
-}
-
-fn sweeper(node: &Node) -> Sweeper {
-    Sweeper::new(
-        node.store.db().clone(),
-        vec![node.backend.clone()],
-        SweepConfig { batch_size: 7, interval: None },
-        node.store.replicated().pins().clone(),
-    )
+    let meta = pigeonhole_testkit::tablet(dir, s3kit::register).await;
+    Node::open(meta, vec![s3kit::member(mem)], s3kit::ingest(CHUNK_SIZE, BLOCK_SIZE), S3Options::for_test()).await
 }
 
 async fn get_object(s3: &pigeonhole::S3Gateway, k: &str) -> Result<Option<Vec<u8>>, String> {
-    let out =
-        match s3.get_object(req(GetObjectInput { bucket: BUCKET.into(), key: k.into(), ..Default::default() })).await {
-            Ok(r) => r.output,
-            Err(e) if *e.code() == S3ErrorCode::NoSuchKey => return Ok(None),
-            Err(e) => return Err(format!("get {k}: {e:?}")),
-        };
-    let mut body = out.body.ok_or_else(|| format!("get {k}: no body"))?;
-    let mut data = Vec::new();
-    while let Some(chunk) = body.next().await {
-        data.extend_from_slice(&chunk.map_err(|e| format!("get {k}: body: {e}"))?);
-    }
-    Ok(Some(data))
+    get(s3, BUCKET, k).await
 }
 
 #[derive(Default)]
@@ -270,7 +178,8 @@ async fn backend_keys(mem: &MemoryBlobStore) -> BTreeSet<Vec<u8>> {
 }
 
 async fn expected_keys(node: &Node) -> BTreeSet<Vec<u8>> {
-    node.store.db().live_part_keys(&node.instance_id).await.unwrap().into_iter().collect()
+    let instance = &node.backends[0].instance().id;
+    node.store.db().live_part_keys(instance).await.unwrap().into_iter().collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -284,7 +193,10 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     // A dead writer's uploads: on the backend, never committed to chunk_parts.
     let ours = node.store.replicated().pins().owner();
     for i in 0..5u64 {
-        node.backend.put(payload(0xDEAD + i, 1024), &pigeonhole_blob::BlobId::random_of(ours).name()).await.unwrap();
+        node.backends[0]
+            .put(payload(0xDEAD + i, 1024), &pigeonhole_blob::BlobId::random_of(ours).name())
+            .await
+            .unwrap();
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -292,7 +204,7 @@ async fn concurrent_ops_with_aggressive_sweeper() {
     let sweep_deleted = Arc::new(AtomicU64::new(0));
 
     let sweep_task = {
-        let sw = sweeper(&node);
+        let sw = node.sweeper(7);
         let (stop, passes, deleted) = (stop.clone(), sweep_passes.clone(), sweep_deleted.clone());
         tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
@@ -335,7 +247,7 @@ async fn concurrent_ops_with_aggressive_sweeper() {
 
     // Quiesce: no upload is pinned, so everything up to the last returned key
     // is a candidate.
-    let sw = sweeper(&node);
+    let sw = node.sweeper(7);
     for _ in 0..3 {
         sw.sweep_once().await.unwrap();
     }

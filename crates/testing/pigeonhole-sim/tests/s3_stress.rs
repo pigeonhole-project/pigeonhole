@@ -8,17 +8,15 @@
 //! out: no rewrite lost, no chunk left that nothing points at.
 
 use bytes::Bytes;
-use futures::StreamExt;
-use http::{Extensions, HeaderMap, Method, Uri};
-use pigeonhole_blob::{erase, CheapestFirst, OrderedKey, Replicated, SharedBackend};
-use pigeonhole_chunk_store::{BlobDb, ChunkStore, IngestOptions, SweepConfig, Sweeper};
-use pigeonhole_gateway_s3::{build_s3_gateway, Index, S3Gateway, S3Options};
+use pigeonhole_blob::{OrderedKey, SharedBackend};
+use pigeonhole_gateway_s3::{S3Gateway, S3Options};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_sim::faults::{Fault, FaultPlan, Faulty};
 use pigeonhole_sim::{random_ms, random_u64};
 use pigeonhole_storage_memory::MemoryBlobStore;
+use pigeonhole_testkit::s3::{self as s3kit, intact, payload, req, Node, HEADER};
 use s3s::dto::*;
-use s3s::{S3ErrorCode, S3Request, S3};
+use s3s::S3;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,52 +26,6 @@ const BUCKET: &str = "stress";
 const KEYS: u64 = 6;
 const WORKERS: u64 = 4;
 const OPS: u64 = 40;
-const HEADER: usize = 16;
-
-fn req<T>(input: T) -> S3Request<T> {
-    S3Request {
-        input,
-        method: Method::GET,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::default(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
-
-/// `[seed][len][bytes from seed]`: an intact object checks itself.
-fn payload(seed: u64, len: usize) -> Bytes {
-    let len = len.max(HEADER);
-    let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(&seed.to_le_bytes());
-    out.extend_from_slice(&(len as u64).to_le_bytes());
-    let mut x = seed | 1;
-    while out.len() < len {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-    out.truncate(len);
-    Bytes::from(out)
-}
-
-fn intact(data: &[u8]) -> bool {
-    data.len() >= HEADER && {
-        let seed = u64::from_le_bytes(data[..8].try_into().unwrap());
-        let len = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
-        len == data.len() && payload(seed, len).as_ref() == data
-    }
-}
-
-struct Node {
-    s3: S3Gateway,
-    store: Arc<ChunkStore>,
-    backends: Vec<SharedBackend>,
-}
 
 /// Every chunk goes to every member; one success is enough. `inline_max`:
 /// objects up to it stay in the metadata (docs/inline-objects.md).
@@ -86,44 +38,18 @@ async fn open_node(
     let meta = MetaStore::open(
         Arc::new(ChainLogStore::new(log.clone())),
         Arc::new(BlobSnapshotStore::new(snaps.clone())),
-        Index::register(BlobDb::register(Namespaces::new())),
+        s3kit::register(Namespaces::new()),
         MetaOptions { snapshot_every: Some(50), ..MetaOptions::default() },
     )
     .await
     .unwrap();
-    let s3_opts = S3Options { inline_max, ..S3Options::for_test() };
-    let mut opts = IngestOptions::new(16 * 1024, pigeonhole_chunk_store::ChunkCodec::Zstd);
-    opts.block_size = 4 * 1024;
-    let backends: Vec<SharedBackend> = members.iter().map(|m| Arc::new(erase(m.clone())) as SharedBackend).collect();
-    let rep = Arc::new(Replicated::new(backends.clone(), 1, Arc::new(CheapestFirst::new())).unwrap());
-    let store =
-        Arc::new(ChunkStore::open_replicated(BlobDb::open(meta.clone()).await.unwrap(), rep, opts).await.unwrap());
-    let s3 = build_s3_gateway(s3_opts, Index::open(meta).await.unwrap(), store.clone());
-    Node { s3, store, backends }
-}
-
-fn sweeper(node: &Node) -> Sweeper {
-    Sweeper::new(
-        node.store.db().clone(),
-        node.backends.clone(),
-        SweepConfig { batch_size: 5, interval: None },
-        node.store.replicated().pins().clone(),
-    )
+    let backends: Vec<SharedBackend> = members.iter().map(|m| s3kit::member(m.clone())).collect();
+    let opts = S3Options { inline_max, ..S3Options::for_test() };
+    Node::open(meta, backends, s3kit::ingest(16 * 1024, 4 * 1024), opts).await
 }
 
 async fn get(s3: &S3Gateway, k: &str) -> Result<Option<Vec<u8>>, String> {
-    let out =
-        match s3.get_object(req(GetObjectInput { bucket: BUCKET.into(), key: k.into(), ..Default::default() })).await {
-            Ok(r) => r.output,
-            Err(e) if *e.code() == S3ErrorCode::NoSuchKey => return Ok(None),
-            Err(e) => return Err(format!("{e:?}")),
-        };
-    let mut body = out.body.ok_or("no body")?;
-    let mut data = Vec::new();
-    while let Some(chunk) = body.next().await {
-        data.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
-    }
-    Ok(Some(data))
+    s3kit::get_object(s3, BUCKET, k).await
 }
 
 async fn worker(s3: Arc<S3Gateway>, id: u64, damaged: Arc<Mutex<Vec<String>>>) {
@@ -190,7 +116,7 @@ async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) -> Node {
 
     let stop = Arc::new(AtomicBool::new(false));
     let sweep = {
-        let (sw, stop) = (sweeper(&node), stop.clone());
+        let (sw, stop) = (node.sweeper(5), stop.clone());
         tokio::spawn(async move {
             while !stop.load(Ordering::SeqCst) {
                 let _ = sw.sweep_once().await; // may fail under faults
@@ -228,7 +154,7 @@ async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>) -> Node {
     };
     node.s3.put_object(req(input)).await.unwrap();
     let live = read_all(&node.s3).await;
-    let sw = sweeper(&node);
+    let sw = node.sweeper(5);
     for _ in 0..3 {
         let stats = sw.sweep_once().await.unwrap();
         assert!(stats.failed.is_empty(), "a sweep with the faults off left {:?} out", stats.failed);

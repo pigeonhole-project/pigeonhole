@@ -65,13 +65,8 @@ async fn node(chat: FakeChat, id: u64) -> Arc<MetaStore> {
     MetaStore::open_in(log, snapshots, Namespaces::new().with::<Sum>(), opts, cluster).await.unwrap()
 }
 
-async fn eventually(what: &str, ok: impl Fn() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while !ok() {
-        assert!(tokio::time::Instant::now() < deadline, "never: {what}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
+/// The cluster's deadline for anything to settle.
+const SETTLE: Duration = Duration::from_secs(20);
 
 /// The gate and the health routes, as `serve` layers them, in front of a
 /// stand-in for S3 that counts the requests it got and reads their bodies.
@@ -102,7 +97,7 @@ async fn a_leader_without_its_quorum_serves_reads_and_turns_writes_away() {
     let chat = FakeChat::new();
     let started = futures::future::join_all(MEMBERS.map(|id| node(chat.clone(), id))).await;
     let nodes: HashMap<u64, Arc<MetaStore>> = MEMBERS.into_iter().zip(started).collect();
-    eventually("a leader", || nodes.values().filter(|n| n.is_leader()).count() == 1).await;
+    pigeonhole_testkit::eventually("a leader", SETTLE, || nodes.values().filter(|n| n.is_leader()).count() == 1).await;
     let leader = *nodes.iter().find(|(_, n)| n.is_leader()).unwrap().0;
     let follower = *MEMBERS.iter().find(|&&m| m != leader).unwrap();
     let served = Arc::new(AtomicUsize::new(0));
@@ -117,7 +112,7 @@ async fn a_leader_without_its_quorum_serves_reads_and_turns_writes_away() {
     for m in MEMBERS.into_iter().filter(|&m| m != leader) {
         chat.isolate(m, true);
     }
-    eventually("the leader alone turns read-only", || nodes[&leader].is_read_only()).await;
+    pigeonhole_testkit::eventually("the leader alone turns read-only", SETTLE, || nodes[&leader].is_read_only()).await;
 
     for method in ["PUT", "POST", "DELETE"] {
         let (status, body) = call(&l, method, "/b/k").await;

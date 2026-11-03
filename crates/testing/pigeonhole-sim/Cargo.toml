@@ -20,10 +20,10 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 pigeonhole-storage-api = { workspace = true, features = ["conformance"] }
-http = { workspace = true }
 openraft-chat = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
+pigeonhole-testkit = { workspace = true, features = ["s3"] }
 s3s = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]

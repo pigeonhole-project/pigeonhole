@@ -1,4 +1,8 @@
-//! Conformance suites for pigeonhole storage backends.
+//! Conformance suites for pigeonhole storage backends, and helpers the
+//! tests of several crates share (with feature `s3`: [`s3`]).
+
+#[cfg(feature = "s3")]
+pub mod s3;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -221,4 +225,23 @@ pub async fn gated_tablet(
     .await
     .expect("boot a test tablet");
     (meta, gate)
+}
+
+/// Wait until `pred` holds, checking every few milliseconds; panics with
+/// `what` once `deadline` has passed (virtual time under the simulator).
+pub async fn eventually(what: &str, deadline: std::time::Duration, mut pred: impl FnMut() -> bool) {
+    eventually_async(what, deadline, || std::future::ready(pred())).await;
+}
+
+/// [`eventually`] with a predicate that has to wait for its answer.
+pub async fn eventually_async<F, Fut>(what: &str, deadline: std::time::Duration, mut pred: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let until = tokio::time::Instant::now() + deadline;
+    while !pred().await {
+        assert!(tokio::time::Instant::now() < until, "not within {deadline:?}: {what}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }

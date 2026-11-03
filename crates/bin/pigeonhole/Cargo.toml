@@ -69,7 +69,7 @@ fake = ["discord", "dep:pigeonhole-fake-channels", "pigeonhole-config/fake"]
 pigeonhole-storage-telegram = { workspace = true, features = ["fake"] }
 metrics = { workspace = true }
 metrics-util = { workspace = true }
-pigeonhole-testkit = { workspace = true }
+pigeonhole-testkit = { workspace = true, features = ["s3"] }
 bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }

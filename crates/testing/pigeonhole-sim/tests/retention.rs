@@ -43,16 +43,17 @@ fn writer(t: Arc<MetaStore>, name: &'static str, from: u64) -> tokio::task::Join
 }
 
 /// Wait until the log keeps `keep` bases.
-async fn bases_kept(log: &Arc<MemoryBlobStore>, keep: usize) -> pigeonhole_meta::Discovered {
-    let reader = ChainLogStore::new(log.clone());
-    for _ in 0..1000 {
-        let d = reader.discover().await.unwrap().unwrap();
-        if d.base.is_some() && d.older.len() == keep - 1 {
-            return d;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the log never kept {keep} bases");
+async fn bases_kept(log: &Arc<MemoryBlobStore>, keep: usize) {
+    let reader = &ChainLogStore::new(log.clone());
+    pigeonhole_testkit::eventually_async(
+        &format!("the log keeps {keep} bases"),
+        Duration::from_secs(10),
+        || async move {
+            let d = reader.discover().await.unwrap().unwrap();
+            d.base.is_some() && d.older.len() == keep - 1
+        },
+    )
+    .await;
 }
 
 #[tokio::test]

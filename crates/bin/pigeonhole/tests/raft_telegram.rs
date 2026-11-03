@@ -86,13 +86,8 @@ async fn node(
     MetaStore::open_in(log, snapshots, Namespaces::new().with::<Sum>(), opts, cluster).await.unwrap()
 }
 
-async fn eventually(what: &str, ok: impl Fn() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !ok() {
-        assert!(tokio::time::Instant::now() < deadline, "never: {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
+/// The cluster's deadline for anything to settle.
+const SETTLE: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn a_node_on_telegram_outboxes_joins_two_on_grpc() {
@@ -109,19 +104,19 @@ async fn a_node_on_telegram_outboxes_joins_two_on_grpc() {
     let mut nodes: HashMap<u64, Arc<MetaStore>> = MEMBERS.into_iter().zip(started).collect();
 
     let leader = || nodes.values().find(|n| n.is_leader()).cloned();
-    eventually("a leader", || leader().is_some()).await;
+    pigeonhole_testkit::eventually("a leader", SETTLE, || leader().is_some()).await;
     for _ in 0..3 {
         leader().unwrap().propose::<Sum>(1).await.unwrap().unwrap();
     }
-    eventually("the Telegram node applied the commits", || sum(&nodes[&3]) == 3).await;
+    pigeonhole_testkit::eventually("the Telegram node applied the commits", SETTLE, || sum(&nodes[&3]) == 3).await;
     assert!(outboxes[&3].message_ids().len() > 1, "node 3 answered through its outbox");
     assert!(outboxes[&1].message_ids().len() + outboxes[&2].message_ids().len() > 0, "the pair wrote to node 3");
 
     // The leader dies: the other two (one of them on Telegram only) go on.
     let old = leader().unwrap().node();
     drop(nodes.remove(&old));
-    eventually("a new leader", || nodes.values().any(|n| n.is_leader())).await;
+    pigeonhole_testkit::eventually("a new leader", SETTLE, || nodes.values().any(|n| n.is_leader())).await;
     let new = nodes.values().find(|n| n.is_leader()).unwrap().clone();
     new.propose::<Sum>(10).await.unwrap().unwrap();
-    eventually("both survivors applied it", || nodes.values().all(|n| sum(n) == 13)).await;
+    pigeonhole_testkit::eventually("both survivors applied it", SETTLE, || nodes.values().all(|n| sum(n) == 13)).await;
 }

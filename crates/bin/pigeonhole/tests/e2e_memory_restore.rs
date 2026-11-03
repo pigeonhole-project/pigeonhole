@@ -3,73 +3,33 @@
 //! snapshot export → GET.
 
 use bytes::Bytes;
-use futures::StreamExt;
-use http::Extensions;
-use http::{HeaderMap, Method, Uri};
-use pigeonhole::config::Config;
-use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
-use pigeonhole_blob::{erase, CheapestFirst, Replicated, SharedBackend};
+use pigeonhole::service::S3Options;
+use pigeonhole_codec::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 use pigeonhole_meta::{MetaOptions, MetaStore, Namespaces};
+use pigeonhole_testkit::s3::{self as s3kit, collect_body, req, Node};
 use s3s::dto::*;
-use s3s::{S3Request, S3};
+use s3s::S3;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-fn req<T>(input: T) -> S3Request<T> {
-    S3Request {
-        input,
-        method: Method::GET,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::default(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
-
-async fn collect_body(body: Option<StreamingBlob>) -> Vec<u8> {
-    let mut out = Vec::new();
-    let Some(mut body) = body else {
-        return out;
-    };
-    while let Some(chunk) = body.next().await {
-        out.extend_from_slice(&chunk.unwrap());
-    }
-    out
-}
-
-async fn open_with_shared_mem(
-    dir: &std::path::Path,
-    idx_log: &std::path::Path,
-    blob_log: &std::path::Path,
-    mem: Arc<MemoryBlobStore>,
-) -> pigeonhole::S3Gateway {
-    let cfg = Config::for_test(dir);
-    let index = Index::open(pigeonhole_testkit::tablet(idx_log, Index::register).await).await.unwrap();
-    let db = BlobDb::open(pigeonhole_testkit::tablet(blob_log, BlobDb::register).await).await.unwrap();
-    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    opts.block_size = cfg.block_size;
-
-    let backend: SharedBackend = Arc::new(erase(mem));
-    let rep = Arc::new(Replicated::new(vec![backend], 1, Arc::new(CheapestFirst::new())).unwrap());
-    let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
-    build_s3_gateway(cfg.s3_options(), index, store)
+/// A node over the tablet in `dir` and the store `mem`, both of which
+/// outlive it.
+async fn open_with_shared_mem(dir: &Path, mem: Arc<MemoryBlobStore>) -> pigeonhole::S3Gateway {
+    let meta = pigeonhole_testkit::tablet(dir, s3kit::register).await;
+    let ingest = s3kit::ingest(DEFAULT_CHUNK_SIZE, DEFAULT_BLOCK_SIZE);
+    Node::open(meta, vec![s3kit::member(mem)], ingest, S3Options::for_test()).await.s3
 }
 
 #[tokio::test]
 async fn memory_put_restart_replay_get() {
     let dir = tempfile::tempdir().unwrap();
-    let idx_log = dir.path().join("s3.log");
-    let blob_log = dir.path().join("blob.log");
 
     // The backend survives the restart; so do the metadata logs.
     let mem = Arc::new(MemoryBlobStore::new());
 
-    let s3 = open_with_shared_mem(dir.path(), &idx_log, &blob_log, mem.clone()).await;
+    let s3 = open_with_shared_mem(dir.path(), mem.clone()).await;
 
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
@@ -85,7 +45,7 @@ async fn memory_put_restart_replay_get() {
 
     drop(s3);
 
-    let s32 = open_with_shared_mem(dir.path(), &idx_log, &blob_log, mem).await;
+    let s32 = open_with_shared_mem(dir.path(), mem).await;
     let got = s3s2_get(&s32).await;
     assert_eq!(got, payload.as_ref());
 }
@@ -109,17 +69,10 @@ async fn open_snapshotting(dir: &Path, mem: Arc<MemoryBlobStore>) -> (pigeonhole
         snapshots_outlive_log: true,
         ..MetaOptions::default()
     };
-    let namespaces = Index::register(BlobDb::register(Namespaces::new()));
-    let meta = MetaStore::open(log, snapshots, namespaces, opts).await.unwrap();
-    let cfg = Config::for_test(dir);
-    let index = Index::open(meta.clone()).await.unwrap();
-    let db = BlobDb::open(meta.clone()).await.unwrap();
-    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    opts.block_size = cfg.block_size;
-    let backend: SharedBackend = Arc::new(erase(mem));
-    let rep = Arc::new(Replicated::new(vec![backend], 1, Arc::new(CheapestFirst::new())).unwrap());
-    let store = Arc::new(ChunkStore::open_replicated(db, rep, opts).await.unwrap());
-    (build_s3_gateway(cfg.s3_options(), index, store), meta)
+    let meta = MetaStore::open(log, snapshots, s3kit::register(Namespaces::new()), opts).await.unwrap();
+    let ingest = s3kit::ingest(DEFAULT_CHUNK_SIZE, DEFAULT_BLOCK_SIZE);
+    let node = Node::open(meta.clone(), vec![s3kit::member(mem)], ingest, S3Options::for_test()).await;
+    (node.s3, meta)
 }
 
 #[tokio::test]
@@ -138,9 +91,10 @@ async fn lost_log_restores_from_stored_snapshots() {
     .await
     .unwrap();
     // Snapshots are stored in the background; wait for the one covering the PUT.
-    while meta.base_position() != meta.applied_position() {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    pigeonhole_testkit::eventually("a snapshot covering the PUT", Duration::from_secs(10), || {
+        meta.base_position() == meta.applied_position()
+    })
+    .await;
     drop((s3, meta));
 
     // The disk with the log is gone; the snapshot directory survived.

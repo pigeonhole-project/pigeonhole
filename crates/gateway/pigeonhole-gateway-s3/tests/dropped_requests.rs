@@ -3,11 +3,11 @@
 //! chunks it replaced are released, and so are those of a refused write.
 
 use bytes::Bytes;
-use http::{Extensions, HeaderMap, Method, Uri};
 use pigeonhole_chunk_store::unique_chunk_ids;
 use pigeonhole_chunk_store::{default_layer_opts, BlobDb, ChunkStore};
 use pigeonhole_gateway_s3::{build_s3_gateway, Index, S3Gateway, S3Options};
 use pigeonhole_storage_memory::MemoryBlobStore;
+use pigeonhole_testkit::s3::req;
 use pigeonhole_testkit::GatedLog;
 use s3s::dto::*;
 use s3s::{S3Request, S3};
@@ -15,20 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const BUCKET: &str = "b";
-
-fn req<T>(input: T) -> S3Request<T> {
-    S3Request {
-        input,
-        method: Method::PUT,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::default(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
 
 fn put(key: &str, body: &'static [u8], if_none_match: bool) -> S3Request<PutObjectInput> {
     req(PutObjectInput {
@@ -67,14 +53,12 @@ async fn chunks_of(n: &Node, key: &str) -> Vec<i64> {
 
 /// Chunks nothing points at any more (refs 0), once there are some.
 async fn released(n: &Node) -> Vec<i64> {
-    for _ in 0..500 {
-        let ids = n.store.db().list_zero_ref_chunks().await.unwrap();
-        if !ids.is_empty() {
-            return ids;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Vec::new()
+    let db = n.store.db();
+    pigeonhole_testkit::eventually_async("a chunk released", Duration::from_secs(5), || async move {
+        !db.list_zero_ref_chunks().await.unwrap().is_empty()
+    })
+    .await;
+    db.list_zero_ref_chunks().await.unwrap()
 }
 
 #[tokio::test]
