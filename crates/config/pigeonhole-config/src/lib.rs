@@ -492,8 +492,8 @@ impl Config {
             chunk_codec,
             block_size,
             ingest_budget,
-            limiters: Arc::new(LimiterRegistry::new(tg.clone())),
-            discord_limiters: Arc::new(LimiterRegistry::new(discord.clone())),
+            limiters: Arc::new(LimiterRegistry::new(tg.clone(), pigeonhole_storage_telegram::limits::CLASSES)?),
+            discord_limiters: Arc::new(LimiterRegistry::new(discord.clone(), DISCORD_CLASSES)?),
             tg,
             discord,
             cache: file.cache.into_cache_config()?,
@@ -535,9 +535,18 @@ impl Config {
             block_size: chunker::DEFAULT_BLOCK_SIZE,
             ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
             tg: Self::test_limits(pigeonhole_storage_telegram::limits()),
-            limiters: Arc::new(LimiterRegistry::new(Self::test_limits(pigeonhole_storage_telegram::limits()))),
+            limiters: Arc::new(
+                LimiterRegistry::new(
+                    Self::test_limits(pigeonhole_storage_telegram::limits()),
+                    pigeonhole_storage_telegram::limits::CLASSES,
+                )
+                .expect("the store's own limits"),
+            ),
             discord: Self::test_limits(discord_limits()),
-            discord_limiters: Arc::new(LimiterRegistry::new(Self::test_limits(discord_limits()))),
+            discord_limiters: Arc::new(
+                LimiterRegistry::new(Self::test_limits(discord_limits()), DISCORD_CLASSES)
+                    .expect("the store's own limits"),
+            ),
             cache: CacheConfig { enabled: false, ..CacheConfig::default() },
             bytestream: BytestreamSettings::default(),
             http: HttpSettings::default(),
@@ -1096,6 +1105,12 @@ impl Default for FileIngest {
 
 /// Discord's default limits; without the backend built in, only its bot's
 /// rate (there is nothing to call).
+/// What Discord's calls spend; none without its store.
+#[cfg(feature = "discord")]
+const DISCORD_CLASSES: &[pigeonhole_limits::Class] = pigeonhole_storage_discord::limits::CLASSES;
+#[cfg(not(feature = "discord"))]
+const DISCORD_CLASSES: &[pigeonhole_limits::Class] = &[];
+
 fn discord_limits() -> ChatLimiterConfig {
     #[cfg(feature = "discord")]
     {

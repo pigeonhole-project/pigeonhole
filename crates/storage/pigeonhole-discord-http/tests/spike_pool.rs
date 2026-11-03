@@ -20,7 +20,11 @@ fn env(k: &str) -> String {
 async fn a_pool_of_two_bots_sends_twice_as_fast() {
     let channel: u64 = env("DISCORD_BLOBS_CHANNEL_ID").parse().unwrap();
     let sends: usize = std::env::var("SPIKE_SENDS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
-    let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_storage_discord::limits());
+    let reg = pigeonhole_limits::LimiterRegistry::new(
+        pigeonhole_storage_discord::limits(),
+        pigeonhole_storage_discord::limits::CLASSES,
+    )
+    .unwrap();
     let members = ["DISCORD_BOT_TOKEN", "DISCORD_BOT_TOKEN_2"]
         .into_iter()
         .map(|var| {

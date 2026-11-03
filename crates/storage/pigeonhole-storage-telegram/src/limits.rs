@@ -10,6 +10,9 @@ pub const SEND: Class = Class("send");
 pub const READ: Class = Class("read");
 /// `channels.deleteMessages`.
 pub const DELETE: Class = Class("delete");
+/// Every class the store's calls spend: what a registry checks the config
+/// against.
+pub const CLASSES: &[Class] = &[SEND, READ, DELETE];
 
 /// The defaults: a bot ~30 calls a second; sends at 18 a minute, under the
 /// channel's ~20.

@@ -525,7 +525,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_read_429_cools_its_channel_and_the_bot_only_when_global() {
-        let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_storage_discord::limits());
+        let reg = pigeonhole_limits::LimiterRegistry::new(
+            pigeonhole_storage_discord::limits(),
+            pigeonhole_storage_discord::limits::CLASSES,
+        )
+        .unwrap();
         let call = GET_MESSAGE;
         let once = Retry { attempts: 1, ..RETRY };
         for global in [false, true] {
