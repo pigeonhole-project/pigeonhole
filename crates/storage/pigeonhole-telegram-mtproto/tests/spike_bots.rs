@@ -183,7 +183,11 @@ async fn a_pool_of_two_bots_sends_twice_as_fast() {
         .try_init();
     let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
     let sends: usize = std::env::var("SPIKE_SENDS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
-    let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_storage_telegram::limits());
+    let reg = pigeonhole_limits::LimiterRegistry::new(
+        pigeonhole_storage_telegram::limits(),
+        pigeonhole_storage_telegram::limits::CLASSES,
+    )
+    .unwrap();
     let mut members = Vec::new();
     for (n, var) in [(1, "TG_BOT_TOKEN"), (2, "TG_BOT_TOKEN_2")] {
         let cfg = MtprotoConfig {
@@ -220,7 +224,11 @@ async fn a_pooled_store_reads_with_each_bots_own_locations() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     dotenvy::from_path(root.join(".env")).ok();
     let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
-    let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_storage_telegram::limits());
+    let reg = pigeonhole_limits::LimiterRegistry::new(
+        pigeonhole_storage_telegram::limits(),
+        pigeonhole_storage_telegram::limits::CLASSES,
+    )
+    .unwrap();
     let mut members = Vec::new();
     for (n, var) in [(1, "TG_BOT_TOKEN"), (2, "TG_BOT_TOKEN_2")] {
         let cfg = MtprotoConfig {
@@ -274,7 +282,11 @@ async fn ranged_reads_one_bot_against_two() {
     dotenvy::from_path(root.join(".env")).ok();
     let chat_id: i64 = env("TG_BLOBS_CHAT_ID").parse().unwrap();
     let rounds: usize = std::env::var("SPIKE_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
-    let reg = pigeonhole_limits::LimiterRegistry::new(pigeonhole_storage_telegram::limits());
+    let reg = pigeonhole_limits::LimiterRegistry::new(
+        pigeonhole_storage_telegram::limits(),
+        pigeonhole_storage_telegram::limits::CLASSES,
+    )
+    .unwrap();
     let mut channels = Vec::new();
     for (n, var) in [(1, "TG_BOT_TOKEN"), (2, "TG_BOT_TOKEN_2")] {
         let cfg = MtprotoConfig {

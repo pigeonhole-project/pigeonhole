@@ -378,7 +378,7 @@ impl ChunkRec {
     /// Replica layouts for [`pigeonhole_blob::Replicated::read`], with each
     /// part's `block_stored_lens` taken from the chunk's blocks.
     pub(crate) fn replica_layouts(&self) -> Vec<ReplicaLayout> {
-        let stored_lens: Vec<u32> = self.blocks.iter().map(|b| b.stored_len.max(0) as u32).collect();
+        let stored_lens: Vec<u32> = self.blocks.iter().map(|b| b.stored_len).collect();
         self.replicas
             .iter()
             .map(|(instance, parts)| ReplicaLayout {

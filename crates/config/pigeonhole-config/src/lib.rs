@@ -480,7 +480,6 @@ impl Config {
         let (instances, placement) = topology.blob_placement(blob_store)?;
         let cluster = file.cluster.into_settings(file.node, me, |under| topology.fake_base(under))?;
         topology.check_all_used()?;
-        check_block_size_against_instances(block_size, &instances)?;
 
         Ok(Self {
             listen_addr: file.listen_addr,
@@ -493,8 +492,8 @@ impl Config {
             chunk_codec,
             block_size,
             ingest_budget,
-            limiters: Arc::new(LimiterRegistry::new(tg.clone())),
-            discord_limiters: Arc::new(LimiterRegistry::new(discord.clone())),
+            limiters: Arc::new(LimiterRegistry::new(tg.clone(), pigeonhole_storage_telegram::limits::CLASSES)?),
+            discord_limiters: Arc::new(LimiterRegistry::new(discord.clone(), DISCORD_CLASSES)?),
             tg,
             discord,
             cache: file.cache.into_cache_config()?,
@@ -536,9 +535,18 @@ impl Config {
             block_size: chunker::DEFAULT_BLOCK_SIZE,
             ingest_budget: Some(ByteBudget::new(chunker::DEFAULT_INGEST_MEMORY_BUDGET)),
             tg: Self::test_limits(pigeonhole_storage_telegram::limits()),
-            limiters: Arc::new(LimiterRegistry::new(Self::test_limits(pigeonhole_storage_telegram::limits()))),
+            limiters: Arc::new(
+                LimiterRegistry::new(
+                    Self::test_limits(pigeonhole_storage_telegram::limits()),
+                    pigeonhole_storage_telegram::limits::CLASSES,
+                )
+                .expect("the store's own limits"),
+            ),
             discord: Self::test_limits(discord_limits()),
-            discord_limiters: Arc::new(LimiterRegistry::new(Self::test_limits(discord_limits()))),
+            discord_limiters: Arc::new(
+                LimiterRegistry::new(Self::test_limits(discord_limits()), DISCORD_CLASSES)
+                    .expect("the store's own limits"),
+            ),
             cache: CacheConfig { enabled: false, ..CacheConfig::default() },
             bytestream: BytestreamSettings::default(),
             http: HttpSettings::default(),
@@ -948,32 +956,6 @@ impl FileRepair {
     }
 }
 
-/// `block_size` (+ margin) must fit under every blob store's max_blob_size.
-pub fn check_block_size_against_instances(block_size: usize, instances: &[InstanceConfig]) -> Result<()> {
-    if instances.is_empty() {
-        return Ok(());
-    }
-    let mut min_max = usize::MAX;
-    for inst in instances {
-        let max = match inst.kind {
-            InstanceKind::Memory => pigeonhole_types::BackendLimits::memory().max_blob_size,
-            InstanceKind::LocalDisk => pigeonhole_types::BackendLimits::local_disk().max_blob_size,
-            InstanceKind::Telegram => pigeonhole_types::BackendLimits::telegram().max_blob_size,
-            InstanceKind::Discord => pigeonhole_types::BackendLimits::discord(inst.max_blob_size).max_blob_size,
-        };
-        min_max = min_max.min(max);
-    }
-    if block_size >= min_max {
-        bail!("chunk.block_size ({block_size}) must be < min(max_blob_size) of configured instances ({min_max})");
-    }
-    // Incompressible blocks store raw `block_size`; keep a small header margin.
-    let need = block_size.saturating_add(64);
-    if need >= min_max {
-        bail!("chunk.block_size ({block_size}) with block margin exceeds min(max_blob_size) ({min_max})");
-    }
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileHttp {
@@ -1123,6 +1105,12 @@ impl Default for FileIngest {
 
 /// Discord's default limits; without the backend built in, only its bot's
 /// rate (there is nothing to call).
+/// What Discord's calls spend; none without its store.
+#[cfg(feature = "discord")]
+const DISCORD_CLASSES: &[pigeonhole_limits::Class] = pigeonhole_storage_discord::limits::CLASSES;
+#[cfg(not(feature = "discord"))]
+const DISCORD_CLASSES: &[pigeonhole_limits::Class] = &[];
+
 fn discord_limits() -> ChatLimiterConfig {
     #[cfg(feature = "discord")]
     {

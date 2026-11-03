@@ -1,76 +1,10 @@
 //! Shared types without I/O.
 
-use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::ops::Range;
 
 pub mod metric_doc;
 pub mod schedule;
 pub use metric_doc::{MetricDoc, MetricKind};
-
-/// Result of deleting a backend message/attachment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeleteOutcome {
-    Deleted,
-    /// Already absent — treat as success.
-    Gone,
-    /// Transient or policy failure — retry later.
-    Failed,
-}
-
-/// Stable backend identity, e.g. `tg:-100123` or `discord:987`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BackendId(pub String);
-
-impl BackendId {
-    pub fn new(kind: &str, scope: &str) -> Self {
-        Self(format!("{kind}:{scope}"))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn telegram(scope: &str) -> Self {
-        Self::new("tg", scope)
-    }
-
-    pub fn discord(scope: &str) -> Self {
-        Self::new("discord", scope)
-    }
-
-    pub fn memory() -> Self {
-        Self::new("memory", "local")
-    }
-}
-
-impl fmt::Display for BackendId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl AsRef<str> for BackendId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Immutable cache key used by block caches (L1/L2).
-///
-/// Opaque `key` is backend-agnostic (e.g. `chunk-{id}`); physical blob
-/// addresses live in the blob layer (`BlobLocator`), not here.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BlobKey {
-    pub backend_id: BackendId,
-    pub key: String,
-}
-
-impl BlobKey {
-    pub fn new(backend_id: BackendId, key: impl Into<String>) -> Self {
-        Self { backend_id, key: key.into() }
-    }
-}
 
 /// Optional byte range for blob gets.
 pub type ByteRange = Range<u64>;
@@ -83,40 +17,11 @@ pub enum RangeSupport {
     BestEffort,
 }
 
-/// Static capabilities of a blob backend.
+/// Static capabilities of a blob backend; each store crate has its own.
 #[derive(Debug, Clone)]
 pub struct BackendLimits {
     pub max_blob_size: usize,
     pub supports_range: RangeSupport,
-    pub can_list: bool,
-}
-
-impl BackendLimits {
-    /// MTProto: a bot posts files far larger than any chunk (`MAX_LOGICAL_CHUNK`)
-    /// and reads any 4 KiB-aligned window; the channel can be listed.
-    pub fn telegram() -> Self {
-        Self { max_blob_size: 256 * 1024 * 1024, supports_range: RangeSupport::BestEffort, can_list: true }
-    }
-
-    pub fn memory() -> Self {
-        Self { max_blob_size: 20 * 1024 * 1024 - 1, supports_range: RangeSupport::BestEffort, can_list: false }
-    }
-
-    /// One file per blob; large enough for any chunk (`MAX_LOGICAL_CHUNK`).
-    pub fn local_disk() -> Self {
-        Self { max_blob_size: 256 * 1024 * 1024, supports_range: RangeSupport::BestEffort, can_list: true }
-    }
-
-    /// Discord's attachment limit: exactly 20 MiB per file since September
-    /// 2026 (more on boosted servers: set `max_blob_size`).
-    pub fn discord(max_blob_size: Option<usize>) -> Self {
-        const DEFAULT: usize = 20 * 1024 * 1024;
-        Self {
-            max_blob_size: max_blob_size.unwrap_or(DEFAULT),
-            supports_range: RangeSupport::BestEffort,
-            can_list: true,
-        }
-    }
 }
 
 /// Runs blocking `f` (compression, file I/O) off the async workers: on a

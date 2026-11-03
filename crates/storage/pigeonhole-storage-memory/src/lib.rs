@@ -1,12 +1,13 @@
 //! In-memory [`BlobBackend`] for tests and `memory = true`.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_limits::StoreLimiter;
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, After, BlobBackend, BlobId, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole,
-    Linked, NotFound, OpKind, Unavailable,
+    bytes_stream, check_blob, exists_by_get, newest_loose_at_tail, put_after_tail_by_links, put_loose_linked,
+    slice_range, After, BlobBackend, BlobId, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked,
+    MakeAfter, NotFound, OpKind, Unavailable,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,11 @@ use std::sync::{Arc, Mutex};
 
 /// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
 pub const KIND: &str = "memory";
+
+/// Under 20 MiB a blob, as small as the smallest chat's message (tests see
+/// chunks cut into several parts), read at any offset.
+pub const BLOB_LIMITS: BackendLimits =
+    BackendLimits { max_blob_size: 20 * 1024 * 1024 - 1, supports_range: pigeonhole_types::RangeSupport::BestEffort };
 
 /// Typed identity for the memory backend (stage 1.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +68,7 @@ pub type MemoryBackend = MemoryBlobStore;
 
 impl MemoryBlobStore {
     pub fn new() -> Self {
-        Self::with_limits(BackendLimits::memory())
+        Self::with_limits(BLOB_LIMITS)
     }
 
     /// In-memory store with a custom blob size limit (tests / multi-instance groups).
@@ -203,12 +209,7 @@ impl BlobBackend for MemoryBlobStore {
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
         let _op = self.limiter.op().await;
         self.check_available()?;
-        if data.is_empty() {
-            bail!("refusing empty blob upload (Telegram rejects empty documents)");
-        }
-        if data.len() > self.limits.max_blob_size {
-            bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
-        }
+        check_blob(name, &data, &self.limits)?;
         let file_id = format!("mem-{}", self.next_fid.fetch_add(1, Ordering::Relaxed));
         let message_id = self.next_msg.fetch_add(1, Ordering::Relaxed);
         self.files.lock().unwrap().insert(file_id.clone(), data);
@@ -270,6 +271,15 @@ impl BlobBackend for MemoryBlobStore {
         keys.truncate(limit);
         Ok(keys)
     }
+
+    /// Memory is one deployment's by setup: nothing to mark.
+    async fn mark_owner(&self, owner: pigeonhole_storage_api::Owner) -> Result<pigeonhole_storage_api::Owner> {
+        Ok(owner)
+    }
+
+    async fn exists(&self, id: &Self::Id) -> Result<bool> {
+        exists_by_get(self, id).await
+    }
 }
 
 /// The successor of a message is decided under a lock: the first to link wins.
@@ -308,6 +318,24 @@ impl Chain for MemoryBlobStore {
         self.check_available()?;
         let next = self.chain.lock().unwrap().next.get(&Some(id.message_id as i64)).copied();
         Ok(next.map(|n| self.linked(n)))
+    }
+
+    async fn put_after_tail(
+        &self,
+        hint: Option<&Self::Id>,
+        label: &str,
+        make: &MakeAfter<'_, Self::Id>,
+    ) -> Result<Option<Self::Id>> {
+        put_after_tail_by_links(self, hint, label, make).await
+    }
+
+    /// Linked: the store does not list its loose blobs.
+    async fn put_loose(&self, after: Option<&Self::Id>, label: &str, data: Bytes) -> Result<Self::Id> {
+        put_loose_linked(self, after, label, data).await
+    }
+
+    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
+        newest_loose_at_tail(self, prefix).await
     }
 
     /// Background work: a batch at a time, each when no other operation runs.

@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_limits::StoreLimiter;
 use pigeonhole_storage_api::{
-    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked, MakeAfter,
-    NotFound, OpKind,
+    bytes_stream, exists_by_get, newest_loose_at_tail, put_loose_linked, After, BlobBackend, BoxByteStream, Chain,
+    CostHint, InstanceInfo, InstanceRole, Linked, MakeAfter, NotFound, OpKind,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use segments::Segments;
@@ -30,6 +30,11 @@ pub use segments::{inspect, inspect_dir, DEFAULT_SEGMENT_BYTES};
 
 /// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
 pub const KIND: &str = "local_disk";
+
+/// Records large enough for any chunk (256 MiB, the codec's
+/// `MAX_LOGICAL_CHUNK`), read at any offset.
+pub const BLOB_LIMITS: BackendLimits =
+    BackendLimits { max_blob_size: 256 * 1024 * 1024, supports_range: pigeonhole_types::RangeSupport::BestEffort };
 
 /// Identity of a blob on disk: its key, the record's position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +110,7 @@ impl DiskBlobStore {
         let segments = Segments::open(fs.clone(), &dir, segment_bytes)?;
         Ok(Self {
             dir,
-            limits: BackendLimits::local_disk(),
+            limits: BLOB_LIMITS,
             segments: Arc::new(Mutex::new(segments)),
             fs,
             limiter: Arc::new(StoreLimiter::new(&info.id)),
@@ -164,14 +169,8 @@ impl DiskBlobStore {
         }
     }
 
-    fn check_size(&self, data: &Bytes) -> Result<()> {
-        if data.is_empty() {
-            bail!("refusing an empty blob");
-        }
-        if data.len() > self.limits.max_blob_size {
-            bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
-        }
-        Ok(())
+    fn check(&self, name: &str, data: &[u8]) -> Result<()> {
+        pigeonhole_storage_api::check_blob(name, data, &self.limits)
     }
 
     fn linked(segments: &Segments, key: u64) -> Linked<DiskId> {
@@ -202,7 +201,7 @@ impl BlobBackend for DiskBlobStore {
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
-        self.check_size(&data)?;
+        self.check(name, &data)?;
         let (bytes, owned) = (data.len(), name.to_string());
         let key = self.locked(move |s| s.append(None, &owned, &data)).await?;
         tracing::debug!(store = %self.instance().id, key, segment = key >> 40, bytes, name, "stored");
@@ -260,6 +259,15 @@ impl BlobBackend for DiskBlobStore {
         })
         .await
     }
+
+    /// A directory is one deployment's by setup: nothing to mark.
+    async fn mark_owner(&self, owner: pigeonhole_storage_api::Owner) -> Result<pigeonhole_storage_api::Owner> {
+        Ok(owner)
+    }
+
+    async fn exists(&self, id: &Self::Id) -> Result<bool> {
+        exists_by_get(self, id).await
+    }
 }
 
 /// The successor of a record is decided under the `flock`: a `put_after`
@@ -267,7 +275,7 @@ impl BlobBackend for DiskBlobStore {
 #[async_trait]
 impl Chain for DiskBlobStore {
     async fn put_after(&self, prev: Option<&Self::Id>, label: &str, data: Bytes) -> Result<After<Self::Id>> {
-        self.check_size(&data)?;
+        self.check(label, &data)?;
         let prev = prev.map(|p| p.key);
         let (bytes, owned) = (data.len(), label.to_string());
         let after = self
@@ -297,6 +305,15 @@ impl Chain for DiskBlobStore {
         self.locked(move |s| Ok(s.next.get(&Some(key)).map(|&n| Self::linked(s, n)))).await
     }
 
+    /// Linked: the store does not list its loose blobs.
+    async fn put_loose(&self, after: Option<&Self::Id>, label: &str, data: Bytes) -> Result<Self::Id> {
+        put_loose_linked(self, after, label, data).await
+    }
+
+    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
+        newest_loose_at_tail(self, prefix).await
+    }
+
     /// Atomic: the tail is read and the blob appended under one `flock`
     /// (reading it costs nothing: no hint needed).
     async fn put_after_tail(
@@ -324,7 +341,7 @@ impl Chain for DiskBlobStore {
             };
             let tail_id = tail.map(|key| DiskId { key });
             let Some(blob) = make(tail_id.as_ref().zip(data.as_deref()))? else { return Ok(None) };
-            self.check_size(&blob)?;
+            self.check(&label, &blob)?;
             let key = s.append(Some((tail, &label)), &label, &blob)?;
             tracing::debug!(store = %self.instance().id, label, ?tail, key, bytes = blob.len(), "linked after the tail");
             Ok(Some(DiskId { key }))

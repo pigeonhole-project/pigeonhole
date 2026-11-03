@@ -11,7 +11,8 @@ use futures::StreamExt;
 use lru::LruCache;
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind, Owner,
+    bytes_stream, check_blob, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, Failure, InstanceInfo,
+    NotFound, OpKind, Owner,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -126,7 +127,7 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
     pub fn new(channel: Arc<C>, limiter: Arc<ChatLimiter>, instance: InstanceInfo) -> Self {
         let locations = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())));
         Self {
-            limits: BackendLimits::telegram(),
+            limits: crate::BLOB_LIMITS,
             instance,
             reader: Reader { channel, limiter: limiter.clone(), locations },
             limiter,
@@ -305,19 +306,14 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
             OpKind::Get if id.is_some_and(|i| self.reader.locations.lock().unwrap().contains(&i.message_id)) => {
                 std::time::Duration::ZERO
             }
-            OpKind::Get | OpKind::List => self.limiter.peek_wait(READ),
+            OpKind::Get => self.limiter.peek_wait(READ),
             OpKind::Delete => self.limiter.peek_wait(DELETE),
         };
-        CostHint { wait_secs: wait.as_secs_f64(), latency_ewma_secs: 0.0, inflight: 0 }
+        CostHint { wait_secs: wait.as_secs_f64() }
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
-        if data.is_empty() {
-            bail!("refusing empty blob upload (Telegram rejects empty documents)");
-        }
-        if data.len() > self.limits.max_blob_size {
-            bail!("blob size {} exceeds backend max {}", data.len(), self.limits.max_blob_size);
-        }
+        check_blob(name, &data, &self.limits)?;
         let random_id = blob_random_id(self.reader.channel.channel_id(), name);
         let message_id = self.post_blob(name, data, random_id).await?;
         Ok(TelegramId { message_id })
@@ -373,7 +369,7 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
     async fn exists(&self, id: &Self::Id) -> Result<bool> {
         match self.reader.locate(id.message_id, true).await {
             Ok(_) => Ok(true),
-            Err(e) if e.is::<NotFound>() => {
+            Err(e) if Failure::of(&e) == Failure::NotFound => {
                 self.reader.locations.lock().unwrap().pop(&id.message_id);
                 Ok(false)
             }

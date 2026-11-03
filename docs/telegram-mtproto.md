@@ -113,9 +113,9 @@ bot_ids = [7012345678]             # the bot's id: its token starts with it
   success.
 - **Sweepable / listing**: candidates are produced by reading id ranges up to
   the horizon with `channels.getMessages` and keeping only documents named
-  `ph-<32 hex>.bin`; `can_list = true`. Update sweep-invariants.md: this
+  `ph-<32 hex>.bin`. Update sweep-invariants.md: this
   backend, like Discord, never deletes what is not ours.
-- `BackendLimits::telegram()` (planned as `telegram_mtproto()`): `max_blob_size` = what the chunk store
+- `pigeonhole_storage_telegram::BLOB_LIMITS`: `max_blob_size` = what the chunk store
   allows (`MAX_LOGICAL_CHUNK`, 256 MiB) or less if the spike shows a lower
   bot limit; exact range support.
 - Rate limits: `FLOOD_WAIT_X` becomes the shared rate-limited error (see

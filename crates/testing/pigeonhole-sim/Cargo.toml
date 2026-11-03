@@ -19,6 +19,7 @@ serde = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+pigeonhole-storage-api = { workspace = true, features = ["conformance"] }
 http = { workspace = true }
 openraft-chat = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }

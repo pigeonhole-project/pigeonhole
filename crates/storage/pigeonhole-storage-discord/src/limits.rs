@@ -10,6 +10,9 @@ pub const SEND: Class = Class("send");
 pub const READ: Class = Class("read");
 /// Deleting messages and threads, archiving threads.
 pub const DELETE: Class = Class("delete");
+/// Every class the store's calls spend: what a registry checks the config
+/// against.
+pub const CLASSES: &[Class] = &[SEND, READ, DELETE];
 
 /// The defaults: ~50 requests a second per bot.
 pub fn limits() -> ChatLimiterConfig {

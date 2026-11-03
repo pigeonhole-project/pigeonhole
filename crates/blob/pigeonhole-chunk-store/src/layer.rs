@@ -298,14 +298,14 @@ impl ChunkStore {
         let logical = data.len() as i64;
         let crc = crc32fast::hash(data.as_ref());
         let mut w = self.replicated.chunk_writer();
-        w.push(EncodedBlock { stored: data, logical_len: logical as u32, codec: "raw".into() }).await?;
+        w.push(EncodedBlock { stored: data, logical_len: logical as u32 }).await?;
         let sealed = w.finish().await?;
         let blocks = vec![StoredBlock {
             block_no: 0,
             logical_off: 0,
-            logical_len: logical,
-            stored_len: logical,
-            codec: "raw".into(),
+            logical_len: logical as u32,
+            stored_len: logical as u32,
+            codec: ChunkCodec::Raw,
             crc32: crc,
         }];
         let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts)?;
@@ -508,8 +508,8 @@ impl ChunkStore {
         if needed.is_empty() {
             return Ok(Bytes::new());
         }
-        let first_no = needed[0].block_no as u32;
-        let last_no = needed.last().unwrap().block_no as u32 + 1;
+        let first_no = needed[0].block_no;
+        let last_no = needed.last().unwrap().block_no + 1;
 
         let mut out = Vec::with_capacity(to - from);
         for b in needed {
@@ -532,17 +532,17 @@ impl ChunkStore {
         replicas: &[ReplicaLayout],
         fetch_range: std::ops::Range<u32>,
     ) -> Result<Bytes> {
-        let block_no = block.block_no as u32;
+        let block_no = block.block_no;
         if let Some(l1) = &self.block_cache {
             return l1
                 .get_or_load(chunk_id, block_no, || async {
                     let stored = self.load_compressed_block(chunk_id, block, replicas, fetch_range.clone()).await?;
-                    decode_block_slice(stored.as_ref(), &block.codec, block.logical_len.max(1) as usize)
+                    decode_block_slice(stored.as_ref(), block.codec, block.logical_len as usize)
                 })
                 .await;
         }
         let stored = self.load_compressed_block(chunk_id, block, replicas, fetch_range).await?;
-        decode_block_slice(stored.as_ref(), &block.codec, block.logical_len.max(1) as usize)
+        decode_block_slice(stored.as_ref(), block.codec, block.logical_len as usize)
     }
 
     async fn load_compressed_block(
@@ -552,7 +552,7 @@ impl ChunkStore {
         replicas: &[ReplicaLayout],
         _fetch_range: std::ops::Range<u32>,
     ) -> Result<Bytes> {
-        let block_no = block.block_no as u32;
+        let block_no = block.block_no;
         let loader = || async {
             let hook = self.not_found_hook(chunk_id);
             let mut raw = collect_stream(
@@ -565,11 +565,8 @@ impl ChunkStore {
             if crc32fast::hash(&raw) != block.crc32 {
                 raw = self.read_block_around_damage(chunk_id, block, replicas).await?;
             }
-            if raw.len() as i64 != block.stored_len && block.stored_len > 0 {
-                // Best-effort: tolerate missing stored_len on migrated empty counts.
-                if raw.len() < block.stored_len as usize {
-                    bail!("block {} stored len {} < expected {}", block_no, raw.len(), block.stored_len);
-                }
+            if raw.len() < block.stored_len as usize {
+                bail!("block {} stored len {} < expected {}", block_no, raw.len(), block.stored_len);
             }
             Ok(raw)
         };
@@ -588,7 +585,7 @@ impl ChunkStore {
         block: &StoredBlock,
         replicas: &[ReplicaLayout],
     ) -> Result<Bytes> {
-        let block_no = block.block_no as u32;
+        let block_no = block.block_no;
         for r in replicas {
             let Ok(stream) =
                 self.replicated.read_with_hook(std::slice::from_ref(r), block_no..block_no + 1, None).await
@@ -655,7 +652,7 @@ impl ChunkStore {
         block_buf: &mut Vec<u8>,
         codec: ChunkCodec,
         calls: &Arc<AtomicU64>,
-    ) -> Result<EncodedBlock> {
+    ) -> Result<(EncodedBlock, ChunkCodec)> {
         let logical = std::mem::take(block_buf);
         let logical_len = logical.len();
         let calls = calls.clone();
@@ -666,15 +663,15 @@ impl ChunkStore {
         .await
         .context("encode")??;
         pigeonhole_blob::record_compression_ratio(stored.len(), logical_len);
-        Ok(EncodedBlock { stored, logical_len: logical_len as u32, codec })
+        Ok((EncodedBlock { stored, logical_len: logical_len as u32 }, codec))
     }
 
-    async fn push_encoded(&self, open: &mut OpenChunk, block: EncodedBlock) -> Result<()> {
-        let EncodedBlock { stored, logical_len, codec } = block;
-        let block_no = open.blocks.len() as i64;
-        let logical_off = open.logical;
+    async fn push_encoded(&self, open: &mut OpenChunk, block: EncodedBlock, codec: ChunkCodec) -> Result<()> {
+        let EncodedBlock { stored, logical_len } = block;
+        let block_no = open.blocks.len() as u32;
+        let logical_off = open.logical as u64;
         open.writer
-            .push(EncodedBlock { stored: stored.clone(), logical_len, codec: codec.clone() })
+            .push(EncodedBlock { stored: stored.clone(), logical_len })
             .await
             .context("replicated push block")?;
 
@@ -684,8 +681,8 @@ impl ChunkStore {
         open.blocks.push(StoredBlock {
             block_no,
             logical_off,
-            logical_len: logical_len as i64,
-            stored_len: stored.len() as i64,
+            logical_len,
+            stored_len: stored.len() as u32,
             codec,
             crc32: crc32fast::hash(&stored),
         });
@@ -728,8 +725,8 @@ impl ChunkStore {
         // at ingest level. Per-chunk crc32: hash of block stored bytes.
         let mut h = crc32fast::Hasher::new();
         for b in &blocks {
-            h.update(&(b.stored_len as u32).to_le_bytes());
-            h.update(b.codec.as_bytes());
+            h.update(&b.stored_len.to_le_bytes());
+            h.update(b.codec.as_str().as_bytes());
         }
         let crc = h.finalize();
         // Committed by the caller, with whatever points at it; the uploads
@@ -864,12 +861,12 @@ impl<'a> BlockFeeder<'a> {
     }
 
     async fn push_block(&mut self) -> Result<()> {
-        let block = self.store.encode_block(&mut self.block, self.codec, &self.calls).await?;
+        let (block, codec) = self.store.encode_block(&mut self.block, self.codec, &self.calls).await?;
         if !self.open.blocks.is_empty() && self.open.stored_len + block.stored.len() > self.chunk_stored {
             self.seal().await?;
             self.reserve_chunk().await?;
         }
-        self.store.push_encoded(&mut self.open, block).await?;
+        self.store.push_encoded(&mut self.open, block, codec).await?;
         if self.open.stored_len >= self.chunk_stored || self.open.logical >= self.chunk_logical {
             self.seal().await?;
         }
@@ -928,18 +925,16 @@ impl OpenChunk {
     }
 }
 
-/// E.4: block_size (+ margin for incompressible / header) must fit every member.
+/// `chunk.block_size` and its [`pigeonhole_codec::BLOCK_HEADROOM`] fit
+/// every member's message, as the built stores' `limits()` say.
 pub fn check_block_fits_members(block_size: usize, replicated: &Replicated) -> Result<()> {
     let min_max = replicated.max_blob_size();
-    let need = block_size.saturating_add(pigeonhole_codec::COMPRESS_SIZE_MARGIN.min(64 * 1024));
-    // Incompressible path stores raw `block_size` bytes; require block_size < min max.
-    if block_size >= min_max {
-        bail!("chunk.block_size ({block_size}) must be < min(max_blob_size) of placement group ({min_max})");
+    if block_size.saturating_add(pigeonhole_codec::BLOCK_HEADROOM) >= min_max {
+        bail!(
+            "chunk.block_size ({block_size}) + {} must be under the smallest max_blob_size of its stores ({min_max})",
+            pigeonhole_codec::BLOCK_HEADROOM
+        );
     }
-    if need >= min_max && block_size + 64 >= min_max {
-        bail!("chunk.block_size ({block_size}) with margin exceeds min(max_blob_size) ({min_max})");
-    }
-    let _ = need;
     Ok(())
 }
 
@@ -1062,13 +1057,11 @@ mod tests {
         let a = MemoryBlobStore::with_limits(BackendLimits {
             max_blob_size: 19 * MIB,
             supports_range: pigeonhole_types::RangeSupport::BestEffort,
-            can_list: false,
         })
         .with_instance_id("a-19");
         let b = MemoryBlobStore::with_limits(BackendLimits {
             max_blob_size: 10 * MIB,
             supports_range: pigeonhole_types::RangeSupport::BestEffort,
-            can_list: false,
         })
         .with_instance_id("b-10");
         let rep = Arc::new(
@@ -1136,9 +1129,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("blob.log");
         let db = BlobDb::open(pigeonhole_testkit::tablet(&log_dir, BlobDb::register).await).await.unwrap();
-        let a = MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("a").with_unavailable_flag();
+        let a = MemoryBlobStore::new().with_instance_id("a").with_unavailable_flag();
         let flag = a.unavailable_flag();
-        let b = MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("b");
+        let b = MemoryBlobStore::new().with_instance_id("b");
         let rep = Arc::new(
             Replicated::new(
                 vec![Arc::new(erase(a)) as SharedBackend, Arc::new(erase(b)) as SharedBackend],
@@ -1206,7 +1199,7 @@ mod tests {
             let db = BlobDb::open(pigeonhole_testkit::tablet(&dir.path().join("blob.log"), BlobDb::register).await)
                 .await
                 .unwrap();
-            let store = MemoryBlobStore::with_limits(BackendLimits::memory()).with_unavailable_flag();
+            let store = MemoryBlobStore::new().with_unavailable_flag();
             let down = store.unavailable_flag();
             let mut opts = IngestOptions::new(8 * MIB, ChunkCodec::Zstd);
             opts.block_size = MIB;
@@ -1266,6 +1259,12 @@ mod tests {
         ) -> Result<Vec<Self::Key>> {
             self.inner.candidates(owner, after, upto, limit).await
         }
+        async fn mark_owner(&self, owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
+            self.inner.mark_owner(owner).await
+        }
+        async fn exists(&self, id: &Self::Id) -> Result<bool> {
+            self.inner.exists(id).await
+        }
     }
 
     /// A blob store marked as another deployment's (a channel's pinned marker).
@@ -1307,6 +1306,9 @@ mod tests {
         }
         async fn mark_owner(&self, _owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
             Ok(self.1)
+        }
+        async fn exists(&self, id: &Self::Id) -> Result<bool> {
+            self.0.exists(id).await
         }
     }
 

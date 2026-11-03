@@ -7,8 +7,6 @@ use pigeonhole_codec::{self as chunker, ByteBudget, ChunkCodec};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-pub use pigeonhole_codec::{codec_from_sql, codec_to_sql};
-
 /// Optional streaming hasher updated with plaintext body bytes during ingest.
 ///
 /// Gateways (e.g. S3 CRC/SHA) can implement this; the layer stays free of protocol crates.

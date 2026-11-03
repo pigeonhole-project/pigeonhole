@@ -377,7 +377,7 @@ async fn read_encoded_blocks(
     if blocks.is_empty() {
         // Raw single-part chunk (no chunk_blocks rows).
         let raw = collect_stream(replicated.read(sources, 0..1).await.context("repair read raw")?).await?;
-        return Ok(vec![EncodedBlock { stored: raw.clone(), logical_len: raw.len() as u32, codec: "raw".into() }]);
+        return Ok(vec![EncodedBlock { stored: raw.clone(), logical_len: raw.len() as u32 }]);
     }
 
     let end = blocks.len() as u32;
@@ -386,7 +386,7 @@ async fn read_encoded_blocks(
     let mut out = Vec::with_capacity(blocks.len());
     let mut off = 0usize;
     for b in blocks {
-        let len = b.stored_len.max(0) as usize;
+        let len = b.stored_len as usize;
         if off + len > blob.len() {
             bail!("repair: truncated stored payload at block {} (need {} have {})", b.block_no, off + len, blob.len());
         }
@@ -396,7 +396,7 @@ async fn read_encoded_blocks(
             // Never copy a damaged block onto another member.
             bail!("repair: block {} fails its checksum on the source", b.block_no);
         }
-        out.push(EncodedBlock { stored, logical_len: b.logical_len.max(0) as u32, codec: b.codec.clone() });
+        out.push(EncodedBlock { stored, logical_len: b.logical_len });
     }
     if off != blob.len() {
         bail!("repair: stored payload length mismatch (consumed {off}, got {})", blob.len());
@@ -434,12 +434,8 @@ mod tests {
 
     fn lim(id: &str, max_blob_size: usize) -> SharedBackend {
         Arc::new(erase(
-            MemoryBlobStore::with_limits(BackendLimits {
-                max_blob_size,
-                supports_range: RangeSupport::BestEffort,
-                can_list: false,
-            })
-            .with_instance_id(id),
+            MemoryBlobStore::with_limits(BackendLimits { max_blob_size, supports_range: RangeSupport::BestEffort })
+                .with_instance_id(id),
         ))
     }
 
@@ -480,7 +476,6 @@ mod tests {
         let b_store = MemoryBlobStore::with_limits(BackendLimits {
             max_blob_size: 10 * MIB,
             supports_range: RangeSupport::BestEffort,
-            can_list: false,
         })
         .with_instance_id("b-10");
         let b: SharedBackend = Arc::new(erase(b_store));
@@ -561,10 +556,8 @@ mod tests {
 
     #[tokio::test]
     async fn lost_part_is_repaired() {
-        let a: SharedBackend =
-            Arc::new(erase(MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("a")));
-        let b: SharedBackend =
-            Arc::new(erase(MemoryBlobStore::with_limits(BackendLimits::memory()).with_instance_id("b")));
+        let a: SharedBackend = Arc::new(erase(MemoryBlobStore::new().with_instance_id("a")));
+        let b: SharedBackend = Arc::new(erase(MemoryBlobStore::new().with_instance_id("b")));
         let (_dir, layer, rep) = open_layer(vec![a.clone(), b], 2, 8 * MIB, MIB).await;
 
         let data = Bytes::from(vec![7u8; 3 * MIB]);

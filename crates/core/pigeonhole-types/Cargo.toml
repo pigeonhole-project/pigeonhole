@@ -8,8 +8,6 @@ description = "Shared types for pigeonhole (no I/O)"
 [dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

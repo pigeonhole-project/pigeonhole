@@ -8,6 +8,9 @@ description = "What a pigeonhole store implements: BlobBackend, Sweepable, Chain
 [features]
 # Fake channels' state and hosts (crate::fake): tests, the site's demo.
 fake = []
+# A recording store and the checks that a decorator forwards every method
+# (crate::conformance): decorators' tests.
+conformance = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -19,6 +22,7 @@ serde = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true }
 postcard = { workspace = true }
 serde_json = { workspace = true }
 

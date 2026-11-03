@@ -150,12 +150,16 @@ mod tests {
     const SEND: Class = Class("send");
 
     fn registry() -> LimiterRegistry {
-        LimiterRegistry::new(ChatLimiterConfig {
-            bot: Rate::new(1000.0, 1000.0),
-            classes: vec![(SEND, Rate::new(0.3, 3.0))],
-            upload_concurrency: 1,
-            download_concurrency: 1,
-        })
+        LimiterRegistry::new(
+            ChatLimiterConfig {
+                bot: Rate::new(1000.0, 1000.0),
+                classes: vec![(SEND, Rate::new(0.3, 3.0))],
+                upload_concurrency: 1,
+                download_concurrency: 1,
+            },
+            &[SEND],
+        )
+        .unwrap()
     }
 
     /// A member's answer: `Err(secs)` = rate limited for that long.
@@ -303,12 +307,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn ties_spread_over_the_members() {
-        let reg = LimiterRegistry::new(ChatLimiterConfig {
-            bot: Rate::new(1000.0, 1000.0),
-            classes: vec![(SEND, Rate::new(1000.0, 1000.0))],
-            upload_concurrency: 1,
-            download_concurrency: 1,
-        });
+        let reg = LimiterRegistry::new(
+            ChatLimiterConfig {
+                bot: Rate::new(1000.0, 1000.0),
+                classes: vec![(SEND, Rate::new(1000.0, 1000.0))],
+                upload_concurrency: 1,
+                download_concurrency: 1,
+            },
+            &[SEND],
+        )
+        .unwrap();
         let pool = Pool::new("-1", vec![reg.chat("a", "-1"), reg.chat("b", "-1"), reg.chat("c", "-1")]);
         let mut ran = Vec::new();
         for _ in 0..6 {

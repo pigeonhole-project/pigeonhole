@@ -26,7 +26,6 @@ pub mod telegram {
 }
 
 pub use config::Config;
-pub use pigeonhole_blob::DeleteOutcome;
 pub use pigeonhole_chunk_store::{BlobDb, ChunkStore, IngestOptions};
 pub use pigeonhole_gateway_s3::{Index, S3Gateway};
 pub use pigeonhole_limits::ChatLimiter;
@@ -37,7 +36,7 @@ pub mod discord {
     pub use pigeonhole_storage_discord::*;
 }
 pub use pigeonhole_storage_memory::{MemoryBackend, MemoryBlobStore};
-pub use pigeonhole_types::{BackendId, BackendLimits, BlobKey, RangeSupport};
+pub use pigeonhole_types::{BackendLimits, RangeSupport};
 
 /// Every metric the binary records, crate by crate (docs/metrics.md).
 pub fn metric_docs() -> [&'static [pigeonhole_types::MetricDoc]; 5] {

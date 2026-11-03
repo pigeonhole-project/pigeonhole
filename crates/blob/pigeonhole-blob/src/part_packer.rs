@@ -12,7 +12,6 @@ use std::sync::Arc;
 pub struct EncodedBlock {
     pub stored: Bytes,
     pub logical_len: u32,
-    pub codec: String,
 }
 
 /// Result of uploading one part (one blob / message).
@@ -181,11 +180,7 @@ mod tests {
                     location: format!("memory:{id}"),
                     role: InstanceRole::ReadWrite,
                 },
-                limits: BackendLimits {
-                    max_blob_size,
-                    supports_range: pigeonhole_types::RangeSupport::BestEffort,
-                    can_list: false,
-                },
+                limits: BackendLimits { max_blob_size, supports_range: pigeonhole_types::RangeSupport::BestEffort },
                 next: std::sync::atomic::AtomicU64::new(1),
                 data: Mutex::new(HashMap::new()),
             }
@@ -196,6 +191,12 @@ mod tests {
     impl BlobBackend for LimMem {
         type Id = Id;
         type Key = u64;
+        async fn mark_owner(&self, owner: pigeonhole_storage_api::Owner) -> Result<pigeonhole_storage_api::Owner> {
+            Ok(owner)
+        }
+        async fn exists(&self, id: &Self::Id) -> Result<bool> {
+            crate::exists_by_get(self, id).await
+        }
         fn instance(&self) -> &InstanceInfo {
             &self.info
         }
@@ -249,7 +250,7 @@ mod tests {
     }
 
     fn block(n: usize) -> EncodedBlock {
-        EncodedBlock { stored: Bytes::from(vec![7u8; n]), logical_len: n as u32, codec: "raw".into() }
+        EncodedBlock { stored: Bytes::from(vec![7u8; n]), logical_len: n as u32 }
     }
 
     #[tokio::test]

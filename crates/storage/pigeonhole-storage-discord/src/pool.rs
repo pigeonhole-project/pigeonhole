@@ -173,7 +173,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_429_moves_the_send_to_the_other_bot_and_reads_see_it() {
-        let reg = LimiterRegistry::new(crate::limits().with(SEND, Rate::new(100.0, 10.0)));
+        let reg =
+            LimiterRegistry::new(crate::limits().with(SEND, Rate::new(100.0, 10.0)), crate::limits::CLASSES).unwrap();
         let channel = Arc::new(FakeDiscord::new(7));
         let (a_sends, b_sends) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let bot = |name: &str, floods: u32, sends: &Arc<AtomicU32>| {

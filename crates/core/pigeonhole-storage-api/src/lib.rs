@@ -8,15 +8,24 @@
 
 mod backend;
 mod chain;
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
 mod error;
 #[cfg(feature = "fake")]
 pub mod fake;
 pub mod inspect;
+mod label;
 mod stream;
 pub mod text;
 
-pub use backend::{BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey, Owner};
-pub use chain::{After, Chain, LeaseChain, Linked, MakeAfter, PUT_AFTER_TAIL_ATTEMPTS};
+pub use backend::{
+    exists_by_get, BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey, Owner,
+};
+pub use chain::{
+    newest_loose_at_tail, put_after_tail_by_links, put_loose_linked, After, Chain, LeaseChain, Linked, MakeAfter,
+    PUT_AFTER_TAIL_ATTEMPTS,
+};
 pub use error::{Failure, NotFound, RateLimited, Unavailable};
+pub use label::{check_blob, check_label, MAX_LABEL};
 pub use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 pub use stream::{bytes_stream, collect_stream, slice_range, BoxByteStream};

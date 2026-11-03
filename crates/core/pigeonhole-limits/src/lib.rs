@@ -359,7 +359,27 @@ pub struct ChatLimiterConfig {
     pub download_concurrency: usize,
 }
 
+/// A class a service's calls spend that a limiter config has no rate for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownClass(pub Class);
+
+impl std::fmt::Display for UnknownClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the limiter config has no rate for class {:?}, which the service's calls spend", self.0 .0)
+    }
+}
+
+impl std::error::Error for UnknownClass {}
+
 impl ChatLimiterConfig {
+    /// Every class of `spends` has a rate.
+    pub fn check(&self, spends: &[Class]) -> Result<(), UnknownClass> {
+        match spends.iter().find(|c| self.rate(**c).is_none()) {
+            Some(c) => Err(UnknownClass(*c)),
+            None => Ok(()),
+        }
+    }
+
     pub fn rate(&self, class: Class) -> Option<Rate> {
         self.classes.iter().find(|(c, _)| *c == class).map(|(_, r)| *r)
     }
@@ -384,7 +404,9 @@ impl ChatLimiterConfig {
 }
 
 impl ChatLimiter {
-    /// A chat with a bot of its own (tests, single-chat tools).
+    /// A chat with a bot of its own (tests, single-chat tools). Unchecked:
+    /// spending a class `cfg` has no rate for panics. A node's limiters come
+    /// from a [`LimiterRegistry`], which checks.
     pub fn new(cfg: ChatLimiterConfig) -> Self {
         let bot = Arc::new(BotLimiter::new(cfg.bot));
         Self::for_bot(cfg, bot, "")
@@ -572,8 +594,12 @@ pub struct LimiterRegistry {
 }
 
 impl LimiterRegistry {
-    pub fn new(cfg: ChatLimiterConfig) -> Self {
-        Self { cfg, bots: Mutex::default(), chats: Mutex::default() }
+    /// Limiters by `cfg` for calls that spend `spends` (a service's
+    /// `CLASSES`): a class without a rate is an error here, not a panic at
+    /// its first call.
+    pub fn new(cfg: ChatLimiterConfig, spends: &[Class]) -> Result<Self, UnknownClass> {
+        cfg.check(spends)?;
+        Ok(Self { cfg, bots: Mutex::default(), chats: Mutex::default() })
     }
 
     /// The limiter of `chat` for the bot identified by `bot` (its id, not
@@ -624,7 +650,7 @@ mod tests {
             upload_concurrency: 1,
             download_concurrency: 1,
         };
-        let reg = LimiterRegistry::new(cfg);
+        let reg = LimiterRegistry::new(cfg, &[]).unwrap();
         let l = reg.chat("7", "-100");
         l.acquire(Spend::Class(Class("send"))).await;
         l.acquire(Spend::Class(Class("send"))).await;
@@ -679,12 +705,21 @@ mod tests {
         })
     }
 
+    #[test]
+    fn a_registry_without_a_rate_for_a_spent_class_is_an_error() {
+        let err = LimiterRegistry::new(cfg(), &[SEND, Class("upload")]).unwrap_err();
+        assert_eq!(err, UnknownClass(Class("upload")));
+        assert!(err.to_string().contains("\"upload\""), "{err}");
+        assert!(LimiterRegistry::new(cfg(), &[SEND, GET_FILE, DELETE, INFO]).is_ok());
+    }
+
     #[tokio::test]
     async fn chats_share_their_bot_and_nothing_else() {
-        let reg = LimiterRegistry::new(ChatLimiterConfig {
-            bot: Rate::new(0.01, 2.0),
-            ..cfg().with(SEND, Rate::new(0.01, 1.0))
-        });
+        let reg = LimiterRegistry::new(
+            ChatLimiterConfig { bot: Rate::new(0.01, 2.0), ..cfg().with(SEND, Rate::new(0.01, 1.0)) },
+            &[],
+        )
+        .unwrap();
         let (a, b, a_again) = (reg.chat("bot1", "-1"), reg.chat("bot1", "-2"), reg.chat("bot1", "-1"));
         assert!(Arc::ptr_eq(&a, &a_again), "one limiter per chat");
         assert!(Arc::ptr_eq(a.bot(), b.bot()), "one bot limiter per bot");
@@ -701,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_bot_level_429_holds_every_chat_a_class_429_only_its_own() {
-        let reg = LimiterRegistry::new(cfg());
+        let reg = LimiterRegistry::new(cfg(), &[]).unwrap();
         let (a, b) = (reg.chat("bot", "-1"), reg.chat("bot", "-2"));
         a.cool(Spend::Class(SEND), Level::Class, Duration::from_secs(20));
         assert!(a.peek_wait(SEND) > Duration::from_secs(10));
@@ -730,10 +765,11 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_for_the_chat_holds_no_bot_token() {
-        let reg = LimiterRegistry::new(ChatLimiterConfig {
-            bot: Rate::new(0.01, 2.0),
-            ..cfg().with(SEND, Rate::new(10.0, 1.0))
-        });
+        let reg = LimiterRegistry::new(
+            ChatLimiterConfig { bot: Rate::new(0.01, 2.0), ..cfg().with(SEND, Rate::new(10.0, 1.0)) },
+            &[],
+        )
+        .unwrap();
         let (a, b) = (reg.chat("bot", "-1"), reg.chat("bot", "-2"));
         a.acquire(Spend::Class(SEND)).await; // a's send token, and one of the bot's two
         let again = {

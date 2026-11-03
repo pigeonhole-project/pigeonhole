@@ -22,12 +22,13 @@ pub use part_packer::{EncodedBlock, PartPacker, PartUploaded};
 pub use pigeonhole_storage_api::{
     text, After, Chain, Failure, LeaseChain, Linked, MakeAfter, NotFound, Owner, RateLimited, Unavailable,
 };
-pub use pigeonhole_types::{BackendId, BackendLimits, BlobKey, ByteRange, DeleteOutcome, RangeSupport};
+pub use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 pub use replicated::{
     CheapestFirst, ChunkReplicaWriter, InstanceId, NotFoundHook, PartLayout, ReplicaLayout, ReplicaSelector,
     Replicated, SealedChunk, ShardSpec,
 };
 pub use typed::{
-    load_id, store_id, BlobBackend, BlobId, BlobLocator, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
+    exists_by_get, load_id, store_id, BlobBackend, BlobId, BlobLocator, CostHint, InstanceInfo, InstanceRole, OpKind,
+    OrderedKey,
 };
 pub use upload_pins::{UploadPin, UploadPins};

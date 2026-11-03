@@ -218,7 +218,8 @@ mod tests {
     }
 
     fn pool_of(floods: [u32; 2]) -> (PooledChannel<Arc<Bot>>, [Arc<Bot>; 2]) {
-        let reg = LimiterRegistry::new(crate::limits().with(SEND, Rate::new(100.0, 10.0)));
+        let reg =
+            LimiterRegistry::new(crate::limits().with(SEND, Rate::new(100.0, 10.0)), crate::limits::CLASSES).unwrap();
         let channel = Arc::new(FakeChannel::new(7));
         let bot = |index: usize, floods: u32| {
             Arc::new(Bot {
