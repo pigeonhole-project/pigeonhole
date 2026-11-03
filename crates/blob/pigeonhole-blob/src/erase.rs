@@ -117,6 +117,7 @@ mod tests {
     use super::*;
     use crate::collect_stream;
     use crate::typed::OrderedKey;
+    use pigeonhole_storage_api::Owner;
 
     /// Minimal in-crate backend for erasure tests (avoids depending on storage-memory).
     struct TinyMem {
@@ -152,6 +153,12 @@ mod tests {
     impl BlobBackend for TinyMem {
         type Id = TinyId;
         type Key = u64;
+        async fn mark_owner(&self, owner: pigeonhole_storage_api::Owner) -> Result<pigeonhole_storage_api::Owner> {
+            Ok(owner)
+        }
+        async fn exists(&self, id: &Self::Id) -> Result<bool> {
+            crate::exists_by_get(self, id).await
+        }
         fn instance(&self) -> &InstanceInfo {
             &self.info
         }
@@ -194,6 +201,33 @@ mod tests {
             keys.sort_unstable();
             keys.truncate(limit);
             Ok(keys)
+        }
+    }
+
+    /// Erasure and metrics forward every method to the store.
+    #[tokio::test]
+    async fn erased_and_metered_forward_every_method() {
+        use pigeonhole_storage_api::conformance::{reached, Recording, DATA, MAX_BLOB_SIZE, OWNER, PUT_ID};
+        let store = Arc::new(Recording::default());
+        let erased: SharedBackend = Arc::new(erase(store.clone()));
+        for d in [erased.clone(), crate::MetricsBackend::wrap(erased)] {
+            store.take_calls();
+            assert_eq!((d.instance().id.as_str(), d.limits().max_blob_size), ("recording", MAX_BLOB_SIZE));
+            d.cost(OpKind::Get, None);
+            reached(&store, "cost");
+            let id = d.put(Bytes::from_static(b"x"), "x.bin").await.unwrap();
+            reached(&store, "put");
+            assert_eq!(id, store_id::<Recording>(&PUT_ID).unwrap());
+            assert_eq!(collect_stream(d.get(&id, Some(0..1)).await.unwrap()).await.unwrap().as_ref(), DATA);
+            reached(&store, "get");
+            d.delete(std::slice::from_ref(&id.key)).await.unwrap();
+            reached(&store, "delete");
+            assert_eq!(d.candidates(Owner(0), None, &u64::MAX.to_bytes(), 10).await.unwrap(), vec![id.key.clone()]);
+            reached(&store, "candidates");
+            assert_eq!(d.mark_owner(Owner(1)).await.unwrap(), OWNER);
+            reached(&store, "mark_owner");
+            assert!(!d.exists(&id).await.unwrap());
+            reached(&store, "exists");
         }
     }
 

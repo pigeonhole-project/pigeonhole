@@ -30,7 +30,9 @@ use crate::store::{blob_name, TelegramBlobStore, TelegramId};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_storage_api::{After, BlobBackend, Chain, Linked};
+use pigeonhole_storage_api::{
+    newest_loose_at_tail, put_after_tail_by_links, put_loose_linked, After, BlobBackend, Chain, Linked, MakeAfter,
+};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -257,6 +259,25 @@ impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
             hi = lo - 1;
         }
         Ok(())
+    }
+
+    async fn put_after_tail(
+        &self,
+        hint: Option<&TelegramId>,
+        label: &str,
+        make: &MakeAfter<'_, TelegramId>,
+    ) -> Result<Option<TelegramId>> {
+        put_after_tail_by_links(self, hint, label, make).await
+    }
+
+    /// Linked: a bot cannot list the channel, it finds the newest blob by
+    /// its links. After `after` when given: no probe to learn the top.
+    async fn put_loose(&self, after: Option<&TelegramId>, label: &str, data: Bytes) -> Result<TelegramId> {
+        put_loose_linked(self, after, label, data).await
+    }
+
+    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<TelegramId>>> {
+        newest_loose_at_tail(self, prefix).await
     }
 }
 

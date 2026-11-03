@@ -15,8 +15,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_blob::{
-    After, BackendLimits, BlobBackend, BoxByteStream, ByteRange, Chain, CostHint, InstanceInfo, Linked, MakeAfter,
-    OpKind, RateLimited,
+    After, BackendLimits, BlobBackend, BoxByteStream, ByteRange, Chain, CostHint, InstanceInfo, LeaseChain, Linked,
+    MakeAfter, OpKind, RateLimited,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -106,7 +106,7 @@ pub struct Faulty<B> {
     inner: Arc<B>,
     plan: FaultPlan,
     seed: u64,
-    counters: [AtomicU64; 8],
+    counters: [AtomicU64; OPS],
     quiet: AtomicBool,
     log: Mutex<Vec<(&'static str, Fault)>>,
     /// Keys damaged on purpose ([`Faulty::damage`]), on top of the plan's.
@@ -225,11 +225,20 @@ const PUT_AFTER: usize = 4;
 const TAIL: usize = 5;
 const SUCCESSOR: usize = 6;
 const PRUNE: usize = 7;
+const EXISTS: usize = 8;
+const PUT_LOOSE: usize = 9;
+const NEWEST_LOOSE: usize = 10;
+const NOW: usize = 11;
+const PUT_UNLINKED: usize = 12;
+const LIST_AFTER: usize = 13;
+const OPS: usize = 14;
 
 /// Reads and deletes fail or wait; a failed delete may have deleted.
 const READ_FAULTS: &[Fault] = &[Fault::FailBefore, Fault::RateLimit];
 /// Writes may also be applied and still fail, or land later.
 const WRITE_FAULTS: &[Fault] = &[Fault::FailBefore, Fault::FailAfter, Fault::LandLate, Fault::RateLimit];
+/// Writes that never land late: a late snapshot would pass a newer one.
+const APPLIED_FAULTS: &[Fault] = &[Fault::FailBefore, Fault::FailAfter, Fault::RateLimit];
 
 #[async_trait]
 impl<B: BlobBackend> BlobBackend for Faulty<B> {
@@ -302,6 +311,11 @@ impl<B: BlobBackend> BlobBackend for Faulty<B> {
         self.inner.mark_owner(owner).await
     }
 
+    async fn exists(&self, id: &Self::Id) -> Result<bool> {
+        self.before(EXISTS, "exists", READ_FAULTS).await?;
+        self.inner.exists(id).await
+    }
+
     async fn candidates(
         &self,
         owner: pigeonhole_blob::Owner,
@@ -358,8 +372,7 @@ impl<B: Chain> Chain for Faulty<B> {
         label: &str,
         make: &MakeAfter<'_, Self::Id>,
     ) -> Result<Option<Self::Id>> {
-        let allowed = [Fault::FailBefore, Fault::FailAfter, Fault::RateLimit];
-        match self.before(PUT_AFTER, "put_after_tail", &allowed).await? {
+        match self.before(PUT_AFTER, "put_after_tail", APPLIED_FAULTS).await? {
             Draw::Fault(Fault::FailAfter) => {
                 self.inner.put_after_tail(hint, label, make).await?;
                 Err(anyhow!("injected: put_after_tail applied, then failed"))
@@ -367,12 +380,73 @@ impl<B: Chain> Chain for Faulty<B> {
             _ => self.inner.put_after_tail(hint, label, make).await,
         }
     }
+
+    async fn put_loose(&self, after: Option<&Self::Id>, label: &str, data: Bytes) -> Result<Self::Id> {
+        match self.before(PUT_LOOSE, "put_loose", APPLIED_FAULTS).await? {
+            Draw::Fault(Fault::FailAfter) => {
+                self.inner.put_loose(after, label, data).await?;
+                Err(anyhow!("injected: put_loose applied, then failed"))
+            }
+            _ => self.inner.put_loose(after, label, data).await,
+        }
+    }
+
+    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
+        self.before(NEWEST_LOOSE, "newest_loose", READ_FAULTS).await?;
+        self.inner.newest_loose(prefix).await
+    }
+}
+
+#[async_trait]
+impl<B: LeaseChain> LeaseChain for Faulty<B> {
+    fn stamp_ms(&self, id: &Self::Id) -> u64 {
+        self.inner.stamp_ms(id)
+    }
+
+    async fn now_ms(&self) -> Result<u64> {
+        self.before(NOW, "now_ms", READ_FAULTS).await?;
+        self.inner.now_ms().await
+    }
+
+    async fn put_unlinked(&self, prev: &Self::Id, label: &str, data: Bytes) -> Result<Self::Id> {
+        match self.before(PUT_UNLINKED, "put_unlinked", WRITE_FAULTS).await? {
+            Draw::Fault(Fault::FailAfter) => {
+                self.inner.put_unlinked(prev, label, data).await?;
+                Err(anyhow!("injected: put_unlinked applied, then failed"))
+            }
+            Draw::Fault(Fault::LandLate) => {
+                let (inner, prev, label, late_by) =
+                    (self.inner.clone(), prev.clone(), label.to_string(), self.plan.late_by);
+                tokio::spawn(async move {
+                    tokio::time::sleep(late_by).await;
+                    let _ = inner.put_unlinked(&prev, &label, data).await;
+                });
+                Err(anyhow!("injected: put_unlinked failed, lands later"))
+            }
+            _ => self.inner.put_unlinked(prev, label, data).await,
+        }
+    }
+
+    async fn list_after(&self, after: Option<&Self::Id>, prefix: &str) -> Result<Vec<Linked<Self::Id>>> {
+        self.before(LIST_AFTER, "list_after", READ_FAULTS).await?;
+        self.inner.list_after(after, prefix).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pigeonhole_storage_api::conformance::{check_blob_backend, check_chain, check_lease_chain, Recording};
     use pigeonhole_storage_memory::MemoryBlobStore;
+
+    #[tokio::test]
+    async fn every_method_reaches_the_store() {
+        let store = Arc::new(Recording::default());
+        let faulty = Faulty::with_seed(store.clone(), FaultPlan::none(), 1);
+        check_blob_backend(&store, &faulty).await.unwrap();
+        check_chain(&store, &faulty).await.unwrap();
+        check_lease_chain(&store, &faulty).await.unwrap();
+    }
 
     #[tokio::test]
     async fn a_damaged_blob_reads_back_damaged_every_time() {

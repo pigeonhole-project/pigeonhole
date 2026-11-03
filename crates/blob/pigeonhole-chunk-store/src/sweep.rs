@@ -641,6 +641,14 @@ mod tests {
             self.up()?;
             self.inner.candidates(owner, after, upto, limit).await
         }
+        async fn mark_owner(&self, owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
+            self.up()?;
+            self.inner.mark_owner(owner).await
+        }
+        async fn exists(&self, id: &Self::Id) -> Result<bool> {
+            self.up()?;
+            self.inner.exists(id).await
+        }
     }
 
     /// Two copies of every chunk: on `first` (with a down switch), then on

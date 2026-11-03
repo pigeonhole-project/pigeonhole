@@ -1266,6 +1266,12 @@ mod tests {
         ) -> Result<Vec<Self::Key>> {
             self.inner.candidates(owner, after, upto, limit).await
         }
+        async fn mark_owner(&self, owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
+            self.inner.mark_owner(owner).await
+        }
+        async fn exists(&self, id: &Self::Id) -> Result<bool> {
+            self.inner.exists(id).await
+        }
     }
 
     /// A blob store marked as another deployment's (a channel's pinned marker).
@@ -1307,6 +1313,9 @@ mod tests {
         }
         async fn mark_owner(&self, _owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
             Ok(self.1)
+        }
+        async fn exists(&self, id: &Self::Id) -> Result<bool> {
+            self.0.exists(id).await
         }
     }
 

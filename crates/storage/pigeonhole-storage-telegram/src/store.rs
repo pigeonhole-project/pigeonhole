@@ -11,7 +11,8 @@ use futures::StreamExt;
 use lru::LruCache;
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind, Owner,
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, Failure, InstanceInfo, NotFound, OpKind,
+    Owner,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -373,7 +374,7 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
     async fn exists(&self, id: &Self::Id) -> Result<bool> {
         match self.reader.locate(id.message_id, true).await {
             Ok(_) => Ok(true),
-            Err(e) if e.is::<NotFound>() => {
+            Err(e) if Failure::of(&e) == Failure::NotFound => {
                 self.reader.locations.lock().unwrap().pop(&id.message_id);
                 Ok(false)
             }

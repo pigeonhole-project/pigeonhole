@@ -10,7 +10,8 @@ use lru::LruCache;
 use pigeonhole_limits::ChatLimiter;
 use pigeonhole_storage_api::text;
 use pigeonhole_storage_api::{
-    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, InstanceInfo, NotFound, OpKind, Owner,
+    bytes_stream, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, Failure, InstanceInfo, NotFound, OpKind,
+    Owner,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
@@ -264,7 +265,7 @@ impl<A: DiscordApi> BlobBackend for DiscordBlobStore<A> {
     async fn exists(&self, id: &Self::Id) -> Result<bool> {
         match self.locate(id.message_id, true).await {
             Ok(_) => Ok(true),
-            Err(e) if e.is::<NotFound>() => {
+            Err(e) if Failure::of(&e) == Failure::NotFound => {
                 self.locations.lock().unwrap().pop(&id.message_id);
                 Ok(false)
             }

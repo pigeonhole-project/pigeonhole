@@ -2,7 +2,9 @@
 //! here only the type-erased stored identity.
 
 use anyhow::{bail, Result};
-pub use pigeonhole_storage_api::{BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey};
+pub use pigeonhole_storage_api::{
+    exists_by_get, BlobBackend, BlobId, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
+};
 use serde::{Deserialize, Serialize};
 
 /// Type-erased stored identity: order key + the typed id in postcard.

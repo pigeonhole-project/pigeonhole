@@ -31,7 +31,7 @@ use crate::store::{blob_name, DiscordBlobStore, DiscordId};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_storage_api::{After, BlobBackend, Chain, LeaseChain, Linked};
+use pigeonhole_storage_api::{put_after_tail_by_links, After, BlobBackend, Chain, LeaseChain, Linked, MakeAfter};
 
 const ANCHOR: &str = "chain-anchor.bin";
 /// The text of a clock probe ([`LeaseChain::now_ms`]).
@@ -284,6 +284,15 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
                 _ => return Ok(None),
             }
         }
+    }
+
+    async fn put_after_tail(
+        &self,
+        hint: Option<&DiscordId>,
+        label: &str,
+        make: &MakeAfter<'_, DiscordId>,
+    ) -> Result<Option<DiscordId>> {
+        put_after_tail_by_links(self, hint, label, make).await
     }
 
     /// Our messages below `below` (not the anchor), walking down until a page

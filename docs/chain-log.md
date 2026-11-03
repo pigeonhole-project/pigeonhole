@@ -214,13 +214,26 @@ Where the code differs from the design above:
   snapshots) holds nothing else that chains. The trait is
   `put_after(prev, label, data)`, `tail()`, `successor(id)` and
   `prune(below)` ("delete every blob below `below`, members and losers
-  alike"), plus a provided `put_after_tail(label, make)`: the blob is built
-  from the tail (id and data) and put after it. A claim uses it. The
-  default loops (read the tail, put after it, again on `Lost`, so `make`
-  must be pure); a store that can decide it atomically overrides it (disk:
-  under one `flock`; without it a claimant lost 600 times in a row to a
-  writer appending every few ms); `ChainMeta` is a free-form `label` the log parses
+  alike"), plus `put_after_tail(label, make)`: the blob is built
+  from the tail (id and data) and put after it. A claim uses it.
+  `put_after_tail_by_links` loops (read the tail, put after it, again on
+  `Lost`, so `make` must be pure); a store that can decide it atomically
+  does (disk: under one `flock`; without it a claimant lost 600 times in a
+  row to a writer appending every few ms); `ChainMeta` is a free-form `label` the log parses
   (`log-claim-<gen>`, `log-batch-<gen>`, `snapshot-<log>-<at>.snap`).
+- **Every method is required.** `BlobBackend`, `Chain` and `LeaseChain`
+  have no provided methods: `put_after_tail`, `put_loose`, `newest_loose`,
+  `exists` and `mark_owner` are a store's choice, not a default it may
+  forget to override. The shared ways are free functions a store names:
+  `put_after_tail_by_links`, `put_loose_linked` and `newest_loose_at_tail`
+  (memory, disk, Telegram: snapshots are chain members, found at the tail;
+  Discord lists and posts them plainly), `exists_by_get` (a one-byte read
+  where the store reads ranges; Telegram and Discord look the message up
+  instead). A decorator (`Arc<B>`, the simulator's `Faulty<B>`, the blob
+  layer's `Erased<B>` and `MetricsBackend`) implements each trait its
+  store does, `LeaseChain` included, and forwards every method; the
+  `conformance` feature of `pigeonhole-storage-api` has a store that
+  records its calls and the checks each decorator's tests run.
 - **No `chain_from`.** Replay walks back along the `prev` links in the blobs
   (as the channel log did); the Telegram store reads the whole page below a
   location it misses, so a walk down reads each page once.

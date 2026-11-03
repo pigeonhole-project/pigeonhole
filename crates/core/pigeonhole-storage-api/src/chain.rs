@@ -5,6 +5,12 @@
 //! exactly one gets [`After::Won`], and every later reader agrees which. How
 //! a store decides it is its own business: the order of ids in a channel, a
 //! create-once operation, a conditional write, a lock.
+//!
+//! [`Chain`] and [`LeaseChain`] have no provided methods: a store chooses
+//! each behaviour (the shared ways are free functions here, named for what
+//! they do), and a decorator must forward every method, or it does not
+//! compile. A provided method a decorator forgot would quietly swap a
+//! store's own way for the default.
 
 use crate::BlobBackend;
 use anyhow::Result;
@@ -53,75 +59,96 @@ pub trait Chain: BlobBackend {
     /// tail's id and data (`None` for an empty chain) and returns the blob,
     /// or `None` to put nothing (then the result is `None`). Returns the new
     /// blob's id once it won. `hint`: the tail as the caller last saw it, if
-    /// it did.
+    /// it did. `make` may be called more than once: it must be pure.
     ///
-    /// The default puts after `hint`, or after the tail it reads (on a
-    /// channel, a post to learn the top), again while another blob wins
-    /// first, so it may call `make` more than once: `make` must be pure. A
-    /// hint that lost is not followed but read again: the store may answer
-    /// a put after a long-gone blob with the chain's evidence, not with a
-    /// winner. A store that can decide it atomically (under a lock) should,
-    /// or a busy writer wins every gap between reading the tail and the put.
+    /// A store that can decide it atomically (under a lock) should, or a
+    /// busy writer wins every gap between reading the tail and the put;
+    /// [`put_after_tail_by_links`] is the way by [`Self::put_after`].
     async fn put_after_tail(
         &self,
         hint: Option<&Self::Id>,
         label: &str,
         make: &MakeAfter<'_, Self::Id>,
-    ) -> Result<Option<Self::Id>> {
-        let mut hinted = hint.is_some();
-        let mut tail = match hint {
-            Some(h) => Some(h.clone()),
-            None => self.tail().await?.map(|t| t.id),
-        };
-        // Bounded: writers appending meanwhile settle soon; a store whose
-        // chain never does is a bug, and must not post copies forever.
-        for _ in 0..PUT_AFTER_TAIL_ATTEMPTS {
-            let data = match &tail {
-                Some(id) => Some(crate::collect_stream(self.get(id, None).await?).await?),
-                None => None,
-            };
-            let Some(blob) = make(tail.as_ref().zip(data.as_deref()))? else { return Ok(None) };
-            match self.put_after(tail.as_ref(), label, blob).await? {
-                After::Won(id) => return Ok(Some(id)),
-                After::Lost(_) if std::mem::take(&mut hinted) => tail = self.tail().await?.map(|t| t.id),
-                After::Lost(winner) => tail = Some(winner.id),
-            }
-        }
-        anyhow::bail!("{label}: lost the link {PUT_AFTER_TAIL_ATTEMPTS} times in a row; the chain does not settle")
-    }
+    ) -> Result<Option<Self::Id>>;
 
     /// Put a blob that needs no order but "the newest of its kind"
     /// ([`Self::newest_loose`]): snapshots. `after` is the newest such blob
     /// the caller knows of (the one it put last), if any.
     ///
-    /// The default links it into the chain (a store that cannot list finds
-    /// the newest blob only by following links): after `after` when given,
-    /// which needs no look for the tail (on a channel, a post to learn its
-    /// top); after the tail when not, or when another blob already follows
-    /// `after`. A store that can list should put it plainly, since a link may
-    /// cost a scarce, rate-limited call.
-    async fn put_loose(&self, after: Option<&Self::Id>, label: &str, data: Bytes) -> Result<Self::Id> {
-        if let Some(prev) = after {
-            // Lost: ours is garbage, like any loser's.
-            if let After::Won(id) = self.put_after(Some(prev), label, data.clone()).await? {
-                return Ok(id);
-            }
-        }
-        for _ in 0..PUT_AFTER_TAIL_ATTEMPTS {
-            let tail = self.tail().await?;
-            match self.put_after(tail.as_ref().map(|t| &t.id), label, data.clone()).await? {
-                After::Won(id) => return Ok(id),
-                After::Lost(_) => continue,
-            }
-        }
-        anyhow::bail!("{label}: lost the link {PUT_AFTER_TAIL_ATTEMPTS} times in a row; the chain does not settle")
-    }
+    /// A store that lists puts it plainly (a link may cost a scarce,
+    /// rate-limited call); one that cannot list finds the newest blob only
+    /// by following links: [`put_loose_linked`]. A [`LeaseChain`]'s chain
+    /// holds lease records only, so its loose blobs must not be linked.
+    async fn put_loose(&self, after: Option<&Self::Id>, label: &str, data: Bytes) -> Result<Self::Id>;
 
     /// The newest blob [`Self::put_loose`] put with a label starting with
-    /// `prefix`. The default: the chain's tail, if its label matches.
-    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
-        Ok(self.tail().await?.filter(|t| t.label.starts_with(prefix)))
+    /// `prefix` ([`newest_loose_at_tail`] where loose blobs are linked).
+    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>>;
+}
+
+/// [`Chain::put_after_tail`] by [`Chain::put_after`]: after `hint`, or after
+/// the tail it reads (on a channel, a post to learn the top), again while
+/// another blob wins first. A hint that lost is not followed but read
+/// again: the store may answer a put after a long-gone blob with the
+/// chain's evidence, not with a winner.
+pub async fn put_after_tail_by_links<C: Chain + ?Sized>(
+    chain: &C,
+    hint: Option<&C::Id>,
+    label: &str,
+    make: &MakeAfter<'_, C::Id>,
+) -> Result<Option<C::Id>> {
+    let mut hinted = hint.is_some();
+    let mut tail = match hint {
+        Some(h) => Some(h.clone()),
+        None => chain.tail().await?.map(|t| t.id),
+    };
+    // Bounded: writers appending meanwhile settle soon; a store whose
+    // chain never does is a bug, and must not post copies forever.
+    for _ in 0..PUT_AFTER_TAIL_ATTEMPTS {
+        let data = match &tail {
+            Some(id) => Some(crate::collect_stream(chain.get(id, None).await?).await?),
+            None => None,
+        };
+        let Some(blob) = make(tail.as_ref().zip(data.as_deref()))? else { return Ok(None) };
+        match chain.put_after(tail.as_ref(), label, blob).await? {
+            After::Won(id) => return Ok(Some(id)),
+            After::Lost(_) if std::mem::take(&mut hinted) => tail = chain.tail().await?.map(|t| t.id),
+            After::Lost(winner) => tail = Some(winner.id),
+        }
     }
+    anyhow::bail!("{label}: lost the link {PUT_AFTER_TAIL_ATTEMPTS} times in a row; the chain does not settle")
+}
+
+/// [`Chain::put_loose`] for a store that finds the newest blob by its
+/// links: the blob becomes a chain member. After `after` when given, which
+/// needs no look for the tail (on a channel, a post to learn its top);
+/// after the tail when not, or when another blob already follows `after`.
+pub async fn put_loose_linked<C: Chain + ?Sized>(
+    chain: &C,
+    after: Option<&C::Id>,
+    label: &str,
+    data: Bytes,
+) -> Result<C::Id> {
+    if let Some(prev) = after {
+        // Lost: ours is garbage, like any loser's.
+        if let After::Won(id) = chain.put_after(Some(prev), label, data.clone()).await? {
+            return Ok(id);
+        }
+    }
+    for _ in 0..PUT_AFTER_TAIL_ATTEMPTS {
+        let tail = chain.tail().await?;
+        match chain.put_after(tail.as_ref().map(|t| &t.id), label, data.clone()).await? {
+            After::Won(id) => return Ok(id),
+            After::Lost(_) => continue,
+        }
+    }
+    anyhow::bail!("{label}: lost the link {PUT_AFTER_TAIL_ATTEMPTS} times in a row; the chain does not settle")
+}
+
+/// [`Chain::newest_loose`] where [`put_loose_linked`] put them: the chain's
+/// tail, if its label matches.
+pub async fn newest_loose_at_tail<C: Chain + ?Sized>(chain: &C, prefix: &str) -> Result<Option<Linked<C::Id>>> {
+    Ok(chain.tail().await?.filter(|t| t.label.starts_with(prefix)))
 }
 
 /// A [`Chain`] that can hold a log by a lease (docs/discord-lease.md): its
@@ -130,9 +157,9 @@ pub trait Chain: BlobBackend {
 ///
 /// Its chain holds lease records only: a claim reads the tail as one (it
 /// decodes it). So its [`Chain::put_loose`] must put a plain blob, not a
-/// chain member (the default links one): snapshots in the log's store would
-/// otherwise become the tail and break the next claim. It can, since it
-/// lists ([`Self::list_after`]).
+/// chain member ([`put_loose_linked`] links one): snapshots in the log's
+/// store would otherwise become the tail and break the next claim. It can,
+/// since it lists ([`Self::list_after`]).
 #[async_trait]
 pub trait LeaseChain: Chain {
     /// When the store stamped blob `id`, in ms of the store's own clock:
@@ -155,7 +182,8 @@ pub trait LeaseChain: Chain {
     async fn list_after(&self, after: Option<&Self::Id>, prefix: &str) -> Result<Vec<Linked<Self::Id>>>;
 }
 
-/// Tries of the default [`Chain::put_after_tail`] before it gives up.
+/// Tries of [`put_after_tail_by_links`] and [`put_loose_linked`] before
+/// they give up.
 pub const PUT_AFTER_TAIL_ATTEMPTS: usize = 64;
 
 /// What [`Chain::put_after_tail`] builds a blob with.

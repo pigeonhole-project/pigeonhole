@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_limits::StoreLimiter;
 use pigeonhole_storage_api::{
-    bytes_stream, After, BlobBackend, BoxByteStream, Chain, CostHint, InstanceInfo, InstanceRole, Linked, MakeAfter,
-    NotFound, OpKind,
+    bytes_stream, exists_by_get, newest_loose_at_tail, put_loose_linked, After, BlobBackend, BoxByteStream, Chain,
+    CostHint, InstanceInfo, InstanceRole, Linked, MakeAfter, NotFound, OpKind,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use segments::Segments;
@@ -260,6 +260,15 @@ impl BlobBackend for DiskBlobStore {
         })
         .await
     }
+
+    /// A directory is one deployment's by setup: nothing to mark.
+    async fn mark_owner(&self, owner: pigeonhole_storage_api::Owner) -> Result<pigeonhole_storage_api::Owner> {
+        Ok(owner)
+    }
+
+    async fn exists(&self, id: &Self::Id) -> Result<bool> {
+        exists_by_get(self, id).await
+    }
 }
 
 /// The successor of a record is decided under the `flock`: a `put_after`
@@ -295,6 +304,15 @@ impl Chain for DiskBlobStore {
     async fn successor(&self, id: &Self::Id) -> Result<Option<Linked<Self::Id>>> {
         let key = id.key;
         self.locked(move |s| Ok(s.next.get(&Some(key)).map(|&n| Self::linked(s, n)))).await
+    }
+
+    /// Linked: the store does not list its loose blobs.
+    async fn put_loose(&self, after: Option<&Self::Id>, label: &str, data: Bytes) -> Result<Self::Id> {
+        put_loose_linked(self, after, label, data).await
+    }
+
+    async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<Self::Id>>> {
+        newest_loose_at_tail(self, prefix).await
     }
 
     /// Atomic: the tail is read and the blob appended under one `flock`

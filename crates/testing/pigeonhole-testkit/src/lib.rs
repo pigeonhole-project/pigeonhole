@@ -7,7 +7,8 @@ use pigeonhole_blob::{collect_stream, BlobBackend, BlobId, Owner};
 /// Shared suite for [`BlobBackend`].
 ///
 /// Covers: put/get/range/delete, repeat delete, empty rejected, near-`max_blob_size`
-/// blob, monotonic keys, candidates covering written keys.
+/// blob, monotonic keys, candidates covering written keys, `exists` before
+/// and after a delete.
 pub async fn run_typed_conformance<B>(backend: &B) -> Result<()>
 where
     B: BlobBackend,
@@ -71,8 +72,10 @@ where
 
     // Delete + repeat delete (not-found = ok).
     let del_key = B::key(&id);
+    assert!(backend.exists(&id).await?, "a blob put is there");
     backend.delete(&[del_key]).await?;
     assert!(backend.get(&id, None).await.is_err());
+    assert!(!backend.exists(&id).await?, "a deleted blob is gone, not an error");
     backend.delete(&[del_key]).await?;
 
     // Cleanup remaining blobs (best-effort).

@@ -7,7 +7,7 @@ use crate::BoxByteStream;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_types::{BackendLimits, ByteRange};
+use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fmt::Debug;
 
@@ -208,7 +208,10 @@ impl BlobId {
     }
 }
 
-/// Typed backend with associated Id/Key (stage 1.1).
+/// Typed backend with associated Id/Key.
+///
+/// No provided methods (see [`crate::Chain`]): a decorator forwards each
+/// one, [`crate::conformance`] checks that it does.
 #[async_trait]
 pub trait BlobBackend: Send + Sync + 'static {
     type Id: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static;
@@ -241,26 +244,31 @@ pub trait BlobBackend: Send + Sync + 'static {
     /// Mark the store as `owner`'s unless it is marked already; the owner it
     /// is marked for. Another one than `owner`: another deployment uses this
     /// store (its blobs are safe from our sweep either way, see [`Owner`]).
-    /// A channel marks itself with a pinned message; the default marks
-    /// nothing (a directory or memory is one deployment's by setup).
-    async fn mark_owner(&self, owner: Owner) -> Result<Owner> {
-        Ok(owner)
-    }
+    /// A channel marks itself with a pinned message; a directory or memory
+    /// is one deployment's by setup, and returns `owner`.
+    async fn mark_owner(&self, owner: Owner) -> Result<Owner>;
 
     /// Whether blob `id` is still there, asked of the store itself (no cache
     /// of ours may answer): what a verify pass probes. `Ok(false)` only for
-    /// a blob that is gone; a store that cannot answer is an error. The
-    /// default reads the blob.
-    async fn exists(&self, id: &Self::Id) -> Result<bool> {
-        let read = match self.get(id, None).await {
-            Ok(stream) => crate::collect_stream(stream).await.map(|_| ()),
-            Err(e) => Err(e),
-        };
-        match read {
-            Ok(()) => Ok(true),
-            Err(e) if e.is::<crate::NotFound>() => Ok(false),
-            Err(e) => Err(e),
-        }
+    /// a blob that is gone ([`crate::Failure::NotFound`]); a store that
+    /// cannot answer is an error. It must not download the blob:
+    /// [`exists_by_get`] reads one byte where the store reads ranges.
+    async fn exists(&self, id: &Self::Id) -> Result<bool>;
+}
+
+/// [`BlobBackend::exists`] by a read: of one byte where the store reads
+/// ranges (a blob is never empty), else of the whole blob. Not found by
+/// [`crate::Failure::of`], wherever in the error it is.
+pub async fn exists_by_get<B: BlobBackend + ?Sized>(backend: &B, id: &B::Id) -> Result<bool> {
+    let range = (backend.limits().supports_range != RangeSupport::None).then_some(0..1);
+    let read = match backend.get(id, range).await {
+        Ok(stream) => crate::collect_stream(stream).await.map(|_| ()),
+        Err(e) => Err(e),
+    };
+    match read {
+        Ok(()) => Ok(true),
+        Err(e) if crate::Failure::of(&e) == crate::Failure::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 

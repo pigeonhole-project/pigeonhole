@@ -796,6 +796,12 @@ mod tests {
     impl BlobBackend for MockMem {
         type Id = Id;
         type Key = u64;
+        async fn mark_owner(&self, owner: pigeonhole_storage_api::Owner) -> Result<pigeonhole_storage_api::Owner> {
+            Ok(owner)
+        }
+        async fn exists(&self, id: &Self::Id) -> Result<bool> {
+            crate::exists_by_get(self, id).await
+        }
         fn instance(&self) -> &InstanceInfo {
             &self.info
         }

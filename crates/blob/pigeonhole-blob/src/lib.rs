@@ -28,6 +28,7 @@ pub use replicated::{
     Replicated, SealedChunk, ShardSpec,
 };
 pub use typed::{
-    load_id, store_id, BlobBackend, BlobId, BlobLocator, CostHint, InstanceInfo, InstanceRole, OpKind, OrderedKey,
+    exists_by_get, load_id, store_id, BlobBackend, BlobId, BlobLocator, CostHint, InstanceInfo, InstanceRole, OpKind,
+    OrderedKey,
 };
 pub use upload_pins::{UploadPin, UploadPins};
