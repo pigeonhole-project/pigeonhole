@@ -117,7 +117,9 @@ sim:
 	$(call SIM,-p pigeonhole-sim)
 
 # Every library's tests under the simulator (the binary and its servers are
-# not built there).
+# not built there), the long variants of the scenarios included
+# (PIGEONHOLE_SIM_LONG: s3_stress runs ten times the ops).
+sim-all: export PIGEONHOLE_SIM_LONG = 1
 sim-all:
 	$(call SIM,--workspace --exclude pigeonhole)
 

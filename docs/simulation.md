@@ -1,8 +1,8 @@
 # Deterministic simulation (madsim)
 
-Status: **implemented** (steps 0–5; scenario 4 left, 5 in part: a
-three-node Raft cluster over a fake chat, `tests/cluster.rs`); spike
-findings below. Read [fault-injection.md](fault-injection.md) first: this
+Status: **implemented** (steps 0–5; scenarios 1–4, 5 in part: a
+three-node Raft cluster over a fake chat, `tests/cluster.rs`; § What runs
+lists every test); spike findings below. Read [fault-injection.md](fault-injection.md) first: this
 design takes its fault model and decorator and makes the rest of the run —
 task order, time, randomness, crashes — reproducible from one seed too.
 
@@ -148,7 +148,8 @@ replayed with `MADSIM_TEST_SEED`.
    committed live parts.
 4. **Snapshots and restore**: crashes while a snapshot is stored, while the
    log is rebased, after the old snapshot is removed; boot always finds the
-   snapshot its log names; `restore --lossy` after a lost log.
+   snapshot its log names. (`restore --lossy` after a lost log is tested on
+   tokio only: `bin/pigeonhole/tests/e2e_memory_restore.rs`.)
 5. **Raft between nodes**: partitions, a slow node's store, leader changes
    (the step that motivates the most). Done in part: `cluster.rs` runs three
    tablets as one cluster over openraft-chat's `FakeChat` (not madsim's
@@ -198,12 +199,31 @@ intercepts entropy).
 - openraft runs on `MadsimRuntime` (`pigeonhole-meta/src/sim_runtime.rs`).
 - Gated out under `cfg(madsim)`: the REAPI ephemeral server and its tests,
   the binary, one test that builds its own runtime.
-- Scenarios are in `crates/testing/pigeonhole-sim/tests`: 1–3 in
-  `log_model`, `takeover`, `disk`, `s3_stress`; `retention` (a takeover,
-  then the newest base's snapshot damaged: a third boot replays from an
-  older base, [log-retention.md](log-retention.md)); `cluster` (scenario 5
-  in part). Processes are tasks on one madsim node, crashes are dropped
-  handles plus `SimFs::crash`.
+- Processes are tasks on one madsim node; a crash is their handles
+  aborted and the stores dropped, plus `SimFs::crash` where the log is on
+  the simulated disk.
+
+## What runs
+
+`make sim` runs `crates/testing/pigeonhole-sim` under the simulator, one
+seed per test unless `MADSIM_TEST_NUM` says more (well under a minute);
+`make sim-all` runs every library's tests there, with
+`PIGEONHOLE_SIM_LONG=1` (`s3_stress` with ten times the ops). The same
+tests also run on tokio in `make test` (one fixed sequence of draws),
+but `cluster.rs`, a minute of real time there.
+
+| test file | scenario | what it does | checked |
+|---|---|---|---|
+| `log_model.rs` | 1 | writers of rising generations overlap on one chain log (memory; `SimFs` disk), each appending until fenced or until a fault leaves its outcome unknown; mild and harsh faults from `Faulty` | a reader finds every acknowledged entry where it was acknowledged; no position acknowledged twice |
+| `takeover.rs` | 2 | A writes, B boots on the same log at a random moment | B holds all A acknowledged; A stops `Fenced` |
+| `disk.rs` | 1, 2 | the tablet on `SimFs`: a takeover of a busy disk log; a power failure (`SimFs::crash`, a torn last write) at a random moment | every acknowledged command after the reboot |
+| `s3_stress.rs` | 3 | S3 put / copy / delete / get workers, the sweeper and the repairer on one node, the log and snapshots on `SimFs`, the stores faulty; `a_node_killed_mid_run_reopens_and_goes_on`: two members, the node killed after a random number of ops (tasks aborted, `SimFs::crash` with a torn write), reopened, the workers going on from where they were; a damaged replica read around; the cooler racing rewrites | no damaged read; once faults stop, every object reads back whole, every live chunk has a replica on every member after repair passes, backend keys equal committed live parts after a sweep, a restart reads the same objects; the cooler loses no rewrite and leaks no chunk |
+| `snapshot_crash.rs` | 4 | the process dies between storing a snapshot and rebasing the log on it, between the rebase and removing the dropped base's snapshot, or during that removal (stores that never return from that point) | the next boot finds its base and holds every acknowledged command, a third boot agrees; at most the one snapshot the crash was handling is left behind the oldest base (it is: [log-retention.md](log-retention.md), open questions) |
+| `retention.rs` | 4 | a takeover, then the newest base's snapshot damaged ([log-retention.md](log-retention.md)) | a third boot replays from an older base and loses nothing; with one base kept the boot refuses |
+| `cluster.rs` | 5 (part) | three tablets as one Raft cluster over openraft-chat's `FakeChat`: delayed, lost and doubled posts, one node at a time cut off and healed | every command a leader acknowledged survives; the nodes end up equal |
+
+Not covered: a slow node's store in the cluster, `restore --lossy` under
+the simulator, crashes of a cluster node.
 
 ## Spike findings (2026-10-29, madsim 0.2.34, madsim-tokio 0.2.30, macOS arm64)
 
@@ -264,7 +284,7 @@ where entropy is intercepted, and add Linux with the patched `getrandom`.
    `SimIo` with crashes and torn writes.
 3. ✅ **Determinism**: the clock facade, maps whose order matters, until the
    determinism check passes on every scenario.
-4. ✅ **Scenarios 1–3** (4 left), with the faults of step 11 drawing from the simulator.
+4. ✅ **Scenarios 1–4** (5 in part), with the faults of step 11 drawing from the simulator.
 5. ✅ **Docs**: how to run and replay a seed (README § Tests), what each
    scenario checks.
 
