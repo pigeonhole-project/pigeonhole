@@ -182,7 +182,7 @@ async fn a_rebase_prunes_messages_and_their_links() {
         a.append(1, &[entry(i)]).await.unwrap();
     }
     let messages = channel.message_ids().len();
-    a.rebase(1, Base { at: 3, term: 1, leader: 0, snapshot: SnapshotRef("s3".into()) }, 1).await.unwrap();
+    a.rebase(1, Base { at: 3, term: 1, leader: 0, snapshot: SnapshotRef("s3".into()) }, 1, &[]).await.unwrap();
     a.settle().await; // the collection runs in the background
     assert!(channel.message_ids().contains(&foreign));
     assert!(channel.message_ids().len() < messages, "pruned");
@@ -392,7 +392,7 @@ async fn a_lease_log_rebase_keeps_the_newest_lease_record() {
     for i in 1..=10 {
         a.append(1, &[entry(i)]).await.unwrap();
     }
-    a.rebase(1, Base { at: 8, term: 1, leader: 0, snapshot: SnapshotRef("s8".into()) }, 1).await.unwrap();
+    a.rebase(1, Base { at: 8, term: 1, leader: 0, snapshot: SnapshotRef("s8".into()) }, 1, &[]).await.unwrap();
     a.settle().await;
     a.append(1, &[entry(11)]).await.unwrap();
     let b = leased(&channel);

@@ -180,8 +180,9 @@ impl pigeonhole_meta::LogStore for GatedLog {
         gen: u64,
         base: pigeonhole_meta::Base,
         keep: usize,
+        unusable: &[pigeonhole_meta::Base],
     ) -> pigeonhole_meta::LogResult<Vec<pigeonhole_meta::Base>> {
-        self.inner.rebase(gen, base, keep).await
+        self.inner.rebase(gen, base, keep, unusable).await
     }
 
     async fn settle(&self) {

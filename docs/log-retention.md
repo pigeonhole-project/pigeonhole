@@ -117,7 +117,11 @@ it actually loaded (`Shared::base`), not at the log's newest.
 
 The tablet logs the fallback, counts it
 (`pigeonhole_meta_snapshot_fallbacks_total`) and asks for a snapshot right
-after the boot, so the damaged one stops being the newest base.
+after the boot, so the damaged one stops being the newest base. That rebase
+is told which bases failed (`rebase(.., unusable)`): they are dropped first,
+whatever `keep` says, so the base that loaded stays kept. Counting from the
+log's newest, `keep_snapshots = 2` would otherwise keep the new base and the
+damaged one, and drop the one that worked.
 
 ## Point-in-time restore (later)
 

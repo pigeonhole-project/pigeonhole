@@ -755,10 +755,12 @@ impl MetaStore {
         };
         let fell_back = match &d.base {
             Some(newest) => {
-                let base = load_some_base(&mut sm, snapshots.as_ref(), newest, &d.older, head.log_id).await?;
+                let (base, unusable) =
+                    load_some_base(&mut sm, snapshots.as_ref(), newest, &d.older, head.log_id).await?;
                 shared.based.store(base.at, Ordering::SeqCst);
-                let fell_back = base != *newest;
                 *shared.base.lock().unwrap() = Some(base);
+                let fell_back = !unusable.is_empty();
+                *shared.unusable.lock().unwrap() = unusable;
                 fell_back
             }
             None => false,
@@ -1226,18 +1228,20 @@ fn report_stop(mut stop: watch::Receiver<Option<Stop>>, gen: u64) {
 }
 
 /// Restore the states from the newest base, or else from the newest older
-/// base the log keeps (the log is readable from there): the base loaded.
+/// base the log keeps (the log is readable from there): the base loaded,
+/// and the newer ones that failed (the next rebase drops them).
 async fn load_some_base(
     sm: &mut raft::StateMachine,
     snapshots: &dyn SnapshotStore,
     newest: &Base,
     older: &[Base],
     log_id: LogId,
-) -> Result<Base> {
+) -> Result<(Base, Vec<Base>)> {
     let first = match load_base(sm, snapshots, newest, log_id).await {
-        Ok(()) => return Ok(newest.clone()),
+        Ok(()) => return Ok((newest.clone(), Vec::new())),
         Err(e) => e,
     };
+    let mut failed = vec![newest.clone()];
     for base in older {
         tracing::warn!(
             snapshot = %newest.snapshot.0,
@@ -1250,9 +1254,12 @@ async fn load_some_base(
         match load_base(sm, snapshots, base, log_id).await {
             Ok(()) => {
                 telemetry::record_snapshot_fallback();
-                return Ok(base.clone());
+                return Ok((base.clone(), failed));
             }
-            Err(e) => tracing::warn!(snapshot = %base.snapshot.0, error = %format!("{e:#}"), "older base unusable too"),
+            Err(e) => {
+                tracing::warn!(snapshot = %base.snapshot.0, error = %format!("{e:#}"), "older base unusable too");
+                failed.push(base.clone());
+            }
         }
     }
     Err(first)
@@ -1463,7 +1470,7 @@ pub async fn restore_lossy(log: &dyn LogStore, snapshots: &dyn SnapshotStore) ->
     let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
     let stored = StoredSnapshot { log_id: head.log_id, at: 1, data };
     let snapshot = snapshots.put(&stored, None).await.context("store the restored snapshot")?;
-    log.rebase(gen, raft::base_of(&meta, snapshot), 1).await.context("start the new log from it")?;
+    log.rebase(gen, raft::base_of(&meta, snapshot), 1, &[]).await.context("start the new log from it")?;
     Ok(old_position)
 }
 

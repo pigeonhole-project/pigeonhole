@@ -212,10 +212,12 @@ pub trait LogStore: Send + Sync + 'static {
     /// Start the log from `base` (a snapshot already stored), keeping the
     /// `keep` newest bases (≥ 1, `base` included) and the entries after the
     /// oldest of them; entries before it are collected in the background.
-    /// Returns the bases no longer kept: nothing starts from their
-    /// snapshots any more. `base.at` may be past the head (a snapshot
-    /// installed from elsewhere): the log is then empty up to it.
-    async fn rebase(&self, gen: u64, base: Base, keep: usize) -> LogResult<Vec<Base>>;
+    /// Bases in `unusable` (their snapshots failed to load: a fallback
+    /// boot) are dropped whatever `keep` says, so they never take the place
+    /// of one that works. Returns the bases no longer kept: nothing starts
+    /// from their snapshots any more. `base.at` may be past the head (a
+    /// snapshot installed from elsewhere): the log is then empty up to it.
+    async fn rebase(&self, gen: u64, base: Base, keep: usize, unusable: &[Base]) -> LogResult<Vec<Base>>;
 
     /// Wait for background work (the collection after a rebase); tests use
     /// it before looking at what a rebase dropped.

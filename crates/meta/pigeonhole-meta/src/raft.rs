@@ -118,6 +118,9 @@ pub(crate) struct Shared {
     /// or an older one it keeps when the newest snapshot could not be
     /// loaded. Raft sees the log as purged up to it.
     pub(crate) base: Mutex<Option<Base>>,
+    /// Bases newer than `base` whose snapshots failed to load at boot: the
+    /// next rebase drops them rather than the one that worked.
+    pub(crate) unusable: Mutex<Vec<Base>>,
     /// Snapshots nothing starts from any more, for the remover task
     /// ([`spawn_removals`]): removing one may download it (to find its
     /// parts), and neither the log's writer nor the state machine waits.
@@ -133,6 +136,7 @@ impl Shared {
             current: Mutex::new(None),
             kept: tokio::sync::Notify::new(),
             base: Mutex::new(None),
+            unusable: Mutex::default(),
             removals: spawn_removals(snapshots),
         }
     }
@@ -357,7 +361,8 @@ impl LogAdapter {
         };
         let (at, new_ref) = (base.at, base.snapshot.clone());
         let t0 = std::time::Instant::now();
-        let r = self.log.rebase(gen, base.clone(), keep.0).await;
+        let unusable = self.shared.unusable.lock().unwrap().clone();
+        let r = self.log.rebase(gen, base.clone(), keep.0, &unusable).await;
         crate::telemetry::record_log_write("rebase", r.is_ok(), t0.elapsed());
         let dropped = r.map_err(|e| {
             let msg = format!("purge up to {id}: {e}");
@@ -369,6 +374,8 @@ impl LogAdapter {
         self.tail.lock().unwrap().retain(|p, _| *p > at);
         self.shared.based.store(at, Ordering::SeqCst);
         *self.shared.base.lock().unwrap() = Some(base);
+        // Dropped: no rebase sees them again.
+        self.shared.unusable.lock().unwrap().clear();
         // Nothing starts from them any more.
         for old in dropped.into_iter().filter(|o| o.snapshot != new_ref) {
             self.shared.remove(old.snapshot);

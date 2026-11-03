@@ -418,7 +418,7 @@ async fn snapshot_of_another_state_version_refuses_to_load() {
     let data = raft::RaftSnapshot { meta: meta.clone(), tablet }.encode();
     let stored = StoredSnapshot { log_id: head.log_id, at: head.position, data };
     let snapshot = snaps_of(&log_dir).put(&stored, None).await.unwrap();
-    log.rebase(2, raft::base_of(&meta, snapshot), 1).await.unwrap();
+    log.rebase(2, raft::base_of(&meta, snapshot), 1, &[]).await.unwrap();
     drop(log);
 
     let err = open_dir(&log_dir, counter()).await.err().expect("boot must fail");
@@ -569,6 +569,54 @@ async fn a_boot_falls_back_to_an_older_base_when_the_newest_snapshot_is_unreadab
             (_, other) => panic!("keep {keep}: {:?}", other.map(|_| ())),
         }
     }
+}
+
+/// After a fallback boot the next rebase drops the damaged base, not the
+/// one that loaded: with two kept, the log keeps the new base and the one
+/// the boot started from, and the damaged snapshot is removed.
+#[tokio::test]
+async fn after_a_fallback_boot_the_base_that_loaded_is_kept_and_the_damaged_one_dropped() {
+    use crate::{BlobSnapshotStore, ChainLogStore};
+    let (log_chat, snap_chat) = (Arc::new(MemoryBlobStore::new()), Arc::new(MemoryBlobStore::new()));
+    let snapshots = Arc::new(Unreadable { inner: Arc::new(BlobSnapshotStore::new(snap_chat)), bad: Mutex::default() });
+    let opts = MetaOptions { snapshot_every: Some(5), keep_snapshots: 2, ..MetaOptions::default() };
+    let open =
+        || MetaStore::open(Arc::new(ChainLogStore::new(log_chat.clone())), snapshots.clone(), counter(), opts.clone());
+    let a = open().await.unwrap();
+    for i in 0..23u64 {
+        a.propose::<Counter>(op(i, 1)).await.unwrap().unwrap();
+    }
+    wait_base(&a, 15).await;
+    let d = a.log.discover().await.unwrap().unwrap();
+    let (damaged, good) = (d.base.clone().unwrap(), d.older[0].clone());
+    *snapshots.bad.lock().unwrap() = Some(damaged.snapshot.clone());
+    drop(a);
+
+    let b = open().await.unwrap();
+    // It booted from the older base and asked for a snapshot at once: the
+    // log moves onto it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let d = loop {
+        let d = b.log.discover().await.unwrap().unwrap();
+        if d.base.as_ref().is_some_and(|b| b.snapshot != damaged.snapshot) {
+            break d;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the log never moves off the damaged base");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(d.older, vec![good.clone()], "kept: the new base and the one that loaded");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while snapshots.inner.get(&damaged.snapshot).await.is_ok() {
+        assert!(tokio::time::Instant::now() < deadline, "the damaged snapshot is never removed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    snapshots.inner.get(&good.snapshot).await.expect("the base that loaded stays");
+    drop(b);
+
+    // The new base damaged too: the next boot still has one to fall back on.
+    *snapshots.bad.lock().unwrap() = d.base.map(|b| b.snapshot);
+    let c = open().await.unwrap();
+    assert_eq!(value(&c), 23);
 }
 
 /// A follower starts building a snapshot of its own (at 4), then installs a

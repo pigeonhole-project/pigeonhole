@@ -927,7 +927,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         )
     }
 
-    async fn rebase(&self, gen: u64, base: Base, keep: usize) -> LogResult<Vec<Base>> {
+    async fn rebase(&self, gen: u64, base: Base, keep: usize, unusable: &[Base]) -> LogResult<Vec<Base>> {
         let (_, old_tip) = self.owned(gen)?;
         let (at, old_at) = (base.at, old_tip.base_at());
         if at < old_at {
@@ -936,9 +936,16 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         // Past the head (a snapshot from elsewhere): the log jumps to `at`.
         let (first, head_term) =
             if at > old_tip.position { (at + 1, base.term) } else { (old_tip.position + 1, old_tip.head_term) };
-        // The bases kept, newest first; a repeated base counts once.
-        let mut older: Vec<Base> = old_tip.base.iter().chain(&old_tip.older).filter(|b| **b != base).cloned().collect();
-        let dropped = older.split_off(older.len().min(keep.max(1) - 1));
+        // The bases kept, newest first; a repeated base counts once, an
+        // unusable one not at all.
+        let (mut older, mut dropped): (Vec<Base>, Vec<Base>) = old_tip
+            .base
+            .iter()
+            .chain(&old_tip.older)
+            .filter(|b| **b != base)
+            .cloned()
+            .partition(|b| !unusable.contains(b));
+        dropped.extend(older.split_off(older.len().min(keep.max(1) - 1)));
         let w = Write { first, entries: Vec::new(), head_term, base: Some((base, older)), vote: None };
         let tip = self.write(gen, w).await?;
         // The bases are durable; dropping what lies behind them is best effort.
