@@ -311,3 +311,59 @@ async fn a_claim_after_a_stale_tail_is_fenced_and_the_next_goes_on() {
     assert!(matches!(b.append(2, &[entry(99)]).await, Err(LogError::Fenced { current: 3 })));
     assert_eq!(history(store(&channel).as_ref()).await, vec![1, 2, 3]);
 }
+
+/// A log on a reused chat: 2000 messages deleted below its first claim,
+/// with the real empty-id rule (re-read 5 times, 2 s apart). Its first
+/// member follows the anchor, so neither the claim nor a later boot whose
+/// tail is that claim reads the chat below it or waits on its empty ids.
+/// Before the anchor (the first member checked from id 1): 141 reads and
+/// 10 s for the first boot, 122 reads and 10 s for the second; now 21 (the
+/// walk that finds no member, once) and 2, no wait.
+#[tokio::test(start_paused = true)]
+async fn a_log_on_a_reused_chat_does_not_read_the_whole_chat() {
+    let channel = Arc::new(FakeChannel::new(77));
+    for _ in 0..2000 {
+        let id = channel.post_text();
+        channel.remove(id);
+    }
+    let real = || {
+        let limiter =
+            Arc::new(ChatLimiter::new(pigeonhole_storage_telegram::limits().with_all(Rate::new(1000.0, 100.0))));
+        let info = InstanceInfo {
+            id: "log".into(),
+            kind: pigeonhole_storage_telegram::KIND,
+            fingerprint: "tg:1:77".into(),
+            location: "tg:chat:-10077".into(),
+            role: InstanceRole::ReadWrite,
+        };
+        Arc::new(ChainLogStore::new(Arc::new(TelegramBlobStore::new(channel.clone(), limiter, info))))
+    };
+    let t0 = tokio::time::Instant::now();
+    real().claim(1).await.unwrap();
+    let (first_reads, first_time) = (channel.calls().get_messages, t0.elapsed());
+
+    let t1 = tokio::time::Instant::now();
+    let second = real();
+    second.discover().await.unwrap();
+    second.claim(2).await.unwrap();
+    second.append(2, &[entry(1)]).await.unwrap();
+    let (second_reads, second_time) = (channel.calls().get_messages - first_reads, t1.elapsed());
+    eprintln!("first boot: {first_reads} reads, {first_time:?}; boot on the first claim: {second_reads} reads, {second_time:?}");
+    assert!(first_reads <= 22 && first_time < Duration::from_secs(1), "{first_reads} reads, {first_time:?}");
+    assert!(second_reads <= 3 && second_time < Duration::from_secs(1), "{second_reads} reads, {second_time:?}");
+    assert_eq!(history(real().as_ref()).await, vec![1]);
+}
+
+/// Two first claims at once on a fresh channel: one anchor, one writer.
+#[tokio::test]
+async fn racing_first_claims_share_one_anchor() {
+    let channel = Arc::new(FakeChannel::new(77));
+    let (b, c) = (store(&channel), store(&channel));
+    let (rb, rc) = tokio::join!(b.claim(1), c.claim(1));
+    assert_eq!([&rb, &rc].iter().filter(|r| r.is_ok()).count(), 1, "{rb:?} {rc:?}");
+    let anchors = channel.names().iter().filter(|(_, n)| n.starts_with("chain-anchor.bin")).count();
+    assert_eq!(anchors, 1, "{:?}", channel.names());
+    let winner = if rb.is_ok() { b } else { c };
+    winner.append(1, &[entry(1)]).await.unwrap();
+    assert_eq!(history(store(&channel).as_ref()).await, vec![1]);
+}

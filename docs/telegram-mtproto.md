@@ -340,6 +340,33 @@ Measured on the test channels: boot 17 s on a fresh log, 24 s with ~50
 batches to replay; S3 smoke with every store in a channel 61 s (log appends
 are the limit: ~18 sends a minute).
 
+## The anchor and empty ids (2026-11-03)
+
+The first member of a chain used to name no `prev` (`~root`): whether it
+won was "nothing below it in the whole channel names the root", so a log
+started on a reused chat read every id from 1 and re-read every deleted id
+5 times, 2 s apart. On a fake chat with 2000 deleted messages a first
+claim took 141 `getMessages` and 10 s, and every later boot whose tail was
+that claim 122 and 10 s again.
+
+Now the first member follows an **anchor**, as on Discord: a message
+`chain-anchor.bin` the store posts once, before the first member, and
+never prunes. The first member is named `<label>~<anchor>.bin` and checked
+like any other, from the anchor up (no read at all when it lands right
+above it). A store finds the anchor once per process: the walk of `tail`
+that finds no member has read the channel and learns it; otherwise it
+reads the channel up to a probe. With none, it posts one and reads the ids
+since it last looked (settled): of two anchors posted at once the older is
+the anchor and the other is deleted. A `tail` walk stops at a known anchor.
+The same chat now costs 21 reads for the first boot (the walk that finds
+no member, once) and 2 for the later one, with no wait
+(`storage-telegram/tests/chain_log.rs`,
+`a_log_on_a_reused_chat_does_not_read_the_whole_chat`).
+
+Empty ids are settled only where they can change a check's answer: below
+the first member in the range that names `prev` (or, with none, a newer
+blob). One above it is not the first whatever it turns out to be.
+
 ## Text messages (2026-10-28)
 
 Blobs that fit go as **text messages**, the rest as documents; the store

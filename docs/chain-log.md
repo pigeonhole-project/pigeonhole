@@ -244,8 +244,10 @@ Where the code differs from the design above:
   is the newest claim and a loser's `Fenced { current }` is the winner's.
 - **`confirm`** = `successor(our tip)` is none.
 - **Names** (Telegram, Discord: `pigeonhole_storage_api::chain_name`): a
-  member is named `<label>~<prev>.bin` (`root` for the first); a label
-  follows the one rule every store checks (`check_label`: 1 to 128 of
+  member is named `<label>~<prev>.bin`; the first member follows the
+  store's **anchor** (`chain-anchor.bin`, posted once, the oldest wins a
+  race, never pruned), so every member names a `prev`; a label follows the
+  one rule every store checks (`check_label`: 1 to 128 of
   `[A-Za-z0-9._-]`, so never a `~` or a space). Both stores share the rest of their blob side too: a
   blob that fits a text message goes as one, else as a file, with a cache
   of where recent blobs are (`pigeonhole_storage_api::located`), and the
@@ -253,15 +255,20 @@ Where the code differs from the design above:
 - **Telegram**: a member is a document or a text named as above. `put_after` posts with a fresh `random_id` per call (two
   writers putting the same name must get two messages), wins iff nothing in
   `(prev, b)` names `prev` or a blob newer than `prev` (no read when
-  `b == prev + 1`). The second half fences a writer deposed before a
+  `b == prev + 1`; the first member's `prev` is the anchor, so a chain
+  started on a channel with a long history checks the ids since the
+  anchor, not the channel). The second half fences a writer deposed before a
   collection pruned the claim that followed its tip: what the chain went on
   with is still there, and names newer blobs. `tail` and
   `successor` post a probe to learn the top (probes stay: a hole in a checked
   range costs re-reads), so a snapshot (`put_loose`) goes after the one put
   before it when the caller knows it, which needs no probe; `tail` walks down to the newest message that won its
   link. `prune` deletes our members and probes below a point, walking down
-  until a page holds none of ours. Empty ids in a checked range are re-read,
-  then taken as deleted (`ChainOptions`).
+  until a page holds none of ours (the anchor stays). Empty ids in a
+  checked range are re-read, then taken as deleted (`ChainOptions`); only
+  those below the first member that decides the check (one naming `prev`,
+  else one naming a newer blob), since one above it cannot change the
+  answer.
 - **Telegram text messages**: blobs up to ~7.5 KiB (log batches, claims,
   probes) are text messages whose bytes come with `getMessages`
   (telegram-mtproto.md § Text messages); a replay of small batches

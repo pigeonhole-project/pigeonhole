@@ -250,7 +250,9 @@ above, and why:
 - **No `init-log`: an anchor.** The first blob of a chain links from an
   anchor message the store posts on an empty channel; if two stores post one
   at once, the oldest serves both and the other is deleted. The anchor and
-  its link are never pruned.
+  its link are never pruned. The first member names it as its `prev`
+  (`<label>~<anchor>.bin`), so every member names the message whose
+  thread links it.
 - **A put after a pruned message** (a writer deposed before a collection)
   loses: to the successor its thread still names, else to the tail, since
   only a newer base prunes a member. Pruning retires a thread on a deleted

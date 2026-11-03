@@ -56,6 +56,8 @@ pub struct TelegramBlobStore<C> {
     pub(crate) reader: Reader<C>,
     pub(crate) limiter: Arc<ChatLimiter>,
     pub(crate) chain: crate::chain::ChainOptions,
+    /// The chain's anchor, once known ([`crate::chain`]).
+    pub(crate) anchor: tokio::sync::Mutex<crate::chain::Anchor>,
     /// Blobs that fit a text message go as text ([`pigeonhole_storage_api::text`]).
     inline: bool,
 }
@@ -96,6 +98,7 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
             reader: Reader { channel, limiter: limiter.clone(), locations: Arc::new(Locations::new(LOCATION_CACHE)) },
             limiter,
             chain: crate::chain::ChainOptions::default(),
+            anchor: tokio::sync::Mutex::default(),
             inline: true,
         }
     }
