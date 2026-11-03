@@ -31,6 +31,7 @@ use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 // a bucket's refill and the sleeps waiting for it agree.
 use tokio::time::Instant;
 
+pub mod chat;
 mod pool;
 mod run;
 pub use pool::Pool;

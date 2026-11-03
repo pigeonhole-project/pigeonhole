@@ -6,7 +6,9 @@ license.workspace = true
 description = "Rate limiters a pigeonhole store paces its calls with"
 
 [dependencies]
+anyhow = { workspace = true }
 metrics = { workspace = true }
+pigeonhole-storage-api = { workspace = true }
 pigeonhole-types = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

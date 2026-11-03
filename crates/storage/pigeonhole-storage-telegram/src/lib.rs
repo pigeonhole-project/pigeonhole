@@ -20,8 +20,7 @@ mod store;
 
 pub use chain::ChainOptions;
 pub use channel::{
-    windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, ReadVia, Sent, IDS_PER_CALL,
-    TEXT_MAX_CHARS, WINDOW,
+    windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, Sent, IDS_PER_CALL, TEXT_MAX_CHARS, WINDOW,
 };
 pub use limits::limits;
 pub use pigeonhole_storage_api::BlobBackend;

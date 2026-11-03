@@ -207,7 +207,8 @@ def main() -> int:
             allowed = {
                 "blob": {"storage-api", "types"},
                 "codec": {"types"},
-                "limits": {"types"},
+                # The typed failures (RateLimited, Unavailable) live in storage-api.
+                "limits": {"storage-api", "types"},
                 "meta": {"storage-api", "types"},
                 "storage-api": {"types"},
                 "types": set(),

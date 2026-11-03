@@ -161,3 +161,40 @@ async fn a_pinned_marker_tells_whose_channel_it_is() {
     assert_eq!(store_on(channel.clone()).1.mark_owner(ours).await.unwrap(), ours);
     assert_ne!(channel.pinned_now(), Some(other));
 }
+
+/// A put whose answer was lost is repeated with the same `random_id`: one
+/// message, and the repeat's answer carries the document as Telegram's
+/// does, so the read after it needs no `getMessages`.
+#[tokio::test]
+async fn a_put_repeated_after_a_lost_answer_posts_once_and_knows_its_document() {
+    let (channel, store) = store();
+    let store = store.with_inline(false);
+    let (data, name) = (pattern(5000), BlobId::random().name());
+    channel.lose_next_answer();
+    assert!(store.put(data.clone(), &name).await.is_err(), "the answer was lost");
+    let id = store.put(data.clone(), &name).await.unwrap();
+    assert_eq!(channel.message_ids(), vec![id.message_id], "posted once");
+    let reads = channel.calls().get_messages;
+    assert_eq!(collect_stream(store.get(&id, None).await.unwrap()).await.unwrap(), data);
+    assert_eq!(channel.calls().get_messages, reads, "located by the repeat's answer");
+}
+
+/// Deletes and pins applied whose answers were lost: a delete repeats
+/// harmlessly, and the owner marker is found pinned when it is asked again.
+#[tokio::test]
+async fn deletes_and_pins_whose_answers_were_lost() {
+    use pigeonhole_storage_telegram::fake::Mutation;
+    let (channel, store) = store();
+    let id = store.put(pattern(10), &BlobId::random().name()).await.unwrap();
+    channel.lose_next_answer_of(Mutation::Delete);
+    assert!(store.delete(&[id.message_id]).await.is_err());
+    assert!(!store.exists(&id).await.unwrap(), "deleted all the same");
+    store.delete(&[id.message_id]).await.unwrap();
+
+    let owner = pigeonhole_storage_api::Owner(7);
+    channel.lose_next_answer_of(Mutation::Pin);
+    assert!(store.mark_owner(owner).await.is_err());
+    assert_eq!(store.mark_owner(owner).await.unwrap(), owner);
+    let markers = channel.names().iter().filter(|(_, n)| n.starts_with("owner-")).count();
+    assert_eq!(markers, 1, "{:?}", channel.names());
+}

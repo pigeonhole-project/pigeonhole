@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! <dir>/lock          flock'ed around every write and every chain decision
+//! <dir>/deletes       how many deletes ran (u64): other processes re-read headers
 //! <dir>/seg-<seq>     records in write order; <seq> grows by one per segment
 //! ```
 //!
@@ -18,16 +19,26 @@
 //!
 //! Every write holds the `flock` and first catches up with what another
 //! process appended (the length of the last segment, a newer segment), so the
-//! chain's "first successor wins" holds across processes. A torn record at
-//! the end of the last segment was never acknowledged: the next writer (or
-//! open) truncates it. A delete sets `DEAD` in the header and punches a hole
-//! over the data; a segment whose records are all dead is removed.
+//! chain's "first successor wins" holds across processes. A delete sets
+//! `DEAD` in the header and punches a hole over the data; a segment whose
+//! records are all dead is removed. Only the segments a delete touched are
+//! synced, and the directory once a segment went. A delete also bumps a
+//! counter in `<dir>/deletes`: a process that finds it moved since it last
+//! looked reads the headers of its live records again (and drops the
+//! segments that are gone), so it never reads a hole as a blob.
+//!
+//! A torn record was never acknowledged (each append is synced before it is
+//! answered, so nothing acknowledged follows one): at the end of the last
+//! segment, anything that is not a whole record (a short or zeroed header,
+//! one without its magic, a record past the end or failing its checksum) is
+//! cut off by the next writer or open. A header without its magic that a
+//! whole record follows is corruption, not a crash: an error.
 
 use crate::io::{DirLock, Fs, FsFile};
 use anyhow::{anyhow, bail, Context, Result};
 use pigeonhole_storage_api::inspect::{RecordView, SegmentView};
 use pigeonhole_storage_api::{BlobId, NotFound, Owner};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -98,6 +109,9 @@ pub(crate) struct Segments {
     dir: PathBuf,
     segment_bytes: u64,
     lock: Arc<dyn DirLock>,
+    /// The delete counter (`<dir>/deletes`) and its value when we last looked.
+    deletes: Arc<dyn FsFile>,
+    deletes_seen: u64,
     segs: BTreeMap<u64, Seg>,
     pub records: BTreeMap<u64, Rec>,
     /// Chain: the winning successor of each predecessor (`None`: the start).
@@ -131,17 +145,24 @@ impl Segments {
     pub fn open(fs: Arc<dyn Fs>, dir: &Path, segment_bytes: u64) -> Result<Self> {
         fs.create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let lock = fs.dir_lock(dir).with_context(|| format!("lock file in {}", dir.display()))?;
+        let deletes = open_or_create(fs.as_ref(), &dir.join("deletes"))?;
         let mut this = Self {
             fs,
             dir: dir.to_path_buf(),
             segment_bytes: segment_bytes.max(1),
             lock,
+            deletes,
+            deletes_seen: 0,
             segs: BTreeMap::new(),
             records: BTreeMap::new(),
             next: HashMap::new(),
             tail: None,
         };
-        this.locked()?.catch_up()?;
+        {
+            let mut locked = this.locked()?;
+            locked.deletes_seen = read_counter(locked.deletes.as_ref())?;
+            locked.catch_up()?;
+        }
         Ok(this)
     }
 
@@ -167,6 +188,12 @@ impl Segments {
         Ok(buf)
     }
 
+    /// Whether another process deleted since we last looked (one read of
+    /// the counter, without the lock): a reader then catches up.
+    pub fn deletes_moved(&self) -> Result<bool> {
+        Ok(read_counter(self.deletes.as_ref())? != self.deletes_seen)
+    }
+
     /// Every segment sequence number in the directory.
     fn seqs_on_disk(&self) -> Result<Vec<u64>> {
         let mut seqs = Vec::new();
@@ -184,6 +211,12 @@ impl Locked<'_> {
     /// Index whatever was appended since we last looked (by us at open, or
     /// by another process), truncating a torn record at the very end.
     pub fn catch_up(&mut self) -> Result<()> {
+        // Another process deleted since we looked: re-read what died.
+        let deletes = read_counter(self.deletes.as_ref())?;
+        if deletes != self.deletes_seen {
+            self.reread_deaths()?;
+            self.deletes_seen = deletes;
+        }
         // Nothing new if the active segment did not grow and is not full
         // (only a full segment rolls over): one fstat, no directory listing.
         if let Some(s) = self.segs.values().next_back() {
@@ -309,11 +342,14 @@ impl Locked<'_> {
 
     /// Delete records: `DEAD` in the header, a hole over the data; a segment
     /// left with no live record is removed (not the one being appended to).
+    /// Syncs the segments it touched, and the directory if one went.
     pub fn delete(&mut self, keys: &[u64]) -> Result<()> {
         let active = self.segs.keys().next_back().copied();
+        let (mut touched, mut removed, mut changed) = (BTreeSet::new(), false, false);
         for &key in keys {
             let Some(rec) = self.records.get_mut(&key).filter(|r| !r.dead) else { continue };
             rec.dead = true;
+            changed = true;
             let (data_off, data_len) = (rec.data_offset(key), rec.data_len);
             let (seq, offset) = split(key);
             let Some(seg) = self.segs.get_mut(&seq) else { continue };
@@ -321,25 +357,95 @@ impl Locked<'_> {
             if seg.live == 0 && Some(seq) != active {
                 let path = seg_path(&self.dir, seq);
                 self.fs.remove(&path).with_context(|| format!("remove {}", path.display()))?;
-                self.segs.remove(&seq);
-                let lo = key_of(seq, 0);
-                let hi = key_of(seq + 1, 0);
-                let gone: Vec<u64> = self.records.range(lo..hi).map(|(k, _)| *k).collect();
-                for k in gone {
-                    self.records.remove(&k);
-                }
+                self.forget_segment(seq);
+                touched.remove(&seq);
+                removed = true;
                 continue;
             }
             let mut flags = [0u8; 1];
             seg.file.read_exact_at(&mut flags, offset + 4)?;
             seg.file.write_all_at(&[flags[0] | DEAD], offset + 4)?;
             punch_hole(seg.file.as_ref(), data_off, data_len)?;
+            touched.insert(seq);
         }
-        for seg in self.segs.values() {
-            seg.file.sync()?;
+        for seq in touched {
+            self.segs[&seq].file.sync()?;
+        }
+        if removed {
+            self.fs.sync_dir(&self.dir)?;
+        }
+        if changed {
+            self.deletes_seen = read_counter(self.deletes.as_ref())? + 1;
+            self.deletes.write_all_at(&self.deletes_seen.to_le_bytes(), 0)?;
         }
         Ok(())
     }
+
+    /// Segment `seq` is gone: drop it and its records, but keep a chain
+    /// member's label (dead): a deposed writer putting after a pruned blob
+    /// still learns who won.
+    fn forget_segment(&mut self, seq: u64) {
+        self.segs.remove(&seq);
+        let gone: Vec<u64> = self.records.range(key_of(seq, 0)..key_of(seq + 1, 0)).map(|(k, _)| *k).collect();
+        for k in gone {
+            match self.records.get_mut(&k) {
+                Some(r) if r.chain.is_some() => r.dead = true,
+                _ => {
+                    self.records.remove(&k);
+                }
+            }
+        }
+    }
+
+    /// Another process deleted records: mark what died (one read of a
+    /// header's flags per live record) and drop the segments it removed.
+    fn reread_deaths(&mut self) -> Result<()> {
+        let on_disk: BTreeSet<u64> = self.seqs_on_disk()?.into_iter().collect();
+        let known: Vec<u64> = self.segs.keys().copied().collect();
+        for seq in known {
+            if !on_disk.contains(&seq) {
+                self.forget_segment(seq);
+                continue;
+            }
+            let seg = self.0.segs.get_mut(&seq).unwrap();
+            for (key, rec) in self.0.records.range_mut(key_of(seq, 0)..key_of(seq + 1, 0)) {
+                if rec.dead {
+                    continue;
+                }
+                let mut flags = [0u8; 1];
+                seg.file.read_exact_at(&mut flags, split(*key).1 + 4)?;
+                if flags[0] & DEAD != 0 {
+                    rec.dead = true;
+                    seg.live -= 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Open `path`, creating it if it is not there.
+fn open_or_create(fs: &dyn Fs, path: &Path) -> Result<Arc<dyn FsFile>> {
+    match fs.open(path, false) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs.open(path, true) {
+            Ok(f) => Ok(f),
+            // Another process created it meanwhile.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(fs.open(path, false)?),
+            Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
+        },
+        Err(e) => Err(e).with_context(|| format!("open {}", path.display())),
+    }
+}
+
+/// The delete counter (0 for an empty file).
+fn read_counter(file: &dyn FsFile) -> Result<u64> {
+    if file.len()? < 8 {
+        return Ok(0);
+    }
+    let mut b = [0u8; 8];
+    file.read_exact_at(&mut b, 0)?;
+    Ok(u64::from_le_bytes(b))
 }
 
 /// A record's fixed header (see the module doc for the layout).
@@ -426,6 +532,9 @@ fn read_record(file: &dyn FsFile, pos: u64, size: u64, last: bool) -> Result<Fou
         if h.iter().all(|b| *b == 0) {
             return Ok(Found::Unwritten);
         }
+        if last && !whole_record_after(file, pos, size)? {
+            return Ok(Found::Torn("a header without its magic"));
+        }
         bail!("bad record magic at {pos}");
     };
     let end = pos + header.record_len();
@@ -442,6 +551,31 @@ fn read_record(file: &dyn FsFile, pos: u64, size: u64, last: bool) -> Result<Fou
         }
     }
     Ok(Found::Record(header, label))
+}
+
+/// Whether a whole record (magic, length within the file, checksum) starts
+/// somewhere in `(pos, size)`: then a bad header at `pos` is corruption,
+/// not a torn tail.
+fn whole_record_after(file: &dyn FsFile, pos: u64, size: u64) -> Result<bool> {
+    let mut rest = vec![0; (size - pos) as usize];
+    file.read_exact_at(&mut rest, pos)?;
+    let magic = MAGIC.to_le_bytes();
+    for at in (1..rest.len()).filter(|&i| rest[i..].starts_with(&magic)) {
+        if rest.len() - at < HEADER as usize {
+            break;
+        }
+        let Some(header) = Header::decode(rest[at..at + HEADER as usize].try_into().unwrap()) else { continue };
+        let end = at as u64 + header.record_len();
+        if end > rest.len() as u64 || header.dead() {
+            continue;
+        }
+        let label = &rest[at + HEADER as usize..at + HEADER as usize + header.label_len as usize];
+        let data = &rest[at + HEADER as usize + header.label_len as usize..end as usize];
+        if header.checksum(label, data) == header.crc {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// [`inspect`] on the real file system: what the admin's view of a disk reads.

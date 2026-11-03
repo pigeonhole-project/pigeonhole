@@ -9,7 +9,8 @@
 //!
 //! The first blob of a chain links from the **anchor**, a message the store
 //! posts once (the oldest one wins if two race to post it) and never prunes.
-//! A chain blob is named `<label>~<prev>.bin`, as on Telegram.
+//! A chain blob is named `<label>~<prev>.bin`, as on Telegram (the first
+//! names the anchor).
 //!
 //! The tail is the newest member that won its link: the thread of the
 //! message it names as `prev` names it back. A thread outlives its starter
@@ -31,9 +32,11 @@ use crate::store::{blob_name, DiscordBlobStore, DiscordId};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use pigeonhole_storage_api::chain_name::{chain_name, label_of, parse_chain_name};
 use pigeonhole_storage_api::{
     check_blob, put_after_tail_by_links, After, BlobBackend, Chain, LeaseChain, Linked, MakeAfter,
 };
+use std::collections::HashMap;
 
 const ANCHOR: &str = "chain-anchor.bin";
 /// The text of a clock probe ([`LeaseChain::now_ms`]).
@@ -41,25 +44,9 @@ const PROBE: &str = "clock probe";
 /// Thread names hold 100 characters.
 const THREAD_NAME_MAX: usize = 100;
 
-fn chain_name(label: &str, prev: Option<u64>) -> String {
-    match prev {
-        Some(p) => format!("{label}~{p}.bin"),
-        None => format!("{label}~root.bin"),
-    }
-}
-
-/// A chain blob's label and what it follows (`None`: the anchor).
-fn parse_name(name: &str) -> Option<(&str, Option<u64>)> {
-    let (label, prev) = name.strip_suffix(".bin")?.rsplit_once('~')?;
-    match prev {
-        "root" => Some((label, None)),
-        p => p.parse().ok().map(|p| (label, Some(p))),
-    }
-}
-
-/// A chain blob's label (`None` for anything else).
-fn label_of(name: &str) -> Option<&str> {
-    parse_name(name).map(|(label, _)| label)
+/// A chain blob's label and what it follows.
+fn parse_name(name: &str) -> Option<(&str, u64)> {
+    parse_chain_name(name)
 }
 
 fn thread_name(next: u64, label: &str) -> String {
@@ -74,7 +61,7 @@ fn parse_thread(name: &str) -> Option<(u64, &str)> {
 }
 
 fn is_member(m: &DcMessage) -> bool {
-    blob_name(m).and_then(label_of).is_some()
+    blob_name(m).and_then(parse_name).is_some()
 }
 
 fn is_anchor(m: &DcMessage) -> bool {
@@ -138,16 +125,14 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
         };
         for &m in gone {
             let name = self.names.lock().unwrap().pop(&m);
-            let Some((_, prev)) = name.as_deref().and_then(parse_name) else { continue };
+            let Some((_, p)) = name.as_deref().and_then(parse_name) else { continue };
             // Incoming: the link on `prev`, if it names `m` (gone). An
             // unlinked blob or a loser names `prev` too, while `prev`'s link
             // names another: maybe the first survivor, which it tells won.
-            if let Some(p) = prev {
-                let into_m = self.link_of(p).await?.is_some_and(|l| l.id.message_id == m);
-                if into_m && Some(p) != anchor && !exists(p).await? {
-                    self.api.delete_thread(p).await?;
-                    tracing::debug!(store = %self.instance().id, thread = p, "retired a link");
-                }
+            let into_m = self.link_of(p).await?.is_some_and(|l| l.id.message_id == m);
+            if into_m && Some(p) != anchor && !exists(p).await? {
+                self.api.delete_thread(p).await?;
+                tracing::debug!(store = %self.instance().id, thread = p, "retired a link");
             }
             // Outgoing: the link on `m` (gone) to a successor that is gone too.
             if let Some(next) = self.link_of(m).await? {
@@ -174,12 +159,12 @@ impl<A: DiscordApi> DiscordBlobStore<A> {
 impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
     async fn put_after(&self, prev: Option<&DiscordId>, label: &str, data: Bytes) -> Result<After<DiscordId>> {
         check_blob(label, &data, self.limits())?;
-        let prev = prev.map(|p| p.message_id);
+        // The first member follows the anchor.
         let from = match prev {
-            Some(p) => p,
+            Some(p) => p.message_id,
             None => self.anchor().await?,
         };
-        let b = self.post_blob(&chain_name(label, prev), data, &Self::nonce()).await?.id;
+        let b = self.post_blob(&chain_name(label, from), data, &Self::nonce()).await?.id;
         let name = thread_name(b, label);
         if name.chars().count() > THREAD_NAME_MAX {
             bail!("thread name {name:?} is over {THREAD_NAME_MAX} characters");
@@ -223,24 +208,24 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
 
     /// The newest member that won its link (its `prev`'s thread names it):
     /// every winner is in the chain (a writer puts only after a winner or
-    /// the tail), and a successor would be newer.
+    /// the tail), and a successor would be newer. A listing carries each
+    /// message's thread, so `prev`'s is read from the pages listed; only a
+    /// `prev` not among them (deleted, or further down) costs a read of its
+    /// thread.
     async fn tail(&self) -> Result<Option<Linked<DiscordId>>> {
         let mut before = None;
+        // The thread (or none) of every message listed so far.
+        let mut listed: HashMap<u64, Option<String>> = HashMap::new();
         loop {
             let page = self.api.list(before, None, PAGE).await?;
+            listed.extend(page.iter().map(|m| (m.id, m.thread.clone())));
             for m in page.iter().rev() {
-                let Some((label, prev)) = blob_name(m).and_then(parse_name) else { continue };
-                let from = match prev {
-                    Some(p) => p,
-                    None => match *self.anchor.lock().await {
-                        Some(a) => a,
-                        None => match self.find_anchor().await? {
-                            Some(a) => a,
-                            None => continue,
-                        },
-                    },
+                let Some((label, from)) = blob_name(m).and_then(parse_name) else { continue };
+                let link = match listed.get(&from) {
+                    Some(thread) => thread.as_deref().and_then(parse_thread).map(|(id, _)| id),
+                    None => self.link_of(from).await?.map(|l| l.id.message_id),
                 };
-                if self.link_of(from).await?.is_some_and(|l| l.id.message_id == m.id) {
+                if link == Some(m.id) {
                     tracing::debug!(store = %self.instance().id, message_id = m.id, label, "found the tail");
                     self.remember(m);
                     return Ok(Some(Linked { id: DiscordId { message_id: m.id }, label: label.to_string() }));
@@ -273,7 +258,7 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
             let page = self.api.list(before, None, PAGE).await?;
             for m in page.iter().rev() {
                 let Some(name) = blob_name(m).filter(|n| n.starts_with(prefix)) else { continue };
-                let label = label_of(name).unwrap_or(name).to_string();
+                let label = label_of(name).to_string();
                 self.remember(m);
                 return Ok(Some(Linked { id: DiscordId { message_id: m.id }, label }));
             }
@@ -342,7 +327,7 @@ impl<A: DiscordApi> LeaseChain for DiscordBlobStore<A> {
     /// with no thread: one POST.
     async fn put_unlinked(&self, prev: &DiscordId, label: &str, data: Bytes) -> Result<DiscordId> {
         check_blob(label, &data, self.limits())?;
-        let m = self.post_blob(&chain_name(label, Some(prev.message_id)), data, &Self::nonce()).await?;
+        let m = self.post_blob(&chain_name(label, prev.message_id), data, &Self::nonce()).await?;
         tracing::debug!(store = %self.instance().id, label, prev = prev.message_id, message_id = m.id, "put unlinked");
         Ok(DiscordId { message_id: m.id })
     }
@@ -354,7 +339,7 @@ impl<A: DiscordApi> LeaseChain for DiscordBlobStore<A> {
             let page = self.api.list(None, Some(after), PAGE).await?;
             for m in &page {
                 let Some(name) = blob_name(m).filter(|n| n.starts_with(prefix)) else { continue };
-                let label = label_of(name).unwrap_or(name).to_string();
+                let label = label_of(name).to_string();
                 self.remember(m);
                 out.push(Linked { id: DiscordId { message_id: m.id }, label });
             }
@@ -372,10 +357,7 @@ mod tests {
 
     #[test]
     fn names_and_threads_roundtrip() {
-        assert_eq!(label_of(&chain_name("log-batch-3", Some(41))), Some("log-batch-3"));
-        assert_eq!(label_of(&chain_name("log-claim-1", None)), Some("log-claim-1"));
-        assert_eq!(label_of("ph-00.bin"), None);
-        assert_eq!(label_of(ANCHOR), None);
+        assert_eq!(parse_name(ANCHOR), None);
         assert_eq!(parse_thread(&thread_name(77, "log-batch-2")), Some((77, "log-batch-2")));
         assert_eq!(parse_thread("hello"), None);
     }

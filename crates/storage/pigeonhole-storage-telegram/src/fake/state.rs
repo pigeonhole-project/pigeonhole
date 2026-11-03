@@ -171,7 +171,7 @@ impl TelegramChannelState {
 
     /// Where document `id` is read from, with the current file reference.
     pub fn location(&self, channel: i64, id: i64) -> FileLocation {
-        FileLocation { id, access_hash: channel, file_reference: vec![self.reference_epoch], dc_id: 2, bot: 0 }
+        FileLocation { id, access_hash: channel, file_reference: vec![self.reference_epoch], dc_id: 2 }
     }
 
     /// The blob and size of document `file`, if its reference still holds.

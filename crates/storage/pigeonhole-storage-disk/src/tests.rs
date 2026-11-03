@@ -196,6 +196,33 @@ mod sim {
         assert_eq!(w.id, x);
     }
 
+    /// A delete syncs the segments it touched, and the directory when it
+    /// removed one: after a crash the removed segment stays gone.
+    #[tokio::test]
+    async fn a_delete_syncs_what_it_touched_and_a_removal_survives_a_crash() {
+        let fs = SimFs::new(Duration::ZERO);
+        // Two records a segment: [0, 1], [2, 3].
+        let a = DiskBlobStore::open_on(Arc::new(fs.clone()), "/d", 200).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..4u8 {
+            ids.push(a.put(Bytes::from(vec![i + 1; 40]), &BlobId::random().name()).await.unwrap());
+        }
+        assert_eq!(ids.iter().map(|id| id.key >> 40).collect::<Vec<_>>(), [1, 1, 2, 2]);
+        let (files, dirs) = fs.syncs();
+        // A record of the second segment: that segment only (was: both).
+        a.delete(&[ids[2].key]).await.unwrap();
+        assert_eq!(fs.syncs(), (files + 1, dirs), "one segment synced");
+        // The whole first segment: removed, the directory synced.
+        a.delete(&[ids[0].key, ids[1].key]).await.unwrap();
+        assert_eq!(fs.syncs(), (files + 1, dirs + 1), "no segment left to sync, the directory once");
+        drop(a);
+        fs.crash(None);
+        let b = on(&fs);
+        assert!(b.get(&ids[0], None).await.is_err(), "the removed segment stays removed");
+        assert!(b.get(&ids[1], None).await.is_err());
+        assert_eq!(read(&b, &ids[3]).await, vec![4; 40]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_sync_costs_virtual_time() {
         let fs = SimFs::new(Duration::from_millis(4));
@@ -204,6 +231,68 @@ mod sim {
         a.put(Bytes::from_static(b"one"), &BlobId::random().name()).await.unwrap();
         assert!(t.elapsed() >= Duration::from_millis(4), "{:?}", t.elapsed());
     }
+}
+
+/// A header whose magic did not make it (a page of the append torn off) at
+/// the end of the last segment is cut off on open; the same bytes with a
+/// whole record after them are corruption.
+#[tokio::test]
+async fn a_header_without_its_magic_is_torn_at_the_end_and_corrupt_before_a_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = small(dir.path(), 1 << 20);
+    let kept = a.put(Bytes::from_static(b"kept"), &BlobId::random().name()).await.unwrap();
+    drop(a);
+    let seg = dir.path().join(&segment_files(dir.path())[0]);
+    let whole = fs::read(&seg).unwrap();
+    let garbage = [
+        0x47u8, 0x53, 0x01, 0x02, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+    ];
+    fs::write(&seg, [&whole[..], &garbage[..]].concat()).unwrap();
+    let b = small(dir.path(), 1 << 20);
+    assert_eq!(read(&b, &kept).await, b"kept");
+    assert_eq!(fs::metadata(&seg).unwrap().len(), whole.len() as u64, "cut off");
+    drop(b);
+
+    fs::write(&seg, [&whole[..], &garbage[..], &whole[..]].concat()).unwrap();
+    assert!(DiskBlobStore::with_segment_bytes(dir.path(), 1 << 20).is_err(), "a record after it: corrupt");
+}
+
+/// A deposed writer whose tip was pruned with its whole segment still
+/// learns who won, by label: the log turns that into `Fenced`.
+#[tokio::test]
+async fn a_put_after_a_pruned_segment_loses_to_a_named_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = small(dir.path(), 64);
+    let After::Won(tip) = store.put_after(None, "log-claim-1", Bytes::from(vec![1; 40])).await.unwrap() else {
+        panic!()
+    };
+    let After::Won(next) = store.put_after(Some(&tip), "log-claim-2", Bytes::from(vec![2; 40])).await.unwrap() else {
+        panic!()
+    };
+    let After::Won(last) = store.put_after(Some(&next), "log-batch-2", Bytes::from(vec![3; 40])).await.unwrap() else {
+        panic!()
+    };
+    store.prune(&last).await.unwrap();
+    assert_eq!(segment_files(dir.path()).len(), 1, "the pruned segments are gone");
+    let After::Lost(w) = store.put_after(Some(&tip), "log-batch-1", Bytes::from_static(b"x")).await.unwrap() else {
+        panic!("the deposed writer won")
+    };
+    assert_eq!((w.id, w.label.as_str()), (next, "log-claim-2"));
+}
+
+/// Another process's deletes are seen: a record it deleted is not read
+/// (its data is a hole), nor offered to the sweeper.
+#[tokio::test]
+async fn another_handles_deletes_are_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (small(dir.path(), 1 << 20), small(dir.path(), 1 << 20));
+    let doomed = a.put(Bytes::from(vec![7u8; 10_000]), &BlobId::random().name()).await.unwrap();
+    let kept = a.put(Bytes::from_static(b"kept"), &BlobId::random().name()).await.unwrap();
+    assert_eq!(read(&b, &doomed).await, vec![7u8; 10_000]);
+    a.delete(&[doomed.key]).await.unwrap();
+    let gone = b.get(&doomed, None).await;
+    assert_eq!(pigeonhole_storage_api::Failure::of(&gone.err().unwrap()), pigeonhole_storage_api::Failure::NotFound);
+    assert_eq!(b.candidates(pigeonhole_storage_api::Owner(0), None, u64::MAX, 10).await.unwrap(), vec![kept.key]);
 }
 
 #[tokio::test]

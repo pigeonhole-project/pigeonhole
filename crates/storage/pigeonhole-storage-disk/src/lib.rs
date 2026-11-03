@@ -7,6 +7,15 @@
 //! `put_after` decides "first successor wins" under the directory's `flock`,
 //! so the store holds a metadata log ([`Chain`]) as well as blobs; one
 //! store serves one purpose.
+//!
+//! Several handles (processes) may open one directory: every write takes
+//! the `flock` and first indexes what the others appended, and a delete
+//! bumps a counter the others check before they write or read, then read
+//! the headers of their live records again. That costs one small read per
+//! operation and a pass over the headers only after another handle's
+//! delete; refusing a second opener instead would have cost nothing per
+//! operation, but a restart in one process (the new handle opens before
+//! the old one is dropped) and the tests that race two handles need two.
 
 pub mod io;
 mod segments;
@@ -214,8 +223,8 @@ impl BlobBackend for DiskBlobStore {
         let key = id.key;
         let data = blocking(move || {
             let mut guard = segments.lock().unwrap();
-            if !guard.records.contains_key(&key) {
-                // Appended by another process since we last looked?
+            // Appended by another process since we last looked, or deleted?
+            if !guard.records.contains_key(&key) || guard.deletes_moved()? {
                 guard.locked()?.catch_up()?;
             }
             let len = guard.records.get(&key).filter(|r| !r.dead).map(|r| r.data_len);

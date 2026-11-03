@@ -201,7 +201,8 @@ crate `core/pigeonhole-storage-api` (crates.io only): `BlobBackend` (its
 listing for the sweeper included; `Sweepable` folded into it), `Chain`, `OrderedKey`, `BlobId`, `BackendLimits` and the types
 they need. `pigeonhole-blob`, `pigeonhole-meta` and every storage crate depend
 on it; `scripts/check_deps.py` learns the new layer. A storage crate depends
-on it, `core/pigeonhole-limits` (rate limiters) and `pigeonhole-types` only,
+on it, `core/pigeonhole-limits` (rate limiters, itself on the storage API
+for the error types) and `pigeonhole-types` only,
 never on the blob layer above it. A log or snapshot store
 is configured as any `[[store]]`; one store serves one purpose (blobs, a log,
 or snapshots), as today.
@@ -242,19 +243,32 @@ Where the code differs from the design above:
   tail only. Generations only grow along the chain, so the tail's generation
   is the newest claim and a loser's `Fenced { current }` is the winner's.
 - **`confirm`** = `successor(our tip)` is none.
-- **Telegram**: a member is a document named `<label>~<prev>.bin` (`root`
-  for the first). `put_after` posts with a fresh `random_id` per call (two
+- **Names** (Telegram, Discord: `pigeonhole_storage_api::chain_name`): a
+  member is named `<label>~<prev>.bin`; the first member follows the
+  store's **anchor** (`chain-anchor.bin`, posted once, the oldest wins a
+  race, never pruned), so every member names a `prev`; a label follows the
+  one rule every store checks (`check_label`: 1 to 128 of
+  `[A-Za-z0-9._-]`, so never a `~` or a space). Both stores share the rest of their blob side too: a
+  blob that fits a text message goes as one, else as a file, with a cache
+  of where recent blobs are (`pigeonhole_storage_api::located`), and the
+  pool of bots (`pigeonhole_limits::chat::Pooled`).
+- **Telegram**: a member is a document or a text named as above. `put_after` posts with a fresh `random_id` per call (two
   writers putting the same name must get two messages), wins iff nothing in
   `(prev, b)` names `prev` or a blob newer than `prev` (no read when
-  `b == prev + 1`). The second half fences a writer deposed before a
+  `b == prev + 1`; the first member's `prev` is the anchor, so a chain
+  started on a channel with a long history checks the ids since the
+  anchor, not the channel). The second half fences a writer deposed before a
   collection pruned the claim that followed its tip: what the chain went on
   with is still there, and names newer blobs. `tail` and
   `successor` post a probe to learn the top (probes stay: a hole in a checked
   range costs re-reads), so a snapshot (`put_loose`) goes after the one put
   before it when the caller knows it, which needs no probe; `tail` walks down to the newest message that won its
   link. `prune` deletes our members and probes below a point, walking down
-  until a page holds none of ours. Empty ids in a checked range are re-read,
-  then taken as deleted (`ChainOptions`).
+  until a page holds none of ours (the anchor stays). Empty ids in a
+  checked range are re-read, then taken as deleted (`ChainOptions`); only
+  those below the first member that decides the check (one naming `prev`,
+  else one naming a newer blob), since one above it cannot change the
+  answer.
 - **Telegram text messages**: blobs up to ~7.5 KiB (log batches, claims,
   probes) are text messages whose bytes come with `getMessages`
   (telegram-mtproto.md § Text messages); a replay of small batches
@@ -267,9 +281,16 @@ Where the code differs from the design above:
   process appended (an `fstat` of the active segment; the directory is
   listed only when it grew or is full). The chain (`next`, `tail`) is an
   in-memory index rebuilt by a scan on open; the last record's crc is
-  checked and a torn one truncated. A delete sets `DEAD` in the header and
-  punches a hole over the data (`F_PUNCHHOLE` / `FALLOC_FL_PUNCH_HOLE`); a
-  segment with no live record is removed. A `local_disk` `[meta]` store
+  checked and a torn one truncated (anything at the end of the last
+  segment that is not a whole record, a header without its magic too,
+  unless a whole record follows it: that is corruption). A delete sets
+  `DEAD` in the header and punches a hole over the data (`F_PUNCHHOLE` /
+  `FALLOC_FL_PUNCH_HOLE`), syncs the segments it touched, and removes a
+  segment with no live record (then syncs the directory); it bumps a
+  counter in `<dir>/deletes`, and another handle that sees it moved reads
+  its live records' headers again. A removed segment's chain members keep
+  their labels in the index, so a deposed writer putting after one loses
+  to a named winner (`Fenced`), as on memory. A `local_disk` `[meta]` store
   keeps the log in `<path>/log` and the snapshots in `<path>/snapshots`.
   `LocalLogStore` / `LocalSnapshotStore` are gone.
 - **Benchmark** (`log::chain::tests::disk::bench_disk_logs`, release, macOS,

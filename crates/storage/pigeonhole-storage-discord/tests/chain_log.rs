@@ -231,6 +231,49 @@ async fn removed_snapshots_leave_no_links_behind() {
     assert!(dangling.len() <= 1, "{dangling:?}");
 }
 
+/// A link made whose answer was lost: the put's outcome is unknown to its
+/// caller, and the blob won all the same; a put after the same `prev` loses
+/// to it.
+#[tokio::test]
+async fn a_link_whose_answer_was_lost_still_won() {
+    use pigeonhole_storage_discord::fake::Mutation;
+    let channel = Arc::new(FakeDiscord::new(77));
+    let s = channel_store(&channel);
+    let After::Won(claim) = s.put_after(None, "log-claim-1", bytes::Bytes::from_static(b"c")).await.unwrap() else {
+        panic!("the first claim links")
+    };
+    channel.lose_next_answer_of(Mutation::StartThread);
+    assert!(s.put_after(Some(&claim), "log-batch-1", bytes::Bytes::from_static(b"1")).await.is_err());
+    let tail = s.tail().await.unwrap().unwrap();
+    assert_eq!(tail.label, "log-batch-1");
+    let After::Lost(w) = s.put_after(Some(&claim), "log-batch-1", bytes::Bytes::from_static(b"2")).await.unwrap()
+    else {
+        panic!("the lost answer's blob won the link")
+    };
+    assert_eq!(w.id, tail.id);
+}
+
+/// Snapshots take no thread, so one removed after a restart (a store that
+/// never saw its name) leaves no link behind.
+#[tokio::test]
+async fn snapshots_removed_after_a_restart_leave_no_links() {
+    let channel = Arc::new(FakeDiscord::new(79));
+    let store = BlobSnapshotStore::new(channel_store(&channel));
+    let mut refs = Vec::new();
+    for at in 1..=3u64 {
+        let snap =
+            pigeonhole_meta::StoredSnapshot { log_id: pigeonhole_meta::LogId(1), at, data: vec![at as u8; 9_000] };
+        refs.push(store.put(&snap, refs.last()).await.unwrap());
+    }
+    assert!(channel.thread_ids().is_empty(), "{:?}", channel.thread_ids());
+    let restarted = BlobSnapshotStore::new(channel_store(&channel));
+    for r in &refs[..2] {
+        restarted.remove(r).await.unwrap();
+    }
+    assert!(channel.thread_ids().is_empty(), "{:?}", channel.thread_ids());
+    assert_eq!(restarted.newest().await.unwrap().map(|s| s.at), Some(3));
+}
+
 /// An append is a message and a thread; archiving the link runs after it.
 #[tokio::test]
 async fn links_are_archived_off_the_appends_path() {
@@ -471,4 +514,28 @@ async fn the_clock_probe_leaves_nothing() {
     assert!(channel.message_ids().is_empty(), "{:?}", channel.message_ids());
     assert!(channel.thread_ids().is_empty());
     assert_eq!(s.tail().await.unwrap(), None);
+}
+
+/// The tail under a lease: the newest members are batches nobody links, and
+/// the listing already tells which messages have a thread. Through 20
+/// unlinked batches, a `tail` read 21 threads (one per batch and the claim's
+/// anchor) before; now none, the listing only.
+#[tokio::test]
+async fn the_tail_reads_threads_from_the_listing() {
+    use pigeonhole_storage_api::LeaseChain;
+    let channel = Arc::new(FakeDiscord::new(77));
+    let s = channel_store(&channel);
+    let After::Won(claim) = s.put_after(None, "log-claim-1", bytes::Bytes::from_static(b"c")).await.unwrap() else {
+        panic!("the first claim links")
+    };
+    let mut prev = claim.clone();
+    for i in 0..20 {
+        prev = s.put_unlinked(&prev, "log-batch-1", bytes::Bytes::from(vec![i + 1])).await.unwrap();
+    }
+    let fresh = channel_store(&channel);
+    let before = channel.calls();
+    assert_eq!(fresh.tail().await.unwrap().map(|t| t.id), Some(claim));
+    let after = channel.calls();
+    assert_eq!(after.thread_name - before.thread_name, 0, "{before:?} → {after:?}");
+    assert_eq!(after.list - before.list, 1, "{before:?} → {after:?}");
 }

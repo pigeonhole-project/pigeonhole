@@ -233,14 +233,20 @@ struct SimInner {
     /// Virtual time one sync costs.
     sync_cost: Duration,
     cost: Mutex<Duration>,
+    /// Syncs of files and of directories so far.
+    syncs: Mutex<(u64, u64)>,
 }
 
 #[derive(Default)]
 struct SimState {
     dirs: BTreeSet<PathBuf>,
     files: BTreeMap<PathBuf, Arc<SimFile>>,
-    /// Names whose creation (or removal) a directory sync made durable.
+    /// Names whose creation a directory sync made durable (and whose
+    /// removal it has not yet).
     durable_names: BTreeSet<PathBuf>,
+    /// Files removed whose removal no directory sync made durable yet: a
+    /// crash brings them back.
+    unlinked: BTreeMap<PathBuf, Arc<SimFile>>,
     locks: BTreeMap<PathBuf, Arc<SimLock>>,
 }
 
@@ -260,7 +266,14 @@ struct SimData {
 impl SimFs {
     /// A disk whose sync takes `sync_cost` of virtual time.
     pub fn new(sync_cost: Duration) -> Self {
-        Self { inner: Arc::new(SimInner { state: Mutex::default(), sync_cost, cost: Mutex::new(Duration::ZERO) }) }
+        Self {
+            inner: Arc::new(SimInner {
+                state: Mutex::default(),
+                sync_cost,
+                cost: Mutex::new(Duration::ZERO),
+                syncs: Mutex::default(),
+            }),
+        }
     }
 
     /// Power loss: every file falls back to what was synced; a file whose
@@ -269,6 +282,8 @@ impl SimFs {
     /// (`torn(unsynced len)` → how many bytes survive): a write cut short.
     pub fn crash(&self, mut torn: Option<&mut dyn FnMut(usize) -> usize>) {
         let mut st = self.inner.state.lock().unwrap();
+        let unlinked = std::mem::take(&mut st.unlinked);
+        st.files.extend(unlinked);
         let durable_names = st.durable_names.clone();
         st.files.retain(|path, _| durable_names.contains(path));
         for file in st.files.values() {
@@ -297,6 +312,11 @@ impl SimFs {
 
     fn charge(&self) {
         *self.inner.cost.lock().unwrap() += self.inner.sync_cost;
+    }
+
+    /// Syncs so far: of files, of directories.
+    pub fn syncs(&self) -> (u64, u64) {
+        *self.inner.syncs.lock().unwrap()
     }
 }
 
@@ -339,16 +359,21 @@ impl Fs for SimFs {
 
     fn remove(&self, path: &Path) -> io::Result<()> {
         let mut st = self.inner.state.lock().unwrap();
-        st.files.remove(path).ok_or_else(|| not_found(path))?;
-        st.durable_names.remove(path);
+        let file = st.files.remove(path).ok_or_else(|| not_found(path))?;
+        if st.durable_names.contains(path) {
+            st.unlinked.insert(path.to_path_buf(), file);
+        }
         Ok(())
     }
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         let mut st = self.inner.state.lock().unwrap();
         let names: Vec<PathBuf> = st.files.keys().filter(|p| p.parent() == Some(dir)).cloned().collect();
+        st.durable_names.retain(|p| p.parent() != Some(dir));
         st.durable_names.extend(names);
+        st.unlinked.retain(|p, _| p.parent() != Some(dir));
         drop(st);
+        self.inner.syncs.lock().unwrap().1 += 1;
         self.charge();
         Ok(())
     }
@@ -394,6 +419,7 @@ impl FsFile for SimFile {
         drop(d);
         if let Some(inner) = self.inner.upgrade() {
             *inner.cost.lock().unwrap() += inner.sync_cost;
+            inner.syncs.lock().unwrap().0 += 1;
         }
         Ok(())
     }

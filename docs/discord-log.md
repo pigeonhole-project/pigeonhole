@@ -250,7 +250,9 @@ above, and why:
 - **No `init-log`: an anchor.** The first blob of a chain links from an
   anchor message the store posts on an empty channel; if two stores post one
   at once, the oldest serves both and the other is deleted. The anchor and
-  its link are never pruned.
+  its link are never pruned. The first member names it as its `prev`
+  (`<label>~<anchor>.bin`), so every member names the message whose
+  thread links it.
 - **A put after a pruned message** (a writer deposed before a collection)
   loses: to the successor its thread still names, else to the tail, since
   only a newer base prunes a member. Pruning retires a thread on a deleted
@@ -258,10 +260,20 @@ above, and why:
   loser names that message too, while its thread tells the first survivor
   won.
 - **The tail is the newest member that won its link**, checked through its
-  `prev`'s thread (`GET /channels/{prev}`: a thread outlives its message), not
-  by following links from the start: removing an old snapshot or pruning
-  leaves the start unreachable.
-- **Links of deleted members**: a thread is deleted only after its message
+  `prev`'s thread, not by following links from the start: removing an old
+  snapshot or pruning leaves the start unreachable. The listing carries
+  each message's `thread`, so `prev`'s comes from the pages listed; only a
+  `prev` not among them (deleted, or on a page not listed yet) costs a
+  `GET /channels/{prev}` (a thread outlives its message). Under the lease
+  the newest members are unlinked batches: a `tail` through 20 of them read
+  21 threads before, none now (`tests/chain_log.rs`,
+  `the_tail_reads_threads_from_the_listing`).
+- **Links of deleted members** are retired by the process that deletes
+  them, from the names it has seen: `prune` lists the members first, and
+  snapshots are plain posts with no thread, so a restart leaks no link. A
+  `delete` of a member this process never saw (nothing does one) would
+  leave its links rather than read every deleted blob's message first.
+- **Order of deletes**: a thread is deleted only after its message
   (on an existing message one could be started again). When a member goes,
   its incoming link goes once its `prev` is gone too, its outgoing link once
   its successor is gone: of a deleted stretch only the link into the first

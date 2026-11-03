@@ -12,7 +12,7 @@ use pigeonhole_storage_api::{
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What [`InstanceInfo::kind`](pigeonhole_storage_api::InstanceInfo::kind) says of this store.
@@ -23,10 +23,9 @@ pub const KIND: &str = "memory";
 pub const BLOB_LIMITS: BackendLimits =
     BackendLimits { max_blob_size: 20 * 1024 * 1024 - 1, supports_range: pigeonhole_types::RangeSupport::BestEffort };
 
-/// Typed identity for the memory backend (stage 1.1).
+/// A blob in memory: the number it was put under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryId {
-    pub file_id: String,
     pub message_id: u64,
 }
 
@@ -35,9 +34,8 @@ pub struct MemoryBlobStore {
     limits: BackendLimits,
     instance: InstanceInfo,
     next_msg: AtomicI64,
-    next_fid: AtomicU64,
-    files: Mutex<HashMap<String, Bytes>>,
-    messages: Mutex<HashMap<i64, String>>,
+    /// The blobs, by message id.
+    messages: Mutex<HashMap<i64, Bytes>>,
     /// Message id → the name the blob was uploaded under.
     names: Mutex<HashMap<i64, String>>,
     /// When set and true, get/put fail (failover tests).
@@ -63,9 +61,6 @@ struct ChainLinks {
     labels: HashMap<i64, String>,
 }
 
-/// Alias matching Stage 3 naming.
-pub type MemoryBackend = MemoryBlobStore;
-
 impl MemoryBlobStore {
     pub fn new() -> Self {
         Self::with_limits(BLOB_LIMITS)
@@ -83,8 +78,6 @@ impl MemoryBlobStore {
                 role: InstanceRole::ReadWrite,
             },
             next_msg: AtomicI64::new(1),
-            next_fid: AtomicU64::new(1),
-            files: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             unavailable: None,
@@ -145,19 +138,19 @@ impl MemoryBlobStore {
     }
 
     pub fn len(&self) -> usize {
-        self.files.lock().unwrap().len()
+        self.messages.lock().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Test helper: message sort keys currently held by the store.
     /// The name the message's blob was uploaded under.
     pub fn name_of(&self, message_id: u64) -> Option<String> {
         self.names.lock().unwrap().get(&(message_id as i64)).cloned()
     }
 
+    /// The keys of the blobs the store holds, in order.
     pub fn message_keys(&self) -> Vec<u64> {
         let mut keys: Vec<u64> = self.messages.lock().unwrap().keys().copied().map(|m| m as u64).collect();
         keys.sort_unstable();
@@ -166,16 +159,9 @@ impl MemoryBlobStore {
 
     /// The id of message `message_id`, with the name it was put under.
     fn linked(&self, message_id: i64) -> Linked<MemoryId> {
-        let file_id = self.messages.lock().unwrap().get(&message_id).cloned().unwrap_or_default();
         let label = self.names.lock().unwrap().get(&message_id).cloned();
         let label = label.or_else(|| self.chain.lock().unwrap().labels.get(&message_id).cloned()).unwrap_or_default();
-        Linked { id: MemoryId { file_id, message_id: message_id as u64 }, label }
-    }
-
-    /// Test hook: how many successful `get` calls completed.
-    pub fn get_calls(&self) -> u64 {
-        // kept for Stage 3.5; count via optional counter later
-        0
+        Linked { id: MemoryId { message_id: message_id as u64 }, label }
     }
 }
 
@@ -210,25 +196,24 @@ impl BlobBackend for MemoryBlobStore {
         let _op = self.limiter.op().await;
         self.check_available()?;
         check_blob(name, &data, &self.limits)?;
-        let file_id = format!("mem-{}", self.next_fid.fetch_add(1, Ordering::Relaxed));
         let message_id = self.next_msg.fetch_add(1, Ordering::Relaxed);
-        self.files.lock().unwrap().insert(file_id.clone(), data);
-        self.messages.lock().unwrap().insert(message_id, file_id.clone());
+        let bytes = data.len();
+        self.messages.lock().unwrap().insert(message_id, data);
         self.names.lock().unwrap().insert(message_id, name.to_string());
-        tracing::debug!(store = %self.instance.id, message_id = message_id, name, bytes = self.files.lock().unwrap().get(&file_id).map_or(0, |d| d.len()), "stored");
-        Ok(MemoryId { file_id, message_id: message_id as u64 })
+        tracing::debug!(store = %self.instance.id, message_id = message_id, name, bytes, "stored");
+        Ok(MemoryId { message_id: message_id as u64 })
     }
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let _op = self.limiter.op().await;
         self.check_available()?;
         let data = self
-            .files
+            .messages
             .lock()
             .unwrap()
-            .get(&id.file_id)
+            .get(&(id.message_id as i64))
             .cloned()
-            .ok_or_else(|| NotFound(format!("blob {}", id.file_id)))?;
+            .ok_or_else(|| NotFound(format!("blob {}", id.message_id)))?;
         let sliced = slice_range(data, range)?;
         Ok(bytes_stream(sliced))
     }
@@ -236,16 +221,9 @@ impl BlobBackend for MemoryBlobStore {
     async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
         let _gate = self.delete_gate.read().await;
         let _op = self.limiter.op().await;
+        let mut messages = self.messages.lock().unwrap();
         for &k in keys {
-            let mut messages = self.messages.lock().unwrap();
-            let Some(file_id) = messages.remove(&(k as i64)) else {
-                continue;
-            };
-            let still_used = messages.values().any(|f| f == &file_id);
-            drop(messages);
-            if !still_used {
-                self.files.lock().unwrap().remove(&file_id);
-            }
+            messages.remove(&(k as i64));
         }
         Ok(())
     }

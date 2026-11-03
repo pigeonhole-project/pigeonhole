@@ -216,7 +216,13 @@ nothing until a flood wait, so its rates stay configured.
 ### Bucket kinds
 
 Token buckets for rates, and semaphores for transfers at once (uploads,
-CDN downloads per chat). Discord's thread budget (50 per 300 s in a fixed
+CDN downloads per chat). A semaphore is held only while bytes move: an
+upload permit around a Telegram document's part uploads (not the
+`sendMedia` after them), around each attempt of a Discord attachment send
+(not the waits between attempts). Held through a flood wait or a 429 (a
+minute and more), one rate-limited send had held back every upload of the
+store; the permit was also taken per store, so a pool's other bots waited
+too. Discord's thread budget (50 per 300 s in a fixed
 window) has its own pacer (`Pacer`, GCRA) fed from the answers' headers. It
 becomes a kind of bucket, and the headers feed the limiter
 (`observe(remaining, reset_after)`), only if the bench shows a need (§ Plan).
@@ -259,9 +265,12 @@ let result = ticket.run(&RETRY, classify, |bot| bot.send(…, random_id)).await;
 ## Crates
 
 - **`pigeonhole-limits`**: buckets, plans taken at once, the retry loop,
-  then pools and tickets. It knows no service and depends on tokio (the
-  workspace's `madsim-tokio` alias, so the simulation sees its clock) and
-  metrics.
+  then pools and tickets, and what both chat stores build on
+  (`pigeonhole_limits::chat`: `Pooled`, a channel through several bots;
+  `Member`, a client that can join one; `Failed::into_error`, a failure as
+  the store's error types; `cost`). It knows no service and depends on
+  tokio (the workspace's `madsim-tokio` alias, so the simulation sees its
+  clock), metrics and `pigeonhole-storage-api` (the error types).
 - **The service crates** bring their classes and default rates
   (`limits()`), `classify`, and a `Call` per request (`Budgeted` on
   Telegram, constants on Discord).
@@ -307,8 +316,9 @@ Two bots per service, admins of the blobs test channel, the same host and
 IP. Each bot posted text messages one after another, as fast as the server
 let it: first one bot alone, then both at once. Our own limits were set far
 above the server's. Everything was deleted afterwards
-(`crates/storage/pigeonhole-telegram-mtproto/tests/spike_bots.rs`,
-`scripts/spike-discord-bots.py`).
+(`scripts/spike-discord-bots.py`, and an ignored test
+`pigeonhole-telegram-mtproto/tests/spike_bots.rs`, since deleted: its
+findings are here; at 9ae1d44).
 
 | | one bot | two bots at once | channel total |
 |---|---|---|---|
@@ -356,13 +366,16 @@ until the round trip (~0.3–0.5 s per send) is what is left.
    locations are its own (`FILE_REFERENCE_EXPIRED` for another, measured). Metrics: pool calls by
    member, moves, retry waits. Live, two bots, default limits, sends one
    after another: Telegram 30 in 40 s (44.8/min, one bot's budget 18/min),
-   Discord 40 in 16 s (147/min, one bot's 60/min), no rate limit hit.
-   Telegram reads spread too (decided with the user): a location carries
-   its bot (`FileLocation::bot`), a download goes to that bot, and the
-   store's location cache keeps every bot's location of a document
-   (replicas). `ChannelApi::read_via` picks the holder whose budget is ready
-   soonest, or has a freer bot read the message and add its own; an expired
-   location drops that bot's replica only. A send's answer gives the
+   Discord 40 in 16 s (147/min, one bot's 60/min), no rate limit hit (the
+   ignored tests that measured it, `spike_bots.rs` and `spike_pool.rs`, are
+   deleted; at 9ae1d44).
+   Telegram reads spread too (decided with the user): the pooled channel
+   remembers which bot holds which location of a document (from the reads
+   and sends that went through it; replicas), a download goes to the holder
+   whose budget is ready soonest, or a freer bot reads the message and adds
+   its own; an expired location drops that bot's replica only. The store
+   and `ChannelApi` know nothing of bots: a location is one bot's, as for a
+   channel of one. A send's answer gives the
    sender's location, so a read after write needs no `getMessages` on any
    bot. Live: documents posted through both bots read back after write and
    through a fresh store, no `FILE_REFERENCE_EXPIRED`.
@@ -394,7 +407,7 @@ Telegram's one-bot numbers are those of 2026-10-29 (a one-bot run on
   (the blob's send and the log's, ~0.8 s), not on the 1/s budget.
 - **Large PUTs** are bound by the link, not by limits.
 - **Ranged GETs on Telegram are not slower**: the bench's six reads were
-  noise. Measured apart (`spike_bots.rs` `ranged_reads_one_bot_against_two`,
+  noise. Measured apart (the deleted `spike_bots.rs`, `ranged_reads_one_bot_against_two`,
   1 MiB at random offsets of a 32 MiB document, warm caches, taking
   turns): p50 174 vs 172 ms over 60 reads each, p95 1207 ms with one bot vs
   497 ms with two (reads spread over the bots' budgets).

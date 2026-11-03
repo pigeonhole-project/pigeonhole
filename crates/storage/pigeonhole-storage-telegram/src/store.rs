@@ -1,24 +1,21 @@
 //! [`BlobBackend`] over one channel.
 
-use crate::channel::{
-    windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, ReadVia, IDS_PER_CALL, WINDOW,
-};
+use crate::channel::{windows, ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, IDS_PER_CALL, WINDOW};
 use crate::limits::{DELETE, READ, SEND};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use lru::LruCache;
+use pigeonhole_limits::chat::Classes;
 use pigeonhole_limits::ChatLimiter;
+use pigeonhole_storage_api::located::{as_text, marked_owner, owned_by, Located, Locations, OWNER_MARKER};
 use pigeonhole_storage_api::{
-    bytes_stream, check_blob, slice_range, BlobBackend, BlobId, BoxByteStream, CostHint, Failure, InstanceInfo,
-    NotFound, OpKind, Owner,
+    bytes_stream, check_blob, slice_range, BlobBackend, BoxByteStream, CostHint, Failure, InstanceInfo, OpKind, Owner,
 };
 use pigeonhole_types::{BackendLimits, ByteRange};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// A blob is a message; everything else (file reference, DC, size) is
 /// fetched with it.
@@ -27,34 +24,18 @@ pub struct TelegramId {
     pub message_id: i64,
 }
 
-/// Locations of recently seen documents (saves a `getMessages` per read):
-/// each bot's that read or posted it (its replicas), since a bot downloads
-/// only with its own.
+/// Locations of recently seen documents (saves a `getMessages` per read).
 const LOCATION_CACHE: usize = 4096;
 /// Windows of one blob fetched at a time.
 const WINDOWS_IN_FLIGHT: usize = 4;
 
-/// Where a blob's bytes are: a document's file (a location per bot that
-/// has one, [`FileLocation::bot`]), or the bytes themselves (a text message,
-/// [`pigeonhole_storage_api::text`]).
-#[derive(Clone)]
-pub(crate) enum Located {
-    Doc { size: u64, files: Vec<FileLocation> },
-    Inline(Bytes),
-}
-
-impl Located {
-    /// What message `msg` holds, if it is a blob.
-    pub(crate) fn of(msg: &ChannelMessage) -> Option<Self> {
-        match msg {
-            ChannelMessage::Document { size, file, .. } => {
-                Some(Located::Doc { size: *size, files: vec![file.clone()] })
-            }
-            ChannelMessage::Text { text } => {
-                pigeonhole_storage_api::text::decode(text).map(|(_, data)| Located::Inline(data))
-            }
-            _ => None,
-        }
+/// What message `msg` holds, if it is a blob: a document's file, or a text
+/// message's bytes ([`pigeonhole_storage_api::text`]).
+pub(crate) fn located(msg: &ChannelMessage) -> Option<Located<FileLocation>> {
+    match msg {
+        ChannelMessage::Document { size, file, .. } => Some(Located::File { size: *size, file: file.clone() }),
+        ChannelMessage::Text { text } => Located::of_text(text),
+        _ => None,
     }
 }
 
@@ -67,7 +48,7 @@ pub(crate) fn blob_name(msg: &ChannelMessage) -> Option<&str> {
     }
 }
 
-type Locations = Arc<Mutex<LruCache<i64, Located>>>;
+const CLASSES: Classes = Classes { send: SEND, read: READ, delete: DELETE };
 
 pub struct TelegramBlobStore<C> {
     limits: BackendLimits,
@@ -75,6 +56,8 @@ pub struct TelegramBlobStore<C> {
     pub(crate) reader: Reader<C>,
     pub(crate) limiter: Arc<ChatLimiter>,
     pub(crate) chain: crate::chain::ChainOptions,
+    /// The chain's anchor, once known ([`crate::chain`]).
+    pub(crate) anchor: tokio::sync::Mutex<crate::chain::Anchor>,
     /// Blobs that fit a text message go as text ([`pigeonhole_storage_api::text`]).
     inline: bool,
 }
@@ -83,7 +66,7 @@ pub struct TelegramBlobStore<C> {
 pub(crate) struct Reader<C> {
     pub(crate) channel: Arc<C>,
     limiter: Arc<ChatLimiter>,
-    pub(crate) locations: Locations,
+    pub(crate) locations: Arc<Locations<i64, FileLocation>>,
 }
 
 impl<C> Clone for Reader<C> {
@@ -94,44 +77,28 @@ impl<C> Clone for Reader<C> {
 
 /// The send's `random_id` for blob `name` in `channel`: a repeated put of one
 /// blob (a retry) posts it once.
-/// What an owner marker says to a person reading the channel.
-const OWNER_MARKER: &[u8] = b"pigeonhole: the blobs in this channel are this deployment's";
-
 pub fn blob_random_id(channel_id: i64, name: &str) -> i64 {
     let digest = Sha256::digest(format!("{channel_id}/{name}").as_bytes());
     i64::from_le_bytes(digest[..8].try_into().unwrap())
 }
 
 impl<C: ChannelApi> TelegramBlobStore<C> {
-    /// The owner the pinned message marks the channel for, if it is a marker.
+    /// The owner the pinned message marks the channel for, if it is a
+    /// marker (a bot sees only the latest pin).
     async fn pinned_owner(&self) -> Result<Option<Owner>> {
         let Some(id) = self.reader.channel.pinned().await? else { return Ok(None) };
         let msgs = self.reader.read(&[id]).await?;
-        Ok(msgs.first().and_then(blob_name).and_then(Owner::from_marker))
-    }
-
-    /// The bots whose locations of document `message_id` the store holds,
-    /// sorted (the bot pool's tests).
-    #[cfg(any(test, feature = "fake"))]
-    pub fn document_holders(&self, message_id: i64) -> Vec<usize> {
-        match self.reader.locations.lock().unwrap().peek(&message_id) {
-            Some(Located::Doc { files, .. }) => {
-                let mut bots: Vec<usize> = files.iter().map(|f| f.bot).collect();
-                bots.sort_unstable();
-                bots
-            }
-            _ => Vec::new(),
-        }
+        Ok(marked_owner(msgs.iter().map(blob_name)))
     }
 
     pub fn new(channel: Arc<C>, limiter: Arc<ChatLimiter>, instance: InstanceInfo) -> Self {
-        let locations = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(LOCATION_CACHE).unwrap())));
         Self {
             limits: crate::BLOB_LIMITS,
             instance,
-            reader: Reader { channel, limiter: limiter.clone(), locations },
+            reader: Reader { channel, limiter: limiter.clone(), locations: Arc::new(Locations::new(LOCATION_CACHE)) },
             limiter,
             chain: crate::chain::ChainOptions::default(),
+            anchor: tokio::sync::Mutex::default(),
             inline: true,
         }
     }
@@ -144,23 +111,25 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
 
     /// Post blob `name` as a text message if it fits, else as a document;
     /// its message id. The location is remembered.
+    /// No upload permit is held here: the client takes one around the
+    /// upload of a document's parts, not around the send (whose flood waits
+    /// may last minutes).
     pub(crate) async fn post_blob(&self, name: &str, data: Bytes, random_id: i64) -> Result<i64> {
-        let _upload = self.limiter.acquire_upload().await;
         let channel = &self.reader.channel;
         let store = &self.instance.id;
-        if self.inline && pigeonhole_storage_api::text::fits(name, data.len(), crate::channel::TEXT_MAX_CHARS) {
-            let bytes = data.len();
+        let bytes = data.len();
+        if as_text(self.inline, name, bytes, crate::channel::TEXT_MAX_CHARS) {
             let sent = channel.send_text(&pigeonhole_storage_api::text::encode(name, &data), random_id).await?;
-            self.reader.remember(sent.message_id, Located::Inline(data));
+            self.reader.locations.remember(sent.message_id, Located::Inline(data));
             tracing::debug!(%store, message_id = sent.message_id, name, bytes, kind = "text", "posted");
             return Ok(sent.message_id);
         }
-        let size = data.len() as u64;
+        let size = bytes as u64;
         let sent = channel.send_document(name, data, random_id).await?;
         if let Some(file) = sent.file {
-            self.reader.remember(sent.message_id, Located::Doc { size, files: vec![file] });
+            self.reader.locations.remember(sent.message_id, Located::File { size, file });
         }
-        tracing::debug!(%store, message_id = sent.message_id, name, bytes = size, kind = "document", "posted");
+        tracing::debug!(%store, message_id = sent.message_id, name, bytes, kind = "document", "posted");
         Ok(sent.message_id)
     }
 
@@ -176,63 +145,13 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
 }
 
 impl<C: ChannelApi> Reader<C> {
-    /// Where blob `message_id` is; a document's locations join the ones
-    /// other bots hold (one per bot, the newest).
-    pub(crate) fn remember(&self, message_id: i64, located: Located) {
-        let mut cache = self.locations.lock().unwrap();
-        let located = match (cache.get(&message_id), located) {
-            (Some(Located::Doc { files: held, .. }), Located::Doc { size, files }) => {
-                let mut all: Vec<FileLocation> =
-                    held.iter().filter(|h| files.iter().all(|f| f.bot != h.bot)).cloned().collect();
-                all.extend(files);
-                Located::Doc { size, files: all }
-            }
-            (_, located) => located,
-        };
-        cache.put(message_id, located);
-    }
-
-    /// Bot `bot`'s location of blob `message_id` no longer works.
-    fn forget(&self, message_id: i64, bot: usize) {
-        let mut cache = self.locations.lock().unwrap();
-        if let Some(Located::Doc { files, .. }) = cache.get_mut(&message_id) {
-            files.retain(|f| f.bot != bot);
-            if files.is_empty() {
-                cache.pop(&message_id);
-            }
-        }
-    }
-
-    /// The location to download blob `message_id` with: a holder's the
-    /// channel picks, or that of the bot that reads the message again.
-    async fn pick(&self, message_id: i64, files: &[FileLocation]) -> Result<FileLocation> {
-        let holders: Vec<usize> = files.iter().map(|f| f.bot).collect();
-        match self.channel.read_via(&holders) {
-            ReadVia::Holder(bot) => Ok(files
-                .iter()
-                .find(|f| f.bot == bot)
-                .cloned()
-                .context("the channel picked a bot holding no location")?),
-            ReadVia::Locate => self.relocate(message_id).await,
-        }
-    }
-
-    /// Read blob `message_id` again (through whichever bot the channel
-    /// picks): its location, with a fresh file reference.
-    async fn relocate(&self, message_id: i64) -> Result<FileLocation> {
-        match self.locate(message_id, true).await? {
-            Located::Doc { files, .. } => files.into_iter().next().context("a document without a location"),
-            Located::Inline(_) => bail!("blob {message_id} is no longer a document"),
-        }
-    }
-
     /// Read messages `ids` (at most [`IDS_PER_CALL`]), remembering where
-    /// their documents are.
+    /// their blobs are.
     pub(crate) async fn read(&self, ids: &[i64]) -> Result<Vec<ChannelMessage>> {
         let msgs = self.channel.get_messages(ids).await?;
         for (id, m) in ids.iter().zip(&msgs) {
-            if let Some(located) = Located::of(m) {
-                self.remember(*id, located);
+            if let Some(l) = located(m) {
+                self.locations.remember(*id, l);
             }
         }
         Ok(msgs)
@@ -241,18 +160,24 @@ impl<C: ChannelApi> Reader<C> {
     /// Where blob `message_id` is: from the cache, or read the message
     /// (`fresh` = always read it, for a new file reference). A miss reads
     /// the whole page below: a log replay walks down message by message.
-    async fn locate(&self, message_id: i64, fresh: bool) -> Result<Located> {
-        if !fresh {
-            if let Some(l) = self.locations.lock().unwrap().get(&message_id) {
-                return Ok(l.clone());
-            }
-        }
-        let lo = if fresh { message_id } else { (message_id - IDS_PER_CALL as i64 + 1).max(1) };
-        let ids: Vec<i64> = (lo..=message_id).collect();
-        let msg = self.read(&ids).await?.pop();
-        match msg {
-            Some(ChannelMessage::Empty) | None => Err(NotFound(format!("blob message {message_id}")).into()),
-            Some(m) => Located::of(&m).with_context(|| format!("message {message_id} is not a blob")),
+    async fn locate(&self, message_id: i64, fresh: bool) -> Result<Located<FileLocation>> {
+        self.locations
+            .locate(message_id, fresh, || async move {
+                let lo = if fresh { message_id } else { (message_id - IDS_PER_CALL as i64 + 1).max(1) };
+                let ids: Vec<i64> = (lo..=message_id).collect();
+                match self.read(&ids).await?.pop() {
+                    Some(ChannelMessage::Empty) | None => Ok(None),
+                    Some(m) => located(&m).map(Some).with_context(|| format!("message {message_id} is not a blob")),
+                }
+            })
+            .await
+    }
+
+    /// Read blob `message_id` again: its location, with a fresh file reference.
+    async fn relocate(&self, message_id: i64) -> Result<FileLocation> {
+        match self.locate(message_id, true).await? {
+            Located::File { file, .. } => Ok(file),
+            Located::Inline(_) => bail!("blob {message_id} is no longer a document"),
         }
     }
 
@@ -269,7 +194,6 @@ impl<C: ChannelApi> Reader<C> {
         let _permit = self.limiter.acquire_download().await;
         let bytes = match self.channel.get_file(&file, offset, WINDOW).await {
             Err(e) if e.is::<FileReferenceExpired>() => {
-                self.forget(message_id, file.bot);
                 let fresh = self.relocate(message_id).await?;
                 self.channel.get_file(&fresh, offset, WINDOW).await
             }
@@ -301,15 +225,8 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
     }
 
     fn cost(&self, op: OpKind, id: Option<&Self::Id>) -> CostHint {
-        let wait = match op {
-            OpKind::Put => self.limiter.peek_wait(SEND),
-            OpKind::Get if id.is_some_and(|i| self.reader.locations.lock().unwrap().contains(&i.message_id)) => {
-                std::time::Duration::ZERO
-            }
-            OpKind::Get => self.limiter.peek_wait(READ),
-            OpKind::Delete => self.limiter.peek_wait(DELETE),
-        };
-        CostHint { wait_secs: wait.as_secs_f64() }
+        let cached = id.is_some_and(|i| self.reader.locations.holds(i.message_id));
+        pigeonhole_limits::chat::cost(&self.limiter, CLASSES, op, cached)
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
@@ -321,14 +238,13 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
 
     async fn get(&self, id: &Self::Id, range: Option<ByteRange>) -> Result<BoxByteStream> {
         let message_id = id.message_id;
-        let (size, files) = match self.reader.locate(message_id, false).await? {
+        let (size, file) = match self.reader.locate(message_id, false).await? {
             Located::Inline(data) => {
                 tracing::debug!(store = %self.instance.id, message_id = message_id, ?range, kind = "text", "read");
                 return Ok(bytes_stream(slice_range(data, range)?));
             }
-            Located::Doc { size, files } => (size, files),
+            Located::File { size, file } => (size, file),
         };
-        let file = self.reader.pick(message_id, &files).await?;
         tracing::debug!(store = %self.instance.id, message_id = message_id, ?range, size, kind = "document", "read");
         let (start, end) = match range {
             Some(r) if r.start > r.end || r.end > size => {
@@ -348,10 +264,9 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
         Ok(Box::pin(stream))
     }
 
-    /// The pinned owner marker if there is one, else ours, posted and pinned.
-    /// A bot learns only the latest pin: of two deployments racing on a new
-    /// channel, the last to pin keeps it and the other learns so here (a
-    /// read after its own pin) or at its next start.
+    /// The pinned owner marker if there is one, else ours, posted and pinned
+    /// (read again after: of two deployments racing on a new channel, the
+    /// last to pin keeps it, [`marked_owner`]).
     async fn mark_owner(&self, owner: Owner) -> Result<Owner> {
         if let Some(marked) = self.pinned_owner().await? {
             return Ok(marked);
@@ -369,10 +284,7 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
     async fn exists(&self, id: &Self::Id) -> Result<bool> {
         match self.reader.locate(id.message_id, true).await {
             Ok(_) => Ok(true),
-            Err(e) if Failure::of(&e) == Failure::NotFound => {
-                self.reader.locations.lock().unwrap().pop(&id.message_id);
-                Ok(false)
-            }
+            Err(e) if Failure::of(&e) == Failure::NotFound => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -381,15 +293,14 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
         for ids in keys.chunks(IDS_PER_CALL) {
             self.reader.channel.delete_messages(ids).await?;
             tracing::debug!(store = %self.instance.id, messages = ?ids, "deleted");
-            let mut cache = self.reader.locations.lock().unwrap();
             for id in ids {
-                cache.pop(id);
+                self.reader.locations.forget(*id);
             }
         }
         Ok(())
     }
 
-    /// `owner`'s blobs (documents or texts named by a [`BlobId`] of its) with
+    /// `owner`'s blobs (documents or texts named by a [`BlobId`](pigeonhole_storage_api::BlobId) of its) with
     /// ids in `(after, upto]`, read from the channel 100 ids at a time;
     /// nothing else in the channel is ever a candidate.
     async fn candidates(
@@ -406,10 +317,8 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
             let ids: Vec<i64> = (next..=last).collect();
             let msgs = self.reader.read(&ids).await?;
             for (id, msg) in ids.into_iter().zip(msgs) {
-                if let Some(name) = blob_name(&msg) {
-                    if BlobId::from_name(name).is_some_and(|b| b.owner() == owner) {
-                        out.push(id);
-                    }
+                if owned_by(blob_name(&msg), owner) {
+                    out.push(id);
                 }
             }
             next = last.saturating_add(1);

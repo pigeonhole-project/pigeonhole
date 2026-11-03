@@ -2,7 +2,7 @@
 //! (docs/chain-log.md, docs/telegram-mtproto.md § The log).
 //!
 //! A chain blob is a document named `<label>~<prev>.bin` (`prev` = the id of
-//! the message it follows, `root` for the first). The channel gives every
+//! the message it follows). The channel gives every
 //! message an id, atomically and in increasing order, and any reader sees
 //! that order: the successor of `p` is the **first** message, by id, that
 //! names `p`. A message names a `p` that already existed, so a put after `p`
@@ -20,16 +20,27 @@
 //! in `(p, b)` that names one is just as final a "no" (and its label tells
 //! the writer who holds the log now).
 //!
+//! The first member follows the **anchor**, a message posted once, before
+//! it, and never pruned: its id is the floor of the first member's range,
+//! so a chain started on a channel with a long history reads the ids since
+//! the anchor, not the channel. Of two stores posting an anchor at once the
+//! older one is the anchor (the other deletes its own). The store finds it
+//! once per process: when it walks the channel finding no member, or by
+//! reading the channel up to the top before it posts one.
+//!
 //! The top of a channel is only learnt by posting: `tail` and `successor`
 //! post a probe (kept: deleting it would leave an empty id in a range some
 //! check reads). An empty id inside a checked range is read again a few
-//! times (a message not visible yet shows up), then taken as deleted.
+//! times (a message not visible yet shows up), then taken as deleted; only
+//! the ids below the first member that decides the check are, since one
+//! above it cannot change the answer.
 
 use crate::channel::{ChannelApi, ChannelMessage, IDS_PER_CALL};
 use crate::store::{blob_name, TelegramBlobStore, TelegramId};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use pigeonhole_storage_api::chain_name::{chain_name, parse_chain_name};
 use pigeonhole_storage_api::{
     check_blob, newest_loose_at_tail, put_after_tail_by_links, put_loose_linked, After, BlobBackend, Chain, Linked,
     MakeAfter,
@@ -53,20 +64,25 @@ impl Default for ChainOptions {
 }
 
 const PROBE: &str = "chain-probe.bin";
+const ANCHOR: &str = "chain-anchor.bin";
 
-fn chain_name(label: &str, prev: Option<i64>) -> String {
-    match prev {
-        Some(p) => format!("{label}~{p}.bin"),
-        None => format!("{label}~root.bin"),
-    }
+/// What the store knows of its chain's anchor.
+#[derive(Debug, Default)]
+pub(crate) struct Anchor {
+    /// The anchor, once found.
+    found: Option<i64>,
+    /// The ids up to here were read and held no anchor.
+    none_upto: i64,
 }
 
-/// A chain blob's label and the id it follows (`None`: the first).
-fn parse_name(name: &str) -> Option<(&str, Option<i64>)> {
-    let (label, prev) = name.strip_suffix(".bin")?.rsplit_once('~')?;
-    match prev {
-        "root" => Some((label, None)),
-        p => p.parse().ok().map(|p| (label, Some(p))),
+impl Anchor {
+    /// Learn from `view`, which holds every id in `[1, upto]`: its oldest
+    /// anchor is the chain's; with none, there is none up to `upto`.
+    fn learn(&mut self, view: &View, upto: i64) {
+        if self.found.is_none() {
+            self.found = view.range(..=upto).find(|(_, s)| **s == Seen::Anchor).map(|(id, _)| *id);
+            self.none_upto = self.none_upto.max(upto);
+        }
     }
 }
 
@@ -75,8 +91,9 @@ fn parse_name(name: &str) -> Option<(&str, Option<i64>)> {
 enum Seen {
     Empty,
     /// A chain blob: its label and what it follows.
-    Member(String, Option<i64>),
+    Member(String, i64),
     Probe,
+    Anchor,
     Foreign,
 }
 
@@ -86,7 +103,8 @@ fn seen(msg: &ChannelMessage) -> Seen {
     }
     match blob_name(msg) {
         Some(PROBE) => Seen::Probe,
-        Some(name) => match parse_name(name) {
+        Some(ANCHOR) => Seen::Anchor,
+        Some(name) => match parse_chain_name(name) {
             Some((label, prev)) => Seen::Member(label.to_string(), prev),
             None => Seen::Foreign,
         },
@@ -95,6 +113,18 @@ fn seen(msg: &ChannelMessage) -> Seen {
 }
 
 type View = BTreeMap<i64, Seen>;
+
+/// The member of `(prev, hi)` that decides what follows `prev`, by id:
+/// the first that names `prev`, else the first that names a newer blob.
+fn decisive(view: &View, prev: i64, hi: i64) -> Option<(i64, String)> {
+    let first = |follows: &dyn Fn(i64) -> bool| {
+        view.range(prev + 1..hi).find_map(|(id, s)| match s {
+            Seen::Member(label, p) if follows(*p) => Some((*id, label.clone())),
+            _ => None,
+        })
+    };
+    first(&|p| p == prev).or_else(|| first(&|p| p > prev))
+}
 
 impl<C: ChannelApi> TelegramBlobStore<C> {
     async fn page(&self, view: &mut View, lo: i64, hi: i64) -> Result<()> {
@@ -123,10 +153,13 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
         Ok(())
     }
 
-    /// Read the empty ids of `(lo, hi)` again a few times: a message not
-    /// visible yet shows up; one that stays empty was deleted.
-    async fn settle(&self, view: &mut View, lo: i64, hi: i64) -> Result<()> {
+    /// Read the empty ids of `(lo, bound)` again a few times, where
+    /// `bound` is what the view says the check needs read (it can only fall
+    /// as messages show up): a message not visible yet shows up; one that
+    /// stays empty was deleted.
+    async fn settle(&self, view: &mut View, lo: i64, bound: impl Fn(&View) -> i64) -> Result<()> {
         for attempt in 0..=self.chain.empty_retries {
+            let hi = bound(view);
             let empty: Vec<i64> =
                 view.range(lo + 1..hi).filter(|(_, s)| **s == Seen::Empty).map(|(id, _)| *id).collect();
             if empty.is_empty() {
@@ -145,27 +178,47 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
         Ok(())
     }
 
-    /// What `prev` (at `lo`) is followed by in `(lo, hi)`, read and
-    /// settled: the first member that names it, else the first that names a
-    /// newer one (the chain went on past `prev`; its successor was deleted).
-    async fn first_naming(
-        &self,
-        view: &mut View,
-        lo: i64,
-        hi: i64,
-        prev: Option<i64>,
-    ) -> Result<Option<Linked<TelegramId>>> {
-        self.fill(view, lo + 1, hi - 1).await?;
-        self.settle(view, lo, hi).await?;
-        let first = |follows: &dyn Fn(Option<i64>) -> bool| {
-            view.range(lo + 1..hi).find_map(|(id, s)| match s {
-                Seen::Member(label, p) if follows(*p) => {
-                    Some(Linked { id: TelegramId { message_id: *id }, label: label.clone() })
-                }
-                _ => None,
-            })
-        };
-        Ok(first(&|p| p == prev).or_else(|| first(&|p| p.is_some_and(|p| p > lo))))
+    /// What `prev` is followed by in `(prev, hi)`, read and settled: the
+    /// first member that names it, else the first that names a newer one
+    /// (the chain went on past `prev`; its successor was deleted). Only the
+    /// empty ids below that member are settled: one above cannot be first.
+    async fn first_naming(&self, view: &mut View, prev: i64, hi: i64) -> Result<Option<Linked<TelegramId>>> {
+        self.fill(view, prev + 1, hi - 1).await?;
+        self.settle(view, prev, |view| decisive(view, prev, hi).map_or(hi, |(id, _)| id)).await?;
+        Ok(decisive(view, prev, hi).map(|(id, label)| Linked { id: TelegramId { message_id: id }, label }))
+    }
+
+    /// The chain's anchor: found once per process, posted if the channel
+    /// has none. The first member's range starts at it.
+    async fn anchor(&self) -> Result<i64> {
+        let mut known = self.anchor.lock().await;
+        if let Some(a) = known.found {
+            return Ok(a);
+        }
+        let mut view = View::new();
+        if known.none_upto == 0 {
+            // Never looked in this process: read the channel up to its top.
+            let top = self.top().await?;
+            self.fill(&mut view, 1, top - 1).await?;
+            known.learn(&view, top - 1);
+            if let Some(a) = known.found {
+                return Ok(a);
+            }
+        }
+        let looked = known.none_upto;
+        let mine = self.post(ANCHOR, Bytes::from_static(&[0])).await?;
+        // Another store may have posted one since: the oldest is the anchor.
+        self.fill(&mut view, looked + 1, mine - 1).await?;
+        self.settle(&mut view, looked, |_| mine).await?;
+        known.learn(&view, mine);
+        let anchor = *known.found.get_or_insert(mine);
+        if anchor != mine {
+            if let Err(e) = self.delete(&[mine]).await {
+                tracing::debug!(store = %self.instance().id, message_id = mine, error = %format!("{e:#}"), "a second anchor stays");
+            }
+        }
+        tracing::debug!(store = %self.instance().id, anchor, mine, "the chain's anchor");
+        Ok(anchor)
     }
 
     /// Post a blob (text if it fits); its id.
@@ -186,56 +239,65 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
 impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
     async fn put_after(&self, prev: Option<&TelegramId>, label: &str, data: Bytes) -> Result<After<TelegramId>> {
         check_blob(label, &data, self.limits())?;
-        let prev = prev.map(|p| p.message_id);
+        // The first member follows the anchor.
+        let prev = match prev {
+            Some(p) => p.message_id,
+            None => self.anchor().await?,
+        };
         let b = self.post(&chain_name(label, prev), data).await?;
-        let lo = prev.unwrap_or(0);
-        if b <= lo {
-            bail!("the channel gave message id {b}, not above {lo}");
+        if b <= prev {
+            bail!("the channel gave message id {b}, not above {prev}");
         }
         let store = &self.instance().id;
-        if prev.is_some() && b == lo + 1 {
-            tracing::debug!(%store, label, ?prev, message_id = b, "linked (next id, no read)");
+        if b == prev + 1 {
+            tracing::debug!(%store, label, prev, message_id = b, "linked (next id, no read)");
             return Ok(After::Won(TelegramId { message_id: b }));
         }
-        match self.first_naming(&mut View::new(), lo, b, prev).await? {
+        match self.first_naming(&mut View::new(), prev, b).await? {
             Some(winner) => {
-                tracing::debug!(%store, label, ?prev, message_id = b, winner = winner.id.message_id, winner_label = %winner.label, "lost the link");
+                tracing::debug!(%store, label, prev, message_id = b, winner = winner.id.message_id, winner_label = %winner.label, "lost the link");
                 Ok(After::Lost(winner))
             }
             None => {
-                tracing::debug!(%store, label, ?prev, message_id = b, "linked");
+                tracing::debug!(%store, label, prev, message_id = b, "linked");
                 Ok(After::Won(TelegramId { message_id: b }))
             }
         }
     }
 
+    /// The newest member that won its link, walking down from the top to
+    /// the anchor (to the bottom while it is not known; a walk that finds no
+    /// member learns where the anchor is).
     async fn tail(&self) -> Result<Option<Linked<TelegramId>>> {
         let top = self.top().await?;
+        let floor = self.anchor.lock().await.found.unwrap_or(0);
         let mut view = View::new();
         let mut id = top - 1;
-        while id >= 1 {
-            self.fill(&mut view, (id - IDS_PER_CALL as i64 + 1).max(1), id).await?;
+        while id > floor {
+            self.fill(&mut view, (id - IDS_PER_CALL as i64 + 1).max(floor + 1), id).await?;
             if let Some(Seen::Member(label, prev)) = view.get(&id).cloned() {
                 // A member that won its link is in the chain; the newest is the tail.
-                if self.first_naming(&mut view, prev.unwrap_or(0), id, prev).await?.is_none() {
+                if self.first_naming(&mut view, prev, id).await?.is_none() {
                     tracing::debug!(store = %self.instance().id, message_id = id, %label, top, "found the tail");
                     return Ok(Some(Linked { id: TelegramId { message_id: id }, label }));
                 }
             }
             id -= 1;
         }
+        if floor == 0 {
+            self.anchor.lock().await.learn(&view, top - 1);
+        }
         Ok(None)
     }
 
     async fn successor(&self, id: &TelegramId) -> Result<Option<Linked<TelegramId>>> {
         let top = self.top().await?;
-        let at = id.message_id;
-        self.first_naming(&mut View::new(), at, top, Some(at)).await
+        self.first_naming(&mut View::new(), id.message_id, top).await
     }
 
     /// Our messages (members, losers, probes) below `below`, walking down
     /// until a page holds none of ours: what lies further down was pruned
-    /// before.
+    /// before. The anchor stays.
     async fn prune(&self, below: &TelegramId) -> Result<()> {
         let mut hi = below.message_id - 1;
         while hi >= 1 {
@@ -274,20 +336,5 @@ impl<C: ChannelApi> Chain for TelegramBlobStore<C> {
 
     async fn newest_loose(&self, prefix: &str) -> Result<Option<Linked<TelegramId>>> {
         newest_loose_at_tail(self, prefix).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn names_roundtrip() {
-        assert_eq!(chain_name("log-batch-3", Some(41)), "log-batch-3~41.bin");
-        assert_eq!(parse_name("log-batch-3~41.bin"), Some(("log-batch-3", Some(41))));
-        assert_eq!(parse_name("log-claim-1~root.bin"), Some(("log-claim-1", None)));
-        for foreign in ["ph-00.bin", "photo.jpg", "x~y.bin", PROBE] {
-            assert_eq!(parse_name(foreign), None, "{foreign}");
-        }
     }
 }
