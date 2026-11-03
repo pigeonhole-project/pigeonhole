@@ -129,11 +129,7 @@ impl ReplicaSelector for CheapestFirst {
             let g = self.inner.lock().unwrap();
             replicas.iter().map(|r| g.unhealthy.get(&r.instance).is_some_and(|u| u.open_until > now)).collect()
         };
-        // Drawn last replica first: two close replicas then come in the
-        // order the comparison sort gave them (the demo's smoke test reads
-        // a wiped copy first by that draw).
         let mut keyed: Vec<(bool, i64, u64, usize)> = (0..replicas.len())
-            .rev()
             .map(|i| {
                 let score = costs[i].wait_secs;
                 let bucket = if score.is_finite() { (score / self.close_epsilon).floor() as i64 } else { i64::MAX };

@@ -158,9 +158,15 @@ if (mode === "smoke") {
   read(await m.idle(3000), "idle"); // heartbeats, over both kinds of links
   await call({op: "put", key: "text"}, new TextEncoder().encode("hello ".repeat(100000)));
   await call({op: "put", key: "random"}, crypto.getRandomValues(new Uint8Array(60000)));
-  // A copy gone behind the node's back: a read that tries it fails over;
-  // the check queues it for repair.
+  // A copy gone behind the node's back, the other one down: a read fails on
+  // both (which copy it tries first is a random draw, so neither is spared);
+  // the check queues the wiped one for repair once the other is back.
   await call({op: "wipe", store: "dc-1"});
+  await call({op: "outage", store: "tg-1", down: true});
+  const failed = await m.op({op: "get", key: "random"});
+  read(failed.events, "get");
+  if (!failed.reply.error) throw new Error("a read with one copy wiped and the other down succeeded");
+  await call({op: "outage", store: "tg-1", down: false});
   await call({op: "get", key: "random"});
   await call({op: "verify", store: "dc-1"});
   read(await m.idle(5000), "idle"); // the repair; the outboxes pruned
