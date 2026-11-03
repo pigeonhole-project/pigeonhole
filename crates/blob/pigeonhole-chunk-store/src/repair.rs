@@ -53,6 +53,8 @@ pub struct RepairStats {
     pub skipped_budget: u64,
     pub skipped_noop: u64,
     pub failed: u64,
+    /// Jobs given up on in this pass ([`crate::Unrepairable`]).
+    pub parked: u64,
 }
 
 /// Background repair / backfill worker.
@@ -106,6 +108,7 @@ impl Repairer {
                 pigeonhole_blob::record_repair("skipped_budget", stats.skipped_budget);
                 pigeonhole_blob::record_repair("skipped_noop", stats.skipped_noop);
                 pigeonhole_blob::record_repair("failed", stats.failed);
+                pigeonhole_blob::set_repair_unrepairable(self.db.unrepairable().len() as u64);
                 if let Ok(depth) = self.db.repair_queue_len().await {
                     pigeonhole_blob::set_repair_queue_depth(depth);
                 }
@@ -153,16 +156,11 @@ impl Repairer {
                     stats.skipped_noop += 1;
                     let _ = self.db.dequeue_repair(chunk_id, &instance_id).await;
                 }
-                Ok(Copied::DeferredBudget) => stats.skipped_budget += 1,
-                Err(e) => {
-                    stats.failed += 1;
-                    warn!(
-                        chunk_id,
-                        instance = %instance_id,
-                        error = %e,
-                        "repair job failed"
-                    );
+                Ok(Copied::DeferredBudget) => {
+                    stats.skipped_budget += 1;
+                    self.db.repair_deferred(chunk_id, &instance_id);
                 }
+                Err(e) => self.failed(chunk_id, &instance_id, &e, &mut stats),
             }
         }
         self.commit(ready, &mut stats).await;
@@ -181,8 +179,10 @@ impl Repairer {
         let added = match self.db.commit_instance_replicas(&replicas, pins).await {
             Ok(added) => added,
             Err(e) => {
-                stats.failed += ready.len() as u64;
-                warn!(jobs = ready.len(), error = %e, "commit repaired replicas failed");
+                let e = e.context("commit repaired replicas");
+                for r in &ready {
+                    self.failed(r.chunk_id, &r.layout.instance, &e, stats);
+                }
                 return;
             }
         };
@@ -196,6 +196,18 @@ impl Repairer {
                 stats.skipped_noop += 1;
                 self.discard(&r).await;
             }
+        }
+    }
+
+    /// A job failed: it backs off, or is parked once it failed too often.
+    fn failed(&self, chunk_id: ChunkId, instance: &str, e: &anyhow::Error, stats: &mut RepairStats) {
+        stats.failed += 1;
+        let error = format!("{e:#}");
+        if self.db.repair_failed(chunk_id, instance, &error) {
+            stats.parked += 1;
+            warn!(chunk_id, instance, error, "repair job failed too often; parked as unrepairable");
+        } else {
+            warn!(chunk_id, instance, error, "repair job failed; retried later");
         }
     }
 
@@ -615,6 +627,39 @@ mod tests {
         let a_layout = fixed.iter().find(|l| l.instance == "a").unwrap();
         let got = layer.read_from_replicas(chunk_id, 0, data.len(), std::slice::from_ref(a_layout)).await.unwrap();
         assert_eq!(got, data);
+    }
+
+    /// A job that cannot succeed (its only source is gone) no longer takes
+    /// the pass's slots: the jobs behind it are repaired in the next passes.
+    #[tokio::test]
+    async fn a_job_that_cannot_succeed_does_not_starve_the_queue() {
+        let a = lim("a", 4 * MIB);
+        let (_dir, layer, _) = open_layer(vec![a.clone()], 1, MIB, MIB).await;
+        let lost = layer.put_small(Bytes::from_static(b"lost")).await.unwrap();
+        let mut others = Vec::new();
+        for i in 0..3u8 {
+            others.push(layer.put_small(Bytes::from(vec![i; 100])).await.unwrap());
+        }
+        let keys: Vec<Vec<u8>> = layer.db().get_replica_layouts(lost).await.unwrap()[0]
+            .parts
+            .iter()
+            .map(|p| p.locator.key.clone())
+            .collect();
+        a.delete(&keys).await.unwrap();
+        let rep = add_b(&layer, a).await;
+        let config = RepairConfig { scrub: false, batch_size: 1, ..RepairConfig::default() };
+        let repairer = Repairer::new(layer.db().clone(), rep, config);
+        assert_eq!(repairer.enqueue_instance_backfill("b").await.unwrap(), 4);
+
+        let first = repairer.repair_once().await.unwrap();
+        assert_eq!((first.repaired, first.failed), (0, 1), "the lost chunk comes first and fails");
+        for _ in 0..3 {
+            assert_eq!(repairer.repair_once().await.unwrap().repaired, 1);
+        }
+        assert_eq!(layer.db().repair_jobs().await, vec![(lost, "b".to_string())], "only the lost one waits");
+        for id in others {
+            assert!(layer.db().get_replica_layouts(id).await.unwrap().iter().any(|l| l.instance == "b"));
+        }
     }
 
     /// The member set `[a]` grown to `[a, b]`, synced into the layer.
