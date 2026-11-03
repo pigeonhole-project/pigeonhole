@@ -7,7 +7,7 @@
 // free); the data follows. Creating, removing and opening a file are then
 // synchronous, as WASI needs; only adding pool files is not (the worker does
 // it between calls). Pool file 0 holds the list of directories.
-export const HEADER = 4096;
+const HEADER = 4096;
 const DIRS = "\u0000dirs";
 const E = {SUCCESS: 0, BADF: 8, EXIST: 20, INVAL: 28, ISDIR: 31, NOENT: 44, NOSPC: 51, NOSYS: 52, NOTDIR: 54, NOTEMPTY: 55};
 const enc = new TextEncoder(),

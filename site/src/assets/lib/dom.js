@@ -44,3 +44,8 @@ export function activate(el, fn) {
 }
 
 export const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+// A screen with hover (a mouse), not only touch.
+export const canHover = () => matchMedia("(hover: hover)").matches;
+
+// $("id") in `root` (a view's template, the document).
+export const within = root => id => root.querySelector(`#${id}`);

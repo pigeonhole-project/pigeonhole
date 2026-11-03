@@ -4,15 +4,15 @@
 //
 // The op's reply: {tasks: [{task, every: "10s" | "off", next_in_ms, work: [...]}],
 //                  snapshot: {head, base, at: the newest snapshot's position, every}}.
-import {activate, button, h, svg} from "../lib/dom.js";
+import {activate, button, canHover, h, svg} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {boarded, perched} from "./art.js";
 import {sentence} from "./entities.js";
 
-export const TASKS = ["repair", "sweep", "cool", "snapshot"];
+const TASKS = ["repair", "sweep", "cool", "snapshot"];
 // The tasks only the leader runs (the chunk stores are its); every node
 // takes snapshots of its own state.
-export const LEADER_TASKS = new Set(["repair", "sweep", "cool"]);
+const LEADER_TASKS = new Set(["repair", "sweep", "cool"]);
 // The dynamic key that sets a task's period; the period "on" means when the file has it off.
 export const TASK_KEY = {repair: "repair.interval", sweep: "sweep.interval", cool: "inline.cool_every", snapshot: "meta.snapshot_every"};
 export const TASK_ON = {repair: "10s", sweep: "30s", cool: "30s", snapshot: "1m"};
@@ -30,7 +30,7 @@ export function ms(text) {
 }
 
 // "45 s", "9 min": how long until a pass.
-export function soon(msLeft) {
+function soon(msLeft) {
   const sec = Math.ceil((msLeft || 0) / 1000);
   return sec < 120 ? t("time.s", {n: sec}) : t("time.min", {n: Math.round(sec / 60)});
 }
@@ -68,17 +68,20 @@ export function describe(bg, name) {
   };
 }
 
+// A repair job ({chunk, store}): a sentence (its store a link, entities.js).
+const jobSentence = item => ["demo.job", {chunk: item.chunk, store: item.store}];
+
 // A piece of work as a tile; a repair job's channel, a link to it.
 function jobTile(name, item) {
   const li = h("li", "job-tile");
-  if (name === "repair") li.append(...sentence(["demo.job", {chunk: item.chunk, store: item.store}]));
+  if (name === "repair") li.append(...sentence(jobSentence(item)));
   else li.textContent = workLabel(name, item);
   return li;
 }
 
 // One piece of a task's work, in words.
 export function workLabel(name, item) {
-  if (name === "repair") return t("demo.job", {chunk: item.chunk, store: item.store});
+  if (name === "repair") return t(...jobSentence(item));
   if (name === "sweep") return t("bg.sweep_item", {chunk: item.chunk});
   return t("bg.cool_item", {key: item.key, size: bytes(item.size), reason: t(`bg.reason_${item.reason}`)});
 }
@@ -146,8 +149,6 @@ export function taskWindows(g, entrances, onOpen, {follower = false} = {}) {
     tip.refresh(bg);
   };
 }
-
-const canHover = () => matchMedia("(hover: hover)").matches;
 
 // A window's tooltip: what the task is, when it passes next, what waits;
 // it follows the background while it is up. Beside the window, kept on the

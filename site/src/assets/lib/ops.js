@@ -12,7 +12,7 @@
 // its files go, no node behind it). A request may name the `node` of a
 // cluster it goes to; none: the leader.
 
-export const OP_CLOSE = "close";
+const OP_CLOSE = "close";
 export const OP_RESET = "reset";
 
 // Each op the page sends, as a request (a body, if any, goes beside it).

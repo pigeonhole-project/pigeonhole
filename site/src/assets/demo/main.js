@@ -2,7 +2,7 @@
 // Every flight on it is an event the node logged; clicking a node opens its
 // panel. This module keeps the page's state and wires the views (pure: data
 // and callbacks in, elements out) to the node's ops.
-import {button, h, reducedMotion} from "../lib/dom.js";
+import {button, h, reducedMotion, within} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {ops} from "../lib/ops.js";
 import {budgetsOf, sendLevel} from "./budgets.js";
@@ -20,10 +20,10 @@ import {connect} from "./node.js";
 import {makeRaftWatch} from "./raft.js";
 import {apply as applyEvent, merge} from "./reduce.js";
 import {storeView} from "./store-view.js";
-import {TASK_KEY, TASK_ON, taskWindows} from "./tasks.js";
+import {TASK_KEY, TASK_ON, taskWindows, workLabel} from "./tasks.js";
 import {makeWizard} from "./wizard.js";
 
-const $ = id => document.getElementById(id);
+const $ = within(document);
 const ok = reply => reply && !reply.error;
 const pause = ms => new Promise(r => setTimeout(r, reducedMotion() ? 0 : ms));
 
@@ -35,6 +35,7 @@ const state = {
   node: null, // the node your requests go to (your panel); null: whichever leads
   look: null, // the node on screen (its panel, log, tasks); null: the one your requests go to
   cluster: null, // the `cluster` op's: {leader, term, nodes}
+  views: new Map(), // each node's own `cluster` op, by id
   term: null, // the newest term seen: a new leader is told once
   timing: null, // the cluster's clocks (ms): {heartbeat, election: [min, max]}
   cut: new Set(), // the nodes cut off from the others
@@ -240,8 +241,8 @@ async function refreshObjects() {
   const {reply} = await call(ops.list(state.bucket, state.cluster?.leader ?? undefined));
   if (ok(reply)) state.objects = reply.objects || [];
   graph.setObjects(state.objects.length);
-  view?.setObjects?.(state.objects);
-  view?.setCounters?.(counters());
+  if (isOpen("client")) view.setObjects(state.objects);
+  if (isOpen("loft")) view.setCounters(counters());
 }
 
 // The channels as the node has them now, the graph's windows from them;
@@ -277,7 +278,7 @@ async function loadLog() {
   await loadChannels();
   if (ok(reply)) state.log = reply;
   if (isOpen("log")) renderPanel();
-  view?.setCounters?.(counters());
+  if (isOpen("loft")) view.setCounters(counters());
 }
 
 // ------------------------------------------------------------ background tasks
@@ -363,8 +364,8 @@ const clusterData = (dynamic = null) => {
   const leader = state.cluster?.leader;
   return {
     nodes: state.nodes,
-    own: state.views ?? new Map(),
-    leader: state.views?.get(leader) ?? null,
+    own: state.views,
+    leader: state.views.get(leader) ?? null,
     cut: state.cut,
     dynamic,
     chronicle: raft.chronicle(),
@@ -376,13 +377,13 @@ const clusterData = (dynamic = null) => {
 async function updateCluster() {
   const leader = state.cluster?.leader;
   const dynamic = leader == null ? null : (await call(ops.dynamic(leader))).reply;
-  if (isOpen("cluster")) view?.update?.(clusterData(ok(dynamic) ? dynamic : null));
+  if (isOpen("cluster")) view.update(clusterData(ok(dynamic) ? dynamic : null));
 }
 
 // The nodes as they say now, on the graph: roles, terms, election clocks.
 const raft = makeRaftWatch();
 function showNodes() {
-  if (state.nodes.length < 2 || !graph.drawn() || state.wizard) return;
+  if (state.nodes.length < 2 || document.hidden || !graph.drawn() || state.wizard) return;
   // openraft lets a follower stand only once the leader's lease (an
   // election's longest timeout) and then its own random timeout have both
   // gone by without a word: up to twice the longest timeout.
@@ -390,11 +391,11 @@ function showNodes() {
     timeout = 2 * (state.timing?.election?.[1] ?? 0);
   graph.setNodes(new Map(state.nodes.map(id => [id, {...raft.of(id), clock: raft.clock(id, now, timeout)}])));
 }
-setInterval(showNodes, 100);
+const clocks = setInterval(showNodes, 100);
 
 // Node `id` cut off from the others, or back: its links and its outbox.
 async function isolate(id, cut) {
-  const {reply} = await node.call(ops.isolate(id, cut));
+  const {reply} = await call(ops.isolate(id, cut));
   if (!ok(reply)) return sayError(reply?.error);
   if (cut) state.cut.add(id);
   else state.cut.delete(id);
@@ -404,7 +405,7 @@ async function isolate(id, cut) {
   await refreshChannels(); // its outbox up or down
 }
 // While idle: the worker lets the node's loops run between calls.
-setInterval(() => {
+const polls = setInterval(() => {
   if (!state.busy && !state.wizard && !document.hidden && graph.drawn()) pollBackground();
 }, 1000);
 
@@ -417,10 +418,10 @@ function renderBackground() {
     graph.setQueue(
       c.store,
       jobs.filter(j => j.store === c.store),
-      j => t("demo.job", {chunk: j.chunk, store: c.store}),
+      j => workLabel("repair", j),
     );
   updateWindows(bg);
-  view?.setBackground?.(bg);
+  if (isOpen("loft")) view.setBackground(bg);
 }
 
 // On: back to the file's period (or a default when the file has it off);
@@ -522,7 +523,8 @@ function renderPanel() {
     // A cluster's "reset" is its own config back: the demo's is one node's.
     const demo = cluster ? state.config : state.demo;
     const own = state.channels.filter(c => c.role !== "data" && (c.node == null || c.node === id)).map(c => c.store);
-    const v = loftView({counters: counters(), ...state, demo, cluster, own}, loftOps);
+    const {bg, config, admin} = state;
+    const v = loftView({counters: counters(), bg, cluster, own, config, demo, admin}, loftOps);
     show(cluster ? t("nodes.loft_title", {n: id}) : "pigeonhole", t(cluster ? "nodes.loft_sub" : "demo.loft_sub"), v.nodes, v);
     if (!state.log) loadLog();
   } else if (open.kind === "cluster") {
@@ -631,7 +633,7 @@ async function boot() {
 function restart(text) {
   return whileBusy(async () => {
     view?.setError("");
-    const {reply} = await node.call(ops.restart(text));
+    const {reply} = await call(ops.restart(text));
     if (reply?.error) {
       view?.setError(reply.error);
       return;
@@ -781,8 +783,13 @@ async function startAdmin() {
   say(["admin.caption", {n: state.buckets.length}]);
 }
 
-// Leaving (a reload, the other language): the node closes (node.js close).
-addEventListener("pagehide", () => node.close());
+// Leaving (a reload, the other language): the node closes (node.js close),
+// nothing polls it any more.
+addEventListener("pagehide", () => {
+  clearInterval(clocks);
+  clearInterval(polls);
+  node.close();
+});
 // Back from the browser's page cache, the worker is gone: start again.
 addEventListener("pageshow", e => {
   if (e.persisted) location.reload();

@@ -11,7 +11,7 @@ import {button, h} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {nodeLink} from "./entities.js";
 
-export const MAX_UPLOAD = 64 << 20; // it all lives in the tab's memory
+const MAX_UPLOAD = 64 << 20; // it all lives in the tab's memory
 
 export function clientView({buckets, bucket, objects, admin, cluster}, on) {
   const view = document.getElementById("tpl-client").content.cloneNode(true);

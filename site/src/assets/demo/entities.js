@@ -10,7 +10,7 @@
 // A mention is a link: on a screen with hover, pointing at it marks the
 // thing on the graph and a click opens it; by touch, a tap marks it and a
 // second tap opens it.
-import {h} from "../lib/dom.js";
+import {canHover, h} from "../lib/dom.js";
 import {t, tHtmlWith} from "../lib/i18n.js";
 
 export const ref = {
@@ -26,7 +26,6 @@ export const setLinks = handlers => {
   on = handlers;
 };
 
-const canHover = () => matchMedia("(hover: hover)").matches;
 let armed = null; // the link a first tap marked
 
 // A link to `r`, reading `text`.

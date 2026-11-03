@@ -3,9 +3,11 @@
 // erased. Read-only on a real node.
 //
 // on: {restart(text), erase()}. Returns {nodes, setError(text)}.
+import {within} from "../lib/dom.js";
+
 export function configView({config, demo, admin}, on) {
   const view = document.getElementById("tpl-config").content.cloneNode(true);
-  const $ = id => view.querySelector(`#${id}`);
+  const $ = within(view);
   const editor = $("config-text"),
     error = $("config-error");
   editor.value = config;
