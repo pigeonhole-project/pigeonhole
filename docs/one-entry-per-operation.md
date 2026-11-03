@@ -90,7 +90,12 @@ entry with whatever is queued). The crash risk is unchanged from today, where
 a crash between `PutObject` and `Release` already leaves the old chunks with
 `refs` one too high: space leaks, data does not. Closing that leak is a
 separate job (an offline reconciliation of `refs` against the index), noted
-under Open questions.
+under Open questions. A request that goes away before its answer (the
+client hung up, a timeout) loses nothing: every S3 write handler runs in a
+task of its own (`S3Gateway::to_the_end`, a dropped `JoinHandle` does not
+cancel it), so the commit, the `Release` after it and the release of a
+refused write's chunks all happen; the CAS's `put_stream` commits the same
+way.
 
 ## Per operation
 
@@ -160,8 +165,9 @@ group with `PutObject`); the threshold is a constant, not config.
 - Outcomes are taken by slot (`Proposal::push` → `Slot<S>`,
   `Outcomes::take(slot)`), not by tuple types.
 - `ingest` returns `PendingChunks` (commits + upload pins);
-  `PendingChunks::propose_in` + `Committing::done` (queue repair, drop the
-  pins) or `ChunkStore::commit`; `ingest_and_commit` for callers with
+  `PendingChunks::propose_in` (the pins go into the proposal, dropped by
+  the batcher once the entry is applied) + `Committing::done` (queue
+  repair) or `ChunkStore::commit`; `ingest_and_commit` for callers with
   nothing to commit along.
 - `ChunkStore::commit_along(chunks, meta, proposal)`: one entry when the
   other layer shares the tablet (always in the binary); tests that give each

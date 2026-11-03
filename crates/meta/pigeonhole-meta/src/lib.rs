@@ -129,11 +129,17 @@ impl<S: StateMachine> fmt::Debug for Prepared<S> {
     }
 }
 
-/// Commands to commit as one entry ([`MetaStore::propose_all`]).
+/// Commands to commit as one entry ([`MetaStore::propose_all`]), and what
+/// must stay alive until they are applied ([`Proposal::hold`]).
 #[derive(Default)]
 pub struct Proposal {
     commands: Vec<Command>,
+    holds: Vec<Hold>,
 }
+
+/// Something a proposal keeps alive until its entry is applied: dropped
+/// then, never looked at.
+type Hold = Box<dyn Send>;
 
 /// Where the outcome of one command of a [`Proposal`] is.
 #[derive(Debug, PartialEq, Eq)]
@@ -162,6 +168,16 @@ impl Proposal {
 
     pub fn extend<S: StateMachine>(&mut self, prepared: impl IntoIterator<Item = Prepared<S>>) -> Vec<Slot<S>> {
         prepared.into_iter().map(|p| self.push(p)).collect()
+    }
+
+    /// Keep `hold` alive until the entry is applied, or until it is certain
+    /// the commands will not be applied by this proposal (refused before the
+    /// batcher, not the leader, the tablet stopped, the caller gone before
+    /// the write began). The caller going away while the entry is written
+    /// does not drop it: whatever the entry depends on (upload pins that
+    /// keep its parts from the sweeper) outlives the request that proposed it.
+    pub fn hold(&mut self, hold: impl Send + 'static) {
+        self.holds.push(Box::new(hold));
     }
 
     pub fn len(&self) -> usize {
@@ -452,6 +468,8 @@ pub(crate) type States = HashMap<&'static str, Arc<dyn AnyState>>;
 /// entry together, answered with the entry's position and their outcomes.
 struct Pending {
     commands: Vec<Command>,
+    /// The proposal's holds: dropped with it, once it is answered.
+    _holds: Vec<Hold>,
     reply: tokio::sync::oneshot::Sender<Result<(Position, Vec<Vec<u8>>)>>,
     /// When it was queued (the batcher's queue wait).
     enqueued: std::time::Instant,
@@ -845,7 +863,8 @@ impl MetaStore {
         let enqueued = std::time::Instant::now();
         // Counted before the send: the batcher may take it at once.
         telemetry::record_enqueued();
-        if self.queue.send(Pending { commands: proposal.commands, reply, enqueued }).is_err() {
+        let pending = Pending { commands: proposal.commands, _holds: proposal.holds, reply, enqueued };
+        if self.queue.send(pending).is_err() {
             telemetry::record_dequeued(1);
             bail!("the tablet's batcher is gone");
         }

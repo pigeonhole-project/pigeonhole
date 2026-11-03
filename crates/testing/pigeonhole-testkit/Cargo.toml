@@ -7,11 +7,13 @@ description = "Conformance testkits for pigeonhole storage and gateways"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 pigeonhole-blob = { workspace = true }
 pigeonhole-types = { workspace = true }
 pigeonhole-meta = { workspace = true }
 pigeonhole-storage-disk = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

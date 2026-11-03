@@ -106,3 +106,107 @@ pub fn disk_meta(
     let snapshots = Arc::new(DiskBlobStore::open(dir.join("snapshots")).expect("open the snapshot directory"));
     (Arc::new(pigeonhole_meta::ChainLogStore::new(log)), Arc::new(pigeonhole_meta::BlobSnapshotStore::new(snapshots)))
 }
+
+/// A log whose appends can be held back: a proposal stays in flight (in
+/// the batcher, its entry not yet written) for as long as a test likes.
+pub struct GatedLog {
+    inner: std::sync::Arc<dyn pigeonhole_meta::LogStore>,
+    open: tokio::sync::watch::Sender<bool>,
+    parked: tokio::sync::Notify,
+}
+
+impl GatedLog {
+    pub fn new(inner: std::sync::Arc<dyn pigeonhole_meta::LogStore>) -> Self {
+        Self { inner, open: tokio::sync::watch::Sender::new(true), parked: tokio::sync::Notify::new() }
+    }
+
+    /// Appends from now on wait until [`Self::open`].
+    pub fn close(&self) {
+        self.open.send_replace(false);
+    }
+
+    /// Let the appends waiting, and those to come, through.
+    pub fn open(&self) {
+        self.open.send_replace(true);
+    }
+
+    /// Wait until an append waits at the closed gate.
+    pub async fn parked(&self) {
+        self.parked.notified().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl pigeonhole_meta::LogStore for GatedLog {
+    async fn claim(&self, gen: u64) -> pigeonhole_meta::LogResult<pigeonhole_meta::Head> {
+        self.inner.claim(gen).await
+    }
+
+    async fn append(
+        &self,
+        gen: u64,
+        batch: &[pigeonhole_meta::Entry],
+    ) -> pigeonhole_meta::LogResult<pigeonhole_meta::Position> {
+        let mut open = self.open.subscribe();
+        if !*open.borrow() {
+            self.parked.notify_one();
+            let _ = open.wait_for(|&o| o).await;
+        }
+        self.inner.append(gen, batch).await
+    }
+
+    async fn truncate(&self, gen: u64, from: pigeonhole_meta::Position) -> pigeonhole_meta::LogResult<()> {
+        self.inner.truncate(gen, from).await
+    }
+
+    async fn save_vote(&self, gen: u64, vote: &[u8]) -> pigeonhole_meta::LogResult<()> {
+        self.inner.save_vote(gen, vote).await
+    }
+
+    async fn confirm(&self, gen: u64) -> pigeonhole_meta::LogResult<()> {
+        self.inner.confirm(gen).await
+    }
+
+    async fn discover(&self) -> pigeonhole_meta::LogResult<Option<pigeonhole_meta::Discovered>> {
+        self.inner.discover().await
+    }
+
+    fn read(&self, from: pigeonhole_meta::Position, head: pigeonhole_meta::Head) -> pigeonhole_meta::EntryStream {
+        self.inner.read(from, head)
+    }
+
+    async fn rebase(
+        &self,
+        gen: u64,
+        base: pigeonhole_meta::Base,
+        keep: usize,
+    ) -> pigeonhole_meta::LogResult<Vec<pigeonhole_meta::Base>> {
+        self.inner.rebase(gen, base, keep).await
+    }
+
+    async fn settle(&self) {
+        self.inner.settle().await;
+    }
+
+    async fn release(&self, gen: u64) -> pigeonhole_meta::LogResult<()> {
+        self.inner.release(gen).await
+    }
+}
+
+/// [`tablet`] over a [`GatedLog`] (open), and the gate.
+pub async fn gated_tablet(
+    dir: impl AsRef<std::path::Path>,
+    register: impl FnOnce(pigeonhole_meta::Namespaces) -> pigeonhole_meta::Namespaces,
+) -> (std::sync::Arc<pigeonhole_meta::MetaStore>, std::sync::Arc<GatedLog>) {
+    let (log, snapshots) = disk_meta(dir);
+    let gate = std::sync::Arc::new(GatedLog::new(log));
+    let meta = pigeonhole_meta::MetaStore::open(
+        gate.clone(),
+        snapshots,
+        register(pigeonhole_meta::Namespaces::new()),
+        Default::default(),
+    )
+    .await
+    .expect("boot a test tablet");
+    (meta, gate)
+}

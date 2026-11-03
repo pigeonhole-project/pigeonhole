@@ -172,12 +172,13 @@ impl Repairer {
     /// Commit the copies of a pass in one entry. A copy whose chunk went
     /// meanwhile is dropped (its parts deleted); if the commit fails, the
     /// jobs stay queued.
-    async fn commit(&self, ready: Vec<Ready>, stats: &mut RepairStats) {
+    async fn commit(&self, mut ready: Vec<Ready>, stats: &mut RepairStats) {
         if ready.is_empty() {
             return;
         }
+        let pins = ready.iter_mut().flat_map(|r| std::mem::take(&mut r.pins)).collect();
         let replicas: Vec<_> = ready.iter().map(|r| (r.chunk_id, &r.layout)).collect();
-        let added = match self.db.commit_instance_replicas(&replicas).await {
+        let added = match self.db.commit_instance_replicas(&replicas, pins).await {
             Ok(added) => added,
             Err(e) => {
                 stats.failed += ready.len() as u64;
@@ -328,7 +329,7 @@ impl Repairer {
         }
 
         let layout = ReplicaLayout { instance: instance_id.to_string(), parts };
-        Ok(Copied::Ready(Ready { chunk_id, layout, _pins: pins }))
+        Ok(Copied::Ready(Ready { chunk_id, layout, pins }))
     }
 }
 
@@ -343,8 +344,9 @@ enum Copied {
 struct Ready {
     chunk_id: ChunkId,
     layout: ReplicaLayout,
-    /// Held until the commit: the parts are no orphans meanwhile.
-    _pins: Vec<UploadPin>,
+    /// Held until the commit is applied (they go with its proposal): the
+    /// parts are no orphans meanwhile.
+    pins: Vec<UploadPin>,
 }
 
 fn within_cost_budget(
@@ -678,7 +680,8 @@ mod tests {
         db.delete_chunk_metadata(dropped).await.unwrap();
 
         // Dropped while its copy was made: that one is not added, the tablet goes on.
-        let added = db.commit_instance_replicas(&[(kept, &kept_layout), (dropped, &dropped_layout)]).await.unwrap();
+        let added =
+            db.commit_instance_replicas(&[(kept, &kept_layout), (dropped, &dropped_layout)], Vec::new()).await.unwrap();
         assert_eq!(added, vec![true, false]);
         assert!(db.get_replica_layouts(dropped).await.unwrap().is_empty());
         layer.put_small(Bytes::from_static(b"after")).await.unwrap();

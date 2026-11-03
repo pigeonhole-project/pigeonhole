@@ -539,12 +539,19 @@ impl BlobDb {
 
     /// Replace each chunk's replica on its layout's instance, all in one
     /// entry. Per replica: `false` when its chunk is gone or reclaiming (that
-    /// one is not added; the others are).
-    pub async fn commit_instance_replicas(&self, replicas: &[(ChunkId, &ReplicaLayout)]) -> Result<Vec<bool>> {
+    /// one is not added; the others are). `pins` (the copies' upload pins)
+    /// go with the entry and are dropped once it is applied, even if the
+    /// caller is gone by then ([`Proposal::hold`]).
+    pub async fn commit_instance_replicas(
+        &self,
+        replicas: &[(ChunkId, &ReplicaLayout)],
+        pins: Vec<pigeonhole_blob::UploadPin>,
+    ) -> Result<Vec<bool>> {
         let mut proposal = Proposal::new();
         let slots = proposal.extend(replicas.iter().map(|&(chunk_id, layout)| {
             Prepared::<ChunkState>::new(&ChunkCommand::AddReplica { chunk_id, replica: Replica::from(layout) })
         }));
+        proposal.hold(pins);
         let mut outcomes = self.meta.propose_all(proposal).await?;
         let mut added = Vec::with_capacity(slots.len());
         for slot in slots {

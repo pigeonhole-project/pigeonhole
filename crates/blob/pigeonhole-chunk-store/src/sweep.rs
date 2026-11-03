@@ -201,19 +201,9 @@ impl Sweeper {
                 break;
             }
 
-            // Re-check liveness immediately before delete (never cache across batches).
-            let (to_delete, skipped_batch) = self.filter_deletable(instance_id, &keys).await?;
-            stats.keys_skipped_live += skipped_batch;
-            if !to_delete.is_empty() {
-                // Orphans are judged by this incarnation's state: delete only
-                // while it still holds the generation. (Reclaim needs no check:
-                // its deletes follow a committed BeginReclaim.)
-                self.db.confirm_active().await.context("confirm the tablet's generation before deleting orphans")?;
-                if let Err(e) = backend.delete(&to_delete).await {
-                    failed(stats, "delete", e);
-                    return Ok(());
-                }
-                stats.keys_deleted += to_delete.len() as u64;
+            if let Err(e) = self.delete_orphans(backend, &keys, stats).await? {
+                failed(stats, "delete", e);
+                return Ok(());
             }
 
             let last = keys.last().cloned();
@@ -226,6 +216,42 @@ impl Sweeper {
             }
         }
         Ok(())
+    }
+
+    /// Delete the keys of a candidate batch no chunk in the state has.
+    /// `Err` = the metadata failed (or the tablet is fenced); `Ok(Err(_))` =
+    /// the instance's delete failed.
+    async fn delete_orphans(
+        &self,
+        backend: &SharedBackend,
+        keys: &[Vec<u8>],
+        stats: &mut SweepStats,
+    ) -> Result<Result<()>> {
+        let instance_id = backend.instance().id.as_str();
+        // Re-check liveness immediately before delete (never cache across batches).
+        let (to_delete, skipped) = self.filter_deletable(instance_id, keys).await?;
+        stats.keys_skipped_live += skipped;
+        if to_delete.is_empty() {
+            return Ok(Ok(()));
+        }
+        // Orphans are judged by this incarnation's state: delete only while
+        // it still holds the generation. (Reclaim needs no check: its deletes
+        // follow a committed BeginReclaim.)
+        self.db.confirm_active().await.context("confirm the tablet's generation before deleting orphans")?;
+        // And once more after it: an entry applied meanwhile (by the time
+        // the generation is confirmed, everything committed is applied) may
+        // point at a key here. Its upload pins keep the horizon below such
+        // keys until it is applied; this is the second line.
+        let (to_delete, skipped) = self.filter_deletable(instance_id, &to_delete).await?;
+        stats.keys_skipped_live += skipped;
+        if to_delete.is_empty() {
+            return Ok(Ok(()));
+        }
+        if let Err(e) = backend.delete(&to_delete).await {
+            return Ok(Err(e));
+        }
+        stats.keys_deleted += to_delete.len() as u64;
+        Ok(Ok(()))
     }
 
     /// Split a candidate batch (all at or below the horizon) into
@@ -363,6 +389,48 @@ mod tests {
         let stats = sweeper(&f).sweep_once().await.unwrap();
         assert_eq!(stats.keys_deleted, 2);
         assert!(!on_backend(&f, &slow) && !on_backend(&f, &after));
+    }
+
+    /// A commit whose caller is dropped while its entry is being written (a
+    /// request gone): the upload pins go with the proposal and stay until
+    /// the entry is applied, so the sweeper never deletes the parts the
+    /// entry then points at.
+    #[tokio::test]
+    async fn a_commit_whose_caller_is_dropped_keeps_its_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (meta, gate) = pigeonhole_testkit::gated_tablet(dir.path().join("blob.log"), BlobDb::register).await;
+        let db = BlobDb::open(meta).await.unwrap();
+        let mem = Arc::new(MemoryBlobStore::new().with_instance_id("default"));
+        let backend: SharedBackend = Arc::new(erase(mem.clone()));
+        let (layer, pins) = open_layer(db.clone(), backend.clone()).await;
+        let f = Fixture { dir, db, mem, backend, layer, pins };
+
+        let data = Bytes::from_static(b"in flight when its request went");
+        let ingested = f.layer.ingest(futures::stream::iter([Ok(data.clone())]), None).await.unwrap();
+        gate.close();
+        let mut commit = Box::pin(f.layer.commit(ingested.chunks));
+        tokio::select! {
+            _ = &mut commit => panic!("committed through a closed log"),
+            () = gate.parked() => {}
+        }
+        drop(commit);
+        assert!(f.pins.live("default") > 0, "the pins went with the proposal");
+        let stats = sweeper(&f).sweep_once().await.unwrap();
+        assert_eq!(stats.keys_deleted, 0);
+
+        gate.open();
+        let chunk = ingested.extents[0].chunk;
+        for _ in 0..500 {
+            if f.pins.live("default") == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(f.pins.live("default"), 0, "the pins dropped once applied");
+        assert!(f.db.chunk_meta(chunk).await.unwrap().is_some(), "applied before the pins dropped");
+        let stats = sweeper(&f).sweep_once().await.unwrap();
+        assert_eq!(stats.keys_deleted, 0);
+        assert_eq!(f.layer.read(&ingested.extents, None).await.unwrap(), data);
     }
 
     #[tokio::test]
