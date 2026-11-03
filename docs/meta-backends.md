@@ -349,8 +349,9 @@ gives openraft:
 
 - **Log storage**: each node's own `LogStore`. Entries carry their Raft
   term; `truncate` drops a divergent tail (a record linking to the entry
-  before it); `purge` behind a snapshot is `rebase`; the vote and the head
-  term are registers carried in every record of the chain. A conformance
+  before it); `purge` behind a snapshot is `rebase`; the vote is a register
+  carried in every record of the chain. The head's Raft id (term and
+  leader) is read from the last entry, at boot only. A conformance
   suite runs against every store kind.
 - **Two processes as one node** are fenced as before: every durable change
   (a vote, an acknowledged entry) is a write under the process's

@@ -97,7 +97,7 @@ What `Chain` promises and what it does not:
 ## `ChainLogStore<C: Chain>`: the one `LogStore`
 
 Blobs of a log chain: `Claim { gen }` and `Batch { gen, first, entries, base,
-vote, head_term, collected }` (the registers as in today's channel log), both
+vote, collected }` (the registers as in today's channel log), both
 postcard, versioned. `ChainMeta` carries kind and generation.
 
 **Writer invariant**: a writer calls `put_after(prev)` only with a `prev` it
@@ -225,7 +225,7 @@ Where the code differs from the design above:
   (as the channel log did); the Telegram store reads the whole page below a
   location it misses, so a walk down reads each page once.
 - **Every blob carries the registers** (log id, base, the older bases kept
-  ([log-retention.md](log-retention.md)), vote, head term, head position), a claim too (an empty batch at head + 1): `discover` reads the
+  ([log-retention.md](log-retention.md)), vote, head position), a claim too (an empty batch at head + 1): `discover` reads the
   tail only. Generations only grow along the chain, so the tail's generation
   is the newest claim and a loser's `Fenced { current }` is the winner's.
 - **`confirm`** = `successor(our tip)` is none.

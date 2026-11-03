@@ -23,8 +23,9 @@ use openraft::raft::{
 };
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use openraft::{
-    AnyError, BasicNode, EntryPayload, LogState, RaftLogReader, RaftNetwork, RaftNetworkFactory, RaftSnapshotBuilder,
-    Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
+    AnyError, BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogState, RaftLogReader, RaftNetwork,
+    RaftNetworkFactory, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
+    Vote,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -186,6 +187,11 @@ fn spawn_removals(snapshots: Arc<dyn SnapshotStore>) -> mpsc::UnboundedSender<Sn
         .in_current_span(),
     );
     tx
+}
+
+/// A snapshot that could not be stored (`Write`) or read (`Read`), as Raft's error.
+fn snapshot_err(verb: ErrorVerb, e: impl std::fmt::Display) -> SErr {
+    StorageIOError::new(ErrorSubject::Snapshot(None), verb, AnyError::error(format!("{e:#}"))).into()
 }
 
 fn read_err(e: impl ToString) -> SErr {
@@ -472,6 +478,8 @@ impl RaftLogStorage<TypeConfig> for LogAdapter {
         let purged = base.as_ref().filter(|b| b.at > 0).map(|b| log_id(b.term, b.leader, b.at - 1));
         let head = d.head.position;
         let base_at = base.as_ref().map_or(0, |b| b.at);
+        // Raft's id of the last entry names its leader as well as its term;
+        // only the entry holds both (at boot, one read of the tail blob).
         let last =
             if head > base_at { self.read_positions(head - 1, head).await?.pop().map(|e| e.log_id) } else { purged };
         Ok(LogState { last_purged_log_id: purged, last_log_id: last })
@@ -605,10 +613,7 @@ impl StateMachine {
         // The newest one stored: the last kept, else the one the log starts from.
         let after = shared.current.lock().unwrap().as_ref().map(|c| c.snapshot.clone());
         let after = after.or_else(|| shared.base.lock().unwrap().as_ref().map(|b| b.snapshot.clone()));
-        let snapshot = snapshots
-            .put(&stored, after.as_ref())
-            .await
-            .map_err(|e| StorageError::from(StorageIOError::write_snapshot(None, AnyError::error(format!("{e:#}")))))?;
+        let snapshot = snapshots.put(&stored, after.as_ref()).await.map_err(|e| snapshot_err(ErrorVerb::Write, e))?;
         crate::telemetry::record_snapshot(data.len(), t0.elapsed());
         tracing::info!(at, bytes = data.len(), ms = t0.elapsed().as_millis() as u64, "snapshot stored");
         let current = CurrentSnapshot { meta: snap.meta.clone(), data, snapshot };
@@ -703,10 +708,8 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), SErr> {
-        let snap = RaftSnapshot::decode(snapshot.get_ref())
-            .map_err(|e| StorageError::from(StorageIOError::read_snapshot(None, AnyError::error(format!("{e:#}")))))?;
-        crate::restore_states(&self.states, &snap.tablet)
-            .map_err(|e| StorageError::from(StorageIOError::read_snapshot(None, AnyError::error(format!("{e:#}")))))?;
+        let snap = RaftSnapshot::decode(snapshot.get_ref()).map_err(|e| snapshot_err(ErrorVerb::Read, e))?;
+        crate::restore_states(&self.states, &snap.tablet).map_err(|e| snapshot_err(ErrorVerb::Read, e))?;
         let snap = RaftSnapshot { meta: meta.clone(), tablet: snap.tablet };
         Self::keep(self.snapshots.as_ref(), self.history, &self.shared, &snap).await?;
         self.last_applied = meta.last_log_id;

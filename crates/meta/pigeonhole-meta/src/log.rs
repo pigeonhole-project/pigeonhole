@@ -14,7 +14,7 @@ pub use chain::{ChainLogStore, Lease};
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.
-pub const LOG_FORMAT: u32 = 5;
+pub const LOG_FORMAT: u32 = 6;
 
 /// One log entry: the Raft term it was written in and an opaque payload (a
 /// tablet command; later an openraft entry).
@@ -118,8 +118,6 @@ pub struct Discovered {
     /// from one of these and replay (docs/log-retention.md).
     pub older: Vec<Base>,
     pub head: Head,
-    /// Term of the entry at the head (the base's if the head is the base).
-    pub head_term: u64,
     /// The last vote saved ([`LogStore::save_vote`]), opaque.
     pub vote: Option<Vec<u8>>,
     /// Newest claimed generation.

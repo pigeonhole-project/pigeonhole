@@ -87,7 +87,7 @@ where
 
     let again = open().await;
     let d = again.discover().await.unwrap().unwrap();
-    assert_eq!((d.base.map(|b| b.at), d.head.position, d.head_term), (Some(10), 11, 5));
+    assert_eq!((d.base.map(|b| b.at), d.head.position), (Some(10), 11));
     assert_eq!(read_all(again.as_ref(), 10, Head { position: 11, ..head }).await.unwrap(), vec![(11, termed(5, 11))]);
     assert!(matches!(read_all(again.as_ref(), 2, Head { position: 11, ..head }).await, Err(LogError::Lost(_))));
 }
@@ -237,7 +237,7 @@ where
 
     let again = open().await;
     let d = again.discover().await.unwrap().unwrap();
-    assert_eq!((d.head.position, d.head_term), (5, 2));
+    assert_eq!(d.head.position, 5);
     let all = read_all(again.as_ref(), 0, d.head).await.unwrap();
     let want = vec![(1, entry(1)), (2, entry(2)), (3, entry(3)), (4, termed(2, 40)), (5, termed(2, 50))];
     assert_eq!(all, want);
@@ -248,7 +248,7 @@ where
     assert!(again.truncate(2, 3).await.is_err(), "behind the base");
     again.truncate(2, 4).await.unwrap();
     let d = again.discover().await.unwrap().unwrap();
-    assert_eq!((d.head.position, d.head_term), (3, 1), "the head term is the base's");
+    assert_eq!(d.head.position, 3, "the head is the base");
     assert_eq!(again.append(2, &[termed(3, 4)]).await.unwrap(), 4);
     assert_eq!(read_all(again.as_ref(), 3, Head { position: 4, ..head }).await.unwrap(), vec![(4, termed(3, 4))]);
 }

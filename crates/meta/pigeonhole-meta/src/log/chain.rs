@@ -6,7 +6,7 @@
 //! - `log-claim-<gen>`: generation `gen` claims the log;
 //! - `log-batch-<gen>`: a [`Batch`] written by `gen`.
 //!
-//! Every blob carries the log's registers (id, base, vote, head term, head
+//! Every blob carries the log's registers (id, base, vote, head
 //! position) as of itself and a link (id + crc) to its predecessor, so the
 //! tail alone tells where the log stands and replay walks back from it.
 //!
@@ -140,8 +140,6 @@ struct ChainDoc<Id> {
     /// Older bases kept, newest first (`LogStore::rebase`'s `keep`).
     older: Vec<Base>,
     vote: Option<Vec<u8>>,
-    /// Term of the entry at the head once this blob is the tail.
-    head_term: u64,
     batch: Batch,
 }
 
@@ -205,12 +203,11 @@ struct Tip<Id> {
     base: Option<Base>,
     older: Vec<Base>,
     vote: Option<Vec<u8>>,
-    head_term: u64,
 }
 
 impl<Id> Default for Tip<Id> {
     fn default() -> Self {
-        Self { at: None, position: 0, base: None, older: Vec::new(), vote: None, head_term: 0 }
+        Self { at: None, position: 0, base: None, older: Vec::new(), vote: None }
     }
 }
 
@@ -221,7 +218,6 @@ impl<Id: Clone> Tip<Id> {
             base: doc.base.clone(),
             older: doc.older.clone(),
             vote: doc.vote.clone(),
-            head_term: doc.head_term,
             at: Some(at),
         }
     }
@@ -276,7 +272,6 @@ impl<Id> Default for State<Id> {
 struct Write {
     first: Position,
     entries: Vec<Entry>,
-    head_term: u64,
     /// A new base and the older ones kept with it.
     base: Option<(Base, Vec<Base>)>,
     vote: Option<Vec<u8>>,
@@ -468,7 +463,6 @@ impl<C: Chain> ChainLogStore<C> {
             base: tip.base.clone(),
             older: tip.older.clone(),
             vote: tip.vote.clone(),
-            head_term: tip.head_term,
             batch: Batch::new(gen, tip.position + 1, Vec::new()),
         };
         let bytes = doc.encode();
@@ -615,7 +609,6 @@ impl<C: Chain> ChainLogStore<C> {
             base,
             older,
             vote: w.vote.or_else(|| tip.vote.clone()),
-            head_term: w.head_term,
             batch: Batch::new(gen, w.first, w.entries),
         };
         let w_first = doc.batch.first;
@@ -686,7 +679,6 @@ async fn lease_record<C: Chain>(
             base: o.tip.base.clone(),
             older: o.tip.older.clone(),
             vote: o.tip.vote.clone(),
-            head_term: o.tip.head_term,
             batch: Batch::new(gen, o.tip.position + 1, Vec::new()),
         }
     };
@@ -784,7 +776,6 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
                 base: tip.base.clone(),
                 older: tip.older.clone(),
                 vote: tip.vote.clone(),
-                head_term: tip.head_term,
                 batch: Batch::new(gen, tip.position + 1, Vec::new()),
             };
             let bytes = doc.encode();
@@ -812,13 +803,12 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
 
     async fn append(&self, gen: u64, batch: &[Entry]) -> LogResult<Position> {
         let (_, tip) = self.owned(gen)?;
-        let head_term = batch.last().map_or(tip.head_term, |e| e.term);
-        let w = Write { first: tip.position + 1, entries: batch.to_vec(), head_term, base: None, vote: None };
+        let w = Write { first: tip.position + 1, entries: batch.to_vec(), base: None, vote: None };
         Ok(self.write(gen, w).await?.position)
     }
 
     async fn truncate(&self, gen: u64, from: Position) -> LogResult<()> {
-        let (log_id, tip) = self.owned(gen)?;
+        let (_, tip) = self.owned(gen)?;
         let base_at = tip.base_at();
         if from <= base_at || from > tip.position + 1 {
             return Err(LogError::Other(anyhow!("truncate at {from} outside ({base_at}, {}]", tip.position + 1)));
@@ -826,26 +816,13 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         if from == tip.position + 1 {
             return Ok(());
         }
-        let head_term = if from - 1 == base_at {
-            tip.base.as_ref().map_or(0, |b| b.term)
-        } else {
-            let head = Head { log_id, position: from - 1 };
-            let entries = self.reader().read_all(tip.clone(), from - 2, head).await?;
-            entries.last().map_or(0, |(_, e)| e.term)
-        };
-        let w = Write { first: from, entries: Vec::new(), head_term, base: None, vote: None };
+        let w = Write { first: from, entries: Vec::new(), base: None, vote: None };
         self.write(gen, w).await.map(|_| ())
     }
 
     async fn save_vote(&self, gen: u64, vote: &[u8]) -> LogResult<()> {
         let (_, tip) = self.owned(gen)?;
-        let w = Write {
-            first: tip.position + 1,
-            entries: Vec::new(),
-            head_term: tip.head_term,
-            base: None,
-            vote: Some(vote.to_vec()),
-        };
+        let w = Write { first: tip.position + 1, entries: Vec::new(), base: None, vote: Some(vote.to_vec()) };
         self.write(gen, w).await.map(|_| ())
     }
 
@@ -871,7 +848,6 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
                 base: o.tip.base.clone(),
                 older: o.tip.older.clone(),
                 head: Head { log_id: o.log_id, position: o.tip.position },
-                head_term: o.tip.head_term,
                 vote: o.tip.vote.clone(),
                 gen: o.gen,
             }));
@@ -886,7 +862,6 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             base: tip.base.clone(),
             older: tip.older.clone(),
             head: Head { log_id: doc.log_id, position: tip.position },
-            head_term: tip.head_term,
             vote: tip.vote.clone(),
             gen: doc.gen,
         };
@@ -918,8 +893,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             return Err(LogError::Other(anyhow!("rebase at {at} behind the base {old_at}")));
         }
         // Past the head (a snapshot from elsewhere): the log jumps to `at`.
-        let (first, head_term) =
-            if at > old_tip.position { (at + 1, base.term) } else { (old_tip.position + 1, old_tip.head_term) };
+        let first = if at > old_tip.position { at + 1 } else { old_tip.position + 1 };
         // The bases kept, newest first; a repeated base counts once, an
         // unusable one not at all.
         let (mut older, mut dropped): (Vec<Base>, Vec<Base>) = old_tip
@@ -930,7 +904,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
             .cloned()
             .partition(|b| !unusable.contains(b));
         dropped.extend(older.split_off(older.len().min(keep.max(1) - 1)));
-        let w = Write { first, entries: Vec::new(), head_term, base: Some((base, older)), vote: None };
+        let w = Write { first, entries: Vec::new(), base: Some((base, older)), vote: None };
         let tip = self.write(gen, w).await?;
         // The bases are durable; dropping what lies behind them is best effort.
         self.collect_behind(&tip);

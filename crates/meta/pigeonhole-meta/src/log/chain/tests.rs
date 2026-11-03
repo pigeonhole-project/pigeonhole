@@ -341,7 +341,6 @@ fn a_batch_at_position_zero_is_not_a_log_blob() {
         base: None,
         older: Vec::new(),
         vote: None,
-        head_term: 0,
         batch: Batch::new(1, 0, Vec::new()),
     };
     assert!(matches!(ChainDoc::<u64>::decode(&doc.encode()), Err(LogError::Lost(_))));

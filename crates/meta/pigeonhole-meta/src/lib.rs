@@ -711,8 +711,11 @@ impl Drop for MetaStore {
         if let Some(t) = self.ticker.lock().unwrap().take() {
             t.abort();
         }
+        // Outside a runtime (its last Arc dropped after it ended) there is
+        // nothing to shut down on: Raft's tasks went with the runtime.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
         let raft = self.raft.clone();
-        tokio::spawn(
+        runtime.spawn(
             async move {
                 let _ = raft.shutdown().await;
             }
@@ -959,13 +962,9 @@ impl MetaStore {
     }
 
     /// Generation this tablet claimed on boot.
-    pub fn generation(&self) -> u64 {
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
         self.gen
-    }
-
-    /// The node's Raft: what a network's receiving side hands requests to.
-    pub fn raft(&self) -> &raft::Raft {
-        &self.raft
     }
 
     /// The leader as this node knows it.

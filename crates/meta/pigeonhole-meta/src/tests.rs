@@ -114,6 +114,12 @@ fn raw_entry(term: u64, position: Position, cmd: Command) -> Entry {
     Entry { term, payload: postcard::to_stdvec(&entry).unwrap() }
 }
 
+/// The term of the entry at `head`.
+async fn head_term(log: &dyn LogStore, head: Head) -> u64 {
+    let last = log.read(head.position - 1, head).await.unwrap();
+    last[0].1.term
+}
+
 /// Wait until `f` holds (a background removal finished).
 async fn eventually(what: &str, f: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -333,6 +339,17 @@ async fn second_incarnation_fences_the_first_without_losing_acknowledged_entries
     b.propose::<Counter>(op(1 << 40, 1)).await.unwrap().unwrap();
 }
 
+/// The last handle to a tablet dropped after its runtime ended (a test's or
+/// a tool's) has nothing to shut down on, and does not panic.
+#[test]
+fn a_tablet_dropped_after_its_runtime_does_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let store = runtime.block_on(open_on(dir.path()));
+    drop(runtime);
+    drop(store);
+}
+
 #[tokio::test]
 async fn crash_between_append_and_apply_is_applied_once_on_boot() {
     let dir = tempfile::tempdir().unwrap();
@@ -343,7 +360,7 @@ async fn crash_between_append_and_apply_is_applied_once_on_boot() {
     // An incarnation that appended an entry and died before committing it.
     let log = log_of(&dir.path().join("log"));
     let head = log.claim(2).await.unwrap();
-    let term = log.discover().await.unwrap().unwrap().head_term;
+    let term = head_term(log.as_ref(), head).await;
     let next = head.position + 1;
     assert_eq!(log.append(2, &[raw_entry(term, next, command::<Counter>(&op(2, 5)))]).await.unwrap(), next);
 
@@ -364,7 +381,7 @@ async fn entries_of_another_command_format_refuse_to_replay() {
     }
     let log = log_of(&dir.path().join("log"));
     let head = log.claim(2).await.unwrap();
-    let term = log.discover().await.unwrap().unwrap().head_term;
+    let term = head_term(log.as_ref(), head).await;
     let mut old = command::<Counter>(&op(2, 1));
     old.version = Counter::VERSION + 1;
     log.append(2, &[raw_entry(term, head.position + 1, old)]).await.unwrap();
