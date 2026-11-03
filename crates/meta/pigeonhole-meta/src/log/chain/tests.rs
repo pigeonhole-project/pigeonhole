@@ -1,6 +1,5 @@
 use super::*;
 use crate::log::conformance;
-use futures::TryStreamExt;
 use pigeonhole_storage_memory::MemoryBlobStore;
 
 fn store(mem: &Arc<MemoryBlobStore>) -> Arc<ChainLogStore<MemoryBlobStore>> {
@@ -14,7 +13,6 @@ fn entry(i: u64) -> Entry {
 async fn history(log: &dyn LogStore) -> Vec<u64> {
     let d = log.discover().await.unwrap().unwrap();
     log.read(0, d.head)
-        .try_collect::<Vec<_>>()
         .await
         .unwrap()
         .into_iter()
@@ -105,7 +103,7 @@ async fn a_rebase_prunes_below_the_oldest_needed_blob() {
     a.append(1, &[entry(5)]).await.unwrap();
     let again = store(&mem);
     let d = again.discover().await.unwrap().unwrap();
-    let got = again.read(3, d.head).try_collect::<Vec<_>>().await.unwrap();
+    let got = again.read(3, d.head).await.unwrap();
     assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![4, 5]);
 }
 
@@ -162,14 +160,14 @@ async fn reads_back_from_the_end_walk_the_chain_once() {
     let mut to = head.position;
     while to > 0 {
         let from = to.saturating_sub(64);
-        let part: Vec<_> = b.read(from, Head { position: to, ..head }).try_collect().await.unwrap();
+        let part: Vec<_> = b.read(from, Head { position: to, ..head }).await.unwrap();
         got.splice(0..0, part.into_iter().map(|(_, e)| u64::from_le_bytes(e.payload.try_into().unwrap())));
         to = from;
     }
     assert_eq!(got, (1..=n).collect::<Vec<_>>());
     // One read of a single entry near the end, then near the start.
     for p in [n - 3, 5] {
-        let one: Vec<_> = b.read(p - 1, Head { position: p, ..head }).try_collect().await.unwrap();
+        let one: Vec<_> = b.read(p - 1, Head { position: p, ..head }).await.unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(u64::from_le_bytes(one[0].1.payload.clone().try_into().unwrap()), p);
     }
@@ -246,7 +244,7 @@ mod disk {
             let head = again.claim(2).await.unwrap();
             let claim = t.elapsed();
             let t = Instant::now();
-            let n = again.read(0, head).try_fold(0u64, |n, _| async move { Ok(n + 1) }).await.unwrap();
+            let n = again.read(0, head).await.unwrap().len() as u64;
             let replay = t.elapsed();
             assert_eq!(n, head.position);
 

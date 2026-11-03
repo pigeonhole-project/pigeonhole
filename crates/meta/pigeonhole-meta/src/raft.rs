@@ -15,7 +15,6 @@ use crate::log::{Base, Entry, Head, LogError, LogId as HistoryId, LogStore, Posi
 use crate::snapshot::{SnapshotRef, SnapshotStore, StoredSnapshot};
 use crate::{apply_group, take_snapshot, Applied, Group, States, Stop, TabletSnapshot};
 use anyhow::Context;
-use futures::TryStreamExt;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::raft::{
@@ -433,12 +432,8 @@ impl LogAdapter {
         let missing_to = out.keys().next().map_or(to, |first| first - 1);
         let durable = self.durable.load(Ordering::SeqCst).min(missing_to);
         if durable > from {
-            let entries: Vec<(Position, Entry)> = self
-                .log
-                .read(from, Head { log_id: self.history, position: durable })
-                .try_collect()
-                .await
-                .map_err(read_err)?;
+            let entries: Vec<(Position, Entry)> =
+                self.log.read(from, Head { log_id: self.history, position: durable }).await.map_err(read_err)?;
             for (pos, e) in entries {
                 let entry = postcard::from_bytes(&e.payload).map_err(|err| read_err(format!("entry {pos}: {err}")))?;
                 out.entry(pos).or_insert(entry);

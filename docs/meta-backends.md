@@ -141,9 +141,10 @@ trait LogStore {
     /// Base + log head + newest generation (bootstrap without local state).
     async fn discover(&self) -> Result<Option<Discovered>>;
 
-    /// Entries after `from` up to `head`, in order (replay); `from` may be
-    /// behind the base, down to the oldest base kept.
-    fn read(&self, from: Position, head: Head) -> EntryStream;
+    /// Entries after `from` up to `head`, in order, all at once (Raft reads
+    /// short ranges); `from` may be behind the base, down to the oldest
+    /// base kept.
+    async fn read(&self, from: Position, head: Head) -> Result<Vec<(Position, Entry)>, LogError>;
 
     /// Start the log from `base` = { at, snapshot: SnapshotRef } (a snapshot
     /// already stored), keeping the `keep` newest bases and the log from the

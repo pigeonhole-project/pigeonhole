@@ -3,7 +3,6 @@
 
 use crate::snapshot::SnapshotRef;
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -172,9 +171,6 @@ impl From<anyhow::Error> for LogError {
 
 pub type LogResult<T> = Result<T, LogError>;
 
-/// Entries in order with their positions.
-pub type EntryStream = BoxStream<'static, LogResult<(Position, Entry)>>;
-
 #[async_trait]
 pub trait LogStore: Send + Sync + 'static {
     /// Become generation `gen` (> any earlier claim, else `Fenced { current }`).
@@ -204,10 +200,11 @@ pub trait LogStore: Send + Sync + 'static {
     /// log was never claimed.
     async fn discover(&self) -> LogResult<Option<Discovered>>;
 
-    /// Entries after `from` up to `head`, in order (replay). `from` may lie
-    /// behind the base, down to the oldest base kept ([`Discovered::older`]);
-    /// further back is `Lost`.
-    fn read(&self, from: Position, head: Head) -> EntryStream;
+    /// Entries after `from` up to `head` with their positions, in order
+    /// (replay), all at once: callers read short ranges (openraft asks for
+    /// a few entries at a time). `from` may lie behind the base, down to the
+    /// oldest base kept ([`Discovered::older`]); further back is `Lost`.
+    async fn read(&self, from: Position, head: Head) -> LogResult<Vec<(Position, Entry)>>;
 
     /// Start the log from `base` (a snapshot already stored), keeping the
     /// `keep` newest bases (≥ 1, `base` included) and the entries after the

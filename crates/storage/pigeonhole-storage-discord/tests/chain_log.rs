@@ -1,7 +1,6 @@
 //! The generic chain log and snapshots over a Discord channel (the Discord
 //! [`Chain`]: threads as compare-and-set), on a fake channel.
 
-use futures::TryStreamExt;
 use pigeonhole_limits::{ChatLimiter, Rate};
 use pigeonhole_meta::log::conformance;
 use pigeonhole_meta::snapshot::conformance as snapshot_conformance;
@@ -41,7 +40,6 @@ fn entry(i: u64) -> Entry {
 async fn history(log: &dyn LogStore) -> Vec<u64> {
     let d = log.discover().await.unwrap().unwrap();
     log.read(0, d.head)
-        .try_collect::<Vec<_>>()
         .await
         .unwrap()
         .into_iter()
@@ -168,7 +166,7 @@ async fn a_changed_log_blob_is_detected() {
     channel.edit(ids[2]); // anchor, claim, first batch
     let fresh = store(&channel);
     let head = fresh.discover().await.unwrap().unwrap().head;
-    let read: Result<Vec<_>, _> = fresh.read(0, head).try_collect().await;
+    let read: Result<Vec<_>, _> = fresh.read(0, head).await;
     assert!(matches!(read, Err(LogError::Lost(_))), "{read:?}");
 }
 
@@ -193,7 +191,7 @@ async fn a_rebase_prunes_messages_and_their_links() {
     let b = store(&channel);
     assert_eq!(b.claim(2).await.unwrap().position, 6);
     let head = b.discover().await.unwrap().unwrap().head;
-    let got: Vec<_> = b.read(3, head).try_collect().await.unwrap();
+    let got: Vec<_> = b.read(3, head).await.unwrap();
     assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![4, 5, 6]);
 }
 
@@ -398,7 +396,7 @@ async fn a_lease_log_rebase_keeps_the_newest_lease_record() {
     let b = leased(&channel);
     assert_eq!(b.claim(2).await.unwrap().position, 11);
     let head = b.discover().await.unwrap().unwrap().head;
-    let got: Vec<_> = b.read(8, head).try_collect().await.unwrap();
+    let got: Vec<_> = b.read(8, head).await.unwrap();
     assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![9, 10, 11]);
 }
 

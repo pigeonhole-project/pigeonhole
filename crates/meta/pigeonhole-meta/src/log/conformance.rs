@@ -4,7 +4,6 @@
 
 use super::{Base, Entry, Head, LogError, LogStore, Position};
 use crate::snapshot::SnapshotRef;
-use futures::TryStreamExt;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -21,7 +20,7 @@ fn base(at: Position) -> Base {
 }
 
 async fn read_all(log: &dyn LogStore, from: Position, head: Head) -> Result<Vec<(Position, Entry)>, LogError> {
-    log.read(from, head).try_collect().await
+    log.read(from, head).await
 }
 
 /// Run the whole suite; each case gets fresh logs from `fresh()`, a factory of

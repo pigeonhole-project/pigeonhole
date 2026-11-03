@@ -62,8 +62,8 @@ mod telemetry;
 mod view;
 
 pub use log::{
-    Base, Batch, ChainLogStore, Discovered, Entry, EntryStream, Head, Lease, LogError, LogId, LogResult, LogStore,
-    Position, LOG_FORMAT,
+    Base, Batch, ChainLogStore, Discovered, Entry, Head, Lease, LogError, LogId, LogResult, LogStore, Position,
+    LOG_FORMAT,
 };
 pub use snapshot::{BlobSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 pub use telemetry::METRICS;

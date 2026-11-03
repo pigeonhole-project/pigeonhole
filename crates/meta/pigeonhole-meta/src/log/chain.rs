@@ -27,16 +27,12 @@
 //! reads the tail it links after. For a store whose links are scarce (a
 //! Discord thread per link) and whose ids carry the store's time.
 
-use super::{
-    Base, Batch, Discovered, Entry, EntryStream, Head, LogError, LogId, LogResult, LogStore, Position, LOG_FORMAT,
-};
+use super::{Base, Batch, Discovered, Entry, Head, LogError, LogId, LogResult, LogStore, Position, LOG_FORMAT};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
 use pigeonhole_storage_api::{collect_stream, After, BlobBackend, Chain, LeaseChain, Linked};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -902,7 +898,7 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
         Ok(Some(found))
     }
 
-    fn read(&self, from: Position, head: Head) -> EntryStream {
+    async fn read(&self, from: Position, head: Head) -> LogResult<Vec<(Position, Entry)>> {
         let tip = {
             let state = self.state.lock().unwrap();
             match (&state.owner, &state.seen) {
@@ -911,20 +907,8 @@ impl<C: Chain> LogStore for ChainLogStore<C> {
                 _ => None,
             }
         };
-        let this = self.reader();
-        let fut = async move {
-            let tip =
-                tip.ok_or_else(|| LogError::Lost(format!("no head of log {} known to this handle", head.log_id)))?;
-            this.read_all(tip, from, head).await
-        };
-        Box::pin(
-            futures::stream::once(fut)
-                .map(|r| match r {
-                    Ok(items) => futures::stream::iter(items).map(Ok).left_stream(),
-                    Err(e) => futures::stream::iter([Err(e)]).right_stream(),
-                })
-                .flatten(),
-        )
+        let tip = tip.ok_or_else(|| LogError::Lost(format!("no head of log {} known to this handle", head.log_id)))?;
+        self.reader().read_all(tip, from, head).await
     }
 
     async fn rebase(&self, gen: u64, base: Base, keep: usize, unusable: &[Base]) -> LogResult<Vec<Base>> {
@@ -1077,18 +1061,17 @@ impl<C: Chain> Reader<C> {
             return Err(LogError::Lost(format!("entries after {from} collected up to base {kept_from}")));
         }
         let Plan { known, mut next, mut limit, walked } = self.plan(&tip, from, head.position);
-        let mut out = BTreeMap::new();
-        let take = |out: &mut BTreeMap<Position, Entry>, doc: ChainDoc<C::Id>, limit: Position| {
-            for (k, entry) in doc.batch.entries.into_iter().enumerate() {
-                let pos = doc.batch.first + k as u64;
-                if pos > from && pos < limit && pos <= head.position {
-                    out.insert(pos, entry);
-                }
-            }
+        // Each blob holds the run of positions below what a newer one
+        // holds: runs come newest first, each in order.
+        let mut runs: Vec<Vec<(Position, Entry)>> = Vec::new();
+        let take = |doc: ChainDoc<C::Id>, limit: Position| -> Vec<(Position, Entry)> {
+            let first = doc.batch.first;
+            let positions = (first..).take_while(|&pos| pos < limit && pos <= head.position);
+            positions.zip(doc.batch.entries).filter(|(pos, _)| *pos > from).collect()
         };
         let followed = known.len();
         for step in known {
-            take(&mut out, self.follow(&step.link).await?, step.limit);
+            runs.push(take(self.follow(&step.link).await?, step.limit));
         }
         let mut steps = Vec::new();
         while limit > from + 1 {
@@ -1096,14 +1079,16 @@ impl<C: Chain> Reader<C> {
             let doc = self.follow(&link).await?;
             let step = Step { link, first: doc.batch.first, limit, prev: doc.prev.clone() };
             (limit, next) = (step.below(), doc.prev.clone());
-            take(&mut out, doc, step.limit);
+            runs.push(take(doc, step.limit));
             steps.push(step);
         }
         self.extend(&tip, walked, followed, steps);
-        if out.len() as u64 != head.position - from {
+        let out: Vec<_> = runs.into_iter().rev().flatten().collect();
+        let whole = out.len() as u64 == head.position - from && out.iter().zip(from + 1..).all(|((p, _), q)| *p == q);
+        if !whole {
             return Err(LogError::Lost(format!("the chain lacks entries in ({from}, {}]", head.position)));
         }
-        Ok(out.into_iter().collect())
+        Ok(out)
     }
 
     /// The blobs of the walk from `tip` that hold `(from, head]`, and where
