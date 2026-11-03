@@ -8,6 +8,7 @@ import {activate, button, canHover, h, svg} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {boarded, perched} from "./art.js";
 import {sentence} from "./entities.js";
+import {settings} from "./settings.js";
 
 const TASKS = ["repair", "sweep", "cool", "snapshot"];
 // The tasks only the leader runs (the chunk stores are its); every node
@@ -18,7 +19,6 @@ export const TASK_KEY = {repair: "repair.interval", sweep: "sweep.interval", coo
 export const TASK_ON = {repair: "10s", sweep: "30s", cool: "30s", snapshot: "1m"};
 // The dovecote's entrance each task lives in (dovecote(): the top row is 0–2).
 const TASK_WINDOW = {repair: 0, sweep: 1, cool: 2, snapshot: 4};
-const JOBS_SHOWN = 40;
 
 // "1m 30s", "250ms" → ms; "off" (or nothing) → null.
 export function ms(text) {
@@ -270,8 +270,9 @@ function taskCard(name, onToggle, onRun, follower) {
       return;
     }
     const work = d.task.work;
-    jobs.replaceChildren(...work.slice(0, JOBS_SHOWN).map(item => jobTile(name, item)));
-    if (work.length > JOBS_SHOWN) jobs.append(h("li", "job-tile more", `+${work.length - JOBS_SHOWN}`));
+    const most = settings.jobsShown;
+    jobs.replaceChildren(...work.slice(0, most).map(item => jobTile(name, item)));
+    if (work.length > most) jobs.append(h("li", "job-tile more", `+${work.length - most}`));
     if (!work.length) jobs.append(h("li", "empty", t("bg.idle")));
   }
   return {name, el, update};

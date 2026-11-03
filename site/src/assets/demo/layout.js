@@ -10,9 +10,9 @@
 // node's {x, w: the bridge, from one block's side to the other's, roof:
 // the blocks' roofs, scale: the dovecote's, size: its name's letters}.
 import {FLOOR} from "./art.js";
+import {settings} from "./settings.js";
 
 const COL = 26; // a window's column
-const FLOORS = 8; // every block's: they do not grow; the newest messages show
 
 // What a channel's windows hold, oldest first: as many unnamed messages as
 // its total has beyond the ones it lists, then those.
@@ -21,8 +21,9 @@ export function contents(c) {
   const older = Math.max(0, (c.total ?? 0) - list.length);
   return {older, list, count: older + list.length};
 }
-// A block's floors: the same for every block, `most` at most (what the view has room for).
-export const floorsFor = most => Math.min(FLOORS, most);
+// A block's floors: the same for every block (`settings.floors`: they do not
+// grow, the newest messages show), `most` at most (what the view has room for).
+export const floorsFor = most => Math.min(settings.floors, most);
 
 // The channels by what they are: the chunk stores, a node's own (its log
 // and snapshots: the one node's, or node `id`'s), the Raft outboxes.

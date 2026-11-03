@@ -4,16 +4,17 @@
 // tested without a browser.
 //
 // A flight (flights.js) goes in a lane:
-//   "yours"  your requests and the node's work: one leaves every SPACING ms,
-//            in the order they came; every one flies
-//   "raft"   the cluster's own traffic: at once, at most RAFT_CAP in the air;
-//            more are let go (they never fly, but still count as landed)
+//   "yours"  your requests and the node's work: one leaves every
+//            `settings.spacing` ms, in the order they came; every one flies
+//   "raft"   the cluster's own traffic: at once, at most `settings.raftCap`
+//            in the air (0: no cap); more are let go (they never fly, but
+//            still count as landed)
 // Every flight ends once, landing or let go: then its `onLand` runs and the
 // promise `add` returned resolves.
 
-export const SPACING = 70;
-export const RAFT_CAP = 6;
-const LANES = {yours: {spacing: SPACING, cap: Infinity}, raft: {spacing: 0, cap: RAFT_CAP}};
+import {settings} from "../settings.js";
+
+const LANES = {yours: {spacing: () => settings.spacing, cap: () => Infinity}, raft: {spacing: () => 0, cap: () => settings.raftCap || Infinity}};
 
 // `start(flight)`: the flight's duration in ms as it leaves, or 0 when it
 // cannot fly (its places are not on the screen): it is let go.
@@ -43,8 +44,8 @@ export function makeSky({start}) {
         entry.done = done;
       });
       const l = lane(flight);
-      if (l.spacing > 0) waiting.push(entry);
-      else if ([...flying].filter(x => lane(x.flight) === l).length >= l.cap) end(entry);
+      if (l === LANES.yours) waiting.push(entry);
+      else if ([...flying].filter(x => lane(x.flight) === l).length >= l.cap()) end(entry);
       else leave(entry, now);
       return entry.ended;
     },
@@ -53,7 +54,7 @@ export function makeSky({start}) {
     tick(now) {
       while (waiting.length && now >= nextAt) {
         leave(waiting.shift(), Math.max(now, nextAt));
-        nextAt = Math.max(now, nextAt) + SPACING;
+        nextAt = Math.max(now, nextAt) + LANES.yours.spacing();
       }
       const up = [];
       for (const entry of [...flying]) {
@@ -95,7 +96,7 @@ export function lengthOf([p0, p1, p2, p3]) {
   return (dist(p0, p1) + dist(p1, p2) + dist(p2, p3) + dist(p0, p3)) / 2;
 }
 // A flight's duration for an arc that long.
-export const durationOf = len => Math.min(1400, 450 + len * 1.1);
+export const durationOf = len => Math.min(settings.flightMax, settings.flightMin + len * settings.flightPerPx);
 
 // Where along its arc a flight is at k (0…1 of its time): a soft start and
 // landing; a failed one reaches 88% of the way and turns back.

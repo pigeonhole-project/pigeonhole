@@ -85,6 +85,7 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .bar-links { display: flex; align-items: center; gap: 12px; font-size: 14px; }
 .bar-links a { color: var(--wing-2); text-decoration: none; }
 .icon { border: 1px solid var(--line); background: none; border-radius: 50%; width: 32px; height: 32px; cursor: pointer; }
+#settings { font-size: 17px; line-height: 1; }
 
 /* the loft: the graph, and a panel when a node is opened */
 #app { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -251,6 +252,10 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .chan-row { display: flex; align-items: center; gap: 12px; margin: 0 0 10px; }
 .chan-n { width: 76px; color: var(--slate); font-size: 14px; }
 .num { width: 96px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--feather); font: inherit; font-size: 14px; color: inherit; }
+/* the settings panel: a knob is a slider and a number */
+.knob-row { display: flex; align-items: center; gap: 10px; }
+.knob-range { flex: 1; min-width: 0; accent-color: var(--wing); }
+.knob-unit { color: var(--slate); font-size: 13.5px; min-width: 3.5em; }
 .rates { margin: 0 0 8px; padding-left: 18px; color: var(--wing-2); font-size: 14px; }
 .toml { width: 100%; min-height: 46vh; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--feather); color: inherit; resize: vertical; white-space: pre; overflow: auto; }
 .wiz-nav { margin-top: 22px; justify-content: flex-end; }
