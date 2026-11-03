@@ -47,7 +47,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -744,14 +744,7 @@ impl MetaStore {
 
         let (stop_tx, stop) = watch::channel(None);
         report_stop(stop.clone(), gen);
-        let shared = Arc::new(raft::Shared {
-            stop: stop_tx,
-            applied: AtomicU64::new(0),
-            based: AtomicU64::new(0),
-            current: Mutex::new(None),
-            kept: tokio::sync::Notify::new(),
-            base: Mutex::new(None),
-        });
+        let shared = Arc::new(raft::Shared::new(stop_tx, snapshots.clone()));
         let mut sm = raft::StateMachine {
             states: states.clone(),
             snapshots: snapshots.clone(),
@@ -773,15 +766,7 @@ impl MetaStore {
         let fresh = d.head.position == 0 && d.base.is_none() && d.vote.is_none();
 
         let keep = raft::Keep(opts.keep_snapshots.max(1));
-        let adapter = raft::LogAdapter::new(
-            log.clone(),
-            gen,
-            head.log_id,
-            d.head.position,
-            shared.clone(),
-            snapshots.clone(),
-            keep,
-        );
+        let adapter = raft::LogAdapter::new(log.clone(), gen, head.log_id, d.head.position, shared.clone(), keep);
         let config = Arc::new(raft_config(&opts, cluster.members.len())?);
         let raft = raft::Raft::new(cluster.node, config, cluster.network, adapter, sm).await.context("start raft")?;
         if let Some(serve) = cluster.serve {

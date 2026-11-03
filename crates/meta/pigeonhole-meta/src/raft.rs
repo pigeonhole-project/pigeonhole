@@ -118,9 +118,30 @@ pub(crate) struct Shared {
     /// or an older one it keeps when the newest snapshot could not be
     /// loaded. Raft sees the log as purged up to it.
     pub(crate) base: Mutex<Option<Base>>,
+    /// Snapshots nothing starts from any more, for the remover task
+    /// ([`spawn_removals`]): removing one may download it (to find its
+    /// parts), and neither the log's writer nor the state machine waits.
+    removals: mpsc::UnboundedSender<SnapshotRef>,
 }
 
 impl Shared {
+    pub(crate) fn new(stop: watch::Sender<Option<Stop>>, snapshots: Arc<dyn SnapshotStore>) -> Self {
+        Self {
+            stop,
+            applied: AtomicU64::new(0),
+            based: AtomicU64::new(0),
+            current: Mutex::new(None),
+            kept: tokio::sync::Notify::new(),
+            base: Mutex::new(None),
+            removals: spawn_removals(snapshots),
+        }
+    }
+
+    /// Remove `snapshot` in the background (best effort).
+    fn remove(&self, snapshot: SnapshotRef) {
+        let _ = self.removals.send(snapshot);
+    }
+
     /// The current snapshot if it holds position `at` or later.
     fn current_from(&self, at: u64) -> Option<CurrentSnapshot> {
         self.current.lock().unwrap().clone().filter(|c| c.at() >= at)
@@ -147,6 +168,23 @@ impl Shared {
     }
 }
 
+/// The remover: removes the snapshots sent to it, one at a time, until
+/// every sender is gone.
+fn spawn_removals(snapshots: Arc<dyn SnapshotStore>) -> mpsc::UnboundedSender<SnapshotRef> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<SnapshotRef>();
+    tokio::spawn(
+        async move {
+            while let Some(snapshot) = rx.recv().await {
+                if let Err(e) = snapshots.remove(&snapshot).await {
+                    tracing::warn!(snapshot = %snapshot.0, error = %format!("{e:#}"), "removing an old snapshot failed");
+                }
+            }
+        }
+        .in_current_span(),
+    );
+    tx
+}
+
 fn read_err(e: impl ToString) -> SErr {
     StorageIOError::read_logs(AnyError::error(e.to_string())).into()
 }
@@ -158,7 +196,8 @@ const TAIL_KEEP: u64 = 4096;
 enum Op {
     Append(Vec<RaftEntry>, LogFlushed<TypeConfig>),
     Truncate(Position, oneshot::Sender<Result<(), SErr>>),
-    Rebase(Base, oneshot::Sender<Result<(), SErr>>),
+    /// Rebase on the snapshot that covers this id, once one does.
+    Purge(RaftLogId),
     Vote(Vec<u8>, oneshot::Sender<Result<(), SErr>>),
 }
 
@@ -169,7 +208,8 @@ enum Op {
 /// message) before reporting them flushed. That is group commit: openraft
 /// hands over one client write at a time and keeps accepting more while the
 /// previous batch is being written. Truncate, purge and votes go through the
-/// same queue, so writes stay in order.
+/// same queue, so writes stay in order. The writer only writes the log:
+/// what a rebase drops is removed by another task.
 #[derive(Clone)]
 pub(crate) struct LogAdapter {
     log: Arc<dyn LogStore>,
@@ -187,6 +227,43 @@ pub(crate) struct LogAdapter {
     tx: mpsc::UnboundedSender<Op>,
 }
 
+/// An append and every append queued right behind it, for one batch; the
+/// first other op is left in `next`.
+fn gather(
+    mut entries: Vec<RaftEntry>,
+    callback: LogFlushed<TypeConfig>,
+    rx: &mut mpsc::UnboundedReceiver<Op>,
+    next: &mut Option<Op>,
+) -> (Vec<RaftEntry>, Vec<LogFlushed<TypeConfig>>) {
+    let mut callbacks = vec![callback];
+    while let Ok(op) = rx.try_recv() {
+        match op {
+            Op::Append(more, callback) => {
+                entries.extend(more);
+                callbacks.push(callback);
+            }
+            other => {
+                *next = Some(other);
+                break;
+            }
+        }
+    }
+    (entries, callbacks)
+}
+
+/// Fail `op`: the writer writes no more ([`LogAdapter::purge_to`]).
+fn refuse(op: Op, why: &str) {
+    let err =
+        || -> SErr { StorageIOError::write_logs(AnyError::error(format!("the log writer stopped: {why}"))).into() };
+    match op {
+        Op::Append(_, callback) => callback.log_io_completed(Err(std::io::Error::other(why.to_string()))),
+        Op::Truncate(_, done) | Op::Vote(_, done) => {
+            let _ = done.send(Err(err()));
+        }
+        Op::Purge(_) => {}
+    }
+}
+
 /// Bases (and their snapshots) the log keeps: the newest `keep`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Keep(pub(crate) usize);
@@ -199,7 +276,6 @@ impl LogAdapter {
         history: HistoryId,
         head: Position,
         shared: Arc<Shared>,
-        snapshots: Arc<dyn SnapshotStore>,
         keep: Keep,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -212,18 +288,15 @@ impl LogAdapter {
             shared,
             tx,
         };
-        tokio::spawn(this.clone().write_loop(gen, snapshots, keep, rx).in_current_span());
+        tokio::spawn(this.clone().write_loop(gen, keep, rx).in_current_span());
         this
     }
 
-    async fn write_loop(
-        self,
-        gen: u64,
-        snapshots: Arc<dyn SnapshotStore>,
-        keep: Keep,
-        mut rx: mpsc::UnboundedReceiver<Op>,
-    ) {
+    async fn write_loop(self, gen: u64, keep: Keep, mut rx: mpsc::UnboundedReceiver<Op>) {
         let mut next = None;
+        // Set once a purge could not rebase: the log may lack the jump to
+        // its base, so nothing more is written.
+        let mut broken: Option<String> = None;
         loop {
             let op = match next.take() {
                 Some(op) => op,
@@ -232,59 +305,22 @@ impl LogAdapter {
                     None => return,
                 },
             };
+            if let Some(why) = &broken {
+                refuse(op, why);
+                continue;
+            }
             match op {
                 Op::Append(entries, callback) => {
-                    // Everything queued behind it goes in the same batch.
-                    let mut entries = entries;
-                    let mut callbacks = vec![callback];
-                    while let Ok(op) = rx.try_recv() {
-                        match op {
-                            Op::Append(more, callback) => {
-                                entries.extend(more);
-                                callbacks.push(callback);
-                            }
-                            other => {
-                                next = Some(other);
-                                break;
-                            }
-                        }
-                    }
+                    let (entries, callbacks) = gather(entries, callback, &mut rx, &mut next);
                     let result = self.append_batch(gen, &entries).await;
                     for callback in callbacks {
                         callback.log_io_completed(result.clone().map_err(std::io::Error::other));
                     }
                 }
                 Op::Truncate(from, done) => {
-                    let t0 = std::time::Instant::now();
-                    let r = self.log.truncate(gen, from).await.map_err(|e| self.shared.log_error(e));
-                    crate::telemetry::record_log_write("truncate", r.is_ok(), t0.elapsed());
-                    if r.is_ok() {
-                        self.durable.store(from - 1, Ordering::SeqCst);
-                        self.tail.lock().unwrap().retain(|p, _| *p < from);
-                    }
-                    let _ = done.send(r);
+                    let _ = done.send(self.truncate_to(gen, from).await);
                 }
-                Op::Rebase(base, done) => {
-                    let (at, new_ref) = (base.at, base.snapshot.clone());
-                    let t0 = std::time::Instant::now();
-                    let r = self.log.rebase(gen, base.clone(), keep.0).await.map_err(|e| self.shared.log_error(e));
-                    crate::telemetry::record_log_write("rebase", r.is_ok(), t0.elapsed());
-                    let r = r.inspect(|_| {
-                        tracing::info!(at, snapshot = %new_ref.0, "log rebased on a snapshot");
-                        self.durable.fetch_max(at, Ordering::SeqCst);
-                        self.tail.lock().unwrap().retain(|p, _| *p > at);
-                        self.shared.based.store(at, Ordering::SeqCst);
-                        *self.shared.base.lock().unwrap() = Some(base);
-                    });
-                    let dropped = r.clone().unwrap_or_default();
-                    let _ = done.send(r.map(|_| ()));
-                    // Nothing starts from them any more (best effort).
-                    for old in dropped.into_iter().filter(|o| o.snapshot != new_ref) {
-                        if let Err(e) = snapshots.remove(&old.snapshot).await {
-                            tracing::warn!(snapshot = %old.snapshot.0, error = %format!("{e:#}"), "removing an old base failed");
-                        }
-                    }
-                }
+                Op::Purge(id) => broken = self.purge_to(gen, id, keep).await.err(),
                 Op::Vote(vote, done) => {
                     let t0 = std::time::Instant::now();
                     let r = self.log.save_vote(gen, &vote).await.map_err(|e| self.shared.log_error(e));
@@ -293,6 +329,51 @@ impl LogAdapter {
                 }
             }
         }
+    }
+
+    async fn truncate_to(&self, gen: u64, from: Position) -> Result<(), SErr> {
+        let t0 = std::time::Instant::now();
+        let r = self.log.truncate(gen, from).await.map_err(|e| self.shared.log_error(e));
+        crate::telemetry::record_log_write("truncate", r.is_ok(), t0.elapsed());
+        if r.is_ok() {
+            self.durable.store(from - 1, Ordering::SeqCst);
+            self.tail.lock().unwrap().retain(|p, _| *p < from);
+        }
+        r
+    }
+
+    /// Rebase the log on the snapshot that covers `id`, once one does, and
+    /// hand the snapshots of the bases it drops to the remover. `Err`: the
+    /// tablet stopped first, or the rebase failed.
+    async fn purge_to(&self, gen: u64, id: RaftLogId, keep: Keep) -> Result<(), String> {
+        let Some(current) = self.covering(&id).await else {
+            return Err(format!("purge up to {id}: the tablet stopped before a snapshot covered it"));
+        };
+        let base = Base {
+            at: position(&id),
+            term: id.leader_id.term,
+            leader: id.leader_id.node_id,
+            snapshot: current.snapshot,
+        };
+        let (at, new_ref) = (base.at, base.snapshot.clone());
+        let t0 = std::time::Instant::now();
+        let r = self.log.rebase(gen, base.clone(), keep.0).await;
+        crate::telemetry::record_log_write("rebase", r.is_ok(), t0.elapsed());
+        let dropped = r.map_err(|e| {
+            let msg = format!("purge up to {id}: {e}");
+            self.shared.log_error(e);
+            msg
+        })?;
+        tracing::info!(at, snapshot = %new_ref.0, "log rebased on a snapshot");
+        self.durable.fetch_max(at, Ordering::SeqCst);
+        self.tail.lock().unwrap().retain(|p, _| *p > at);
+        self.shared.based.store(at, Ordering::SeqCst);
+        *self.shared.base.lock().unwrap() = Some(base);
+        // Nothing starts from them any more.
+        for old in dropped.into_iter().filter(|o| o.snapshot != new_ref) {
+            self.shared.remove(old.snapshot);
+        }
+        Ok(())
     }
 
     /// Append `entries` as one write of the log; the error as text, for
@@ -449,36 +530,28 @@ impl RaftLogStorage<TypeConfig> for LogAdapter {
         Ok(())
     }
 
+    /// Hands the purge to the writer and returns: the writer rebases once
+    /// a stored snapshot covers `id`, however long storing it takes (a
+    /// follower installing a snapshot in many parts on a chat). Writes
+    /// queued meanwhile wait behind it, in order.
     async fn purge(&mut self, id: RaftLogId) -> Result<(), SErr> {
-        let Some(current) = self.covering(&id).await else {
-            return Err(StorageIOError::write_logs(AnyError::error(format!(
-                "purge up to {id} without a snapshot covering it"
-            )))
-            .into());
-        };
-        let base = Base {
-            at: position(&id),
-            term: id.leader_id.term,
-            leader: id.leader_id.node_id,
-            snapshot: current.snapshot,
-        };
-        self.write(|done| Op::Rebase(base, done)).await?;
+        self.tx
+            .send(Op::Purge(id))
+            .map_err(|_| StorageError::from(StorageIOError::write_logs(AnyError::error("the log writer is gone"))))?;
+        // A snapshot past the head: the log goes on after it.
         let mut head = self.head.lock().unwrap();
         *head = (*head).max(position(&id));
         Ok(())
     }
 }
 
-/// How long a purge waits for the snapshot that covers it.
-const COVERING_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
 impl LogAdapter {
-    /// The current snapshot once it covers `id`. On a follower that installs
-    /// one from its leader, Raft asks to purge the log behind it while the
-    /// state machine is still storing it: wait for that (a while), never
-    /// purge entries no stored snapshot holds.
+    /// The current snapshot once it covers `id`; `None` if the tablet stops
+    /// first. On a follower that installs one from its leader, Raft asks to
+    /// purge the log behind it while the state machine is still storing it:
+    /// wait for that, never purge entries no stored snapshot holds.
     async fn covering(&self, id: &RaftLogId) -> Option<CurrentSnapshot> {
-        let deadline = tokio::time::Instant::now() + COVERING_WAIT;
+        let mut stop = self.shared.stop.subscribe();
         loop {
             let kept = self.shared.kept.notified();
             tokio::pin!(kept);
@@ -487,8 +560,13 @@ impl LogAdapter {
             if let Some(c) = current.filter(|c| c.meta.last_log_id.is_some_and(|l| l.index >= id.index)) {
                 return Some(c);
             }
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            tokio::time::timeout(left, kept).await.ok()?;
+            if stop.borrow_and_update().is_some() {
+                return None;
+            }
+            tokio::select! {
+                () = &mut kept => {}
+                changed = stop.changed() => changed.ok()?,
+            }
         }
     }
 }
@@ -546,9 +624,7 @@ impl StateMachine {
         // log drops it.
         let base_ref = shared.base.lock().unwrap().as_ref().map(|b| b.snapshot.clone());
         if let Some(unused) = unused.filter(|u| u.snapshot != kept.snapshot && Some(&u.snapshot) != base_ref.as_ref()) {
-            if let Err(e) = snapshots.remove(&unused.snapshot).await {
-                tracing::warn!(snapshot = %unused.snapshot.0, error = %format!("{e:#}"), "removing an unused snapshot failed");
-            }
+            shared.remove(unused.snapshot);
         }
         Ok(kept)
     }

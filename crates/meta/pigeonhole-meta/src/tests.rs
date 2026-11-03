@@ -579,14 +579,7 @@ async fn a_build_stored_after_an_install_of_a_newer_snapshot_stays_out() {
     use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
     let snapshots: Arc<dyn SnapshotStore> = Arc::new(crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())));
     let (stop, _) = watch::channel(None);
-    let shared = Arc::new(raft::Shared {
-        stop,
-        applied: AtomicU64::new(0),
-        based: AtomicU64::new(0),
-        current: Mutex::new(None),
-        kept: tokio::sync::Notify::new(),
-        base: Mutex::new(None),
-    });
+    let shared = Arc::new(raft::Shared::new(stop, snapshots.clone()));
     // Raft's index 3 is position 4, 7 is 8.
     let (at4, at8) = (raft::solo_meta(3), raft::solo_meta(7));
     let mut sm = raft::StateMachine {
@@ -608,6 +601,79 @@ async fn a_build_stored_after_an_install_of_a_newer_snapshot_stays_out() {
     assert_eq!(current.meta.last_log_id, at8.last_log_id, "the leader's is current");
     let stored = snapshots.get(&current.snapshot).await.unwrap();
     assert_eq!(stored.at, 8, "the leader's snapshot is still stored");
+}
+
+/// A snapshot store whose `put` takes two minutes (a snapshot in many parts
+/// on a chat).
+struct SlowPut(Arc<dyn SnapshotStore>);
+
+#[async_trait::async_trait]
+impl SnapshotStore for SlowPut {
+    async fn put(&self, s: &StoredSnapshot, after: Option<&SnapshotRef>) -> Result<SnapshotRef> {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        self.0.put(s, after).await
+    }
+    async fn get(&self, r: &SnapshotRef) -> Result<StoredSnapshot> {
+        self.0.get(r).await
+    }
+    async fn newest(&self) -> Result<Option<StoredSnapshot>> {
+        self.0.newest().await
+    }
+    async fn remove(&self, r: &SnapshotRef) -> Result<()> {
+        self.0.remove(r).await
+    }
+}
+
+/// A follower installs its leader's snapshot (at 8, past its empty log)
+/// into a slow store, and Raft asks to purge behind it meanwhile: the purge
+/// returns at once, the log is rebased once the snapshot is stored however
+/// long that takes, and a write queued behind the purge waits for it.
+#[tokio::test(start_paused = true)]
+async fn a_purge_waits_for_a_slow_snapshot_store_without_a_deadline() {
+    use openraft::storage::{RaftLogStorage, RaftStateMachine};
+    let log = Arc::new(crate::ChainLogStore::new(Arc::new(MemoryBlobStore::new())));
+    let head = log.claim(1).await.unwrap();
+    let snapshots: Arc<dyn SnapshotStore> =
+        Arc::new(SlowPut(Arc::new(crate::BlobSnapshotStore::new(Arc::new(MemoryBlobStore::new())))));
+    let (stop, stopped) = watch::channel(None);
+    let shared = Arc::new(raft::Shared::new(stop, snapshots.clone()));
+    let mut adapter = raft::LogAdapter::new(log.clone(), 1, head.log_id, 0, shared.clone(), raft::Keep(2));
+    let mut sm = raft::StateMachine {
+        states: Arc::new(collect_states(counter()).unwrap()),
+        snapshots,
+        history: head.log_id,
+        last_applied: None,
+        membership: Default::default(),
+        shared: shared.clone(),
+    };
+    let at8 = raft::solo_meta(7);
+    let data = raft::RaftSnapshot { meta: at8.clone(), tablet: take_snapshot(&sm.states, 8) }.encode();
+    let t0 = tokio::time::Instant::now();
+    let install = tokio::spawn(async move {
+        sm.install_snapshot(&at8, Box::new(std::io::Cursor::new(data))).await.map(|_| sm.last_applied)
+    });
+    tokio::task::yield_now().await;
+
+    adapter.purge(at8_id()).await.unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(1), "the purge does not wait for the store");
+    let vote = openraft::Vote::new(3, raft::SOLO);
+    let mut voter = adapter.clone();
+    let voted = tokio::spawn(async move { voter.save_vote(&vote).await });
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!((shared.based.load(Ordering::SeqCst), voted.is_finished()), (0, false), "nothing before it is stored");
+
+    assert!(install.await.unwrap().is_ok());
+    voted.await.unwrap().unwrap();
+    assert!(t0.elapsed() >= Duration::from_secs(120));
+    assert_eq!(shared.based.load(Ordering::SeqCst), 8);
+    let d = log.discover().await.unwrap().unwrap();
+    assert_eq!((d.base.map(|b| b.at), d.head.position, d.vote.is_some()), (Some(8), 8, true));
+    assert!(stopped.borrow().is_none(), "the tablet goes on");
+}
+
+/// Raft's id of the entry at position 8 in a cluster of one (term 1).
+fn at8_id() -> raft::RaftLogId {
+    raft::solo_meta(7).last_log_id.unwrap()
 }
 
 #[tokio::test]
