@@ -1,0 +1,15 @@
+# typos (`make gates`): misspellings in code, docs and the site.
+
+[files]
+# Patched copies of other projects' crates: their spelling is theirs.
+extend-exclude = ["vendor/"]
+
+[default]
+# A Discord bot token's first part is a user id in base64 ("MTIz…" is "123…").
+extend-ignore-re = ["\"MTIz[A-Za-z0-9]*\\."]
+
+[default.extend-words]
+# The Telegram MTProto client library.
+grammers = "grammers"
+# A part number (S3 multipart upload).
+pn = "pn"

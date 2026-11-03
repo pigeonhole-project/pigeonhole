@@ -1,0 +1,3 @@
+# Lines of code in a function body (no blanks, no comments); the lint is
+# turned on in Cargo.toml ([workspace.lints.clippy]).
+too-many-lines-threshold = 100

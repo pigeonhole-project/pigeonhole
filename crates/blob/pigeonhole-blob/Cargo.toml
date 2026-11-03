@@ -15,7 +15,6 @@ pigeonhole-types = { workspace = true }
 pigeonhole-storage-api = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
-uuid = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

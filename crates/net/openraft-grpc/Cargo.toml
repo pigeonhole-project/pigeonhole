@@ -28,3 +28,7 @@ tonic-build = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# Used by the code tonic-build generates (OUT_DIR), which machete does not read.
+ignored = ["prost"]

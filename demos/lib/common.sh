@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared by every demo: a pigeonhole to point things at, S3 calls by curl,
 # pinned third-party binaries. Sourced, not run.
 #

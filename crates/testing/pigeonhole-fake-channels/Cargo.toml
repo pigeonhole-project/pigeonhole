@@ -20,7 +20,6 @@ pigeonhole-storage-discord = { workspace = true, features = ["fake"] }
 pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true, features = ["fake"] }
-pigeonhole-types = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

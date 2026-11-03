@@ -40,6 +40,17 @@ jobs:
       # so code behind a feature or behind its absence is linted too.
       - run: make lint
 
+  gates:
+    name: gates (cargo-deny, cargo-machete, shellcheck, typos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete,shellcheck,typos
+      - run: make gates
+
   site:
     name: site JavaScript (biome, node --test)
     runs-on: ubuntu-latest
@@ -86,9 +97,11 @@ jobs:
         with:
           name: code-report
           path: code-report.md
-      # A ratchet: lower these as the hotspots are split, never raise them.
-      - name: No function past the complexity and length limits
-        run: ./scripts/code_report.py --no-traits --max-cognitive 20 --max-lines 100 --out /dev/null
+      # A ratchet: lower it as the hotspots are split, never raise it. The
+      # length limit is clippy's (too_many_lines, clippy.toml); clippy's own
+      # cognitive_complexity counts differently and is still in nursery.
+      - name: No function past the complexity limit
+        run: ./scripts/code_report.py --no-traits --max-cognitive 20 --out /dev/null
 
   compat-memory:
     name: compat-memory (ceph known-good)
