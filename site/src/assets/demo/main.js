@@ -334,7 +334,7 @@ function renderNodes() {
   const all = button("node-pick cluster-pick", t("cluster.title"), () => openPanel(ref.cluster()));
   all.setAttribute("aria-pressed", String(isOpen("cluster")));
   bar.replaceChildren(all);
-  if (isOpen("client")) view?.setCluster?.(clientCluster());
+  if (isOpen("client")) view.setCluster(clientCluster());
 }
 const clientCluster = () => (state.nodes.length > 1 ? {nodes: state.nodes, node: state.node, leader: state.cluster?.leader ?? null, cut: state.cut} : null);
 
@@ -516,7 +516,8 @@ function renderPanel() {
     view = v;
   };
   if (open.kind === "client") {
-    const v = clientView({...state, cluster: clientCluster()}, clientOps);
+    const {buckets, bucket, objects, admin} = state;
+    const v = clientView({buckets, bucket, objects, admin, cluster: clientCluster()}, clientOps);
     show(t("demo.you"), t("demo.you_sub"), v.nodes, v);
   } else if (open.kind === "loft") {
     const id = shown();
