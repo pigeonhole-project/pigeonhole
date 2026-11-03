@@ -1,65 +1,38 @@
 //! In-process S3 API tests over ChunkStore(Memory) + temp SQLite.
 
 use bytes::Bytes;
-use futures::StreamExt;
-use http::Extensions;
-use http::{HeaderMap, Method, Uri};
-use pigeonhole::config::Config;
-use pigeonhole::index::Index;
 use pigeonhole::memory::MemoryBlobStore;
-use pigeonhole::{build_s3_gateway, BlobDb, ChunkStore, IngestOptions};
+use pigeonhole::service::{S3Gateway, S3Options};
+use pigeonhole_codec::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
+use pigeonhole_meta::MetaStore;
+use pigeonhole_testkit::s3::{self as s3kit, code, collect_body, req, Node};
 use s3s::dto::*;
-use s3s::{S3ErrorCode, S3Request, S3Response, S3};
+use s3s::{S3ErrorCode, S3Response, S3};
 use std::sync::Arc;
+use std::time::Duration;
 
-fn req<T>(input: T) -> S3Request<T> {
-    S3Request {
-        input,
-        method: Method::GET,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::default(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
-
-async fn setup_with_mem() -> (pigeonhole::service::S3Gateway, Arc<MemoryBlobStore>, tempfile::TempDir) {
+/// A gateway over one tablet (as the binary runs it) and a memory store.
+async fn setup(
+    chunk_size: usize,
+    block_size: usize,
+    inline_max: Option<usize>,
+) -> (S3Gateway, Arc<MetaStore>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let idx_url = dir.path().join("s3.log");
-    let blob_url = dir.path().join("blob.log");
-    let cfg = Config::for_test(dir.path());
-    let index = Index::open(pigeonhole_testkit::tablet(&idx_url, Index::register).await).await.unwrap();
-    let mem = Arc::new(MemoryBlobStore::new());
-    let db = BlobDb::open(pigeonhole_testkit::tablet(&blob_url, BlobDb::register).await).await.unwrap();
-    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    opts.block_size = cfg.block_size;
-    // ChunkStore takes ownership of a MemoryBlobStore; clone state is not shared.
-    // For blob-count tests, open with a clone of the same Arc via erase — use one mem.
-    let store_mem = MemoryBlobStore::new();
-    // We cannot share Arc into ChunkStore::open which takes ownership.
-    // Expose counts via chunk metadata instead in updated tests.
-    let store = Arc::new(ChunkStore::open(db, store_mem, opts).await.unwrap());
-    let s3 = build_s3_gateway(cfg.s3_options(), index, store);
-    (s3, mem, dir)
+    let meta = pigeonhole_testkit::tablet(dir.path().join("meta"), s3kit::register).await;
+    let members = vec![s3kit::member(Arc::new(MemoryBlobStore::new()))];
+    let opts = S3Options { inline_max, ..S3Options::for_test() };
+    let node = Node::open(meta.clone(), members, s3kit::ingest(chunk_size, block_size), opts).await;
+    (node.s3, meta, dir)
 }
 
-async fn collect_body(body: Option<StreamingBlob>) -> Vec<u8> {
-    let mut out = Vec::new();
-    let Some(mut body) = body else {
-        return out;
-    };
-    while let Some(chunk) = body.next().await {
-        out.extend_from_slice(&chunk.unwrap());
-    }
-    out
+/// [`setup`] with the default chunk and block sizes.
+async fn setup_default() -> (S3Gateway, Arc<MetaStore>, tempfile::TempDir) {
+    setup(DEFAULT_CHUNK_SIZE, DEFAULT_BLOCK_SIZE, None).await
 }
 
 #[tokio::test]
 async fn empty_object_put_get() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let put = s3
@@ -87,7 +60,7 @@ async fn empty_object_put_get() {
 
 #[tokio::test]
 async fn put_get_roundtrip_and_range() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let data = Bytes::from(vec![7u8; 100_000]);
@@ -123,7 +96,7 @@ async fn put_get_roundtrip_and_range() {
 
 #[tokio::test]
 async fn compressible_object_roundtrip_and_snapshot() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let data = Bytes::from(vec![b'z'; 200_000]);
@@ -153,7 +126,7 @@ async fn compressible_object_roundtrip_and_snapshot() {
 
 #[tokio::test]
 async fn content_md5_mismatch_rejected() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let err = s3
@@ -171,7 +144,7 @@ async fn content_md5_mismatch_rejected() {
 
 #[tokio::test]
 async fn content_md5_invalid_short_is_invalid_digest() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let err = s3
@@ -189,7 +162,7 @@ async fn content_md5_invalid_short_is_invalid_digest() {
 
 #[tokio::test]
 async fn get_bucket_location_and_list_v1() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),
@@ -218,7 +191,7 @@ async fn get_bucket_location_and_list_v1() {
 
 #[tokio::test]
 async fn list_parts_and_multipart_uploads() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
 
     let created = s3
@@ -268,7 +241,7 @@ async fn list_parts_and_multipart_uploads() {
 
 #[tokio::test]
 async fn object_tagging_roundtrip() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),
@@ -319,7 +292,7 @@ async fn object_tagging_roundtrip() {
 
 #[tokio::test]
 async fn upload_part_copy_range() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),
@@ -382,7 +355,7 @@ async fn upload_part_copy_range() {
 
 #[tokio::test]
 async fn upload_part_copy_whole_object_reuses_chunks() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     let body = Bytes::from_static(b"whole-object-shallow-copy");
     s3.put_object(req(PutObjectInput {
@@ -443,7 +416,7 @@ async fn upload_part_copy_whole_object_reuses_chunks() {
 
 #[tokio::test]
 async fn list_object_versions_as_null_current() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     s3.create_bucket(req(CreateBucketInput { bucket: "demo".into(), ..Default::default() })).await.unwrap();
     s3.put_object(req(PutObjectInput {
         bucket: "demo".into(),
@@ -469,7 +442,7 @@ async fn list_object_versions_as_null_current() {
 
 #[tokio::test]
 async fn delete_everything_releases_every_object_chunk() {
-    let (s3, _mem, _dir) = setup_with_mem().await;
+    let (s3, _mem, _dir) = setup_default().await;
     for bucket in ["a", "b"] {
         s3.create_bucket(req(CreateBucketInput { bucket: bucket.into(), ..Default::default() })).await.unwrap();
         for key in ["x", "y"] {
@@ -497,20 +470,8 @@ async fn delete_everything_releases_every_object_chunk() {
 }
 
 /// One tablet for the index and the chunk store, as in the binary.
-async fn setup_one_tablet(
-    chunk_size: usize,
-) -> (pigeonhole::service::S3Gateway, Arc<pigeonhole_meta::MetaStore>, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let mut cfg = Config::for_test(dir.path());
-    cfg.chunk_size = chunk_size;
-    cfg.block_size = 64 * 1024;
-    let meta = pigeonhole_testkit::tablet(dir.path().join("meta"), |ns| Index::register(BlobDb::register(ns))).await;
-    let index = Index::open(meta.clone()).await.unwrap();
-    let db = BlobDb::open(meta.clone()).await.unwrap();
-    let mut opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    opts.block_size = cfg.block_size;
-    let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
-    (build_s3_gateway(cfg.s3_options(), index, store), meta, dir)
+async fn setup_one_tablet(chunk_size: usize) -> (S3Gateway, Arc<MetaStore>, tempfile::TempDir) {
+    setup(chunk_size, 64 * 1024, None).await
 }
 
 #[tokio::test]
@@ -545,15 +506,8 @@ async fn a_put_is_one_log_entry_and_a_bad_digest_commits_nothing() {
     let before = meta.applied_position();
     s3.put_object(req(tagged(payload, None))).await.unwrap();
     assert_eq!(meta.applied_position(), before + 1);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while meta.applied_position() < before + 2 {
-        assert!(tokio::time::Instant::now() < deadline, "the release never came");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-}
-
-fn code(err: s3s::S3Error) -> S3ErrorCode {
-    err.code().clone()
+    pigeonhole_testkit::eventually("the release", Duration::from_secs(5), || meta.applied_position() >= before + 2)
+        .await;
 }
 
 fn put(key: &str, body: &str, if_match: Option<&str>, if_none_match: bool) -> PutObjectInput {
@@ -698,29 +652,20 @@ async fn racing_creates_one_wins_and_losers_release_their_chunks() {
         }
     }
     assert_eq!(won, 1);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while s3.store.db().stats().live != 1 {
-        assert!(tokio::time::Instant::now() < deadline, "losers' chunks still live: {:?}", s3.store.db().stats());
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    pigeonhole_testkit::eventually("losers' chunks released", Duration::from_secs(5), || {
+        s3.store.db().stats().live == 1
+    })
+    .await;
 }
 
 /// One tablet, objects up to 1 KiB inline (docs/inline-objects.md).
-async fn setup_inline() -> (pigeonhole::service::S3Gateway, Arc<pigeonhole_meta::MetaStore>, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = Config::for_test(dir.path());
-    let meta = pigeonhole_testkit::tablet(dir.path().join("meta"), |ns| Index::register(BlobDb::register(ns))).await;
-    let index = Index::open(meta.clone()).await.unwrap();
-    let db = BlobDb::open(meta.clone()).await.unwrap();
-    let opts = IngestOptions::new(cfg.chunk_size, cfg.chunk_codec);
-    let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
-    let s3opts = pigeonhole::service::S3Options { inline_max: Some(1024), ..cfg.s3_options() };
-    let s3 = build_s3_gateway(s3opts, index, store);
+async fn setup_inline() -> (S3Gateway, Arc<MetaStore>, tempfile::TempDir) {
+    let (s3, meta, dir) = setup(DEFAULT_CHUNK_SIZE, DEFAULT_BLOCK_SIZE, Some(1024)).await;
     s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
     (s3, meta, dir)
 }
 
-async fn get_all(s3: &pigeonhole::service::S3Gateway, key: &str, range: Option<Range>) -> Vec<u8> {
+async fn get_all(s3: &S3Gateway, key: &str, range: Option<Range>) -> Vec<u8> {
     let out = s3
         .get_object(req(GetObjectInput { bucket: "b".into(), key: key.into(), range, ..Default::default() }))
         .await
@@ -845,11 +790,10 @@ async fn an_inline_rewrite_releases_the_chunks_it_replaces() {
     s3.put_object(req(put_len("k", &vec![1u8; 5000], true))).await.unwrap();
     assert_eq!(s3.store.db().stats().live, 1);
     s3.put_object(req(put_len("k", b"tiny", true))).await.unwrap();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while s3.store.db().stats().live != 0 {
-        assert!(tokio::time::Instant::now() < deadline, "the old chunk is still live");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    pigeonhole_testkit::eventually("the old chunk released", Duration::from_secs(5), || {
+        s3.store.db().stats().live == 0
+    })
+    .await;
     assert_eq!(get_all(&s3, "k", None).await, b"tiny");
 }
 
@@ -904,4 +848,167 @@ async fn a_copy_follows_the_current_threshold() {
         s3.index.get_object("b", "dst").await.unwrap().unwrap(),
     );
     assert_eq!(src.etag, dst.etag);
+}
+
+async fn create_upload(s3: &S3Gateway, bucket: &str, key: &str) -> String {
+    let input = CreateMultipartUploadInput { bucket: bucket.into(), key: key.into(), ..Default::default() };
+    s3.create_multipart_upload(req(input)).await.unwrap().output.upload_id.unwrap()
+}
+
+fn part_input(key: &str, upload_id: &str, part_number: i32, data: &[u8]) -> UploadPartInput {
+    UploadPartInput {
+        bucket: "b".into(),
+        key: key.into(),
+        upload_id: upload_id.into(),
+        part_number,
+        body: Some(StreamingBlob::from_bytes(Bytes::copy_from_slice(data))),
+        ..Default::default()
+    }
+}
+
+fn complete_input(key: &str, upload_id: &str, parts: &[(i32, &str)]) -> CompleteMultipartUploadInput {
+    let parts = parts
+        .iter()
+        .map(|&(n, e)| CompletedPart {
+            part_number: Some(n),
+            e_tag: Some(ETag::Strong(e.into())),
+            ..Default::default()
+        })
+        .collect();
+    CompleteMultipartUploadInput {
+        bucket: "b".into(),
+        key: key.into(),
+        upload_id: upload_id.into(),
+        multipart_upload: Some(CompletedMultipartUpload { parts: Some(parts) }),
+        ..Default::default()
+    }
+}
+
+/// CompleteMultipartUpload is decided by the parts as they are when its
+/// command applies: listed ones there with their ETags, ascending; the
+/// object's size and ETag are theirs; parts left out are released. An
+/// upload id names one key: under another it is `NoSuchUpload`.
+#[tokio::test]
+async fn multipart_completes_from_the_parts_it_lists() {
+    use md5::Digest as _;
+    let (s3, _meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    let id = create_upload(&s3, "b", "mp").await;
+    let data: Vec<Vec<u8>> = (1..=3u8).map(|i| vec![i; 70_000 + i as usize]).collect();
+    let mut etags = Vec::new();
+    for (i, d) in data.iter().enumerate() {
+        let out = s3.upload_part(req(part_input("mp", &id, i as i32 + 1, d))).await.unwrap().output;
+        etags.push(out.e_tag.unwrap().value().to_string());
+    }
+    let (e1, e2) = (etags[0].as_str(), etags[1].as_str());
+
+    let refused = |input| async { code(s3.complete_multipart_upload(req(input)).await.unwrap_err()) };
+    assert_eq!(refused(complete_input("mp", &id, &[(2, e2), (1, e1)])).await, S3ErrorCode::InvalidPartOrder);
+    assert_eq!(refused(complete_input("mp", &id, &[(1, e1), (1, e1)])).await, S3ErrorCode::InvalidPartOrder);
+    assert_eq!(refused(complete_input("mp", &id, &[(1, e2)])).await, S3ErrorCode::InvalidPart);
+    assert_eq!(refused(complete_input("mp", &id, &[(1, e1), (4, e2)])).await, S3ErrorCode::InvalidPart);
+    assert_eq!(refused(complete_input("other", &id, &[(1, e1)])).await, S3ErrorCode::NoSuchUpload);
+    let wrong_key = s3.upload_part(req(part_input("other", &id, 1, b"x"))).await.unwrap_err();
+    assert_eq!(code(wrong_key), S3ErrorCode::NoSuchUpload);
+    let abort = AbortMultipartUploadInput {
+        bucket: "b".into(),
+        key: "other".into(),
+        upload_id: id.clone(),
+        ..Default::default()
+    };
+    assert_eq!(code(s3.abort_multipart_upload(req(abort)).await.unwrap_err()), S3ErrorCode::NoSuchUpload);
+
+    let done = s3.complete_multipart_upload(req(complete_input("mp", &id, &[(1, e1), (2, e2)]))).await.unwrap();
+    let mut md5s = Vec::new();
+    for e in [e1, e2] {
+        md5s.extend(hex::decode(e).unwrap());
+    }
+    let want_etag = format!("{:x}-2", md5::Md5::digest(&md5s));
+    assert_eq!(done.output.e_tag.unwrap().value(), want_etag);
+    let head = s3
+        .head_object(req(HeadObjectInput { bucket: "b".into(), key: "mp".into(), ..Default::default() }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.content_length, Some((data[0].len() + data[1].len()) as i64));
+    assert_eq!(head.e_tag.unwrap().value(), want_etag);
+    let got = s3.get_object(req(GetObjectInput { bucket: "b".into(), key: "mp".into(), ..Default::default() })).await;
+    assert_eq!(collect_body(got.unwrap().output.body).await, [&data[0][..], &data[1][..]].concat());
+
+    // Part 3 is gone with the upload: only the object's chunks stay live.
+    let held = s3.index.get_extents("b", "mp").await.unwrap().unwrap();
+    let held = pigeonhole_chunk_store::unique_chunk_ids(&held).len() as u64;
+    pigeonhole_testkit::eventually("part 3 released", Duration::from_secs(5), || s3.store.db().stats().live == held)
+        .await;
+}
+
+#[tokio::test]
+async fn deleting_a_bucket_releases_its_uploads() {
+    let (s3, _meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    let id = create_upload(&s3, "b", "mp").await;
+    s3.upload_part(req(part_input("mp", &id, 1, &[7; 1000]))).await.unwrap();
+    assert_eq!(s3.store.db().stats().live, 1);
+    s3.delete_bucket(req(DeleteBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    pigeonhole_testkit::eventually("the part released", Duration::from_secs(5), || s3.store.db().stats().live == 0)
+        .await;
+}
+
+/// DeleteObjects is one command: one entry for every key (and one more
+/// for the release after it); each key answered on its own, an `ETag` in
+/// the request as its `If-Match`.
+#[tokio::test]
+async fn delete_objects_is_one_entry_and_answers_each_key() {
+    let (s3, meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    for key in ["a", "b", "c"] {
+        s3.put_object(req(put(key, &key.repeat(1000), None, false))).await.unwrap();
+    }
+    let ident = |key: &str, etag: Option<&str>| ObjectIdentifier {
+        key: key.into(),
+        e_tag: etag.map(|e| ETag::Strong(e.into())),
+        ..Default::default()
+    };
+    let objects = vec![ident("a", None), ident("b", Some("0123")), ident("c", None), ident("missing", None)];
+    let before = meta.applied_position();
+    let out = s3
+        .delete_objects(req(DeleteObjectsInput::builder()
+            .bucket("b".into())
+            .delete(Delete { objects, quiet: None })
+            .build()
+            .unwrap()))
+        .await
+        .unwrap()
+        .output;
+    let deleted: Vec<String> = out.deleted.unwrap().into_iter().map(|d| d.key.unwrap()).collect();
+    assert_eq!(deleted, ["a", "c", "missing"]);
+    let errors = out.errors.unwrap();
+    assert_eq!((errors[0].key.as_deref(), errors[0].code.as_deref()), (Some("b"), Some("PreconditionFailed")));
+    pigeonhole_testkit::eventually("the release after the answer", Duration::from_secs(5), || {
+        meta.applied_position() >= before + 2
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(meta.applied_position(), before + 2, "the deletes in one entry, the release in one more");
+    assert_eq!(s3.index.count_objects().await.unwrap(), 1);
+
+    let nobucket = DeleteObjectsInput::builder()
+        .bucket("nope".into())
+        .delete(Delete { objects: vec![ident("a", None)], quiet: None })
+        .build()
+        .unwrap();
+    assert_eq!(code(s3.delete_objects(req(nobucket)).await.unwrap_err()), S3ErrorCode::NoSuchBucket);
+}
+
+#[tokio::test]
+async fn tagging_a_missing_object_is_no_such_key() {
+    let (s3, _meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    let tagging = Tagging { tag_set: vec![Tag { key: Some("k".into()), value: Some("v".into()) }] };
+    let put = PutObjectTaggingInput::builder().bucket("b".into()).key("gone".into()).tagging(tagging).build().unwrap();
+    assert_eq!(code(s3.put_object_tagging(req(put)).await.unwrap_err()), S3ErrorCode::NoSuchKey);
+    let del = DeleteObjectTaggingInput { bucket: "b".into(), key: "gone".into(), ..Default::default() };
+    assert_eq!(code(s3.delete_object_tagging(req(del)).await.unwrap_err()), S3ErrorCode::NoSuchKey);
+    let get = GetObjectTaggingInput { bucket: "b".into(), key: "gone".into(), ..Default::default() };
+    assert_eq!(code(s3.get_object_tagging(req(get)).await.unwrap_err()), S3ErrorCode::NoSuchKey);
 }

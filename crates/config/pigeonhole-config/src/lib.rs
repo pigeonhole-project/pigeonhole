@@ -565,14 +565,7 @@ impl Config {
 
     /// What the S3 gateway takes from this config.
     pub fn s3_options(&self) -> S3Options {
-        S3Options {
-            region: self.region.clone(),
-            chunk_size: self.chunk_size,
-            chunk_codec: self.chunk_codec,
-            block_size: self.block_size,
-            ingest_budget: self.ingest_budget.clone(),
-            inline_max: self.inline.max_object_size,
-        }
+        S3Options { region: self.region.clone(), inline_max: self.inline.max_object_size }
     }
 
     /// The limiter of `chat` for the bot holding `bot_token` (shared by every

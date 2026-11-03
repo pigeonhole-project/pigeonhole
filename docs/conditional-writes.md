@@ -32,6 +32,7 @@ decided, not before it.
 | same + `If-Match: <etag>` | 404 `NoSuchKey` | write | 412 |
 | same + `If-Match: *` | 404 `NoSuchKey` | write | write |
 | `DeleteObject` + `If-Match: <etag>` / `*` | 404 `NoSuchKey` | delete | 412 / delete |
+| `DeleteObjects`, an object with `<ETag>` | `NoSuchKey` for it | delete it | `PreconditionFailed` for it |
 
 - AWS documents `If-None-Match: *` and `If-Match: <etag>`; the other two
   are HTTP's (RFC 9110) and ceph's s3-tests check them
@@ -50,6 +51,7 @@ decided, not before it.
 
 In the command, not in the handler. `S3Command::PutObject`,
 `CompleteUpload` and `DeleteObject` carry `expect: Option<Expect>`
+(`DeleteObjects` one per key)
 (`Absent` | `ETag(String)`); `S3State::apply` checks it against the object
 as of that log position and rejects with `S3Reject::PreconditionFailed` or
 `NoSuchKey`, leaving the state untouched (as every rejection does). The
@@ -71,7 +73,6 @@ entry and the release leaves `refs` one too high. `S3State::VERSION` 3.
 
 ## Not in scope
 
-- `If-Match` on `DeleteObjects` (per-object ETags in the batch).
 - Versioned reads (`GetObject` with `versionId`): T4 uses them only for a
   point-in-time restore.
 - Conditional reads (`If-Match` on `GetObject`/`HeadObject`) are a different

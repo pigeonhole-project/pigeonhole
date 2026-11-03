@@ -7,7 +7,8 @@
 //! rejected command leaves the state untouched.
 
 use anyhow::Result;
-use pigeonhole_chunk_store::{ChunkId, Extent};
+use md5::{Digest, Md5};
+use pigeonhole_chunk_store::{unique_chunk_ids, ChunkId, Extent};
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -90,6 +91,13 @@ pub enum S3Command {
         key: String,
         expect: Option<Expect>,
     },
+    /// Delete several objects of one bucket, each if it is what its
+    /// `expect` says (a missing key without one counts as deleted). Reply:
+    /// [`S3Reply::Deleted`].
+    DeleteObjects {
+        bucket: String,
+        objects: Vec<(String, Option<Expect>)>,
+    },
     /// Replace an object's tags (empty = delete them).
     PutObjectTags {
         bucket: String,
@@ -113,12 +121,13 @@ pub enum S3Command {
         size: i64,
         extents: Vec<Extent>,
     },
-    /// Assemble the object from parts; part extents move to the object (no release).
+    /// Assemble the object from `parts` (`(number, etag)`, ascending; each
+    /// must be the part stored under that number). Its size and ETag come
+    /// from the parts assembled; their extents move to the object, and the
+    /// chunks of the parts not listed are released.
     CompleteUpload {
         upload_id: String,
-        part_numbers: Vec<i64>,
-        etag: String,
-        total_size: i64,
+        parts: Vec<(i64, String)>,
         mtime: String,
         expect: Option<Expect>,
     },
@@ -144,19 +153,42 @@ pub enum S3Reject {
     BucketNotEmpty,
     NoSuchKey,
     NoSuchUpload,
-    MissingPart(i64),
+    /// CompleteUpload: no part under this number, or not with the ETag listed.
+    InvalidPart(i64),
     /// The key's object is not what the write's [`Expect`] said.
     PreconditionFailed,
     /// CreateUpload: the upload id is taken (ids are random: a bug of ours,
     /// but a proposal's content, so a rejection and not an apply error).
     UploadExists,
+    /// CompleteUpload: part numbers not ascending, or one listed twice.
+    InvalidPartOrder,
 }
 
-/// Reply of every committed command: chunk ids the caller must release
-/// (replaced or removed), sorted and unique; empty when nothing was freed.
+/// Chunk ids the caller must release (replaced or removed), sorted; empty
+/// when nothing was freed. An object or a part holds one ref on each chunk
+/// it points into, so a chunk is here once for each holder that let it go.
 pub type Released = Vec<ChunkId>;
 
-type Applied = std::result::Result<Released, S3Reject>;
+/// Reply of a committed command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum S3Reply {
+    /// Every command but `DeleteObjects`.
+    Released(Released),
+    /// `DeleteObjects`: the keys not deleted, and why; every other key is
+    /// gone (or was never there).
+    Deleted { released: Released, refused: Vec<(String, S3Reject)> },
+}
+
+impl S3Reply {
+    /// The chunks to release.
+    pub fn released(self) -> Released {
+        match self {
+            S3Reply::Released(ids) | S3Reply::Deleted { released: ids, .. } => ids,
+        }
+    }
+}
+
+type Applied = std::result::Result<S3Reply, S3Reject>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BucketRec {
@@ -208,9 +240,9 @@ pub struct S3State {
 
 impl StateMachine for S3State {
     const NAME: &'static str = NAMESPACE;
-    const VERSION: u32 = 5;
+    const VERSION: u32 = 6;
     type Command = S3Command;
-    type Reply = Released;
+    type Reply = S3Reply;
     type Reject = S3Reject;
 
     fn apply(&mut self, command: S3Command) -> Result<Outcome<Self>> {
@@ -243,6 +275,7 @@ impl StateMachine for S3State {
                 self.put_object(bucket, key, rec, expect.as_ref())
             }
             S3Command::DeleteObject { bucket, key, expect } => self.delete_object(bucket, key, expect.as_ref()),
+            S3Command::DeleteObjects { bucket, objects } => self.delete_objects(bucket, objects),
             S3Command::PutObjectTags { bucket, key, tags } => match self.objects.get_mut(&(bucket, key)) {
                 Some(o) => {
                     o.tags = tags.into_iter().collect();
@@ -277,16 +310,16 @@ impl StateMachine for S3State {
                     return Ok(Err(S3Reject::NoSuchUpload));
                 };
                 let old = upload.parts.insert(part_number, PartRec { etag, size, extents });
-                released(old.map(|p| chunk_ids(&p.extents)).unwrap_or_default())
+                released(old.iter().map(|p| &p.extents[..]))
             }
-            S3Command::CompleteUpload { upload_id, part_numbers, etag, total_size, mtime, expect } => {
-                self.complete_upload(&upload_id, &part_numbers, etag, total_size, mtime, expect.as_ref())
+            S3Command::CompleteUpload { upload_id, parts, mtime, expect } => {
+                self.complete_upload(&upload_id, &parts, mtime, expect.as_ref())
             }
             S3Command::AbortUpload { upload_id } => {
                 let Some(upload) = self.uploads.remove(&upload_id) else {
                     return Ok(Err(S3Reject::NoSuchUpload));
                 };
-                released(upload.parts.values().flat_map(|p| chunk_ids(&p.extents)).collect())
+                released(upload.parts.values().map(|p| &p.extents[..]))
             }
             S3Command::Cool { bucket, key, etag, extents } => self.cool(bucket, key, etag, extents),
         })
@@ -326,15 +359,31 @@ impl S3State {
             return Err(S3Reject::BucketNotFound);
         }
         self.check(&bucket, &key, expect)?;
-        released(self.write_object(bucket, key, rec))
+        released([&self.write_object(bucket, key, rec)[..]])
     }
 
     fn delete_object(&mut self, bucket: String, key: String, expect: Option<&Expect>) -> Applied {
         self.check(&bucket, &key, expect)?;
         match self.remove_object(bucket, key) {
-            Some(o) => released(chunk_ids(o.body.extents())),
+            Some(o) => released([o.body.extents()]),
             None => Err(S3Reject::NoSuchKey),
         }
+    }
+
+    /// Each object as [`Self::delete_object`] would, on its own.
+    fn delete_objects(&mut self, bucket: String, objects: Vec<(String, Option<Expect>)>) -> Applied {
+        if !self.buckets.contains_key(&bucket) {
+            return Err(S3Reject::BucketNotFound);
+        }
+        let (mut gone, mut refused) = (Vec::new(), Vec::new());
+        for (key, expect) in objects {
+            if let Err(reason) = self.check(&bucket, &key, expect.as_ref()) {
+                refused.push((key, reason));
+                continue;
+            }
+            gone.extend(self.remove_object(bucket.clone(), key));
+        }
+        Ok(S3Reply::Deleted { released: freed(gone.iter().map(|o| o.body.extents())), refused })
     }
 
     fn create_upload(&mut self, upload_id: String, rec: UploadRec) -> Applied {
@@ -361,7 +410,8 @@ impl S3State {
         ok()
     }
 
-    /// Refuses a bucket with objects; its unfinished uploads go with it.
+    /// Refuses a bucket with objects; its unfinished uploads go with it,
+    /// their parts' chunks to release.
     fn delete_bucket(&mut self, name: &str) -> Applied {
         if !self.buckets.contains_key(name) {
             return Err(S3Reject::BucketNotFound);
@@ -370,8 +420,10 @@ impl S3State {
             return Err(S3Reject::BucketNotEmpty);
         }
         self.buckets.remove(name);
-        self.uploads.retain(|_, u| u.bucket != name);
-        ok()
+        let ids: Vec<String> =
+            self.uploads.iter().filter(|(_, u)| u.bucket == name).map(|(id, _)| id.clone()).collect();
+        let dropped: Vec<UploadRec> = ids.iter().filter_map(|id| self.uploads.remove(id)).collect();
+        released(dropped.iter().flat_map(|u| u.parts.values()).map(|p| &p.extents[..]))
     }
 
     pub(crate) fn bucket_objects<'a>(
@@ -384,12 +436,12 @@ impl S3State {
             .map(|((_, key), o)| (key, o))
     }
 
-    /// Insert or replace an object; returns the replaced version's chunks.
-    fn write_object(&mut self, bucket: String, key: String, rec: ObjectRec) -> Vec<ChunkId> {
+    /// Insert or replace an object; returns the replaced version's extents.
+    fn write_object(&mut self, bucket: String, key: String, rec: ObjectRec) -> Vec<Extent> {
         self.inline_bytes += rec.body.inline_len();
         let Some(old) = self.objects.insert((bucket, key), rec) else { return Vec::new() };
         self.inline_bytes -= old.body.inline_len();
-        chunk_ids(old.body.extents())
+        old.body.extents().to_vec()
     }
 
     fn remove_object(&mut self, bucket: String, key: String) -> Option<ObjectRec> {
@@ -398,31 +450,43 @@ impl S3State {
         Some(old)
     }
 
-    /// Parts not listed are dropped with the upload.
+    /// The object assembled from `parts` (checked against the parts
+    /// stored); the parts not listed are dropped with the upload.
     fn complete_upload(
         &mut self,
         upload_id: &str,
-        part_numbers: &[i64],
-        etag: String,
-        total_size: i64,
+        parts: &[(i64, String)],
         mtime: String,
         expect: Option<&Expect>,
     ) -> Applied {
         let Some(upload) = self.uploads.get(upload_id) else {
             return Err(S3Reject::NoSuchUpload);
         };
-        self.check(&upload.bucket, &upload.key, expect)?;
-        let mut extents = Vec::new();
-        for &pn in part_numbers {
-            let Some(part) = upload.parts.get(&pn) else {
-                return Err(S3Reject::MissingPart(pn));
-            };
-            extents.extend_from_slice(&part.extents);
+        if parts.is_empty() {
+            return Err(S3Reject::InvalidPart(0));
         }
-        let upload = self.uploads.remove(upload_id).expect("checked above");
+        if parts.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err(S3Reject::InvalidPartOrder);
+        }
+        let mut extents = Vec::new();
+        let mut size = 0;
+        for (pn, etag) in parts {
+            match upload.parts.get(pn) {
+                Some(part) if part.etag == *etag => {
+                    extents.extend_from_slice(&part.extents);
+                    size += part.size;
+                }
+                _ => return Err(S3Reject::InvalidPart(*pn)),
+            }
+        }
+        let etag = multipart_etag(parts.iter().map(|(_, e)| e.as_str())).ok_or(S3Reject::InvalidPart(0))?;
+        self.check(&upload.bucket, &upload.key, expect)?;
+        let mut upload = self.uploads.remove(upload_id).expect("checked above");
+        let listed: Vec<PartRec> = parts.iter().filter_map(|(pn, _)| upload.parts.remove(pn)).collect();
+        let key = (upload.bucket.clone(), upload.key.clone());
         let rec = ObjectRec {
             etag,
-            size: total_size,
+            size,
             content_type: upload.content_type,
             mtime,
             checksums_json: "{}".into(),
@@ -430,22 +494,49 @@ impl S3State {
             user_meta: upload.user_meta,
             tags: upload.tags,
         };
-        released(self.write_object(upload.bucket, upload.key, rec))
+        let old = self.write_object(upload.bucket, upload.key, rec);
+        // The listed parts' refs go to the object, which holds one per chunk:
+        // a chunk two parts share gives one back.
+        let mut surplus = freed(listed.iter().map(|p| &p.extents[..]));
+        let object = self.objects.get(&key).expect("written above");
+        for id in unique_chunk_ids(object.body.extents()) {
+            let at = surplus.binary_search(&id).expect("each part's chunks are listed");
+            surplus.remove(at);
+        }
+        let mut ids = freed(std::iter::once(&old[..]).chain(upload.parts.values().map(|p| &p.extents[..])));
+        ids.extend(surplus);
+        ids.sort_unstable();
+        Ok(S3Reply::Released(ids))
     }
 }
 
+/// The ETag of a multipart object made of parts with these ETags: the MD5
+/// of their MD5s, then `-` and their count. `None` if one is not an MD5 in
+/// hex.
+pub(crate) fn multipart_etag<'a>(part_etags: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut md5 = Md5::new();
+    let mut count = 0;
+    for etag in part_etags {
+        md5.update(hex::decode(etag).ok()?);
+        count += 1;
+    }
+    Some(format!("{:x}-{count}", md5.finalize()))
+}
+
 fn ok() -> Applied {
-    Ok(Vec::new())
+    Ok(S3Reply::Released(Vec::new()))
 }
 
-fn released(mut chunk_ids: Vec<ChunkId>) -> Applied {
-    chunk_ids.sort_unstable();
-    chunk_ids.dedup();
-    Ok(chunk_ids)
+/// The chunks `holders` (objects, parts) let go, to release.
+fn released<'a>(holders: impl IntoIterator<Item = &'a [Extent]>) -> Applied {
+    Ok(S3Reply::Released(freed(holders)))
 }
 
-fn chunk_ids(extents: &[Extent]) -> Vec<ChunkId> {
-    extents.iter().map(|e| e.chunk).collect()
+/// One ref for each chunk of each holder, sorted (see [`Released`]).
+fn freed<'a>(holders: impl IntoIterator<Item = &'a [Extent]>) -> Released {
+    let mut ids: Released = holders.into_iter().flat_map(unique_chunk_ids).collect();
+    ids.sort_unstable();
+    ids
 }
 
 #[cfg(test)]
@@ -463,7 +554,7 @@ mod tests {
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 1, b'b', 1, b'k', 1, 1, 1, b'e']);
         let cmd = S3Command::CreateBucket { name: "b".into(), created_at: "t".into() };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [0, 1, b'b', 1, b't']);
-        assert_eq!(S3State::VERSION, 5);
+        assert_eq!(S3State::VERSION, 6);
     }
 
     #[test]
@@ -484,16 +575,14 @@ mod tests {
         };
         assert_eq!(s.apply(put("k")).unwrap(), Err(S3Reject::BucketNotFound));
         let create = S3Command::CreateBucket { name: "b".into(), created_at: "t".into() };
-        assert_eq!(s.apply(create.clone()).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(create.clone()).unwrap(), Ok(S3Reply::Released(vec![])));
         assert_eq!(s.apply(create).unwrap(), Err(S3Reject::BucketExists));
-        assert_eq!(s.apply(put("k")).unwrap(), Ok(vec![]));
-        assert_eq!(s.apply(put("k")).unwrap(), Ok(vec![7]), "overwrite releases the old chunks");
+        assert_eq!(s.apply(put("k")).unwrap(), Ok(S3Reply::Released(vec![])));
+        assert_eq!(s.apply(put("k")).unwrap(), Ok(S3Reply::Released(vec![7])), "overwrite releases the old chunks");
         let before = pigeonhole_meta::encode_state(&s);
         let done = S3Command::CompleteUpload {
             upload_id: "u".into(),
-            part_numbers: vec![1],
-            etag: "e".into(),
-            total_size: 1,
+            parts: vec![(1, "e".into())],
             mtime: "t".into(),
             expect: None,
         };
@@ -526,7 +615,7 @@ mod tests {
         // Absent key.
         assert_eq!(s.apply(put("1", etag("1"))).unwrap(), Err(S3Reject::NoSuchKey));
         assert_eq!(s.apply(del(etag("1"))).unwrap(), Err(S3Reject::NoSuchKey));
-        assert_eq!(s.apply(put("1", Some(Expect::Absent))).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(put("1", Some(Expect::Absent))).unwrap(), Ok(S3Reply::Released(vec![])));
 
         // Present, ETag "1".
         let before = pigeonhole_meta::encode_state(&s);
@@ -534,8 +623,8 @@ mod tests {
         assert_eq!(s.apply(put("2", etag("0"))).unwrap(), Err(S3Reject::PreconditionFailed));
         assert_eq!(s.apply(del(etag("0"))).unwrap(), Err(S3Reject::PreconditionFailed));
         assert_eq!(pigeonhole_meta::encode_state(&s), before);
-        assert_eq!(s.apply(put("2", etag("1"))).unwrap(), Ok(vec![]));
-        assert_eq!(s.apply(del(etag("2"))).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(put("2", etag("1"))).unwrap(), Ok(S3Reply::Released(vec![])));
+        assert_eq!(s.apply(del(etag("2"))).unwrap(), Ok(S3Reply::Released(vec![])));
         assert!(s.objects.is_empty());
     }
 
@@ -566,18 +655,18 @@ mod tests {
         };
         let chunks = |chunk: ChunkId| Body::Chunks(vec![Extent { chunk, offset: 0, len: 3 }]);
 
-        assert_eq!(s.apply(put("a", "1", Body::Inline(b"abc".to_vec()))).unwrap(), Ok(vec![]));
-        assert_eq!(s.apply(put("b", "1", Body::Inline(b"xyz".to_vec()))).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(put("a", "1", Body::Inline(b"abc".to_vec()))).unwrap(), Ok(S3Reply::Released(vec![])));
+        assert_eq!(s.apply(put("b", "1", Body::Inline(b"xyz".to_vec()))).unwrap(), Ok(S3Reply::Released(vec![])));
         assert_eq!(s.inline_bytes, 6);
 
         // Inline over chunks releases them; chunks over inline release nothing.
-        assert_eq!(s.apply(put("c", "1", chunks(9))).unwrap(), Ok(vec![]));
-        assert_eq!(s.apply(put("c", "2", Body::Inline(b"new".to_vec()))).unwrap(), Ok(vec![9]));
-        assert_eq!(s.apply(put("c", "3", chunks(10))).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(put("c", "1", chunks(9))).unwrap(), Ok(S3Reply::Released(vec![])));
+        assert_eq!(s.apply(put("c", "2", Body::Inline(b"new".to_vec()))).unwrap(), Ok(S3Reply::Released(vec![9])));
+        assert_eq!(s.apply(put("c", "3", chunks(10))).unwrap(), Ok(S3Reply::Released(vec![])));
         assert_eq!(s.inline_bytes, 6);
 
         // Cooling: accepted for the same inline version, refused otherwise.
-        assert_eq!(s.apply(cool("a", "1", 11)).unwrap(), Ok(vec![]));
+        assert_eq!(s.apply(cool("a", "1", 11)).unwrap(), Ok(S3Reply::Released(vec![])));
         assert_eq!(s.objects[&("b".into(), "a".into())].body, chunks(11));
         assert_eq!(s.inline_bytes, 3);
         assert_eq!(s.apply(cool("a", "1", 12)).unwrap(), Err(S3Reject::PreconditionFailed), "no longer inline");
@@ -587,11 +676,133 @@ mod tests {
         // Delete drops the count; a replay (decode + rebuild) recounts it.
         assert_eq!(
             s.apply(S3Command::DeleteObject { bucket: "b".into(), key: "b".into(), expect: None }).unwrap(),
-            Ok(vec![])
+            Ok(S3Reply::Released(vec![]))
         );
         assert_eq!(s.inline_bytes, 0);
         s.apply(put("d", "1", Body::Inline(b"0123456789".to_vec()))).unwrap().unwrap();
         let replayed: S3State = pigeonhole_meta::decode_state(&pigeonhole_meta::encode_state(&s)).unwrap();
         assert_eq!(replayed.inline_bytes, 10);
+    }
+
+    fn create(s: &mut S3State, bucket: &str) {
+        s.apply(S3Command::CreateBucket { name: bucket.into(), created_at: "t".into() }).unwrap().unwrap();
+    }
+
+    fn extents(chunks: &[ChunkId]) -> Vec<Extent> {
+        chunks.iter().map(|&chunk| Extent { chunk, offset: 0, len: 4 }).collect()
+    }
+
+    fn upload(s: &mut S3State, id: &str, bucket: &str, parts: &[(i64, &str, &[ChunkId])]) {
+        let create = S3Command::CreateUpload {
+            upload_id: id.into(),
+            bucket: bucket.into(),
+            key: "k".into(),
+            content_type: None,
+            user_meta: vec![],
+            tags: vec![],
+            checksum_algorithm: None,
+            initiated_at: "t".into(),
+        };
+        s.apply(create).unwrap().unwrap();
+        for &(part_number, etag, chunks) in parts {
+            let put = S3Command::PutPart {
+                upload_id: id.into(),
+                part_number,
+                etag: etag.into(),
+                size: 4 * chunks.len() as i64,
+                extents: extents(chunks),
+            };
+            s.apply(put).unwrap().unwrap();
+        }
+    }
+
+    fn complete(id: &str, parts: &[(i64, &str)]) -> S3Command {
+        S3Command::CompleteUpload {
+            upload_id: id.into(),
+            parts: parts.iter().map(|&(n, e)| (n, e.to_string())).collect(),
+            mtime: "t".into(),
+            expect: None,
+        }
+    }
+
+    const E1: &str = "00000000000000000000000000000001";
+    const E2: &str = "00000000000000000000000000000002";
+    const E3: &str = "00000000000000000000000000000003";
+
+    /// CompleteMultipartUpload is decided by the parts as they are when it
+    /// applies: listed ones must be there with their ETags, in ascending
+    /// order; size and ETag are theirs; the parts left out are released,
+    /// and a chunk two listed parts share gives back its extra ref.
+    #[test]
+    fn complete_checks_the_parts_it_assembles() {
+        let mut s = S3State::default();
+        create(&mut s, "b");
+        upload(&mut s, "u", "b", &[(1, E1, &[10, 11]), (2, E2, &[11]), (3, E3, &[12])]);
+        let before = pigeonhole_meta::encode_state(&s);
+        assert_eq!(s.apply(complete("u", &[(2, E2), (1, E1)])).unwrap(), Err(S3Reject::InvalidPartOrder));
+        assert_eq!(s.apply(complete("u", &[(1, E1), (1, E1)])).unwrap(), Err(S3Reject::InvalidPartOrder));
+        assert_eq!(s.apply(complete("u", &[(1, E1), (2, E3)])).unwrap(), Err(S3Reject::InvalidPart(2)));
+        assert_eq!(s.apply(complete("u", &[(1, E1), (4, E1)])).unwrap(), Err(S3Reject::InvalidPart(4)));
+        assert_eq!(s.apply(complete("u", &[])).unwrap(), Err(S3Reject::InvalidPart(0)));
+        assert_eq!(s.apply(complete("gone", &[(1, E1)])).unwrap(), Err(S3Reject::NoSuchUpload));
+        assert_eq!(pigeonhole_meta::encode_state(&s), before, "refusals change nothing");
+
+        // Part 3 left out: its chunk is released; 11 is in parts 1 and 2,
+        // the object keeps one ref on it.
+        assert_eq!(s.apply(complete("u", &[(1, E1), (2, E2)])).unwrap(), Ok(S3Reply::Released(vec![11, 12])));
+        let o = &s.objects[&("b".to_string(), "k".to_string())];
+        assert_eq!(o.size, 12);
+        assert_eq!(Some(o.etag.clone()), multipart_etag([E1, E2]));
+        assert!(o.etag.ends_with("-2"));
+        assert_eq!(o.body, Body::Chunks(extents(&[10, 11, 11])));
+        assert!(s.uploads.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_bucket_releases_its_uploads() {
+        let mut s = S3State::default();
+        create(&mut s, "b");
+        create(&mut s, "other");
+        upload(&mut s, "u1", "b", &[(1, E1, &[1, 2]), (2, E2, &[2])]);
+        upload(&mut s, "u2", "other", &[(1, E1, &[3])]);
+        let got = s.apply(S3Command::DeleteBucket { name: "b".into() }).unwrap();
+        assert_eq!(got, Ok(S3Reply::Released(vec![1, 2, 2])), "one ref per part");
+        assert_eq!(s.uploads.keys().collect::<Vec<_>>(), ["u2"]);
+    }
+
+    #[test]
+    fn delete_objects_answers_each_key() {
+        let mut s = S3State::default();
+        create(&mut s, "b");
+        let put = |key: &str, chunk: ChunkId| S3Command::PutObject {
+            bucket: "b".into(),
+            key: key.into(),
+            etag: format!("e{chunk}"),
+            size: 4,
+            content_type: None,
+            body: Body::Chunks(extents(&[chunk])),
+            user_meta: vec![],
+            tags: vec![],
+            checksums_json: "{}".into(),
+            mtime: "t".into(),
+            expect: None,
+        };
+        for (key, chunk) in [("a", 1), ("b", 2), ("c", 3)] {
+            s.apply(put(key, chunk)).unwrap().unwrap();
+        }
+        let objects = vec![
+            ("a".to_string(), None),
+            ("b".to_string(), Some(Expect::ETag("wrong".into()))),
+            ("c".to_string(), Some(Expect::ETag("e3".into()))),
+            ("missing".to_string(), None),
+            ("missing too".to_string(), Some(Expect::ETag("e9".into()))),
+        ];
+        let got = s.apply(S3Command::DeleteObjects { bucket: "b".into(), objects: objects.clone() }).unwrap();
+        let refused =
+            vec![("b".to_string(), S3Reject::PreconditionFailed), ("missing too".to_string(), S3Reject::NoSuchKey)];
+        assert_eq!(got, Ok(S3Reply::Deleted { released: vec![1, 3], refused }));
+        assert_eq!(s.objects.len(), 1);
+        let nobucket = S3Command::DeleteObjects { bucket: "nope".into(), objects };
+        assert_eq!(s.apply(nobucket).unwrap(), Err(S3Reject::BucketNotFound));
     }
 }

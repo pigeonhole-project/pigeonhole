@@ -20,7 +20,6 @@ s3s = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-pigeonhole-codec = { workspace = true }
 pigeonhole-types = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
 pigeonhole-meta = { workspace = true }
@@ -29,7 +28,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-pigeonhole-testkit = { workspace = true }
+pigeonhole-testkit = { workspace = true, features = ["s3"] }
 postcard = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

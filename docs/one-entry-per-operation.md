@@ -105,8 +105,32 @@ way.
 | UploadPart (n chunks) | n + 1 | **1**: n × CommitChunk + PutPart; the replaced part's chunks released after |
 | CompleteMultipartUpload | 1 (+ Release) | **1**; Release after |
 | DeleteObject | 1 (+ Release) | **1**; Release after |
+| DeleteObjects (n keys) | n (+ n Releases) | **1**: one `DeleteObjects` for every key; one Release after |
 | CopyObject | Retain, then PutObject (+ Release) | **2**: Retain must succeed before the object is written; Release after |
-| CreateBucket / DeleteBucket / tags | 1 | 1 (unchanged) |
+| CreateBucket / DeleteBucket / tags | 1 | 1 (unchanged); DeleteBucket's unfinished uploads' chunks released after |
+
+### CompleteMultipartUpload and DeleteObjects in detail
+
+- `CompleteUpload` carries the parts as the client listed them,
+  `(part number, ETag)`. Its `apply` checks them against the parts stored
+  at that log position: ascending and each number once
+  (`InvalidPartOrder`), each there with that ETag (`InvalidPart`). The
+  object's size is the sum of the parts assembled and its ETag the MD5 of
+  their MD5s with `-<count>`, both computed in `apply`; nothing is read
+  before the command and trusted after it. The parts left out are dropped
+  with the upload and their chunks returned for release, like the object
+  replaced.
+- `DeleteObjects { bucket, objects }` deletes every key of the request in
+  one command; each key may carry the `ETag` the request gave it (an
+  `If-Match`). The reply names the keys refused and why
+  (`PreconditionFailed`, `NoSuchKey`); every other key is deleted, a
+  missing one included, as S3 answers. A missing bucket refuses the whole
+  command (`NoSuchBucket`); a failure to commit answers the request with
+  its status (503 on a node that cannot write), not a 200 with an error
+  per key.
+- Released ids count refs: an object or a part holds one ref on each chunk
+  it points into, so a chunk is released once for each holder that let it
+  go (two parts copied from one source hold two).
 
 ### PutObject in detail
 

@@ -166,7 +166,15 @@ Everything else: [cluster.md](docs/cluster.md).
   their blobs.
 - **REAPI remote cache.** Build with `--features bytestream`, set
   `[bytestream] enabled = true`, then
-  `bazel build --remote_cache=grpc://127.0.0.1:8980 //…`.
+  `bazel build --remote_cache=grpc://127.0.0.1:8980 //…`. The CAS
+  (ByteStream Read/Write, BatchRead/BatchUpdate, FindMissing) and the
+  ActionCache (results kept in the metadata, keyed by the Action's digest,
+  up to 1 MiB each) both work. A Write's bytes are hashed on their way in
+  and nothing is stored unless they match their digest. Reads and repeat
+  writes add no log entry: last-access times are written once per GC pass.
+  Tested in process over gRPC (`gateway-bytestream/tests/reapi.rs`: writes,
+  reads, ranges, wrong bytes, ActionCache round trip), not yet with a real
+  Bazel build.
 - **Demos.** etcd and SQLite running on a Telegram channel through S3
   conditional writes: [demos/](demos/README.md).
 

@@ -8,7 +8,7 @@ pub mod layer;
 pub mod repair;
 pub mod sweep;
 
-pub use blob_db::{is_chunk_gone, BlobDb, ChunkGone, ChunkStats, ReadPin, StoredBlock};
+pub use blob_db::{is_chunk_gone, unique_chunk_ids, BlobDb, ChunkGone, ChunkStats, ReadPin, StoredBlock};
 pub use block_cache::BlockCache;
 pub use commands::{ChunkCommand, ChunkReject, ChunkState, InstanceRec, PartRec, Replica};
 pub use ingest::{IngestHasher, IngestOptions};

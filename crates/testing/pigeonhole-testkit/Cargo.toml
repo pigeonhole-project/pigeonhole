@@ -5,14 +5,23 @@ edition.workspace = true
 license.workspace = true
 description = "Conformance testkits for pigeonhole storage and gateways"
 
+[features]
+# Helpers for tests of the S3 gateway (`pigeonhole_testkit::s3`).
+s3 = ["dep:futures", "dep:http", "dep:s3s", "dep:pigeonhole-chunk-store", "dep:pigeonhole-gateway-s3"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 pigeonhole-blob = { workspace = true }
+pigeonhole-chunk-store = { workspace = true, optional = true }
+pigeonhole-gateway-s3 = { workspace = true, optional = true }
 pigeonhole-types = { workspace = true }
 pigeonhole-meta = { workspace = true }
 pigeonhole-storage-disk = { workspace = true }
+s3s = { workspace = true, optional = true }
 tokio = { workspace = true }
 
 [lints]
