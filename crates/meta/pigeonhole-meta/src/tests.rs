@@ -342,6 +342,7 @@ async fn second_incarnation_fences_the_first_without_losing_acknowledged_entries
 /// The last handle to a tablet dropped after its runtime ended (a test's or
 /// a tool's) has nothing to shut down on, and does not panic.
 #[test]
+#[cfg(not(madsim))] // builds a runtime of its own
 fn a_tablet_dropped_after_its_runtime_does_not_panic() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
