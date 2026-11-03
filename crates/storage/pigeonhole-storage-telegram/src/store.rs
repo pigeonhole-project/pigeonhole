@@ -111,8 +111,10 @@ impl<C: ChannelApi> TelegramBlobStore<C> {
 
     /// Post blob `name` as a text message if it fits, else as a document;
     /// its message id. The location is remembered.
+    /// No upload permit is held here: the client takes one around the
+    /// upload of a document's parts, not around the send (whose flood waits
+    /// may last minutes).
     pub(crate) async fn post_blob(&self, name: &str, data: Bytes, random_id: i64) -> Result<i64> {
-        let _upload = self.limiter.acquire_upload().await;
         let channel = &self.reader.channel;
         let store = &self.instance.id;
         let bytes = data.len();

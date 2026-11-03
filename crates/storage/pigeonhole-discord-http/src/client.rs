@@ -164,8 +164,23 @@ impl DiscordClient {
         call: &Call,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<Answer> {
+        self.request_with(limiter, retry, call, false, build).await
+    }
+
+    /// [`Self::request`]; with `upload`, each attempt holds an upload permit
+    /// while its body goes up and its answer comes, and no longer: a 429's
+    /// wait (minutes, sometimes) between attempts holds back no other upload.
+    async fn request_with(
+        &self,
+        limiter: &ChatLimiter,
+        retry: &Retry,
+        call: &Call,
+        upload: bool,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<Answer> {
         let what = call.what;
         let answer = pigeonhole_limits::run(Some(limiter), call, retry, classify, || async {
+            let _permit = if upload { Some(limiter.acquire_upload().await) } else { None };
             let resp = build().send().await.map_err(AttemptFailed::Network)?;
             let status = resp.status().as_u16();
             let headers = resp.headers().clone();
@@ -329,10 +344,9 @@ impl DiscordApi for DiscordChannel {
                     .await?
             }
             Some((name, data)) => {
-                let _upload = self.limiter.acquire_upload().await;
                 payload["attachments"] = serde_json::json!([{ "id": 0, "filename": name }]);
                 let payload = payload.to_string();
-                c.request(&self.limiter, &self.retry, &SEND_ATTACHMENT, || {
+                c.request_with(&self.limiter, &self.retry, &SEND_ATTACHMENT, true, || {
                     let part = Part::stream_with_length(reqwest::Body::from(data.clone()), data.len() as u64)
                         .file_name(name.to_string())
                         .mime_str("application/octet-stream")
@@ -546,6 +560,93 @@ mod tests {
             let other = b.peek_wait(SEND);
             assert_eq!(other > Duration::from_secs(3), global, "another channel's sends (global: {global})");
         }
+    }
+
+    /// A local HTTP server (a thread): the first `fail` requests whose body
+    /// holds `failing` answer 503, the rest a message. Each answer closes
+    /// its connection.
+    fn server(failing: &'static str, fail: usize) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            for (n, conn) in listener.incoming().enumerate() {
+                let Ok(mut conn) = conn else { return };
+                let failed = failed.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(conn.try_clone().unwrap());
+                    let (mut len, mut chunked) = (0, false);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(v) = lower.strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                        chunked |= lower.starts_with("transfer-encoding:") && lower.contains("chunked");
+                    }
+                    let mut body = Vec::new();
+                    if chunked {
+                        while !body.ends_with(b"0\r\n\r\n") {
+                            let mut b = [0u8; 1];
+                            if reader.read(&mut b).unwrap_or(0) == 0 {
+                                break;
+                            }
+                            body.push(b[0]);
+                        }
+                    } else {
+                        body.resize(len, 0);
+                        reader.read_exact(&mut body).ok();
+                    }
+                    let ours = String::from_utf8_lossy(&body).contains(failing);
+                    let fails = ours && failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < fail;
+                    let (status, body) = if fails {
+                        ("503 Service Unavailable", "{}".to_string())
+                    } else {
+                        ("200 OK", format!(r#"{{"id":"{}","type":0,"content":"x","attachments":[]}}"#, n + 1))
+                    };
+                    let answer = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    conn.write_all(answer.as_bytes()).ok();
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An attachment send whose first attempts fail waits its backoff
+    /// without its upload permit: another upload of the bot in the channel
+    /// goes on meanwhile (one permit; the retries back off 200 + 400 ms).
+    #[tokio::test]
+    async fn a_retried_upload_does_not_hold_the_permit_while_it_waits() {
+        let cfg = pigeonhole_storage_discord::limits();
+        let cfg = pigeonhole_limits::ChatLimiterConfig {
+            upload_concurrency: 1,
+            ..cfg.with_all(pigeonhole_limits::Rate::new(1000.0, 1000.0))
+        };
+        let reg = pigeonhole_limits::LimiterRegistry::new(cfg, pigeonhole_storage_discord::limits::CLASSES).unwrap();
+        let client = DiscordClient::with_api_base("1.a.b".into(), server("\"n1\"", 2)).unwrap();
+        let channel = client.channel(7, reg.chat("1", "7"));
+        let file = || Some(("ph-1.bin", Bytes::from(vec![1u8; 1000])));
+        let t0 = std::time::Instant::now();
+        let first = async {
+            channel.send("ph-1.bin", file(), "n1").await.unwrap();
+            t0.elapsed()
+        };
+        let second = async {
+            // After the first's first attempt took the permit and failed.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            channel.send("ph-1.bin", file(), "n2").await.unwrap();
+            t0.elapsed()
+        };
+        let (first, second) = tokio::join!(first, second);
+        assert!(first >= Duration::from_millis(500), "the first backed off twice: {first:?}");
+        assert!(second < first, "the second went up while the first waited: {second:?} vs {first:?}");
     }
 
     #[test]

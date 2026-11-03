@@ -216,7 +216,13 @@ nothing until a flood wait, so its rates stay configured.
 ### Bucket kinds
 
 Token buckets for rates, and semaphores for transfers at once (uploads,
-CDN downloads per chat). Discord's thread budget (50 per 300 s in a fixed
+CDN downloads per chat). A semaphore is held only while bytes move: an
+upload permit around a Telegram document's part uploads (not the
+`sendMedia` after them), around each attempt of a Discord attachment send
+(not the waits between attempts). Held through a flood wait or a 429 (a
+minute and more), one rate-limited send had held back every upload of the
+store; the permit was also taken per store, so a pool's other bots waited
+too. Discord's thread budget (50 per 300 s in a fixed
 window) has its own pacer (`Pacer`, GCRA) fed from the answers' headers. It
 becomes a kind of bucket, and the headers feed the limiter
 (`observe(remaining, reset_after)`), only if the bench shows a need (§ Plan).

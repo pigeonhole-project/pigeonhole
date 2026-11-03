@@ -503,8 +503,12 @@ impl MtprotoChannel {
         self.client.invoke(self.lane, dc, Some(&self.limiter), retry_for(&R::CALL, &self.retry), request).await
     }
 
-    /// Upload `data` as one file; returns what `sendMedia` takes.
+    /// Upload `data` as one file; returns what `sendMedia` takes. Holds an
+    /// upload permit of this bot in the channel while the parts go up, and
+    /// only then: the send after it is paced by the send budget, and a
+    /// flood wait on it must not hold back other uploads.
     async fn upload(&self, name: &str, data: &Bytes) -> Result<enums::InputFile> {
+        let _permit = self.limiter.acquire_upload().await;
         let file_id = random_i64();
         let parts = data.len().div_ceil(PART);
         let big = data.len() > BIG_FILE;
