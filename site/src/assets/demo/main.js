@@ -4,6 +4,7 @@
 // and callbacks in, elements out) to the node's ops.
 import {button, h, reducedMotion} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
+import {ops} from "../lib/ops.js";
 import {s3Sentence} from "../lib/say.js";
 import {budgetsOf, budgetTable, sendLevel} from "./budgets.js";
 import {appOf, kinOf} from "./channels.js";
@@ -247,7 +248,7 @@ function setBusy(on) {
 // Your objects: the bucket's, as the leader lists it (a follower turns S3
 // away, whichever node is on screen); kept as they were when none answers.
 async function refreshObjects() {
-  const {reply} = await call({op: "list", bucket: state.bucket, node: state.cluster?.leader ?? undefined});
+  const {reply} = await call(ops.list(state.bucket, state.cluster?.leader ?? undefined));
   if (ok(reply)) state.objects = reply.objects || [];
   graph.setObjects(state.objects.length);
   view?.setObjects?.(state.objects);
@@ -259,11 +260,11 @@ async function refreshObjects() {
 // In a cluster, each other node's own log and snapshots too: the node on
 // screen lists only its own.
 async function loadChannels() {
-  const {reply} = await call({op: "channels"});
+  const {reply} = await call(ops.channels());
   const fresh = new Set(state.channels.flatMap(c => c.messages.filter(m => m.fresh).map(m => `${c.store}/${m.id}`)));
   const listed = [...(reply?.channels || [])];
   for (const id of state.nodes.length > 1 ? state.nodes.filter(id => id !== shown()) : []) {
-    const other = await call({op: "channels", node: id});
+    const other = await call(ops.channels(id));
     listed.push(...(other.reply?.channels || []).filter(c => c.node === id && c.role !== "outbox"));
   }
   state.channels = listed.map(c => ({...c, messages: (c.messages || []).map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
@@ -279,7 +280,7 @@ async function refreshChannels() {
 
 // The log and its channel's posts, decoded.
 async function loadLog() {
-  const {reply} = await call({op: "log", limit: 200});
+  const {reply} = await call(ops.log(200));
   await loadChannels();
   graph.setChannels(state.channels);
   state.log = reply;
@@ -289,7 +290,7 @@ async function loadLog() {
 
 // ------------------------------------------------------------ background tasks
 async function pollBackground() {
-  const {reply} = await call({op: "background"});
+  const {reply} = await call(ops.background());
   if (!ok(reply)) return;
   state.bg = reply;
   await pollBudgets();
@@ -306,7 +307,7 @@ async function pollCluster() {
     told = [],
     replies = new Map();
   for (const id of state.nodes) {
-    const {reply} = await call({op: "cluster", node: id});
+    const {reply} = await call(ops.cluster(id));
     if (!ok(reply)) continue;
     replies.set(id, reply);
     const own = reply.nodes.find(n => n.id === reply.me);
@@ -382,7 +383,7 @@ const clusterData = (dynamic = null) => {
 };
 async function updateCluster() {
   const leader = state.cluster?.leader;
-  const dynamic = leader == null ? null : (await call({op: "dynamic", node: leader})).reply;
+  const dynamic = leader == null ? null : (await call(ops.dynamic(leader))).reply;
   if (isOpen("cluster")) view?.update?.(clusterData(ok(dynamic) ? dynamic : null));
 }
 
@@ -401,7 +402,7 @@ setInterval(showNodes, 100);
 
 // Node `id` cut off from the others, or back: its links and its outbox.
 async function isolate(id, cut) {
-  const {reply} = await node.call({op: "isolate", node: id, down: cut});
+  const {reply} = await node.call(ops.isolate(id, cut));
   if (!ok(reply)) return sayError(reply?.error);
   if (cut) state.cut.add(id);
   else state.cut.delete(id);
@@ -437,19 +438,19 @@ async function toggleTask(task, on) {
   // the dynamic config: an entry in the log) through the leader.
   if (task === "snapshot" && state.nodes.length > 1) {
     const key = `node.${shown()}.snapshot_every`;
-    const r = await call({op: "dynamic_set", key, value: on ? TASK_ON.snapshot : "off", node: state.cluster?.leader ?? undefined});
+    const r = await call(ops.dynamicSet(key, on ? TASK_ON.snapshot : "off", state.cluster?.leader ?? undefined));
     if (r.reply?.error) sayError(r.reply.error);
     else say([on ? "bg.turned_on" : "bg.turned_off", {task: t("bg.snapshot"), key}]);
     return pollBackground();
   }
   const key = TASK_KEY[task];
   let r;
-  if (!on) r = await call({op: "dynamic_set", key, value: "off"});
+  if (!on) r = await call(ops.dynamicSet(key, "off"));
   else {
-    const {reply} = await call({op: "dynamic"});
+    const {reply} = await call(ops.dynamic());
     const k = reply?.keys?.find(x => x.key === key);
     const fromFile = k?.overridden && k.file && k.file !== "off";
-    r = await call(fromFile ? {op: "dynamic_unset", key} : {op: "dynamic_set", key, value: TASK_ON[task]});
+    r = await call(fromFile ? ops.dynamicUnset(key) : ops.dynamicSet(key, TASK_ON[task]));
   }
   if (r.reply?.error) sayError(r.reply.error);
   else say([on ? "bg.turned_on" : "bg.turned_off", {task: t(`bg.${task}`), key}]);
@@ -457,7 +458,7 @@ async function toggleTask(task, on) {
 }
 
 async function runTask(task) {
-  const {reply} = await call({op: "run_task", task});
+  const {reply} = await call(ops.runTask(task));
   if (reply?.error) sayError(reply.error);
   else say(["bg.asked", {task: t(`bg.${task}`)}]);
   await pollBackground();
@@ -503,7 +504,7 @@ const counters = () => ({objects: state.objects.length, dataChannels: state.chan
 // The bots' budgets as they stand: a bar per channel on the graph, the
 // table in the open channel's panel.
 async function pollBudgets() {
-  const {reply} = await call({op: "budgets"});
+  const {reply} = await call(ops.budgets());
   if (!ok(reply)) return;
   state.budgets = reply.budgets || [];
   for (const c of state.channels) graph.setBudget(c.store, sendLevel(budgetsOf(c, state.budgets)));
@@ -562,17 +563,24 @@ const clientOps = {
     state.bucket = name;
     refreshObjects();
   },
-  upload: (name, body) => op({op: "put", bucket: state.bucket, key: name}, body),
+  upload: (name, body) => op(ops.put(state.bucket, name), body),
   tooBig: () => say(["try.too_big", {}]),
   // 100 KB from somewhere in the object: only the blocks that hold it are read.
   async read(key, size) {
     const len = Math.min(size, 100_000),
       first = Math.floor(Math.random() * Math.max(1, size - len));
-    const r = await op({op: "get", bucket: state.bucket, key, range: [first, first + len - 1]});
+    const r = await op(ops.get(state.bucket, key, [first, first + len - 1]));
     if (ok(r)) say(["demo.read_done", {len: bytes(r.len), key}]);
   },
-  copy: key => op({op: "copy", bucket: state.bucket, key, to: key.replace(/(\.[^.]*)?$/, ext => `-copy${ext}`)}),
-  remove: key => op({op: "delete", bucket: state.bucket, key}),
+  copy: key =>
+    op(
+      ops.copy(
+        state.bucket,
+        key,
+        key.replace(/(\.[^.]*)?$/, ext => `-copy${ext}`),
+      ),
+    ),
+  remove: key => op(ops.remove(state.bucket, key)),
   // In a cluster: the leader (null) or a node of yours.
   async sendTo(id) {
     await pickNode(id);
@@ -588,21 +596,21 @@ const faultOps = c => {
   const store = c.store;
   return {
     async outage() {
-      const r = await op({op: "outage", store, down: !c.down});
+      const r = await op(ops.outage(store, !c.down));
       if (ok(r)) say([r.down ? "say.down" : "say.up", {store}]);
       await refreshChannels();
     },
     async wipe() {
-      const r = await op({op: "wipe", store});
+      const r = await op(ops.wipe(store));
       if (ok(r)) say(["say.wiped", {store, n: r.deleted}]);
       await refreshChannels();
     },
     async verify() {
-      const r = await op({op: "verify", store});
+      const r = await op(ops.verify(store));
       if (ok(r)) say([r.gone ? "say.verified" : "say.verified_ok", {store, checked: r.checked, gone: r.gone}]);
     },
     async repair() {
-      const r = await op({op: "repair"});
+      const r = await op(ops.repair());
       if (ok(r)) say(["say.repair", {n: r.repaired}]);
       await refreshChannels();
     },
@@ -612,7 +620,7 @@ const faultOps = c => {
 // A reader deleted a message of a data channel, behind the node's back.
 async function deleteMessage(c, m) {
   if (!confirm(t("demo.delete_confirm"))) return;
-  const r = await op({op: "delete_message", store: c.store, message: String(m.id)});
+  const r = await op(ops.deleteMessage(c.store, String(m.id)));
   if (ok(r)) say(["say.deleted_one", {store: c.store, name: m.name || ""}]);
   await refreshChannels();
 }
@@ -631,7 +639,7 @@ async function boot() {
 async function restart(text) {
   view?.setError("");
   setBusy(true);
-  const {reply} = await node.call({op: "restart", config: text});
+  const {reply} = await node.call(ops.restart(text));
   if (reply?.error) {
     view?.setError(reply.error);
     setBusy(false);
@@ -647,7 +655,7 @@ async function restart(text) {
 // Everything this browser keeps for the demo goes; the page starts over.
 async function erase() {
   if (!confirm(t("try.erase_confirm"))) return;
-  await node.call({op: "reset"});
+  await node.call(ops.reset());
   location.reload();
 }
 
@@ -669,7 +677,7 @@ function openWizard() {
 // error, if one does not.
 async function startFromWizard(text) {
   const t0 = performance.now();
-  const {reply, events} = await open({op: "open", config: text});
+  const {reply, events} = await open(ops.open(text));
   const ms = performance.now() - t0;
   if (reply?.error) return reply.error;
   Object.assign(state, {config: text, nodes: reply.nodes});
@@ -752,7 +760,7 @@ async function startDemo() {
     return;
   }
   const t0 = performance.now();
-  const booted = await open({op: "open"});
+  const booted = await open(ops.open());
   if (booted.reply?.error) {
     bootFailed(booted.reply.error);
     return;
@@ -769,7 +777,7 @@ async function startAdmin() {
   state.admin = true;
   document.body.classList.add("admin");
   const t0 = performance.now();
-  const {reply} = await node.call({op: "info"});
+  const {reply} = await node.call(ops.info());
   if (!ok(reply)) {
     status(t("try.error", {error: reply?.error || "no answer"}));
     return;
@@ -782,6 +790,8 @@ async function startAdmin() {
   say(["admin.caption", {n: state.buckets.length}]);
 }
 
+// Leaving (a reload, the other language): the node closes (node.js close).
+addEventListener("pagehide", () => node.close());
 // Back from the browser's page cache, the worker is gone: start again.
 addEventListener("pageshow", e => {
   if (e.persisted) location.reload();

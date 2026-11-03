@@ -3,18 +3,14 @@
 // handles, seen as /data). Without OPFS (a file:// page, an old browser) the
 // pool is in memory and a reload starts from scratch.
 //
-// In: {id, op, …, body?: ArrayBuffer}; {op: "reset"} drops everything kept
-// (the page reloads after it). Out:
-//   {type: "waiting", why: "files"}  the page just left still holds the files
-//   {type: "started", reply: {config, demo, saved, persistent, why} | {error}, events}
-//   {type: "events", id, events}  what the node logged during call `id`, as it went
-//   {type: "reply", id, reply, events: [], ms}
-//   {type: "tick", events}        what the node logged on its own between calls
+// In: {id, ...request, body?: ArrayBuffer} (lib/ops.js `ops`); `reset`
+// drops everything kept (the page reloads after it), `close` ends the
+// worker once the node closed. Out: lib/ops.js `MSG`.
 //
 // The module never blocks: a call is queued (ph_call), then the node runs
 // (ph_run) until it has nothing to do but wait; the shim notes its next
 // timer (wasi.nextWake) and this worker sleeps until then, free meanwhile.
-import {frame, unframe} from "./lib/ops.js";
+import {deliver, frame, msg, OP_RESET, unframe} from "./lib/ops.js";
 import {MemoryHandle, Pool, Wasi} from "./wasi.js";
 
 // The assets' version (?v=…), the same for the wasm as for this script.
@@ -82,7 +78,7 @@ async function openPool() {
     } catch (e) {
       if (opened === 0 && !said) {
         // Held by the page just left: say so while waiting.
-        postMessage({type: "waiting", why: "files"});
+        postMessage(msg.waiting());
         said = true;
       }
       if (performance.now() > deadline) {
@@ -94,43 +90,12 @@ async function openPool() {
   }
 }
 
-// One export of the module on the framed request: {reply, events, ms}.
-function run(fn, request = {}, body = null) {
-  wasi.setStdin(frame(request, body));
-  const t0 = performance.now();
-  fn();
-  const ms = performance.now() - t0;
-  return {...unframe(wasi.takeLines()), ms};
-}
-
-// The module's output, in order: log lines go with the call in flight
-// (else as the node's own), an answer ends its call.
-function deliver(lines) {
-  let events = [];
-  const flush = () => {
-    if (!events.length) return;
-    const call = calls.values().next().value;
-    postMessage(call ? {type: "events", id: call.id, events} : {type: "tick", events});
-    events = [];
-  };
-  for (const line of lines) {
-    let l;
-    try {
-      l = JSON.parse(line);
-    } catch {
-      continue; // a stray print: not the protocol's
-    }
-    if (!("call" in l)) {
-      events.push(l);
-      continue;
-    }
-    flush();
-    const call = calls.get(l.call);
-    calls.delete(l.call);
-    if (call?.op === "close") end();
-    else if (call) postMessage({type: "reply", id: call.id, reply: l.reply, events: [], ms: performance.now() - call.t0});
-  }
-  flush();
+// The module's output, in order (lib/ops.js deliver): to the page; the
+// worker ends once the node closed.
+function post(lines) {
+  const {messages, closed} = deliver(lines, calls);
+  for (const m of messages) postMessage(m);
+  if (closed) end();
 }
 
 // Runs the node until it would wait, then sleeps until its next timer.
@@ -140,7 +105,7 @@ function pump() {
   wasi.nextWake = Infinity;
   wasi.setStdin(new Uint8Array(0));
   exports.ph_run();
-  deliver(wasi.takeLines());
+  post(wasi.takeLines());
   if (wasi.nextWake !== Infinity) timer = setTimeout(pump, Math.max(0, wasi.nextWake - performance.now()));
   grow();
 }
@@ -179,26 +144,29 @@ const ready = (async () => {
   exports = instance.exports;
   wasi.memory = exports.memory;
   wasi.yieldFlag = exports.ph_yield_flag();
-  const out = run(exports.ph_open, {op: "start"});
-  postMessage({type: "started", reply: {...out.reply, persistent, why}, events: out.events});
-})().catch(e => postMessage({type: "started", reply: {error: String(e.message || e)}, events: []}));
+  // Its tracing set up; the node itself starts with the page's `open`.
+  wasi.setStdin(new Uint8Array(0));
+  exports.ph_open();
+  const out = unframe(wasi.takeLines());
+  postMessage(msg.started({...out.reply, persistent, why}, out.events));
+})().catch(e => postMessage(msg.started({error: String(e.message || e)}, [])));
 
 addEventListener("message", ({data}) => handle(data));
 
 async function handle({id, body, ...request}) {
   await ready;
-  if (request.op === "reset") {
+  if (request.op === OP_RESET) {
     clearTimeout(timer);
     await reset();
-    postMessage({type: "reply", id, reply: {ok: true}, events: []});
+    postMessage(msg.reply(id, {ok: true}));
     return;
   }
   try {
     wasi.setStdin(frame(request, body));
     calls.set(exports.ph_call(), {id, op: request.op, t0: performance.now()});
-    deliver(wasi.takeLines());
+    post(wasi.takeLines());
     pump();
   } catch (e) {
-    postMessage({type: "reply", id, reply: {error: String(e)}, events: []});
+    postMessage(msg.reply(id, {error: String(e)}));
   }
 }
