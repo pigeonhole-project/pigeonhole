@@ -28,7 +28,7 @@ Terms used in code, comments, and docs (Stage B onward).
 | **Snapshot** | All namespace states as of a position (`TabletSnapshot`), kept in a **SnapshotStore** (`local_disk`, `memory`, `telegram`, `discord`) | state size | replaced | tablet |
 | **Base** | The stored snapshot a log starts from (`at` + `SnapshotRef`), set by `rebase`; entries ≤ `at` are dropped | — | moves forward | `LogStore` |
 | **Node** | One process of a Raft cluster, with its own copy of the tablet (its own log and snapshots) and the shared blob stores ([cluster.md](cluster.md)) | — | config | binary |
-| **Leader** | The node Raft elected: the only one that writes, serves S3 and runs background work (`MetaStore::is_leader`) | — | per term | openraft |
+| **Leader** | The node Raft elected that serves: once it applied its own term's first entry (so everything committed before), the only one that writes, serves S3 and runs background work (`MetaStore::is_leader`; Raft's role alone: `raft_state`) | — | per term | openraft |
 | **Outbox** | A node's own channel, where it posts its Raft frames for the nodes that read it over the chat ([cluster.md](cluster.md)) | — | append-only | `openraft-chat` |
 | **Zero entry** | Empty batch appended on boot: proves the claim and starts the generation | 0 entries | immutable | tablet |
 

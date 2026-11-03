@@ -72,9 +72,35 @@ trait StateMachine: Default + Serialize + DeserializeOwned {
     type Reply;                  // handed back in-process, never serialized
     type Reject;                 // deterministic failure, state untouched
     fn apply(&mut self, cmd: Self::Command) -> Result<Result<Self::Reply, Self::Reject>>;
+    fn check(&self, cmd: &Self::Command) -> Option<Self::Reject> { None }
     fn rebuild(&mut self) {}     // recompute #[serde(skip)] indexes after loading
 }
 ```
+
+**`apply` never fails on what a proposal carries.** Its `Err` stops the
+tablet, and not on one node: every node applies the entry and fails alike,
+and since the entry stays in the log, every boot replays it into the same
+`Err`. One bad proposal would be a permanent outage. So whatever a command
+holds that the state does not allow is a `Reject` (`Ok(Err(_))`), with the
+state untouched: a chunk id committed already, an unknown instance, a key
+another chunk owns, an upload id taken. `Err` is left for what no proposal
+can cause: a command of another `VERSION` or one that does not decode, a
+namespace the binary does not serve (a binary that cannot read its log must
+stop, not guess).
+
+A proposal's commands land in one entry and are applied in order; a
+rejection of one undoes nothing else. Two exceptions apply none of them:
+
+- **Check.** In a proposal of several commands, each first goes through its
+  namespace's `check`: a rejection the state alone gives it, whatever else
+  the proposal holds. One rejected there, and nothing of the proposal is
+  applied (the others' outcome is `NotApplied::Skipped`). A chunk commit is
+  checked so: a rejected chunk takes the object that points at it with it.
+- **Fence.** A command prepared from the leader's state for its term
+  (`Prepared::fenced(term)`, a new chunk's id) makes its proposal apply only
+  from an entry of that term: written after the lead changed, even back to
+  the same node, nothing of it is applied (`NotApplied::Fenced`, a 503 for
+  S3). The entry's term is part of the log, so every replay agrees.
 
 Commands, states, log batches and snapshots are encoded with postcard. That
 encoding follows the Rust types, so every format carries a version: each batch
@@ -127,8 +153,9 @@ trait LogStore {
 }
 ```
 
-`Entry` = `{ term, payload }` (the tablet's payload is a `Command { namespace,
-version, command }`), a `Batch` = `{ format, gen, first, entries }`, both
+`Entry` = `{ term, payload }` (the tablet's payload is a list of proposals,
+each a `Group { fence, commands }` of `Command { namespace, version, command
+}`), a `Batch` = `{ format, gen, first, entries }`, both
 postcard. A batch replaces whatever the log held from `first` on, so a
 truncate is a batch with no entries and `first` ≤ the head; every store keeps
 the records in write order and the log is the result of applying them. The

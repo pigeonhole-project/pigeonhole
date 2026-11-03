@@ -47,7 +47,11 @@ pub async fn read(log: &dyn LogStore, from: Option<u64>, limit: usize) -> Result
                 "commands",
                 batch
                     .iter()
-                    .map(|c| json!({ "namespace": c.namespace, "version": c.version, "command": decode(c) }))
+                    .flat_map(|g| {
+                        g.commands.iter().map(|c| {
+                            json!({ "namespace": c.namespace, "version": c.version, "fence": g.fence, "command": decode(c) })
+                        })
+                    })
                     .collect(),
             ),
         };

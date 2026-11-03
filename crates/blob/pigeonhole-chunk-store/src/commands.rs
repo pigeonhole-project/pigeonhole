@@ -5,10 +5,13 @@
 //! code that changes them. It must stay deterministic: no clocks, no id
 //! generation, no metrics — those belong to the proposer in [`crate::BlobDb`].
 //! Every check runs before the first mutation, so a rejected command leaves
-//! the state untouched.
+//! the state untouched. Whatever a command carries that the state does not
+//! allow (an id committed already, an unknown instance, a key another chunk
+//! owns) is a [`ChunkReject`], never an `Err`: an `Err` would stop the
+//! tablet on every node, and again on every boot.
 
 use crate::blob_db::{ChunkId, StoredBlock};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use pigeonhole_blob::{BlobId, BlobLocator, Owner, PartLayout, ReplicaLayout};
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
@@ -46,7 +49,7 @@ pub enum ChunkCommand {
 }
 
 /// Deterministic failure of a [`ChunkCommand`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChunkReject {
     /// Retain: chunk missing, refs = 0, or reclaiming. AddReplica: chunk
     /// missing or reclaiming (dropped while its copy was made).
@@ -55,6 +58,17 @@ pub enum ChunkReject {
     DoubleRelease(ChunkId),
     /// BeginReclaim: chunk is referenced again or already gone.
     NotReclaimable(ChunkId),
+    /// CommitChunk: a chunk of this id was committed already (ids are never
+    /// reused). The leader serves only once caught up and fences commits to
+    /// its term, so this is a bug if it comes.
+    ChunkExists(ChunkId),
+    /// CommitChunk, AddReplica: a replica the state cannot take (an unknown
+    /// instance, two on one instance, a key twice or one another chunk
+    /// owns).
+    BadReplica { chunk_id: ChunkId, why: String },
+    /// SyncInstances: the configured instances conflict (two read-write ones
+    /// at one location).
+    BadInstances(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,23 +144,32 @@ impl StateMachine for ChunkState {
     type Reject = ChunkReject;
 
     fn apply(&mut self, command: ChunkCommand) -> Result<Outcome<Self>> {
-        match command {
+        Ok(match command {
             ChunkCommand::SyncInstances { instances } => self.sync_instances(instances),
             ChunkCommand::CommitChunk { chunk_id, logical_size, crc32, blocks, replicas, created_at } => {
                 self.commit_chunk(chunk_id, logical_size, crc32, blocks, replicas, created_at)
             }
-            ChunkCommand::Retain { chunk_ids } => Ok(self.retain(&chunk_ids)),
-            ChunkCommand::Release { chunk_ids } => Ok(self.release(&chunk_ids)),
-            ChunkCommand::BeginReclaim { chunk_id } => Ok(self.begin_reclaim(chunk_id)),
+            ChunkCommand::Retain { chunk_ids } => self.retain(&chunk_ids),
+            ChunkCommand::Release { chunk_ids } => self.release(&chunk_ids),
+            ChunkCommand::BeginReclaim { chunk_id } => self.begin_reclaim(chunk_id),
             ChunkCommand::DropChunk { chunk_id } => {
                 self.drop_chunk(chunk_id);
-                Ok(Ok(()))
+                Ok(())
             }
             ChunkCommand::AddReplica { chunk_id, replica } => self.add_replica(chunk_id, replica),
             ChunkCommand::SetOwner { owner } => {
                 self.owner.get_or_insert(owner);
-                Ok(Ok(()))
+                Ok(())
             }
+        })
+    }
+
+    /// A chunk commit the state refuses applies nothing of its proposal:
+    /// the object that would point at it is not written either.
+    fn check(&self, command: &ChunkCommand) -> Option<ChunkReject> {
+        match command {
+            ChunkCommand::CommitChunk { chunk_id, replicas, .. } => self.check_commit(*chunk_id, replicas).err(),
+            _ => None,
         }
     }
 
@@ -164,7 +187,7 @@ impl StateMachine for ChunkState {
 }
 
 impl ChunkState {
-    fn sync_instances(&mut self, configured: Vec<(String, InstanceRec)>) -> Result<Applied> {
+    fn sync_instances(&mut self, configured: Vec<(String, InstanceRec)>) -> Applied {
         let mut instances = self.instances.clone();
         let ids: HashSet<&str> = configured.iter().map(|(id, _)| id.as_str()).collect();
         for (id, rec) in &mut instances {
@@ -176,31 +199,49 @@ impl ChunkState {
         let mut locations = HashSet::new();
         for (id, rec) in &instances {
             if rec.state == "read-write" && !locations.insert(rec.location.as_str()) {
-                bail!("instance {id}: location {} already has a read-write instance", rec.location);
+                let why = format!("instance {id}: location {} already has a read-write instance", rec.location);
+                return Err(ChunkReject::BadInstances(why));
             }
         }
         self.instances = instances;
-        Ok(Ok(()))
+        Ok(())
     }
 
     /// A replica's parts must name a known instance and keys no other part owns.
-    fn check_replica(&self, chunk_id: ChunkId, rep: &Replica) -> Result<()> {
+    fn check_replica(&self, chunk_id: ChunkId, rep: &Replica) -> Applied {
+        let bad = |why: String| Err(ChunkReject::BadReplica { chunk_id, why });
         if !self.instances.contains_key(&rep.instance) {
-            bail!("chunk {chunk_id}: unknown instance {}", rep.instance);
+            return bad(format!("unknown instance {}", rep.instance));
         }
         let mut seen = HashSet::new();
         for part in &rep.parts {
             if !seen.insert(part.sort_key.as_slice()) {
-                bail!("chunk {chunk_id}: duplicate sort_key on instance {}", rep.instance);
+                return bad(format!("duplicate sort_key on instance {}", rep.instance));
             }
             let owner = self.by_key.get(&(rep.instance.clone(), part.sort_key.clone()));
             if let Some(&owner) = owner.filter(|&&o| o != chunk_id) {
-                bail!(
-                    "chunk {chunk_id}: key {} on {} belongs to chunk {owner}",
+                return bad(format!(
+                    "key {} on {} belongs to chunk {owner}",
                     hex::encode(&part.sort_key),
                     rep.instance
-                );
+                ));
             }
+        }
+        Ok(())
+    }
+
+    /// A new chunk: an id never committed, at most one replica per instance,
+    /// each one valid.
+    fn check_commit(&self, chunk_id: ChunkId, replicas: &[Replica]) -> Applied {
+        if self.chunks.contains_key(&chunk_id) {
+            return Err(ChunkReject::ChunkExists(chunk_id));
+        }
+        let mut instances = HashSet::new();
+        for rep in replicas {
+            if !instances.insert(rep.instance.as_str()) {
+                return Err(ChunkReject::BadReplica { chunk_id, why: format!("two replicas on {}", rep.instance) });
+            }
+            self.check_replica(chunk_id, rep)?;
         }
         Ok(())
     }
@@ -229,17 +270,8 @@ impl ChunkState {
         mut blocks: Vec<StoredBlock>,
         replicas: Vec<Replica>,
         created_at: String,
-    ) -> Result<Applied> {
-        if self.chunks.contains_key(&chunk_id) {
-            bail!("chunk {chunk_id} committed twice");
-        }
-        let mut instances = HashSet::new();
-        for rep in &replicas {
-            if !instances.insert(rep.instance.as_str()) {
-                bail!("chunk {chunk_id}: two replicas on {}", rep.instance);
-            }
-            self.check_replica(chunk_id, rep)?;
-        }
+    ) -> Applied {
+        self.check_commit(chunk_id, &replicas)?;
         blocks.sort_by_key(|b| b.block_no);
         let rec =
             ChunkRec { logical_size, crc32, refs: 1, reclaiming: false, created_at, blocks, replicas: BTreeMap::new() };
@@ -248,7 +280,7 @@ impl ChunkState {
         for rep in replicas {
             self.put_replica(chunk_id, rep);
         }
-        Ok(Ok(()))
+        Ok(())
     }
 
     /// All-or-nothing `refs + 1` (an id listed twice gets two).
@@ -303,20 +335,21 @@ impl ChunkState {
         self.chunks.remove(&id);
     }
 
-    fn add_replica(&mut self, chunk_id: ChunkId, rep: Replica) -> Result<Applied> {
+    fn add_replica(&mut self, chunk_id: ChunkId, rep: Replica) -> Applied {
         if self.chunks.get(&chunk_id).is_none_or(|c| c.reclaiming) {
-            return Ok(Err(ChunkReject::ChunkGone(chunk_id)));
+            return Err(ChunkReject::ChunkGone(chunk_id));
         }
         // Keys of the replica being replaced may be reused by the new one.
         let old = self.remove_replica(chunk_id, &rep.instance);
         if let Err(e) = self.check_replica(chunk_id, &rep) {
+            // Put back as it was: a rejection leaves the state untouched.
             if let Some(old) = old {
                 self.put_replica(chunk_id, old);
             }
             return Err(e);
         }
         self.put_replica(chunk_id, rep);
-        Ok(Ok(()))
+        Ok(())
     }
 }
 
@@ -382,5 +415,79 @@ mod tests {
         let cmd = ChunkCommand::Release { chunk_ids: vec![1, 2] };
         assert_eq!(postcard::to_stdvec(&cmd).unwrap(), [3, 2, 2, 4]);
         assert_eq!(ChunkState::VERSION, 5);
+    }
+
+    fn instance() -> InstanceRec {
+        InstanceRec {
+            kind: "memory".into(),
+            fingerprint: "f".into(),
+            location: "here".into(),
+            state: "read-write".into(),
+        }
+    }
+
+    fn replica(instance: &str, key: u8) -> Replica {
+        let part = PartRec {
+            first_block: 0,
+            block_count: 1,
+            sort_key: vec![key],
+            locator: vec![key],
+            blob_id: BlobId::random(),
+        };
+        Replica { instance: instance.into(), parts: vec![part] }
+    }
+
+    fn commit(chunk_id: ChunkId, replicas: Vec<Replica>) -> ChunkCommand {
+        ChunkCommand::CommitChunk {
+            chunk_id,
+            logical_size: 1,
+            crc32: 0,
+            blocks: vec![],
+            replicas,
+            created_at: "t".into(),
+        }
+    }
+
+    /// `command` gets `reject`, from `check` and from `apply`, and the state
+    /// stays as it was.
+    fn rejected(s: &mut ChunkState, command: ChunkCommand, reject: ChunkReject) {
+        let before = pigeonhole_meta::encode_state(s);
+        let keys = s.by_key.clone();
+        if matches!(command, ChunkCommand::CommitChunk { .. }) {
+            assert_eq!(s.check(&command), Some(reject.clone()));
+        }
+        assert_eq!(s.apply(command).unwrap(), Err(reject));
+        assert_eq!(pigeonhole_meta::encode_state(s), before, "the state is untouched");
+        assert_eq!(s.by_key, keys);
+    }
+
+    #[test]
+    fn what_a_command_carries_is_rejected_never_an_apply_error() {
+        let mut s = ChunkState::default();
+        let sync = ChunkCommand::SyncInstances { instances: vec![("a".into(), instance())] };
+        assert_eq!(s.apply(sync).unwrap(), Ok(()));
+        let ok = commit(7, vec![replica("a", 1)]);
+        assert_eq!(s.check(&ok), None);
+        assert_eq!(s.apply(ok).unwrap(), Ok(()));
+
+        rejected(&mut s, commit(7, vec![replica("a", 2)]), ChunkReject::ChunkExists(7));
+        let why = |w: &str| ChunkReject::BadReplica { chunk_id: 8, why: w.into() };
+        rejected(&mut s, commit(8, vec![replica("b", 2)]), why("unknown instance b"));
+        rejected(&mut s, commit(8, vec![replica("a", 2), replica("a", 3)]), why("two replicas on a"));
+        rejected(&mut s, commit(8, vec![replica("a", 1)]), why("key 01 on a belongs to chunk 7"));
+        let mut twice = replica("a", 2);
+        twice.parts.push(twice.parts[0].clone());
+        rejected(&mut s, commit(8, vec![twice]), why("duplicate sort_key on instance a"));
+
+        // A new replica of chunk 7 on a key chunk 9 owns: chunk 7 keeps its own.
+        assert_eq!(s.apply(commit(9, vec![replica("a", 4)])).unwrap(), Ok(()));
+        let bad = ChunkReject::BadReplica { chunk_id: 7, why: "key 04 on a belongs to chunk 9".into() };
+        rejected(&mut s, ChunkCommand::AddReplica { chunk_id: 7, replica: replica("a", 4) }, bad);
+
+        let mut clash = instance();
+        clash.fingerprint = "g".into();
+        let two = ChunkCommand::SyncInstances { instances: vec![("a".into(), instance()), ("c".into(), clash)] };
+        let why = "instance c: location here already has a read-write instance".to_string();
+        rejected(&mut s, two, ChunkReject::BadInstances(why));
     }
 }

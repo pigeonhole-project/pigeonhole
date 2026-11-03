@@ -20,7 +20,26 @@ with the same ones.
 
 ## The leader does the work
 
-Only the leader writes, and only the leader serves:
+Only the leader writes, and only the leader serves.
+
+**Serving.** A node Raft elected is not yet a leader that serves. Raft
+§5.4.2: the entries an earlier leader committed are known committed to the
+new one only once an entry of its own term commits, so until then its
+applied state may lag them. Choosing a chunk id from that state would repeat
+one its predecessor committed. So `MetaStore::is_leader` says yes only once
+the node leads and has applied an entry of its own term (the blank entry
+Raft appends on election; once it is applied, so is everything before it).
+Until then:
+
+- the S3 port and the admin API answer 503 (`not the leader yet: elected in
+  term N, still applying the entries of earlier terms`);
+- `MetaStore::serving_term`, which a write takes its term from, is
+  `CatchingUp`, and proposals wait for it to serve (its blank entry commits
+  as fast as they would);
+- background passes skip, and `ChunkStore::take_over` waits.
+
+`MetaStore::raft_state` is Raft's role alone, for display (the cluster view
+shows `leader` as soon as elected).
 
 - **S3.** A follower answers every S3 request with 503
   `ServiceUnavailable`, naming the leader. Writes would fail there, and
@@ -41,13 +60,24 @@ Only the leader writes, and only the leader serves:
   with its next pass. Each node's snapshot ticker runs on its own:
   snapshots are per node.
 - **Taking over** (`ChunkStore::take_over`, on boot when leading and again
-  on every gain of leadership). The leader:
+  each time this node starts serving). The leader:
   - records the configured stores;
   - chooses or reads the deployment's owner ([store-owner.md](store-owner.md))
     and marks the stores with it;
-  - seeds the sweep's horizon from the committed parts.
+  - seeds the sweep's horizon from the committed parts;
+  - clears its block caches (below).
 - **Chunk ids** go on after the newest the tablet applied, so a node that
-  took over never hands out an id its predecessor used.
+  took over never hands out an id its predecessor used: it serves only
+  once caught up. An id is chosen when its chunk is sealed, maybe minutes
+  before the PUT commits, and the lead may change meanwhile, and back. So
+  the commit is fenced to the term of the seal: written in another term,
+  nothing of its entry applies (`NotApplied::Fenced`), and the PUT fails
+  with 503; its parts are orphans for the sweeper. The blocks the node
+  cached under those ids may be another leader's chunk's by then: a
+  leader clears its caches when it takes over. Should a commit still
+  carry an id committed already, or a replica the state cannot take, it
+  is rejected (meta-backends.md § Namespaces) and its PUT fails: never
+  an error in `apply`, which would stop every node for good.
 - **The dynamic config** ([dynamic-config.md](dynamic-config.md)).
   Overrides reach every node by replication, and `DynConfig::follow`
   recomputes the knobs there. On a follower, `PUT`/`DELETE
@@ -68,7 +98,10 @@ quorum last acknowledged the leader (openraft's `millis_since_quorum_ack`,
 the gauge `pigeonhole_meta_raft_quorum_ack_age_seconds`). Past the lease,
 `election_timeout.1`, the leader is **read-only**: the other nodes may have
 elected another leader by then. Over gRPC that is 3 s, over a chat 90 s
-(§ Timing). It is never read-only in a cluster of one.
+(§ Timing). It is never read-only in a cluster of one. openraft knows no
+ack before a quorum acknowledged something in the leader's term; until then
+the lease counts from when the node saw itself elected, so a leader cut off
+right after its election turns read-only too.
 
 What each node does (three nodes, two of them gone or cut off):
 

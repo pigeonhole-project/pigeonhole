@@ -95,7 +95,10 @@ pub struct Committing {
 
 impl Committing {
     /// Check the commits were applied and queue repair for replicas the
-    /// write missed.
+    /// write missed. `Err` when one was not: rejected (its proposal then
+    /// applied nothing, [`pigeonhole_meta::StateMachine::check`]) or fenced
+    /// out by a change of leader; the pins went with the proposal, and the
+    /// parts are orphans for the sweeper.
     pub async fn done(self, store: &ChunkStore, outcomes: &mut Outcomes) -> Result<()> {
         for slot in self.slots {
             if let Err(reason) = outcomes.take(slot)? {
@@ -211,8 +214,15 @@ impl ChunkStore {
     /// configured ones in the tablet, choose the deployment's owner (once)
     /// and mark every store with it, and start the sweep's horizon at the
     /// committed parts. Writes, so a follower does it once it leads
-    /// ([`Self::follow_leadership`]); again is harmless.
+    /// ([`Self::follow_leadership`]); again is harmless. Runs only on a
+    /// leader that serves, so it reads the state its predecessors left.
     pub async fn take_over(&self) -> Result<()> {
+        // Blocks this node cached when it sealed chunks in an earlier term
+        // are keyed by ids that may not have committed, and a leader since
+        // may have committed other chunks under them.
+        for cache in [&self.block_cache, &self.compressed_cache].into_iter().flatten() {
+            cache.clear();
+        }
         let infos: Vec<_> = self.replicated.members().iter().map(|m| m.instance().clone()).collect();
         self.db.sync_instances(&infos).await?;
         let owner = self.db.owner().await?;
@@ -228,9 +238,9 @@ impl ChunkStore {
         Ok(())
     }
 
-    /// [`Self::take_over`] each time this node becomes the leader (retried
-    /// on every change Raft reports until it succeeds); ends once the
-    /// tablet stops.
+    /// [`Self::take_over`] each time this node becomes the leader and serves
+    /// (retried on every change Raft reports until it succeeds); ends once
+    /// the tablet stops.
     pub async fn follow_leadership(self: Arc<Self>) {
         let mut changes = self.db.meta().changes();
         let mut taken = self.db.is_leader();
@@ -298,7 +308,7 @@ impl ChunkStore {
             codec: "raw".into(),
             crc32: crc,
         }];
-        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts);
+        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts)?;
         let chunk = PendingChunk { chunk_id, commit, layouts: sealed.layouts, pins: sealed.pins };
         self.commit(PendingChunks { chunks: vec![chunk] }).await?;
         Ok(chunk_id)
@@ -724,9 +734,10 @@ impl ChunkStore {
         let crc = h.finalize();
         // Committed by the caller, with whatever points at it; the uploads
         // stay pinned until then.
-        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts);
-        // Ids are never reused: an entry of a chunk that fails to commit is
-        // never asked for.
+        let (chunk_id, commit) = self.db.prepare_commit(logical, crc, &blocks, &sealed.layouts)?;
+        // A chunk that fails to commit is never asked for here; another
+        // leader may commit its id, so a leader clears the caches when it
+        // takes over.
         if let Some(l2) = &self.compressed_cache {
             for (block_no, data) in stored.into_iter().enumerate() {
                 l2.insert(chunk_id, block_no as u32, data).await;

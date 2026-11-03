@@ -15,7 +15,7 @@ pub use chain::{ChainLogStore, Lease};
 
 /// Version of the log envelope ([`Batch`], [`Entry`]). Bump it on any change
 /// to their encoding: a binary refuses to read batches of another format.
-pub const LOG_FORMAT: u32 = 4;
+pub const LOG_FORMAT: u32 = 5;
 
 /// One log entry: the Raft term it was written in and an opaque payload (a
 /// tablet command; later an openraft entry).

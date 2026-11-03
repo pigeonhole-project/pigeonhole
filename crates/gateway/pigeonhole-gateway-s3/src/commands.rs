@@ -6,7 +6,7 @@
 //! [`crate::index::Index`]). Every check runs before the first mutation, so a
 //! rejected command leaves the state untouched.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use pigeonhole_chunk_store::{ChunkId, Extent};
 use pigeonhole_meta::{Outcome, StateMachine};
 use serde::{Deserialize, Serialize};
@@ -147,6 +147,9 @@ pub enum S3Reject {
     MissingPart(i64),
     /// The key's object is not what the write's [`Expect`] said.
     PreconditionFailed,
+    /// CreateUpload: the upload id is taken (ids are random: a bug of ours,
+    /// but a proposal's content, so a rejection and not an apply error).
+    UploadExists,
 }
 
 /// Reply of every committed command: chunk ids the caller must release
@@ -267,7 +270,7 @@ impl StateMachine for S3State {
                     initiated_at,
                     parts: BTreeMap::new(),
                 };
-                self.create_upload(upload_id, rec)?
+                self.create_upload(upload_id, rec)
             }
             S3Command::PutPart { upload_id, part_number, etag, size, extents } => {
                 let Some(upload) = self.uploads.get_mut(&upload_id) else {
@@ -334,16 +337,15 @@ impl S3State {
         }
     }
 
-    /// A reused upload id is a bug of ours, not a refusal.
-    fn create_upload(&mut self, upload_id: String, rec: UploadRec) -> Result<Applied> {
+    fn create_upload(&mut self, upload_id: String, rec: UploadRec) -> Applied {
         if !self.buckets.contains_key(&rec.bucket) {
-            return Ok(Err(S3Reject::BucketNotFound));
+            return Err(S3Reject::BucketNotFound);
         }
         if self.uploads.contains_key(&upload_id) {
-            bail!("upload id {upload_id} reused");
+            return Err(S3Reject::UploadExists);
         }
         self.uploads.insert(upload_id, rec);
-        Ok(ok())
+        ok()
     }
 
     /// Move an inline object out to `extents`, unless it changed (no longer

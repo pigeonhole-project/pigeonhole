@@ -13,7 +13,15 @@
 //!
 //! A command can fail on state (e.g. retain of a reclaimed chunk). `apply` then
 //! returns `Ok(Err(reject))` and leaves the state untouched, but the entry
-//! still consumes a position — every replay reaches the same verdict.
+//! still consumes a position — every replay reaches the same verdict. Nothing
+//! a proposal carries may make `apply` fail: an `Err` stops the tablet on
+//! every node, and every boot replays the entry into the same `Err`.
+//!
+//! A proposal may be fenced to a term ([`Prepared::fenced`]): its entry then
+//! applies it only if it was written in that term. A leader serves (writes,
+//! runs leader work) only once it applied its own term's first entry
+//! ([`MetaStore::is_leader`]), so what it chose from its state (ids) took
+//! every earlier committed entry into account.
 //!
 //! Encodings (postcard): commands carry their namespace's
 //! [`StateMachine::VERSION`] and batches the [`LOG_FORMAT`]; a binary refuses a
@@ -90,9 +98,20 @@ pub trait StateMachine: Default + Serialize + DeserializeOwned + Send + Sync + '
     type Reject: Serialize + DeserializeOwned + Send + 'static;
 
     /// Apply one command; must be deterministic. Validate before mutating: a
-    /// rejection must leave the state untouched. `Err` is a command that cannot
-    /// be applied at all (a bug); it stops the tablet.
+    /// rejection must leave the state untouched. Whatever a command carries
+    /// that the state does not allow is a rejection, never an `Err`: an `Err`
+    /// stops the tablet on every node and again on every boot (the entry stays
+    /// in the log). Keep `Err` for what no proposal can cause.
     fn apply(&mut self, command: Self::Command) -> Result<Outcome<Self>>;
+
+    /// The rejection `command` would get from the state alone, whatever else
+    /// its proposal holds. Checked for every command of a proposal of several
+    /// before any of them applies: one rejected here, and the proposal applies
+    /// nothing (the others are [`NotApplied`]). `apply` must still reject it
+    /// on its own. `None` by default.
+    fn check(&self, _command: &Self::Command) -> Option<Self::Reject> {
+        None
+    }
 
     /// Recompute `#[serde(skip)]` fields after [`decode_state`].
     fn rebuild(&mut self) {}
@@ -114,12 +133,22 @@ pub fn decode_state<S: StateMachine>(data: &[u8]) -> Result<S> {
 /// else: a caller may order and propose it ([`Proposal`]) without seeing it.
 pub struct Prepared<S: StateMachine> {
     command: Command,
+    fence: Option<u64>,
     _s: PhantomData<fn() -> S>,
 }
 
 impl<S: StateMachine> Prepared<S> {
     pub fn new(command: &S::Command) -> Self {
-        Self { command: self::command::<S>(command), _s: PhantomData }
+        Self { command: self::command::<S>(command), fence: None, _s: PhantomData }
+    }
+
+    /// Valid only in leader term `term` (what it was prepared from, such as
+    /// a chunk id, may be stale in another): the proposal it goes into
+    /// applies only from an entry of that term, else none of it does
+    /// ([`NotApplied::Fenced`]).
+    pub fn fenced(mut self, term: u64) -> Self {
+        self.fence = Some(term);
+        self
     }
 }
 
@@ -135,6 +164,9 @@ impl<S: StateMachine> fmt::Debug for Prepared<S> {
 pub struct Proposal {
     commands: Vec<Command>,
     holds: Vec<Hold>,
+    /// The term its entry must be of: the oldest a command was fenced to (a
+    /// proposal of commands fenced to two terms never applies).
+    fence: Option<u64>,
 }
 
 /// Something a proposal keeps alive until its entry is applied: dropped
@@ -162,6 +194,9 @@ impl Proposal {
     }
 
     pub fn push<S: StateMachine>(&mut self, prepared: Prepared<S>) -> Slot<S> {
+        if let Some(term) = prepared.fence {
+            self.fence = Some(self.fence.map_or(term, |f| f.min(term)));
+        }
         self.commands.push(prepared.command);
         Slot { index: self.commands.len() - 1, _s: PhantomData }
     }
@@ -191,20 +226,69 @@ impl Proposal {
 
 /// The outcomes of a committed [`Proposal`].
 pub struct Outcomes {
-    outcomes: Vec<Option<Vec<u8>>>,
+    outcomes: Vec<Option<Applied>>,
 }
 
 impl Outcomes {
-    /// The outcome of the command at `slot` (each taken once).
+    /// The outcome of the command at `slot` (each taken once); `Err`
+    /// [`NotApplied`] when its proposal was committed but not applied.
     pub fn take<S: StateMachine>(&mut self, slot: Slot<S>) -> Result<Outcome<S>> {
-        let bytes = self
+        let applied = self
             .outcomes
             .get_mut(slot.index)
             .and_then(Option::take)
             .with_context(|| format!("no outcome at {} (taken already?)", slot.index))?;
-        postcard::from_bytes(&bytes).with_context(|| format!("decode the outcome of a {} command", S::NAME))
+        match applied {
+            Applied::Done(bytes) => {
+                postcard::from_bytes(&bytes).with_context(|| format!("decode the outcome of a {} command", S::NAME))
+            }
+            Applied::Not(why) => Err(why.into()),
+        }
     }
 }
+
+/// One proposal as an entry holds it: its commands, applied in order, and
+/// the term it is fenced to ([`Prepared::fenced`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Group {
+    pub fence: Option<u64>,
+    pub commands: Vec<Command>,
+}
+
+/// What became of one command of an entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum Applied {
+    /// Applied, or rejected by its namespace: the encoded [`Outcome`].
+    Done(Vec<u8>),
+    /// Committed but not applied: the state is as if it never was.
+    Not(NotApplied),
+}
+
+/// Why a committed command was not applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum NotApplied {
+    /// Its proposal was fenced to a term and the entry is of another: the
+    /// leader that prepared it lost the lead before it was written. The
+    /// write may go again.
+    Fenced { fence: u64, term: u64 },
+    /// Another command of its proposal was rejected by its check
+    /// ([`StateMachine::check`]); that one's outcome says why.
+    Skipped,
+}
+
+impl fmt::Display for NotApplied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotApplied::Fenced { fence, term } => write!(
+                f,
+                "not applied: prepared by the leader of term {fence}, written in term {term} (the lead changed meanwhile)"
+            ),
+            NotApplied::Skipped => f.write_str("not applied: another command of its proposal was rejected"),
+        }
+    }
+}
+
+impl std::error::Error for NotApplied {}
 
 /// One layer command: what an entry's payload holds. `version` is the
 /// namespace's command format ([`StateMachine::VERSION`]) it was encoded with.
@@ -266,6 +350,8 @@ impl TabletSnapshot {
 trait AnyState: Send + Sync {
     /// Apply and encode the [`Outcome`] for the proposer.
     fn apply(&self, command: &Command) -> Result<Vec<u8>>;
+    /// [`StateMachine::check`]: the encoded rejection, if any.
+    fn check(&self, command: &Command) -> Result<Option<Vec<u8>>>;
     /// `(VERSION, encode_state)`.
     fn snapshot(&self) -> (u32, Vec<u8>);
     fn restore(&self, version: u32, data: &[u8]) -> Result<()>;
@@ -274,15 +360,24 @@ trait AnyState: Send + Sync {
 
 struct StateCell<S>(RwLock<S>);
 
+/// The command for `S` in `command`. `Err` is no proposal's doing but a
+/// binary that cannot read its log (another format): it must stop, not guess.
+fn decode_command<S: StateMachine>(command: &Command) -> Result<S::Command> {
+    if command.version != S::VERSION {
+        bail!("{} command in format {}, this binary reads {}", S::NAME, command.version, S::VERSION);
+    }
+    postcard::from_bytes(&command.command).with_context(|| format!("decode {} command", S::NAME))
+}
+
 impl<S: StateMachine> AnyState for StateCell<S> {
     fn apply(&self, command: &Command) -> Result<Vec<u8>> {
-        if command.version != S::VERSION {
-            bail!("{} command in format {}, this binary reads {}", S::NAME, command.version, S::VERSION);
-        }
-        let cmd: S::Command =
-            postcard::from_bytes(&command.command).with_context(|| format!("decode {} command", S::NAME))?;
-        let outcome = self.0.write().unwrap().apply(cmd)?;
+        let outcome = self.0.write().unwrap().apply(decode_command::<S>(command)?)?;
         Ok(postcard::to_stdvec(&outcome).expect("an outcome always encodes"))
+    }
+
+    fn check(&self, command: &Command) -> Result<Option<Vec<u8>>> {
+        let reject = self.0.read().unwrap().check(&decode_command::<S>(command)?);
+        Ok(reject.map(|r| postcard::to_stdvec(&Outcome::<S>::Err(r)).expect("an outcome always encodes")))
     }
 
     fn snapshot(&self) -> (u32, Vec<u8>) {
@@ -455,11 +550,37 @@ impl fmt::Display for CommitUnknown {
 
 impl std::error::Error for CommitUnknown {}
 
+/// A write on a node elected leader that has not applied its own term's
+/// first entry yet: the entries its predecessors committed may not all be
+/// applied, so what it would choose from its state (ids) could repeat
+/// theirs. It serves once it has (docs/cluster.md § Serving). Nothing was
+/// proposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchingUp {
+    pub term: u64,
+}
+
+impl fmt::Display for CatchingUp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "not the leader yet: elected in term {}, still applying the entries of earlier terms", self.term)
+    }
+}
+
+impl std::error::Error for CatchingUp {}
+
 /// Whether `e` says this node cannot write now but the cluster may: not
-/// the leader ([`NotLeader`]), read-only ([`NoQuorum`]), or the quorum lost
-/// mid-commit ([`CommitUnknown`]). A client asks again (S3: 503).
+/// the leader ([`NotLeader`]), elected but not serving yet ([`CatchingUp`]),
+/// read-only ([`NoQuorum`]), the quorum lost mid-commit ([`CommitUnknown`]),
+/// or the lead changed between preparing and writing
+/// ([`NotApplied::Fenced`]). A client asks again (S3: 503).
 pub fn unavailable(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.is::<NotLeader>() || c.is::<NoQuorum>() || c.is::<CommitUnknown>())
+    e.chain().any(|c| {
+        c.is::<NotLeader>()
+            || c.is::<CatchingUp>()
+            || c.is::<NoQuorum>()
+            || c.is::<CommitUnknown>()
+            || matches!(c.downcast_ref::<NotApplied>(), Some(NotApplied::Fenced { .. }))
+    })
 }
 
 pub(crate) type States = HashMap<&'static str, Arc<dyn AnyState>>;
@@ -467,10 +588,10 @@ pub(crate) type States = HashMap<&'static str, Arc<dyn AnyState>>;
 /// A proposal waiting for its batch: one or more commands that go into one
 /// entry together, answered with the entry's position and their outcomes.
 struct Pending {
-    commands: Vec<Command>,
+    group: Group,
     /// The proposal's holds: dropped with it, once it is answered.
     _holds: Vec<Hold>,
-    reply: tokio::sync::oneshot::Sender<Result<(Position, Vec<Vec<u8>>)>>,
+    reply: tokio::sync::oneshot::Sender<Result<(Position, Vec<Applied>)>>,
     /// When it was queued (the batcher's queue wait).
     enqueued: std::time::Instant,
 }
@@ -485,19 +606,19 @@ const MAX_BATCH: usize = 1024;
 async fn batcher(raft: raft::Raft, shared: Arc<raft::Shared>, mut rx: tokio::sync::mpsc::UnboundedReceiver<Pending>) {
     while let Some(first) = rx.recv().await {
         telemetry::record_dequeued(1);
-        let mut size = first.commands.len();
+        let mut size = first.group.commands.len();
         let mut batch = vec![first];
         let mut next = None;
         while size < MAX_BATCH {
             match rx.try_recv() {
-                Ok(p) if size + p.commands.len() > MAX_BATCH => {
+                Ok(p) if size + p.group.commands.len() > MAX_BATCH => {
                     telemetry::record_dequeued(1);
                     next = Some(p);
                     break;
                 }
                 Ok(p) => {
                     telemetry::record_dequeued(1);
-                    size += p.commands.len();
+                    size += p.group.commands.len();
                     batch.push(p);
                 }
                 Err(_) => break,
@@ -520,13 +641,13 @@ async fn write_batch(raft: &raft::Raft, shared: &raft::Shared, mut batch: Vec<Pe
     if batch.is_empty() {
         return;
     }
-    let commands: Vec<Command> = batch.iter().flat_map(|p| p.commands.iter().cloned()).collect();
-    let (n, t0) = (commands.len(), std::time::Instant::now());
+    let groups: Vec<Group> = batch.iter().map(|p| p.group.clone()).collect();
+    let (n, t0) = (groups.iter().map(|g| g.commands.len()).sum(), std::time::Instant::now());
     for p in &batch {
         telemetry::record_queue_wait(t0.saturating_duration_since(p.enqueued));
     }
     let span = tracing::debug_span!("commit", entries = n, proposals = batch.len(), position = tracing::field::Empty);
-    let written = tracing::Instrument::instrument(raft.client_write(commands), span.clone()).await;
+    let written = tracing::Instrument::instrument(raft.client_write(groups), span.clone()).await;
     telemetry::record_commit(written.is_ok(), n, batch.len(), t0.elapsed());
     if let Ok(resp) = &written {
         span.record("position", raft::position(&resp.log_id));
@@ -537,7 +658,7 @@ async fn write_batch(raft: &raft::Raft, shared: &raft::Shared, mut batch: Vec<Pe
             let position = raft::position(&resp.log_id);
             let mut outcomes = resp.data.into_iter();
             for p in batch {
-                let mine = outcomes.by_ref().take(p.commands.len()).collect();
+                let mine = outcomes.by_ref().take(p.group.commands.len()).collect();
                 let _ = p.reply.send(Ok((position, mine)));
             }
         }
@@ -729,11 +850,64 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Whether this node leads its cluster now, as far as it knows. A leader
-    /// cut off from the others learns it once its lease runs out; its writes
-    /// fail meanwhile. Work only the leader should do checks this first.
+    /// Whether this node leads its cluster now and serves, as far as it
+    /// knows: elected, and its own term's first entry applied. Only then are
+    /// the entries its predecessors committed all applied here (Raft §5.4.2:
+    /// they are known committed once an entry of the new term is), so what
+    /// it chooses from its state (ids, the sweep's horizon) is current. A
+    /// leader cut off from the others learns it lost the lead once its lease
+    /// runs out; its writes fail meanwhile. Work only the leader should do
+    /// checks this first. Raft's own role: [`Self::raft_state`].
     pub fn is_leader(&self) -> bool {
-        self.raft.metrics().borrow().state == openraft::ServerState::Leader
+        serving(&self.raft.metrics().borrow())
+    }
+
+    /// The term this node serves as leader in ([`Self::is_leader`]), for a
+    /// proposal prepared from its state to be fenced to
+    /// ([`Prepared::fenced`]). `Err`: [`NotLeader`] or [`CatchingUp`].
+    pub fn serving_term(&self) -> Result<u64> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        if serving(&m) {
+            return Ok(m.current_term);
+        }
+        if m.state == openraft::ServerState::Leader {
+            return Err(CatchingUp { term: m.current_term }.into());
+        }
+        Err(NotLeader { leader: m.current_leader }.into())
+    }
+
+    /// Return once this node serves or no longer leads (its proposal then
+    /// reaches Raft, which answers NotLeader); `NoQuorum` if it turns
+    /// read-only meanwhile. Its blank entry commits as fast as a proposal
+    /// would: waiting costs nothing.
+    async fn until_serving(&self) -> Result<()> {
+        let mut metrics = self.raft.metrics();
+        let mut read_only = self.read_only.clone();
+        let quorum_lost = async move {
+            if read_only.wait_for(|&r| r).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            r = metrics.wait_for(|m| serving(m) || m.state != openraft::ServerState::Leader) => {
+                r.map(|_| ()).map_err(|e| self.stopped_by(e))
+            }
+            () = quorum_lost => Err(self.no_quorum().into()),
+        }
+    }
+
+    /// Elected leader but not serving yet ([`Self::is_leader`]): its term.
+    pub fn catching_up(&self) -> Option<u64> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        (m.state == openraft::ServerState::Leader && !serving(&m)).then_some(m.current_term)
+    }
+
+    /// Raft's role for this node (leader as soon as elected): for display.
+    /// Whether it may write: [`Self::is_leader`].
+    pub fn raft_state(&self) -> openraft::ServerState {
+        self.raft.metrics().borrow().state
     }
 
     /// Whether this node leads but no quorum has acknowledged it for longer
@@ -859,11 +1033,15 @@ impl MetaStore {
         if self.is_read_only() {
             return Err(self.no_quorum().into());
         }
+        if self.catching_up().is_some() {
+            self.until_serving().await?;
+        }
         let (reply, rx) = tokio::sync::oneshot::channel();
         let enqueued = std::time::Instant::now();
         // Counted before the send: the batcher may take it at once.
         telemetry::record_enqueued();
-        let pending = Pending { commands: proposal.commands, _holds: proposal.holds, reply, enqueued };
+        let group = Group { fence: proposal.fence, commands: proposal.commands };
+        let pending = Pending { group, _holds: proposal.holds, reply, enqueued };
         if self.queue.send(pending).is_err() {
             telemetry::record_dequeued(1);
             bail!("the tablet's batcher is gone");
@@ -1147,6 +1325,14 @@ fn raft_config(opts: &MetaOptions, members: usize) -> Result<openraft::Config> {
     .context("raft config")
 }
 
+/// Whether `m` shows a leader that serves: it has applied an entry of its
+/// own term. The first is the blank entry Raft appends on election; once it
+/// is applied, so is everything committed before it.
+fn serving(m: &raft::Metrics) -> bool {
+    m.state == openraft::ServerState::Leader
+        && m.last_applied.as_ref().is_some_and(|l| l.leader_id.get_term() == m.current_term)
+}
+
 /// Log each change of leader as this node learns it (`None`: an election
 /// is on), until Raft stops.
 fn spawn_leader_log(mut metrics: watch::Receiver<raft::Metrics>) {
@@ -1180,17 +1366,8 @@ fn spawn_quorum_watch(mut metrics: watch::Receiver<raft::Metrics>, lease: Durati
     let step = (lease / 4).max(Duration::from_millis(10));
     tokio::spawn(
         async move {
-            // When a quorum last acknowledged this leader, as of the last
-            // report; `None` off the lead, or alone (always a quorum).
-            let acked_at = |m: &raft::Metrics| {
-                let alone = m.membership_config.membership().voter_ids().count() <= 1;
-                if m.state != openraft::ServerState::Leader || alone {
-                    return None;
-                }
-                let now = tokio::time::Instant::now();
-                m.millis_since_quorum_ack.map(|ms| now.checked_sub(Duration::from_millis(ms)).unwrap_or(now))
-            };
-            let mut acked = acked_at(&metrics.borrow_and_update());
+            let mut lead = LeadClock::default();
+            let mut acked = lead.acked_at(&metrics.borrow_and_update(), tokio::time::Instant::now());
             loop {
                 let read_only = acked.is_some_and(|t| t.elapsed() > lease);
                 if tx.send_if_modified(|was| std::mem::replace(was, read_only) != read_only) {
@@ -1206,7 +1383,7 @@ fn spawn_quorum_watch(mut metrics: watch::Receiver<raft::Metrics>, lease: Durati
                         if changed.is_err() {
                             return;
                         }
-                        acked = acked_at(&metrics.borrow_and_update());
+                        acked = lead.acked_at(&metrics.borrow_and_update(), tokio::time::Instant::now());
                     }
                     () = tokio::time::sleep(step) => {}
                 }
@@ -1215,6 +1392,36 @@ fn spawn_quorum_watch(mut metrics: watch::Receiver<raft::Metrics>, lease: Durati
         .in_current_span(),
     );
     rx
+}
+
+/// When a quorum last acknowledged this node's lead, for the read-only
+/// lease ([`spawn_quorum_watch`]).
+#[derive(Default)]
+struct LeadClock {
+    /// The term this node leads in and when it saw itself become leader.
+    since: Option<(u64, tokio::time::Instant)>,
+}
+
+impl LeadClock {
+    /// As of report `m`, seen at `now`; `None` off the lead, or alone
+    /// (always a quorum).
+    /// openraft knows no ack before a quorum acknowledged something in this
+    /// term: until then the lead's start counts as the last ack, or a leader
+    /// cut off right after its election would never turn read-only.
+    fn acked_at(&mut self, m: &raft::Metrics, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        if m.state != openraft::ServerState::Leader {
+            self.since = None;
+            return None;
+        }
+        let since = match self.since {
+            Some((term, at)) if term == m.current_term => at,
+            _ => self.since.insert((m.current_term, now)).1,
+        };
+        if m.membership_config.membership().voter_ids().count() <= 1 {
+            return None;
+        }
+        Some(m.millis_since_quorum_ack.map_or(since, |ms| now.checked_sub(Duration::from_millis(ms)).unwrap_or(now)))
+    }
 }
 
 /// Ask for a snapshot whenever `schedule` says (every its period, `None`:
@@ -1275,11 +1482,38 @@ pub async fn restore_lossy(log: &dyn LogStore, snapshots: &dyn SnapshotStore) ->
     Ok(old_position)
 }
 
+/// Apply one proposal of the entry at `pos`, written in `term`: what became
+/// of each command. Not at all if it is fenced to another term, or if a
+/// command of several fails its [`StateMachine::check`].
+pub(crate) fn apply_group(states: &States, pos: Position, term: u64, group: &Group) -> Result<Vec<Applied>> {
+    let n = group.commands.len();
+    if let Some(fence) = group.fence.filter(|&f| f != term) {
+        return Ok(vec![Applied::Not(NotApplied::Fenced { fence, term }); n]);
+    }
+    if n > 1 {
+        for (i, command) in group.commands.iter().enumerate() {
+            let checked = state_of(states, pos, command)?.check(command);
+            if let Some(reject) = checked.with_context(|| format!("check {} entry {pos}", command.namespace))? {
+                let mut out = vec![Applied::Not(NotApplied::Skipped); n];
+                out[i] = Applied::Done(reject);
+                return Ok(out);
+            }
+        }
+    }
+    group.commands.iter().map(|c| apply_command(states, pos, c).map(Applied::Done)).collect()
+}
+
+/// The namespace of `command`. A namespace the binary does not serve is a
+/// binary that cannot read its log, not a proposal's doing: `Err`.
+fn state_of<'a>(states: &'a States, pos: Position, command: &Command) -> Result<&'a Arc<dyn AnyState>> {
+    states
+        .get(command.namespace.as_str())
+        .with_context(|| format!("entry {pos}: unknown namespace {:?}", command.namespace))
+}
+
 /// Apply one command to its namespace; the encoded outcome.
 pub(crate) fn apply_command(states: &States, pos: Position, command: &Command) -> Result<Vec<u8>> {
-    let state = states
-        .get(command.namespace.as_str())
-        .with_context(|| format!("entry {pos}: unknown namespace {:?}", command.namespace))?;
+    let state = state_of(states, pos, command)?;
     state.apply(command).with_context(|| format!("apply {} entry {pos}", command.namespace))
 }
 

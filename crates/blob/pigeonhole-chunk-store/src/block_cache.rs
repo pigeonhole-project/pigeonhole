@@ -1,6 +1,9 @@
 //! In-memory block cache keyed by (chunk, block_no): L1 holds decoded
-//! blocks, L2 the stored (compressed) ones. Chunk ids are never reused, so
-//! entries never go stale; dropped chunks age out.
+//! blocks, L2 the stored (compressed) ones. Committed chunk ids are never
+//! reused, so entries never go stale; dropped chunks age out. Only a chunk
+//! written but never committed (its leader lost the lead) leaves an entry
+//! another leader's chunk may take the id of: a leader clears its caches
+//! when it takes over ([`crate::ChunkStore::take_over`]).
 
 use crate::ChunkId;
 use bytes::Bytes;
@@ -59,6 +62,12 @@ impl BlockCache {
 
     pub async fn insert(&self, chunk: ChunkId, block_no: u32, data: Bytes) {
         self.cache.insert((chunk, block_no), data).await;
+        self.record_size();
+    }
+
+    /// Drop every entry.
+    pub fn clear(&self) {
+        self.cache.invalidate_all();
         self.record_size();
     }
 

@@ -32,12 +32,12 @@ pub async fn only_on_the_leader(
     }
     let op = || format!("{} {}", req.method(), req.uri().path());
     if !meta.is_leader() {
-        let leader = meta.leader();
-        tracing::info!(op = %op(), leader, "not the leader");
-        return unavailable(&match leader {
-            Some(id) => format!("not the leader; node {id} is"),
-            None => "not the leader; no leader known".to_string(),
-        });
+        let why = match meta.serving_term() {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => "not the leader".to_string(),
+        };
+        tracing::info!(op = %op(), leader = meta.leader(), why, "not serving");
+        return unavailable(&why);
     }
     let reads = matches!(*req.method(), Method::GET | Method::HEAD);
     if meta.is_read_only() && !reads {

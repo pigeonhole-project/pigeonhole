@@ -257,18 +257,20 @@ impl BlobDb {
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
     ) -> Result<ChunkId> {
-        let (chunk_id, prepared) = self.prepare_commit(logical_size, crc32, blocks, replicas);
+        let (chunk_id, prepared) = self.prepare_commit(logical_size, crc32, blocks, replicas)?;
         let mut proposal = Proposal::new();
         let slot = proposal.push(prepared);
         match self.meta.propose_all(proposal).await?.take(slot)? {
             Ok(()) => Ok(chunk_id),
-            Err(reason) => bail!("unexpected rejection {reason:?}"),
+            Err(reason) => bail!("chunk commit rejected: {reason:?}"),
         }
     }
 
     /// A chunk id no chunk has had: past every one handed out here and past
     /// the newest the tablet applied. That one moves with replication: a
-    /// node that took over from another leader goes on after its ids.
+    /// node that took over from another leader goes on after its ids, as it
+    /// serves only once it applied all they committed
+    /// ([`pigeonhole_meta::MetaStore::is_leader`]).
     fn next_chunk_id(&self) -> ChunkId {
         let floor = self.read(|s| s.last_chunk_id) + 1;
         let mut next = self.next_chunk_id.load(Ordering::SeqCst);
@@ -282,14 +284,18 @@ impl BlobDb {
     }
 
     /// The `CommitChunk` of a new chunk (its id chosen now), to be proposed
-    /// with other commands in one entry. Never rejected.
+    /// with other commands in one entry. Fenced to the leader's term: the id
+    /// is unique only while this node goes on leading, so a commit written
+    /// after the lead changed (even back to this node) is not applied
+    /// ([`pigeonhole_meta::NotApplied::Fenced`]). `Err` off the lead.
     pub fn prepare_commit(
         &self,
         logical_size: i64,
         crc32: u32,
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
-    ) -> (ChunkId, Prepared<ChunkState>) {
+    ) -> Result<(ChunkId, Prepared<ChunkState>)> {
+        let term = self.meta.serving_term()?;
         let chunk_id = self.next_chunk_id();
         let command = ChunkCommand::CommitChunk {
             chunk_id,
@@ -299,7 +305,7 @@ impl BlobDb {
             replicas: replicas.iter().map(Replica::from).collect(),
             created_at: Utc::now().to_rfc3339(),
         };
-        (chunk_id, Prepared::new(&command))
+        Ok((chunk_id, Prepared::new(&command).fenced(term)))
     }
 
     /// The tablet this layer's state lives in.

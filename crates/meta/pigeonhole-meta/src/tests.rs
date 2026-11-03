@@ -107,7 +107,10 @@ async fn wait_base(store: &MetaStore, at: Position) {
 /// entry for `cmd` at `position` in `term`, led by the only node.
 fn raw_entry(term: u64, position: Position, cmd: Command) -> Entry {
     let id = openraft::LogId::new(openraft::CommittedLeaderId::new(term, raft::SOLO), position - 1);
-    let entry = raft::RaftEntry { log_id: id, payload: openraft::EntryPayload::Normal(vec![cmd]) };
+    let entry = raft::RaftEntry {
+        log_id: id,
+        payload: openraft::EntryPayload::Normal(vec![crate::Group { fence: None, commands: vec![cmd] }]),
+    };
     Entry { term, payload: postcard::to_stdvec(&entry).unwrap() }
 }
 
@@ -736,3 +739,132 @@ fn batcher_metrics_add_up() {
 }
 
 mod cluster;
+
+/// A namespace with a check: `false` is refused, by `check` and by `apply`.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Strict(u64);
+
+impl StateMachine for Strict {
+    const NAME: &'static str = "strict";
+    const VERSION: u32 = 1;
+    type Command = bool;
+    type Reply = u64;
+    type Reject = String;
+
+    fn apply(&mut self, ok: bool) -> Result<Outcome<Self>> {
+        if !ok {
+            return Ok(Err("refused".into()));
+        }
+        self.0 += 1;
+        Ok(Ok(self.0))
+    }
+
+    fn check(&self, ok: &bool) -> Option<String> {
+        (!ok).then(|| "refused".into())
+    }
+}
+
+async fn open_strict(dir: &Path) -> Arc<MetaStore> {
+    open_dir(&dir.join("log"), Namespaces::new().with::<Counter>().with::<Strict>()).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_proposal_fenced_to_another_term_is_committed_but_not_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_strict(dir.path()).await;
+    let term = store.serving_term().unwrap();
+    let booted = store.applied_position();
+
+    let mut p = Proposal::new();
+    let fenced = p.push(Prepared::<Counter>::new(&op(1, 5)).fenced(term + 1));
+    let along = p.push(Prepared::<Counter>::new(&op(2, 1)));
+    let (position, mut outcomes) = store.propose_all_at(p).await.unwrap();
+    assert_eq!(position, booted + 1, "the entry takes its position");
+    for slot in [fenced, along] {
+        let err = outcomes.take(slot).unwrap_err();
+        let not = err.downcast_ref::<NotApplied>();
+        assert_eq!(not, Some(&NotApplied::Fenced { fence: term + 1, term }), "{err:#}");
+        assert!(unavailable(&err), "a client asks again");
+    }
+    assert_eq!(value(&store), 0, "none of the proposal applied");
+
+    let mut p = Proposal::new();
+    let up = p.push(Prepared::<Counter>::new(&op(3, 5)).fenced(term));
+    assert_eq!(store.propose_all(p).await.unwrap().take(up).unwrap(), Ok(5), "its own term applies");
+
+    // Replay reaches the same verdicts.
+    drop(store);
+    let again = open_strict(dir.path()).await;
+    assert_eq!(op_ids(&again), vec![3]);
+}
+
+#[tokio::test]
+async fn a_command_failing_its_check_applies_nothing_of_its_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_strict(dir.path()).await;
+
+    let mut p = Proposal::new();
+    let before = p.push(Prepared::<Counter>::new(&op(1, 5)));
+    let refused = p.push(Prepared::<Strict>::new(&false));
+    let after = p.push(Prepared::<Counter>::new(&op(2, 1)));
+    let mut outcomes = store.propose_all(p).await.unwrap();
+    assert_eq!(outcomes.take(refused).unwrap(), Err("refused".into()));
+    for slot in [before, after] {
+        let err = outcomes.take(slot).unwrap_err();
+        assert_eq!(err.downcast_ref::<NotApplied>(), Some(&NotApplied::Skipped), "{err:#}");
+        assert!(!unavailable(&err), "asking again would not help");
+    }
+    assert_eq!(value(&store), 0);
+    assert_eq!(store.read::<Strict, _>(|s| s.0), 0);
+
+    // Alone, the command is rejected by apply, as any.
+    assert_eq!(store.propose::<Strict>(false).await.unwrap(), Err("refused".into()));
+    assert_eq!(store.propose::<Strict>(true).await.unwrap(), Ok(1));
+}
+
+/// Raft's report of node 1 leading in `term` with `applied` applied (its
+/// term, and its index) among `voters`.
+fn leading(term: u64, applied: Option<u64>, voters: &[u64]) -> raft::Metrics {
+    let mut m = raft::Metrics::new_initial(1);
+    m.state = openraft::ServerState::Leader;
+    m.current_term = term;
+    m.current_leader = Some(1);
+    m.last_applied = applied.map(|t| openraft::LogId::new(openraft::CommittedLeaderId::new(t, 1), 7));
+    let membership = openraft::Membership::new(vec![voters.iter().copied().collect()], None);
+    m.membership_config = Arc::new(openraft::StoredMembership::new(None, membership));
+    m
+}
+
+#[test]
+fn a_leader_serves_once_it_applied_an_entry_of_its_own_term() {
+    assert!(!serving(&leading(3, None, &[1, 2, 3])), "nothing applied yet");
+    assert!(!serving(&leading(3, Some(2), &[1, 2, 3])), "its predecessor's entries only: maybe not all of them");
+    assert!(serving(&leading(3, Some(3), &[1, 2, 3])), "its blank entry, and so all before it");
+    let mut follower = leading(3, Some(3), &[1, 2, 3]);
+    follower.state = openraft::ServerState::Follower;
+    assert!(!serving(&follower));
+}
+
+#[test]
+fn a_leader_no_quorum_acked_yet_counts_from_its_election() {
+    let lease = Duration::from_secs(3);
+    let t0 = tokio::time::Instant::now();
+    let mut clock = LeadClock::default();
+    let three = |term, applied| leading(term, Some(applied), &[1, 2, 3]);
+    assert_eq!(clock.acked_at(&three(4, 4), t0), Some(t0), "elected: its lease starts");
+    let later = t0 + lease * 2;
+    assert_eq!(clock.acked_at(&three(4, 4), later), Some(t0), "no ack known: still its election");
+    // Read-only, as spawn_quorum_watch tells: cut off since its election.
+    assert!(later - t0 > lease);
+
+    let mut acked = three(4, 4);
+    acked.millis_since_quorum_ack = Some(10);
+    assert_eq!(clock.acked_at(&acked, later), Some(later - Duration::from_millis(10)), "an ack known: from it");
+
+    let next = later + lease;
+    assert_eq!(clock.acked_at(&three(5, 4), next), Some(next), "a new term starts its own clock");
+    assert_eq!(clock.acked_at(&leading(5, Some(5), &[1]), next), None, "alone: always a quorum");
+    let mut follower = three(5, 5);
+    follower.state = openraft::ServerState::Follower;
+    assert_eq!(clock.acked_at(&follower, next), None);
+}
