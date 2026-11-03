@@ -6,9 +6,9 @@ mod cool;
 pub mod index;
 mod service;
 
-pub use commands::{Body, Expect, Pairs, Released, S3Command, S3Reject, S3State};
+pub use commands::{Body, Expect, Released, S3Command, S3Reject, S3Reply, S3State};
 pub use cool::{CoolCandidate, CoolPolicy, CoolReason};
-pub use index::{parse_rfc3339, slice_extents, unique_chunk_ids, DeleteBucketResult, Index, ObjectMeta, Rejected};
+pub use index::{Index, ObjectMeta, Rejected};
 pub use pigeonhole_chunk_store::{ChunkStore, Extent};
 pub use service::{CoolStats, S3Gateway, S3Options};
 

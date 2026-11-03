@@ -1,19 +1,17 @@
 //! S3 API implementation on top of gateway index + ChunkStore (via s3s).
 
 use crate::checksums::{self, copy_checksums, IncomingChecksums};
-use crate::commands::{Body, Expect, S3Reject, S3State};
+use crate::commands::{multipart_etag, Body, Expect, S3Reject, S3State};
 use crate::cool::{CoolPolicy, CoolReason};
 use crate::index::{
-    parse_rfc3339, slice_extents, unique_chunk_ids, CopyDest, DeleteBucketResult, Index, ListPage, ObjectMeta,
-    ObjectView, Rejected, SourceSnapshot,
+    parse_rfc3339, slice_extents, CopyDest, Index, ListPage, ObjectMeta, ObjectView, Rejected, SourceSnapshot,
 };
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
 use futures::StreamExt;
 use md5::Digest;
-use pigeonhole_chunk_store::Extent;
-use pigeonhole_chunk_store::{ChunkStore, IngestOptions, Ingested, PendingChunks};
+use pigeonhole_chunk_store::{unique_chunk_ids, ChunkStore, Extent, IngestOptions, Ingested, PendingChunks};
 use pigeonhole_codec::{self as chunker, ByteBudget, ChunkCodec};
 use pigeonhole_meta::{Outcome, Prepared, Proposal};
 use s3s::dto::*;
@@ -25,6 +23,9 @@ use tracing::info;
 
 /// GET re-reads the object this many times if its chunks are reclaimed underneath it.
 const GET_ATTEMPTS: u32 = 5;
+
+/// DeleteObjects takes at most this many keys (as S3).
+const MAX_DELETE_KEYS: usize = 1000;
 
 /// What one [`S3Gateway::cool_pass`] did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +210,20 @@ impl S3Gateway {
             S3Reject::PreconditionFailed => s3_error!(PreconditionFailed),
             S3Reject::NoSuchKey => s3_error!(NoSuchKey),
             S3Reject::BucketNotFound => s3_error!(NoSuchBucket),
+            S3Reject::BucketNotEmpty => s3_error!(BucketNotEmpty),
+            S3Reject::NoSuchUpload => s3_error!(NoSuchUpload),
+            S3Reject::InvalidPart(pn) => s3_error!(InvalidPart, "part {pn} is not there with the ETag listed"),
+            S3Reject::InvalidPartOrder => s3_error!(InvalidPartOrder),
             other => Self::internal(format!("rejected: {other:?}")),
+        }
+    }
+
+    /// The upload `upload_id` of `bucket`/`key`: an id names one upload of
+    /// one key, and is `NoSuchUpload` for any other.
+    async fn upload_for(&self, upload_id: &str, bucket: &str, key: &str) -> S3Result<crate::index::MultipartUpload> {
+        match self.index.get_multipart_upload(upload_id).await.map_err(Self::map_err)? {
+            Some(u) if u.bucket == bucket && u.key == key => Ok(u),
+            _ => Err(s3_error!(NoSuchUpload)),
         }
     }
 
@@ -281,7 +295,7 @@ impl S3Gateway {
         };
         match outcome {
             Ok(old) => {
-                self.release_later(old);
+                self.release_later(old.released());
                 Ok(())
             }
             Err(reject) => {
@@ -675,33 +689,45 @@ impl S3Gateway {
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
 
+    /// One command for every key: they are deleted in one entry, each as
+    /// its own `ETag` (an `If-Match`) allows.
     async fn delete_objects_now(
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let input = req.input;
-        let mut deleted = Vec::new();
-        let mut errors = Vec::new();
-        for obj in input.delete.objects {
-            let key = obj.key;
-            match self.index.delete_object(&input.bucket, &key, None).await {
-                Ok(Some(ids)) => {
-                    self.release_later(ids);
-                    deleted.push(DeletedObject { key: Some(key), ..Default::default() });
-                }
-                Ok(None) => {
-                    deleted.push(DeletedObject { key: Some(key), ..Default::default() });
-                }
-                Err(e) => {
-                    errors.push(Error {
-                        key: Some(key),
-                        code: Some("InternalError".into()),
-                        message: Some(e.to_string()),
-                        ..Default::default()
-                    });
-                }
-            }
+        if input.delete.objects.len() > MAX_DELETE_KEYS {
+            return Err(s3_error!(MalformedXML, "more than {MAX_DELETE_KEYS} keys"));
         }
+        let quiet = input.delete.quiet.unwrap_or(false);
+        let objects: Vec<(String, Option<Expect>)> = input
+            .delete
+            .objects
+            .into_iter()
+            .map(|o| (o.key, o.e_tag.map(|e| Expect::ETag(e.value().to_string()))))
+            .collect();
+        let keys: Vec<String> = objects.iter().map(|(k, _)| k.clone()).collect();
+        let (released, refused) = self.index.delete_objects(&input.bucket, objects).await.map_err(Self::write_err)?;
+        info!(bucket = %input.bucket, keys = keys.len(), refused = refused.len(), released = released.len(),
+              "DeleteObjects ok");
+        self.release_later(released);
+        let errors: Vec<Error> = refused
+            .iter()
+            .map(|(key, reason)| {
+                let e = Self::refused(*reason);
+                Error {
+                    key: Some(key.clone()),
+                    code: Some(e.code().as_str().to_string()),
+                    message: e.message().map(str::to_string),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let deleted: Vec<DeletedObject> = keys
+            .into_iter()
+            .filter(|k| !quiet && !refused.iter().any(|(r, _)| r == k))
+            .map(|k| DeletedObject { key: Some(k), ..Default::default() })
+            .collect();
         Ok(S3Response::new(DeleteObjectsOutput {
             deleted: deleted.is_empty().not().then_some(deleted),
             errors: errors.is_empty().not().then_some(errors),
@@ -770,12 +796,7 @@ impl S3Gateway {
         let part_number = i64::from(input.part_number);
         let expected_md5 = parse_content_md5_header(input.content_md5.as_deref())?;
 
-        let upload = self
-            .index
-            .get_multipart_upload(&upload_id)
-            .await
-            .map_err(Self::map_err)?
-            .ok_or_else(|| s3_error!(NoSuchUpload))?;
+        let upload = self.upload_for(&upload_id, &input.bucket, &input.key).await?;
 
         let mut expected = Checksum::default();
         copy_checksums!(input => expected);
@@ -808,15 +829,7 @@ impl S3Gateway {
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let input = req.input;
-        let upload = self
-            .index
-            .get_multipart_upload(&input.upload_id)
-            .await
-            .map_err(Self::map_err)?
-            .ok_or_else(|| s3_error!(NoSuchUpload))?;
-        if upload.bucket != input.bucket || upload.key != input.key {
-            return Err(s3_error!(NoSuchUpload));
-        }
+        self.upload_for(&input.upload_id, &input.bucket, &input.key).await?;
         let (src_bucket, src_key) = copy_source_of(input.copy_source)?;
         let part_number = i64::from(input.part_number);
         // The first byte and the length of the part in a source of `size`.
@@ -876,47 +889,24 @@ impl S3Gateway {
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let input = req.input;
         let expect = expect_of(input.if_match, input.if_none_match)?;
-        let upload_id = input.upload_id;
-        let upload = self
-            .index
-            .get_multipart_upload(&upload_id)
-            .await
-            .map_err(Self::map_err)?
-            .ok_or_else(|| s3_error!(NoSuchUpload))?;
+        let upload = self.upload_for(&input.upload_id, &input.bucket, &input.key).await?;
 
-        let parts = input.multipart_upload.and_then(|m| m.parts).unwrap_or_default();
-        if parts.is_empty() {
+        let listed = input.multipart_upload.and_then(|m| m.parts).unwrap_or_default();
+        if listed.is_empty() {
             return Err(s3_error!(InvalidArgument, "empty parts list"));
         }
-
-        let mut md5_concat = md5::Md5::new();
-        let mut total_size: i64 = 0;
-        let mut part_numbers = Vec::new();
-        for p in &parts {
+        let mut parts = Vec::with_capacity(listed.len());
+        for p in &listed {
             let pn = i64::from(p.part_number.ok_or_else(|| s3_error!(InvalidArgument, "missing PartNumber"))?);
-            let client_etag = p.e_tag.as_ref().ok_or_else(|| s3_error!(InvalidArgument, "missing ETag"))?;
-            let part = self
-                .index
-                .get_multipart_part(&upload_id, pn)
-                .await
-                .map_err(Self::map_err)?
-                .ok_or_else(|| s3_error!(InvalidPart))?;
-            let normalized = client_etag.value();
-            if part.etag != normalized {
-                return Err(s3_error!(InvalidPart));
-            }
-            let digest = hex::decode(&part.etag).map_err(|_| s3_error!(InvalidPart))?;
-            md5_concat.update(&digest);
-            total_size += part.size;
-            part_numbers.push(pn);
+            let etag = p.e_tag.as_ref().ok_or_else(|| s3_error!(InvalidArgument, "missing ETag"))?;
+            parts.push((pn, etag.value().to_string()));
         }
-        let etag = format!("{:x}-{}", md5_concat.finalize(), part_numbers.len());
-
-        let old = self
-            .index
-            .complete_multipart_upload(&upload, &part_numbers, &etag, total_size, expect)
-            .await
-            .map_err(Self::write_err)?;
+        // The command checks the parts against those stored when it
+        // applies, and builds the object's size and ETag from them; the
+        // ETag is computed here too, from the same (verified) ETags.
+        let etag = multipart_etag(parts.iter().map(|(_, e)| e.as_str())).ok_or_else(|| s3_error!(InvalidPart))?;
+        let old =
+            self.index.complete_multipart_upload(&upload.upload_id, parts, expect).await.map_err(Self::write_err)?;
         self.release_later(old);
 
         Ok(S3Response::new(CompleteMultipartUploadOutput {
@@ -932,8 +922,9 @@ impl S3Gateway {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let upload_id = req.input.upload_id;
-        match self.index.abort_multipart_upload(&upload_id).await.map_err(Self::map_err)? {
+        let input = req.input;
+        self.upload_for(&input.upload_id, &input.bucket, &input.key).await?;
+        match self.index.abort_multipart_upload(&input.upload_id).await.map_err(Self::map_err)? {
             None => Err(s3_error!(NoSuchUpload)),
             Some(ids) => {
                 self.release_later(ids);
@@ -968,15 +959,17 @@ impl S3 for S3Gateway {
         Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
+    /// The bucket's unfinished uploads go with it; their chunks are
+    /// released after the answer.
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
-        match self.index.delete_bucket(&req.input.bucket).await.map_err(Self::map_err)? {
-            DeleteBucketResult::Deleted => {
-                info!(bucket = %req.input.bucket, "DeleteBucket ok");
-                Ok(S3Response::new(DeleteBucketOutput::default()))
-            }
-            DeleteBucketResult::NotFound => Err(s3_error!(NoSuchBucket)),
-            DeleteBucketResult::NotEmpty => Err(s3_error!(BucketNotEmpty)),
-        }
+        let this = self.clone();
+        Self::to_the_end(async move {
+            let released = this.index.delete_bucket(&req.input.bucket).await.map_err(Self::write_err)?;
+            info!(bucket = %req.input.bucket, released = released.len(), "DeleteBucket ok");
+            this.release_later(released);
+            Ok(S3Response::new(DeleteBucketOutput::default()))
+        })
+        .await
     }
 
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
@@ -1168,23 +1161,22 @@ impl S3 for S3Gateway {
 
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
-        let meta = self
+        // One version of the object, read at once (as GET does).
+        let view = self
             .index
-            .get_object(&input.bucket, &input.key)
+            .get_object_view(&input.bucket, &input.key)
             .await
             .map_err(Self::map_err)?
             .ok_or_else(|| s3_error!(NoSuchKey))?;
-        let tag_count =
-            self.index.get_object_tags(&input.bucket, &input.key).await.map_err(Self::map_err)?.len() as i32;
-        let user_meta = self.index.get_user_metadata(&input.bucket, &input.key).await.map_err(Self::map_err)?;
-        let metadata = if user_meta.is_empty() { None } else { Some(user_meta.into_iter().collect()) };
+        let meta = view.meta;
+        let metadata = view.user_meta.is_empty().not().then(|| view.user_meta.into_iter().collect());
         Ok(S3Response::new(HeadObjectOutput {
             e_tag: Some(etag_hex(&meta.etag)),
             content_length: Some(meta.size),
             content_type: meta.content_type,
             last_modified: Some(ts(&meta.mtime)),
             metadata,
-            tag_count: Some(tag_count),
+            tag_count: Some(view.tag_count as i32),
             ..Default::default()
         }))
     }
@@ -1254,11 +1246,8 @@ impl S3 for S3Gateway {
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
         let input = req.input;
-        if self.index.get_object(&input.bucket, &input.key).await.map_err(Self::map_err)?.is_none() {
-            return Err(s3_error!(NoSuchKey));
-        }
         let tags = tags_from_tagging(&input.tagging)?;
-        self.index.put_object_tags(&input.bucket, &input.key, &tags).await.map_err(Self::map_err)?;
+        self.index.put_object_tags(&input.bucket, &input.key, &tags).await.map_err(Self::write_err)?;
         Ok(S3Response::new(PutObjectTaggingOutput::default()))
     }
 
@@ -1267,10 +1256,12 @@ impl S3 for S3Gateway {
         req: S3Request<GetObjectTaggingInput>,
     ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         let input = req.input;
-        if self.index.get_object(&input.bucket, &input.key).await.map_err(Self::map_err)?.is_none() {
-            return Err(s3_error!(NoSuchKey));
-        }
-        let tags = self.index.get_object_tags(&input.bucket, &input.key).await.map_err(Self::map_err)?;
+        let tags = self
+            .index
+            .get_object_tags(&input.bucket, &input.key)
+            .await
+            .map_err(Self::map_err)?
+            .ok_or_else(|| s3_error!(NoSuchKey))?;
         let tag_set = tags.into_iter().map(|(k, v)| Tag { key: Some(k), value: Some(v) }).collect();
         Ok(S3Response::new(GetObjectTaggingOutput { tag_set, ..Default::default() }))
     }
@@ -1280,24 +1271,13 @@ impl S3 for S3Gateway {
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
         let input = req.input;
-        if self.index.get_object(&input.bucket, &input.key).await.map_err(Self::map_err)?.is_none() {
-            return Err(s3_error!(NoSuchKey));
-        }
-        self.index.delete_object_tags(&input.bucket, &input.key).await.map_err(Self::map_err)?;
+        self.index.put_object_tags(&input.bucket, &input.key, &[]).await.map_err(Self::write_err)?;
         Ok(S3Response::new(DeleteObjectTaggingOutput::default()))
     }
 
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
         let input = req.input;
-        let upload = self
-            .index
-            .get_multipart_upload(&input.upload_id)
-            .await
-            .map_err(Self::map_err)?
-            .ok_or_else(|| s3_error!(NoSuchUpload))?;
-        if upload.bucket != input.bucket || upload.key != input.key {
-            return Err(s3_error!(NoSuchUpload));
-        }
+        let upload = self.upload_for(&input.upload_id, &input.bucket, &input.key).await?;
 
         let (max_parts, max_parts_out) = clamp_max_keys(input.max_parts);
         let marker = input.part_number_marker.map(i64::from);

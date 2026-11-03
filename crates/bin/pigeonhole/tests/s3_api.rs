@@ -905,3 +905,170 @@ async fn a_copy_follows_the_current_threshold() {
     );
     assert_eq!(src.etag, dst.etag);
 }
+
+/// Wait until `what` holds, up to five seconds.
+async fn until(what: &str, mut pred: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pred() {
+        assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+async fn create_upload(s3: &pigeonhole::service::S3Gateway, bucket: &str, key: &str) -> String {
+    let input = CreateMultipartUploadInput { bucket: bucket.into(), key: key.into(), ..Default::default() };
+    s3.create_multipart_upload(req(input)).await.unwrap().output.upload_id.unwrap()
+}
+
+fn part_input(key: &str, upload_id: &str, part_number: i32, data: &[u8]) -> UploadPartInput {
+    UploadPartInput {
+        bucket: "b".into(),
+        key: key.into(),
+        upload_id: upload_id.into(),
+        part_number,
+        body: Some(StreamingBlob::from_bytes(Bytes::copy_from_slice(data))),
+        ..Default::default()
+    }
+}
+
+fn complete_input(key: &str, upload_id: &str, parts: &[(i32, &str)]) -> CompleteMultipartUploadInput {
+    let parts = parts
+        .iter()
+        .map(|&(n, e)| CompletedPart {
+            part_number: Some(n),
+            e_tag: Some(ETag::Strong(e.into())),
+            ..Default::default()
+        })
+        .collect();
+    CompleteMultipartUploadInput {
+        bucket: "b".into(),
+        key: key.into(),
+        upload_id: upload_id.into(),
+        multipart_upload: Some(CompletedMultipartUpload { parts: Some(parts) }),
+        ..Default::default()
+    }
+}
+
+/// CompleteMultipartUpload is decided by the parts as they are when its
+/// command applies: listed ones there with their ETags, ascending; the
+/// object's size and ETag are theirs; parts left out are released. An
+/// upload id names one key: under another it is `NoSuchUpload`.
+#[tokio::test]
+async fn multipart_completes_from_the_parts_it_lists() {
+    use md5::Digest as _;
+    let (s3, _meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    let id = create_upload(&s3, "b", "mp").await;
+    let data: Vec<Vec<u8>> = (1..=3u8).map(|i| vec![i; 70_000 + i as usize]).collect();
+    let mut etags = Vec::new();
+    for (i, d) in data.iter().enumerate() {
+        let out = s3.upload_part(req(part_input("mp", &id, i as i32 + 1, d))).await.unwrap().output;
+        etags.push(out.e_tag.unwrap().value().to_string());
+    }
+    let (e1, e2) = (etags[0].as_str(), etags[1].as_str());
+
+    let refused = |input| async { code(s3.complete_multipart_upload(req(input)).await.unwrap_err()) };
+    assert_eq!(refused(complete_input("mp", &id, &[(2, e2), (1, e1)])).await, S3ErrorCode::InvalidPartOrder);
+    assert_eq!(refused(complete_input("mp", &id, &[(1, e1), (1, e1)])).await, S3ErrorCode::InvalidPartOrder);
+    assert_eq!(refused(complete_input("mp", &id, &[(1, e2)])).await, S3ErrorCode::InvalidPart);
+    assert_eq!(refused(complete_input("mp", &id, &[(1, e1), (4, e2)])).await, S3ErrorCode::InvalidPart);
+    assert_eq!(refused(complete_input("other", &id, &[(1, e1)])).await, S3ErrorCode::NoSuchUpload);
+    let wrong_key = s3.upload_part(req(part_input("other", &id, 1, b"x"))).await.unwrap_err();
+    assert_eq!(code(wrong_key), S3ErrorCode::NoSuchUpload);
+    let abort = AbortMultipartUploadInput {
+        bucket: "b".into(),
+        key: "other".into(),
+        upload_id: id.clone(),
+        ..Default::default()
+    };
+    assert_eq!(code(s3.abort_multipart_upload(req(abort)).await.unwrap_err()), S3ErrorCode::NoSuchUpload);
+
+    let done = s3.complete_multipart_upload(req(complete_input("mp", &id, &[(1, e1), (2, e2)]))).await.unwrap();
+    let mut md5s = Vec::new();
+    for e in [e1, e2] {
+        md5s.extend(hex::decode(e).unwrap());
+    }
+    let want_etag = format!("{:x}-2", md5::Md5::digest(&md5s));
+    assert_eq!(done.output.e_tag.unwrap().value(), want_etag);
+    let head = s3
+        .head_object(req(HeadObjectInput { bucket: "b".into(), key: "mp".into(), ..Default::default() }))
+        .await
+        .unwrap()
+        .output;
+    assert_eq!(head.content_length, Some((data[0].len() + data[1].len()) as i64));
+    assert_eq!(head.e_tag.unwrap().value(), want_etag);
+    let got = s3.get_object(req(GetObjectInput { bucket: "b".into(), key: "mp".into(), ..Default::default() })).await;
+    assert_eq!(collect_body(got.unwrap().output.body).await, [&data[0][..], &data[1][..]].concat());
+
+    // Part 3 is gone with the upload: only the object's chunks stay live.
+    let held = s3.index.get_extents("b", "mp").await.unwrap().unwrap();
+    let held = pigeonhole_chunk_store::unique_chunk_ids(&held).len() as u64;
+    until("part 3 released", || s3.store.db().stats().live == held).await;
+}
+
+#[tokio::test]
+async fn deleting_a_bucket_releases_its_uploads() {
+    let (s3, _meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    let id = create_upload(&s3, "b", "mp").await;
+    s3.upload_part(req(part_input("mp", &id, 1, &[7; 1000]))).await.unwrap();
+    assert_eq!(s3.store.db().stats().live, 1);
+    s3.delete_bucket(req(DeleteBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    until("the part released", || s3.store.db().stats().live == 0).await;
+}
+
+/// DeleteObjects is one command: one entry for every key (and one more
+/// for the release after it); each key answered on its own, an `ETag` in
+/// the request as its `If-Match`.
+#[tokio::test]
+async fn delete_objects_is_one_entry_and_answers_each_key() {
+    let (s3, meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    for key in ["a", "b", "c"] {
+        s3.put_object(req(put(key, &key.repeat(1000), None, false))).await.unwrap();
+    }
+    let ident = |key: &str, etag: Option<&str>| ObjectIdentifier {
+        key: key.into(),
+        e_tag: etag.map(|e| ETag::Strong(e.into())),
+        ..Default::default()
+    };
+    let objects = vec![ident("a", None), ident("b", Some("0123")), ident("c", None), ident("missing", None)];
+    let before = meta.applied_position();
+    let out = s3
+        .delete_objects(req(DeleteObjectsInput::builder()
+            .bucket("b".into())
+            .delete(Delete { objects, quiet: None })
+            .build()
+            .unwrap()))
+        .await
+        .unwrap()
+        .output;
+    let deleted: Vec<String> = out.deleted.unwrap().into_iter().map(|d| d.key.unwrap()).collect();
+    assert_eq!(deleted, ["a", "c", "missing"]);
+    let errors = out.errors.unwrap();
+    assert_eq!((errors[0].key.as_deref(), errors[0].code.as_deref()), (Some("b"), Some("PreconditionFailed")));
+    until("the release after the answer", || meta.applied_position() >= before + 2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(meta.applied_position(), before + 2, "the deletes in one entry, the release in one more");
+    assert_eq!(s3.index.count_objects().await.unwrap(), 1);
+
+    let nobucket = DeleteObjectsInput::builder()
+        .bucket("nope".into())
+        .delete(Delete { objects: vec![ident("a", None)], quiet: None })
+        .build()
+        .unwrap();
+    assert_eq!(code(s3.delete_objects(req(nobucket)).await.unwrap_err()), S3ErrorCode::NoSuchBucket);
+}
+
+#[tokio::test]
+async fn tagging_a_missing_object_is_no_such_key() {
+    let (s3, _meta, _dir) = setup_one_tablet(64 * 1024).await;
+    s3.create_bucket(req(CreateBucketInput { bucket: "b".into(), ..Default::default() })).await.unwrap();
+    let tagging = Tagging { tag_set: vec![Tag { key: Some("k".into()), value: Some("v".into()) }] };
+    let put = PutObjectTaggingInput::builder().bucket("b".into()).key("gone".into()).tagging(tagging).build().unwrap();
+    assert_eq!(code(s3.put_object_tagging(req(put)).await.unwrap_err()), S3ErrorCode::NoSuchKey);
+    let del = DeleteObjectTaggingInput { bucket: "b".into(), key: "gone".into(), ..Default::default() };
+    assert_eq!(code(s3.delete_object_tagging(req(del)).await.unwrap_err()), S3ErrorCode::NoSuchKey);
+    let get = GetObjectTaggingInput { bucket: "b".into(), key: "gone".into(), ..Default::default() };
+    assert_eq!(code(s3.get_object_tagging(req(get)).await.unwrap_err()), S3ErrorCode::NoSuchKey);
+}

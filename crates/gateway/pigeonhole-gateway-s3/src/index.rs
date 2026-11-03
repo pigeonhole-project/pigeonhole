@@ -4,7 +4,7 @@
 //! an `s3` command (see [`crate::commands`]). Chunk refcounts live in the
 //! chunk store ([`ChunkStore::retain`] / [`release`]).
 
-use crate::commands::{Body, Expect, ObjectRec, S3Command, S3Reject, S3State, UploadRec, NAMESPACE};
+use crate::commands::{Body, Expect, ObjectRec, Released, S3Command, S3Reject, S3Reply, S3State, UploadRec, NAMESPACE};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use pigeonhole_chunk_store::{ChunkId, Extent};
@@ -13,14 +13,15 @@ use serde::{Deserialize, Serialize};
 use std::ops::Bound;
 use std::sync::Arc;
 
-/// A conditional write refused (docs/conditional-writes.md): the key's
-/// object was not what the write expected.
+/// A write refused by the state it met: a conditional write whose key's
+/// object was not what it expected (docs/conditional-writes.md), a key or
+/// upload gone, parts not as listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rejected(pub S3Reject);
 
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "conditional write refused: {:?}", self.0)
+        write!(f, "write refused: {:?}", self.0)
     }
 }
 
@@ -88,13 +89,6 @@ pub struct MultipartPart {
     pub size: i64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum DeleteBucketResult {
-    Deleted,
-    NotFound,
-    NotEmpty,
-}
-
 impl Index {
     /// Add the `s3` namespace to the set passed to [`MetaStore::open`].
     pub fn register(namespaces: Namespaces) -> Namespaces {
@@ -132,17 +126,13 @@ impl Index {
     }
 
     /// Propose one s3 command; `Ok(Err(reason))` is a deterministic rejection.
-    async fn propose(&self, cmd: S3Command) -> Result<std::result::Result<Vec<ChunkId>, S3Reject>> {
-        self.meta.propose::<S3State>(cmd).await
+    async fn propose(&self, cmd: S3Command) -> Result<std::result::Result<Released, S3Reject>> {
+        Ok(self.meta.propose::<S3State>(cmd).await?.map(S3Reply::released))
     }
 
-    /// A conditional write: its refusal is a [`Rejected`] error.
-    async fn propose_expecting(&self, cmd: S3Command) -> Result<Vec<ChunkId>> {
-        match self.propose(cmd).await? {
-            Ok(ids) => Ok(ids),
-            Err(reason @ (S3Reject::PreconditionFailed | S3Reject::NoSuchKey)) => Err(Rejected(reason).into()),
-            Err(reason) => anyhow::bail!("unexpected s3 rejection {reason:?}"),
-        }
+    /// A write the state may refuse: its refusal is a [`Rejected`] error.
+    async fn propose_expecting(&self, cmd: S3Command) -> Result<Released> {
+        self.propose(cmd).await?.map_err(|reason| Rejected(reason).into())
     }
 
     async fn propose_infallible(&self, cmd: S3Command) -> Result<Vec<ChunkId>> {
@@ -168,13 +158,10 @@ impl Index {
         }
     }
 
-    pub async fn delete_bucket(&self, name: &str) -> Result<DeleteBucketResult> {
-        Ok(match self.propose(S3Command::DeleteBucket { name: name.into() }).await? {
-            Ok(_) => DeleteBucketResult::Deleted,
-            Err(S3Reject::BucketNotFound) => DeleteBucketResult::NotFound,
-            Err(S3Reject::BucketNotEmpty) => DeleteBucketResult::NotEmpty,
-            Err(other) => anyhow::bail!("unexpected delete_bucket rejection {other:?}"),
-        })
+    /// Delete an empty bucket; the chunks of its unfinished uploads, to
+    /// `release`. Missing or not empty: a [`Rejected`] error.
+    pub async fn delete_bucket(&self, name: &str) -> Result<Released> {
+        self.propose_expecting(S3Command::DeleteBucket { name: name.into() }).await
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>> {
@@ -276,7 +263,7 @@ impl Index {
     /// as. Outcome: nothing to release, or `PreconditionFailed` / `NoSuchKey`
     /// if the object changed meanwhile (then the chunk is the caller's to
     /// release).
-    pub fn prepare_cool(&self, c: &crate::CoolCandidate, extents: &[Extent]) -> Prepared<S3State> {
+    pub(crate) fn prepare_cool(&self, c: &crate::CoolCandidate, extents: &[Extent]) -> Prepared<S3State> {
         Prepared::new(&S3Command::Cool {
             bucket: c.bucket.clone(),
             key: c.key.clone(),
@@ -327,33 +314,20 @@ impl Index {
         Ok(self.object(bucket, key, |o| o.body.extents().to_vec()))
     }
 
-    pub async fn get_object_checksums_json(&self, bucket: &str, key: &str) -> Result<Option<String>> {
-        Ok(self.object(bucket, key, |o| o.checksums_json.clone()))
+    /// Ordered by tag key; `None` for a missing object.
+    pub async fn get_object_tags(&self, bucket: &str, key: &str) -> Result<Option<Vec<(String, String)>>> {
+        Ok(self.object(bucket, key, |o| pairs(&o.tags)))
     }
 
-    /// Ordered by name; empty for a missing object.
-    pub async fn get_user_metadata(&self, bucket: &str, key: &str) -> Result<Vec<(String, String)>> {
-        Ok(self.object(bucket, key, |o| pairs(&o.user_meta)).unwrap_or_default())
-    }
-
-    /// Ordered by tag key; empty for a missing object.
-    pub async fn get_object_tags(&self, bucket: &str, key: &str) -> Result<Vec<(String, String)>> {
-        Ok(self.object(bucket, key, |o| pairs(&o.tags)).unwrap_or_default())
-    }
-
+    /// Replace an object's tags (empty: delete them). A missing object is a
+    /// [`Rejected`] error (`NoSuchKey`), even if it went away just now.
     pub async fn put_object_tags(&self, bucket: &str, key: &str, tags: &[(String, String)]) -> Result<()> {
-        self.propose_infallible(S3Command::PutObjectTags {
+        self.propose_expecting(S3Command::PutObjectTags {
             bucket: bucket.into(),
             key: key.into(),
             tags: tags.to_vec(),
         })
         .await?;
-        Ok(())
-    }
-
-    pub async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<()> {
-        self.propose_infallible(S3Command::PutObjectTags { bucket: bucket.into(), key: key.into(), tags: Vec::new() })
-            .await?;
         Ok(())
     }
 
@@ -368,6 +342,22 @@ impl Index {
             Err(S3Reject::NoSuchKey) if !conditional => Ok(None),
             Err(reason @ (S3Reject::PreconditionFailed | S3Reject::NoSuchKey)) => Err(Rejected(reason).into()),
             Err(other) => anyhow::bail!("unexpected delete_object rejection {other:?}"),
+        }
+    }
+
+    /// Delete `objects` of `bucket` (each with what it expects of its key)
+    /// in one command; the chunks to `release` and the keys refused, with
+    /// why. A missing bucket is a [`Rejected`] error.
+    pub async fn delete_objects(
+        &self,
+        bucket: &str,
+        objects: Vec<(String, Option<Expect>)>,
+    ) -> Result<(Released, Vec<(String, S3Reject)>)> {
+        let cmd = S3Command::DeleteObjects { bucket: bucket.into(), objects };
+        match self.meta.propose::<S3State>(cmd).await? {
+            Ok(S3Reply::Deleted { released, refused }) => Ok((released, refused)),
+            Ok(other) => anyhow::bail!("unexpected delete_objects reply {other:?}"),
+            Err(reason) => Err(Rejected(reason).into()),
         }
     }
 
@@ -539,7 +529,7 @@ impl Index {
             released.extend(self.delete_object(&bucket, &key, None).await?.unwrap_or_default());
         }
         for bucket in self.list_buckets().await? {
-            self.delete_bucket(&bucket.name).await?;
+            released.extend(self.delete_bucket(&bucket.name).await?);
         }
         Ok(released)
     }
@@ -603,29 +593,19 @@ impl Index {
         Ok(self.read(|s| Some(s.uploads.get(upload_id)?.parts.get(&part_number)?.extents.clone())))
     }
 
-    /// Assemble object from parts (ownership transfer). Returns old object chunk ids to release.
+    /// Assemble the object from `parts` (`(number, etag)` as the client
+    /// listed them; checked when the command applies). Returns the chunk ids
+    /// to release (the object replaced, the parts left out); a refusal is a
+    /// [`Rejected`] error.
     pub async fn complete_multipart_upload(
         &self,
-        upload: &MultipartUpload,
-        part_numbers: &[i64],
-        etag: &str,
-        total_size: i64,
+        upload_id: &str,
+        parts: Vec<(i64, String)>,
         expect: Option<Expect>,
-    ) -> Result<Vec<ChunkId>> {
-        let cmd = S3Command::CompleteUpload {
-            upload_id: upload.upload_id.clone(),
-            part_numbers: part_numbers.to_vec(),
-            etag: etag.into(),
-            total_size,
-            mtime: Utc::now().to_rfc3339(),
-            expect,
-        };
-        match self.propose(cmd).await? {
-            Ok(ids) => Ok(ids),
-            Err(S3Reject::MissingPart(pn)) => anyhow::bail!("missing part {pn}"),
-            Err(reason @ (S3Reject::PreconditionFailed | S3Reject::NoSuchKey)) => Err(Rejected(reason).into()),
-            Err(other) => anyhow::bail!("complete_multipart_upload rejected: {other:?}"),
-        }
+    ) -> Result<Released> {
+        let cmd =
+            S3Command::CompleteUpload { upload_id: upload_id.into(), parts, mtime: Utc::now().to_rfc3339(), expect };
+        self.propose_expecting(cmd).await
     }
 
     /// Abort upload; returns all part chunk ids to `release`, or `None` if missing.
@@ -727,16 +707,8 @@ fn pairs(map: &std::collections::BTreeMap<String, String>) -> Vec<(String, Strin
     map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
-/// Unique chunk ids referenced by an extent list (sorted).
-pub fn unique_chunk_ids(extents: &[Extent]) -> Vec<ChunkId> {
-    let mut ids: Vec<_> = extents.iter().map(|e| e.chunk).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
 /// Slice an extent list to cover `[start, start+length)` logical bytes.
-pub fn slice_extents(extents: &[Extent], start: u64, length: u64) -> Vec<Extent> {
+pub(crate) fn slice_extents(extents: &[Extent], start: u64, length: u64) -> Vec<Extent> {
     if length == 0 {
         return Vec::new();
     }
@@ -888,7 +860,7 @@ fn group_delimiter_entries(prefix: &str, delim: &str, objs: Vec<ObjectMeta>) -> 
         .collect()
 }
 
-pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
+pub(crate) fn parse_rfc3339(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |d| d.with_timezone(&Utc))
 }
 

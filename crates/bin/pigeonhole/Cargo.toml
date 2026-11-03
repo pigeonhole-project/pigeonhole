@@ -79,6 +79,8 @@ pigeonhole-limits = { workspace = true }
 pigeonhole-chunk-store = { workspace = true }
 pigeonhole-codec = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
+hex = { workspace = true }
+md-5 = { workspace = true }
 s3s = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

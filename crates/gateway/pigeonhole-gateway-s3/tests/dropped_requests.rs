@@ -4,8 +4,9 @@
 
 use bytes::Bytes;
 use http::{Extensions, HeaderMap, Method, Uri};
+use pigeonhole_chunk_store::unique_chunk_ids;
 use pigeonhole_chunk_store::{default_layer_opts, BlobDb, ChunkStore};
-use pigeonhole_gateway_s3::{build_s3_gateway, unique_chunk_ids, Index, S3Gateway, S3Options};
+use pigeonhole_gateway_s3::{build_s3_gateway, Index, S3Gateway, S3Options};
 use pigeonhole_storage_memory::MemoryBlobStore;
 use pigeonhole_testkit::GatedLog;
 use s3s::dto::*;
