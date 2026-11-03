@@ -178,6 +178,24 @@ impl StateMachine for Names {
     }
 }
 
+/// A snapshot without a namespace (one added since it was taken) leaves
+/// that namespace empty, whatever it held before the restore.
+#[test]
+fn a_restore_empties_a_namespace_the_snapshot_lacks() {
+    let states = collect_states(counter().with::<Names>()).unwrap();
+    apply_command(&states, 1, &command::<Counter>(&op(1, 5))).unwrap();
+    let snap = take_snapshot(&states, 1);
+    apply_command(&states, 2, &command::<Names>(&"a".to_string())).unwrap();
+    apply_command(&states, 3, &command::<Counter>(&op(2, 1))).unwrap();
+    assert_eq!(snap.states.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["counter", "names"]);
+    let without_names = TabletSnapshot { states: snap.states.into_iter().filter(|s| s.0 != "names").collect(), ..snap };
+
+    restore_states(&states, &without_names).unwrap();
+    let names = states["names"].as_any().downcast_ref::<StateCell<Names>>().unwrap().0.read().unwrap().0.clone();
+    let counter = states["counter"].as_any().downcast_ref::<StateCell<Counter>>().unwrap().0.read().unwrap().v;
+    assert_eq!((names, counter), (Vec::<String>::new(), 5));
+}
+
 #[tokio::test]
 async fn propose_all_commits_commands_of_several_namespaces_as_one_entry() {
     let dir = tempfile::tempdir().unwrap();

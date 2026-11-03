@@ -355,6 +355,8 @@ trait AnyState: Send + Sync {
     /// `(VERSION, encode_state)`.
     fn snapshot(&self) -> (u32, Vec<u8>);
     fn restore(&self, version: u32, data: &[u8]) -> Result<()>;
+    /// Back to the empty state.
+    fn reset(&self);
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -390,6 +392,10 @@ impl<S: StateMachine> AnyState for StateCell<S> {
         }
         *self.0.write().unwrap() = decode_state(data)?;
         Ok(())
+    }
+
+    fn reset(&self) {
+        *self.0.write().unwrap() = S::default();
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1523,8 +1529,13 @@ pub(crate) fn take_snapshot(states: &States, position: Position) -> TabletSnapsh
     TabletSnapshot { format: SNAPSHOT_FORMAT, position, states: snap }
 }
 
-/// Load every namespace's state from `snap`.
+/// Load every namespace's state from `snap`; one it does not hold starts
+/// empty (a namespace added since): the state comes from the log and the
+/// snapshot only, never from what was in memory before.
 pub(crate) fn restore_states(states: &States, snap: &TabletSnapshot) -> Result<()> {
+    for state in states.values() {
+        state.reset();
+    }
     for (name, version, data) in &snap.states {
         let state = states.get(name.as_str()).with_context(|| format!("snapshot has unknown namespace {name:?}"))?;
         state.restore(*version, data)?;
