@@ -260,9 +260,14 @@ above, and why:
   loser names that message too, while its thread tells the first survivor
   won.
 - **The tail is the newest member that won its link**, checked through its
-  `prev`'s thread (`GET /channels/{prev}`: a thread outlives its message), not
-  by following links from the start: removing an old snapshot or pruning
-  leaves the start unreachable.
+  `prev`'s thread, not by following links from the start: removing an old
+  snapshot or pruning leaves the start unreachable. The listing carries
+  each message's `thread`, so `prev`'s comes from the pages listed; only a
+  `prev` not among them (deleted, or on a page not listed yet) costs a
+  `GET /channels/{prev}` (a thread outlives its message). Under the lease
+  the newest members are unlinked batches: a `tail` through 20 of them read
+  21 threads before, none now (`tests/chain_log.rs`,
+  `the_tail_reads_threads_from_the_listing`).
 - **Links of deleted members**: a thread is deleted only after its message
   (on an existing message one could be started again). When a member goes,
   its incoming link goes once its `prev` is gone too, its outgoing link once

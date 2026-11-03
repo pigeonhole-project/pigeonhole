@@ -472,3 +472,27 @@ async fn the_clock_probe_leaves_nothing() {
     assert!(channel.thread_ids().is_empty());
     assert_eq!(s.tail().await.unwrap(), None);
 }
+
+/// The tail under a lease: the newest members are batches nobody links, and
+/// the listing already tells which messages have a thread. Through 20
+/// unlinked batches, a `tail` read 21 threads (one per batch and the claim's
+/// anchor) before; now none, the listing only.
+#[tokio::test]
+async fn the_tail_reads_threads_from_the_listing() {
+    use pigeonhole_storage_api::LeaseChain;
+    let channel = Arc::new(FakeDiscord::new(77));
+    let s = channel_store(&channel);
+    let After::Won(claim) = s.put_after(None, "log-claim-1", bytes::Bytes::from_static(b"c")).await.unwrap() else {
+        panic!("the first claim links")
+    };
+    let mut prev = claim.clone();
+    for i in 0..20 {
+        prev = s.put_unlinked(&prev, "log-batch-1", bytes::Bytes::from(vec![i + 1])).await.unwrap();
+    }
+    let fresh = channel_store(&channel);
+    let before = channel.calls();
+    assert_eq!(fresh.tail().await.unwrap().map(|t| t.id), Some(claim));
+    let after = channel.calls();
+    assert_eq!(after.thread_name - before.thread_name, 0, "{before:?} → {after:?}");
+    assert_eq!(after.list - before.list, 1, "{before:?} → {after:?}");
+}

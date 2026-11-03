@@ -36,6 +36,7 @@ use pigeonhole_storage_api::chain_name::{chain_name, label_of, parse_chain_name}
 use pigeonhole_storage_api::{
     check_blob, put_after_tail_by_links, After, BlobBackend, Chain, LeaseChain, Linked, MakeAfter,
 };
+use std::collections::HashMap;
 
 const ANCHOR: &str = "chain-anchor.bin";
 /// The text of a clock probe ([`LeaseChain::now_ms`]).
@@ -207,14 +208,24 @@ impl<A: DiscordApi> Chain for DiscordBlobStore<A> {
 
     /// The newest member that won its link (its `prev`'s thread names it):
     /// every winner is in the chain (a writer puts only after a winner or
-    /// the tail), and a successor would be newer.
+    /// the tail), and a successor would be newer. A listing carries each
+    /// message's thread, so `prev`'s is read from the pages listed; only a
+    /// `prev` not among them (deleted, or further down) costs a read of its
+    /// thread.
     async fn tail(&self) -> Result<Option<Linked<DiscordId>>> {
         let mut before = None;
+        // The thread (or none) of every message listed so far.
+        let mut listed: HashMap<u64, Option<String>> = HashMap::new();
         loop {
             let page = self.api.list(before, None, PAGE).await?;
+            listed.extend(page.iter().map(|m| (m.id, m.thread.clone())));
             for m in page.iter().rev() {
                 let Some((label, from)) = blob_name(m).and_then(parse_name) else { continue };
-                if self.link_of(from).await?.is_some_and(|l| l.id.message_id == m.id) {
+                let link = match listed.get(&from) {
+                    Some(thread) => thread.as_deref().and_then(parse_thread).map(|(id, _)| id),
+                    None => self.link_of(from).await?.map(|l| l.id.message_id),
+                };
+                if link == Some(m.id) {
                     tracing::debug!(store = %self.instance().id, message_id = m.id, label, "found the tail");
                     self.remember(m);
                     return Ok(Some(Linked { id: DiscordId { message_id: m.id }, label: label.to_string() }));

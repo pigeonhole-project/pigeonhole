@@ -18,6 +18,8 @@ use std::sync::Mutex;
 pub struct Calls {
     pub send: usize,
     pub get_message: usize,
+    /// Reads of a thread (`GET /channels/{thread}`).
+    pub thread_name: usize,
     pub list: usize,
     pub delete: usize,
     pub start_thread: usize,
@@ -231,7 +233,7 @@ impl<H: FakeHost<DiscordChannelState>> DiscordApi for FakeDiscord<H> {
     }
 
     async fn thread_name(&self, message_id: u64) -> Result<Option<String>> {
-        self.count(|c| c.get_message += 1);
+        self.count(|c| c.thread_name += 1);
         Ok(self.host.read(|s| s.thread(message_id).cloned()))
     }
 
