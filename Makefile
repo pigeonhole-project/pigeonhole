@@ -1,4 +1,4 @@
-.PHONY: web web-smoke lint-js test-js cluster-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint
+.PHONY: web web-smoke lint-js test-js cluster-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint gates
 
 run:
 	cargo run --release
@@ -100,6 +100,15 @@ report:
 	./scripts/code_report.py --out target/code-report.md
 
 test-all: check-deps test smoke
+
+# What clippy does not see: advisories, licences and sources of the crates
+# (deny.toml), unused dependencies (crates/ only: vendor/ is upstream's),
+# the shell scripts (.shellcheckrc), misspellings (_typos.toml).
+gates:
+	cargo deny check
+	cargo machete crates
+	git ls-files -z '*.sh' scripts/wt ':!vendor' | xargs -0 shellcheck
+	typos
 
 # Deterministic simulation (docs/simulation.md). MADSIM_TEST_SEED=<seed>
 # replays one run; MADSIM_TEST_NUM=<n> runs n seeds.

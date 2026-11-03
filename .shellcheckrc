@@ -1,0 +1,4 @@
+# ShellCheck (`make gates`) reads this for every script.
+# SC1091: `.env` and the like are sourced from paths only known at run time.
+# SC2153: the variables those files set look like misspellings to it.
+disable=SC1091,SC2153

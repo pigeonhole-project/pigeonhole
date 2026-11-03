@@ -1,0 +1,47 @@
+# cargo-deny (`make gates`): known vulnerabilities, licences, where crates
+# come from. https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Every RustSec advisory fails, unmaintained crates included.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # No fixed release; only madsim (the simulator, `make sim`) uses it.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1 unmaintained: madsim only" },
+]
+
+[licenses]
+# The licences the dependencies are under today (where a crate offers a
+# choice, the one taken); a new one needs a look before it goes in.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# The workspace's own crates are not published.
+ignore = true
+
+[bans]
+# Two versions of one crate build twice, but nearly all of them (31 crates
+# today) come from dependencies we do not choose: off, not warnings nobody
+# reads. `cargo tree --duplicates` lists them.
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The patched forks of tokio and openraft (Cargo.toml, [patch.crates-io]).
+allow-org = { github = ["pigeonhole-project"] }

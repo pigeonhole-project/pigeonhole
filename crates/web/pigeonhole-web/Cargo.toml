@@ -15,15 +15,12 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
-openraft = { workspace = true }
 openraft-chat = { workspace = true }
 openraft-grpc = { workspace = true }
 pigeonhole-raft-telegram = { workspace = true }
 pigeonhole-blob = { workspace = true }
-pigeonhole-chunk-store = { workspace = true }
 pigeonhole-config = { workspace = true, features = ["fake"] }
 pigeonhole-fake-channels = { workspace = true }
-pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-meta = { workspace = true }
 pigeonhole-node = { workspace = true }
 pigeonhole-storage-api = { workspace = true, features = ["fake"] }
@@ -41,3 +38,7 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# Only their `fake` feature is wanted: the in-memory channels of the demo.
+ignored = ["pigeonhole-storage-api", "pigeonhole-storage-discord"]

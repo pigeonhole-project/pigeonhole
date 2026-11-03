@@ -33,6 +33,7 @@ if [[ -f .env ]]; then
   set +a
 fi
 
+# shellcheck disable=SC2329 # run by the EXIT trap below
 cleanup() {
   if [[ -f "$PIDFILE" ]]; then
     kill "$(cat "$PIDFILE")" 2>/dev/null || true

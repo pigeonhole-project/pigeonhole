@@ -17,6 +17,7 @@ out.md
 .cache/
 /pigeonhole-meta/
 
-# MTProto session files (auth key caches; secret)
+# MTProto session files (auth key caches; secret) and their locks
 *.session
+pigeonhole-tg-*.lock
 /vendor/*/target

@@ -18,7 +18,6 @@ http = { workspace = true, optional = true }
 pigeonhole-blob = { workspace = true }
 pigeonhole-chunk-store = { workspace = true, optional = true }
 pigeonhole-gateway-s3 = { workspace = true, optional = true }
-pigeonhole-types = { workspace = true }
 pigeonhole-meta = { workspace = true }
 pigeonhole-storage-disk = { workspace = true }
 s3s = { workspace = true, optional = true }

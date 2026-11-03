@@ -28,7 +28,7 @@ echo "dir: $DIR"
 PID=()
 cleanup() {
   for n in 1 2 3; do [[ -n "${PID[$n]:-}" ]] && kill -9 "${PID[$n]}" 2>/dev/null || true; done
-  [[ "${KEEP:-}" == 1 ]] && echo "kept $DIR" || rm -rf "$DIR"
+  if [[ "${KEEP:-}" == 1 ]]; then echo "kept $DIR"; else rm -rf "$DIR"; fi
 }
 trap cleanup EXIT
 

@@ -57,7 +57,7 @@ metrics-util = { version = "0.20", default-features = false, features = ["debugg
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 http = "1"
 humantime-serde = "1"
-lru = "0.12"
+lru = "0.18"
 md-5 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 s3s = "=0.17.0"
@@ -173,3 +173,5 @@ uninlined_format_args = "warn"
 unnested_or_patterns = "warn"
 used_underscore_binding = "warn"
 useless_let_if_seq = "warn"
+# Size: no function over 100 lines of code (clippy.toml).
+too_many_lines = "warn"

@@ -20,7 +20,7 @@ MAIN_BRANCH=main
 MAIN_DIR="$(git worktree list --porcelain | awk '/^worktree /{print substr($0, 10); exit}')"
 PARENT="$(dirname "$MAIN_DIR")"
 PREFIX="$(basename "$MAIN_DIR")"
-HERE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HERE="$(command git rev-parse --show-toplevel 2>/dev/null || pwd)"
 git() { command git -C "$MAIN_DIR" "$@"; }
 
 die() { echo "wt: $*" >&2; exit 1; }

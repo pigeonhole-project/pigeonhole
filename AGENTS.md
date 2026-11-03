@@ -35,6 +35,9 @@ Run what the branch touches:
   `cargo install --locked cargo-nextest`),
   `./scripts/check-deps.sh --strict`, and `make sim` for meta, blob, storage
   or sim changes.
+- Dependencies, shell scripts or text: `make gates` (cargo-deny,
+  cargo-machete, ShellCheck, typos; `brew install cargo-deny shellcheck
+  typos-cli`, `cargo install --locked cargo-machete`).
 - The site's JavaScript: `make lint-js`, `make test-js`.
 - The web node (crates/web) or the demo: `make web-smoke`.
 
