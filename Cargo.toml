@@ -175,3 +175,14 @@ used_underscore_binding = "warn"
 useless_let_if_seq = "warn"
 # Size: no function over 100 lines of code (clippy.toml).
 too_many_lines = "warn"
+
+# The site's demo (make web, crates/web): the bytes a visitor downloads, not
+# speed. 11.9 MB → 6.9 MB (gzip 4.1 → 2.6); the demo waits on its fake
+# channels' pacing, not on the CPU, and runs as fast. Without symbols: the
+# name section is 3 MB more (panics still say where).
+[profile.web]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+strip = "symbols"

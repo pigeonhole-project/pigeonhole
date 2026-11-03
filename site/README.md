@@ -18,7 +18,7 @@ python3 site/build.py          # → target/site (open target/site/index.html)
     `wasm32-wasip1` from `crates/web` ([README](../crates/web/README.md)),
     run in a Web Worker (`assets/web-worker.js`) under the site's WASI shim
     (`assets/wasi.js`, its files in the browser's OPFS). `build.py` copies
-    `target/wasm32-wasip1/release/pigeonhole_web.wasm` to
+    `target/wasm32-wasip1/web/pigeonhole_web.wasm` to
     `assets/pigeonhole.wasm`, and warns when it is missing (`make web`).
 - `i18n/` — the strings, one file per language. Keys starting with `js.`
   go to the page scripts (`t("key")` in `assets/site.js`).
