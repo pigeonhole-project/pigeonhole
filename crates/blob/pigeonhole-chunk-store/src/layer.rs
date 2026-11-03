@@ -608,10 +608,14 @@ impl ChunkStore {
         }))
     }
 
-    /// After a quorum write, enqueue backfill for placement members that missed.
+    /// After a quorum write, enqueue backfill for the members of the
+    /// chunk's shard that missed it (the other shards never get a copy).
     async fn enqueue_missing_replicas(&self, chunk_id: ChunkId, layouts: &[ReplicaLayout]) -> Result<()> {
+        let Some(peers) = layouts.first().and_then(|l| self.replicated.shard_peers(&l.instance)) else {
+            return Ok(());
+        };
         let have: std::collections::HashSet<&str> = layouts.iter().map(|l| l.instance.as_str()).collect();
-        for m in self.replicated.members() {
+        for m in peers {
             let id = m.instance().id.as_str();
             if !have.contains(id) {
                 self.db.enqueue_repair(chunk_id, id).await?;

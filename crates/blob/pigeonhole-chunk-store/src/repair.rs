@@ -554,6 +554,38 @@ mod tests {
         assert_eq!(where_is(on_b).await, vec!["b".to_string()]);
     }
 
+    /// A write that missed a member queues a copy for its own shard's
+    /// members only: never for the other shards' (shard size − 1 at most).
+    #[tokio::test]
+    async fn a_write_queues_repairs_in_its_own_shard_only() {
+        let down = |id: &str| {
+            let store = MemoryBlobStore::new().with_instance_id(id).with_unavailable_flag();
+            store.unavailable_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+            Arc::new(erase(store)) as SharedBackend
+        };
+        let (a1, b1) = (lim("a1", 4 * MIB), lim("b1", 4 * MIB));
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let rep = Arc::new(
+            Replicated::sharded(
+                vec![(vec![a1, down("a2")], 1), (vec![b1, down("b2")], 1)],
+                Arc::new(CheapestFirst::new()),
+            )
+            .unwrap(),
+        );
+        let layer =
+            ChunkStore::open_replicated(db.clone(), rep, IngestOptions::new(MIB, ChunkCodec::Raw)).await.unwrap();
+        for i in 0..4u8 {
+            let id = layer.put_small(Bytes::from(vec![i; 10])).await.unwrap();
+            let on = db.get_replica_layouts(id).await.unwrap().remove(0).instance;
+            let missed = if on == "a1" { "a2" } else { "b2" };
+            let jobs: Vec<_> = db.repair_jobs().await.into_iter().filter(|(c, _)| *c == id).collect();
+            assert_eq!(jobs, vec![(id, missed.to_string())], "chunk on {on}");
+        }
+    }
+
     #[tokio::test]
     async fn lost_part_is_repaired() {
         let a: SharedBackend = Arc::new(erase(MemoryBlobStore::new().with_instance_id("a")));
