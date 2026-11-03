@@ -5,7 +5,6 @@
 import {button, h, reducedMotion} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {ops} from "../lib/ops.js";
-import {s3Sentence} from "../lib/say.js";
 import {budgetsOf, budgetTable, sendLevel} from "./budgets.js";
 import {appOf, kinOf} from "./channels.js";
 import {chatView} from "./chat/index.js";
@@ -21,6 +20,7 @@ import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
 import {connect} from "./node.js";
 import {makeRaftWatch} from "./raft.js";
+import {apply as applyEvent, merge} from "./reduce.js";
 import {TASK_KEY, TASK_ON, taskWindows} from "./tasks.js";
 import {makeWizard} from "./wizard.js";
 
@@ -74,6 +74,7 @@ const node = await connect(new URL(`../web-worker.js${new URL(import.meta.url).s
 let updateWindows = () => {};
 let relayout = () => redraw(); // the screen turned narrow or wide: what is on the graph, again
 const graph = makeGraph($("graph"), {
+  channel,
   onOpen: openPanel,
   onRelayout: () => relayout(),
   onLoft: (g, entrances) => {
@@ -135,49 +136,24 @@ const flightCtx = () => ({leader: state.cluster?.leader ?? null, shown: shown(),
 function apply(events) {
   const said = [];
   for (const e of events) {
-    const c = channel(e.store);
+    const {channel: c, said: s} = applyEvent(state.channels, e);
+    said.push(...s);
     if (e.type === "posted" && c) {
-      const m = {id: e.id, kind: e.kind, name: e.name, size: e.bytes, preview: e.preview, fresh: true, at: new Date()};
-      c.messages.push(m);
-      c.total++;
-      const snap = c.role === "snapshots" && /-(\d+)\.snap/.exec(m.name || "");
-      if (snap) said.push(["say.snapshot", {at: +snap[1]}]);
       const flights = flightsOf(e, channel, flightCtx());
       for (const f of flights) graph.fly({...f, onLand: () => landed(c.store)});
       if (!flights.length) landed(c.store);
       if (c.role === "outbox" && panelShows(c.store)) outboxChanged();
     } else if (e.type === "deleted" && c) {
-      // Gone from the channel, as from a messenger's: no trace left.
-      c.total = Math.max(0, c.total - gone(c, e.ids));
-      c.messages = c.messages.filter(m => !e.ids.includes(String(m.id)));
-      graph.setTotal(c.store, c.total);
+      graph.setTotal(c.store);
       if (panelShows(c.store)) renderPanel();
     } else if (e.type === "call" || e.type === "call_failed") {
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
     } else if (e.type === "raft") {
       for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
       said.push(...raft.frame(e, performance.now()));
-    } else if (e.type === "repair_pass" && e.repaired > 0) {
-      said.push(["say.repair_pass", {n: e.repaired}]);
-    } else if (e.type === "s3") {
-      // What one channel got for it: the first data channel's new posts.
-      const first = state.channels.find(x => x.role === "data");
-      const posts = (first?.messages || []).filter(m => m.fresh).map(m => ({kind: m.kind, bytes: m.size}));
-      said.push(s3Sentence(e, posts));
     }
   }
   return said;
-}
-
-// How many of message ids `ids` channel `c` held: those it lists, and
-// those below its first listed one, as many as it has unlisted. An outbox's
-// prune deletes a run of ids, some of them empty already.
-function gone(c, ids) {
-  const listed = new Set(c.messages.map(m => String(m.id)));
-  const first = Math.min(...c.messages.map(m => Number(m.id)));
-  const older = Math.max(0, c.total - c.messages.length);
-  const below = ids.filter(id => !listed.has(id) && Number(id) < first).length;
-  return ids.filter(id => listed.has(id)).length + Math.min(older, below);
 }
 
 // An open outbox's posts come from the log without the frames they hold:
@@ -195,7 +171,7 @@ function outboxChanged() {
 
 // A pigeon landed on a channel.
 function landed(store) {
-  graph.setTotal(store, channel(store)?.total);
+  graph.setTotal(store);
   if (panelShows(store)) renderPanel();
 }
 const panelShows = store => (isOpen("store") && state.open.store === store) || (isOpen("log") && logChannel()?.store === store);
@@ -255,19 +231,23 @@ async function refreshObjects() {
   view?.setCounters?.(counters());
 }
 
-// The channels as the node has them now; the posts seen arriving stay
-// marked. A local disk has files, not messages.
+// The channels as the node has them now, the graph's windows from them;
+// the posts seen arriving stay marked (reduce.js merge: those that came
+// while the channels were read too). A local disk has files, not messages.
 // In a cluster, each other node's own log and snapshots too: the node on
-// screen lists only its own.
+// screen lists only its own. Kept as they were when the node does not answer.
 async function loadChannels() {
+  const me = shown();
   const {reply} = await call(ops.channels());
-  const fresh = new Set(state.channels.flatMap(c => c.messages.filter(m => m.fresh).map(m => `${c.store}/${m.id}`)));
-  const listed = [...(reply?.channels || [])];
-  for (const id of state.nodes.length > 1 ? state.nodes.filter(id => id !== shown()) : []) {
+  if (!ok(reply)) return;
+  const listed = [...(reply.channels || [])];
+  for (const id of state.nodes.length > 1 ? state.nodes.filter(id => id !== me) : []) {
     const other = await call(ops.channels(id));
-    listed.push(...(other.reply?.channels || []).filter(c => c.node === id && c.role !== "outbox"));
+    const theirs = c => c.node === id && c.role !== "outbox";
+    listed.push(...(ok(other.reply) ? other.reply.channels || [] : state.channels).filter(theirs));
   }
-  state.channels = listed.map(c => ({...c, messages: (c.messages || []).map(m => ({...m, fresh: fresh.has(`${c.store}/${m.id}`)}))}));
+  state.channels = merge(state.channels, listed);
+  graph.refill();
 }
 
 // The channels anew, drawn (a fault changes them behind the events).
@@ -282,8 +262,7 @@ async function refreshChannels() {
 async function loadLog() {
   const {reply} = await call(ops.log(200));
   await loadChannels();
-  graph.setChannels(state.channels);
-  state.log = reply;
+  if (ok(reply)) state.log = reply;
   if (isOpen("log")) renderPanel();
   view?.setCounters?.(counters());
 }

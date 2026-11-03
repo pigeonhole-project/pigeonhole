@@ -37,10 +37,12 @@ const seeded = seed => () => {
   return seed / 233280;
 };
 
+// channel(store): the channel as the page has it now (its windows are
+// drawn from it; none: nothing posted yet, as in the wizard's sketch).
 // onLoft(g, windows): the node on screen was drawn, its dovecote's
 // entrances are free to dress (the other nodes' are shuttered).
 // onRelayout(): the screen turned narrow or wide: draw again.
-export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
+export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
   const reduced = reducedMotion();
   const narrow = matchMedia(NARROW);
   narrow.addEventListener("change", onRelayout);
@@ -67,6 +69,8 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
   // The dovecote a channel's way leads from (flights.js: whose traffic it is).
   const homeOf = c => loftOf(ownerOf(c, scene));
   let cards = new Map(); // store id → its block
+  // What a block's windows hold: its channel's messages now.
+  const holds = n => channel(n.store) ?? {};
   const levels = new Map(); // store id → its bots' send budget (setBudget), kept across redraws
   let edges = new Map(); // store id → the way to its block; "" → the client's
 
@@ -87,7 +91,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     const role = placeNote(c) + (c.bots > 1 ? `, ${t("demo.bots", {n: c.bots})}` : "") + (c.down ? `, ${t("demo.down")}` : "");
     const n = node({kind: "store", store: c.store}, parent, `${c.store}: ${role}`);
     n.g.classList.toggle("down", !!c.down);
-    n.c = c;
+    n.store = c.store;
     n.cols = at.cols;
     n.most = at.most;
     // A node's own two blocks come as tall as each other (its bridge lies on both).
@@ -118,11 +122,12 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
 
   // A channel's windows, from what it holds now; `fresh`: light the new ones up.
   function fill(n, fresh) {
-    const {older, list, count} = contents(n.c);
+    const c = holds(n);
+    const {older, list, count} = contents(c);
     const room = n.slots.length - (count > n.slots.length ? n.cols : 0);
     const shown = Math.min(count, room),
       skip = count - shown;
-    const pins = new Set((n.c.pinned || []).map(p => String(p.id)));
+    const pins = new Set((c.pinned || []).map(p => String(p.id)));
     n.win.replaceChildren();
     for (const [i, s] of n.slots.entries()) {
       const m = i < shown && skip + i >= older ? list[skip + i - older] : null;
@@ -134,7 +139,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     }
     n.shown = shown;
     n.older.textContent = skip ? `+${skip}` : "";
-    n.count.textContent = String(n.c.total ?? count);
+    n.count.textContent = String(c.total ?? count);
   }
   // Where a window is, by its place among the shown.
   const windowAt = (n, i) => {
@@ -323,14 +328,9 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     const n = cards.get(store);
     if (n) fill(n, true);
   }
-  // The channels as the node has them now (the same ones, read again).
-  function setChannels(channels) {
-    for (const c of channels) {
-      const n = cards.get(c.store);
-      if (!n) continue;
-      n.c = c;
-      fill(n, false);
-    }
+  // Every block's windows anew: the channels read again.
+  function refill() {
+    for (const n of cards.values()) fill(n, false);
   }
 
   // Repair jobs waiting for a channel ({chunk}), a square each over its roof; `title(job)` names one.
@@ -358,7 +358,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     const n = up(cards.get(p.store));
     if (!n) return null;
     if (p.at === "sign") return {store: p.store, sign: true};
-    const {count} = contents(n.c);
+    const {count} = contents(holds(n));
     const shown = Math.min(count, n.slots.length - (count > n.slots.length ? n.cols : 0));
     return {store: p.store, i: p.at === "free" ? shown : p.at === "any" ? Math.floor(Math.random() * Math.max(1, shown)) : shown - 1};
   }
@@ -412,7 +412,7 @@ export function makeGraph(el, {onOpen, onLoft, onRelayout}) {
     highlight,
     focus,
     setTotal,
-    setChannels,
+    refill,
     setObjects,
     setQueue,
     fly: pigeons.fly,
