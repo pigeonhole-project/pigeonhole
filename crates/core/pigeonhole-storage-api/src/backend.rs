@@ -79,27 +79,20 @@ pub enum OpKind {
     Put,
     Get,
     Delete,
-    List,
 }
 
-/// Hint for replica selection / scheduling.
+/// Hint for replica selection / scheduling: what an operation would wait
+/// for now. (Latency and in-flight counts are not in it: no store measures
+/// them; the circuit breaker of a replica selector covers slow stores.)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostHint {
     /// Estimated wait before the op can start (limiter), seconds.
     pub wait_secs: f64,
-    /// EWMA of past latency, seconds (0 if unknown).
-    pub latency_ewma_secs: f64,
-    /// In-flight ops on this instance.
-    pub inflight: u32,
 }
 
 impl CostHint {
     pub fn free() -> Self {
-        Self { wait_secs: 0.0, latency_ewma_secs: 0.0, inflight: 0 }
-    }
-
-    pub fn score(&self, inflight_weight: f64) -> f64 {
-        self.wait_secs + self.latency_ewma_secs + f64::from(self.inflight) * inflight_weight
+        Self { wait_secs: 0.0 }
     }
 }
 

@@ -54,15 +54,6 @@ impl ChunkCodec {
         }
     }
 
-    /// Config policy that should pack with independent blocks.
-    pub fn uses_block_packing(self) -> bool {
-        matches!(self, Self::Gzip | Self::Zstd | Self::Blocks)
-    }
-
-    pub fn is_compressing(self) -> bool {
-        matches!(self, Self::Gzip | Self::Zstd | Self::Blocks)
-    }
-
     /// Per-block compression algorithm for a packing policy.
     pub fn block_codec(self) -> Self {
         match self {

@@ -70,7 +70,6 @@ pub trait ReplicaSelector: Send + Sync {
 
 /// Circuit-breaking cheapest-first selector.
 pub struct CheapestFirst {
-    inflight_weight: f64,
     close_epsilon: f64,
     inner: Mutex<BreakerState>,
     rng: AtomicU64,
@@ -89,15 +88,10 @@ struct Unhealthy {
 impl CheapestFirst {
     pub fn new() -> Self {
         Self {
-            inflight_weight: 0.05,
             close_epsilon: 0.05,
             inner: Mutex::new(BreakerState { unhealthy: HashMap::new() }),
             rng: AtomicU64::new(0xC0FFEE),
         }
-    }
-
-    pub fn with_weights(inflight_weight: f64, close_epsilon: f64) -> Self {
-        Self { inflight_weight, close_epsilon, ..Self::new() }
     }
 
     fn tick() -> u64 {
@@ -133,7 +127,6 @@ impl ReplicaSelector for CheapestFirst {
     fn rank(&self, replicas: &[ReplicaLayout], costs: &[CostHint]) -> Vec<usize> {
         debug_assert_eq!(replicas.len(), costs.len());
         let mut idxs: Vec<usize> = (0..replicas.len()).collect();
-        let weight = self.inflight_weight;
         let eps = self.close_epsilon;
         idxs.sort_by(|&a, &b| {
             let ua = self.is_unhealthy(&replicas[a].instance);
@@ -142,8 +135,8 @@ impl ReplicaSelector for CheapestFirst {
                 (true, false) => std::cmp::Ordering::Greater,
                 (false, true) => std::cmp::Ordering::Less,
                 _ => {
-                    let sa = costs[a].score(weight);
-                    let sb = costs[b].score(weight);
+                    let sa = costs[a].wait_secs;
+                    let sb = costs[b].wait_secs;
                     if (sa - sb).abs() <= eps {
                         let ra = self.next_rand();
                         let rb = self.next_rand();
@@ -812,11 +805,7 @@ mod tests {
             id.key
         }
         fn cost(&self, _: OpKind, _: Option<&Self::Id>) -> CostHint {
-            CostHint {
-                wait_secs: self.cost_wait.load(Ordering::Relaxed) as f64 / 1000.0,
-                latency_ewma_secs: 0.0,
-                inflight: 0,
-            }
+            CostHint { wait_secs: self.cost_wait.load(Ordering::Relaxed) as f64 / 1000.0 }
         }
         async fn put(&self, data: Bytes, _name: &str) -> Result<Self::Id> {
             if self.unavailable.load(Ordering::Relaxed) {

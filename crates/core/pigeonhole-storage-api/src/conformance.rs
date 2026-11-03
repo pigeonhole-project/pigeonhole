@@ -94,7 +94,7 @@ impl BlobBackend for Recording {
     }
     fn cost(&self, _op: OpKind, _id: Option<&u64>) -> CostHint {
         self.note("cost");
-        CostHint { wait_secs: 7.0, ..CostHint::free() }
+        CostHint { wait_secs: 7.0 }
     }
     async fn put(&self, _data: Bytes, _name: &str) -> Result<u64> {
         self.note("put");

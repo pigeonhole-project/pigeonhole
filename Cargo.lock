@@ -2656,7 +2656,6 @@ dependencies = [
  "pigeonhole-types",
  "serde",
  "tempfile",
- "tracing",
  "zstd",
 ]
 
@@ -3026,7 +3025,6 @@ dependencies = [
  "anyhow",
  "madsim-tokio",
  "serde",
- "serde_json",
 ]
 
 [[package]]

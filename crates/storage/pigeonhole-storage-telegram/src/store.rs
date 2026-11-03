@@ -306,10 +306,10 @@ impl<C: ChannelApi> BlobBackend for TelegramBlobStore<C> {
             OpKind::Get if id.is_some_and(|i| self.reader.locations.lock().unwrap().contains(&i.message_id)) => {
                 std::time::Duration::ZERO
             }
-            OpKind::Get | OpKind::List => self.limiter.peek_wait(READ),
+            OpKind::Get => self.limiter.peek_wait(READ),
             OpKind::Delete => self.limiter.peek_wait(DELETE),
         };
-        CostHint { wait_secs: wait.as_secs_f64(), latency_ewma_secs: 0.0, inflight: 0 }
+        CostHint { wait_secs: wait.as_secs_f64() }
     }
 
     async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
