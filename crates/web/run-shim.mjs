@@ -5,7 +5,8 @@
 //   node run-shim.mjs reload   <pigeonhole_web.wasm>   two module instances on one pool:
 //                                                      a page load, then a reload
 //   node run-shim.mjs snapshot <pigeonhole_web.wasm>   enough puts for a snapshot, a tick
-//   node run-shim.mjs events   <pigeonhole_web.wasm>   every event the demo draws, from the node
+//   node run-shim.mjs events   <pigeonhole_web.wasm>   every event the demo draws, from a
+//                                                      cluster (the wizard's), every line it reads
 import {readFile} from "node:fs/promises";
 import {frame} from "../../site/src/assets/lib/ops.js";
 import {MemoryHandle, Pool, Wasi} from "../../site/src/assets/wasi.js";
@@ -38,8 +39,8 @@ const parse = lines =>
 // The demo's module, started as the worker starts it, and driven as the
 // worker drives it: a call queued, the node run until it would wait, a
 // sleep until its next timer.
-async function node() {
-  const m = await instance("/data");
+async function node(env = {}) {
+  const m = await instance("/data", env);
   m.exports.ph_open();
   m.wasi.takeLines();
   m.events = [];
@@ -108,27 +109,70 @@ if (mode === "smoke") {
   const snaps = (await m.call({op: "channels"})).channels.find(c => c.role === "snapshots");
   console.error(`head ${log.head}, base ${JSON.stringify(log.base)}, snapshot channel ${snaps.messages.map(x => x.name).join(" ")}`);
 } else if (mode === "events") {
-  // The node's log as the demo reads it (demo/events.js): every kind of
-  // event the page draws must still come out of the real node's lines.
-  const {readEvents} = await import("../../site/src/assets/demo/events.js");
-  const seen = new Map();
-  const m = await node();
-  const read = (events, label) => {
-    for (const e of readEvents(events)) seen.set(e.type === "posted" && e.preview ? "posted text" : e.type, label);
+  // The node's log as the demo reads it (demo/events.js): every message it
+  // reads must still come out of the real node's lines, and every kind of
+  // event it draws. A cluster of three as the wizard makes it, its links
+  // direct and over the chat; node 2's log on Discord, with a lease.
+  const {EVENT_TYPES, MESSAGES, readEvents, S3_OK, S3_TARGET} = await import("../../site/src/assets/demo/events.js");
+  const {tomlOf} = await import("../../site/src/assets/demo/toml.js");
+  const cluster = tomlOf({
+    ...{channels: ["telegram", "discord"], copies: 2, quorum: 2, log: "telegram", snapshots: "telegram", every: 15, bots: 1, pace: "demo"},
+    ...{
+      nodes: 3,
+      links: "mixed",
+      others: [
+        {log: "discord", snapshots: "discord"},
+        {log: "local_disk", snapshots: "local_disk"},
+      ],
+    },
+  })
+    // Repair passes every second, so one comes after the check; elections
+    // quicker, so that an outbox keeps its frames (twice the longest
+    // election timeout) for less, and prunes them while this runs.
+    .replace('interval = "10s"', 'interval = "1s"')
+    .replace('heartbeat = "1s"', 'heartbeat = "250ms"')
+    .replace('election_timeout_min = "4s"', 'election_timeout_min = "1s"')
+    .replace('election_timeout_max = "8s"', 'election_timeout_max = "2s"');
+  const env = {PH_DEMO_CLUSTER_KEY: "706967656f6e686f6c652064656d6f20636c75737465723a206e6f206b657900"};
+  const seen = new Map(),
+    said = new Set();
+  const read = (lines, label) => {
+    for (const l of lines) {
+      const msg = l.fields?.message || "";
+      if ((l.target || "").startsWith(S3_TARGET) && msg.endsWith(S3_OK)) said.add("<Op> ok");
+      else said.add(msg);
+    }
+    for (const e of readEvents(lines)) {
+      const kind = e.type === "posted" && e.preview ? "posted text" : e.type === "raft" ? `raft ${e.via} ${e.at}` : e.type;
+      if (!seen.has(kind)) seen.set(kind, label);
+    }
   };
-  const call = async (request, body) => read((await m.op(request, body)).events, request.op);
-  // Repair passes every second, so one comes after the check.
-  await call({op: "open", config: (await config()).replace('interval = "10s"', 'interval = "1s"')});
+  const m = await node(env);
+  const call = async (request, body) => {
+    const {reply, events} = await m.op(request, body);
+    read(events, request.op);
+    if (reply.error) throw new Error(`${request.op}: ${reply.error}`);
+    return reply;
+  };
+  await call({op: "open", config: cluster});
+  read(await m.idle(3000), "idle"); // heartbeats, over both kinds of links
   await call({op: "put", key: "text"}, new TextEncoder().encode("hello ".repeat(100000)));
   await call({op: "put", key: "random"}, crypto.getRandomValues(new Uint8Array(60000)));
-  // A copy gone behind the node's back: a read that tries it (on the fakes
-  // the Discord copy comes first) fails over; the check queues it for repair.
-  await call({op: "wipe", store: "discord"});
+  // A copy gone behind the node's back: a read that tries it fails over;
+  // the check queues it for repair.
+  await call({op: "wipe", store: "dc-1"});
   await call({op: "get", key: "random"});
-  await call({op: "verify", store: "discord"});
-  read(await m.idle(1500), "idle");
-  const want = ["posted", "posted text", "claimed", "s3", "call", "call_failed", "repair_pass"];
-  const missing = want.filter(k => !seen.has(k));
+  await call({op: "verify", store: "dc-1"});
+  read(await m.idle(5000), "idle"); // the repair; the outboxes pruned
+  // A reload whose page did not close: node 2's Discord log is still leased.
+  const again = await node(env);
+  const {events} = await again.op({op: "open", config: cluster});
+  read(events, "reopen");
+  const want = [...EVENT_TYPES.filter(k => k !== "raft"), "posted text", "raft chat sent", "raft chat read", "raft grpc sent", "raft chat answered"];
+  // Every message, but a stream failing mid-read (a wiped copy fails as it
+  // opens: "store call failed"), which nothing here can time.
+  const lines = [...Object.values(MESSAGES).filter(m => m !== MESSAGES.failover), "<Op> ok"];
+  const missing = [...want.filter(k => !seen.has(k)), ...lines.filter(m => !said.has(m)).map(m => `"${m}"`)];
   console.error(`events: ${[...seen].map(([k, op]) => `${k} (${op})`).join(", ")}`);
   if (missing.length) throw new Error(`the demo no longer reads: ${missing.join(", ")}`);
   console.error("events ok");
