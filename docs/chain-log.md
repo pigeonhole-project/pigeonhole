@@ -281,9 +281,16 @@ Where the code differs from the design above:
   process appended (an `fstat` of the active segment; the directory is
   listed only when it grew or is full). The chain (`next`, `tail`) is an
   in-memory index rebuilt by a scan on open; the last record's crc is
-  checked and a torn one truncated. A delete sets `DEAD` in the header and
-  punches a hole over the data (`F_PUNCHHOLE` / `FALLOC_FL_PUNCH_HOLE`); a
-  segment with no live record is removed. A `local_disk` `[meta]` store
+  checked and a torn one truncated (anything at the end of the last
+  segment that is not a whole record, a header without its magic too,
+  unless a whole record follows it: that is corruption). A delete sets
+  `DEAD` in the header and punches a hole over the data (`F_PUNCHHOLE` /
+  `FALLOC_FL_PUNCH_HOLE`), syncs the segments it touched, and removes a
+  segment with no live record (then syncs the directory); it bumps a
+  counter in `<dir>/deletes`, and another handle that sees it moved reads
+  its live records' headers again. A removed segment's chain members keep
+  their labels in the index, so a deposed writer putting after one loses
+  to a named winner (`Fenced`), as on memory. A `local_disk` `[meta]` store
   keeps the log in `<path>/log` and the snapshots in `<path>/snapshots`.
   `LocalLogStore` / `LocalSnapshotStore` are gone.
 - **Benchmark** (`log::chain::tests::disk::bench_disk_logs`, release, macOS,
