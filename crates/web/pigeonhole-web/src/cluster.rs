@@ -7,16 +7,17 @@
 
 use crate::World;
 use anyhow::{Context, Result};
-use openraft_chat::{ChatNetwork, FakeChat, Mailbox, Settings};
+use openraft_chat::{ChatNetwork, Mailbox};
 use openraft_grpc::{Direct, DirectNetwork, Mixed};
-use pigeonhole_config::cluster::{ClusterSettings, Link};
+use pigeonhole_config::cluster::ClusterSettings;
 use pigeonhole_config::Config;
 use pigeonhole_fake_channels::TelegramChannel;
 use pigeonhole_meta::raft::TypeConfig;
-use pigeonhole_meta::{Cluster, Serve};
+use pigeonhole_meta::Cluster;
+use pigeonhole_node::cluster::{chat_network, idle_chat, via_chat};
 use pigeonhole_raft_telegram::TelegramMailbox;
 use pigeonhole_storage_telegram::fake::bot::FakeBot;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -107,36 +108,19 @@ impl Net {
     /// Node `cluster.node`'s side of the cluster, for its tablet.
     pub async fn cluster(&self, world: &World, cfg: &Config, cluster: &ClusterSettings) -> Result<Cluster<Network>> {
         let me = cluster.node;
-        let via_chat: HashSet<u64> =
-            cluster.links().into_iter().filter(|(_, l)| *l == Link::Chat).map(|(id, _)| id).collect();
-        let settings = Settings {
-            cluster: cluster.id,
-            key: cluster.key,
-            tick: cluster.tick,
-            poll: cluster.poll,
-            keep: Some(2 * cluster.election_timeout.1),
-        };
-        let chat = if via_chat.is_empty() {
-            let idle = FakeChat::new();
-            ChatNetwork::new(me, settings, idle.mailbox(me, me), HashMap::new())
+        let peers = via_chat(cluster);
+        let chat: ChatNetwork<TypeConfig> = if peers.is_empty() {
+            idle_chat(cluster)
         } else {
-            let mut peers = HashMap::new();
-            for &peer in &via_chat {
-                peers.insert(peer, self.outbox(world, cfg, cluster, peer, me).await?);
+            let mut outboxes = HashMap::new();
+            for &peer in &peers {
+                outboxes.insert(peer, self.outbox(world, cfg, cluster, peer, me).await?);
             }
-            ChatNetwork::new(me, settings, self.outbox(world, cfg, cluster, me, me).await?, peers)
+            chat_network(cluster, self.outbox(world, cfg, cluster, me, me).await?, outboxes)
         };
-        let (hub, serving) = (self.direct.clone(), chat.clone());
-        let serve: Serve = Box::new(move |raft| {
-            Box::pin(async move {
-                let raft = Arc::new(raft);
-                hub.serve(me, raft.clone());
-                serving.serve(raft).await;
-            })
-        });
-        let network = Mixed { a: self.direct.network(me), b: chat, via_b: via_chat };
-        let members = cluster.nodes.iter().map(|n| n.id).collect();
-        Ok(Cluster { node: me, members, network, serve: Some(serve) })
+        let hub = self.direct.clone();
+        let direct = self.direct.network(me);
+        Ok(pigeonhole_node::cluster::cluster(cluster, direct, chat, move |raft| hub.serve(me, raft)))
     }
 
     /// Cuts node `node` off from the others, or brings it back: its direct
@@ -175,8 +159,28 @@ impl Nodes {
         // election timeout (seconds).
         let opened =
             futures::future::join_all(configs.iter().rev().map(|cfg| crate::Node::open_in(world, cfg, &net))).await;
-        let nodes = ids.into_iter().zip(opened.into_iter().rev()).map(|(id, n)| Ok((id, n?))).collect::<Result<_>>()?;
-        Ok(Self { nodes, net, cluster })
+        let (mut nodes, mut failed) = (std::collections::BTreeMap::new(), None);
+        for (id, node) in ids.into_iter().zip(opened.into_iter().rev()) {
+            match node {
+                Ok(node) => {
+                    nodes.insert(id, node);
+                }
+                Err(e) => {
+                    failed.get_or_insert_with(|| e.context(format!("node {id}")));
+                }
+            }
+        }
+        let nodes = Self { nodes, net, cluster };
+        match failed {
+            None => Ok(nodes),
+            // The nodes that did open let their logs go: the next boot claims them at once.
+            Some(e) => {
+                if let Err(close) = nodes.close().await {
+                    tracing::warn!(error = %format!("{close:#}"), "closing the nodes of a cluster that did not open");
+                }
+                Err(e)
+            }
+        }
     }
 
     /// The node that leads, if one does. A leader cut off still thinks it
@@ -200,11 +204,16 @@ impl Nodes {
         Ok(())
     }
 
-    /// Stops every node, as their processes' exits would.
+    /// Stops every node, as their processes' exits would; the first
+    /// error, once every node was asked.
     pub async fn close(&self) -> Result<()> {
+        let mut first = Ok(());
         for n in self.nodes.values() {
-            n.close().await?;
+            let closed = n.close().await;
+            if first.is_ok() {
+                first = closed;
+            }
         }
-        Ok(())
+        first
     }
 }

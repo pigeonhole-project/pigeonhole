@@ -12,12 +12,9 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 pigeonhole-admin = { workspace = true }
 async-trait = { workspace = true }
-pigeonhole-types = { workspace = true }
-chrono = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
-http = { workspace = true }
 openraft = { workspace = true }
 openraft-chat = { workspace = true }
 openraft-grpc = { workspace = true }
@@ -28,14 +25,11 @@ pigeonhole-config = { workspace = true, features = ["fake"] }
 pigeonhole-fake-channels = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-meta = { workspace = true }
+pigeonhole-node = { workspace = true }
 pigeonhole-storage-api = { workspace = true, features = ["fake"] }
 pigeonhole-storage-discord = { workspace = true, features = ["fake"] }
-pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true, features = ["fake"] }
-postcard = { workspace = true }
-s3s = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -14,6 +14,7 @@ pigeonhole-admin = { workspace = true }
 pigeonhole-blob = { workspace = true }
 pigeonhole-config = { workspace = true, features = ["fake"] }
 pigeonhole-meta = { workspace = true }
+pigeonhole-node = { workspace = true }
 pigeonhole-storage-api = { workspace = true, features = ["fake"] }
 pigeonhole-storage-discord = { workspace = true, features = ["fake"] }
 pigeonhole-storage-disk = { workspace = true }

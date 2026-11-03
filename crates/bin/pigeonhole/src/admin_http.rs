@@ -31,9 +31,10 @@ pub fn router(dynamic: Arc<DynConfig>) -> Router {
         .with_state(dynamic)
 }
 
-/// [`router`], the UI's ops on `admin`, and the UI from `ui_dir`.
-pub fn with_ui(dynamic: Arc<DynConfig>, admin: Arc<Admin>, ui_dir: Option<&std::path::Path>) -> Router {
-    let app = router(dynamic).merge(Router::new().route("/admin/ops", post(ops)).with_state(admin));
+/// [`router`] of `admin`'s dynamic config, the UI's ops on `admin`, and
+/// the UI from `ui_dir`.
+pub fn with_ui(admin: Arc<Admin>, ui_dir: Option<&std::path::Path>) -> Router {
+    let app = router(admin.dynamic.clone()).merge(Router::new().route("/admin/ops", post(ops)).with_state(admin));
     match ui_dir {
         Some(dir) => app.fallback_service(tower_http::services::ServeDir::new(dir)),
         None => app,

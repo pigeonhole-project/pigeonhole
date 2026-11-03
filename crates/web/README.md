@@ -1,11 +1,19 @@
 # pigeonhole in the browser
 
 `pigeonhole-web` reads a `pigeonhole.toml` with pigeonhole-config, as the
-binary does, and builds the stack the binary builds from it — the metadata
-tablet on openraft, the blob stores and their replica group, the chunk store
-with zstd, the S3 handlers — in one process, without HTTP, for
-`wasm32-wasip1`. The site runs it in a Web Worker under a WASI shim
-(`site/src/assets/web-worker.js`, `wasi.js`).
+binary does, and assembles the node the binary assembles from it, with the
+same code (`pigeonhole-node`: the metadata tablet on openraft, the blob
+stores and their replica group, the chunk store with zstd, the S3 handlers,
+the admin, the background loops) — in one process, without HTTP, for
+`wasm32-wasip1`. What it adds is how it reaches the channels: every one is
+a fake (`pigeonhole_fake_channels::Fakes`; a real one is refused), and its
+memory stores outlive a restart. The site runs it in a Web Worker under a
+WASI shim (`site/src/assets/web-worker.js`, `wasi.js`).
+
+A cluster's nodes boot together (`cluster::Nodes`); if one fails, the ones
+that opened are closed again, as are the nodes of a boot whose first write
+(the demo's bucket) fails: nothing is left holding a log the next boot
+claims.
 
 The demo's config (`pigeonhole-web/demo.toml`) has the real `telegram` and
 `discord` stores on fake channels (`fake = "channel-data"`,

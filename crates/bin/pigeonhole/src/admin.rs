@@ -1,14 +1,14 @@
 //! Binary-only: offline maintenance subcommands (`purge`, `restore`).
 
-use crate::runtime::open_runtime;
+use crate::runtime;
 use anyhow::{bail, Context};
 use pigeonhole::config::Config;
-use pigeonhole::index::Index;
-use pigeonhole_chunk_store::Sweeper;
+use pigeonhole_node::Stack;
 use tracing::{info, warn};
 
 /// Delete every upload, object and bucket, releasing their chunks. Backend
-/// blobs are then reclaimed by the sweeper.
+/// blobs are then reclaimed by a sweeper pass (the dynamic config's knobs);
+/// what it leaves, the next server's sweeper takes.
 pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<()> {
     let cfg = Config::load().context("load config")?;
     if cfg.instances.iter().all(|i| i.kind == pigeonhole::instances::InstanceKind::Memory) {
@@ -20,39 +20,36 @@ pub async fn cmd_purge(yes: bool, expect_chat: Option<&str>) -> anyhow::Result<(
             bail!("--expect-chat mismatch: config scope_id={scope} got {expected}");
         }
     }
-    let rt = open_runtime(&cfg).await.context("open runtime")?;
-    let index = Index::open(rt.meta.clone()).await.context("open index")?;
-    let objects = index.count_objects().await.unwrap_or(0);
-    let buckets = index.count_buckets().await.unwrap_or(0);
-    info!(
-        scope_id = %scope,
-        objects,
-        buckets,
-        "purge plan: delete every upload, object and bucket"
-    );
+    // Its loops stay off: the one sweep is this command's.
+    let node = runtime::open(&cfg, |ns| ns, &[]).await.context("open the node")?;
+    let purged = purge(&node, scope, yes).await;
+    let closed = node.close().await.context("release the metadata log");
+    crate::fakes::close().await?;
+    purged.and(closed)
+}
+
+async fn purge(node: &Stack, scope: &str, yes: bool) -> anyhow::Result<()> {
+    let objects = node.index.count_objects().await.unwrap_or(0);
+    let buckets = node.index.count_buckets().await.unwrap_or(0);
+    info!(scope_id = %scope, objects, buckets, "purge plan: delete every upload, object and bucket");
     if !yes {
         bail!(
             "refusing to purge (scope_id={scope}, objects={objects}). \
              Re-run with: pigeonhole purge --yes [--expect-chat {scope}]"
         );
     }
-
-    let released = index.delete_everything().await.context("delete gateway index")?;
-    rt.store.release(&released).await.context("release object chunks")?;
-
+    let released = node.index.delete_everything().await.context("delete gateway index")?;
+    node.store.release(&released).await.context("release object chunks")?;
     // Reclaim the released chunks now; orphans below the horizon (seeded from
     // the committed parts) go too.
-    let members: Vec<_> = rt.store.replicated().members().to_vec();
-    let pins = rt.store.replicated().pins().clone();
-    let sweeper = Sweeper::new(rt.store.db().clone(), members, cfg.sweep.clone(), pins);
-    match sweeper.sweep_once().await {
+    match node.sweep().await {
         Ok(stats) => info!(
             zero_ref_chunks = stats.zero_ref_chunks,
             keys_deleted = stats.keys_deleted,
             failed = ?stats.failed,
             "purge sweeper pass complete"
         ),
-        Err(e) => warn!(error = %e, "purge sweeper pass failed; background sweeper will retry"),
+        Err(e) => warn!(error = %format!("{e:#}"), "purge sweeper pass failed; the background sweeper will retry"),
     }
     info!("purge complete: gateway index emptied, chunks released");
     Ok(())
@@ -65,9 +62,8 @@ pub async fn cmd_restore(lossy: bool) -> anyhow::Result<()> {
     if !lossy {
         bail!("restore from a snapshot loses every change after it; re-run with --lossy to accept");
     }
-    let log = crate::runtime::open_log(&cfg).await?;
-    let snapshots = crate::runtime::open_snapshots(&cfg).await?;
-    let position = pigeonhole_meta::restore_lossy(log.as_ref(), snapshots.as_ref()).await?;
+    let stores = runtime::open_meta_stores(&cfg).await?;
+    let position = pigeonhole_meta::restore_lossy(stores.log.as_ref(), stores.snapshots.as_ref()).await?;
     warn!(position, "metadata restored from a stored snapshot; changes after it are lost");
-    Ok(())
+    crate::fakes::close().await
 }

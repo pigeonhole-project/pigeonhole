@@ -205,24 +205,18 @@ async fn start(text: String) -> anyhow::Result<Value> {
     if let Some(old) = &old {
         old.close().await?;
     }
-    let nodes = match Nodes::open(&world, &text).await {
-        Ok(nodes) => nodes,
+    let (nodes, replayed) = match open_with_bucket(&world, &text).await {
+        Ok(opened) => opened,
         Err(e) => {
             // Back on the config that ran: its tablets claim their logs again.
             if old.is_some() {
                 let previous = CONFIG.with(|c| c.borrow().clone());
-                NODES.with(|n| n.borrow_mut().take());
                 let nodes = Nodes::open(&world, &previous).await?;
                 NODES.with(|n| *n.borrow_mut() = Some(Rc::new(nodes)));
             }
             return Err(e);
         }
     };
-    let leader = nodes.node(None)?;
-    let replayed = leader.replayed();
-    if leader.list("demo").await.is_err() {
-        leader.create_bucket("demo").await?;
-    }
     let ids: Vec<u64> = nodes.nodes.keys().copied().collect();
     let leading = nodes.leader();
     NODES.with(|n| *n.borrow_mut() = Some(Rc::new(nodes)));
@@ -230,6 +224,30 @@ async fn start(text: String) -> anyhow::Result<Value> {
     let _ = std::fs::write(SAVED_CONFIG, &text);
     CONFIG.with(|c| *c.borrow_mut() = text);
     Ok(json!({ "replayed": replayed, "restarted": old.is_some(), "nodes": ids, "leader": leading }))
+}
+
+/// The nodes `text` describes, booted, with the demo's bucket (made on the
+/// first boot); how many entries the leader replayed. A failed first write
+/// closes them: nothing is left running to fence the next boot.
+async fn open_with_bucket(world: &Arc<World>, text: &str) -> anyhow::Result<(Nodes, u64)> {
+    let nodes = Nodes::open(world, text).await?;
+    let greeted = async {
+        let leader = nodes.node(None)?;
+        if leader.list("demo").await.is_err() {
+            leader.create_bucket("demo").await?;
+        }
+        anyhow::Ok(leader.replayed())
+    }
+    .await;
+    match greeted {
+        Ok(replayed) => Ok((nodes, replayed)),
+        Err(e) => {
+            if let Err(close) = nodes.close().await {
+                tracing::warn!(error = %format!("{close:#}"), "closing nodes whose first write failed");
+            }
+            Err(e)
+        }
+    }
 }
 
 async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {

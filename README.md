@@ -217,8 +217,9 @@ A Cargo workspace under `crates/`, by role:
 | `gateway/` | S3 and REAPI |
 | `config/pigeonhole-config` | `pigeonhole.toml` into a `Config`, the dynamic config |
 | `admin/pigeonhole-admin` | the admin ops, shared by a real node and the demo |
-| `bin/pigeonhole` | the binary: wiring, HTTP, the Raft runtime, the CLI |
-| `web/pigeonhole-web` | the binary's stack for wasm (the demo) |
+| `node/pigeonhole-node` | the node assembled from a `Config` (tablet, chunk store, S3 handlers, admin, background loops), the same for the binary and the demo |
+| `bin/pigeonhole` | the binary: the real channels, HTTP, the Raft runtime, the CLI |
+| `web/pigeonhole-web` | the node for wasm on fake channels (the demo) |
 | `testing/` | conformance suites, the simulation, fake channels |
 
 Layering is enforced by `./scripts/check-deps.sh --strict`. How agents and

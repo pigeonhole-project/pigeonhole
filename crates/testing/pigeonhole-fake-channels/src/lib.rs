@@ -10,7 +10,8 @@
 //! tell it from the node's (the site hides it).
 //!
 //! [`World`] holds a process's fake channels and builds the node's stores on
-//! them; [`FakeView`] shows them to the admin's UI.
+//! them ([`Fakes`]: as the node's assembly asks); [`FakeView`] shows them to
+//! the admin's UI.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -147,9 +148,11 @@ pub async fn discord(channel: u64, stores: Stores) -> Result<DiscordChannel> {
     Ok(FakeDiscord::on(channel, TabletHost::open(stores, &format!("discord:{channel}")).await?))
 }
 
+mod opener;
 pub mod view;
 pub mod world;
 
+pub use opener::Fakes;
 pub use view::FakeView;
 pub use world::World;
 
