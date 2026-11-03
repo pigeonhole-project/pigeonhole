@@ -1,12 +1,12 @@
 # Glossary
 
-Terms used in code, comments, and docs (Stage B onward).
+Terms used in code, comments, and docs.
 
 | Term | Meaning | Size | Mutability | Owner |
 |---|---|---|---|---|
 | **Store** (instance) | Where bytes live, a `[[store]]`: a dir, or bot + chat/channel (`tg-main`, `dc-backup`) | — | config | `storage-*` + config |
 | **Replica group** | `[[replicas]]`: stores that each get a copy of every chunk written to the group | — | config | `Replicated` |
-| **Shard** | One member of `[[shards]]` (a store or replica group); a chunk lives in exactly one shard | — | config | `Replicated` |
+| **Shard** | One member of `[[shards]]` (a store or replica group); a chunk lives in exactly one shard. The chunk records it (`ChunkRec::shard`: the shard's stores at its write, plus those repair copied it to): repair copies a chunk only within the placement shard that holds its recorded stores (a store that joins that shard is backfilled); a re-sharding that puts them in different shards fails the chunk's repair jobs loudly (parked as unrepairable) instead of dropping them | — | config; recorded per chunk | `Replicated` + chunk store |
 | **Blob** | One message in one instance; address is `BlobLocator` | ≤ instance `max_blob_size` | immutable | blob storage (stateless) |
 | **Block** | Chunk slice; unit of compression and Range | ~1 MiB logical | immutable | codec + chunk-store metadata |
 | **Chunk** | Logical immutable storage unit: `ChunkId`, size, CRC, refcount; independent of backend limits | ≤ `chunk.size` stored (19 MiB), ≤ 256 MiB logical | immutable (`refs` / replica set may change) | chunk store |
@@ -26,7 +26,7 @@ Terms used in code, comments, and docs (Stage B onward).
 | **Owner** | A deployment's 32 random bits, chosen once and kept in the tablet; in every blob id it mints and in a marker pinned in each channel store, so two deployments never sweep each other's blobs ([store-owner.md](store-owner.md)) | u32 | fixed | tablet + chunk store |
 | **Inline object** | An object of at most `[inline] max_object_size` kept in its metadata record instead of chunks; the cooler moves it out once cold ([inline-objects.md](inline-objects.md)) | ≤ 1 KiB default | until cooled | S3 gateway + tablet |
 | **Upload pin** | Process-local mark of an upload not committed yet; with the others it sets the sweep **horizon** | — | until commit | `UploadPins` |
-| **Read pin** | Process-local mark of a chunk being read; reclaim waits for it | — | for one read | `BlobDb` |
+| **Read pin** | Process-local mark of a chunk being read; reclaim waits for it | — | while the read's stream lives | `BlobDb` (`ReadStream` holds it) |
 | **Snapshot** | All namespace states as of a position (`TabletSnapshot`), kept in a **SnapshotStore** (`local_disk`, `memory`, `telegram`, `discord`) | state size | replaced | tablet |
 | **Base** | The stored snapshot a log starts from (`at` + `SnapshotRef`), set by `rebase`; entries ≤ `at` are dropped | — | moves forward | `LogStore` |
 | **Node** | One process of a Raft cluster, with its own copy of the tablet (its own log and snapshots) and the shared blob stores ([cluster.md](cluster.md)) | — | config | binary |

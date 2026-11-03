@@ -38,7 +38,7 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::counter(
         "pigeonhole_cache_requests_total",
         &["level", "outcome"],
-        "Block cache lookups: hit, miss (loaded the block), collapsed (waited for another lookup's load)",
+        "Block cache lookups: hit, miss",
     ),
     MetricDoc::gauge("pigeonhole_cache_bytes", &["level"], "Bytes held by a block cache level"),
     MetricDoc::gauge("pigeonhole_cache_entries", &["level"], "Blocks held by a block cache level"),
@@ -46,8 +46,10 @@ pub const METRICS: &[MetricDoc] = &[
     MetricDoc::histogram("pigeonhole_ingest_budget_wait_seconds", &[], "Time PUTs wait for the ingest memory budget (waits > 0 only)"),
     MetricDoc::histogram("pigeonhole_background_pass_seconds", &["task", "outcome"], "Duration of a sweep / repair pass"),
     MetricDoc::counter("pigeonhole_sweep_keys_total", &["outcome"], "Sweeper outcomes: deleted keys, live keys skipped, zero-ref chunks reclaimed"),
-    MetricDoc::counter("pigeonhole_repair_jobs_total", &["outcome"], "Repair job outcomes"),
+    MetricDoc::gauge("pigeonhole_sweep_retired_left", &[], "Reclaimed chunks kept because parts of theirs are on stores no longer configured"),
+    MetricDoc::counter("pigeonhole_repair_jobs_total", &["outcome"], "Repair job outcomes: repaired, scrub_enqueued, skipped_budget, skipped_noop, failed, parked (given up on)"),
     MetricDoc::gauge("pigeonhole_repair_queue_depth", &[], "Pending repair jobs"),
+    MetricDoc::gauge("pigeonhole_repair_unrepairable", &[], "Repair jobs parked as unrepairable: they failed too often"),
     MetricDoc::counter("pigeonhole_chunk_gone_total", &[], "Retains that failed: the chunk was reclaiming or missing"),
     MetricDoc::counter("pigeonhole_double_release_total", &[], "Releases of a chunk whose refs were already 0"),
 ];
@@ -228,8 +230,16 @@ pub fn record_repair(outcome: &str, n: u64) {
     .increment(n);
 }
 
+pub fn set_sweep_retired_left(n: u64) {
+    metrics::gauge!("pigeonhole_sweep_retired_left").set(n as f64);
+}
+
 pub fn set_repair_queue_depth(n: u64) {
     metrics::gauge!("pigeonhole_repair_queue_depth").set(n as f64);
+}
+
+pub fn set_repair_unrepairable(n: u64) {
+    metrics::gauge!("pigeonhole_repair_unrepairable").set(n as f64);
 }
 
 pub fn record_replica_selected(instance: &str) {

@@ -1,4 +1,5 @@
-//! Stage I: replica repair / backfill with re-packing onto the target instance.
+//! Replica repair and backfill: copy a chunk onto a member of its shard
+//! that lacks it, re-packed into that store's blob size.
 
 use crate::blob_db::{BlobDb, ChunkId, StoredBlock};
 use anyhow::{bail, Context, Result};
@@ -53,6 +54,8 @@ pub struct RepairStats {
     pub skipped_budget: u64,
     pub skipped_noop: u64,
     pub failed: u64,
+    /// Jobs given up on in this pass ([`crate::Unrepairable`]).
+    pub parked: u64,
 }
 
 /// Background repair / backfill worker.
@@ -106,6 +109,7 @@ impl Repairer {
                 pigeonhole_blob::record_repair("skipped_budget", stats.skipped_budget);
                 pigeonhole_blob::record_repair("skipped_noop", stats.skipped_noop);
                 pigeonhole_blob::record_repair("failed", stats.failed);
+                pigeonhole_blob::set_repair_unrepairable(self.db.unrepairable().len() as u64);
                 if let Ok(depth) = self.db.repair_queue_len().await {
                     pigeonhole_blob::set_repair_queue_depth(depth);
                 }
@@ -131,7 +135,10 @@ impl Repairer {
 
     /// Single pass: optional scrub, then up to `batch_size` jobs, copied
     /// `concurrency` at a time; the copies made are committed in one entry.
+    /// One pass at a time per tablet: a pass asked for while another runs
+    /// (any repairer's) waits for it, so no job is copied twice at once.
     pub async fn repair_once(&self) -> Result<RepairStats> {
+        let _pass = self.db.repair_pass().await;
         let mut stats = RepairStats::default();
         if self.config.scrub {
             stats.scrub_enqueued = self.scrub_enqueue().await?;
@@ -153,16 +160,11 @@ impl Repairer {
                     stats.skipped_noop += 1;
                     let _ = self.db.dequeue_repair(chunk_id, &instance_id).await;
                 }
-                Ok(Copied::DeferredBudget) => stats.skipped_budget += 1,
-                Err(e) => {
-                    stats.failed += 1;
-                    warn!(
-                        chunk_id,
-                        instance = %instance_id,
-                        error = %e,
-                        "repair job failed"
-                    );
+                Ok(Copied::DeferredBudget) => {
+                    stats.skipped_budget += 1;
+                    self.db.repair_deferred(chunk_id, &instance_id);
                 }
+                Err(e) => self.failed(chunk_id, &instance_id, &e, &mut stats),
             }
         }
         self.commit(ready, &mut stats).await;
@@ -181,8 +183,10 @@ impl Repairer {
         let added = match self.db.commit_instance_replicas(&replicas, pins).await {
             Ok(added) => added,
             Err(e) => {
-                stats.failed += ready.len() as u64;
-                warn!(jobs = ready.len(), error = %e, "commit repaired replicas failed");
+                let e = e.context("commit repaired replicas");
+                for r in &ready {
+                    self.failed(r.chunk_id, &r.layout.instance, &e, stats);
+                }
                 return;
             }
         };
@@ -196,6 +200,18 @@ impl Repairer {
                 stats.skipped_noop += 1;
                 self.discard(&r).await;
             }
+        }
+    }
+
+    /// A job failed: it backs off, or is parked once it failed too often.
+    fn failed(&self, chunk_id: ChunkId, instance: &str, e: &anyhow::Error, stats: &mut RepairStats) {
+        stats.failed += 1;
+        let error = format!("{e:#}");
+        if self.db.repair_failed(chunk_id, instance, &error) {
+            stats.parked += 1;
+            warn!(chunk_id, instance, error, "repair job failed too often; parked as unrepairable");
+        } else {
+            warn!(chunk_id, instance, error, "repair job failed; retried later");
         }
     }
 
@@ -224,8 +240,8 @@ impl Repairer {
         Ok(n)
     }
 
-    /// Verify `instance_id`: probe each live replica it holds (its first
-    /// part) and enqueue a repair for every one that is gone. A store that
+    /// Verify `instance_id`: probe each live replica it holds (every part)
+    /// and enqueue a repair for every one that lost a part. A store that
     /// lost blobs behind our back (a cleared channel) is found without a
     /// read happening to hit it; scrub only sees what the metadata lacks.
     /// How many replicas it checked, and how many were gone.
@@ -239,8 +255,7 @@ impl Repairer {
             let Some(layout) = layouts.iter().find(|l| l.instance == instance_id) else { continue };
             checked += 1;
             // A store that cannot answer fails the pass: gone is only what it says is gone.
-            let part = layout.parts.first().context("verify: a replica without parts")?;
-            if !target.exists(&part.locator).await.with_context(|| format!("verify {instance_id}"))? {
+            if !replica_intact(&target, layout).await.with_context(|| format!("verify {instance_id}"))? {
                 warn!(chunk_id, instance = instance_id, "verify: the replica is gone");
                 self.db.enqueue_repair(chunk_id, instance_id).await?;
                 gone += 1;
@@ -273,22 +288,21 @@ impl Repairer {
             return Ok(Copied::Noop);
         };
 
-        let layouts = self.db.get_replica_layouts(chunk_id).await?;
         // A chunk belongs to the shard it was written to; never copy it into
         // another shard.
-        let peers = self.replicated.shard_peers(instance_id).unwrap_or_default();
-        if !layouts.iter().any(|l| peers.iter().any(|p| p.instance().id == l.instance)) {
+        let shard = self.db.chunk_shard(chunk_id).unwrap_or_default();
+        if !self.shard_admits(chunk_id, &shard, instance_id)? {
             self.db.dequeue_repair(chunk_id, instance_id).await?;
             return Ok(Copied::Noop);
         }
-        if layouts.iter().any(|l| l.instance == instance_id) {
-            // Already present; still allow re-pack if caller deleted backend blobs
-            // and re-enqueued. Detect healthy replica by probing the first part.
-            if let Some(existing) = layouts.iter().find(|l| l.instance == instance_id) {
-                if replica_probe_ok(&target, existing).await {
-                    self.db.dequeue_repair(chunk_id, instance_id).await?;
-                    return Ok(Copied::Noop);
-                }
+        let layouts = self.db.get_replica_layouts(chunk_id).await?;
+        // A replica recorded there is copied again only if the store says
+        // a part of it is gone; a store that cannot answer (rate limited,
+        // down) fails the job, it never gets a second copy.
+        if let Some(existing) = layouts.iter().find(|l| l.instance == instance_id) {
+            if replica_intact(&target, existing).await.context("probe the replica")? {
+                self.db.dequeue_repair(chunk_id, instance_id).await?;
+                return Ok(Copied::Noop);
             }
         }
 
@@ -333,6 +347,28 @@ impl Repairer {
     }
 }
 
+impl Repairer {
+    /// Whether a chunk that belongs on `shard` (as recorded in it) belongs
+    /// on `target` too: `target`'s shard in the placement holds every
+    /// instance of `shard` still in it. None of them: a job aimed at another
+    /// shard (`false`). Some, not all: a re-sharding moved the chunk's
+    /// stores apart, and no copy is right; an error, so the job fails (and
+    /// is parked) where it shows, not dropped in silence.
+    fn shard_admits(&self, chunk_id: ChunkId, shard: &[String], target: &str) -> Result<bool> {
+        let peers = self.replicated.shard_peers(target).unwrap_or_default();
+        let placed: Vec<&str> =
+            shard.iter().map(String::as_str).filter(|i| self.replicated.member(i).is_some()).collect();
+        let inside = placed.iter().filter(|&&i| peers.iter().any(|p| p.instance().id == i)).count();
+        if inside > 0 && inside < placed.len() {
+            bail!(
+                "chunk {chunk_id} belongs on {shard:?}, which the placement now splits over several shards; \
+                 put these stores back in one shard"
+            );
+        }
+        Ok(inside > 0)
+    }
+}
+
 /// What [`Repairer::copy_one`] did.
 enum Copied {
     Ready(Ready),
@@ -359,13 +395,19 @@ fn within_cost_budget(
     get.wait_secs <= max_wait && put.wait_secs <= max_wait
 }
 
-/// The replica's first part is in the store, asked of the store (a cache
-/// of ours could still hold a deleted text blob); any failure counts as gone.
-async fn replica_probe_ok(backend: &SharedBackend, layout: &ReplicaLayout) -> bool {
-    let Some(part) = layout.parts.first() else {
-        return false;
-    };
-    backend.exists(&part.locator).await.unwrap_or(false)
+/// Every part of the replica is in the store, asked of the store (a cache
+/// of ours could still hold a deleted text blob). `Err` when the store
+/// cannot answer: gone is only what it says is gone.
+async fn replica_intact(backend: &SharedBackend, layout: &ReplicaLayout) -> Result<bool> {
+    if layout.parts.is_empty() {
+        return Ok(false);
+    }
+    for part in &layout.parts {
+        if !backend.exists(&part.locator).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Read stored block payloads from any live source replica (ChunkId unchanged).
@@ -375,11 +417,8 @@ async fn read_encoded_blocks(
     blocks: &[StoredBlock],
 ) -> Result<Vec<EncodedBlock>> {
     if blocks.is_empty() {
-        // Raw single-part chunk (no chunk_blocks rows).
-        let raw = collect_stream(replicated.read(sources, 0..1).await.context("repair read raw")?).await?;
-        return Ok(vec![EncodedBlock { stored: raw.clone(), logical_len: raw.len() as u32 }]);
+        bail!("repair: a chunk without blocks");
     }
-
     let end = blocks.len() as u32;
     let blob = collect_stream(replicated.read(sources, 0..end).await.context("repair read blocks")?).await?;
 
@@ -480,7 +519,7 @@ mod tests {
         .with_instance_id("b-10");
         let b: SharedBackend = Arc::new(erase(b_store));
         let rep2 = Arc::new(Replicated::new(vec![a, b.clone()], 1, Arc::new(CheapestFirst::new())).unwrap());
-        // Sync new instance into blob.db.
+        // The new instance, into the tablet.
         layer
             .db()
             .sync_instances(&rep2.members().iter().map(|m| m.instance().clone()).collect::<Vec<_>>())
@@ -554,6 +593,67 @@ mod tests {
         assert_eq!(where_is(on_b).await, vec!["b".to_string()]);
     }
 
+    /// A write that missed a member queues a copy for its own shard's
+    /// members only: never for the other shards' (shard size − 1 at most).
+    #[tokio::test]
+    async fn a_write_queues_repairs_in_its_own_shard_only() {
+        let down = |id: &str| {
+            let store = MemoryBlobStore::new().with_instance_id(id).with_unavailable_flag();
+            store.unavailable_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+            Arc::new(erase(store)) as SharedBackend
+        };
+        let (a1, b1) = (lim("a1", 4 * MIB), lim("b1", 4 * MIB));
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let rep = Arc::new(
+            Replicated::sharded(
+                vec![(vec![a1, down("a2")], 1), (vec![b1, down("b2")], 1)],
+                Arc::new(CheapestFirst::new()),
+            )
+            .unwrap(),
+        );
+        let layer =
+            ChunkStore::open_replicated(db.clone(), rep, IngestOptions::new(MIB, ChunkCodec::Raw)).await.unwrap();
+        for i in 0..4u8 {
+            let id = layer.put_small(Bytes::from(vec![i; 10])).await.unwrap();
+            let on = db.get_replica_layouts(id).await.unwrap().remove(0).instance;
+            let missed = if on == "a1" { "a2" } else { "b2" };
+            let jobs: Vec<_> = db.repair_jobs().await.into_iter().filter(|(c, _)| *c == id).collect();
+            assert_eq!(jobs, vec![(id, missed.to_string())], "chunk on {on}");
+        }
+    }
+
+    /// A re-sharding that moves a chunk's stores apart fails its repair
+    /// loudly (it used to be dropped as aimed at another shard).
+    #[tokio::test]
+    async fn a_split_shard_fails_the_job_loudly() {
+        let a1 = lim("a1", 4 * MIB);
+        let a2 = MemoryBlobStore::new().with_instance_id("a2").with_unavailable_flag();
+        let a2_down = a2.unavailable_flag();
+        let a2: SharedBackend = Arc::new(erase(a2));
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let rep = Arc::new(Replicated::new(vec![a1.clone(), a2.clone()], 1, Arc::new(CheapestFirst::new())).unwrap());
+        let layer =
+            ChunkStore::open_replicated(db.clone(), rep, IngestOptions::new(MIB, ChunkCodec::Raw)).await.unwrap();
+        a2_down.store(true, std::sync::atomic::Ordering::Relaxed);
+        let id = layer.put_small(Bytes::from_static(b"on a1 only")).await.unwrap();
+        a2_down.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(db.chunk_shard(id).unwrap(), vec!["a1".to_string(), "a2".to_string()]);
+        assert_eq!(db.repair_jobs().await, vec![(id, "a2".to_string())]);
+
+        let split =
+            Arc::new(Replicated::sharded(vec![(vec![a1], 1), (vec![a2], 1)], Arc::new(CheapestFirst::new())).unwrap());
+        let repairer = Repairer::new(db.clone(), split, RepairConfig { scrub: false, ..RepairConfig::default() });
+        let stats = repairer.repair_once().await.unwrap();
+        assert_eq!((stats.repaired, stats.failed), (0, 1));
+        assert_eq!(db.repair_jobs().await, vec![(id, "a2".to_string())], "kept, waiting");
+    }
+
     #[tokio::test]
     async fn lost_part_is_repaired() {
         let a: SharedBackend = Arc::new(erase(MemoryBlobStore::new().with_instance_id("a")));
@@ -583,6 +683,120 @@ mod tests {
         let a_layout = fixed.iter().find(|l| l.instance == "a").unwrap();
         let got = layer.read_from_replicas(chunk_id, 0, data.len(), std::slice::from_ref(a_layout)).await.unwrap();
         assert_eq!(got, data);
+    }
+
+    /// A job that cannot succeed (its only source is gone) no longer takes
+    /// the pass's slots: the jobs behind it are repaired in the next passes.
+    #[tokio::test]
+    async fn a_job_that_cannot_succeed_does_not_starve_the_queue() {
+        let a = lim("a", 4 * MIB);
+        let (_dir, layer, _) = open_layer(vec![a.clone()], 1, MIB, MIB).await;
+        let lost = layer.put_small(Bytes::from_static(b"lost")).await.unwrap();
+        let mut others = Vec::new();
+        for i in 0..3u8 {
+            others.push(layer.put_small(Bytes::from(vec![i; 100])).await.unwrap());
+        }
+        let keys: Vec<Vec<u8>> = layer.db().get_replica_layouts(lost).await.unwrap()[0]
+            .parts
+            .iter()
+            .map(|p| p.locator.key.clone())
+            .collect();
+        a.delete(&keys).await.unwrap();
+        let rep = add_b(&layer, a).await;
+        let config = RepairConfig { scrub: false, batch_size: 1, ..RepairConfig::default() };
+        let repairer = Repairer::new(layer.db().clone(), rep, config);
+        assert_eq!(repairer.enqueue_instance_backfill("b").await.unwrap(), 4);
+
+        let first = repairer.repair_once().await.unwrap();
+        assert_eq!((first.repaired, first.failed), (0, 1), "the lost chunk comes first and fails");
+        for _ in 0..3 {
+            assert_eq!(repairer.repair_once().await.unwrap().repaired, 1);
+        }
+        assert_eq!(layer.db().repair_jobs().await, vec![(lost, "b".to_string())], "only the lost one waits");
+        for id in others {
+            assert!(layer.db().get_replica_layouts(id).await.unwrap().iter().any(|l| l.instance == "b"));
+        }
+    }
+
+    /// Verify probes every part of a replica: one that lost only its last
+    /// part is found.
+    #[tokio::test]
+    async fn verify_finds_a_replica_that_lost_a_later_part() {
+        let a = lim("a", 2 * MIB);
+        let (_dir, layer, rep) = open_layer(vec![a.clone()], 1, 8 * MIB, MIB).await;
+        let data = Bytes::from(vec![5u8; 5 * MIB]);
+        let ingested = layer.ingest_and_commit(stream::iter(vec![Ok::<_, anyhow::Error>(data)]), None).await.unwrap();
+        let layout = layer.db().get_replica_layouts(ingested.extents[0].chunk).await.unwrap().remove(0);
+        assert!(layout.parts.len() >= 3, "{} parts", layout.parts.len());
+        a.delete(&[layout.parts.last().unwrap().locator.key.clone()]).await.unwrap();
+        let repairer = Repairer::new(layer.db().clone(), rep, RepairConfig { scrub: false, ..RepairConfig::default() });
+        assert_eq!(repairer.verify_instance("a").await.unwrap(), (1, 1));
+    }
+
+    /// A store that answers every probe "rate limited".
+    struct ProbeFails(Arc<MemoryBlobStore>);
+
+    #[async_trait::async_trait]
+    impl pigeonhole_blob::BlobBackend for ProbeFails {
+        type Id = <MemoryBlobStore as pigeonhole_blob::BlobBackend>::Id;
+        type Key = <MemoryBlobStore as pigeonhole_blob::BlobBackend>::Key;
+        fn instance(&self) -> &pigeonhole_blob::InstanceInfo {
+            self.0.instance()
+        }
+        fn limits(&self) -> &BackendLimits {
+            self.0.limits()
+        }
+        fn key(id: &Self::Id) -> Self::Key {
+            MemoryBlobStore::key(id)
+        }
+        fn cost(&self, op: OpKind, id: Option<&Self::Id>) -> pigeonhole_blob::CostHint {
+            self.0.cost(op, id)
+        }
+        async fn put(&self, data: Bytes, name: &str) -> Result<Self::Id> {
+            self.0.put(data, name).await
+        }
+        async fn get(
+            &self,
+            id: &Self::Id,
+            range: Option<pigeonhole_types::ByteRange>,
+        ) -> Result<pigeonhole_blob::BoxByteStream> {
+            self.0.get(id, range).await
+        }
+        async fn delete(&self, keys: &[Self::Key]) -> Result<()> {
+            self.0.delete(keys).await
+        }
+        async fn candidates(
+            &self,
+            owner: pigeonhole_blob::Owner,
+            after: Option<Self::Key>,
+            upto: Self::Key,
+            limit: usize,
+        ) -> Result<Vec<Self::Key>> {
+            self.0.candidates(owner, after, upto, limit).await
+        }
+        async fn mark_owner(&self, owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
+            self.0.mark_owner(owner).await
+        }
+        async fn exists(&self, _id: &Self::Id) -> Result<bool> {
+            Err(pigeonhole_blob::RateLimited { method: "exists", retry_after: Duration::from_secs(5) }.into())
+        }
+    }
+
+    /// A probe the store cannot answer fails the job: the replica is not
+    /// uploaded a second time.
+    #[tokio::test]
+    async fn a_probe_that_fails_is_a_job_failure_not_a_copy() {
+        let a = lim("a", 4 * MIB);
+        let b = Arc::new(MemoryBlobStore::new().with_instance_id("b"));
+        let b_shared: SharedBackend = Arc::new(erase(ProbeFails(b.clone())));
+        let (_dir, layer, rep) = open_layer(vec![a, b_shared], 2, MIB, MIB).await;
+        let id = layer.put_small(Bytes::from_static(b"on both")).await.unwrap();
+        assert_eq!(b.len(), 1);
+        layer.db().enqueue_repair(id, "b").await.unwrap();
+        let repairer = Repairer::new(layer.db().clone(), rep, RepairConfig { scrub: false, ..RepairConfig::default() });
+        let stats = repairer.repair_once().await.unwrap();
+        assert_eq!((stats.repaired, stats.failed), (0, 1));
+        assert_eq!(b.len(), 1, "no second copy");
     }
 
     /// The member set `[a]` grown to `[a, b]`, synced into the layer.

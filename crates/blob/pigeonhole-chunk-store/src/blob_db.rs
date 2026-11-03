@@ -14,6 +14,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// Failed copies after which a repair job is parked as [`Unrepairable`].
+pub const REPAIR_MAX_ATTEMPTS: u32 = 6;
+/// Wait after a repair job's first failure; doubled after each next one, up
+/// to [`REPAIR_BACKOFF_MAX`]. A deferred job (its stores busy) waits this
+/// long too, without counting as a failure.
+pub const REPAIR_BACKOFF: Duration = Duration::from_secs(30);
+pub const REPAIR_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// Chunk id, chosen by the proposer and never reused.
 pub type ChunkId = i64;
@@ -68,6 +78,13 @@ pub struct StoredBlock {
     pub crc32: u32,
 }
 
+/// A chunk's size and refs ([`BlobDb::chunk_meta`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkMeta {
+    pub logical_size: i64,
+    pub refs: i64,
+}
+
 /// What [`BlobDb::stats`] counts.
 #[derive(Debug, Default, Clone)]
 pub struct ChunkStats {
@@ -80,13 +97,39 @@ pub struct ChunkStats {
     pub stored_bytes: BTreeMap<String, u64>,
 }
 
+/// A repair job waiting in this process.
+#[derive(Debug, Clone, Copy)]
+struct RepairJob {
+    /// Enqueue order (a deferred job goes to the back).
+    seq: u64,
+    /// Failed copies so far.
+    attempts: u32,
+    /// Not taken before then (after a failure or a deferral).
+    not_before: Option<Instant>,
+}
+
+/// A repair job given up on after [`REPAIR_MAX_ATTEMPTS`] failed copies (no
+/// source can be read, the target refuses every upload): parked, so that
+/// it no longer takes a pass's slots from the jobs that can succeed. Kept
+/// until the chunk goes or [`BlobDb::retry_unrepairable`] queues it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unrepairable {
+    pub chunk_id: ChunkId,
+    pub instance: String,
+    pub attempts: u32,
+    /// The last failure.
+    pub error: String,
+}
+
 /// Progress of this process; lost on restart by design.
 #[derive(Default)]
 struct NodeLocal {
     sweep_cursor: HashMap<String, Vec<u8>>,
-    /// `(chunk, instance)` → enqueue order.
-    repair_queue: BTreeMap<(ChunkId, String), u64>,
+    /// `(chunk, instance)` → the job.
+    repair_queue: BTreeMap<(ChunkId, String), RepairJob>,
     repair_seq: u64,
+    /// Jobs given up on.
+    unrepairable: BTreeMap<(ChunkId, String), Unrepairable>,
     /// Reclaiming chunk → a log position at or after its `BeginReclaim`.
     reclaim_gates: HashMap<ChunkId, u64>,
 }
@@ -123,6 +166,17 @@ pub struct BlobDb {
     /// Next chunk id to hand out; ids are chosen by the proposer (see commands.rs).
     next_chunk_id: Arc<AtomicI64>,
     local: Arc<Mutex<NodeLocal>>,
+    /// One sweep pass at a time, one repair pass at a time, whoever runs
+    /// it (the background loop, the admin, a purge): every clone of this
+    /// view shares them.
+    passes: Arc<Passes>,
+}
+
+/// Held while a pass runs.
+#[derive(Default)]
+struct Passes {
+    sweep: tokio::sync::Mutex<()>,
+    repair: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for BlobDb {
@@ -148,6 +202,7 @@ impl BlobDb {
             read_pins: Arc::default(),
             next_chunk_id: Arc::new(AtomicI64::new(last + 1)),
             local: Arc::default(),
+            passes: Arc::default(),
         })
     }
 
@@ -166,11 +221,7 @@ impl BlobDb {
                     (false, false) => st.unreferenced += 1,
                 }
                 st.logical_bytes += c.logical_size.max(0) as u64;
-                let stored = if c.blocks.is_empty() {
-                    c.logical_size.max(0) as u64
-                } else {
-                    c.blocks.iter().map(|b| u64::from(b.stored_len)).sum()
-                };
+                let stored: u64 = c.blocks.iter().map(|b| u64::from(b.stored_len)).sum();
                 for instance in c.replicas.keys() {
                     *st.stored_bytes.entry(instance.clone()).or_default() += stored;
                 }
@@ -181,6 +232,16 @@ impl BlobDb {
 
     fn chunk<R>(&self, chunk_id: ChunkId, f: impl FnOnce(&ChunkRec) -> R) -> Option<R> {
         self.read(|s| s.chunks.get(&chunk_id).map(f))
+    }
+
+    /// Held for a sweep pass: another one waits.
+    pub(crate) async fn sweep_pass(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.passes.sweep.lock().await
+    }
+
+    /// Held for a repair pass: another one waits.
+    pub(crate) async fn repair_pass(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.passes.repair.lock().await
     }
 
     /// Prove the tablet still holds its generation (a log round trip); call
@@ -236,7 +297,7 @@ impl BlobDb {
                     kind: i.kind.into(),
                     fingerprint: i.fingerprint.clone(),
                     location: i.location.clone(),
-                    state: i.role.as_str().into(),
+                    state: i.role,
                 };
                 (i.id.clone(), rec)
             })
@@ -248,26 +309,21 @@ impl BlobDb {
         Ok(self.read(|s| s.instances.iter().map(|(id, i)| (id.clone(), i.fingerprint.clone())).collect()))
     }
 
-    /// `read-write` / `read-only` / `retired`, or `None` if never configured.
-    pub async fn instance_state(&self, instance_id: &str) -> Result<Option<String>> {
-        Ok(self.read(|s| s.instances.get(instance_id).map(|i| i.state.clone())))
-    }
-
     /// Chunk with refs = 1 and no blocks or parts (tests).
     #[cfg(test)]
-    pub(crate) async fn insert_chunk(&self, logical_size: i64, crc32: u32) -> Result<ChunkId> {
-        self.commit_chunk(logical_size, crc32, &[], &[]).await
+    pub(crate) async fn insert_chunk(&self, logical_size: i64) -> Result<ChunkId> {
+        self.commit_chunk(logical_size, &[], &[]).await
     }
 
     /// Atomically record chunk + blocks + parts after a successful quorum write.
     pub async fn commit_chunk(
         &self,
         logical_size: i64,
-        crc32: u32,
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
     ) -> Result<ChunkId> {
-        let (chunk_id, prepared) = self.prepare_commit(logical_size, crc32, blocks, replicas)?;
+        let shard: Vec<String> = replicas.iter().map(|r| r.instance.clone()).collect();
+        let (chunk_id, prepared) = self.prepare_commit(logical_size, blocks, replicas, &shard)?;
         let mut proposal = Proposal::new();
         let slot = proposal.push(prepared);
         match self.meta.propose_all(proposal).await?.take(slot)? {
@@ -294,25 +350,26 @@ impl BlobDb {
     }
 
     /// The `CommitChunk` of a new chunk (its id chosen now), to be proposed
-    /// with other commands in one entry. Fenced to the leader's term: the id
+    /// with other commands in one entry; `shard`: the instances of the shard
+    /// it was written to. Fenced to the leader's term: the id
     /// is unique only while this node goes on leading, so a commit written
     /// after the lead changed (even back to this node) is not applied
     /// ([`pigeonhole_meta::NotApplied::Fenced`]). `Err` off the lead.
     pub fn prepare_commit(
         &self,
         logical_size: i64,
-        crc32: u32,
         blocks: &[StoredBlock],
         replicas: &[ReplicaLayout],
+        shard: &[String],
     ) -> Result<(ChunkId, Prepared<ChunkState>)> {
         let term = self.meta.serving_term()?;
         let chunk_id = self.next_chunk_id();
         let command = ChunkCommand::CommitChunk {
             chunk_id,
             logical_size,
-            crc32,
             blocks: blocks.to_vec(),
             replicas: replicas.iter().map(Replica::from).collect(),
+            shard: shard.to_vec(),
             created_at: Utc::now().to_rfc3339(),
         };
         Ok((chunk_id, Prepared::new(&command).fenced(term)))
@@ -354,18 +411,45 @@ impl BlobDb {
         }
     }
 
-    /// `(logical_size, crc32, refs)`.
-    pub async fn chunk_meta(&self, chunk_id: i64) -> Result<Option<(i64, u32, i64)>> {
-        Ok(self.chunk(chunk_id, |c| (c.logical_size, c.crc32, c.refs)))
-    }
-
-    pub async fn chunk_block_count(&self, chunk_id: i64) -> Result<Option<i64>> {
-        Ok(self.chunk(chunk_id, |c| c.blocks.len() as i64))
+    /// The chunk's size and refs; `None` for a missing chunk.
+    pub async fn chunk_meta(&self, chunk_id: i64) -> Result<Option<ChunkMeta>> {
+        Ok(self.chunk(chunk_id, |c| ChunkMeta { logical_size: c.logical_size, refs: c.refs }))
     }
 
     /// Blocks in `block_no` order; empty for a missing chunk.
     pub async fn get_blocks(&self, chunk_id: i64) -> Result<Vec<StoredBlock>> {
         Ok(self.chunk(chunk_id, |c| c.blocks.clone()).unwrap_or_default())
+    }
+
+    /// The chunk's logical size; `None` for a missing chunk.
+    pub(crate) fn chunk_meta_size(&self, chunk_id: ChunkId) -> Option<i64> {
+        self.chunk(chunk_id, |c| c.logical_size)
+    }
+
+    /// The chunk's blocks that hold any of its logical bytes `from..to`.
+    pub(crate) fn blocks_overlapping(&self, chunk_id: ChunkId, from: usize, to: usize) -> Vec<StoredBlock> {
+        self.chunk(chunk_id, |c| {
+            c.blocks
+                .iter()
+                .filter(|b| {
+                    let start = b.logical_off as usize;
+                    start < to && start + b.logical_len as usize > from
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// [`Self::get_replica_layouts`], without the `async`.
+    pub(crate) fn get_replica_layouts_now(&self, chunk_id: ChunkId) -> Vec<ReplicaLayout> {
+        self.chunk(chunk_id, ChunkRec::replica_layouts).unwrap_or_default()
+    }
+
+    /// The instances the chunk belongs on (see `ChunkRec::shard`); `None`
+    /// for a missing chunk.
+    pub fn chunk_shard(&self, chunk_id: ChunkId) -> Option<Vec<String>> {
+        self.chunk(chunk_id, |c| c.shard.clone())
     }
 
     /// Replica layouts for a chunk (for [`pigeonhole_blob::Replicated::read`]),
@@ -488,18 +572,22 @@ impl BlobDb {
         self.propose_infallible(ChunkCommand::DropChunk { chunk_id }).await?;
         let mut local = self.local.lock().unwrap();
         local.repair_queue.retain(|(id, _), _| *id != chunk_id);
+        local.unrepairable.retain(|(id, _), _| *id != chunk_id);
         local.reclaim_gates.remove(&chunk_id);
         Ok(())
     }
 
-    /// Enqueue `repair(chunk_id, instance_id)` (idempotent).
+    /// Enqueue `repair(chunk_id, instance_id)` (idempotent; a job parked
+    /// as [`Unrepairable`] stays parked).
     pub async fn enqueue_repair(&self, chunk_id: ChunkId, instance_id: &str) -> Result<()> {
         let mut local = self.local.lock().unwrap();
+        let key = (chunk_id, instance_id.to_string());
+        if local.unrepairable.contains_key(&key) {
+            return Ok(());
+        }
         let seq = local.repair_seq;
-        if let std::collections::btree_map::Entry::Vacant(e) =
-            local.repair_queue.entry((chunk_id, instance_id.to_string()))
-        {
-            e.insert(seq);
+        if let std::collections::btree_map::Entry::Vacant(e) = local.repair_queue.entry(key) {
+            e.insert(RepairJob { seq, attempts: 0, not_before: None });
             local.repair_seq += 1;
         }
         Ok(())
@@ -511,11 +599,55 @@ impl BlobDb {
         Ok(())
     }
 
-    /// Up to `limit` jobs, chunks with the fewest replicas first, then oldest.
+    /// A job's copy failed: it waits [`REPAIR_BACKOFF`] (doubling per
+    /// failure), and after [`REPAIR_MAX_ATTEMPTS`] it is parked as
+    /// [`Unrepairable`]. Whether it was parked.
+    pub fn repair_failed(&self, chunk_id: ChunkId, instance_id: &str, error: &str) -> bool {
+        let key = (chunk_id, instance_id.to_string());
+        let mut local = self.local.lock().unwrap();
+        let Some(job) = local.repair_queue.get_mut(&key) else { return false };
+        job.attempts += 1;
+        let attempts = job.attempts;
+        if attempts < REPAIR_MAX_ATTEMPTS {
+            let wait = REPAIR_BACKOFF.saturating_mul(1 << (attempts - 1).min(16)).min(REPAIR_BACKOFF_MAX);
+            job.not_before = Some(Instant::now() + wait);
+            return false;
+        }
+        local.repair_queue.remove(&key);
+        let parked = Unrepairable { chunk_id, instance: key.1.clone(), attempts, error: error.to_string() };
+        local.unrepairable.insert(key, parked);
+        pigeonhole_blob::record_repair("parked", 1);
+        true
+    }
+
+    /// A job put off (its stores are busy): to the back of the queue, not
+    /// taken for [`REPAIR_BACKOFF`]; not a failure.
+    pub fn repair_deferred(&self, chunk_id: ChunkId, instance_id: &str) {
+        let mut local = self.local.lock().unwrap();
+        let seq = local.repair_seq;
+        if let Some(job) = local.repair_queue.get_mut(&(chunk_id, instance_id.to_string())) {
+            job.seq = seq;
+            job.not_before = Some(Instant::now() + REPAIR_BACKOFF);
+            local.repair_seq += 1;
+        }
+    }
+
+    /// Up to `limit` jobs due now, chunks with the fewest replicas first,
+    /// then oldest. A job that failed or was deferred is not due until its
+    /// wait is over, so jobs that cannot succeed never take every slot.
     pub async fn take_repair_jobs(&self, limit: usize) -> Result<Vec<(ChunkId, String)>> {
+        Ok(self.repair_jobs_due(limit, Instant::now()))
+    }
+
+    pub(crate) fn repair_jobs_due(&self, limit: usize, now: Instant) -> Vec<(ChunkId, String)> {
         let queue: Vec<((ChunkId, String), u64)> = {
             let local = self.local.lock().unwrap();
-            local.repair_queue.iter().map(|(k, &seq)| (k.clone(), seq)).collect()
+            local
+                .repair_queue
+                .iter()
+                .filter(|(_, job)| job.not_before.is_none_or(|t| t <= now))
+                .map(|(k, job)| (k.clone(), job.seq))
+                .collect()
         };
         let mut jobs: Vec<(usize, u64, ChunkId, String)> = self.read(|s| {
             queue
@@ -528,12 +660,30 @@ impl BlobDb {
         });
         jobs.sort();
         jobs.truncate(limit.max(1));
-        Ok(jobs.into_iter().map(|(_, _, id, instance)| (id, instance)).collect())
+        jobs.into_iter().map(|(_, _, id, instance)| (id, instance)).collect()
     }
 
-    /// Referenced chunks (`refs > 0`) missing a replica on `instance_id`.
-    /// Live chunks of `instance_id`'s shard (a replica on one of `peers`)
-    /// that have none on `instance_id`.
+    /// The jobs parked as unrepairable whose chunk is still there.
+    pub fn unrepairable(&self) -> Vec<Unrepairable> {
+        let parked: Vec<Unrepairable> = self.local.lock().unwrap().unrepairable.values().cloned().collect();
+        self.read(|s| parked.into_iter().filter(|u| s.chunks.contains_key(&u.chunk_id)).collect())
+    }
+
+    /// Queue every parked job again, from no attempts (after the operator
+    /// fixed a store); how many.
+    pub fn retry_unrepairable(&self) -> usize {
+        let mut local = self.local.lock().unwrap();
+        let parked = std::mem::take(&mut local.unrepairable);
+        for key in parked.keys() {
+            let seq = local.repair_seq;
+            local.repair_seq += 1;
+            local.repair_queue.insert(key.clone(), RepairJob { seq, attempts: 0, not_before: None });
+        }
+        parked.len()
+    }
+
+    /// Live chunks of `instance_id`'s shard (one that belongs on one of
+    /// `peers`) that have no replica on `instance_id`.
     pub async fn chunks_missing_instance(&self, instance_id: &str, peers: &[&str]) -> Result<Vec<ChunkId>> {
         Ok(self.read(|s| {
             s.chunks
@@ -541,7 +691,7 @@ impl BlobDb {
                 .filter(|(_, c)| {
                     c.refs > 0
                         && !c.replicas.contains_key(instance_id)
-                        && c.replicas.keys().any(|i| peers.contains(&i.as_str()))
+                        && c.shard.iter().any(|i| peers.contains(&i.as_str()))
                 })
                 .map(|(&id, _)| id)
                 .collect()
@@ -586,15 +736,15 @@ impl BlobDb {
         Ok(added)
     }
 
-    /// Pending repair queue depth (tests / metrics).
     /// The repair jobs waiting, (chunk, instance), in queue order.
     pub async fn repair_jobs(&self) -> Vec<(ChunkId, String)> {
         let local = self.local.lock().unwrap();
-        let mut jobs: Vec<_> = local.repair_queue.iter().map(|(k, &seq)| (seq, k.clone())).collect();
+        let mut jobs: Vec<_> = local.repair_queue.iter().map(|(k, job)| (job.seq, k.clone())).collect();
         jobs.sort();
         jobs.into_iter().map(|(_, k)| k).collect()
     }
 
+    /// Pending repair queue depth (parked jobs not counted).
     pub async fn repair_queue_len(&self) -> Result<u64> {
         Ok(self.local.lock().unwrap().repair_queue.len() as u64)
     }
@@ -621,7 +771,7 @@ mod tests {
         let fps = db.list_instance_fingerprints().await.unwrap();
         assert_eq!(fps, vec![("tg-main".into(), "tg:1:-100".into())]);
 
-        let chunk_id = db.insert_chunk(32, 0xdeadbeef).await.unwrap();
+        let chunk_id = db.insert_chunk(32).await.unwrap();
         let layouts = vec![ReplicaLayout {
             instance: "tg-main".into(),
             parts: vec![PartLayout {
@@ -633,11 +783,11 @@ mod tests {
             }],
         }];
         // Direct part insert via commit of empty blocks + one part.
-        let id2 = db.commit_chunk(32, 1, &[], &layouts).await.unwrap();
+        let id2 = db.commit_chunk(32, &[], &layouts).await.unwrap();
         let _ = chunk_id;
         db.retain(&[id2]).await.unwrap();
         db.release(&[id2]).await.unwrap();
-        assert_eq!(db.chunk_meta(id2).await.unwrap().unwrap().2, 1);
+        assert_eq!(db.chunk_meta(id2).await.unwrap().unwrap().refs, 1);
     }
 
     #[tokio::test]
@@ -654,7 +804,7 @@ mod tests {
         };
         db.sync_instances(std::slice::from_ref(&a)).await.unwrap();
         db.sync_instances(&[]).await.unwrap();
-        assert_eq!(db.instance_state("a").await.unwrap().as_deref(), Some("retired"));
+        assert_eq!(db.read(|s| s.instances["a"].state), InstanceRole::Retired);
     }
 
     #[tokio::test]
@@ -673,7 +823,6 @@ mod tests {
         let id = db
             .commit_chunk(
                 8,
-                1,
                 &[],
                 &[ReplicaLayout {
                     instance: "mem".into(),
@@ -696,7 +845,6 @@ mod tests {
         let id2 = db
             .commit_chunk(
                 4,
-                2,
                 &[],
                 &[ReplicaLayout {
                     instance: "mem".into(),
@@ -714,7 +862,7 @@ mod tests {
         let err = db.retain(&[id2, id]).await.unwrap_err();
         assert!(is_chunk_gone(&err), "{err}");
         let meta = db.chunk_meta(id2).await.unwrap().unwrap();
-        assert_eq!(meta.2, 1, "id2 refs must be unchanged after rolled-back retain");
+        assert_eq!(meta.refs, 1, "id2 refs must be unchanged after rolled-back retain");
     }
 
     #[tokio::test]
@@ -724,8 +872,8 @@ mod tests {
         // Two views opened at once: one is this node, the other stands for
         // a leader before it whose commits reach it by replication.
         let (this, before) = (BlobDb::open(meta.clone()).await.unwrap(), BlobDb::open(meta).await.unwrap());
-        let first = before.insert_chunk(8, 1).await.unwrap();
-        let next = this.insert_chunk(8, 1).await.unwrap();
+        let first = before.insert_chunk(8).await.unwrap();
+        let next = this.insert_chunk(8).await.unwrap();
         assert!(next > first, "{next} after {first}");
     }
 
@@ -748,7 +896,6 @@ mod tests {
             async move {
                 db.commit_chunk(
                     8,
-                    1,
                     &[],
                     &[ReplicaLayout {
                         instance: "mem".into(),
@@ -765,8 +912,9 @@ mod tests {
                 .unwrap()
             }
         };
-        // Reclaim the highest id: plain INTEGER PRIMARY KEY would hand it out again,
-        // and anything keyed by chunk id (block cache, stale extents) would alias.
+        // Reclaim the highest id: a counter taken from the chunks left would hand
+        // it out again, and anything keyed by chunk id (block cache, stale
+        // extents) would alias.
         let old = commit(1).await;
         db.release(&[old]).await.unwrap();
         assert!(db.try_begin_reclaim(old).await.unwrap());
@@ -781,7 +929,7 @@ mod tests {
         let replayed = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
             .await
             .unwrap();
-        let after = replayed.insert_chunk(8, 1).await.unwrap();
+        let after = replayed.insert_chunk(8).await.unwrap();
         assert!(after > new, "chunk id {new} reused as {after} after replay");
     }
 
@@ -809,12 +957,55 @@ mod tests {
                 block_stored_lens: vec![],
             };
             let replica = ReplicaLayout { instance: "mem".into(), parts: vec![part] };
-            db.commit_chunk(1, 1, &[], &[replica]).await.unwrap();
+            db.commit_chunk(1, &[], &[replica]).await.unwrap();
         }
         let (bytes, index) = db.read(|s| (pigeonhole_meta::encode_state(s), s.by_key.clone()));
         let decoded = pigeonhole_meta::decode_state::<ChunkState>(&bytes).unwrap();
         assert_eq!(index.len(), 3);
         assert_eq!(decoded.by_key, index);
+    }
+
+    /// A failing job backs off (doubling) so the others get the slots, and
+    /// is parked once it failed too often; a parked job is not queued again
+    /// until retried.
+    #[tokio::test]
+    async fn a_failing_repair_job_backs_off_then_is_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlobDb::open(pigeonhole_testkit::tablet(dir.path().join("blob.log"), BlobDb::register).await)
+            .await
+            .unwrap();
+        let (bad, good) = (db.insert_chunk(1).await.unwrap(), db.insert_chunk(1).await.unwrap());
+        db.enqueue_repair(bad, "b").await.unwrap();
+        db.enqueue_repair(good, "b").await.unwrap();
+        assert_eq!(db.take_repair_jobs(1).await.unwrap(), vec![(bad, "b".to_string())], "oldest first");
+
+        assert!(!db.repair_failed(bad, "b", "no source"));
+        assert_eq!(db.take_repair_jobs(1).await.unwrap(), vec![(good, "b".to_string())], "the failed one waits");
+        let now = Instant::now();
+        assert_eq!(db.repair_jobs_due(2, now + REPAIR_BACKOFF).len(), 2, "due again after the backoff");
+        assert!(!db.repair_failed(bad, "b", "no source"));
+        assert_eq!(db.repair_jobs_due(2, now + REPAIR_BACKOFF).len(), 1, "the second wait is longer");
+        assert_eq!(db.repair_jobs_due(2, now + REPAIR_BACKOFF * 2 + Duration::from_secs(1)).len(), 2);
+
+        for _ in 2..REPAIR_MAX_ATTEMPTS - 1 {
+            assert!(!db.repair_failed(bad, "b", "no source"));
+        }
+        assert!(db.repair_failed(bad, "b", "no source"), "parked");
+        let parked = db.unrepairable();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(
+            (parked[0].chunk_id, parked[0].attempts, parked[0].error.as_str()),
+            (bad, REPAIR_MAX_ATTEMPTS, "no source")
+        );
+        assert_eq!(db.repair_jobs().await, vec![(good, "b".to_string())]);
+        db.enqueue_repair(bad, "b").await.unwrap();
+        assert_eq!(db.repair_queue_len().await.unwrap(), 1, "a parked job is not queued again");
+
+        assert_eq!(db.retry_unrepairable(), 1);
+        assert!(db.unrepairable().is_empty());
+        assert_eq!(db.repair_queue_len().await.unwrap(), 2);
+        db.repair_deferred(bad, "b");
+        assert_eq!(db.take_repair_jobs(2).await.unwrap(), vec![(good, "b".to_string())], "deferred: waits too");
     }
 
     #[tokio::test]
@@ -832,7 +1023,6 @@ mod tests {
         db.sync_instances(&[info]).await.unwrap();
         let id = db
             .commit_chunk(
-                1,
                 1,
                 &[],
                 &[ReplicaLayout {

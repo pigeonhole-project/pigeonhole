@@ -1,4 +1,4 @@
-//! Multi-instance replication: fan-out writes and failover reads (stage D.2).
+//! Multi-instance replication: fan-out writes and failover reads.
 
 use crate::backend::{bytes_stream, BoxByteStream};
 use crate::erase::DynBlobBackend;
@@ -110,11 +110,6 @@ impl CheapestFirst {
         self.rng.store(x, Ordering::Relaxed);
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
-
-    fn is_unhealthy(&self, instance: &str) -> bool {
-        let g = self.inner.lock().unwrap();
-        matches!(g.unhealthy.get(instance), Some(u) if u.open_until > Self::tick())
-    }
 }
 
 impl Default for CheapestFirst {
@@ -124,30 +119,25 @@ impl Default for CheapestFirst {
 }
 
 impl ReplicaSelector for CheapestFirst {
+    /// Healthy first, then cheapest; scores within `close_epsilon` of each
+    /// other (one bucket) in random order, to spread reads. Keys are
+    /// computed once per replica, so the order is total.
     fn rank(&self, replicas: &[ReplicaLayout], costs: &[CostHint]) -> Vec<usize> {
         debug_assert_eq!(replicas.len(), costs.len());
-        let mut idxs: Vec<usize> = (0..replicas.len()).collect();
-        let eps = self.close_epsilon;
-        idxs.sort_by(|&a, &b| {
-            let ua = self.is_unhealthy(&replicas[a].instance);
-            let ub = self.is_unhealthy(&replicas[b].instance);
-            match (ua, ub) {
-                (true, false) => std::cmp::Ordering::Greater,
-                (false, true) => std::cmp::Ordering::Less,
-                _ => {
-                    let sa = costs[a].wait_secs;
-                    let sb = costs[b].wait_secs;
-                    if (sa - sb).abs() <= eps {
-                        let ra = self.next_rand();
-                        let rb = self.next_rand();
-                        ra.cmp(&rb)
-                    } else {
-                        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-                    }
-                }
-            }
-        });
-        idxs
+        let unhealthy: Vec<bool> = {
+            let now = Self::tick();
+            let g = self.inner.lock().unwrap();
+            replicas.iter().map(|r| g.unhealthy.get(&r.instance).is_some_and(|u| u.open_until > now)).collect()
+        };
+        let mut keyed: Vec<(bool, i64, u64, usize)> = (0..replicas.len())
+            .map(|i| {
+                let score = costs[i].wait_secs;
+                let bucket = if score.is_finite() { (score / self.close_epsilon).floor() as i64 } else { i64::MAX };
+                (unhealthy[i], bucket, self.next_rand(), i)
+            })
+            .collect();
+        keyed.sort_unstable();
+        keyed.into_iter().map(|(.., i)| i).collect()
     }
 
     fn record_success(&self, instance: &str) {
@@ -191,6 +181,9 @@ pub struct Replicated {
 #[derive(Debug)]
 pub struct SealedChunk {
     pub layouts: Vec<ReplicaLayout>,
+    /// The members of the shard it was written to (a replica on each but
+    /// those that missed the write).
+    pub shard: Vec<InstanceId>,
     /// Drop only after `commit_chunk` is applied (or on failure → orphans).
     pub pins: Vec<UploadPin>,
 }
@@ -254,11 +247,6 @@ impl Replicated {
         })
     }
 
-    pub fn with_member_timeout(mut self, timeout: Duration) -> Self {
-        self.member_timeout = timeout;
-        self
-    }
-
     /// Upload pins of this placement group (shared with the sweeper and repair).
     pub fn pins(&self) -> &Arc<UploadPins> {
         &self.pins
@@ -281,10 +269,6 @@ impl Replicated {
 
     pub fn member(&self, instance_id: &str) -> Option<&Arc<dyn DynBlobBackend>> {
         self.by_id.get(instance_id)
-    }
-
-    pub fn selector(&self) -> &Arc<dyn ReplicaSelector> {
-        &self.selector
     }
 
     pub fn max_blob_size(&self) -> usize {
@@ -339,11 +323,9 @@ impl Replicated {
             bail!("read requires at least one replica layout");
         }
 
-        let costs: Vec<CostHint> = replicas
-            .iter()
-            .map(|r| self.by_id.get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None)))
-            .collect();
-        let order = self.selector.rank(replicas, &costs);
+        // The stream owns what it needs: the backends of these replicas.
+        let backends: Vec<_> = replicas.iter().map(|r| self.by_id.get(&r.instance).cloned()).collect();
+        let order = self.selector.rank(replicas, &get_costs(&backends));
         if let Some(&first) = order.first() {
             if let Some(r) = replicas.get(first) {
                 crate::metrics::record_replica_selected(&r.instance);
@@ -351,7 +333,7 @@ impl Replicated {
         }
 
         let state = ReadState {
-            backends: self.by_id.clone(),
+            backends,
             selector: self.selector.clone(),
             timeout: self.member_timeout,
             replicas: replicas.to_vec(),
@@ -400,11 +382,6 @@ pub struct ChunkReplicaWriter {
 }
 
 impl ChunkReplicaWriter {
-    /// Sum of unfilled open-part buffers across live members (memory budget).
-    pub fn open_part_bytes(&self) -> usize {
-        self.writers.iter().filter(|w| !w.failed).filter_map(|w| w.packer.as_ref()).map(|p| p.open_bytes()).sum()
-    }
-
     /// Fan-out one encoded block to all live members (`Bytes` clone is refcounted).
     pub async fn push(&mut self, block: EncodedBlock) -> Result<()> {
         let timeout = self.timeout;
@@ -486,6 +463,7 @@ impl ChunkReplicaWriter {
             }
         }
 
+        let shard = self.writers.iter().map(|w| w.instance.clone()).collect();
         let mut ok = Vec::new();
         for w in self.writers {
             if !w.failed {
@@ -497,14 +475,21 @@ impl ChunkReplicaWriter {
             // Dropping the pins makes the parts sweep orphans.
             bail!("write quorum not met: {} successful replicas, need {}", ok.len(), self.write_quorum);
         }
-        Ok(SealedChunk { layouts: ok, pins: self.pins })
+        Ok(SealedChunk { layouts: ok, shard, pins: self.pins })
     }
 }
 
 // --- failover read ---
 
+/// What a GET from each backend would cost now (a backend not in the
+/// placement: free, and skipped when tried).
+fn get_costs(backends: &[Option<Arc<dyn DynBlobBackend>>]) -> Vec<CostHint> {
+    backends.iter().map(|b| b.as_ref().map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None))).collect()
+}
+
 struct ReadState {
-    backends: HashMap<InstanceId, Arc<dyn DynBlobBackend>>,
+    /// The backend of each replica, `None` if not in the placement.
+    backends: Vec<Option<Arc<dyn DynBlobBackend>>>,
     selector: Arc<dyn ReplicaSelector>,
     timeout: Duration,
     replicas: Vec<ReplicaLayout>,
@@ -523,8 +508,11 @@ struct ActivePart {
     /// Absolute block range this download covers.
     blocks_left: Range<u32>,
     stream: BoxByteStream,
-    /// Expected stored length for `blocks_left` (`u64::MAX` = read until EOF).
+    /// Stored length of `blocks_left`.
     expected_len: u64,
+    /// Bytes before them in the stream (a store that cannot serve a range
+    /// sends the whole part).
+    skip: u64,
 }
 
 impl ReadState {
@@ -554,9 +542,9 @@ impl ReadState {
             let mut active = self.active.take().expect("active part");
             let mut buf = BytesMut::new();
             let mut failed = false;
+            let want = active.skip + active.expected_len;
             loop {
-                let done = active.expected_len != u64::MAX && (buf.len() as u64) >= active.expected_len;
-                if done {
+                if buf.len() as u64 >= want {
                     break;
                 }
                 match tokio::time::timeout(self.timeout, active.stream.next()).await {
@@ -590,15 +578,13 @@ impl ReadState {
                 continue;
             }
 
-            if active.expected_len != u64::MAX && (buf.len() as u64) < active.expected_len {
+            if (buf.len() as u64) < want {
                 // A replica that ends early serves badly: route around it.
                 self.failed(&active.instance, Failure::Unavailable);
                 continue;
             }
-
-            if active.expected_len != u64::MAX && (buf.len() as u64) > active.expected_len {
-                buf.truncate(active.expected_len as usize);
-            }
+            let mut buf = buf.split_off(active.skip as usize);
+            buf.truncate(active.expected_len as usize);
 
             self.next_block = active.blocks_left.end;
             self.selector.record_success(&active.instance);
@@ -616,12 +602,7 @@ impl ReadState {
             if self.reranked {
                 return Ok(false);
             }
-            let costs: Vec<CostHint> = self
-                .replicas
-                .iter()
-                .map(|r| self.backends.get(&r.instance).map_or_else(CostHint::free, |b| b.cost(OpKind::Get, None)))
-                .collect();
-            self.order = self.selector.rank(&self.replicas, &costs);
+            self.order = self.selector.rank(&self.replicas, &get_costs(&self.backends));
             self.tried.clear();
             self.reranked = true;
         }
@@ -632,18 +613,16 @@ impl ReadState {
             }
             self.tried.push(ri);
             let layout = &self.replicas[ri];
-            let Some(backend) = self.backends.get(&layout.instance) else {
+            let Some(backend) = &self.backends[ri] else {
                 continue;
             };
-            let Some((part, byte_range, block_range, expected_len)) =
-                plan_part_read(layout, self.next_block, self.end_block)
-            else {
+            let Some((part, byte_range, block_range)) = plan_part_read(layout, self.next_block, self.end_block) else {
                 continue;
             };
-
-            let range = match backend.limits().supports_range {
-                RangeSupport::None => None,
-                RangeSupport::BestEffort => byte_range,
+            let expected_len = byte_range.end - byte_range.start;
+            let (range, skip) = match backend.limits().supports_range {
+                RangeSupport::None => (None, byte_range.start),
+                RangeSupport::BestEffort => (Some(byte_range), 0),
             };
 
             let get = backend.get(&part.locator, range);
@@ -654,6 +633,7 @@ impl ReadState {
                         blocks_left: block_range,
                         stream,
                         expected_len,
+                        skip,
                     });
                     return Ok(true);
                 }
@@ -675,12 +655,9 @@ impl ReadState {
     }
 }
 
-/// Plan a GET covering `[next, end)` starting at `next` within one part.
-fn plan_part_read(
-    layout: &ReplicaLayout,
-    next: u32,
-    end: u32,
-) -> Option<(&PartLayout, Option<ByteRange>, Range<u32>, u64)> {
+/// Plan a GET covering `[next, end)` starting at `next` within one part:
+/// the part, the bytes of it and the blocks they hold.
+fn plan_part_read(layout: &ReplicaLayout, next: u32, end: u32) -> Option<(&PartLayout, ByteRange, Range<u32>)> {
     for part in &layout.parts {
         let part_end = part.first_block + part.block_count;
         if next >= part_end || end <= part.first_block {
@@ -695,15 +672,8 @@ fn plan_part_read(
         let local_from = (from - part.first_block) as usize;
         let local_to = (to - part.first_block) as usize;
         if part.block_stored_lens.len() < local_to {
-            // Missing lens: download whole part from block 0.
-            let total: u64 = part.block_stored_lens.iter().map(|&l| l as u64).sum();
-            let total = if total == 0 {
-                // Unknown size — stream until EOF; expected_len = u64::MAX sentinel handled by EOF.
-                u64::MAX
-            } else {
-                total
-            };
-            return Some((part, None, part.first_block..part_end, total));
+            // Lengths short of its blocks: bad metadata, not a replica to read.
+            return None;
         }
         let mut off = 0u64;
         for len in &part.block_stored_lens[..local_from] {
@@ -713,8 +683,7 @@ fn plan_part_read(
         for len in &part.block_stored_lens[local_from..local_to] {
             need += u64::from(*len);
         }
-        let range = Some(off..(off + need));
-        return Some((part, range, from..to, need));
+        return Some((part, off..off + need, from..to));
     }
     None
 }
@@ -999,5 +968,36 @@ mod tests {
         w.push(block(1, 100)).await.unwrap();
         let err = w.finish().await.unwrap_err();
         assert!(err.to_string().contains("write quorum"), "{err}");
+    }
+
+    #[test]
+    fn rank_puts_healthy_and_cheap_first_and_shuffles_close_ones() {
+        let layout = |id: &str| ReplicaLayout { instance: id.into(), parts: vec![] };
+        let cost = |wait_secs: f64| CostHint { wait_secs };
+        let sel = CheapestFirst::new();
+        let replicas = [layout("slow"), layout("a"), layout("b"), layout("down")];
+        let costs = [cost(10.0), cost(0.0), cost(0.01), cost(0.0)];
+        sel.record_failure("down", Failure::Unavailable);
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let order = sel.rank(&replicas, &costs);
+            assert_eq!(&order[2..], &[0, 3], "the slow one, then the one down");
+            firsts.insert(order[0]);
+        }
+        assert_eq!(firsts.len(), 2, "a and b, close, take turns");
+    }
+
+    /// A store that cannot serve a range sends the whole part: the blocks
+    /// asked for are cut out of it.
+    #[tokio::test]
+    async fn a_store_without_ranges_reads_blocks_inside_a_part() {
+        let mut a = MockMem::new("a", 1000);
+        Arc::get_mut(&mut a).unwrap().limits.supports_range = RangeSupport::None;
+        let rep = Replicated::new(vec![a.erase()], 1, Arc::new(CheapestFirst::new())).unwrap();
+        let blocks = vec![block(1, 100), block(2, 100), block(3, 100)];
+        let layouts = write_blocks(&rep, &blocks).await.unwrap();
+        assert_eq!(layouts[0].parts.len(), 1);
+        let got = collect_stream(rep.read(&layouts, 1..2).await.unwrap()).await.unwrap();
+        assert_eq!(got, Bytes::from(vec![2u8; 100]));
     }
 }

@@ -88,15 +88,17 @@ pigeonhole_meta_applied_position - pigeonhole_meta_base_position
 | `pigeonhole_instance_rate_limited_total` | counter | `instance`, `op` | Backend calls that failed rate limited (a 429 / FLOOD_WAIT longer than the call's budget) |
 | `pigeonhole_replica_selected_total` | counter | `instance` | Replicas chosen to read from |
 | `pigeonhole_parts_per_chunk` | histogram | `instance` | Backend parts written per chunk replica |
-| `pigeonhole_cache_requests_total` | counter | `level`, `outcome` | Block cache lookups: hit, miss (loaded the block), collapsed (waited for another lookup's load) |
+| `pigeonhole_cache_requests_total` | counter | `level`, `outcome` | Block cache lookups: hit, miss |
 | `pigeonhole_cache_bytes` | gauge | `level` | Bytes held by a block cache level |
 | `pigeonhole_cache_entries` | gauge | `level` | Blocks held by a block cache level |
 | `pigeonhole_compression_ratio` | histogram |  | Stored / logical size of each block written (lower is better) |
 | `pigeonhole_ingest_budget_wait_seconds` | histogram |  | Time PUTs wait for the ingest memory budget (waits > 0 only) |
 | `pigeonhole_background_pass_seconds` | histogram | `task`, `outcome` | Duration of a sweep / repair pass |
 | `pigeonhole_sweep_keys_total` | counter | `outcome` | Sweeper outcomes: deleted keys, live keys skipped, zero-ref chunks reclaimed |
-| `pigeonhole_repair_jobs_total` | counter | `outcome` | Repair job outcomes |
+| `pigeonhole_sweep_retired_left` | gauge |  | Reclaimed chunks kept because parts of theirs are on stores no longer configured |
+| `pigeonhole_repair_jobs_total` | counter | `outcome` | Repair job outcomes: repaired, scrub_enqueued, skipped_budget, skipped_noop, failed, parked (given up on) |
 | `pigeonhole_repair_queue_depth` | gauge |  | Pending repair jobs |
+| `pigeonhole_repair_unrepairable` | gauge |  | Repair jobs parked as unrepairable: they failed too often |
 | `pigeonhole_chunk_gone_total` | counter |  | Retains that failed: the chunk was reclaiming or missing |
 | `pigeonhole_double_release_total` | counter |  | Releases of a chunk whose refs were already 0 |
 

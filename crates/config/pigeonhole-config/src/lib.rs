@@ -7,10 +7,9 @@ use crate::instances::InstanceKind;
 use crate::instances::{memory_instance, InstanceConfig, TelegramLogin};
 use crate::stores::{FileReplicas, FileShards, FileStore, Store, Topology};
 use anyhow::{bail, Context, Result};
-use pigeonhole_blob::CacheConfig;
 use pigeonhole_chunk_store::{
-    RepairConfig, SweepConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL, DEFAULT_SWEEP_INTERVAL,
-    REPAIR_BATCH_SIZE, REPAIR_CONCURRENCY, SWEEP_BATCH_SIZE,
+    CacheConfig, RepairConfig, SweepConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL,
+    DEFAULT_SWEEP_INTERVAL, REPAIR_BATCH_SIZE, REPAIR_CONCURRENCY, SWEEP_BATCH_SIZE,
 };
 use pigeonhole_codec::ByteBudget;
 use pigeonhole_codec::{self as chunker, ChunkCodec};

@@ -41,6 +41,9 @@ pub struct SweepStats {
     /// Instances the pass could not sweep (or delete a reclaimed chunk's
     /// parts on): down, rate-limited. The others are swept all the same.
     pub failed: Vec<String>,
+    /// Reclaimed chunks kept (`reclaiming`) because parts of theirs are on
+    /// an instance no longer in the placement: put it back to let them go.
+    pub retired_left: u64,
 }
 
 /// One sweeper per process; iterates every member of the placement group.
@@ -91,6 +94,13 @@ impl Sweeper {
                 if !stats.failed.is_empty() {
                     warn!(failed = ?stats.failed, "sweep pass left instances out");
                 }
+                pigeonhole_blob::set_sweep_retired_left(stats.retired_left);
+                if stats.retired_left > 0 {
+                    warn!(
+                        chunks = stats.retired_left,
+                        "reclaimed chunks keep parts on stores no longer configured; put the stores back to delete them"
+                    );
+                }
                 pigeonhole_blob::record_sweep("deleted", stats.keys_deleted);
                 pigeonhole_blob::record_sweep("skipped_live", stats.keys_skipped_live);
                 pigeonhole_blob::record_sweep("zero_ref", stats.zero_ref_chunks);
@@ -111,8 +121,11 @@ impl Sweeper {
 
     /// Single pass: reclaim `refs = 0` chunks, then range-sweep each instance.
     /// An instance that fails (down, rate-limited) is left for the next pass
-    /// ([`SweepStats::failed`]); the others are swept all the same.
+    /// ([`SweepStats::failed`]); the others are swept all the same. One pass
+    /// at a time per tablet: a pass asked for while another runs (any
+    /// sweeper's) waits for it.
     pub async fn sweep_once(&self) -> Result<SweepStats> {
+        let _pass = self.db.sweep_pass().await;
         let mut stats = SweepStats::default();
         self.reclaim_zero_refs(&mut stats).await?;
         for member in &self.members {
@@ -152,11 +165,16 @@ impl Sweeper {
     }
 
     /// Delete a reclaimed chunk's parts on every instance; whether all went.
+    /// Parts on an instance no longer in the placement cannot go: the chunk
+    /// stays `reclaiming`, its metadata naming them, until it is back.
     async fn delete_parts(&self, chunk_id: i64, layouts: &[ReplicaLayout], stats: &mut SweepStats) -> bool {
         let mut all_gone = true;
+        let mut retired = false;
         for layout in layouts {
             let Some(backend) = self.members.iter().find(|m| m.instance().id == layout.instance) else {
-                warn!(chunk_id, instance = %layout.instance, "zero-ref reclaim: instance not in placement; leaving parts");
+                debug!(chunk_id, instance = %layout.instance, "reclaim: instance not in the placement; its parts stay");
+                retired = true;
+                all_gone = false;
                 continue;
             };
             let keys: Vec<Vec<u8>> = layout.parts.iter().map(|p| p.locator.key.clone()).collect();
@@ -169,6 +187,7 @@ impl Sweeper {
                 all_gone = false;
             }
         }
+        stats.retired_left += u64::from(retired);
         all_gone
     }
 
@@ -731,5 +750,44 @@ mod tests {
         assert_eq!((stats.zero_ref_chunks, stats.failed.len()), (1, 0));
         assert!(p.db.chunk_meta(id).await.unwrap().is_none());
         assert!(p.first.inner.message_keys().is_empty());
+    }
+
+    /// A copy on an instance taken out of the placement keeps the reclaimed
+    /// chunk (its metadata names the parts left there) until it is back.
+    #[tokio::test]
+    async fn a_copy_on_a_retired_instance_keeps_the_chunk() {
+        let p = pair().await;
+        let id = p.layer.put_small(Bytes::from_static(b"released")).await.unwrap();
+        p.layer.release(&[id]).await.unwrap();
+        let config = SweepConfig { batch_size: SWEEP_BATCH_SIZE, interval: None };
+        let without_first = Sweeper::new(p.db.clone(), vec![p.members[1].clone()], config, p.pins.clone());
+
+        let stats = without_first.sweep_once().await.unwrap();
+        assert_eq!((stats.zero_ref_chunks, stats.retired_left), (0, 1));
+        assert!(p.db.chunk_meta(id).await.unwrap().is_some(), "kept, reclaiming");
+        assert!(p.second.message_keys().is_empty(), "the copy in the placement went");
+        assert_eq!(p.first.inner.message_keys().len(), 1, "the retired one's stays");
+
+        let stats = p.sweeper().sweep_once().await.unwrap();
+        assert_eq!((stats.zero_ref_chunks, stats.retired_left), (1, 0));
+        assert!(p.db.chunk_meta(id).await.unwrap().is_none());
+        assert!(p.first.inner.message_keys().is_empty());
+    }
+
+    /// Passes asked for at once (the loop's, the admin's: two sweepers of
+    /// one tablet) run one after the other.
+    #[tokio::test]
+    async fn one_sweep_pass_at_a_time() {
+        let f = setup().await;
+        let running = f.db.sweep_pass().await;
+        let other = tokio::spawn({
+            let sweeper = f.layer.sweeper(SweepConfig::default());
+            async move { sweeper.sweep_once().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!other.is_finished(), "waits for the running pass");
+        drop(running);
+        other.await.unwrap().unwrap();
+        f.layer.sweep_now(SweepConfig::default()).await.unwrap();
     }
 }

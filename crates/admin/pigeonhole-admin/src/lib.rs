@@ -10,7 +10,7 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pigeonhole_chunk_store::{ChunkStore, RepairStats, Repairer, SweepStats, Sweeper};
+use pigeonhole_chunk_store::{ChunkStore, RepairStats, SweepStats};
 use pigeonhole_config::DynConfig;
 use pigeonhole_gateway_s3::{Index, S3Gateway};
 use pigeonhole_meta::{LogStore, MetaStore};
@@ -296,13 +296,9 @@ impl Admin {
         log_view::read(self.log.as_ref(), from, limit).await
     }
 
-    fn repairer(&self) -> Repairer {
-        Repairer::new(self.store.db().clone(), self.store.replicated().clone(), self.dynamic.repair.get())
-    }
-
     /// One repair pass: copy chunks that lost a replica back to full.
     pub async fn repair(&self) -> Result<RepairStats> {
-        self.repairer().repair_once().await
+        self.store.repair_now(self.dynamic.repair.get()).await
     }
 
     /// Repair jobs waiting.
@@ -313,18 +309,11 @@ impl Admin {
     /// Probe every copy store `id` should hold; queue a repair for each one
     /// gone. How many it checked, and how many were gone.
     pub async fn verify(&self, id: &str) -> Result<(u64, u64)> {
-        self.repairer().verify_instance(id).await
+        self.store.verify(id).await
     }
 
     /// One sweeper pass: delete posts that no chunk points to.
     pub async fn sweep(&self) -> Result<SweepStats> {
-        let replicated = self.store.replicated();
-        let sweeper = Sweeper::new(
-            self.store.db().clone(),
-            replicated.members().to_vec(),
-            self.dynamic.sweep.get(),
-            replicated.pins().clone(),
-        );
-        sweeper.sweep_once().await
+        self.store.sweep_now(self.dynamic.sweep.get()).await
     }
 }

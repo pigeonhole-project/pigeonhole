@@ -8,8 +8,6 @@ use pigeonhole_chunk_store::{unique_chunk_ids, ChunkId, ChunkStore, PendingChunk
 use pigeonhole_meta::Proposal;
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 /// Store and fetch CAS payloads through [`CasIndex`] + [`ChunkStore`].
 #[derive(Clone)]
@@ -65,14 +63,8 @@ impl CasStore {
             return Ok(Some(Box::pin(futures::stream::once(async { Ok(Bytes::new()) }))));
         }
 
-        let store = self.store.clone();
-        let extents = entry.extents;
-        let (tx, rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(1);
-        tokio::spawn(async move {
-            let result = store.read(&extents, Some(from..to)).await;
-            let _ = tx.send(result).await;
-        });
-        Ok(Some(Box::pin(ReceiverStream::new(rx))))
+        // Streamed: the read's chunks stay pinned while the stream lives.
+        Ok(Some(Box::pin(self.store.read_stream(&entry.extents, Some(from..to)).await?)))
     }
 
     /// True when a CAS row for `(hash, size)` exists and its chunks are live
@@ -236,7 +228,7 @@ mod tests {
         let entry = cas.cas.get(&hash, size).await.unwrap().unwrap();
         assert!(!entry.extents.is_empty());
         let meta = cas.store.db().chunk_meta(entry.extents[0].chunk).await.unwrap().unwrap();
-        assert_eq!(meta.2, 1, "duplicate write must not add a ref");
+        assert_eq!(meta.refs, 1, "duplicate write must not add a ref");
     }
 
     fn digest(data: &[u8]) -> (String, i64) {
@@ -261,7 +253,7 @@ mod tests {
         assert!(is_digest_mismatch(&err), "{err:#}");
         assert_eq!(cas.cas.get(&hash, size).await.unwrap().unwrap().extents, entry.extents);
         assert_eq!(cas.get_bytes(&hash, size).await.unwrap().unwrap(), good);
-        let refs = cas.store.db().chunk_meta(entry.extents[0].chunk).await.unwrap().unwrap().2;
+        let refs = cas.store.db().chunk_meta(entry.extents[0].chunk).await.unwrap().unwrap().refs;
         assert_eq!(refs, 1);
     }
 

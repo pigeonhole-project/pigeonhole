@@ -1,4 +1,4 @@
-//! Pack encoded blocks into instance-sized blob parts (stage D.1).
+//! Pack encoded blocks into instance-sized blob parts.
 
 use crate::erase::DynBlobBackend;
 use crate::typed::{BlobId, BlobLocator};
@@ -57,23 +57,6 @@ impl PartPacker {
             open_lens: Vec::new(),
             open_total: 0,
         }
-    }
-
-    pub fn backend(&self) -> &Arc<dyn DynBlobBackend> {
-        &self.backend
-    }
-
-    pub fn max_blob_size(&self) -> usize {
-        self.max_blob_size
-    }
-
-    pub fn next_block(&self) -> u32 {
-        self.next_block
-    }
-
-    /// Bytes buffered in the open (unfilled) part.
-    pub fn open_bytes(&self) -> usize {
-        self.open_total
     }
 
     /// Push one block. Returns a sealed part when the open part was flushed.

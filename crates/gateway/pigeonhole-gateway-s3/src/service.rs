@@ -327,9 +327,10 @@ impl S3Gateway {
         })
     }
 
-    /// One version of an object and the bytes of `range` of it. If its
-    /// chunks went away meanwhile (overwritten or deleted, then reclaimed),
-    /// that version is gone: look the key up again.
+    /// One version of an object and the bytes of `range` of it, streamed
+    /// (the read's chunks pinned while the body lives). If its chunks went
+    /// away meanwhile (overwritten or deleted, then reclaimed), that version
+    /// is gone: look the key up again.
     async fn read_object(&self, bucket: &str, key: &str, range: Option<&Range>) -> S3Result<ObjectRead> {
         let mut attempt = 0;
         loop {
@@ -342,16 +343,18 @@ impl S3Gateway {
                 .ok_or_else(|| s3_error!(NoSuchKey))?;
             let (start, length) = resolve_range(range, view.meta.size as u64)?;
             let span = start..start + length;
-            let data = match &view.body {
-                _ if length == 0 => Bytes::new(),
-                Body::Inline(bytes) => Bytes::copy_from_slice(&bytes[span.start as usize..span.end as usize]),
-                Body::Chunks(extents) => match self.store.read(extents, Some(span)).await {
-                    Ok(data) => data,
+            let body = match &view.body {
+                _ if length == 0 => StreamingBlob::from_bytes(Bytes::new()),
+                Body::Inline(bytes) => {
+                    StreamingBlob::from_bytes(Bytes::copy_from_slice(&bytes[span.start as usize..span.end as usize]))
+                }
+                Body::Chunks(extents) => match self.store.read_stream(extents, Some(span)).await {
+                    Ok(stream) => StreamingBlob::wrap(stream.map(|r| r.map_err(std::io::Error::other))),
                     Err(e) if pigeonhole_chunk_store::is_chunk_gone(&e) && attempt < GET_ATTEMPTS => continue,
                     Err(e) => return Err(Self::map_err(e)),
                 },
             };
-            return Ok(ObjectRead { view, start, length, data });
+            return Ok(ObjectRead { view, start, length, body });
         }
     }
 
@@ -362,8 +365,12 @@ impl S3Gateway {
         if length == src.size && !src.etag.contains('-') {
             return Ok(src.etag.clone());
         }
-        let data = self.store.read(extents, None).await.map_err(Self::map_err)?;
-        Ok(format!("{:x}", md5::Md5::digest(&data)))
+        let mut stream = self.store.read_stream(extents, None).await.map_err(Self::map_err)?;
+        let mut md5 = md5::Md5::new();
+        while let Some(piece) = stream.next().await {
+            md5.update(piece.map_err(Self::map_err)?);
+        }
+        Ok(format!("{:x}", md5.finalize()))
     }
 }
 
@@ -381,7 +388,7 @@ struct ObjectRead {
     view: ObjectView,
     start: u64,
     length: u64,
-    data: Bytes,
+    body: StreamingBlob,
 }
 
 /// Read `stream` into `head` until it ends (the whole of it: `Some`) or
@@ -1118,7 +1125,7 @@ impl S3 for S3Gateway {
 
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
-        let ObjectRead { view, start, length, data } =
+        let ObjectRead { view, start, length, body } =
             self.read_object(&input.bucket, &input.key, input.range.as_ref()).await?;
         let meta = view.meta;
         let total = meta.size as u64;
@@ -1126,7 +1133,7 @@ impl S3 for S3Gateway {
         let content_range = input.range.as_ref().map(|_| format!("bytes {start}-{}/{total}", start + length - 1));
         let metadata = view.user_meta.is_empty().not().then(|| view.user_meta.into_iter().collect());
         let mut output = GetObjectOutput {
-            body: Some(StreamingBlob::from_bytes(data)),
+            body: Some(body),
             content_length: Some(length as i64),
             content_range,
             e_tag: Some(etag_hex(&meta.etag)),
