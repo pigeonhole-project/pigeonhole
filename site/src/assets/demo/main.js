@@ -5,15 +5,13 @@
 import {button, h, reducedMotion} from "../lib/dom.js";
 import {bytes, t} from "../lib/i18n.js";
 import {ops} from "../lib/ops.js";
-import {budgetsOf, budgetTable, sendLevel} from "./budgets.js";
-import {appOf, kinOf} from "./channels.js";
-import {chatView} from "./chat/index.js";
+import {budgetsOf, sendLevel} from "./budgets.js";
+import {appOf} from "./channels.js";
 import {forgetPlaces} from "./chat/scroll.js";
 import {clientView} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {ref, sentence, setLinks} from "./entities.js";
 import {readEvents} from "./events.js";
-import {faultsView} from "./faults-view.js";
 import {flightsOf, refused} from "./flights.js";
 import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
@@ -21,6 +19,7 @@ import {logView} from "./log-view.js";
 import {connect} from "./node.js";
 import {makeRaftWatch} from "./raft.js";
 import {apply as applyEvent, merge} from "./reduce.js";
+import {storeView} from "./store-view.js";
 import {TASK_KEY, TASK_ON, taskWindows} from "./tasks.js";
 import {makeWizard} from "./wizard.js";
 
@@ -81,9 +80,9 @@ const graph = makeGraph($("graph"), {
     updateWindows = taskWindows(
       g,
       entrances,
-      task => {
-        openPanel({kind: "loft"});
-        $(`task-${task}`)?.scrollIntoView({block: "nearest"});
+      async task => {
+        await openPanel({kind: "loft"});
+        if (isOpen("loft")) view.focus(task);
       },
       {follower: following()},
     );
@@ -501,9 +500,7 @@ async function pollBudgets() {
   if (!ok(reply)) return;
   state.budgets = reply.budgets || [];
   for (const c of state.channels) graph.setBudget(c.store, sendLevel(budgetsOf(c, state.budgets)));
-  const box = document.querySelector("#panel-body .budgets");
-  const c = isOpen("store") && channel(state.open.store);
-  if (box && c) box.replaceWith(budgetTable(budgetsOf(c, state.budgets)));
+  if (isOpen("store")) view?.setBudgets(state.budgets);
 }
 
 function renderPanel() {
@@ -542,12 +539,13 @@ function renderPanel() {
     show(t("demo.log_title"), t(sub, {store: c?.store, app: appOf(c?.kind)}), logView(state.log, c, state.logView, setView));
   } else {
     const c = channel(open.store);
-    if (!c) return;
-    const nodes = [budgetTable(budgetsOf(c, state.budgets)), chatView(c, m => deleteMessage(c, m))];
-    if (c.role === "data") nodes.unshift(faultsView(c, state.admin, faultOps(c)));
-    const kin = kinOf(c, state.channels);
-    if (kin) nodes.unshift(kin);
-    show(c.store, t(`demo.channel_sub_${c.role}`, {app: appOf(c.kind), scope: c.scope}), nodes);
+    if (!c) {
+      view = null;
+      return;
+    }
+    const props = {channel: c, channels: state.channels, budgets: state.budgets, admin: state.admin};
+    const v = storeView(props, {faults: faultOps(c), deleteMessage: m => deleteMessage(c, m)});
+    show(c.store, t(`demo.channel_sub_${c.role}`, {app: appOf(c.kind), scope: c.scope}), v.nodes, v);
   }
 }
 

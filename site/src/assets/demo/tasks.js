@@ -197,14 +197,19 @@ const tip = (() => {
 // poll keeps the focus where it was). onToggle(name, on), onRun(name);
 // `follower`: why the leader's tasks are not here (a follower runs none of
 // them; nodes, its links among them), shown above; its snapshots are its
-// own. Returns update(bg).
+// own. Returns {update(bg), focus(task): its card scrolled into view}.
 export function taskCards(box, {onToggle, onRun, follower = null}) {
   const cards = TASKS.map(name => taskCard(name, onToggle, onRun, !!follower));
   const note = h("p", "field-note tasks-ro");
   if (follower) note.append(...follower);
   box.replaceChildren(...(follower ? [note] : []), ...cards.map(c => c.el));
-  return bg => {
-    for (const c of cards) c.update(describe(bg, c.name));
+  return {
+    update(bg) {
+      for (const c of cards) c.update(describe(bg, c.name));
+    },
+    focus(task) {
+      cards.find(c => c.name === task)?.el.scrollIntoView({block: "nearest"});
+    },
   };
 }
 
@@ -212,7 +217,6 @@ function taskCard(name, onToggle, onRun, follower) {
   // A follower's view of a task only the leader runs: no clock, no queue.
   const away = follower && LEADER_TASKS.has(name);
   const el = h("div", "task");
-  el.id = `task-${name}`;
   let on = false;
   const sw = button("switch", null, () => onToggle(name, !on));
   sw.setAttribute("role", "switch");
