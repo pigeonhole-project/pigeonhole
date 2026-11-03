@@ -145,15 +145,15 @@ pub(crate) struct FileCluster {
     id: u64,
     /// The env var holding the key: 64 hex digits.
     key_env: Option<String>,
-    #[serde(with = "humantime_serde")]
+    #[serde(deserialize_with = "crate::units::opt_duration")]
     heartbeat: Option<Duration>,
-    #[serde(with = "humantime_serde")]
+    #[serde(deserialize_with = "crate::units::opt_duration")]
     election_timeout_min: Option<Duration>,
-    #[serde(with = "humantime_serde")]
+    #[serde(deserialize_with = "crate::units::opt_duration")]
     election_timeout_max: Option<Duration>,
-    #[serde(with = "humantime_serde")]
+    #[serde(deserialize_with = "crate::units::opt_duration")]
     tick: Option<Duration>,
-    #[serde(with = "humantime_serde")]
+    #[serde(deserialize_with = "crate::units::opt_duration")]
     poll: Option<Duration>,
     /// The chat of the outboxes: `"telegram"` (the default).
     chat: Option<String>,
@@ -255,12 +255,22 @@ pub(crate) fn node_stores(nodes: &[FileNode], me: Option<u64>) -> Result<NodeSto
 }
 
 /// No node's bot is a store's: the store's posts and the node's Raft
-/// frames would share one budget. Checked on the file as written, every
-/// node's and every store's, before anything is resolved.
-pub(crate) fn check_bots_apart(nodes: &[FileNode], stores: &[crate::stores::FileStore]) -> Result<()> {
+/// frames would share one budget. Checked on the file as written, before
+/// anything is resolved: every node's bots (on fake outboxes, its default
+/// one when it names none) against every store's.
+pub(crate) fn check_bots_apart(
+    cluster: &FileCluster,
+    nodes: &[FileNode],
+    stores: &[crate::stores::FileStore],
+) -> Result<()> {
+    let bots_of = |n: &FileNode| match (&n.bot_ids, &cluster.fake) {
+        (Some(ids), _) => ids.clone(),
+        (None, Some(_)) => vec![fake_raft_bot(n.id)],
+        (None, None) => Vec::new(),
+    };
     for s in stores {
         for bot in s.declared_bot_ids() {
-            if let Some(n) = nodes.iter().find(|n| n.bot_ids.as_deref().unwrap_or_default().contains(&bot)) {
+            if let Some(n) = nodes.iter().find(|n| bots_of(n).contains(&bot)) {
                 bail!(
                     "bot {bot} is in the bot_ids of [[node]] {} and of [[store]] {}: a node's Raft bots must be its own (they would share one budget)",
                     n.id,
@@ -272,9 +282,42 @@ pub(crate) fn check_bots_apart(nodes: &[FileNode], stores: &[crate::stores::File
     Ok(())
 }
 
+/// Each node of a cluster keeps its own log and snapshots: a `[[node]]`
+/// without its own `log` (or `snapshot`) takes `[meta]`'s, which only a
+/// cluster of one may when that is a chat (two nodes on one chat log fence
+/// each other at every boot). `is_chat(id)`: whether `[[store]]` `id` is a
+/// telegram or discord one (fake or not).
+pub(crate) fn check_own_meta(
+    nodes: &[FileNode],
+    meta_log: Option<&str>,
+    meta_snapshot: Option<&str>,
+    is_chat: impl Fn(&str) -> bool,
+) -> Result<()> {
+    if nodes.len() < 2 {
+        return Ok(());
+    }
+    for n in nodes {
+        for (what, own, shared) in [("log", &n.log, meta_log), ("snapshot", &n.snapshot, meta_snapshot)] {
+            if let (None, Some(shared)) = (own, shared) {
+                if is_chat(shared) {
+                    bail!(
+                        "[[node]] {}: {what} = \"<store id>\" is required: [meta] {what} is the chat {shared:?}, and \
+                         two nodes on one chat {what} fence each other at every boot; each node names its own",
+                        n.id
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Timing for the slowest link: heartbeat, election timeout, tick, poll
 /// (docs/cluster.md § Timing).
 struct Timing(Duration, (Duration, Duration), Duration, Duration);
+
+/// The shortest tick and poll on a real chat: each is a call to it.
+const CHAT_FLOOR: Duration = Duration::from_secs(1);
 
 const fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -288,6 +331,22 @@ fn timing(nodes: &[NodeSettings]) -> Timing {
         false => Timing(ms(250), (ms(1_500), ms(3_000)), ms(20), ms(200)),
         true => Timing(ms(10_000), (ms(45_000), ms(90_000)), ms(4_000), ms(3_000)),
     }
+}
+
+/// Every node on the chat names its bots; on fake outboxes, one that
+/// names none gets its own ([`fake_raft_bot`]).
+fn name_bots(nodes: &mut [NodeSettings], fake: bool) -> Result<()> {
+    if fake {
+        for n in nodes.iter_mut().filter(|n| n.bot_ids.is_empty()) {
+            n.bot_ids = vec![fake_raft_bot(n.id)];
+        }
+        return Ok(());
+    }
+    let on_chat = |n: &NodeSettings| nodes.iter().any(|m| m.id != n.id && link(n, m) == Some(Link::Chat));
+    if let Some(n) = nodes.iter().find(|n| on_chat(n) && n.bot_ids.is_empty()) {
+        bail!("[[node]] {}: bot_ids = [...] is required for a node on the chat: its bots' ids", n.id);
+    }
+    Ok(())
 }
 
 fn read_nodes(nodes: Vec<FileNode>) -> Result<Vec<NodeSettings>> {
@@ -336,51 +395,26 @@ impl FileCluster {
         fake_base: impl FnOnce(&str) -> Result<FakeBacking>,
     ) -> Result<Option<ClusterSettings>> {
         let Some(node) = node else { return Ok(None) };
-        let nodes = read_nodes(nodes)?;
+        let chat_kind = self.chat.as_deref().unwrap_or("telegram");
+        if chat_kind != "telegram" {
+            bail!("[cluster] chat = {chat_kind:?}: only \"telegram\" for now");
+        }
+        let mut nodes = read_nodes(nodes)?;
+        let fake = self.fake(fake_base)?;
+        name_bots(&mut nodes, fake.is_some())?;
         let me =
             nodes.iter().find(|n| n.id == node).with_context(|| format!("this node, {node}, is not a [[node]]"))?;
         let chat_link = nodes.iter().any(|n| n.id != node && link(me, n) == Some(Link::Chat));
-        let fake = match &self.fake {
-            None => None,
-            Some(_) if !cfg!(feature = "fake") => {
-                bail!("[cluster] fake: fake outboxes are only in builds with the `fake` feature")
-            }
-            Some(_) if self.bot_token_envs.is_some() || self.api_id_env.is_some() => {
-                bail!("[cluster] fake outboxes have no real bots: drop bot_token_envs, api_id_env, api_hash_env")
-            }
-            Some(under) => Some(fake_base(under).context("[cluster] fake")?),
-        };
-        let mut nodes = nodes;
-        let on_chat =
-            |n: &NodeSettings, all: &[NodeSettings]| all.iter().any(|m| m.id != n.id && link(n, m) == Some(Link::Chat));
-        if fake.is_some() {
-            for n in &mut nodes {
-                if n.bot_ids.is_empty() {
-                    n.bot_ids = vec![fake_raft_bot(n.id)];
-                }
-            }
-        } else {
-            let all = nodes.clone();
-            if let Some(n) = all.iter().find(|n| on_chat(n, &all) && n.bot_ids.is_empty()) {
-                bail!("[[node]] {}: bot_ids = [...] is required for a node on the chat: its bots' ids", n.id);
-            }
-        }
-        let me = nodes.iter().find(|n| n.id == node).expect("checked above");
         let chat = match (chat_link, &fake) {
             (false, _) => None,
             (true, Some(_)) => Some(ChatSettings::Fake),
             (true, None) => Some(self.chat_settings(me)?),
         };
-        let key_env = self.key_env.context("[cluster] key_env: the env var with the cluster's key")?;
-        let key = parse_key(&std::env::var(&key_env).with_context(|| format!("{key_env} is not set"))?)
-            .with_context(|| key_env.clone())?;
-        let Timing(heartbeat, election, tick, poll) = timing(&nodes);
-        let election_timeout =
-            (self.election_timeout_min.unwrap_or(election.0), self.election_timeout_max.unwrap_or(election.1));
-        let heartbeat = self.heartbeat.unwrap_or(heartbeat);
-        if !(heartbeat < election_timeout.0 && election_timeout.0 < election_timeout.1) {
-            bail!("[cluster]: need heartbeat < election_timeout_min < election_timeout_max");
-        }
+        let key_env = self.key_env.as_deref().context("[cluster] key_env: the env var with the cluster's key")?;
+        let key = parse_key(&std::env::var(key_env).with_context(|| format!("{key_env} is not set"))?)
+            .with_context(|| key_env.to_string())?;
+        let Timing(heartbeat, election_timeout, tick, poll) =
+            self.timing(&nodes, matches!(chat, Some(ChatSettings::Telegram { .. })))?;
         Ok(Some(ClusterSettings {
             node,
             id: self.id as u128,
@@ -389,35 +423,64 @@ impl FileCluster {
             chat,
             heartbeat,
             election_timeout,
-            tick: self.tick.unwrap_or(tick),
-            poll: self.poll.unwrap_or(poll),
+            tick,
+            poll,
             fake,
         }))
+    }
+
+    /// Where fake outboxes keep themselves (`[cluster] fake`), if they are fakes.
+    fn fake(&self, fake_base: impl FnOnce(&str) -> Result<FakeBacking>) -> Result<Option<FakeBacking>> {
+        Ok(match &self.fake {
+            None => None,
+            Some(_) if !cfg!(feature = "fake") => {
+                bail!("[cluster] fake: fake outboxes are only in builds with the `fake` feature")
+            }
+            Some(_) if self.bot_token_envs.is_some() || self.api_id_env.is_some() => {
+                bail!("[cluster] fake outboxes have no real bots: drop bot_token_envs, api_id_env, api_hash_env")
+            }
+            Some(under) => Some(fake_base(under).context("[cluster] fake")?),
+        })
+    }
+
+    /// Heartbeat, election timeout, tick and poll: the file's, else set for
+    /// the slowest link; on a real chat (`real_chat`), a tick and a poll of
+    /// a second at least.
+    fn timing(&self, nodes: &[NodeSettings], real_chat: bool) -> Result<Timing> {
+        let Timing(heartbeat, election, tick, poll) = timing(nodes);
+        let election_timeout =
+            (self.election_timeout_min.unwrap_or(election.0), self.election_timeout_max.unwrap_or(election.1));
+        let heartbeat = self.heartbeat.unwrap_or(heartbeat);
+        if !(heartbeat < election_timeout.0 && election_timeout.0 < election_timeout.1) {
+            bail!("[cluster]: need heartbeat < election_timeout_min < election_timeout_max");
+        }
+        let (tick, poll) = (self.tick.unwrap_or(tick), self.poll.unwrap_or(poll));
+        for (what, d) in [("tick", tick), ("poll", poll)] {
+            if real_chat && d < CHAT_FLOOR {
+                bail!("[cluster] {what} = {d:?}: at least {CHAT_FLOOR:?} on a Telegram chat (each is a call to it)");
+            }
+        }
+        Ok(Timing(heartbeat, election_timeout, tick, poll))
     }
 
     /// This node's bots in the chat of the outboxes: its tokens must be
     /// the bots its `[[node]] bot_ids` names.
     fn chat_settings(&self, me: &NodeSettings) -> Result<ChatSettings> {
-        match self.chat.as_deref().unwrap_or("telegram") {
-            "telegram" => {
-                let envs = self.bot_token_envs.clone().unwrap_or_else(|| vec!["RAFT_BOT_TOKEN".into()]);
-                if envs.is_empty() {
-                    bail!("[cluster] bot_token_envs is empty");
-                }
-                let bots = TelegramBots {
-                    envs: &envs,
-                    api_id_env: self.api_id_env.clone(),
-                    api_hash_env: self.api_hash_env.clone(),
-                    session: None,
-                };
-                let logins = bots.logins("[cluster]")?;
-                let tokens: Vec<&str> = logins.iter().map(|l| l.bot_token.as_str()).collect();
-                let what = format!("[cluster] bot_token_envs of [[node]] {}", me.id);
-                check_bot_ids(&what, &envs, &tokens, telegram_bot_id, Some(&me.bot_ids))?;
-                Ok(ChatSettings::Telegram { logins })
-            }
-            other => bail!("[cluster] chat = {other:?}: only \"telegram\" for now"),
+        let envs = self.bot_token_envs.clone().unwrap_or_else(|| vec!["RAFT_BOT_TOKEN".into()]);
+        if envs.is_empty() {
+            bail!("[cluster] bot_token_envs is empty");
         }
+        let bots = TelegramBots {
+            envs: &envs,
+            api_id_env: self.api_id_env.clone(),
+            api_hash_env: self.api_hash_env.clone(),
+            session: None,
+        };
+        let logins = bots.logins("[cluster]")?;
+        let tokens: Vec<&str> = logins.iter().map(|l| l.bot_token.as_str()).collect();
+        let what = format!("[cluster] bot_token_envs of [[node]] {}", me.id);
+        check_bot_ids(&what, &envs, &tokens, telegram_bot_id, Some(&me.bot_ids))?;
+        Ok(ChatSettings::Telegram { logins })
     }
 }
 

@@ -58,7 +58,7 @@ metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [features]
 default = ["discord", "metrics-prometheus"]
-discord = ["dep:pigeonhole-storage-discord", "dep:pigeonhole-discord-http", "pigeonhole-config/discord"]
+discord = ["dep:pigeonhole-storage-discord", "dep:pigeonhole-discord-http"]
 bytestream = ["dep:pigeonhole-gateway-bytestream"]
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
 # Telegram and Discord stores on fake channels (`fake = …` in a store): the

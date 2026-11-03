@@ -6,8 +6,6 @@ license.workspace = true
 description = "pigeonhole.toml and the environment, read into a Config"
 
 [features]
-# Discord stores in the config (their default limits).
-discord = ["dep:pigeonhole-storage-discord"]
 # `fake = …` on a telegram or discord store: a fake channel (the site's demo,
 # the fake-channel build). Off: such a config is refused.
 fake = []
@@ -24,7 +22,7 @@ pigeonhole-codec = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-limits = { workspace = true }
 pigeonhole-meta = { workspace = true }
-pigeonhole-storage-discord = { workspace = true, optional = true }
+pigeonhole-storage-discord = { workspace = true }
 pigeonhole-storage-disk = { workspace = true }
 pigeonhole-storage-memory = { workspace = true }
 pigeonhole-storage-telegram = { workspace = true }

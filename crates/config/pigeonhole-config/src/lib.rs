@@ -98,6 +98,9 @@ pub struct Config {
     /// Small objects in the metadata, and the cooler (`[inline]`).
     pub inline: InlineSettings,
     pub config_path: PathBuf,
+    /// The file as read (no secrets: those are in the environment), as the
+    /// admin shows it; empty for a config built in code.
+    pub text: String,
     /// The file as read: the base the dynamic config's overrides go on.
     file: toml::Table,
 }
@@ -111,13 +114,6 @@ pub struct InlineSettings {
     pub cool: CoolPolicy,
     /// Pause between cooler passes; `None`: only when asked.
     pub cool_every: Option<Duration>,
-}
-
-impl InlineSettings {
-    /// Nothing inline (tests that count chunks).
-    pub fn off() -> Self {
-        Self { max_object_size: None, cool: CoolPolicy::default(), cool_every: Some(DEFAULT_COOL_EVERY) }
-    }
 }
 
 /// Default `[inline] cool_every`.
@@ -232,10 +228,12 @@ pub enum LogSettings {
 pub enum MetaPlace<'a> {
     LocalDisk(&'a Path),
     Memory,
-    /// A real channel: `telegram` or `discord`, and its id.
+    /// A real channel: `telegram` or `discord`, its id, and how many bots
+    /// post to it.
     Chat {
         kind: &'static str,
         scope: &'a str,
+        bots: usize,
     },
     Fake(&'a crate::stores::FakeChannel),
 }
@@ -245,8 +243,12 @@ impl SnapshotSettings {
         match self {
             SnapshotSettings::LocalDisk { path } => MetaPlace::LocalDisk(path),
             SnapshotSettings::Memory => MetaPlace::Memory,
-            SnapshotSettings::Telegram { chat_id, .. } => MetaPlace::Chat { kind: "telegram", scope: chat_id },
-            SnapshotSettings::Discord { channel_id, .. } => MetaPlace::Chat { kind: "discord", scope: channel_id },
+            SnapshotSettings::Telegram { chat_id, logins } => {
+                MetaPlace::Chat { kind: InstanceKind::Telegram.as_str(), scope: chat_id, bots: logins.len() }
+            }
+            SnapshotSettings::Discord { channel_id, bot_tokens, .. } => {
+                MetaPlace::Chat { kind: InstanceKind::Discord.as_str(), scope: channel_id, bots: bot_tokens.len() }
+            }
             SnapshotSettings::Fake(f) => MetaPlace::Fake(f),
         }
     }
@@ -257,8 +259,12 @@ impl LogSettings {
         match self {
             LogSettings::LocalDisk { path } => MetaPlace::LocalDisk(path),
             LogSettings::Memory => MetaPlace::Memory,
-            LogSettings::Telegram { chat_id, .. } => MetaPlace::Chat { kind: "telegram", scope: chat_id },
-            LogSettings::Discord { channel_id, .. } => MetaPlace::Chat { kind: "discord", scope: channel_id },
+            LogSettings::Telegram { chat_id, logins } => {
+                MetaPlace::Chat { kind: InstanceKind::Telegram.as_str(), scope: chat_id, bots: logins.len() }
+            }
+            LogSettings::Discord { channel_id, bot_tokens, .. } => {
+                MetaPlace::Chat { kind: InstanceKind::Discord.as_str(), scope: channel_id, bots: bot_tokens.len() }
+            }
             LogSettings::Fake(f) => MetaPlace::Fake(f),
         }
     }
@@ -428,7 +434,9 @@ impl Config {
     fn parse(text: &str, path: &Path, node: Option<u64>) -> Result<Self> {
         let file: FileConfig = toml::from_str(text).with_context(|| format!("parse TOML {}", path.display()))?;
         let table = text.parse().with_context(|| format!("parse TOML {}", path.display()))?;
-        Self::from_file(file, table, path.to_path_buf(), node)
+        let mut cfg = Self::from_file(file, table, path.to_path_buf(), node)?;
+        cfg.text = text.to_string();
+        Ok(cfg)
     }
 
     fn from_file(mut file: FileConfig, table: toml::Table, config_path: PathBuf, as_node: Option<u64>) -> Result<Self> {
@@ -454,12 +462,14 @@ impl Config {
         let ingest_budget = Some(ByteBudget::new(memory_budget));
 
         let tg = file.telegram.into_limiter_config("telegram", pigeonhole_storage_telegram::limits())?;
-        let discord = file.discord.into_limiter_config("discord", discord_limits())?;
+        let discord = file.discord.into_limiter_config("discord", pigeonhole_storage_discord::limits())?;
 
         // In a cluster, this node's own log and snapshots replace [meta]'s;
         // the other nodes' are checked, not opened.
         let me = file.cluster.this_node(&file.node, as_node)?;
-        cluster::check_bots_apart(&file.node, &file.store)?;
+        let is_chat = |id: &str| file.store.iter().any(|s| s.store_id() == id && s.is_chat());
+        cluster::check_own_meta(&file.node, file.meta.log.as_deref(), file.meta.snapshot.as_deref(), is_chat)?;
+        cluster::check_bots_apart(&file.cluster, &file.node, &file.store)?;
         let own = cluster::node_stores(&file.node, me)?;
         if own.log.is_some() {
             file.meta.log = own.log;
@@ -493,7 +503,10 @@ impl Config {
             block_size,
             ingest_budget,
             limiters: Arc::new(LimiterRegistry::new(tg.clone(), pigeonhole_storage_telegram::limits::CLASSES)?),
-            discord_limiters: Arc::new(LimiterRegistry::new(discord.clone(), DISCORD_CLASSES)?),
+            discord_limiters: Arc::new(LimiterRegistry::new(
+                discord.clone(),
+                pigeonhole_storage_discord::limits::CLASSES,
+            )?),
             tg,
             discord,
             cache: file.cache.into_cache_config()?,
@@ -508,6 +521,7 @@ impl Config {
             log: file.log.into_settings(),
             inline: file.inline.into_settings()?,
             config_path,
+            text: String::new(),
             file: table,
         })
     }
@@ -521,8 +535,12 @@ impl Config {
         }
     }
 
-    /// Defaults for in-process tests; metadata files go under `dir`.
+    /// Defaults for in-process tests; metadata files go under `dir`. Its
+    /// file is [`FOR_TEST`]: the dynamic config's base, so the loops run
+    /// with what the fields say (change a knob there, not in a field).
     pub fn for_test(dir: &Path) -> Self {
+        let table: toml::Table = FOR_TEST.parse().expect("FOR_TEST is TOML");
+        let file: FileConfig = toml::Value::Table(table.clone()).try_into().expect("FOR_TEST is a config");
         Self {
             listen_addr: "127.0.0.1:0".into(),
             meta: MetaSettings::in_dir(dir),
@@ -542,24 +560,28 @@ impl Config {
                 )
                 .expect("the store's own limits"),
             ),
-            discord: Self::test_limits(discord_limits()),
+            discord: Self::test_limits(pigeonhole_storage_discord::limits()),
             discord_limiters: Arc::new(
-                LimiterRegistry::new(Self::test_limits(discord_limits()), DISCORD_CLASSES)
-                    .expect("the store's own limits"),
+                LimiterRegistry::new(
+                    Self::test_limits(pigeonhole_storage_discord::limits()),
+                    pigeonhole_storage_discord::limits::CLASSES,
+                )
+                .expect("the store's own limits"),
             ),
             cache: CacheConfig { enabled: false, ..CacheConfig::default() },
-            bytestream: BytestreamSettings::default(),
+            bytestream: file.bytestream.into_settings(),
             http: HttpSettings::default(),
             instances: vec![memory_instance("mem")],
             placement: PlacementConfig::single("mem"),
-            sweep: SweepConfig::default(),
-            repair: RepairConfig::default(),
-            metrics: MetricsSettings::default(),
+            sweep: file.sweep.into_sweep_config(),
+            repair: file.repair.into_repair_config(),
+            metrics: file.metrics.into_settings(),
             admin: AdminSettings::default(),
             log: LoggingSettings::default(),
-            inline: InlineSettings::off(),
+            inline: file.inline.into_settings().expect("FOR_TEST's [inline]"),
             config_path: PathBuf::from("(test)"),
-            file: toml::Table::new(),
+            text: String::new(),
+            file: table,
         }
     }
 
@@ -594,6 +616,10 @@ impl Config {
         Ok(self.primary_instance()?.scope_id.as_str())
     }
 }
+
+/// [`Config::for_test`]'s file: nothing inline (tests that count chunks),
+/// the rest the defaults.
+const FOR_TEST: &str = "[inline]\nmax_object_size = \"off\"\n";
 
 fn config_path_from_env() -> PathBuf {
     env::var("PIGEONHOLE_CONFIG").map_or_else(|_| PathBuf::from("pigeonhole.toml"), PathBuf::from)
@@ -748,7 +774,7 @@ impl FileMeta {
 
     fn into_settings(self, topology: &mut Topology) -> Result<MetaSettings> {
         let log_store = match &self.log {
-            Some(id) => topology.meta_store(id, "[meta] log")?,
+            Some(id) => topology.take(id, "[meta] log")?,
             None => Store::LocalDisk { path: DEFAULT_META_DIR.into() },
         };
         let log = match &log_store {
@@ -765,7 +791,7 @@ impl FileMeta {
             Store::Fake(f) => LogSettings::Fake(f.clone()),
         };
         let snapshot_store = match &self.snapshot {
-            Some(id) => topology.meta_store(id, "[meta] snapshot")?,
+            Some(id) => topology.take(id, "[meta] snapshot")?,
             None if matches!(log_store, Store::LocalDisk { .. } | Store::Memory) => log_store,
             None => bail!("[meta] snapshot is required with a telegram or discord log"),
         };
@@ -1096,30 +1122,6 @@ impl Default for FileIngest {
     }
 }
 
-/// Discord's default limits; without the backend built in, only its bot's
-/// rate (there is nothing to call).
-/// What Discord's calls spend; none without its store.
-#[cfg(feature = "discord")]
-const DISCORD_CLASSES: &[pigeonhole_limits::Class] = pigeonhole_storage_discord::limits::CLASSES;
-#[cfg(not(feature = "discord"))]
-const DISCORD_CLASSES: &[pigeonhole_limits::Class] = &[];
-
-fn discord_limits() -> ChatLimiterConfig {
-    #[cfg(feature = "discord")]
-    {
-        pigeonhole_storage_discord::limits()
-    }
-    #[cfg(not(feature = "discord"))]
-    {
-        ChatLimiterConfig {
-            bot: Rate::new(40.0, 50.0),
-            classes: Vec::new(),
-            upload_concurrency: 2,
-            download_concurrency: 8,
-        }
-    }
-}
-
 /// `[telegram]` / `[discord]`: transfers at once, and a table per rate:
 /// `[telegram.bot]` (every call of a bot) and one per class of call
 /// (`[telegram.send]`, …). What is not set keeps the service's default.
@@ -1215,14 +1217,15 @@ mod tests {
         tgm_store(id, chat)
     }
 
-    // Without the Discord store there are no Discord classes to set.
-    #[cfg(feature = "discord")]
     #[test]
     fn discord_limits_are_its_own() {
         let send = Class("send");
         let cfg = load_mem("[discord.send]\nrate_per_sec = 2.0\n[telegram.send]\nrate_per_sec = 0.5\n").unwrap();
         assert_eq!((cfg.discord.rate(send).unwrap().per_sec, cfg.tg.rate(send).unwrap().per_sec), (2.0, 0.5));
-        assert_eq!(cfg.discord.rate(send).unwrap().burst, discord_limits().rate(send).unwrap().burst);
+        assert_eq!(
+            cfg.discord.rate(send).unwrap().burst,
+            pigeonhole_storage_discord::limits().rate(send).unwrap().burst
+        );
         assert!(load_mem("[discord.send]\nrate_per_sec = 0.0\n").is_err());
         // Keyed by the bot's id, and each service by its own registry.
         let dc = cfg.chat_limiter(InstanceKind::Discord, "MTIz.ts.hmac-a", "7");
@@ -1255,7 +1258,7 @@ rate_per_sec = 20.0
         assert_eq!(cfg.tg.upload_concurrency, 4);
         assert_eq!(
             cfg.discord.rate(Class("send")),
-            discord_limits().rate(Class("send")),
+            pigeonhole_storage_discord::limits().rate(Class("send")),
             "[discord] keeps its own defaults"
         );
         for (bad, want) in [
@@ -1405,7 +1408,8 @@ rate_per_sec = 20.0
         };
         let cfg = load(&store("[\"PH_TEST_TGM_TOKEN\", \"PH_TEST_TGM_TOKEN_2\"]", "bot_ids = [42, 43]\n")).unwrap();
         let inst = cfg.primary_instance().unwrap();
-        assert_eq!(inst.bot_tokens, vec!["42:secret".to_string(), "43:other".to_string()]);
+        let tokens: Vec<_> = inst.telegram.iter().map(|l| l.bot_token.as_str()).collect();
+        assert_eq!((tokens, inst.discord_tokens.len()), (vec!["42:secret", "43:other"], 0));
         let sessions: Vec<_> = inst.telegram.iter().map(|l| l.session.display().to_string()).collect();
         assert_eq!(sessions, vec!["pigeonhole-tg-42.session", "pigeonhole-tg-43.session"], "a session per bot");
         assert_eq!(inst.info.fingerprint, "tg:42:-1003", "named by the primary");
@@ -1661,7 +1665,7 @@ fake = "memory"
         let tg = cfg.instances.iter().find(|i| i.info.id == "tg").unwrap();
         assert_eq!((tg.kind, tg.scope_id.as_str()), (InstanceKind::Telegram, "-1001"));
         assert_eq!(tg.info.fingerprint, "fake:telegram:-1001");
-        assert!(tg.telegram.is_empty() && tg.bot_tokens.is_empty());
+        assert!(tg.telegram.is_empty() && tg.discord_tokens.is_empty());
         let fake = tg.fake.as_ref().unwrap();
         assert_eq!((&fake.backing, fake.bots), (&stores::FakeBacking::Memory, 1), "one bot unless `bots` says");
         assert!(matches!(cfg.meta.log, LogSettings::Fake(stores::FakeChannel { kind: InstanceKind::Telegram, .. })));
@@ -2013,9 +2017,80 @@ max_batch_total_size = "8 MiB"
             (format!("[cluster]\nnode = 1\nkey_env = \"PH_TEST_NO_SUCH_KEY\"\n{nodes}"), "is not set"),
             (format!("{base}heartbeat = \"5s\"\n{nodes}"), "heartbeat < election_timeout_min"),
             (format!("{base}{nodes}[[node]]\nid = 2\ngrpc = \"x:1\"\n"), "id 2 twice"),
+            (format!("{base}tick = \"0s\"\n{nodes}"), "must be more than zero"),
+            (format!("{base}election_timeout_min = \"0ms\"\n{nodes}"), "must be more than zero"),
+            (format!("{base}poll = \"off\"\n{nodes}"), "\"off\""),
+            // Checked on every node, a chat link or not.
+            (format!("{base}chat = \"discord\"\n{nodes}"), "chat = \"discord\": only \"telegram\""),
         ] {
             let err = format!("{:#}", load_mem(&toml).unwrap_err());
             assert!(err.contains(want), "{toml:?}: want {want:?} in {err}");
         }
+    }
+
+    #[test]
+    fn a_chat_log_is_each_nodes_own() {
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        let file = |node2: &str| {
+            format!(
+                "[cluster]\nid = 9\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n\
+                 [meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n\
+                 [[node]]\nid = 1\ngrpc = \"a:1\"\n\
+                 [[node]]\nid = 2\ngrpc = \"b:1\"\n{node2}\
+                 [chunk]\nstore = \"blobs\"\n[[store]]\nid = \"blobs\"\nkind = \"memory\"\n\
+                 [[store]]\nid = \"tg-log\"\nkind = \"telegram\"\nchat_id = -11\nbot_ids = [42]\n\
+                 [[store]]\nid = \"tg-snap\"\nkind = \"telegram\"\nchat_id = -12\nbot_ids = [42]\n\
+                 [[store]]\nid = \"disk-2\"\nkind = \"local_disk\"\npath = \"node-2\"\n"
+            )
+        };
+        let path = Path::new("pigeonhole.toml");
+        // Node 1 keeps [meta]'s chat log; node 2 has none of its own: refused on every node.
+        for node in [1, 2] {
+            let err = format!("{:#}", Config::from_toml_as(&file(""), path, node).unwrap_err());
+            assert!(err.contains("[[node]] 1: log = \"<store id>\" is required"), "{err}");
+        }
+        let err = format!("{:#}", Config::from_toml_as(&file("log = \"disk-2\"\n"), path, 2).unwrap_err());
+        assert!(err.contains("[[node]] 1: log"), "node 1 still shares [meta]'s: {err}");
+        // Node 1 on chats of its own, node 2 on a disk.
+        let disk = file("log = \"disk-2\"\n").replace("[meta]\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n", "");
+        let disk = disk.replace("grpc = \"a:1\"\n", "grpc = \"a:1\"\nlog = \"tg-log\"\nsnapshot = \"tg-snap\"\n");
+        assert!(Config::from_toml_as(&disk, path, 2).is_ok(), "node 2 leaves node 1's stores alone");
+    }
+
+    #[test]
+    fn a_telegram_chat_ticks_at_least_once_a_second() {
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        set_env("PH_TEST_RAFT_BOT_TICK", "51:secret");
+        set_env("PH_TEST_TGM_API_ID", "12345");
+        set_env("PH_TEST_TGM_API_HASH", "hash");
+        let text = |timing: &str| {
+            format!(
+                "[cluster]\nid = 9\nnode = 1\nkey_env = \"PH_TEST_CLUSTER_KEY\"\n{timing}\
+                 bot_token_envs = [\"PH_TEST_RAFT_BOT_TICK\"]\n\
+                 api_id_env = \"PH_TEST_TGM_API_ID\"\napi_hash_env = \"PH_TEST_TGM_API_HASH\"\n\
+                 [[node]]\nid = 1\noutbox = -1001\nbot_ids = [51]\n[[node]]\nid = 2\noutbox = -1002\nbot_ids = [52]\n"
+            )
+        };
+        assert!(load_mem(&text("tick = \"1s\"\n")).is_ok());
+        for (timing, want) in [("tick = \"100ms\"\n", "[cluster] tick"), ("poll = \"20ms\"\n", "[cluster] poll")] {
+            let err = format!("{:#}", load_mem(&text(timing)).unwrap_err());
+            assert!(err.contains(want) && err.contains("at least 1s"), "{timing}: {err}");
+        }
+    }
+
+    #[cfg(feature = "fake")]
+    #[test]
+    fn a_fake_outboxs_default_bot_is_no_stores() {
+        set_env("PH_TEST_CLUSTER_KEY", KEY);
+        let text = "[cluster]\nid = 9\nnode = 1\nkey_env = \"PH_TEST_CLUSTER_KEY\"\nfake = \"memory\"\n\
+             [[node]]\nid = 1\noutbox = -1001\n[[node]]\nid = 2\noutbox = -1002\n\
+             [chunk]\nstore = \"tg\"\n[[store]]\nid = \"tg\"\nkind = \"telegram\"\nchat_id = -5\nfake = \"memory\"\n";
+        assert!(Config::from_toml(text, Path::new("demo.toml")).is_ok());
+        let taken = text.replace(
+            "chat_id = -5\nfake = \"memory\"\n",
+            &format!("chat_id = -5\nfake = \"memory\"\nbot_ids = [{}]\n", cluster::fake_raft_bot(2)),
+        );
+        let err = format!("{:#}", Config::from_toml(&taken, Path::new("demo.toml")).unwrap_err());
+        assert!(err.contains("of [[node]] 2 and of [[store]] tg"), "{err}");
     }
 }

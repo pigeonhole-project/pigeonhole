@@ -385,7 +385,7 @@ async fn build_member(cfg: &Config, inst: &InstanceConfig) -> anyhow::Result<Sha
             #[cfg(feature = "discord")]
             {
                 use pigeonhole_storage_discord::DiscordBlobStore;
-                let (channel, _) = discord_channel(cfg, &inst.bot_tokens, &inst.scope_id, false)
+                let (channel, _) = discord_channel(cfg, &inst.discord_tokens, &inst.scope_id, false)
                     .await
                     .with_context(|| format!("store {id:?}: permission check"))?;
                 let limiter = channel.limiter().clone();

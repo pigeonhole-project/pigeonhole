@@ -19,8 +19,7 @@ impl InstanceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Telegram => pigeonhole_storage_telegram::KIND,
-            // The crate is optional; a test pins the two together.
-            Self::Discord => "discord",
+            Self::Discord => pigeonhole_storage_discord::KIND,
             Self::Memory => pigeonhole_storage_memory::KIND,
             Self::LocalDisk => pigeonhole_storage_disk::KIND,
         }
@@ -35,13 +34,14 @@ pub struct InstanceConfig {
     /// Env var names holding the bots' tokens (never the secrets), the
     /// primary first; empty for memory and local_disk.
     pub bot_token_envs: Vec<String>,
-    /// Resolved tokens (from env), as `bot_token_envs`.
-    pub bot_tokens: Vec<String>,
+    /// `discord`: the bots' tokens (from env), as `bot_token_envs`; a
+    /// Telegram store's bots log in with `telegram`.
+    pub discord_tokens: Vec<String>,
     /// Telegram chat id, Discord channel id or local_disk path (string form).
     pub scope_id: String,
     /// Per-message size limit override (Discord); `None` = backend default.
     pub max_blob_size: Option<usize>,
-    /// `telegram`: how each bot logs in, as `bot_tokens`.
+    /// `telegram`: how each bot logs in, as `bot_token_envs`.
     pub telegram: Vec<TelegramLogin>,
     /// A fake channel stands in for the service (builds with feature `fake`).
     pub fake: Option<crate::stores::FakeChannel>,
@@ -122,7 +122,7 @@ pub fn memory_instance(id: &str) -> InstanceConfig {
             role: InstanceRole::ReadWrite,
         },
         bot_token_envs: Vec::new(),
-        bot_tokens: Vec::new(),
+        discord_tokens: Vec::new(),
         scope_id: "local".into(),
         max_blob_size: None,
         telegram: Vec::new(),
@@ -175,12 +175,6 @@ pub fn check_fingerprints(configured: &[InstanceConfig], stored: &[(String, Stri
 mod tests {
     use super::*;
 
-    #[cfg(feature = "discord")]
-    #[test]
-    fn discord_kind_is_the_crates() {
-        assert_eq!(InstanceKind::Discord.as_str(), pigeonhole_storage_discord::KIND);
-    }
-
     #[test]
     fn rejects_two_writers_same_location() {
         let a = InstanceConfig {
@@ -193,7 +187,7 @@ mod tests {
                 role: InstanceRole::ReadWrite,
             },
             bot_token_envs: vec!["T".into()],
-            bot_tokens: vec!["1:x".into()],
+            discord_tokens: Vec::new(),
             scope_id: "-100".into(),
             max_blob_size: None,
             telegram: Vec::new(),
@@ -216,7 +210,7 @@ mod tests {
                 role: InstanceRole::ReadWrite,
             },
             bot_token_envs: vec!["T".into()],
-            bot_tokens: vec!["1:x".into()],
+            discord_tokens: Vec::new(),
             scope_id: "-100".into(),
             max_blob_size: None,
             telegram: Vec::new(),
@@ -241,7 +235,7 @@ mod tests {
                 role: InstanceRole::ReadWrite,
             },
             bot_token_envs: vec!["T".into()],
-            bot_tokens: vec!["1:x".into()],
+            discord_tokens: Vec::new(),
             scope_id: "-100".into(),
             max_blob_size: None,
             telegram: Vec::new(),

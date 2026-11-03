@@ -12,7 +12,7 @@ bytes = { workspace = true }
 openraft-chat = { workspace = true }
 pigeonhole-admin = { workspace = true }
 pigeonhole-blob = { workspace = true }
-pigeonhole-config = { workspace = true, features = ["discord", "fake"] }
+pigeonhole-config = { workspace = true, features = ["fake"] }
 pigeonhole-meta = { workspace = true }
 pigeonhole-storage-api = { workspace = true, features = ["fake"] }
 pigeonhole-storage-discord = { workspace = true, features = ["fake"] }
