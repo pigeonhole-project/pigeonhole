@@ -175,24 +175,50 @@ impl<C: RaftTypeConfig> ChatNetwork<C> {
     }
 
     /// Send `body` to `target` and wait up to `ttl` for its response.
+    /// Dropped before then (openraft's own timeout around it), the call
+    /// stops waiting all the same: it is no longer in [`Self::pending_calls`]
+    /// and counts as a timeout.
     pub async fn call(&self, target: C::NodeId, body: Body<C>, ttl: Duration) -> Result<Body<C>, CallError> {
         let rpc = self.inner.next_rpc.fetch_add(1, Ordering::Relaxed);
-        let (kind, peer, t0) = (body.rpc(), target.to_string(), Instant::now());
         let (tx, rx) = oneshot::channel();
         self.inner.waiting.lock().unwrap().insert(rpc, (target.clone(), tx));
+        let mut call =
+            Call { inner: &self.inner, rpc, peer: target.to_string(), kind: body.rpc(), t0: Instant::now(), ok: false };
         self.inner.enqueue(Envelope { to: target, rpc, body });
-        let got = tokio::time::timeout(ttl, rx).await;
-        self.inner.waiting.lock().unwrap().remove(&rpc);
-        let got = match got {
+        let got = match tokio::time::timeout(ttl, rx).await {
             Ok(Ok(body)) => Ok(body),
             _ => Err(CallError::Timeout),
         };
-        telemetry::record_call(peer, kind, if got.is_ok() { "ok" } else { "timeout" }, t0.elapsed());
+        call.ok = got.is_ok();
         got
+    }
+
+    /// Calls waiting for their response now.
+    pub fn pending_calls(&self) -> usize {
+        self.inner.waiting.lock().unwrap().len()
     }
 
     fn client(&self, target: C::NodeId) -> ChatClient<C> {
         ChatClient { net: self.clone(), target }
+    }
+}
+
+/// A call in flight: however it ends (answered, timed out, dropped), it
+/// stops waiting and is counted.
+struct Call<'a, C: RaftTypeConfig> {
+    inner: &'a Inner<C>,
+    rpc: u64,
+    peer: String,
+    kind: &'static str,
+    t0: Instant,
+    ok: bool,
+}
+
+impl<C: RaftTypeConfig> Drop for Call<'_, C> {
+    fn drop(&mut self) {
+        self.inner.waiting.lock().unwrap().remove(&self.rpc);
+        let outcome = if self.ok { "ok" } else { "timeout" };
+        telemetry::record_call(std::mem::take(&mut self.peer), self.kind, outcome, self.t0.elapsed());
     }
 }
 
