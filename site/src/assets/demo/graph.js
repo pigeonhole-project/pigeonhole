@@ -21,8 +21,8 @@ import {ownerOf} from "./flights.js";
 import {contents, floorsFor, layout} from "./layout.js";
 import {arc as arcPoints} from "./pigeons/model.js";
 import {makePigeons} from "./pigeons/render.js";
+import {settings} from "./settings.js";
 
-const QUEUE_SHOWN = 12; // repair jobs drawn over a block; the rest as "+n"
 // A phone's screen: the town top to bottom, scrolled.
 const NARROW = "(max-width: 640px)";
 
@@ -338,13 +338,15 @@ export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
     const q = cards.get(store)?.queue;
     if (!q) return;
     q.replaceChildren();
-    const shown = Math.min(jobs.length, QUEUE_SHOWN),
+    // Repair jobs drawn over the block: `settings.queueShown`, the rest as "+n".
+    const most = settings.queueShown;
+    const shown = Math.min(jobs.length, most),
       left = -((shown - 1) * 9) / 2 - 3;
-    jobs.slice(0, QUEUE_SHOWN).forEach((j, i) => {
+    jobs.slice(0, most).forEach((j, i) => {
       const sq = svg("rect", {class: "job", x: left + i * 9, y: 0, width: 6, height: 6, rx: 1.5}, q);
       svg("title", {}, sq).textContent = title(j);
     });
-    if (jobs.length > QUEUE_SHOWN) svg("text", {class: "job-more", x: left + QUEUE_SHOWN * 9 + 2, y: 6}, q).textContent = `+${jobs.length - QUEUE_SHOWN}`;
+    if (jobs.length > most) svg("text", {class: "job-more", x: left + most * 9 + 2, y: 6}, q).textContent = `+${jobs.length - most}`;
   }
 
   // ---- pigeons (pigeons/): the town tells them where its places are

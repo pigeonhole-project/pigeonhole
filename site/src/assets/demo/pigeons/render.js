@@ -4,6 +4,7 @@
 // it flies on to where its places are now.
 import {reducedMotion, svg} from "../../lib/dom.js";
 import {beat, flying, glide} from "../art.js";
+import {settings} from "../settings.js";
 import {along, arc, durationOf, lengthOf, makeSky, pointOn} from "./model.js";
 
 // town: {spot(place): where a place is, chosen once (a window: which one)
@@ -16,7 +17,7 @@ export function makePigeons(town) {
   const sky = makeSky({start});
   let raf = 0;
 
-  const liftOf = f => town.lift() * (f.lane === "raft" ? 0.45 : 1);
+  const liftOf = f => town.lift() * (f.lane === "raft" ? settings.raftLift : 1);
   const curveOf = (f, d) => {
     const a = town.point(d.from),
       b = town.point(d.to);
@@ -35,7 +36,7 @@ export function makePigeons(town) {
       d.el = d.bird.g;
     }
     shown.set(f, d);
-    return f.spark ? 700 : durationOf(lengthOf(curve));
+    return f.spark ? settings.sparkMs : durationOf(lengthOf(curve));
   }
 
   // One flight's pigeon at k (0…1) of its time.

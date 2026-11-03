@@ -19,6 +19,8 @@ import {logView} from "./log-view.js";
 import {connect} from "./node.js";
 import {makeRaftWatch} from "./raft.js";
 import {apply as applyEvent, merge} from "./reduce.js";
+import {reset as resetSettings, settings, watch} from "./settings.js";
+import {settingsView} from "./settings-view.js";
 import {storeView} from "./store-view.js";
 import {TASK_KEY, TASK_ON, taskWindows, workLabel} from "./tasks.js";
 import {makeWizard} from "./wizard.js";
@@ -47,7 +49,7 @@ const state = {
   objects: [], // [[key, size]] in the bucket
   log: null, // the `log` op's: {head, base, entries}
   bg: null, // the `background` op's (tasks.js)
-  open: null, // the panel: {kind: "client" | "loft" | "log"} or {kind: "store", store}
+  open: null, // the panel: {kind: "client" | "loft" | "log" | "cluster" | "settings"} or {kind: "store", store}
   logView: "readable",
   busy: false, // an op runs: the panels' buttons wait
   wizard: false, // the first visit's setup is on screen
@@ -391,7 +393,6 @@ function showNodes() {
     timeout = 2 * (state.timing?.election?.[1] ?? 0);
   graph.setNodes(new Map(state.nodes.map(id => [id, {...raft.of(id), clock: raft.clock(id, now, timeout)}])));
 }
-const clocks = setInterval(showNodes, 100);
 
 // Node `id` cut off from the others, or back: its links and its outbox.
 async function isolate(id, cut) {
@@ -404,10 +405,19 @@ async function isolate(id, cut) {
   renderNodes();
   await refreshChannels(); // its outbox up or down
 }
-// While idle: the worker lets the node's loops run between calls.
-const polls = setInterval(() => {
-  if (!state.busy && !state.wizard && !document.hidden && graph.drawn()) pollBackground();
-}, 1000);
+// The page's timers (their periods are settings): the election clocks
+// drawn; while idle, the node polled (the worker lets its loops run between calls).
+let clocks = 0,
+  polls = 0;
+function startTimers() {
+  clearInterval(clocks);
+  clearInterval(polls);
+  clocks = setInterval(showNodes, settings.clockMs);
+  polls = setInterval(() => {
+    if (!state.busy && !state.wizard && !document.hidden && graph.drawn()) pollBackground();
+  }, settings.pollMs);
+}
+startTimers();
 
 function renderBackground() {
   const bg = state.bg;
@@ -539,6 +549,9 @@ function renderPanel() {
     };
     const sub = c?.kind === "local_disk" ? "demo.log_sub_disk" : "demo.log_sub";
     show(t("demo.log_title"), t(sub, {store: c?.store, app: appOf(c?.kind)}), logView(state.log, c, state.logView, setView));
+  } else if (open.kind === "settings") {
+    const v = settingsView({cluster: state.nodes.length > 1, admin: state.admin}, settingsOps);
+    show(t("set.title"), t("set.sub"), v.nodes);
   } else {
     const c = channel(open.store);
     if (!c) {
@@ -584,6 +597,24 @@ const clientOps = {
 
 // The node: its config, its background tasks.
 const loftOps = {restart, erase, toggle: toggleTask, run: runTask, isolate};
+
+// The settings: the page's knobs (settings.js), the ways to the node's own.
+const settingsOps = {
+  reset() {
+    resetSettings();
+    renderPanel();
+  },
+  openNode: () => openPanel({kind: "loft"}),
+  openCluster: () => openPanel({kind: "cluster"}),
+  erase,
+};
+$("settings").addEventListener("click", () => (isOpen("settings") ? closePanel() : openPanel({kind: "settings"})));
+// A knob turned: the town drawn again for those it draws with, the page's
+// timers set again for theirs.
+watch(knobs => {
+  if (knobs.some(k => k.redraw) && graph.drawn() && !state.wizard) redraw();
+  if (knobs.some(k => k.timer)) startTimers();
+});
 
 // A data channel's faults, and what finds and mends them.
 const faultOps = c => {

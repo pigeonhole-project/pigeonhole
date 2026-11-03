@@ -1,13 +1,13 @@
 // A cluster's Raft as the page follows it: each node's own word (its role,
 // its term: the `cluster` op asked of it), when each last heard a leader
 // (the frames the nodes logged, events.js), and a chronicle of what
-// happened, as say.* sentences ([key, vars]), newest last.
+// happened, as say.* sentences ([key, vars]), newest last (the last
+// `settings.chronicle` kept).
 //
 // A follower that hears nothing from a leader for an election's timeout
 // stands for leader: its election clock (`clock`) runs down from 1 to 0
 // between two heartbeats.
-
-const KEPT = 100; // the chronicle's sentences kept
+import {settings} from "./settings.js";
 
 export function makeRaftWatch() {
   const nodes = new Map(); // id → {role, term, heard: ms of the last word from a leader}
@@ -19,7 +19,7 @@ export function makeRaftWatch() {
   // A sentence into the chronicle; returned, to be said now.
   function tell(at, sentence) {
     chronicle.push({at, sentence});
-    if (chronicle.length > KEPT) chronicle.shift();
+    while (chronicle.length > settings.chronicle) chronicle.shift();
     return sentence;
   }
 

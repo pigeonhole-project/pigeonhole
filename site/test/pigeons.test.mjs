@@ -1,7 +1,11 @@
 // The pigeons' sky (demo/pigeons/model.js): order, caps, landings, motion.
 import assert from "node:assert/strict";
 import {test} from "node:test";
-import {along, arc, makeSky, pointOn, RAFT_CAP, SPACING} from "../src/assets/demo/pigeons/model.js";
+import {along, arc, makeSky, pointOn} from "../src/assets/demo/pigeons/model.js";
+import {set, settings} from "../src/assets/demo/settings.js";
+
+const SPACING = settings.spacing,
+  RAFT_CAP = settings.raftCap;
 
 const sky = (dur = 100) => {
   const started = [];
@@ -40,6 +44,17 @@ test("sky: Raft's go at once, at most RAFT_CAP; the rest are let go, landed all 
   s.tick(100);
   await Promise.all(ends);
   assert.equal(landed, RAFT_CAP + 2);
+});
+
+test("sky: a Raft cap of 0 is none: every one of Raft's flies", () => {
+  set("raftCap", 0);
+  try {
+    const {s, started} = sky();
+    for (let id = 0; id < 20; id++) s.add({id, lane: "raft"}, 0);
+    assert.equal(started.length, 20);
+  } finally {
+    set("raftCap", RAFT_CAP);
+  }
 });
 
 test("sky: landed() waits for yours, not Raft's; a flight that cannot fly ends at once", async () => {

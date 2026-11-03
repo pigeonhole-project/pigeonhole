@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import {readdirSync, readFileSync} from "node:fs";
 import {test} from "node:test";
+import {GROUPS, KNOBS} from "../src/assets/demo/settings.js";
 
 const site = new URL("../", import.meta.url);
 const strings = lang => JSON.parse(readFileSync(new URL(`i18n/${lang}.json`, site), "utf8"));
@@ -26,4 +27,16 @@ test("i18n: every literal key the scripts use is there", () => {
       for (const re of USES) for (const [, key] of text.matchAll(re)) if (!(`js.${key}` in have)) missing.push(`${lang}: ${key} (${file})`);
   }
   assert.deepEqual(missing, []);
+});
+
+test("i18n: every knob of the settings has its label and note, every group its heading", () => {
+  const keys = [...KNOBS.flatMap(k => [`set.${k.key}`, `set.${k.key}_note`]), ...GROUPS.map(g => `set.group_${g}`)];
+  for (const lang of ["en", "ru"]) {
+    const have = strings(lang);
+    assert.deepEqual(
+      keys.filter(key => !(`js.${key}` in have)),
+      [],
+      lang,
+    );
+  }
 });
