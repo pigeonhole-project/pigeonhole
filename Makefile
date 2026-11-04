@@ -1,4 +1,4 @@
-.PHONY: web web-smoke lint-js test-js cluster-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all check-deps report lint gates
+.PHONY: web web-smoke lint-js test-js cluster-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all arch report lint gates
 
 run:
 	cargo run --release
@@ -90,20 +90,27 @@ metrics-demo-down:
 test:
 	cargo nextest run --workspace
 
-check-deps:
-	./scripts/check-deps.sh --strict
+# Which crate may depend on which, read from their manifests (easement.yml);
+# and the backends' identifiers stay in the stores, the config and the
+# binary. `brew install mokevnin/tap/easement` or
+# `cargo install --locked easement --version 0.4.10` (CI's).
+arch:
+	easement check
+	@! git grep -nwE 'file_id|chat_id|channel_id' -- 'crates/*.rs' ':!crates/storage' ':!crates/bin' ':!crates/config' \
+		|| { echo "backend identifiers outside the stores, the config and the binary" >&2; exit 1; }
 
 # Size, complexity hotspots and the trait graph (Mermaid) → target/code-report.md.
 # Needs `cargo install --locked rust-code-analysis-cli`.
 report:
 	./scripts/code_report.py --out target/code-report.md
 
-test-all: check-deps test smoke
+test-all: arch test smoke
 
-# What clippy does not see: advisories, licences and sources of the crates
-# (deny.toml), unused dependencies (crates/ only: vendor/ is upstream's),
-# the shell scripts (.shellcheckrc), misspellings (_typos.toml).
-gates:
+# What clippy does not see: the layers (arch), advisories, licences and
+# sources of the crates (deny.toml), unused dependencies (crates/ only:
+# vendor/ is upstream's), the shell scripts (.shellcheckrc), misspellings
+# (_typos.toml).
+gates: arch
 	cargo deny check
 	cargo machete crates
 	git ls-files -z '*.sh' scripts/wt ':!vendor' | xargs -0 shellcheck

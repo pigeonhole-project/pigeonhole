@@ -222,7 +222,7 @@ A Cargo workspace under `crates/`, by role:
 | `web/pigeonhole-web` | the node for wasm on fake channels (the demo) |
 | `testing/` | conformance suites, the simulation, fake channels |
 
-Layering is enforced by `./scripts/check-deps.sh --strict`. How agents and
+Layering is enforced by `make arch`. How agents and
 people work in this repository (a worktree per task, checks, merging):
 [AGENTS.md](AGENTS.md).
 

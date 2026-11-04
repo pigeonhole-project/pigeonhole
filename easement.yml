@@ -1,0 +1,120 @@
+# easement (`make arch`): which crate may depend on which, read from the
+# crates' manifests (`packages: true`): a dependency is a line of a
+# Cargo.toml, a feature the part `feature/<name>` of it.
+# Only the manifests are read for now: in the code, the integration tests
+# (crates/*/*/tests) and a module inside a `#[cfg(test)]` one would count as
+# the crate's own code.
+version: 1
+packages: true
+strict: true
+tests: auto
+# The workspace's own manifest: no crate, no component.
+unowned: [Cargo.toml]
+
+exclude:
+  - "**/*.rs"
+  - "**/*.py"
+  - "**/*.js"
+  - "**/*.mjs"
+  - vendor
+  - site
+  - demos
+  - compat
+  - ops
+  - target
+
+components:
+  types: { in: crates/core/pigeonhole-types }
+  codec: { in: crates/core/pigeonhole-codec }
+  storage-api: { in: crates/core/pigeonhole-storage-api }
+  limits: { in: crates/core/pigeonhole-limits }
+  meta: { in: crates/meta/pigeonhole-meta }
+  blob: { in: crates/blob/pigeonhole-blob }
+  chunk-store: { in: crates/blob/pigeonhole-chunk-store }
+  # Openraft over a chat, with no pigeonhole crate at all (docs/cluster.md).
+  raft-chat: { in: crates/net/openraft-chat }
+  # Raft over gRPC: the chat crate's frames, still no pigeonhole crate.
+  raft-grpc: { in: crates/net/openraft-grpc }
+  # A Raft outbox in a chat: the Mailbox over a chat store's channel.
+  raft-telegram: { in: crates/net/pigeonhole-raft-telegram }
+  # The stores on a channel, each on its own.
+  stores:
+    in:
+      - crates/storage/pigeonhole-storage-telegram
+      - crates/storage/pigeonhole-storage-discord
+  # The stores the node opens itself.
+  local-stores:
+    in:
+      - crates/storage/pigeonhole-storage-memory
+      - crates/storage/pigeonhole-storage-disk
+  # The network clients a store runs on (its ChannelApi / DiscordApi).
+  clients:
+    in:
+      - crates/storage/pigeonhole-telegram-mtproto
+      - crates/storage/pigeonhole-discord-http
+  gateways: { in: crates/gateway }
+  config: { in: crates/config/pigeonhole-config }
+  admin: { in: crates/admin/pigeonhole-admin }
+  node: { in: crates/node/pigeonhole-node }
+  bin: { in: crates/bin/pigeonhole }
+  # The in-browser build: a composition root like the binary.
+  web: { in: crates/web/pigeonhole-web }
+  # Fake channels kept by a tablet: the demo and the fake-channel build.
+  fake-channels: { in: crates/testing/pigeonhole-fake-channels }
+  testkit:
+    in:
+      - crates/testing/pigeonhole-testkit
+      - crates/testing/pigeonhole-sim
+  # The stores' in-memory channels: never in a default build.
+  fakes:
+    in: "crates/**/Cargo.toml"
+    part: feature/fake
+    priority: 10
+    allow_importers: [web, fake-channels, tests]
+    because: the in-memory channels get into the demo and the fake-channel build only, never into a default build
+
+rules:
+  types: { may_depend_on: [] }
+  codec: { may_depend_on: [types] }
+  storage-api: { may_depend_on: [types] }
+  limits:
+    may_depend_on: [storage-api, types]
+    because: the typed failures (RateLimited, Unavailable) live in storage-api
+  meta: { may_depend_on: [storage-api, types] }
+  blob: { may_depend_on: [storage-api, types] }
+  chunk-store:
+    may_depend_on: [blob, codec, config, limits, meta, storage-api, types]
+    forbid_external:
+      - { name: s3s, because: the chunk store serves no protocol }
+      - { name: tonic, because: the chunk store serves no protocol }
+      - { name: axum, because: the chunk store serves no protocol }
+  raft-chat:
+    may_depend_on: []
+    because: openraft-chat is standalone, no pigeonhole crate
+  raft-grpc: { may_depend_on: [raft-chat] }
+  raft-telegram: { may_depend_on: [raft-chat, stores, storage-api, types] }
+  stores:
+    may_depend_on: [limits, storage-api, types]
+    because: a store knows the storage API, never the blob layer, meta or another store
+  local-stores:
+    may_depend_on: [limits, storage-api, types]
+    because: a store knows the storage API, never the blob layer, meta or another store
+  clients: { may_depend_on: [limits, stores, local-stores, storage-api, types] }
+  gateways:
+    may_depend_on: [chunk-store, codec, meta, types]
+    because: a gateway speaks to the chunk store, never to a store
+  config:
+    may_depend_on: [types, codec, storage-api, limits, meta, blob, chunk-store, raft-chat, raft-grpc, raft-telegram, stores, local-stores, gateways, admin, node]
+    because: config builds for wasm, so no network client and nothing that runs the stack
+  admin:
+    may_depend_on: [blob, chunk-store, codec, config, gateways, limits, meta, storage-api, types]
+    because: the admin builds for wasm, so no store, no network client, no server
+  node:
+    may_depend_on: [blob, chunk-store, codec, config, gateways, limits, meta, storage-api, types, admin, raft-chat, raft-grpc, local-stores]
+    because: the node opens the memory and disk stores itself; a channel's store is the root's
+  bin: &root
+    may_depend_on: [types, codec, storage-api, limits, meta, blob, chunk-store, raft-chat, raft-grpc, raft-telegram, stores, local-stores, clients, gateways, config, admin, node, bin, fake-channels, testkit, fakes]
+  web: *root
+  fake-channels: *root
+  testkit: *root
+  fakes: *root

@@ -190,7 +190,7 @@ here changes.
 ## Steps
 
 Each step ends with `cargo test --workspace` and
-`./scripts/check-deps.sh --strict` green; one logical change per commit.
+`make arch` green; one logical change per commit.
 
 1. **Spike**: `turso_core` with `conn_raw_api` in a throwaway binary: read
    frames during a write workload, bounded passive checkpoint, truncate,

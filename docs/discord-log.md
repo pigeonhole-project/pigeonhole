@@ -333,7 +333,7 @@ lease records, batches as plain posts.
 ## Steps
 
 Each step ends with `cargo test --workspace` and
-`./scripts/check-deps.sh --strict` green; one logical change per commit.
+`make arch` green; one logical change per commit.
 
 1. ~~**Spike**~~ Done; results in Spike findings above.
 2. ✅ **Blob backend**: `DiscordId` = `message_id`, nonce uploads, 20 MiB default

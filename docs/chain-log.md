@@ -200,7 +200,7 @@ on disk.
 crate `core/pigeonhole-storage-api` (crates.io only): `BlobBackend` (its
 listing for the sweeper included; `Sweepable` folded into it), `Chain`, `OrderedKey`, `BlobId`, `BackendLimits` and the types
 they need. `pigeonhole-blob`, `pigeonhole-meta` and every storage crate depend
-on it; `scripts/check_deps.py` learns the new layer. A storage crate depends
+on it; `easement.yml` learns the new layer. A storage crate depends
 on it, `core/pigeonhole-limits` (rate limiters, itself on the storage API
 for the error types) and `pigeonhole-types` only,
 never on the blob layer above it. A log or snapshot store
@@ -308,7 +308,7 @@ Where the code differs from the design above:
 ## Steps
 
 Each step ends with `cargo test --workspace` and
-`./scripts/check-deps.sh --strict` green; one logical change per commit.
+`make arch` green; one logical change per commit.
 
 1. ✅ **Move the traits** into `pigeonhole-storage-api`; no behaviour change.
 2. ✅ **`Chain` for memory**, `ChainLogStore`, `BlobSnapshotStore`; the
