@@ -71,7 +71,7 @@ test("node: each message by its type; an unknown type is no call's reply", async
   assert.deepEqual((await call).reply, {config: "x"});
 });
 
-test("node: close goes out at once, not behind a call, with an id of its own", async () => {
+test("node: close goes out at once, not behind a call, at full speed, the fakes answering at once", async () => {
   const w = fakeWorker();
   const node = workerNode(w);
   node.call(ops.log(5));
@@ -81,7 +81,10 @@ test("node: close goes out at once, not behind a call, with an id of its own", a
     w.sent.map(m => [m.id, m.op]),
     [
       [1, "log"],
-      [2, "close"],
+      [2, "pause"],
+      [3, "speed"],
+      [4, "fake"],
+      [5, "close"],
     ],
   );
 });

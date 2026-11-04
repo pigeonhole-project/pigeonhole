@@ -103,8 +103,13 @@ export function workerNode(worker) {
     // Leaving (a reload, the other language): the node closes as a server
     // does on SIGTERM, releasing a lease log, then the worker lets go of the
     // files and ends (web-worker.js), so the next page boots at once. Not
-    // queued behind a call: the page will not wait; nobody waits for its answer.
+    // queued behind a call: the page will not wait; nobody waits for its
+    // answer. At full speed, the fakes answering at once: a close cut short
+    // leaves a lease the next page must wait out.
     close: () => {
+      send(ops.pause(false));
+      send(ops.speed(1));
+      send(ops.fake([0, 0], [0, 0]));
       send(ops.close());
     },
     // The worker waits for the files the page just left still holds.

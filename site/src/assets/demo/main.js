@@ -493,7 +493,6 @@ function setPaused(on) {
   if (!on) $("sim-next").textContent = "";
 }
 if (!node.admin) {
-  node.speed(settings.speed);
   $("sim").hidden = false;
   $("sim-step").setAttribute("aria-label", t("sim.step"));
   $("sim-step").title = t("sim.step");
@@ -748,6 +747,20 @@ function setFakes() {
   if (node.admin) return;
   return call(ops.fake([settings.latencyMin, settings.latencyMax], [settings.linkMin, settings.linkMax]));
 }
+// A boot runs at full speed, the fakes answering at once (nothing of it is
+// watched but its end); then the node's clock slows down to the settings'
+// and the fakes take their time. A restart's nodes close the same way.
+async function fullSpeed() {
+  if (node.admin) return;
+  if (paused) setPaused(false);
+  node.speed(1);
+  await call(ops.fake([0, 0], [0, 0]));
+}
+function settingsSpeed() {
+  if (node.admin) return;
+  node.speed(settings.speed);
+  return setFakes();
+}
 
 // A data channel's faults, and what finds and mends them.
 const faultOps = c => {
@@ -797,15 +810,17 @@ async function boot() {
 function restart(text) {
   return whileBusy(async () => {
     view?.setError("");
+    await fullSpeed();
     const {reply} = await call(ops.restart(text));
     if (reply?.error) {
       view?.setError(reply.error);
+      await settingsSpeed();
       return;
     }
     Object.assign(state, {config: text, nodes: reply.nodes});
     state.cut.clear();
     state.leader = null;
-    await setFakes();
+    await settingsSpeed();
     await boot();
     say(["say.restart", {n: reply.replayed}]);
   });
@@ -843,7 +858,7 @@ async function startFromWizard(text) {
   const ms = performance.now() - t0;
   if (reply?.error) return reply.error;
   Object.assign(state, {config: text, nodes: reply.nodes});
-  await setFakes();
+  await settingsSpeed();
   if (state.nodes.length > 1) await pollCluster();
   state.wizard = false;
   relayout = redraw;
@@ -931,7 +946,7 @@ async function startDemo() {
     return;
   }
   state.nodes = booted.reply.nodes;
-  await setFakes();
+  await settingsSpeed();
   if (state.nodes.length > 1) await pollCluster();
   await boot();
   ready(performance.now() - t0, reply.why);
