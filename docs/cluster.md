@@ -344,10 +344,13 @@ reads the outboxes of its chat peers.
   tick, not one per follower.
 - **Reading: push first, polling as the safety net.**
   - Push: a bot that is a channel's member gets every new post as an update
-    (MTProto `updateNewChannelMessage`). There is no poll interval, and no
-    read budget is spent.
-  - Polling: "messages after the last id I saw", one window per peer per
-    poll. It fills the gaps updates leave after a reconnect.
+    (MTProto `updateNewChannelMessage`), the message in it. A reader takes
+    the frames from the pushes: no read budget is spent (a frame too big
+    for a text is still downloaded).
+  - Reading the chat, "messages after the last id I saw", in two cases
+    only: a hole (ids between the pushed ones that no push brought: read
+    whole, up to the newest pushed), or nothing pushed for **poll** (a push
+    lost on a reconnect is found then).
 - **Authorship.** Only the node's own bots have post rights in its outbox.
   The HMAC below says who wrote a frame cryptographically.
 
@@ -365,14 +368,16 @@ which is close to a pair channel anyway.
 | posts | ~20 / min (measured 19.7) | ~57 / min (measured, no 429) |
 | reads (ours) | `info` budget 2 / s | ~5 / s |
 
-A node posts at most once per **tick** and reads each peer once per
-**poll**. For n nodes:
+A node posts at most once per **tick**; it reads a peer's outbox only for
+a hole, or once per **poll** while the peer pushes nothing. For n nodes:
 
 - posts per node: `1 / tick` against its bot's budget (Telegram: tick
   ≥ 3.5 s to stay under ~0.33/s with room for the burst; Discord: tick
   ≥ 1.1 s);
-- reads per node: `(n − 1) / poll` against the same bot's read budget, or
-  none with push updates.
+- reads per node: none while every peer posts within a poll (a heartbeat
+  every 10 s and a poll of 3 s: three reads a peer between heartbeats); at
+  most `(n − 1) / poll` against the same bot's read budget with nothing
+  pushed.
 
 Bots shared between nodes share these budgets: one bot per node.
 
@@ -485,12 +490,18 @@ and fake ones in the demo):
 - bots can read only by id, so a reader reads ids upward, 100 at a time,
   and skips holes and foreign messages (a window with nothing in it is
   skipped while the channel is known to go past it);
+- the posts pushed to any of the process's bots (`channel_log::on_post`;
+  every bot logs in with updates) go to the peer's mailbox, message and
+  all (`TelegramMailbox::pushed`); `read_after` takes the frames from them,
+  reads a hole among them (one call per 100 ids), and reads the chat only
+  when nothing came for `poll` (`TelegramMailbox::polling`). The node's own
+  outbox has no pushes kept: nobody reads it here;
 - a reader learns how far the channel goes from its own posts, from the
-  posts pushed to any of the process's bots (`channel_log::on_post`; every
-  bot logs in with updates), and, at the start, from a lookup: windows of
+  pushes, and, at the start, from a lookup: windows of
   100 ids with doubling strides, then halving, up from the pinned anchor
   (below);
-- `wait` wakes on a push, else after `poll`;
+- `wait` wakes on a push past what the reader took (a trailing message that
+  is no frame, a pin's, does not wake it again), else after `poll`;
 - `prune` pins the frame it keeps from as the anchor, then deletes the ids
   below it, 100 a call, at most 10 calls a prune (the rest the next time).
   The lookup starts at the anchor, above which nothing was deleted, so it

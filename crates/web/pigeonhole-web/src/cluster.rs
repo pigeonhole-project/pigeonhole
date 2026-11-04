@@ -22,27 +22,27 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type Outbox = TelegramMailbox<FakeBot<TelegramChannel>>;
-/// Every node's copy of one outbox.
+/// The readers' copies of one outbox.
 type Copies = Arc<Mutex<Vec<Arc<Outbox>>>>;
 /// The outboxes as each node sees them, by `(owner, user)`; and by owner,
-/// every node's copy.
+/// the readers' copies.
 type Outboxes = (HashMap<(u64, u64), Arc<dyn Mailbox>>, HashMap<u64, Copies>);
 
 /// One outbox as one node sees it, through that node's bot. A post through
-/// any node's copy wakes the readers of the others at once, as Telegram
-/// pushes a new post to every bot in the channel.
+/// any node's copy is pushed to the others at once, message and all, as
+/// Telegram pushes a new post to every bot in the channel.
 struct Copy {
     own: Arc<Outbox>,
-    /// Every node's copy of this outbox (this one too).
+    /// The readers' copies of this outbox (the other nodes').
     all: Copies,
 }
 
 #[async_trait::async_trait]
 impl Mailbox for Copy {
     async fn post(&self, frame: bytes::Bytes) -> Result<u64> {
-        let at = self.own.post(frame).await?;
+        let (at, message) = self.own.post_message(frame).await?;
         for copy in self.all.lock().unwrap().iter() {
-            copy.seen(at as i64);
+            copy.pushed(at as i64, message.clone());
         }
         Ok(at)
     }
@@ -96,10 +96,13 @@ impl Net {
         let bot = bot.with_context(|| format!("[[node]] {user}: no bot"))?;
         let own = Arc::new(
             TelegramMailbox::new(Arc::new(world.fakes.telegram_bot(cfg, &channel, bot).await?))
-                .named(pigeonhole_admin::outbox_store(owner)),
+                .named(pigeonhole_admin::outbox_store(owner))
+                .polling(cluster.poll),
         );
         let all = all.entry(owner).or_default().clone();
-        all.lock().unwrap().push(own.clone());
+        if user != owner {
+            all.lock().unwrap().push(own.clone());
+        }
         let copy: Arc<dyn Mailbox> = Arc::new(Copy { own, all });
         copies.insert((owner, user), copy.clone());
         Ok(copy)
