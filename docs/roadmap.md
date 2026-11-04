@@ -16,7 +16,7 @@ this repository (worktrees, checks, merging) is in
 - After S3-visible changes also run `make compat-s3s-e2e` (an STS failure is
   expected), `make compat-s3s-boto3` and `make compat-memory`.
 - Docs, comments and commit messages are in English only.
-- Layering is enforced (`./scripts/check-deps.sh --strict`):
+- Layering is enforced (`make arch`):
   - `meta`, `types`, `codec` and `storage-api` depend on crates.io only;
   - storage crates do not see chunk-store or the gateways;
   - `openraft-chat` depends on no pigeonhole crate.

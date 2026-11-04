@@ -399,7 +399,7 @@ first line as they read a document's file name.
 ## Steps
 
 Each step ends with `cargo test --workspace` and
-`./scripts/check-deps.sh --strict` green; one logical change per commit.
+`make arch` green; one logical change per commit.
 
 1. ~~**Spike**~~ Done: a throwaway binary against the test channels (not
    merged); results in Spike findings above.

@@ -7,7 +7,7 @@ description = "Telegram storage backend for pigeonhole over MTProto, logged in a
 
 [features]
 # The in-memory channel (`fake`): tests, the site's demo and the opt-in
-# fake-channel build. Never in a default build (scripts/check_deps.py).
+# fake-channel build. Never in a default build (easement.yml).
 fake = ["pigeonhole-storage-api/fake"]
 
 [dependencies]

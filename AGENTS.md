@@ -32,12 +32,12 @@ Run what the branch touches:
 
 - Rust: `make lint` (rustfmt check, clippy with `-D warnings`), `make test`
   (cargo-nextest: every test binary at once, ~30 s for the workspace;
-  `cargo install --locked cargo-nextest`),
-  `./scripts/check-deps.sh --strict`, and `make sim` for meta, blob, storage
-  or sim changes.
-- Dependencies, shell scripts or text: `make gates` (cargo-deny,
-  cargo-machete, ShellCheck, typos; `brew install cargo-deny shellcheck
-  typos-cli`, `cargo install --locked cargo-machete`).
+  `cargo install --locked cargo-nextest`), and `make sim` for meta, blob,
+  storage or sim changes.
+- Dependencies, shell scripts or text: `make gates` (the crate layers in
+  easement.yml, cargo-deny, cargo-machete, ShellCheck, typos; `brew install
+  cargo-deny shellcheck typos-cli mokevnin/tap/easement`, `cargo install
+  --locked cargo-machete`).
 - The site's JavaScript: `make lint-js`, `make test-js`.
 - The web node (crates/web) or the demo: `make web-smoke`.
 

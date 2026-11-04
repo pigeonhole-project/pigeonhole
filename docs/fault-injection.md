@@ -136,7 +136,7 @@ seconds) and many more under `--ignored` (`PIGEONHOLE_FAULT_RUNS=1000`).
 ## Steps
 
 Each step ends with `cargo test --workspace` and
-`./scripts/check-deps.sh --strict` green; bugs the faults find are fixed in
+`make arch` green; bugs the faults find are fixed in
 commits of their own, each with the seed that found it as a regression case.
 
 1. **`pigeonhole_sim::faults`** (planned as `pigeonhole-faults`): `Faulty<B>`, `FaultPlan`, `FaultLog`, counter-based

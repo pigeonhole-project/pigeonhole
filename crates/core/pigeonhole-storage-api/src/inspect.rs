@@ -3,7 +3,7 @@
 //!
 //! Disk-shaped, yet here and not in `pigeonhole-storage-disk`: the admin
 //! crate shows it and may not depend on a storage crate (the layering in
-//! scripts/check_deps.py); the disk store fills it in, the admin reads it.
+//! easement.yml); the disk store fills it in, the admin reads it.
 
 /// One file of a store and its records, in the order they were written.
 #[derive(Debug, Clone, PartialEq, Eq)]

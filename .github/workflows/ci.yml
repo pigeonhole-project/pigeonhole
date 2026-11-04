@@ -21,8 +21,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Check workspace dependency layers
-        run: ./scripts/check-deps.sh --strict
       - run: make test
 
   clippy:
@@ -41,7 +39,7 @@ jobs:
       - run: make lint
 
   gates:
-    name: gates (cargo-deny, cargo-machete, shellcheck, typos)
+    name: gates (easement, cargo-deny, cargo-machete, shellcheck, typos)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,6 +47,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny,cargo-machete,shellcheck,typos
+      - name: Install easement
+        run: cargo install --locked easement --version 0.4.10
       - run: make gates
 
   site:
