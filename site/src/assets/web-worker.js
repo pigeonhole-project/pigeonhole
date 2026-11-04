@@ -23,9 +23,11 @@ const POOL_DIR = "pigeonhole";
 // The demo's cluster seals its Raft frames with this key ([cluster]
 // key_env): no secret, every visitor's is the same.
 const DEMO_CLUSTER_KEY = "706967656f6e686f6c652064656d6f20636c75737465723a206e6f206b657900";
-const POOL_START = 64; // files opened at start
-const POOL_LOW = 24; // fewer free than this after a call: open POOL_MORE
-const POOL_MORE = 32;
+// A call can't wait for a file (the module is synchronous): a pool that
+// runs out fails it (ENOSPC). A three-node cluster's boot takes ~70.
+const POOL_START = 128; // files opened at start
+const POOL_LOW = 64; // fewer free than this before or after a call: open POOL_MORE
+const POOL_MORE = 64;
 
 let wasi,
   exports,
@@ -33,25 +35,22 @@ let wasi,
   dir = null,
   opened = 0,
   persistent = false,
-  growing = false,
+  growing = null, // the files being opened, a promise
   timer = null,
   why = "";
 // The module's call number → the page's {id, t0}.
 const calls = new Map();
 
 async function openFiles(n) {
-  const handles = [];
-  try {
-    for (let i = 0; i < n; i++) {
-      const fh = await dir.getFileHandle(`file-${String(opened + i).padStart(5, "0")}`, {create: true});
-      handles.push(await fh.createSyncAccessHandle());
-    }
-  } catch (e) {
-    for (const h of handles) h.close();
-    throw e;
+  const open = async i => (await dir.getFileHandle(`file-${String(opened + i).padStart(5, "0")}`, {create: true})).createSyncAccessHandle();
+  const got = await Promise.allSettled(Array.from({length: n}, (_, i) => open(i)));
+  const failed = got.find(g => g.status === "rejected");
+  if (failed) {
+    for (const g of got) if (g.status === "fulfilled") g.value.close();
+    throw failed.reason;
   }
   opened += n;
-  return handles;
+  return got.map(g => g.value);
 }
 
 // A sync access handle is exclusive: the page just left (a reload, the
@@ -110,7 +109,7 @@ function pump() {
   exports.ph_run();
   post(wasi.takeLines());
   if (wasi.nextWake !== Infinity) timer = setTimeout(pump, Math.max(0, wasi.nextWake - performance.now()));
-  grow();
+  grow().catch(e => console.warn("no more files:", e));
 }
 
 // The page is gone and the node closed: let go of the files for the next
@@ -121,15 +120,16 @@ function end() {
   close();
 }
 
-// More files for what comes, between runs.
-async function grow() {
-  if (!persistent || growing || pool.free() >= POOL_LOW) return;
-  growing = true;
-  try {
-    pool.add(await openFiles(POOL_MORE));
-  } finally {
-    growing = false;
-  }
+// More files for what comes, between runs; a call waits for those being
+// opened.
+function grow() {
+  if (!growing && persistent && pool.free() < POOL_LOW)
+    growing = openFiles(POOL_MORE)
+      .then(handles => pool.add(handles))
+      .finally(() => {
+        growing = null;
+      });
+  return growing || Promise.resolve();
 }
 
 async function reset() {
@@ -154,10 +154,15 @@ const ready = (async () => {
   postMessage(msg.started({...out.reply, persistent, why}, out.events));
 })().catch(e => postMessage(msg.started({error: String(e.message || e)}, [])));
 
-addEventListener("message", ({data}) => handle(data));
+// One message at a time, in order: a call may first wait for more files.
+let queue = Promise.resolve();
+addEventListener("message", ({data}) => {
+  queue = queue.then(() => handle(data)).catch(e => console.error(e));
+});
 
 async function handle({id, body, ...request}) {
   await ready;
+  await grow().catch(e => console.warn("no more files:", e));
   if (request.op === OP_RESET) {
     clearTimeout(timer);
     await reset();

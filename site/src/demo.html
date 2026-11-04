@@ -33,6 +33,11 @@
     <div class="sky" id="sky">
       <svg id="graph" role="img" aria-label="{{demo.graph_label}}"></svg>
       <p class="hint" id="hint">{{demo.hint}}</p>
+      <fieldset class="city-send" id="city-send" hidden>
+        <label class="btn primary">{{try.pick}}<input type="file" id="city-file" multiple hidden></label>
+        <button class="btn" type="button" data-sample="photo">{{try.sample_random}}</button>
+        <button class="btn" type="button" data-sample="text">{{try.sample_text}}</button>
+      </fieldset>
       <p class="credit">{{demo.credit}}</p>
     </div>
     <aside class="panel" id="panel" hidden>

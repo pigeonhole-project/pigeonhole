@@ -91,8 +91,9 @@ export function workLabel(name, item) {
 // too); a pigeon sits in while work waits, a badge counts it; a task that
 // is off has its shutters closed. The windows no task lives in are boarded
 // up, and on a `follower` the leader's tasks' too. onOpen(task): a window
-// was clicked. Returns update(bg).
-export function taskWindows(g, entrances, onOpen, {follower = false} = {}) {
+// was clicked; `id`: the node's (its windows' ids apart from the others').
+// Returns update(bg).
+export function taskWindows(g, entrances, onOpen, {follower = false, id = 0} = {}) {
   const windows = {};
   for (const name of TASKS) {
     const w = entrances[TASK_WINDOW[name]];
@@ -101,26 +102,26 @@ export function taskWindows(g, entrances, onOpen, {follower = false} = {}) {
       continue;
     }
     const win = svg("g", {class: "win", tabindex: 0, role: "button", "aria-label": t(`bg.${name}`)}, g);
-    const clip = svg("clipPath", {id: `win-${name}`}, win);
+    const clip = svg("clipPath", {id: `win-${id}-${name}`}, win);
     svg("path", {d: w.d}, clip);
     // Lived in: a faint glow always, the light rising over it.
     svg("path", {class: "win-glow", d: w.d}, win);
-    const light = svg("rect", {class: "win-light", x: w.x - 10, y: w.y + 14, width: 20, height: 0, "clip-path": `url(#win-${name})`}, win);
+    const light = svg("rect", {class: "win-light", x: w.x - 10, y: w.y + 14, width: 20, height: 0, "clip-path": `url(#win-${id}-${name})`}, win);
     svg("path", {class: "win-frame", d: w.d}, win);
     perched(win, {class: "win-bird", transform: `translate(${w.x},${w.y + 4}) scale(.82)`});
     const badge = svg("g", {class: "win-badge"}, win);
     svg("circle", {cx: w.x + 11, cy: w.y - 9, r: 7}, badge);
     const count = svg("text", {x: w.x + 11, y: w.y - 6, "text-anchor": "middle"}, badge);
     const title = svg("title", {}, win);
-    win.addEventListener("mouseenter", () => canHover() && tip.show(name, win));
-    win.addEventListener("focus", () => tip.show(name, win));
+    win.addEventListener("mouseenter", () => canHover() && tip.show(name, id, win));
+    win.addEventListener("focus", () => tip.show(name, id, win));
     win.addEventListener("mouseleave", tip.hide);
     win.addEventListener("blur", tip.hide);
     // Without hover (a phone) a tap shows the tooltip first, the next one opens.
     activate(win, e => {
       e.stopPropagation();
-      if (!canHover() && !tip.showing(name)) {
-        tip.show(name, win);
+      if (!canHover() && !tip.showing(name, id)) {
+        tip.show(name, id, win);
         return;
       }
       tip.hide();
@@ -146,25 +147,26 @@ export function taskWindows(g, entrances, onOpen, {follower = false} = {}) {
       const when = d.period ? t("bg.tip", {task: d.title, when: soon(d.task.next_in_ms)}) : d.of ? `${d.title}: ${d.next}` : t("bg.tip_off", {task: d.title});
       win.title.textContent = name === "snapshot" || d.n > 0 ? `${when}; ${d.work}` : when;
     }
-    tip.refresh(bg);
+    tip.refresh(id, bg);
   };
 }
 
 // A window's tooltip: what the task is, when it passes next, what waits;
-// it follows the background while it is up. Beside the window, kept on the
-// screen; a tap elsewhere puts it away.
+// it follows its node's background while it is up. Beside the window, kept
+// on the screen; a tap elsewhere puts it away.
 const tip = (() => {
   let box = null,
-    shown = null,
-    last = null;
+    shown = null, // the task
+    of = null; // its node
+  const last = new Map(); // node → its background as last told
   function fill() {
     box.replaceChildren(h("b", "", t(`bg.${shown}`)), h("p", "", t(`bg.${shown}_note`)));
-    const d = describe(last, shown);
+    const d = describe(last.get(of), shown);
     if (!d) return;
     box.append(h("div", "tip-when", d.next), h("div", `tip-work${d.n ? " busy" : ""}`, d.work));
   }
   return {
-    show(name, el) {
+    show(name, id, el) {
       if (!box) {
         box = h("div", "tip");
         box.setAttribute("role", "tooltip");
@@ -174,6 +176,7 @@ const tip = (() => {
         });
       }
       shown = name;
+      of = id;
       fill();
       box.hidden = false;
       const r = el.getBoundingClientRect(),
@@ -182,14 +185,14 @@ const tip = (() => {
       const below = r.top - 8 + box.offsetHeight > innerHeight;
       box.style.top = `${Math.round(below ? r.top - box.offsetHeight - 8 : r.top - 8)}px`;
     },
-    showing: name => shown === name,
+    showing: (name, id) => shown === name && of === id,
     hide() {
       shown = null;
       if (box) box.hidden = true;
     },
-    refresh(bg) {
-      last = bg;
-      if (shown) fill();
+    refresh(id, bg) {
+      last.set(id, bg);
+      if (shown && of === id) fill();
     },
   };
 })();

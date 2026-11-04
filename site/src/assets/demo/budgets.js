@@ -13,8 +13,11 @@ const serviceOf = kind => (kind === "discord" ? "discord" : "telegram");
 export const budgetsOf = (c, budgets) => (budgets || []).filter(b => b.service === serviceOf(c.kind) && b.chat === String(c.scope));
 
 // A bucket's state: "busy" while calls wait for it or it cools down after a
-// rate limit, "low" under a third, else "ok".
-const stateOf = b => (b.waiting > 0 || b.cooling_ms > 0 ? "busy" : b.tokens < b.capacity / 3 ? "low" : "ok");
+// rate limit, "low" under a third, else "ok". The bot as a whole (`whole`)
+// counts calls waiting for any of its buckets: a read waiting for a chat's
+// read budget (an outbox polled faster than it allows) is that chat's, so
+// the bot is busy only when it is out itself.
+const stateOf = (b, whole = false) => (b.cooling_ms > 0 || (b.waiting > 0 && (!whole || b.tokens < 1)) ? "busy" : b.tokens < b.capacity / 3 ? "low" : "ok");
 const RANK = {ok: 0, low: 1, busy: 2};
 
 // What the graph shows under a channel's sign: its sends, the worst of its
@@ -22,8 +25,11 @@ const RANK = {ok: 0, low: 1, busy: 2};
 export function sendLevel(entries) {
   let worst = null;
   for (const e of entries) {
-    for (const b of [e.classes?.send, e.bot_total].filter(Boolean)) {
-      const level = {frac: b.capacity > 0 ? b.tokens / b.capacity : 0, state: stateOf(b)};
+    for (const [b, whole] of [
+      [e.classes?.send, false],
+      [e.bot_total, true],
+    ].filter(([b]) => b)) {
+      const level = {frac: b.capacity > 0 ? b.tokens / b.capacity : 0, state: stateOf(b, whole)};
       if (!worst || RANK[level.state] > RANK[worst.state] || (level.state === worst.state && level.frac < worst.frac)) worst = level;
     }
   }
@@ -50,7 +56,9 @@ export function budgetTable(entries) {
   for (const e of entries) {
     const rows = [...Object.entries(e.classes || {}), ["bot", e.bot_total]];
     rows.forEach(([cls, b], i) => {
-      const tr = h("tr", `budget-${stateOf(b)}${cls === "bot" ? " budget-whole" : ""}`);
+      const whole = cls === "bot",
+        state = stateOf(b, whole);
+      const tr = h("tr", `budget-${state}${whole ? " budget-whole" : ""}`);
       tr.append(h("td", "", i === 0 ? botName(e.bot) : ""));
       tr.append(h("td", "", t(`budget.class_${cls}`)));
       const left = h("td", "budget-left");
@@ -61,7 +69,8 @@ export function budgetTable(entries) {
       left.append(bar, h("span", "", `${fmt(b.tokens)} / ${fmt(b.capacity)}`));
       tr.append(left);
       tr.append(h("td", "", t("budget.per_sec", {n: fmt(b.per_sec)})));
-      const wait = b.cooling_ms > 0 ? t("budget.cooling", {s: (b.cooling_ms / 1000).toFixed(1)}) : b.waiting > 0 ? String(b.waiting) : "";
+      const wait =
+        b.cooling_ms > 0 ? t("budget.cooling", {s: (b.cooling_ms / 1000).toFixed(1)}) : b.waiting > 0 && (!whole || state === "busy") ? String(b.waiting) : "";
       tr.append(h("td", "", wait));
       table.append(tr);
     });

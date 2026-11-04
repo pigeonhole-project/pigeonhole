@@ -103,6 +103,14 @@ export function tomlOf(w) {
   const data = dataChannels(w),
     shards = w.channels.length / w.copies;
   const quote = ids => `[${ids.map(id => `"${id}"`).join(", ")}]`;
+  // Each channel's bots its own (fake ones, by id: 1, 2, …; the nodes' are
+  // 101, …): no bot posts in two channels, a bot's budget is one channel's.
+  let nextBot = 1;
+  const botIds = () => {
+    const ids = Array.from({length: w.bots}, (_, i) => nextBot + i);
+    nextBot += w.bots;
+    return `[${ids.join(", ")}]`;
+  };
   const store = (c, comment) => [
     ...(comment ? [`# ${comment}`] : []),
     "[[store]]",
@@ -110,7 +118,7 @@ export function tomlOf(w) {
     `kind = "${c.kind}"`,
     c.kind === "telegram" ? `chat_id = ${c.scope}` : `channel_id = ${c.scope}`,
     'fake = "channel-data"',
-    `bots = ${w.bots}`,
+    `bot_ids = ${botIds()}`,
     "",
   ];
   const out = [

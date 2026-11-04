@@ -15,7 +15,7 @@
 // calls onOpen(target).
 import {activate, reducedMotion, svg} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
-import {birdDefs, block, boarded, dovecote, flag, perched, roofLetters, tower} from "./art.js";
+import {birdDefs, block, dovecote, flag, perched, roofLetters, tower} from "./art.js";
 import {appOf, placeNote} from "./channels.js";
 import {ownerOf} from "./flights.js";
 import {contents, floorsFor, layout} from "./layout.js";
@@ -39,8 +39,8 @@ const seeded = seed => () => {
 
 // channel(store): the channel as the page has it now (its windows are
 // drawn from it; none: nothing posted yet, as in the wizard's sketch).
-// onLoft(g, windows): the node on screen was drawn, its dovecote's
-// entrances are free to dress (the other nodes' are shuttered).
+// onLoft(g, entrances, id): node `id` (0: the one node) was drawn, its
+// dovecote's entrances are free to dress.
 // onRelayout(): the screen turned narrow or wide: draw again.
 export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
   const reduced = reducedMotion();
@@ -216,10 +216,9 @@ export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
     client = you(at.client, town);
     setObjects(objects);
 
-    const onScreen = at.lofts.has(0) ? 0 : (scene.shown ?? scene.leader ?? [...at.lofts.keys()][0]);
     // The blocks first: a node's bridge lies on its own two.
     cards = new Map(channels.map(c => [c.store, card(c, at.stores.get(c.store), town)]));
-    lofts = new Map([...at.lofts].map(([id, L]) => [id, loftBlock(id, L, town, rnd, id === onScreen)]));
+    lofts = new Map([...at.lofts].map(([id, L]) => [id, loftBlock(id, L, town, rnd)]));
 
     // The ways: you to the node you talk to, each node to its own channels,
     // the leader to the data channels; between nodes with a direct link, theirs.
@@ -234,9 +233,9 @@ export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
   }
 
   // A node: the dovecote on its block's roof, the name on the roof. In a
-  // cluster, what it is now under the name; the leader's flies a flag. The
-  // node on screen's entrances are its background tasks (onLoft).
-  function loftBlock(id, L, parent, rnd, onScreen) {
+  // cluster, what it is now under the name; the leader's flies a flag. Its
+  // entrances are its background tasks (onLoft).
+  function loftBlock(id, L, parent, rnd) {
     const cluster = id !== 0;
     const role = !cluster
       ? t("demo.loft_role")
@@ -266,8 +265,7 @@ export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
     }
     const cote = svg("g", {transform: `translate(${cx},${deck - 4}) scale(${L.scale})`}, n.g);
     const entrances = dovecote(cote);
-    if (onScreen) onLoft(cote, entrances);
-    else for (const w of entrances) boarded(cote, w);
+    onLoft(cote, entrances, id);
     if (cluster && id === scene.leader && !scene.cut.has(id)) flag(cote);
     n.door = [cx, deck - 4 - 150 * L.scale];
     // Its election clock: an arc round the dovecote, wound up by each word
