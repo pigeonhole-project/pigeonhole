@@ -89,6 +89,12 @@ pub struct Request {
     /// The cluster node the op runs on (the demo runs them all; a server is one).
     #[serde(default)]
     pub node: Option<u64>,
+    /// `fake` (the demo's own): how long a fake bot's call takes, and a
+    /// frame over a direct link, each way: (min, max) in ms; none: as it is.
+    #[serde(default)]
+    pub latency: Option<(u64, u64)>,
+    #[serde(default)]
+    pub link: Option<(u64, u64)>,
 }
 
 fn demo() -> String {

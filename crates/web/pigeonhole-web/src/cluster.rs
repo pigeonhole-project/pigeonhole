@@ -95,7 +95,7 @@ impl Net {
         let bot = cluster.nodes.iter().find(|n| n.id == user).and_then(|n| n.bot_ids.first().copied());
         let bot = bot.with_context(|| format!("[[node]] {user}: no bot"))?;
         let own = Arc::new(
-            TelegramMailbox::new(Arc::new(world.fakes.telegram_bot(cfg, &channel, bot).await?))
+            TelegramMailbox::new(Arc::new(world.fakes.telegram_bot(cfg, &channel, bot, user).await?))
                 .named(pigeonhole_admin::outbox_store(owner))
                 .polling(cluster.poll),
         );
@@ -128,6 +128,11 @@ impl Net {
 
     /// Cuts node `node` off from the others, or brings it back: its direct
     /// links, and its outbox (the channel down: its frames do not go out).
+    /// A direct link's frame takes `range` each way.
+    pub fn set_link(&self, range: (Duration, Duration)) {
+        self.direct.set_delay(Some(range));
+    }
+
     pub fn isolate(&self, world: &World, cluster: &ClusterSettings, node: u64, cut: bool) {
         self.direct.isolate(node, cut);
         if let Some(outbox) = cluster.outbox_channel(node) {
@@ -149,12 +154,21 @@ impl Nodes {
     /// at once (a tablet waits for a leader).
     pub async fn open(world: &Arc<World>, text: &str) -> Result<Self> {
         let net = Net::default();
+        // The fakes' delays as the file has them (the page may change them as the nodes run).
+        let fakes = |cfg: &Config| {
+            world.fakes.latency.set(cfg.fake.latency);
+            world.link.set(cfg.fake.link);
+            net.set_link(cfg.fake.link);
+        };
         let ids = Config::node_ids(text)?;
         if ids.is_empty() {
-            let node = crate::Node::open(world, &crate::parse_config(text)?).await?;
+            let cfg = crate::parse_config(text)?;
+            fakes(&cfg);
+            let node = crate::Node::open(world, &cfg).await?;
             return Ok(Self { nodes: [(1, node)].into(), net, cluster: None });
         }
         let configs = ids.iter().map(|&id| crate::parse_config_as(text, id)).collect::<Result<Vec<_>>>()?;
+        fakes(&configs[0]);
         let cluster = configs[0].cluster.clone();
         // The lowest id starts a fresh cluster's first election: polled
         // last, it finds the others serving already. Polled first, its votes
@@ -197,6 +211,11 @@ impl Nodes {
     pub fn node(&self, id: Option<u64>) -> Result<&crate::Node> {
         let id = id.or_else(|| self.leader()).or_else(|| self.nodes.keys().next().copied());
         id.and_then(|id| self.nodes.get(&id)).with_context(|| format!("no node {id:?}"))
+    }
+
+    /// A direct link's frame takes `range` each way, from now on.
+    pub fn set_link(&self, range: (Duration, Duration)) {
+        self.net.set_link(range);
     }
 
     /// Cuts node `node` off from the others, or brings it back.

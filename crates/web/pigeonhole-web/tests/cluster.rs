@@ -135,10 +135,10 @@ async fn a_frame_posted_to_a_fake_outbox_is_read_back() {
     let outbox = cfg.cluster.as_ref().unwrap().outbox_channel(3).unwrap();
     // Node 3 posts with its bot, node 1 reads with its own.
     let writer = pigeonhole_raft_telegram::TelegramMailbox::new(Arc::new(
-        world.fakes.telegram_bot(&cfg, &outbox, 3).await.unwrap(),
+        world.fakes.telegram_bot(&cfg, &outbox, 3, 3).await.unwrap(),
     ));
     let reader = pigeonhole_raft_telegram::TelegramMailbox::new(Arc::new(
-        world.fakes.telegram_bot(&cfg, &outbox, 1).await.unwrap(),
+        world.fakes.telegram_bot(&cfg, &outbox, 1, 1).await.unwrap(),
     ));
     let at = writer.post(Bytes::from_static(b"a frame")).await.unwrap();
     assert_eq!(reader.read_after(0, 10).await.unwrap(), vec![(at, Bytes::from_static(b"a frame"))]);

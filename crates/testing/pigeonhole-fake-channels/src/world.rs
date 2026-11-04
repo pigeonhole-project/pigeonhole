@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use pigeonhole_config::instances::InstanceKind;
 use pigeonhole_config::stores::{FakeBacking, FakeChannel};
 use pigeonhole_config::Config;
-use pigeonhole_storage_api::fake::FakeHost;
+use pigeonhole_storage_api::fake::{FakeCalls, FakeHost, Latency};
 use pigeonhole_storage_api::InstanceInfo;
 use pigeonhole_storage_discord::fake::bot::FakeBot as DiscordBot;
 use pigeonhole_storage_discord::fake::state::DiscordChannelState;
@@ -33,6 +33,9 @@ pub struct World {
     discord: tokio::sync::Mutex<HashMap<(u64, String), Arc<DiscordChannel>>>,
     /// Channels taken down (`kind:scope`): every bot's call fails.
     outages: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// How long every fake bot's call takes: `[fake] latency_*` as the
+    /// world's user sets it, changed as the node runs (the demo's settings).
+    pub latency: Latency,
 }
 
 /// The stores a fake channel's tablet keeps itself in.
@@ -142,12 +145,26 @@ impl World {
     }
 
     /// Fake bot `bot` on Telegram channel `f`, behind the channel's down
-    /// switch: a node posting to its Raft outbox, or reading another's,
+    /// switch: node `node` posting to its Raft outbox, or reading another's,
     /// with its own bot.
-    pub async fn telegram_bot(&self, cfg: &Config, f: &FakeChannel, bot: u64) -> Result<TelegramBot<TelegramChannel>> {
+    pub async fn telegram_bot(
+        &self,
+        cfg: &Config,
+        f: &FakeChannel,
+        bot: u64,
+        node: u64,
+    ) -> Result<TelegramBot<TelegramChannel>> {
         let channel = self.telegram(&f.scope, &f.backing).await?;
         let limiter = cfg.chat_limiter(InstanceKind::Telegram, &fake_bot(bot), &f.scope);
-        Ok(TelegramBot::new(channel, limiter, 0).with_switch(self.outage(f.kind, &f.scope)))
+        Ok(TelegramBot::new(channel, limiter, 0)
+            .with_switch(self.outage(f.kind, &f.scope))
+            .with_calls(self.calls(f, Some(node))))
+    }
+
+    /// Fake channel `f`'s calls, by node `node` when one makes them all (an
+    /// outbox's reader), logged and delayed by the world's latency.
+    fn calls(&self, f: &FakeChannel, node: Option<u64>) -> FakeCalls {
+        FakeCalls::new(&f.id, node, self.latency.clone())
     }
 
     /// A Telegram store on fake channel `f`, through its bots: each with
@@ -158,7 +175,9 @@ impl World {
             .map(|(i, &id)| {
                 let limiter = cfg.chat_limiter(InstanceKind::Telegram, &fake_bot(id), &f.scope);
                 (
-                    TelegramBot::new(channel.clone(), limiter.clone(), i).with_switch(self.outage(f.kind, &f.scope)),
+                    TelegramBot::new(channel.clone(), limiter.clone(), i)
+                        .with_switch(self.outage(f.kind, &f.scope))
+                        .with_calls(self.calls(f, None)),
                     limiter,
                 )
             })
@@ -177,11 +196,13 @@ impl World {
         info: InstanceInfo,
     ) -> Result<DiscordStore> {
         let channel = self.discord(&f.scope, &f.backing).await?;
-        let bots = (f.bot_ids.iter().enumerate())
-            .map(|(i, &id)| {
+        let bots = (f.bot_ids.iter())
+            .map(|&id| {
                 let limiter = cfg.chat_limiter(InstanceKind::Discord, &fake_bot(id), &f.scope);
                 (
-                    DiscordBot::new(channel.clone(), limiter.clone(), i).with_switch(self.outage(f.kind, &f.scope)),
+                    DiscordBot::new(channel.clone(), limiter.clone())
+                        .with_switch(self.outage(f.kind, &f.scope))
+                        .with_calls(self.calls(f, None)),
                     limiter,
                 )
             })

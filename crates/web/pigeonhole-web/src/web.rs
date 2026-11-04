@@ -24,6 +24,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 /// Shared with the shim's `poll_oneoff` ([`ph_yield_flag`]):
 /// - `[0]` = 1: [`ph_run`] wants to return, so a park must not wait for its
@@ -250,6 +251,24 @@ async fn open_with_bucket(world: &Arc<World>, text: &str) -> anyhow::Result<(Nod
     }
 }
 
+/// The `fake` op: the fake bots' call time and the direct links' frame
+/// time (ms, min and max), each if given, from now on; both as they are now.
+fn set_fakes(r: &Request) -> Value {
+    let world = WORLD.with(Arc::clone);
+    let range = |(min, max): (u64, u64)| (Duration::from_millis(min), Duration::from_millis(max));
+    if let Some(latency) = r.latency {
+        world.fakes.latency.set(range(latency));
+    }
+    if let Some(link) = r.link {
+        world.link.set(range(link));
+        if let Some(nodes) = NODES.with(|n| n.borrow().clone()) {
+            nodes.set_link(range(link));
+        }
+    }
+    let ms = |(min, max): (Duration, Duration)| [min.as_millis() as u64, max.as_millis() as u64];
+    json!({ "latency": ms(world.fakes.latency.get()), "link": ms(world.link.get()) })
+}
+
 async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
     match r.op.as_str() {
         "open" | "restart" => {
@@ -267,6 +286,9 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
             return Ok(json!({ "closed": true }));
         }
         _ => {}
+    }
+    if r.op == "fake" {
+        return Ok(set_fakes(&r));
     }
     let nodes = NODES.with(|n| n.borrow().clone()).ok_or_else(|| anyhow::anyhow!("no node: open first"))?;
     if r.op == "isolate" {
