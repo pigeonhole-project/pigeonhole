@@ -45,7 +45,7 @@ slow_request = "5s"                     # slower requests are logged at info
 | `commit` | `entries`, `proposals`, `position` | the tablet's batcher writing one Raft entry |
 
 In a cluster, the lines a node logs about Raft itself (`raft frame sent` /
-`raft frame received` at debug, `leader changed` and `not the leader` at
+`raft frame received` at debug, `raft state changed` and `not the leader` at
 info, with their fields) are in [cluster.md](cluster.md) § Observability.
 
 A task spawned while serving a request does not inherit its span by itself;

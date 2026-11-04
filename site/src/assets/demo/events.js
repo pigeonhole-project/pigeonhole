@@ -16,6 +16,7 @@ export const MESSAGES = {
   repaired: "repair pass complete", // pigeonhole-chunk-store repair
   leaseWait: "waiting out the lease", // pigeonhole-meta log/chain: a lease log another held
   claimed: "claimed the metadata log", // pigeonhole-meta: the tablet took its log
+  state: "raft state changed", // pigeonhole-meta: a node's Raft state, term or leader, as it learns it
   frameSent: "raft frame sent", // openraft-chat, openraft-grpc
   voteAnswered: "raft vote answered", // openraft-chat, openraft-grpc
   frameReceived: "raft frame received", // openraft-chat (the demo reads the chat's only)
@@ -35,13 +36,14 @@ export const S3_OK = " ok";
 //   {type: "repair_pass", repaired}
 //   {type: "claimed", generation}                              the node took the metadata log
 //   {type: "lease_wait", ms}                                   it waits out the lease another held on it
+//   {type: "role", node, state, term, leader}                  node's Raft state now (leader null: an election)
 //   {type: "s3", op, ...fields}                                an S3 call that succeeded
 //   {type: "raft", from, to, via, kind: "voted", granted, at: "answered"}
 //                                                              a vote's answer, from the voter
 //   {type: "raft", from, to, via, kind, at}                    a Raft request between nodes:
 //       via "grpc" (direct), or "chat" through the sender's outbox; `at`
 //       "sent" (into the outbox, over the chat) or "read" (out of it)
-export const EVENT_TYPES = ["posted", "deleted", "call", "call_failed", "repair_pass", "claimed", "lease_wait", "s3", "raft"];
+export const EVENT_TYPES = ["posted", "deleted", "call", "call_failed", "repair_pass", "claimed", "lease_wait", "s3", "raft", "role"];
 
 export function readEvents(lines) {
   const out = [];
@@ -72,6 +74,8 @@ export function readEvents(lines) {
       out.push({type: "repair_pass", repaired: +f.repaired});
     } else if (msg === MESSAGES.leaseWait) {
       out.push({type: "lease_wait", ms: +f.wait_ms});
+    } else if (msg === MESSAGES.state) {
+      out.push({type: "role", node: +f.node, state: f.state, term: +f.term, leader: f.leader == null ? null : +f.leader});
     } else if (msg === MESSAGES.claimed) {
       out.push({type: "claimed", generation: f.generation});
     } else if (msg === MESSAGES.frameSent && f.reply === false) {

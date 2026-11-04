@@ -585,8 +585,9 @@ them.
   - `raft frame sent` and `raft frame received` (debug), with fields
     `to`/`from`, `kind` (heartbeat, append, vote, snapshot), `reply`,
     `via` (grpc, chat) and `bytes`. `Direct` logs as `grpc`.
-  - `leader changed` (info), with `term` and `leader` (absent during an
-    election).
+  - `raft state changed` (info), with `node`, `state` (leader, follower,
+    candidate, learner, shutdown), `term` and `leader` (absent during an
+    election): each change of any of them, as the node learns it.
   - `not the leader` (info), with `op` (method and path) and `leader`:
     a follower turning an S3 request away.
 

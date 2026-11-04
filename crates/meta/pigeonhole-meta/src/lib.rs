@@ -810,7 +810,7 @@ impl MetaStore {
             let _ = raft.trigger().snapshot().await;
         }
         *store.ticker.lock().unwrap() = Some(spawn_snapshot_ticker(raft, shared, store.snapshots.schedule()));
-        spawn_leader_log(store.raft.metrics());
+        spawn_state_log(store.raft.metrics());
         telemetry::record_boot(store.applied_position().saturating_sub(store.base_position()), t0.elapsed());
         tracing::info!(
             generation = gen,
@@ -1342,20 +1342,21 @@ fn serving(m: &raft::Metrics) -> bool {
         && m.last_applied.as_ref().is_some_and(|l| l.leader_id.get_term() == m.current_term)
 }
 
-/// Log each change of leader as this node learns it (`None`: an election
-/// is on), until Raft stops.
-fn spawn_leader_log(mut metrics: watch::Receiver<raft::Metrics>) {
+/// Log each change of this node's state, term or leader as it learns it
+/// (`leader` none: an election is on), until Raft stops.
+fn spawn_state_log(mut metrics: watch::Receiver<raft::Metrics>) {
     tokio::spawn(
         async move {
             let mut known = None;
             loop {
-                let (leader, term) = {
+                let (node, now) = {
                     let m = metrics.borrow_and_update();
-                    (m.current_leader, m.current_term)
+                    (m.id, (telemetry::state_name(m.state), m.current_term, m.current_leader))
                 };
-                if known != Some(leader) {
-                    tracing::info!(term, leader, "leader changed");
-                    known = Some(leader);
+                if known != Some(now) {
+                    let (state, term, leader) = now;
+                    tracing::info!(node, state, term, leader, "raft state changed");
+                    known = Some(now);
                 }
                 if metrics.changed().await.is_err() {
                     return;

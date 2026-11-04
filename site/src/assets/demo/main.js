@@ -37,6 +37,7 @@ const state = {
   node: null, // the node your requests go to (your panel); null: whichever leads
   look: null, // the node on screen (its panel, log, tasks); null: the one your requests go to
   cluster: null, // the `cluster` op's: {leader, term, nodes}
+  leader: null, // the leader as the nodes' logs tell it ("role" events): {id (null: none), term}
   views: new Map(), // each node's own `cluster` op, by id
   term: null, // the newest term seen: a new leader is told once
   timing: null, // the cluster's clocks (ms): {heartbeat, election: [min, max]}
@@ -56,8 +57,11 @@ const state = {
   wizard: false, // the first visit's setup is on screen
 };
 const channel = store => state.channels.find(c => c.store === store);
+// The leader as the page last learnt it: from the nodes' own word in their
+// log (a "role" event), else from the last `cluster` poll; the newer term wins.
+const leaderId = () => (state.leader && state.leader.term >= (state.cluster?.term ?? 0) ? state.leader.id : (state.cluster?.leader ?? null));
 // The node your requests go to: the one you picked, else the leader, else the first.
-const target = () => state.node ?? state.cluster?.leader ?? state.nodes[0];
+const target = () => state.node ?? leaderId() ?? state.nodes[0];
 // The node on screen: the one you look at, else the one your requests go to.
 const shown = () => state.look ?? target();
 // Your request, for the node it goes to (the server picks the leader without one).
@@ -67,7 +71,7 @@ const onShown = request => (request.node != null || state.look == null ? onNode(
 // The log the `log` op reads: the node on screen's.
 const logChannel = () => state.channels.find(c => c.role === "log" && (c.node == null || c.node === shown()));
 // Node `id` (0: the one node) follows a leader it knows: the leader's tasks are not its.
-const follows = id => id !== 0 && state.cluster?.leader != null && id !== state.cluster.leader;
+const follows = id => id !== 0 && leaderId() != null && id !== leaderId();
 const isOpen = kind => state.open?.kind === kind;
 // The graph's node for a panel: the log's is its channel's card.
 const nodeOf = open => (open?.kind === "log" ? {kind: "store", store: logChannel()?.store} : open);
@@ -101,7 +105,7 @@ const graph = makeGraph($("graph"), {
 let drawnLeader = null,
   drawnLinks = 0; // the cluster drawn last
 const scene = () => ({
-  leader: state.cluster?.leader ?? null,
+  leader: leaderId(),
   cut: state.cut,
   shown: shown(),
   links: state.cluster?.links || [],
@@ -119,7 +123,7 @@ setLinks({
 });
 
 function redraw() {
-  drawnLeader = state.cluster?.leader ?? null;
+  drawnLeader = leaderId();
   drawnLinks = state.cluster?.links?.length ?? 0;
   graph.draw(state.channels, state.objects.length, scene());
   graph.markOpen(nodeOf(state.open));
@@ -140,7 +144,7 @@ const status = text => {
 // What the node logged: pigeons to fly, posts and deletions in the channels.
 // Returns what it said, as sentences, newest last.
 // Whose traffic is whose (flights.js): the leader as last seen, the node on screen.
-const flightCtx = () => ({leader: state.cluster?.leader ?? null, shown: shown(), cut: state.cut});
+const flightCtx = () => ({leader: leaderId(), shown: shown(), cut: state.cut});
 function apply(events) {
   const said = [];
   for (const e of events) {
@@ -166,8 +170,22 @@ function apply(events) {
       for (const f of flights) fly({...f, onLand: heard});
       if (!flights.length) heard?.();
       said.push(...raft.frame(e, node.now()));
+    } else if (e.type === "role") {
+      said.push(...roleChanged(e));
     }
   }
+  return said;
+}
+
+// A node's Raft state changed, as its log says: told, its role on the
+// graph; a new leader (or none: the old one stepped down) its flag.
+function roleChanged(e) {
+  const said = raft.view(e.node, {role: e.state, term: e.term}, node.now());
+  const known = state.leader;
+  if (e.leader != null && e.term >= (known?.term ?? 0)) state.leader = {id: e.leader, term: e.term};
+  else if (known?.id === e.node && e.state !== "leader") state.leader = {id: null, term: Math.max(e.term, known.term)};
+  if (graph.drawn() && !state.wizard && leaderId() !== drawnLeader) redraw();
+  else showNodes();
   return said;
 }
 
@@ -277,7 +295,7 @@ async function whileBusy(fn) {
 // Your objects: the bucket's, as the leader lists it (a follower turns S3
 // away, whichever node is on screen); kept as they were when none answers.
 async function refreshObjects() {
-  const {reply} = await call(ops.list(state.bucket, state.cluster?.leader ?? undefined));
+  const {reply} = await call(ops.list(state.bucket, leaderId() ?? undefined));
   if (ok(reply)) state.objects = reply.objects || [];
   graph.setObjects(state.objects.length);
   if (isOpen("client")) view.setObjects(state.objects);
@@ -349,7 +367,8 @@ async function pollCluster() {
     if (!ok(reply)) continue;
     replies.set(id, reply);
     const own = reply.nodes.find(n => n.id === reply.me);
-    told.push(...raft.view(id, {role: own?.role ?? null, term: reply.term}, now));
+    // The nodes' logs tell their roles as they change; a poll only fills in one not told yet.
+    if (raft.of(id)?.role == null) told.push(...raft.view(id, {role: own?.role ?? null, term: reply.term}, now));
   }
   const reply = replies.get(shown()) ?? [...replies.values()][0];
   if (!reply) return;
@@ -358,14 +377,14 @@ async function pollCluster() {
   // A newer term only: a node cut off still thinks it leads, in its old term.
   const seen = state.term;
   // A node back from a cut still names itself in its old term: the newer word stands.
-  state.cluster = seen != null && reply.term < seen ? {...reply, leader: state.cluster?.leader ?? null} : reply;
+  state.cluster = seen != null && reply.term < seen ? {...reply, leader: leaderId()} : reply;
   state.term = Math.max(seen ?? 0, reply.term);
   if (told.length) say(told.at(-1));
   renderNodes();
   showNodes();
   if (isOpen("cluster")) await updateCluster();
   // A new leader: its flag, its ways to the data channels.
-  if (graph.drawn() && !state.wizard && (reply.leader !== drawnLeader || reply.links.length !== drawnLinks)) redraw();
+  if (graph.drawn() && !state.wizard && (leaderId() !== drawnLeader || reply.links.length !== drawnLinks)) redraw();
 }
 
 // The nodes in the bar: which leads (★), which is cut off; the one on
@@ -381,7 +400,7 @@ function renderNodes() {
   bar.replaceChildren(all);
   if (isOpen("client")) view.setCluster(clientCluster());
 }
-const clientCluster = () => (state.nodes.length > 1 ? {nodes: state.nodes, node: state.node, leader: state.cluster?.leader ?? null, cut: state.cut} : null);
+const clientCluster = () => (state.nodes.length > 1 ? {nodes: state.nodes, node: state.node, leader: leaderId(), cut: state.cut} : null);
 
 // Your requests go to node `id` (null: the leader); you look at it too.
 async function pickNode(id) {
@@ -406,7 +425,7 @@ async function showNode() {
 
 // The cluster's panel: what every node says, the leader's word on the dynamic config.
 const clusterData = (dynamic = null) => {
-  const leader = state.cluster?.leader;
+  const leader = leaderId();
   return {
     nodes: state.nodes,
     own: state.views,
@@ -421,7 +440,7 @@ const clusterData = (dynamic = null) => {
   };
 };
 async function updateCluster() {
-  const leader = state.cluster?.leader;
+  const leader = leaderId();
   const dynamic = leader == null ? null : (await call(ops.dynamic(leader))).reply;
   if (isOpen("cluster")) view.update(clusterData(ok(dynamic) ? dynamic : null));
 }
@@ -521,7 +540,7 @@ async function toggleTask(task, on) {
   // the dynamic config: an entry in the log) through the leader.
   if (task === "snapshot" && state.nodes.length > 1) {
     const key = `node.${shown()}.snapshot_every`;
-    const r = await call(ops.dynamicSet(key, on ? TASK_ON.snapshot : "off", state.cluster?.leader ?? undefined));
+    const r = await call(ops.dynamicSet(key, on ? TASK_ON.snapshot : "off", leaderId() ?? undefined));
     if (r.reply?.error) sayError(r.reply.error);
     else say([on ? "bg.turned_on" : "bg.turned_off", {task: t("bg.snapshot"), key}]);
     return pollBackground();
@@ -598,7 +617,7 @@ async function pollBudgets() {
     for (const e of reply.budgets || []) {
       const key = `${e.service} ${e.bot} ${e.chat}`,
         c = state.channels.find(c => budgetsOf(c, [e]).length);
-      if (!seen.has(key) || id === (c?.node ?? state.cluster?.leader)) seen.set(key, e);
+      if (!seen.has(key) || id === (c?.node ?? leaderId())) seen.set(key, e);
     }
   }
   state.budgets = [...seen.values()];
@@ -621,7 +640,7 @@ function renderPanel() {
     show(t("demo.you"), t("demo.you_sub"), v.nodes, v);
   } else if (open.kind === "loft") {
     const id = shown();
-    const cluster = state.nodes.length > 1 ? {node: id, cut: state.cut.has(id), leader: state.cluster?.leader ?? null} : null;
+    const cluster = state.nodes.length > 1 ? {node: id, cut: state.cut.has(id), leader: leaderId()} : null;
     // A cluster's "reset" is its own config back: the demo's is one node's.
     const demo = cluster ? state.config : state.demo;
     const own = state.channels.filter(c => c.role !== "data" && (c.node == null || c.node === id)).map(c => c.store);
@@ -780,6 +799,7 @@ function restart(text) {
     }
     Object.assign(state, {config: text, nodes: reply.nodes});
     state.cut.clear();
+    state.leader = null;
     await boot();
     say(["say.restart", {n: reply.replayed}]);
   });
