@@ -454,9 +454,10 @@ function startTimers() {
 }
 
 // ------------------------------------------------------------ the node's clock
-// Stopped (⏸), the node's time moves only by hand: ⏭ on to its next timer,
-// the node run once, then what it did (its flights; the background and the
-// cluster polled again: stopped, nothing polls them).
+// Stopped (⏸), the node's time moves only by hand: ⏭ on to its next event
+// (timer by timer until it does something drawn; with Shift, one timer
+// only), then what it did (its flights; the background and the cluster
+// polled again: stopped, nothing polls them).
 let paused = false,
   stepped = false;
 function setPaused(on) {
@@ -474,9 +475,9 @@ if (!node.admin) {
   $("sim-step").title = t("sim.step");
   setPaused(false);
   $("sim-play").addEventListener("click", () => setPaused(!paused));
-  $("sim-step").addEventListener("click", () => {
+  $("sim-step").addEventListener("click", e => {
     stepped = true;
-    node.step();
+    node.step(e.shiftKey);
   });
   node.onClock(({paused: on, now, next}) => {
     if (on) $("sim-next").textContent = next == null ? t("sim.idle") : t("sim.next", {ms: Math.max(0, Math.round(next - now))});

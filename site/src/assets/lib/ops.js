@@ -11,7 +11,7 @@
 // of the cluster cut off); `reset`, `go`, `pause` and `step` are the
 // worker's alone (web-worker.js: its files go, no node behind it; the page
 // drew a batch of the node's events, its clock may go on; the clock stopped
-// or let go; stopped, on to the node's next timer). A request may name the `node` of a
+// or let go; stopped, on to the node's next event, or `one` timer only). A request may name the `node` of a
 // cluster it goes to; none: the leader.
 
 const OP_CLOSE = "close";
@@ -29,7 +29,7 @@ export const ops = {
   reset: () => ({op: OP_RESET}),
   go: seq => ({op: OP_GO, seq}),
   pause: on => ({op: OP_PAUSE, on}),
-  step: () => ({op: OP_STEP}),
+  step: one => ({op: OP_STEP, one}),
   isolate: (node, down) => ({op: "isolate", node, down}),
   // S3 (the body: the object's bytes).
   put: (bucket, key) => ({op: "put", bucket, key}),

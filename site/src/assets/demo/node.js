@@ -16,8 +16,9 @@
 // so: a promise, or nothing for at once; a batch kept for the reply is
 // drawn at once. now(): the node's time as the page reckons it, on
 // performance.now()'s scale (a real node's: the wall's). pause(true) stops
-// the clock, step() then moves it on to the node's next timer and runs the
-// node once; onClock's fn hears {paused, now, next} after each.
+// the clock, step(one) then moves it on timer by timer until the node does
+// something drawn (or by `one` timer); onClock's fn hears {paused, now,
+// next} after each.
 import {frame, MSG, ops} from "../lib/ops.js";
 import {Clock} from "../wasi.js";
 
@@ -140,7 +141,7 @@ export function workerNode(worker) {
       else if (!out.size) clock.release();
       worker.postMessage(ops.pause(on));
     },
-    step: () => worker.postMessage(ops.step()),
+    step: one => worker.postMessage(ops.step(one)),
     onClock: fn => {
       onClock = fn;
     },

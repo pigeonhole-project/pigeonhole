@@ -496,7 +496,7 @@
   "js.set.holdSparks_note": "A cluster sends heartbeats all the time: waiting for every spark slows it down to the sparks' pace.",
   "js.sim.pause": "Stop the node's clock",
   "js.sim.play": "Let the node's clock go",
-  "js.sim.step": "On to the node's next timer",
+  "js.sim.step": "On to the node's next event (Shift: its next timer only)",
   "js.sim.next": "next +{ms} ms",
   "js.sim.idle": "no timer"
 }
