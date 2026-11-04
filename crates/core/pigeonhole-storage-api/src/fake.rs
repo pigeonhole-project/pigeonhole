@@ -174,14 +174,25 @@ impl FakeCalls {
 
     /// Call `call` starts: logged, then its delay. Returns its id, for [`Self::done`].
     pub async fn start(&self, call: &'static str, bytes: Option<u64>) -> u64 {
-        let id = CALL_IDS.fetch_add(1, Ordering::Relaxed) + 1;
-        let delay = self.latency.of(id);
-        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-        tracing::debug!(store = %self.store, node = self.node, call, id, bytes, ms, "fake call");
+        let (id, delay) = self.draw();
+        self.begin(id, call, bytes, delay);
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
         id
+    }
+
+    /// A new call's id, and the delay the latency gives it.
+    pub fn draw(&self) -> (u64, Duration) {
+        let id = CALL_IDS.fetch_add(1, Ordering::Relaxed) + 1;
+        (id, self.latency.of(id))
+    }
+
+    /// Call `id` (`call`, of `bytes`) starts and takes `delay`, which its
+    /// caller waits out: logged.
+    pub fn begin(&self, id: u64, call: &'static str, bytes: Option<u64>, delay: Duration) {
+        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        tracing::debug!(store = %self.store, node = self.node, call, id, bytes, ms, "fake call");
     }
 
     /// Call `id` ends: it went through (`ok`) or failed.

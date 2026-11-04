@@ -16,14 +16,54 @@ use pigeonhole_meta::raft::TypeConfig;
 use pigeonhole_meta::Cluster;
 use pigeonhole_node::cluster::{chat_network, idle_chat, via_chat};
 use pigeonhole_raft_telegram::TelegramMailbox;
+use pigeonhole_storage_api::fake::FakeCalls;
 use pigeonhole_storage_telegram::fake::bot::FakeBot;
+use pigeonhole_storage_telegram::ChannelMessage;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::Instant;
 
 type Outbox = TelegramMailbox<FakeBot<TelegramChannel>>;
 /// The readers' copies of one outbox.
-type Copies = Arc<Mutex<Vec<Arc<Outbox>>>>;
+type Copies = Arc<Mutex<Vec<Reader>>>;
+
+/// A reader's copy of an outbox, and the way a push reaches it: one after
+/// another, each a fake call ("push") taking the fakes' latency, as
+/// Telegram's update takes its time to reach a bot.
+struct Reader {
+    calls: FakeCalls,
+    /// When the last push queued reaches the reader: the next one no sooner.
+    last: Mutex<Instant>,
+    queue: tokio::sync::mpsc::UnboundedSender<(u64, Instant, i64, Option<ChannelMessage>)>,
+}
+
+impl Reader {
+    fn new(copy: Arc<Outbox>, calls: FakeCalls) -> Self {
+        let (queue, mut pushes) = tokio::sync::mpsc::unbounded_channel();
+        let done = calls.clone();
+        tokio::spawn(async move {
+            while let Some((id, when, at, message)) = pushes.recv().await {
+                tokio::time::sleep_until(when).await;
+                done.done(id, true);
+                copy.pushed(at, message);
+            }
+        });
+        Self { calls, last: Mutex::new(Instant::now()), queue }
+    }
+
+    /// Post `at` (`bytes` of it) on its way to the reader.
+    fn push(&self, at: i64, message: Option<ChannelMessage>, bytes: u64) {
+        let (id, delay) = self.calls.draw();
+        let when = {
+            let mut last = self.last.lock().unwrap();
+            *last = (*last).max(Instant::now() + delay);
+            *last
+        };
+        self.calls.begin(id, "push", Some(bytes), when - Instant::now());
+        let _ = self.queue.send((id, when, at, message));
+    }
+}
 /// The outboxes as each node sees them, by `(owner, user)`; and by owner,
 /// the readers' copies.
 type Outboxes = (HashMap<(u64, u64), Arc<dyn Mailbox>>, HashMap<u64, Copies>);
@@ -40,9 +80,10 @@ struct Copy {
 #[async_trait::async_trait]
 impl Mailbox for Copy {
     async fn post(&self, frame: bytes::Bytes) -> Result<u64> {
+        let bytes = frame.len() as u64;
         let (at, message) = self.own.post_message(frame).await?;
-        for copy in self.all.lock().unwrap().iter() {
-            copy.pushed(at as i64, message.clone());
+        for reader in self.all.lock().unwrap().iter() {
+            reader.push(at as i64, message.clone(), bytes);
         }
         Ok(at)
     }
@@ -101,7 +142,8 @@ impl Net {
         );
         let all = all.entry(owner).or_default().clone();
         if user != owner {
-            all.lock().unwrap().push(own.clone());
+            let calls = FakeCalls::new(&channel.id, Some(user), world.fakes.latency.clone());
+            all.lock().unwrap().push(Reader::new(own.clone(), calls));
         }
         let copy: Arc<dyn Mailbox> = Arc::new(Copy { own, all });
         copies.insert((owner, user), copy.clone());
