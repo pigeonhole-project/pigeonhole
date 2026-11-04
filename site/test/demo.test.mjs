@@ -352,6 +352,10 @@ test("apiFlight: a fake call flies from its node (named, its channel's own, else
   const push = apiFlight(call("outbox-3", "push", {node: 1}), channel, ctx);
   assert.deepEqual([push.from, push.to, push.lane], [{store: "outbox-3", at: "new"}, {node: 1}, "raft"], "a frame reaching its reader");
   assert.equal(apiFlight(call("nope", "send_text"), channel, ctx), null, "a channel not drawn: nothing flies");
+  const request = apiFlight(call("you", "request", {node: 2}), channel, ctx);
+  assert.deepEqual([request.from, request.to], [{client: true}, {node: 2}], "your request to the node it goes to");
+  const answer = apiFlight(call("you", "response"), channel, ctx);
+  assert.deepEqual([answer.from, answer.to], [{node: 1}, {client: true}], "its answer back");
   assert.equal(ownerOf({node: null}, {leader: null, shown: 3}), 3, "no leader known: the node on screen");
 });
 

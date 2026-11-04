@@ -12,7 +12,7 @@ import {clientView, sample, uploadFiles} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {ref, sentence, setLinks} from "./entities.js";
 import {readEvents} from "./events.js";
-import {apiFlight, frameFlight, landingOf, reaches, refused} from "./flights.js";
+import {apiFlight, frameFlight, landingOf, reaches} from "./flights.js";
 import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
@@ -257,8 +257,7 @@ async function runOp(request, body) {
   const {reply, events} = await node.call(onNode(request), body, evs => said.push(...apply(readEvents(evs))));
   said.push(...apply(readEvents(events)));
   if (reply?.error?.startsWith("not the leader")) {
-    // You knocked on a follower: your pigeon turns back at its door.
-    graph.fly(refused(target()));
+    // You knocked on a follower: its answer flew back to you, a refusal.
     say(["say.not_leader", {n: target(), error: reply.error}]);
   } else if (reply?.error && state.channels.some(c => c.down)) say([request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: reply.error}]);
   else if (reply?.error) sayError(reply.error);

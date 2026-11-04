@@ -15,6 +15,7 @@ use crate::cluster::Nodes;
 use crate::{World, DEMO_CONFIG};
 use bytes::Bytes;
 use pigeonhole_admin::Request;
+use pigeonhole_storage_api::fake::FakeCalls;
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -296,5 +297,21 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
         nodes.isolate(&WORLD.with(Arc::clone), node, r.down)?;
         return Ok(json!({ "node": node, "isolated": r.down }));
     }
-    nodes.node(r.node)?.admin.handle(&r, body).await
+    let node = nodes.node(r.node)?;
+    if !matches!(r.op.as_str(), "put" | "get" | "copy" | "delete") {
+        return node.admin.handle(&r, body).await;
+    }
+    // Your S3 request reaches the node, and its answer you, over a link as
+    // long as the nodes' own: fake calls the page draws as pigeons.
+    let you = FakeCalls::new(YOU, nodes.which(r.node), WORLD.with(|w| w.link.clone()));
+    let id = you.start("request", Some(body.len() as u64)).await;
+    you.done(id, true);
+    let reply = node.admin.handle(&r, body).await;
+    let bytes = reply.as_ref().ok().and_then(|v| v.get("len")).and_then(Value::as_u64);
+    let id = you.start("response", bytes).await;
+    you.done(id, true);
+    reply
 }
+
+/// The store name of your S3 client in the fake calls: the page's "you".
+const YOU: &str = "you";

@@ -251,8 +251,13 @@ impl Nodes {
 
     /// Node `id`; without one, the leader (or the first, while none leads).
     pub fn node(&self, id: Option<u64>) -> Result<&crate::Node> {
-        let id = id.or_else(|| self.leader()).or_else(|| self.nodes.keys().next().copied());
+        let id = self.which(id);
         id.and_then(|id| self.nodes.get(&id)).with_context(|| format!("no node {id:?}"))
+    }
+
+    /// The node a request for `id` goes to: that one, else the leader, else the first.
+    pub fn which(&self, id: Option<u64>) -> Option<u64> {
+        id.or_else(|| self.leader()).or_else(|| self.nodes.keys().next().copied())
     }
 
     /// A direct link's frame takes `range` each way, from now on.

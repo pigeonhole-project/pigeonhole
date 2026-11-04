@@ -27,6 +27,10 @@
 // ctx: {leader: id | null, shown: the node on screen, cut: Set of the nodes cut off}.
 export const ownerOf = (c, ctx) => c.node ?? ctx.leader ?? ctx.shown;
 
+// The store your S3 client's calls go by (crates/web: its "request" to
+// the node, the node's "response" back), over a link as the nodes' own.
+export const YOU = "you";
+
 // The fake bots' calls that bring something from the channel (the rest take
 // something to it); "push": an outbox's post reaching a reader.
 const READS = new Set(["get_messages", "get_file", "get_message", "list", "pinned", "thread_name", "download", "push"]);
@@ -35,6 +39,11 @@ const READS = new Set(["get_messages", "get_file", "get_message", "list", "pinne
 // for a channel not on the graph. `ahead`: the sends to the same channel
 // already flying (they take the windows before this one's).
 export function apiFlight(e, channel, ctx, ahead = 0) {
+  if (e.store === YOU) {
+    const node = {node: e.node ?? ctx.leader ?? ctx.shown};
+    const out = e.call === "request";
+    return {key: `api:${e.id}`, from: out ? {client: true} : node, to: out ? node : {client: true}, size: e.bytes ?? 2048, ms: e.ms};
+  }
   const c = channel(e.store);
   if (!c) return null;
   const node = {node: e.node ?? ownerOf(c, ctx)};
@@ -85,6 +94,3 @@ export function reaches(e) {
   if (e.type !== "raft" || (e.kind !== "heartbeat" && e.kind !== "append")) return null;
   return e.at === "read" ? e.to : null;
 }
-
-// You knocked on a node that does not lead: your pigeon turns back at its door.
-export const refused = node => ({from: {client: true}, to: {node}, failed: true, size: 2048, ms: 0});
