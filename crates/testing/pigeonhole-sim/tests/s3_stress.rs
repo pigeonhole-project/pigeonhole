@@ -13,7 +13,7 @@
 
 use bytes::Bytes;
 use pigeonhole_blob::{OrderedKey, SharedBackend};
-use pigeonhole_chunk_store::{RepairConfig, Repairer};
+use pigeonhole_chunk_store::{RepairConfig, Repairer, REPAIR_BACKOFF_MAX};
 use pigeonhole_gateway_s3::{S3Gateway, S3Options};
 use pigeonhole_meta::{BlobSnapshotStore, ChainLogStore, MetaOptions, MetaStore, Namespaces};
 use pigeonhole_sim::faults::{Fault, FaultPlan, Faulty};
@@ -237,10 +237,18 @@ async fn run(members: Vec<Arc<Faulty<MemoryBlobStore>>>, crash: bool) -> Node {
     };
     node.s3.put_object(req(input)).await.unwrap();
     let live = read_all(&node.s3).await;
-    // Repair until nothing is missing: every live chunk on every member.
+    // Repair until nothing is missing: every live chunk on every member. A
+    // job that failed while the faults were on waits out its backoff (the
+    // clock moved on past it), one parked after too many failures is queued
+    // again, as an operator does once the stores are back.
+    node.store.db().retry_unrepairable();
     let rp = repairer(&node);
     for _ in 0..10 {
         rp.repair_once().await.unwrap();
+        if node.store.db().repair_jobs().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(REPAIR_BACKOFF_MAX).await;
     }
     for backend in &node.backends {
         let id = backend.instance().id.clone();
