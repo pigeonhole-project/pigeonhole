@@ -1,73 +1,112 @@
-// The pigeons' sky without a screen: which flights are in the air, which
-// wait, how far each has come. The renderer (render.js) asks it each frame
-// and draws; time is passed in, so the order, the caps and the motion can be
-// tested without a browser.
+// The pigeons' sky without a screen: which flights are in the air and how
+// far each has come. The renderer (render.js) asks it each frame and draws;
+// time is passed in (the wall's and the node's), so the caps and the motion
+// can be tested without a browser.
 //
-// A flight (flights.js) goes in a lane:
-//   "yours"  your requests and the node's work: one leaves every
-//            `settings.spacing` ms, in the order they came; every one flies
-//   "raft"   the cluster's own traffic: at once, at most `settings.raftCap`
-//            in the air (0: no cap); more are let go (they never fly, but
-//            still count as landed)
-// Every flight ends once, landing or let go: then its `onLand` runs and the
-// promise `add` returned resolves.
+// A flight (flights.js) is timed one of two ways:
+//   ms > 0   on the node's clock: it leaves as the node starts the thing it
+//            stands for and is where the node's time says, landing as the
+//            thing ends (land(key)), at `ms` if all goes as the log said; a
+//            clock slowed down or stopped slows or stops it
+//   ms = 0   a moment of the node's: flown in the wall's time, as long as
+//            `start` says
+// It goes in a lane: "raft" (the cluster's own: at most `settings.raftCap`
+// in the air, 0: no cap; more are let go: they never fly, but count as
+// landed) or none (every one flies). One that fails turns back from where
+// it is (land(key, {failed})). Every flight ends once, landing or let go:
+// then the promise `add` returned resolves.
 
 import {settings} from "../settings.js";
 
-const LANES = {yours: {spacing: () => settings.spacing, cap: () => Infinity}, raft: {spacing: () => 0, cap: () => settings.raftCap || Infinity}};
+const LOST = 3; // a timed flight whose end never comes ends at LOST × its ms
+const BACK_MS = 600; // a failed flight's way back, in the wall's ms
 
-// `start(flight)`: the flight's duration in ms as it leaves, or 0 when it
+// `start(flight)`: the flight's duration in the wall's ms as it leaves (a
+// moment's; a timed one's is a guess, for its wing beats), or 0 when it
 // cannot fly (its places are not on the screen): it is let go.
 export function makeSky({start}) {
-  const waiting = []; // [{flight, ended, done}] in the order they came, yours only
-  const flying = new Set(); // {flight, ended, done, t0, dur}
-  let nextAt = 0; // when the next of yours may leave
+  const flying = new Set(); // {flight, ended, done, t0: node, w0: wall, dur, endAt?: node, back?: {from, w0}}
+  const byKey = new Map(); // flight.key → its entry
+  const cap = () => settings.raftCap || Infinity;
 
-  const lane = f => LANES[f.lane ?? "yours"];
   function end(entry) {
     flying.delete(entry);
-    entry.flight.onLand?.();
+    if (byKey.get(entry.flight.key) === entry) byKey.delete(entry.flight.key);
     entry.done();
   }
-  function leave(entry, now) {
-    const dur = start(entry.flight);
-    if (!dur) return end(entry);
-    Object.assign(entry, {t0: now, dur});
-    flying.add(entry);
-  }
+  // How far a timed flight has come at node time `node` (0…1).
+  const along = (entry, node) => {
+    const span = entry.endAt == null ? entry.flight.ms : Math.max(1e-6, entry.endAt - entry.t0);
+    return Math.min(1, Math.max(0, (node - entry.t0) / span));
+  };
 
   return {
-    // A flight into the sky at `now`; resolves when it ends.
-    add(flight, now) {
-      const entry = {flight};
+    // A flight into the sky at wall time `wall`, node time `node`; resolves when it ends.
+    add(flight, wall, node) {
+      const entry = {flight, t0: node, w0: wall};
       entry.ended = new Promise(done => {
         entry.done = done;
       });
-      const l = lane(flight);
-      if (l === LANES.yours) waiting.push(entry);
-      else if ([...flying].filter(x => lane(x.flight) === l).length >= l.cap()) end(entry);
-      else leave(entry, now);
+      const full = flight.lane === "raft" && [...flying].filter(x => x.flight.lane === "raft").length >= cap();
+      const dur = full ? 0 : start(flight);
+      if (!dur) {
+        entry.done();
+        return entry.ended;
+      }
+      entry.dur = dur;
+      flying.add(entry);
+      if (flight.key) byKey.set(flight.key, entry);
       return entry.ended;
     },
-    // Moves time to `now`: the waiting leave, the arrived land. Returns the
-    // flights in the air, each with how far it has come (0…1) and for how long.
-    tick(now) {
-      while (waiting.length && now >= nextAt) {
-        leave(waiting.shift(), Math.max(now, nextAt));
-        nextAt = Math.max(now, nextAt) + LANES.yours.spacing();
+    // What flight `key` stands for ended at node time `node`: it lands, or
+    // (failed) turns back from where it is; `kind` what it turned out to be.
+    land(key, wall, node, {failed = false, kind} = {}) {
+      const entry = byKey.get(key);
+      if (!entry) return;
+      if (kind) entry.flight.kind = kind;
+      if (!failed) entry.endAt = node;
+      else if (!entry.back) {
+        entry.flight.failed = true;
+        entry.back = {from: entry.flight.ms > 0 ? along(entry, node) : 1, w0: wall};
       }
+    },
+    // Moves time to `wall` and `node`: the arrived land. Returns the flights
+    // in the air, each with how far it has come (0…1), whether on its way
+    // back, and for how long it has flown and will (the wall's ms).
+    tick(wall, node) {
       const up = [];
       for (const entry of [...flying]) {
-        const k = (now - entry.t0) / entry.dur;
-        if (k >= 1) end(entry);
-        else up.push({flight: entry.flight, k: Math.max(0, k), ms: now - entry.t0, dur: entry.dur});
+        const f = entry.flight;
+        let k;
+        if (entry.back) {
+          const b = (wall - entry.back.w0) / BACK_MS;
+          if (b >= 1) {
+            end(entry);
+            continue;
+          }
+          k = entry.back.from * (1 - b);
+        } else if (f.ms > 0) {
+          const late = node - entry.t0 >= f.ms * LOST;
+          k = along(entry, node);
+          if (k >= 1 && (entry.endAt != null || late)) {
+            end(entry);
+            continue;
+          }
+        } else {
+          k = (wall - entry.w0) / entry.dur;
+          if (k >= 1) {
+            end(entry);
+            continue;
+          }
+        }
+        up.push({flight: f, k: Math.max(0, k), back: !!entry.back, ms: wall - entry.w0, dur: entry.dur});
       }
       return up;
     },
-    // Something is in the air or waits to leave.
-    busy: () => flying.size > 0 || waiting.length > 0,
+    // Something is in the air.
+    busy: () => flying.size > 0,
     // Resolves when every flight of yours (not Raft's) added so far has ended.
-    landed: () => Promise.all([...waiting, ...flying].filter(e => lane(e.flight) === LANES.yours).map(e => e.ended)),
+    landed: () => Promise.all([...flying].filter(e => e.flight.lane !== "raft").map(e => e.ended)),
   };
 }
 

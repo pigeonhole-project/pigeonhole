@@ -119,7 +119,7 @@ pub extern "C" fn ph_open() -> i32 {
         .with_span_list(true)
         .with_env_filter(
             "warn,pigeonhole_web=info,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
-             pigeonhole_chunk_store=debug,pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug,pigeonhole_fake_channels=debug,\
+             pigeonhole_chunk_store=debug,pigeonhole_storage_api=debug,pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug,pigeonhole_fake_channels=debug,\
              openraft_grpc=debug,openraft_chat=debug,pigeonhole_raft_telegram=debug",
         )
         .with_writer(std::io::stdout)

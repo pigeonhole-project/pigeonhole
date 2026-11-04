@@ -265,7 +265,6 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 /* the settings panel: a knob is a slider and a number */
 .knob-row { display: flex; align-items: center; gap: 10px; }
 .knob-range { flex: 1; min-width: 0; accent-color: var(--wing); }
-.knob-check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .knob-unit { color: var(--slate); font-size: 13.5px; min-width: 3.5em; }
 .rates { margin: 0 0 8px; padding-left: 18px; color: var(--wing-2); font-size: 14px; }
 .toml { width: 100%; min-height: 46vh; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--feather); color: inherit; resize: vertical; white-space: pre; overflow: auto; }

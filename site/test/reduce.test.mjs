@@ -2,7 +2,7 @@
 // merged in (demo/reduce.js).
 import assert from "node:assert/strict";
 import {beforeEach, test} from "node:test";
-import {apply, drawn, gone, merge} from "../src/assets/demo/reduce.js";
+import {apply, gone, merge} from "../src/assets/demo/reduce.js";
 
 beforeEach(() => {
   globalThis.LANG = "en";
@@ -95,32 +95,4 @@ test("merge: a fresh message older than the listing's newest and not in it is go
     [6],
   );
   assert.equal(now[0].total, 1);
-});
-
-test("drawn: a flying post is not drawn yet: out of the messages and the total, its id among the flying", () => {
-  const c = {store: "tg", total: 5, messages: [{id: 7}, {id: 8, flying: true}, {id: 9, flying: true}]};
-  assert.deepEqual(drawn(c), {store: "tg", total: 3, messages: [{id: 7}], flying: ["8", "9"]});
-  const landed = {store: "tg", total: 1, messages: [{id: 7}]};
-  assert.equal(drawn(landed), landed, "nothing flying: the channel itself");
-});
-
-test("merge: a post still flying stays flying in the new listing", () => {
-  const was = [
-    {
-      store: "tg",
-      total: 2,
-      messages: [
-        {id: "1", fresh: true, flying: true},
-        {id: "2", fresh: true},
-      ],
-    },
-  ];
-  const [c] = merge(was, [{store: "tg", total: 2, messages: [{id: "1"}, {id: "2"}]}]);
-  assert.deepEqual(
-    c.messages.map(m => [m.id, m.flying]),
-    [
-      ["1", true],
-      ["2", false],
-    ],
-  );
 });

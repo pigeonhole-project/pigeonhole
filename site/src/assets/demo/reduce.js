@@ -5,7 +5,7 @@ import {s3Sentence} from "../lib/say.js";
 
 // Event `e` on the channels: a post adds a message (fresh: seen arriving),
 // a deletion takes them out. Returns {channel: the one it is about, or null;
-// message: the one posted; said: what it says, as say.* sentences}.
+// said: what it says, as say.* sentences}.
 export function apply(channels, e, at = new Date()) {
   const c = e.store == null ? null : (channels.find(x => x.store === e.store) ?? null);
   if (e.type === "posted" && c) {
@@ -13,7 +13,7 @@ export function apply(channels, e, at = new Date()) {
     c.messages.push(m);
     c.total = (c.total ?? 0) + 1;
     const snap = c.role === "snapshots" && /-(\d+)\.snap/.exec(m.name || "");
-    return {channel: c, message: m, said: snap ? [["say.snapshot", {at: +snap[1]}]] : []};
+    return {channel: c, said: snap ? [["say.snapshot", {at: +snap[1]}]] : []};
   }
   if (e.type === "deleted" && c) {
     // Gone from the channel, as from a messenger's: no trace left.
@@ -30,15 +30,6 @@ export function apply(channels, e, at = new Date()) {
     return {channel: null, said: said ? [said] : []};
   }
   return {channel: c, said: []};
-}
-
-// Channel `c` as drawn: a post is `flying` until its pigeon lands (main.js),
-// and only then shows, in the town and the panels. The messages landed, the
-// total without the others; `flying`: the others' ids, oldest first.
-export function drawn(c) {
-  if (!c?.messages?.some(m => m.flying)) return c;
-  const flying = c.messages.filter(m => m.flying);
-  return {...c, messages: c.messages.filter(m => !m.flying), total: (c.total ?? c.messages.length) - flying.length, flying: flying.map(m => String(m.id))};
 }
 
 // How many of message ids `ids` channel `c` held: those it lists, and
@@ -64,16 +55,14 @@ function newer(a, b) {
 }
 
 // The channels as the node lists them now (`listed`), what the page saw
-// arriving kept: a listed post seen arriving stays fresh (and flying, its
-// pigeon not landed yet), and a fresh one newer than the listing (posted
-// while it was read) stays, counted.
+// arriving kept: a listed post seen arriving stays fresh, and a fresh one
+// newer than the listing (posted while it was read) stays, counted.
 export function merge(channels, listed) {
   const was = new Map(channels.map(c => [c.store, c]));
   return listed.map(c => {
     const seen = (was.get(c.store)?.messages || []).filter(m => m.fresh);
     const fresh = new Set(seen.map(m => String(m.id)));
-    const flying = new Set(seen.filter(m => m.flying).map(m => String(m.id)));
-    const messages = (c.messages || []).map(m => ({...m, fresh: fresh.has(String(m.id)), flying: flying.has(String(m.id))}));
+    const messages = (c.messages || []).map(m => ({...m, fresh: fresh.has(String(m.id))}));
     const ids = new Set(messages.map(m => String(m.id)));
     const newest = messages.reduce((a, m) => (newer(m.id, a) ? m.id : a), null);
     const later = seen.filter(m => !ids.has(String(m.id)) && newer(m.id, newest));

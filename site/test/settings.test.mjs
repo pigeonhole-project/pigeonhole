@@ -24,7 +24,7 @@ test("settings: set and reset tell the watchers which knobs changed", () => {
   const told = [];
   const unwatch = watch(knobs => told.push(knobs.map(k => k.key)));
   set("floors", 12);
-  set("spacing", 0);
+  set("speed", 1);
   set("nonsense", 1);
   assert.equal(settings.floors, 12);
   reset();
@@ -32,6 +32,6 @@ test("settings: set and reset tell the watchers which knobs changed", () => {
   unwatch();
   set("floors", 3);
   reset();
-  assert.deepEqual(told, [["floors"], ["spacing"], ["spacing", "floors"]]);
+  assert.deepEqual(told, [["floors"], ["speed"], ["speed", "floors"]]);
   assert.deepEqual(settings, DEFAULTS);
 });

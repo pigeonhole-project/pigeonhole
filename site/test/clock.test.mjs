@@ -28,14 +28,27 @@ test("clock: held, no time passes; released, it goes on as far behind as it stoo
   assert.equal(c.held, false);
 });
 
-test("clock: held, advance moves it on at once, never back; not held, it does nothing", () => {
+test("clock: advance moves it on at once, never back; held or running", async () => {
   const c = new Clock();
-  c.advance(c.now() + 1000);
-  assert.ok(Math.abs(c.now() - performance.now()) < 1, "not held: the wall's");
-  c.hold();
   const at = c.now();
-  c.advance(at + 250);
-  assert.equal(c.now(), at + 250);
-  c.advance(at);
-  assert.equal(c.now(), at + 250, "never back");
+  c.advance(at + 1000);
+  assert.ok(c.now() - at >= 1000, "running: on");
+  c.hold();
+  const held = c.now();
+  c.advance(held + 250);
+  assert.equal(c.now(), held + 250);
+  c.advance(held);
+  assert.equal(c.now(), held + 250, "never back");
+});
+
+test("clock: at a quarter speed, a quarter of the wall's time passes; until() is in the wall's ms", async () => {
+  const c = new Clock();
+  c.setSpeed(0.25);
+  const at = c.now();
+  await sleep(80);
+  const passed = c.now() - at;
+  assert.ok(passed >= 19 && passed < 40, `${passed} ms`);
+  assert.ok(Math.abs(c.until(c.now() + 25) - 100) < 2);
+  c.hold();
+  assert.equal(c.until(c.now() + 25), Infinity, "held: never");
 });

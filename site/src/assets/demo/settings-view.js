@@ -9,7 +9,7 @@ import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
 import {GROUPS, KNOBS, set, settings} from "./settings.js";
 
-const UNITS = {ms: () => t("set.unit_ms"), "ms/px": () => t("set.unit_ms_px")};
+const UNITS = {ms: () => t("set.unit_ms"), "ms/px": () => t("set.unit_ms_px"), x: () => "×"};
 
 export function settingsView({cluster, admin}, on) {
   const nodes = [h("p", "field-note", t("set.lede"))];
@@ -30,9 +30,8 @@ export function settingsView({cluster, admin}, on) {
 }
 
 // One knob: its label, a slider and a number (either sets it, the other
-// shows it), its unit, its note; an on/off one, a checkbox.
+// shows it), its unit, its note.
 function knob(k) {
-  if (k.bool) return toggle(k);
   const field = h("div", "field knob", null);
   const id = `knob-${k.key}`;
   const label = h("label", "field-label", t(`set.${k.key}`));
@@ -51,15 +50,5 @@ function knob(k) {
   const row = h("div", "knob-row", null);
   row.append(slider, number, h("span", "knob-unit", k.unit ? UNITS[k.unit]() : ""));
   field.append(label, row, h("p", "field-note", t(`set.${k.key}_note`)));
-  return field;
-}
-
-function toggle(k) {
-  const field = h("div", "field knob", null);
-  const box = Object.assign(h("input", "", null), {type: "checkbox", checked: !!settings[k.key]});
-  box.addEventListener("change", () => set(k.key, box.checked ? 1 : 0));
-  const label = h("label", "field-label knob-check", null);
-  label.append(box, ` ${t(`set.${k.key}`)}`);
-  field.append(label, h("p", "field-note", t(`set.${k.key}_note`)));
   return field;
 }

@@ -8,15 +8,16 @@
 // in the demo; the demo's worker adds its own (crates/web, web.rs): `open`,
 // `restart` (a config, or the one kept: every node boots on it), `close`
 // (the page is going: the node closes, the worker ends), `isolate` (a node
-// of the cluster cut off); `reset`, `go`, `pause` and `step` are the
-// worker's alone (web-worker.js: its files go, no node behind it; the page
-// drew a batch of the node's events, its clock may go on; the clock stopped
-// or let go; stopped, on to the node's next event, or `one` timer only). A request may name the `node` of a
+// of the cluster cut off), `fake` (how long the fakes take); `reset`,
+// `speed`, `pause` and `step` are the worker's alone (web-worker.js: its
+// files go, no node behind it; the node's clock runs at `value` of the
+// wall's; stopped or let go; stopped, on to the node's next event, or `one`
+// timer only). A request may name the `node` of a
 // cluster it goes to; none: the leader.
 
 const OP_CLOSE = "close";
 export const OP_RESET = "reset";
-export const OP_GO = "go";
+export const OP_SPEED = "speed";
 export const OP_PAUSE = "pause";
 export const OP_STEP = "step";
 
@@ -27,7 +28,9 @@ export const ops = {
   restart: config => ({op: "restart", config}),
   close: () => ({op: OP_CLOSE}),
   reset: () => ({op: OP_RESET}),
-  go: seq => ({op: OP_GO, seq}),
+  speed: value => ({op: OP_SPEED, value}),
+  // The fakes' delays, ms [min, max] each: a bot's call, a direct link's frame.
+  fake: (latency, link) => ({op: "fake", latency, link}),
   pause: on => ({op: OP_PAUSE, on}),
   step: one => ({op: OP_STEP, one}),
   isolate: (node, down) => ({op: "isolate", node, down}),
@@ -59,13 +62,13 @@ export const ops = {
 
 // The worker's messages to the page (web-worker.js → demo/node.js); the
 // page sends {id, ...request, body?}. A batch of events (`events`, `tick`)
-// carries a `seq`: the node's clock stands until the page sends `go` for it.
+// carries the node's time it happened at (`at`).
 export const MSG = {
   waiting: "waiting", // the page just left still holds the files
   started: "started", // the module is up: {reply: {config, demo, saved, persistent, why} | {error}, events}
-  events: "events", // what the node logged during call `id`, as it went: {id, events, seq}
+  events: "events", // what the node logged during call `id`, as it went: {id, events, at}
   reply: "reply", // call `id` answered: {id, reply, events: [], ms}
-  tick: "tick", // what the node logged on its own between calls: {events, seq}
+  tick: "tick", // what the node logged on its own between calls: {events, at}
   clock: "clock", // after a pause or a step: {paused, now, next} (the node's ms; next: its next timer, null: none)
 };
 export const msg = {

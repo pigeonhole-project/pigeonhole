@@ -12,12 +12,12 @@ import {clientView, sample, uploadFiles} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {ref, sentence, setLinks} from "./entities.js";
 import {readEvents} from "./events.js";
-import {flightsOf, reaches, refused} from "./flights.js";
+import {apiFlight, frameFlight, landingOf, reaches, refused} from "./flights.js";
 import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
 import {makeRaftWatch} from "./raft.js";
-import {apply as applyEvent, drawn, merge} from "./reduce.js";
+import {apply as applyEvent, merge} from "./reduce.js";
 import {reset as resetSettings, settings, watch} from "./settings.js";
 import {settingsView} from "./settings-view.js";
 import {node as connecting} from "./start.js";
@@ -83,7 +83,8 @@ const node = await connecting;
 const windows = new Map();
 let relayout = () => redraw(); // the screen turned narrow or wide: what is on the graph, again
 const graph = makeGraph($("graph"), {
-  channel: store => drawn(channel(store)),
+  channel,
+  now: () => node.now(),
   onOpen: openPanel,
   onRelayout: () => relayout(),
   onLoft: (g, entrances, id) => {
@@ -145,30 +146,33 @@ const status = text => {
 // Returns what it said, as sentences, newest last.
 // Whose traffic is whose (flights.js): the leader as last seen, the node on screen.
 const flightCtx = () => ({leader: leaderId(), shown: shown(), cut: state.cut});
+// A pigeon flies from each start (a fake bot's call, a direct frame) and
+// lands with its end, both as the node logged them (flights.js); a post
+// shows as it is posted, the call that posts it ending.
 function apply(events) {
   const said = [];
   for (const e of events) {
-    const {channel: c, message: m, said: s} = applyEvent(state.channels, e);
+    const {channel: c, said: s} = applyEvent(state.channels, e);
     said.push(...s);
     if (e.type === "posted" && c) {
-      // Flying until its pigeon lands: only then in the town and the panels.
-      const flights = flightsOf(e, channel, flightCtx());
-      m.flying = flights.length > 0;
-      for (const f of flights) fly({...f, onLand: () => land(c.store, m.id)});
-      if (!flights.length) landed(c.store);
+      landed(c.store);
       if (c.role === "outbox" && panelShows(c.store)) outboxChanged();
     } else if (e.type === "deleted" && c) {
       graph.setTotal(c.store);
       if (panelShows(c.store)) renderPanel();
-    } else if (e.type === "call" || e.type === "call_failed") {
-      for (const f of flightsOf(e, channel, flightCtx())) fly(f);
+    } else if (e.type === "api" && e.at === "start") {
+      callStarted(e);
+    } else if (e.type === "api") {
+      const l = landingOf(e);
+      graph.land(l.key, l);
     } else if (e.type === "raft") {
-      // A leader's word reaching a follower winds its clock as it lands.
+      const f = frameFlight(e, flightCtx());
+      if (f) graph.fly(f);
+      const l = landingOf(e);
+      if (l) graph.land(l.key, l);
+      // A leader's word reaching a follower winds its election clock.
       const to = reaches(e);
-      const heard = to == null ? undefined : () => raft.heard(to, node.now());
-      const flights = flightsOf(e, channel, flightCtx());
-      for (const f of flights) fly({...f, onLand: heard});
-      if (!flights.length) heard?.();
+      if (to != null) raft.heard(to, node.now());
       said.push(...raft.frame(e, node.now()));
     } else if (e.type === "role") {
       said.push(...roleChanged(e));
@@ -189,21 +193,19 @@ function roleChanged(e) {
   return said;
 }
 
-// The node's clock stands while what it did flies (node.js onDrawn): until
-// the flights of a batch land, `settings.holdMax` ms at most (0: it never
-// stands); a heartbeat's spark is waited for only with `settings.holdSparks`.
-let flown = []; // the flights of the batch being drawn, as they will land
-function fly(f) {
-  const landed = graph.fly(f);
-  if (!f.spark || settings.holdSparks) flown.push(landed);
-  return landed;
+// A fake bot's call started: its pigeon leaves. A send to a channel aims
+// past the windows the sends already flying to it will take.
+const sending = new Map(); // store → the keys of the sends flying to it
+function callStarted(e) {
+  const flying = sending.get(e.store) ?? new Set();
+  const f = apiFlight(e, channel, flightCtx(), flying.size);
+  if (!f) return;
+  if (f.to.store != null) {
+    flying.add(f.key);
+    sending.set(e.store, flying);
+  }
+  graph.fly(f).then(() => flying.delete(f.key));
 }
-node.onDrawn(() => {
-  const all = flown;
-  flown = [];
-  if (!all.length || !settings.holdMax) return null;
-  return Promise.race([Promise.all(all), new Promise(r => setTimeout(r, settings.holdMax))]);
-});
 
 // An open outbox's posts come from the log without the frames they hold:
 // the node opens those. Read a second after a post, one read at a time.
@@ -218,14 +220,7 @@ function outboxChanged() {
   }, 1000);
 }
 
-// A post's pigeon landed: the post shows (found by id: a new listing may
-// have taken the place of the message it was).
-function land(store, id) {
-  const m = channel(store)?.messages.find(x => String(x.id) === String(id));
-  if (m) m.flying = false;
-  landed(store);
-}
-// A channel changed under a landing: its windows, its panel, anew.
+// A channel's posts changed: its windows, its panel, anew.
 function landed(store) {
   graph.setTotal(store);
   if (panelShows(store)) renderPanel();
@@ -498,6 +493,7 @@ function setPaused(on) {
   if (!on) $("sim-next").textContent = "";
 }
 if (!node.admin) {
+  node.speed(settings.speed);
   $("sim").hidden = false;
   $("sim-step").setAttribute("aria-label", t("sim.step"));
   $("sim-step").title = t("sim.step");
@@ -669,7 +665,7 @@ function renderPanel() {
       view = null;
       return;
     }
-    const props = {channel: drawn(c), channels: state.channels, budgets: state.budgets, admin: state.admin};
+    const props = {channel: c, channels: state.channels, budgets: state.budgets, admin: state.admin};
     const v = storeView(props, {faults: faultOps(c), deleteMessage: m => deleteMessage(c, m)});
     show(c.store, t(`demo.channel_sub_${c.role}`, {app: appOf(c.kind), scope: c.scope}), v.nodes, v);
   }
@@ -742,7 +738,16 @@ $("settings").addEventListener("click", () => (isOpen("settings") ? closePanel()
 watch(knobs => {
   if (knobs.some(k => k.redraw) && graph.drawn() && !state.wizard) redraw();
   if (knobs.some(k => k.timer)) startTimers();
+  if (knobs.some(k => k.clock)) node.speed?.(settings.speed);
+  if (knobs.some(k => k.fake) && !state.wizard) setFakes();
 });
+
+// The fakes' delays (settings.js "network") told to the demo's node: after
+// each boot (it starts on its file's), and as they are turned.
+function setFakes() {
+  if (node.admin) return;
+  return call(ops.fake([settings.latencyMin, settings.latencyMax], [settings.linkMin, settings.linkMax]));
+}
 
 // A data channel's faults, and what finds and mends them.
 const faultOps = c => {
@@ -800,6 +805,7 @@ function restart(text) {
     Object.assign(state, {config: text, nodes: reply.nodes});
     state.cut.clear();
     state.leader = null;
+    await setFakes();
     await boot();
     say(["say.restart", {n: reply.replayed}]);
   });
@@ -837,6 +843,7 @@ async function startFromWizard(text) {
   const ms = performance.now() - t0;
   if (reply?.error) return reply.error;
   Object.assign(state, {config: text, nodes: reply.nodes});
+  await setFakes();
   if (state.nodes.length > 1) await pollCluster();
   state.wizard = false;
   relayout = redraw;
@@ -924,6 +931,7 @@ async function startDemo() {
     return;
   }
   state.nodes = booted.reply.nodes;
+  await setFakes();
   if (state.nodes.length > 1) await pollCluster();
   await boot();
   ready(performance.now() - t0, reply.why);

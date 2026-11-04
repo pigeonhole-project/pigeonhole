@@ -39,10 +39,11 @@ const seeded = seed => () => {
 
 // channel(store): the channel as the page has it now (its windows are
 // drawn from it; none: nothing posted yet, as in the wizard's sketch).
+// now(): the node's time, its pigeons' flights are timed on.
 // onLoft(g, entrances, id): node `id` (0: the one node) was drawn, its
 // dovecote's entrances are free to dress.
 // onRelayout(): the screen turned narrow or wide: draw again.
-export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
+export function makeGraph(el, {channel, now, onOpen, onLoft, onRelayout}) {
   const reduced = reducedMotion();
   const narrow = matchMedia(NARROW);
   narrow.addEventListener("change", onRelayout);
@@ -358,15 +359,13 @@ export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
     const n = up(cards.get(p.store));
     if (!n) return null;
     if (p.at === "sign") return {store: p.store, sign: true};
-    const c = holds(n);
-    const {count} = contents(c);
+    const {count} = contents(holds(n));
     const room = n.slots.length - (count > n.slots.length ? n.cols : 0);
     const shown = Math.min(count, room);
-    if (p.at === "free") return {store: p.store, i: shown};
+    // The next empty window, past those others flying to it will take.
+    if (p.at === "free") return {store: p.store, i: Math.min(room - 1, shown + (p.ahead ?? 0))};
     if (p.at === "any") return {store: p.store, i: Math.floor(Math.random() * Math.max(1, shown))};
-    // A post's window: past the landed ones, behind those flying ahead of it.
-    const ahead = c.flying?.indexOf(p.id) ?? -1;
-    return {store: p.store, i: ahead < 0 ? shown - 1 : Math.min(room - 1, shown + ahead)};
+    return {store: p.store, i: shown - 1};
   }
   // Where a spot is on the town as drawn now.
   function point(s) {
@@ -375,7 +374,7 @@ export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
     const n = cards.get(s.store);
     return !n ? null : s.sign ? n.sign : windowAt(n, s.i);
   }
-  const pigeons = makePigeons({spot, point, lift: () => lift, small: () => el.classList.contains("tall")});
+  const pigeons = makePigeons({spot, point, lift: () => lift, small: () => el.classList.contains("tall"), now});
 
   // ---- the first boot: the places come up one by one, the ways last
   // What is up so far (kept across a redraw), and whether the ways are.
@@ -422,6 +421,7 @@ export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
     setObjects,
     setQueue,
     fly: pigeons.fly,
+    land: pigeons.land,
     landed: pigeons.landed,
     hideAll,
     reveal,

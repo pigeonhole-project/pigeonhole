@@ -184,40 +184,53 @@ function normalize(base, rel) {
   return `/${out.join("/")}`;
 }
 
-// The module's time, in ms: the wall's (performance.now() and Date.now()),
-// less the time it was held. While held (hold() … release()) the module
-// sees no time pass: its timers wait, what it does meanwhile (a call) it
-// does at one instant. The demo's worker holds it while the page draws what
-// the node just did (web-worker.js).
+// The module's time, in ms, on performance.now()'s scale: the wall's, run
+// at `speed` (1: as fast; 0.25: four times slower) and stopped while held
+// (hold() … release()). While held the module sees no time pass: its
+// timers wait, what it does meanwhile (a call) it does at one instant. The
+// demo's worker runs its node slowed down, so that what takes the node
+// 200 ms (a fake call) is seen to, and stops or steps it by hand.
 export class Clock {
   constructor() {
-    this.lost = 0; // ms held, the hold going on not counted
-    this.since = null; // performance.now() the hold going on began; null: none
+    this.base = performance.now(); // the module's time when it last started running
+    this.since = performance.now(); // the wall's then; null: held
+    this.speed = 1;
+    this.epoch = Date.now() - performance.now(); // the module's wall clock: epoch + now()
   }
   get held() {
-    return this.since != null;
+    return this.since == null;
   }
-  // The module's monotonic time, on performance.now()'s scale.
   now() {
-    const t = performance.now();
-    return t - this.lost - (this.since == null ? 0 : t - this.since);
+    return this.since == null ? this.base : this.base + (performance.now() - this.since) * this.speed;
   }
-  // The module's wall clock, as Date.now(): as far behind it as it was held.
+  // The module's wall clock, as Date.now().
   wall() {
-    return Date.now() - (performance.now() - this.now());
+    return this.epoch + this.now();
   }
   hold() {
-    if (this.since == null) this.since = performance.now();
-  }
-  release() {
     if (this.since == null) return;
-    this.lost += performance.now() - this.since;
+    this.base = this.now();
     this.since = null;
   }
-  // Held, the module's time moved on to `to` at once (a step); never back.
+  release() {
+    if (this.since == null) this.since = performance.now();
+  }
+  setSpeed(speed) {
+    this.restart(this.now());
+    this.speed = speed;
+  }
+  // The module's time moved on to `to` at once (a step, or catching up
+  // with another clock); never back.
   advance(to) {
-    const d = to - this.now();
-    if (this.since != null && d > 0) this.lost -= d;
+    if (to > this.now()) this.restart(to);
+  }
+  // Wall ms until the module's time is `t` (running; held: never).
+  until(t) {
+    return this.since == null || this.speed <= 0 ? Infinity : Math.max(0, (t - this.now()) / this.speed);
+  }
+  restart(at) {
+    this.base = at;
+    if (this.since != null) this.since = performance.now();
   }
 }
 

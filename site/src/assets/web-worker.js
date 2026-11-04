@@ -11,14 +11,15 @@
 // (ph_run) until it has nothing to do but wait; the shim notes its next
 // timer (wasi.nextWake) and this worker sleeps until then, free meanwhile.
 //
-// The node's time is the shim's clock, held while the page draws what the
-// node did: each batch of its events goes out with a `seq`, and the clock
-// stands until the page has sent `go` for every batch out. Meanwhile a call
-// still runs, at that one instant; only the node's timers wait. The page
-// can stop the clock (`pause`) and move it on by hand (`step`): timer by
-// timer until the node does something the page draws, or one timer only.
+// The node's time is the shim's clock, slowed down as the page asks
+// (`speed`), so that what takes the node time (a fake call, a frame) is
+// seen to: each batch of its events goes out with the node's time it
+// happened at (`at`). The page can stop the clock (`pause`) and move it on
+// by hand (`step`): timer by timer until the node does something the page
+// draws, or one timer only. Stopped, a call still runs, at that one
+// instant; only the node's timers wait.
 import {readEvents} from "./demo/events.js";
-import {deliver, frame, MSG, msg, OP_GO, OP_PAUSE, OP_RESET, OP_STEP, unframe} from "./lib/ops.js";
+import {deliver, frame, MSG, msg, OP_PAUSE, OP_RESET, OP_SPEED, OP_STEP, unframe} from "./lib/ops.js";
 import {Clock, MemoryHandle, Pool, Wasi} from "./wasi.js";
 
 // The assets' version (?v=…), the same for the wasm as for this script.
@@ -52,10 +53,6 @@ let wasi,
 // The module's call number → the page's {id, t0}.
 const calls = new Map();
 const clock = new Clock();
-// The batches of events the page has not drawn yet (their seq).
-const drawing = new Set();
-let seq = 0,
-  paused = false; // the page stopped the clock
 
 async function openFiles(n) {
   const open = async i => (await dir.getFileHandle(`file-${String(opened + i).padStart(5, "0")}`, {create: true})).createSyncAccessHandle();
@@ -108,18 +105,15 @@ async function openPool() {
   }
 }
 
-// The module's output, in order (lib/ops.js deliver): to the page; the
-// worker ends once the node closed. A batch of events holds the clock
-// until the page has drawn it. Returns whether the page draws any of it
-// (events.js reads an event in it).
+// The module's output, in order (lib/ops.js deliver): to the page, each
+// batch of events at the node's time; the worker ends once the node closed.
+// Returns whether the page draws any of it (events.js reads an event in it).
 function post(lines) {
   const {messages, closed} = deliver(lines, calls);
   let drawn = false;
   for (const m of messages) {
     if (m.type === MSG.events || m.type === MSG.tick) {
-      m.seq = ++seq;
-      drawing.add(m.seq);
-      clock.hold();
+      m.at = clock.now();
       drawn ||= readEvents(m.events).length > 0;
     }
     postMessage(m);
@@ -141,42 +135,37 @@ function pump() {
   return drawn;
 }
 
-// Until the node's next timer, on its clock; while held, until the page lets it go.
+// Until the node's next timer, on its clock; stopped, until the page lets it go.
 function sleep() {
   clearTimeout(timer);
   timer = null;
-  if (clock.held || wasi.nextWake === Infinity) return;
-  timer = setTimeout(pump, Math.max(0, wasi.nextWake - clock.now()));
-}
-
-// The page drew batch `n`: once it has drawn every one out, the clock goes
-// on (unless stopped).
-function drawn(n) {
-  drawing.delete(n);
-  if (!drawing.size && !paused) {
-    clock.release();
-    sleep();
-  }
+  const wait = clock.until(wasi.nextWake);
+  if (wait !== Infinity) timer = setTimeout(pump, wait);
 }
 
 // The page stops the clock, or lets it go.
 function pause(on) {
-  paused = on;
   if (on) clock.hold();
-  else drawn(null);
-  postMessage(msg.clock(paused, clock.now(), wasi.nextWake));
+  else clock.release();
+  sleep();
+  postMessage(msg.clock(clock.held, clock.now(), wasi.nextWake));
+}
+// The node's time runs at `speed` of the wall's.
+function speed(value) {
+  clock.setSpeed(value);
+  sleep();
 }
 // Stopped: on to the node's next timer (a ms past it: tokio rounds a
 // deadline up to its ms), the node run; again, until it did something the
 // page draws (STEP_MAX_MS on its clock at most), or once only (`one`).
 function step(one) {
-  if (!paused) return;
+  if (!clock.held) return;
   const until = clock.now() + STEP_MAX_MS;
   for (let i = 0; i < STEP_RUNS && wasi.nextWake !== Infinity; i++) {
     clock.advance(wasi.nextWake + 1);
     if (pump() || one || clock.now() > until) break;
   }
-  postMessage(msg.clock(paused, clock.now(), wasi.nextWake));
+  postMessage(msg.clock(true, clock.now(), wasi.nextWake));
 }
 
 // The page is gone and the node closed: let go of the files for the next
@@ -229,8 +218,8 @@ addEventListener("message", ({data}) => {
 
 async function handle({id, body, ...request}) {
   await ready;
-  if (request.op === OP_GO) return drawn(request.seq);
   if (request.op === OP_PAUSE) return pause(!!request.on);
+  if (request.op === OP_SPEED) return speed(+request.value || 1);
   if (request.op === OP_STEP) return step(!!request.one);
   await grow().catch(e => console.warn("no more files:", e));
   if (request.op === OP_RESET) {
