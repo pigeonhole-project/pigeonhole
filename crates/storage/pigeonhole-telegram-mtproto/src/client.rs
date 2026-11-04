@@ -125,9 +125,11 @@ fn pool(session: &Arc<FileSession>, api_id: i32, updates: bool) -> (Pool, Option
 /// Raw MTProto updates as the connections receive them.
 pub type UpdatesRx = tokio::sync::mpsc::Receiver<grammers_session::updates::UpdatesLike>;
 
-/// The new channel posts in `update`: `(channel id, message id)` of each
-/// `updateNewChannelMessage` (the channel id without the `-100`).
-pub fn new_channel_posts(update: &grammers_session::updates::UpdatesLike) -> Vec<(i64, i64)> {
+/// The new channel posts in `update`: `(channel id, message id, message)`
+/// of each `updateNewChannelMessage` (the channel id without the `-100`),
+/// the message as a read gives it (a service message too, as `Other`: a
+/// reader that counts ids sees no gap there).
+pub fn new_channel_posts(update: &grammers_session::updates::UpdatesLike) -> Vec<(i64, i64, ChannelMessage)> {
     let grammers_session::updates::UpdatesLike::Updates(u) = update else { return Vec::new() };
     let list: &[enums::Update] = match u {
         enums::Updates::Updates(u) => &u.updates,
@@ -137,13 +139,16 @@ pub fn new_channel_posts(update: &grammers_session::updates::UpdatesLike) -> Vec
     };
     list.iter()
         .filter_map(|up| match up {
-            enums::Update::NewChannelMessage(n) => match &n.message {
-                enums::Message::Message(m) => match &m.peer_id {
-                    enums::Peer::Channel(c) => Some((c.channel_id, i64::from(m.id))),
-                    _ => None,
-                },
-                _ => None,
-            },
+            enums::Update::NewChannelMessage(n) => {
+                let peer = match &n.message {
+                    enums::Message::Message(m) => &m.peer_id,
+                    enums::Message::Service(m) => &m.peer_id,
+                    enums::Message::Empty(_) => return None,
+                };
+                let enums::Peer::Channel(c) = peer else { return None };
+                let (id, message) = channel_message(n.message.clone());
+                Some((c.channel_id, id, message))
+            }
             _ => None,
         })
         .collect()

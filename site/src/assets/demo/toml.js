@@ -87,7 +87,8 @@ function clusterToml(w, nodes) {
   const direct = n => w.links === "direct" || (w.links === "mixed" && n <= 2);
   const chat = () => w.links !== "direct";
   const out = [`# ${t("wiz.toml_cluster", {n: w.nodes})}`, "[cluster]", "id = 1", 'key_env = "PH_DEMO_CLUSTER_KEY"'];
-  out.push('fake = "channel-data"', 'heartbeat = "1s"', 'election_timeout_min = "4s"', 'election_timeout_max = "8s"', 'tick = "100ms"', 'poll = "200ms"', "");
+  // Frames come pushed; `poll` is the read when none came for that long (a lost push), as on a server.
+  out.push('fake = "channel-data"', 'heartbeat = "1s"', 'election_timeout_min = "4s"', 'election_timeout_max = "8s"', 'tick = "100ms"', 'poll = "3s"', "");
   for (const m of nodes) {
     out.push("[[node]]", `id = ${m.node}`);
     if (direct(m.node)) out.push(`grpc = "node-${m.node}:7001"`);

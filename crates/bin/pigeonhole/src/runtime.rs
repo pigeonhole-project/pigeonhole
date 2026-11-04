@@ -274,28 +274,34 @@ async fn chat_network(
         let n = cluster.nodes.iter().find(|n| n.id == node).expect("a member");
         n.outbox.with_context(|| format!("[[node]] {node} has no outbox"))
     };
-    let own = telegram_outbox(cfg, logins, cluster.node, outbox(cluster.node)?).await?;
+    let own = telegram_outbox(cfg, logins, cluster.node, outbox(cluster.node)?, None).await?;
     let mut others = std::collections::HashMap::new();
     for &peer in peers {
-        others.insert(peer, telegram_outbox(cfg, logins, peer, outbox(peer)?).await?);
+        others.insert(peer, telegram_outbox(cfg, logins, peer, outbox(peer)?, Some(cluster.poll)).await?);
     }
     Ok(pigeonhole_node::cluster::chat_network(cluster, own, others))
 }
 
-/// Node `node`'s Raft outbox `chat` through `logins`' bots, woken by its
-/// pushed posts.
+/// Node `node`'s Raft outbox `chat` through `logins`' bots. A peer's
+/// (`poll`: read the chat after that long without a push) is read from
+/// what Telegram pushes; our own is only posted to.
 async fn telegram_outbox(
     cfg: &Config,
     logins: &[TelegramLogin],
     node: u64,
     chat: i64,
+    poll: Option<std::time::Duration>,
 ) -> anyhow::Result<Arc<dyn openraft_chat::Mailbox>> {
     use pigeonhole_raft_telegram::TelegramMailbox;
     let channel = telegram_channel(cfg, logins, &chat.to_string(), Lane::Meta)
         .await
         .with_context(|| format!("Raft outbox {chat}"))?;
-    let mailbox = Arc::new(TelegramMailbox::new(Arc::new(channel)).named(pigeonhole_admin::outbox_store(node)));
+    let mailbox = TelegramMailbox::new(Arc::new(channel)).named(pigeonhole_admin::outbox_store(node));
+    let Some(poll) = poll else { return Ok(Arc::new(mailbox)) };
+    let mailbox = Arc::new(mailbox.polling(poll));
     let pushed = mailbox.clone();
-    channel_log::on_post(pigeonhole::telegram::channel_id_of(chat)?, move |id| pushed.seen(id));
+    channel_log::on_post(pigeonhole::telegram::channel_id_of(chat)?, move |id, message| {
+        pushed.pushed(id, Some(message));
+    });
     Ok(mailbox)
 }

@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context};
 use pigeonhole::instances::TelegramLogin;
+use pigeonhole_storage_telegram::ChannelMessage;
 use pigeonhole_telegram_mtproto::{new_channel_posts, MtprotoConfig, TelegramMtproto, UpdatesRx};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,12 +15,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 static CLIENTS: OnceLock<tokio::sync::Mutex<HashMap<i64, (PathBuf, TelegramMtproto)>>> = OnceLock::new();
 
 /// Who to tell of a channel's new posts, by channel id (without `-100`).
-type Listener = Arc<dyn Fn(i64) + Send + Sync>;
+type Listener = Arc<dyn Fn(i64, ChannelMessage) + Send + Sync>;
 static LISTENERS: OnceLock<Mutex<HashMap<i64, Vec<Listener>>>> = OnceLock::new();
 
-/// Call `f` with the id of every post in channel `channel_id` (without the
-/// `-100`) that Telegram pushes to any of this process's bots.
-pub fn on_post(channel_id: i64, f: impl Fn(i64) + Send + Sync + 'static) {
+/// Call `f` with every post in channel `channel_id` (without the `-100`)
+/// that Telegram pushes to any of this process's bots: its id, the message.
+pub fn on_post(channel_id: i64, f: impl Fn(i64, ChannelMessage) + Send + Sync + 'static) {
     LISTENERS.get_or_init(Default::default).lock().unwrap().entry(channel_id).or_default().push(Arc::new(f));
 }
 
@@ -27,10 +28,10 @@ pub fn on_post(channel_id: i64, f: impl Fn(i64) + Send + Sync + 'static) {
 /// bot's connections push.
 async fn dispatch(mut updates: UpdatesRx) {
     while let Some(update) = updates.recv().await {
-        for (channel, id) in new_channel_posts(&update) {
+        for (channel, id, message) in new_channel_posts(&update) {
             let listeners = LISTENERS.get_or_init(Default::default).lock().unwrap().get(&channel).cloned();
             for f in listeners.into_iter().flatten() {
-                f(id);
+                f(id, message.clone());
             }
         }
     }
