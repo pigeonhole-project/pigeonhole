@@ -17,7 +17,7 @@ import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
 import {makeRaftWatch} from "./raft.js";
-import {apply as applyEvent, merge} from "./reduce.js";
+import {apply as applyEvent, drawn, merge} from "./reduce.js";
 import {reset as resetSettings, settings, watch} from "./settings.js";
 import {settingsView} from "./settings-view.js";
 import {node as connecting} from "./start.js";
@@ -79,7 +79,7 @@ const node = await connecting;
 const windows = new Map();
 let relayout = () => redraw(); // the screen turned narrow or wide: what is on the graph, again
 const graph = makeGraph($("graph"), {
-  channel,
+  channel: store => drawn(channel(store)),
   onOpen: openPanel,
   onRelayout: () => relayout(),
   onLoft: (g, entrances, id) => {
@@ -144,11 +144,13 @@ const flightCtx = () => ({leader: state.cluster?.leader ?? null, shown: shown(),
 function apply(events) {
   const said = [];
   for (const e of events) {
-    const {channel: c, said: s} = applyEvent(state.channels, e);
+    const {channel: c, message: m, said: s} = applyEvent(state.channels, e);
     said.push(...s);
     if (e.type === "posted" && c) {
+      // Flying until its pigeon lands: only then in the town and the panels.
       const flights = flightsOf(e, channel, flightCtx());
-      for (const f of flights) fly({...f, onLand: () => landed(c.store)});
+      m.flying = flights.length > 0;
+      for (const f of flights) fly({...f, onLand: () => land(c.store, m.id)});
       if (!flights.length) landed(c.store);
       if (c.role === "outbox" && panelShows(c.store)) outboxChanged();
     } else if (e.type === "deleted" && c) {
@@ -198,7 +200,14 @@ function outboxChanged() {
   }, 1000);
 }
 
-// A pigeon landed on a channel.
+// A post's pigeon landed: the post shows (found by id: a new listing may
+// have taken the place of the message it was).
+function land(store, id) {
+  const m = channel(store)?.messages.find(x => String(x.id) === String(id));
+  if (m) m.flying = false;
+  landed(store);
+}
+// A channel changed under a landing: its windows, its panel, anew.
 function landed(store) {
   graph.setTotal(store);
   if (panelShows(store)) renderPanel();
@@ -641,7 +650,7 @@ function renderPanel() {
       view = null;
       return;
     }
-    const props = {channel: c, channels: state.channels, budgets: state.budgets, admin: state.admin};
+    const props = {channel: drawn(c), channels: state.channels, budgets: state.budgets, admin: state.admin};
     const v = storeView(props, {faults: faultOps(c), deleteMessage: m => deleteMessage(c, m)});
     show(c.store, t(`demo.channel_sub_${c.role}`, {app: appOf(c.kind), scope: c.scope}), v.nodes, v);
   }

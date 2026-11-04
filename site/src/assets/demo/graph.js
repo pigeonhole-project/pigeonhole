@@ -358,9 +358,15 @@ export function makeGraph(el, {channel, onOpen, onLoft, onRelayout}) {
     const n = up(cards.get(p.store));
     if (!n) return null;
     if (p.at === "sign") return {store: p.store, sign: true};
-    const {count} = contents(holds(n));
-    const shown = Math.min(count, n.slots.length - (count > n.slots.length ? n.cols : 0));
-    return {store: p.store, i: p.at === "free" ? shown : p.at === "any" ? Math.floor(Math.random() * Math.max(1, shown)) : shown - 1};
+    const c = holds(n);
+    const {count} = contents(c);
+    const room = n.slots.length - (count > n.slots.length ? n.cols : 0);
+    const shown = Math.min(count, room);
+    if (p.at === "free") return {store: p.store, i: shown};
+    if (p.at === "any") return {store: p.store, i: Math.floor(Math.random() * Math.max(1, shown))};
+    // A post's window: past the landed ones, behind those flying ahead of it.
+    const ahead = c.flying?.indexOf(p.id) ?? -1;
+    return {store: p.store, i: ahead < 0 ? shown - 1 : Math.min(room - 1, shown + ahead)};
   }
   // Where a spot is on the town as drawn now.
   function point(s) {

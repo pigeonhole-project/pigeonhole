@@ -339,8 +339,8 @@ test("flightsOf: a node's own channel is its; a data channel the leader's; Raft 
   const channels = {"tg-log-2": {store: "tg-log-2", node: 2}, "tg-1": {store: "tg-1", node: null}, "outbox-3": {store: "outbox-3", node: 3, role: "outbox"}};
   const channel = s => channels[s];
   const ctx = {leader: 1, shown: 2};
-  assert.deepEqual(flightsOf({type: "posted", store: "tg-log-2", bytes: 300}, channel, ctx), [
-    {from: {node: 2}, to: {store: "tg-log-2", at: "new"}, size: 300},
+  assert.deepEqual(flightsOf({type: "posted", store: "tg-log-2", id: 41, bytes: 300}, channel, ctx), [
+    {from: {node: 2}, to: {store: "tg-log-2", at: "new", id: "41"}, size: 300},
   ]);
   assert.deepEqual(flightsOf({type: "call", store: "tg-1", op: "get", bytes: 9}, channel, ctx)[0].to, {node: 1}, "the leader reads the data");
   assert.equal(flightsOf({type: "call_failed", store: "tg-1"}, channel, ctx)[0].failed, true);
