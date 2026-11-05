@@ -1,7 +1,7 @@
 # typos (`make gates`): misspellings in code, docs and the site.
 
 [files]
-# Patched copies of other projects' crates: their spelling is theirs.
+# Copies of other projects' code (the site's xterm.js): their spelling is theirs.
 extend-exclude = ["vendor/"]
 
 [default]

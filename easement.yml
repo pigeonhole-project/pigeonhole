@@ -16,7 +16,6 @@ exclude:
   - "**/*.py"
   - "**/*.js"
   - "**/*.mjs"
-  - vendor
   - site
   - demos
   - compat

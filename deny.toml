@@ -43,5 +43,7 @@ multiple-versions = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The patched forks of tokio and openraft (Cargo.toml, [patch.crates-io]).
+# The patched forks (Cargo.toml, [patch.crates-io]): tokio and openraft on
+# GitHub, grammers on Codeberg.
 allow-org = { github = ["pigeonhole-project"] }
+allow-git = ["https://codeberg.org/wo1f/grammers"]

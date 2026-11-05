@@ -117,13 +117,12 @@ report:
 test-all: arch test smoke
 
 # What clippy does not see: the layers (arch), advisories, licences and
-# sources of the crates (deny.toml), unused dependencies (crates/ only:
-# vendor/ is upstream's), the shell scripts (.shellcheckrc), misspellings
-# (_typos.toml).
+# sources of the crates (deny.toml), unused dependencies (crates/), the shell
+# scripts (.shellcheckrc), misspellings (_typos.toml).
 gates: arch
 	cargo deny check
 	cargo machete crates
-	git ls-files -z '*.sh' scripts/wt ':!vendor' | xargs -0 shellcheck
+	git ls-files -z '*.sh' scripts/wt | xargs -0 shellcheck
 	typos
 
 # Deterministic simulation (docs/simulation.md). MADSIM_TEST_SEED=<seed>

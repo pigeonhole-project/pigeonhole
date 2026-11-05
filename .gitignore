@@ -20,4 +20,3 @@ out.md
 # MTProto session files (auth key caches; secret) and their locks
 *.session
 pigeonhole-tg-*.lock
-/vendor/*/target
