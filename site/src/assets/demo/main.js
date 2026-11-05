@@ -15,6 +15,7 @@ import {readEvents} from "./events.js";
 import {apiFlight, frameFlight, landingOf, reaches} from "./flights.js";
 import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
+import {makeLogPanel} from "./log-tail-view.js";
 import {logView} from "./log-view.js";
 import {makeRaftWatch} from "./raft.js";
 import {apply as applyEvent, merge} from "./reduce.js";
@@ -491,6 +492,16 @@ function setPaused(on) {
   $("sim-step").disabled = !on;
   if (!on) $("sim-next").textContent = "";
 }
+// The node's own log, live, in a panel under the town (the demo's: a real
+// node's stays on its server).
+if (!node.admin) {
+  const toggle = $("log-toggle");
+  const panel = makeLogPanel($("node-log"), node, open => toggle.setAttribute("aria-pressed", String(open)));
+  toggle.textContent = t("log.open");
+  toggle.hidden = false;
+  toggle.addEventListener("click", () => panel.toggle());
+}
+
 if (!node.admin) {
   $("sim").hidden = false;
   $("sim-step").setAttribute("aria-label", t("sim.step"));

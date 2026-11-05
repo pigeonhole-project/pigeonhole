@@ -108,10 +108,32 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .credit { position: absolute; right: 16px; bottom: 8px; margin: 0; padding: 2px 8px; border-radius: 6px; background: var(--plume); color: var(--slate); font-size: 11.5px; }
 .credit a { color: inherit; }
 .loft.zoomed .credit { display: none; }
+.foot { display: flex; align-items: flex-start; gap: 16px; border-top: 1px solid var(--line); }
 .caption {
-  margin: 0; padding: 12px 24px 16px; min-height: 52px; border-top: 1px solid var(--line);
+  margin: 0; padding: 12px 24px 16px; min-height: 52px; flex: 1;
   color: var(--wing-2); max-width: 80ch;
 }
+.log-toggle { margin: 10px 24px 0 auto; flex: none; font-size: 13px; padding: 6px 12px; }
+.log-toggle[aria-pressed="true"] { border-color: var(--wing); }
+
+/* the node's log (log-tail-view.js): a terminal under the town */
+.node-log { height: 36vh; min-height: 120px; resize: vertical; overflow: hidden; display: flex; flex-direction: column; border-top: 1px solid var(--line); background: var(--plume); }
+.node-log[hidden] { display: none; }
+.log-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.log-bar .btn.mini { padding: 3px 9px; font-size: 13px; }
+.log-find { font: inherit; font-size: 13px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--feather); color: inherit; }
+.log-menu { position: relative; }
+.log-menu > summary { list-style: none; cursor: pointer; }
+.log-menu > summary::-webkit-details-marker { display: none; }
+.log-menu > summary::after { content: " ▾"; color: var(--slate); }
+.log-menu-list { position: absolute; z-index: 5; top: calc(100% + 6px); left: 0; min-width: 240px; max-height: 24vh; overflow: auto; padding: 8px 10px; background: var(--plume); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.18); }
+.log-menu-list .row { margin: 0 0 6px; }
+.log-menu-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; font: 12.5px var(--mono); cursor: pointer; white-space: nowrap; }
+.log-menu-row small { color: var(--slate); margin-left: auto; padding-left: 12px; }
+.log-lvl.error { color: #d1453b; } .log-lvl.warn { color: #c98a14; } .log-lvl.info { color: #2f9e5a; } .log-lvl.debug { color: #3b78d1; } .log-lvl.trace { color: var(--slate); }
+.log-find { width: 16em; }
+.log-count { color: var(--slate); margin-left: auto; font-family: var(--mono); font-size: 12px; }
+.log-screen { flex: 1; min-height: 0; padding: 4px 0 0 8px; }
 .caption b { color: var(--wing); font-weight: 600; }
 
 /* graph: the town (graph.js, art.js) */

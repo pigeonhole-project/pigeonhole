@@ -5,7 +5,9 @@
 //
 // Either way: {admin, call(request, body?, onEvents?) → {reply, events},
 // onTick(fn), onWaiting(fn), now(), close()}; calls run one at a time, in
-// order. The worker's also has speed(value), pause(on), step(one), onClock(fn).
+// order. The worker's also has speed(value), pause(on), step(one),
+// onClock(fn), and onLog(fn): fn(lines) gets every line the node logs, as
+// they come (those before it was set first).
 // With onEvents, a call's events go to it as the node logs them (a slow
 // call's flights fly as they happen), and the reply's events are what is
 // left. The worker's also has `started`: the module up, {reply, events}.
@@ -52,12 +54,15 @@ export function workerNode(worker) {
     tick = () => {},
     onWaiting = () => {},
     onClock = () => {},
+    early = [], // the node's lines before onLog
+    logged = lines => early.push(...lines),
     started;
   // The node's clock as the page reckons it.
   const clock = new Clock();
   // Each message by its type (lib/ops.js MSG); a call's by its id.
   worker.onmessage = ({data}) => {
     const w = waiting.get(data.id);
+    if (data.events?.length) logged(data.events);
     switch (data.type) {
       case MSG.started:
         return started({reply: data.reply, events: data.events});
@@ -133,6 +138,11 @@ export function workerNode(worker) {
     step: one => worker.postMessage(ops.step(one)),
     onClock: fn => {
       onClock = fn;
+    },
+    onLog(fn) {
+      fn(early);
+      early = [];
+      logged = fn;
     },
   };
 }

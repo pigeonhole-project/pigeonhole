@@ -503,5 +503,17 @@
   "js.set.linkMin": "A direct link, at least",
   "js.set.linkMin_note": "A Raft frame between two nodes over a direct (gRPC) link, each way.",
   "js.set.linkMax": "A direct link, at most",
-  "js.set.linkMax_note": "Raise it past the election timeout and watch the cluster lose its leader."
+  "js.set.linkMax_note": "Raise it past the election timeout and watch the cluster lose its leader.",
+  "js.log.open": "The node's log",
+  "js.log.title": "The node's log",
+  "js.log.search": "Find (Enter: next, Shift+Enter: back)",
+  "js.log.clear": "Clear",
+  "js.log.download": "Download .jsonl",
+  "js.log.count": "{n} lines",
+  "js.set.logLines": "Lines of the node's log kept",
+  "js.set.logLines_note": "The log panel (the button under the town) keeps the node's last lines, as many as this; the oldest go first.",
+  "js.log.components": "Components ({shown} of {all})",
+  "js.log.all": "All",
+  "js.log.none": "None",
+  "js.log.levels": "Levels ({shown} of {all})"
 }
