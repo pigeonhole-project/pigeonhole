@@ -11,8 +11,8 @@
 // Its label and note are i18n's "set.<key>" and "set.<key>_note".
 export const KNOBS = [
   {key: "speed", group: "time", def: 0.25, min: 0.05, max: 2, step: 0.05, unit: "x", clock: true},
-  {key: "latencyMin", group: "network", def: 80, min: 0, max: 3000, step: 10, unit: "ms", fake: true},
-  {key: "latencyMax", group: "network", def: 250, min: 0, max: 3000, step: 10, unit: "ms", fake: true},
+  {key: "latencyMin", group: "network", def: 40, min: 0, max: 3000, step: 10, unit: "ms", fake: true},
+  {key: "latencyMax", group: "network", def: 120, min: 0, max: 3000, step: 10, unit: "ms", fake: true},
   {key: "linkMin", group: "network", def: 30, min: 0, max: 1000, step: 5, unit: "ms", fake: true},
   {key: "linkMax", group: "network", def: 90, min: 0, max: 1000, step: 5, unit: "ms", fake: true},
   {key: "flightMin", group: "pigeons", def: 450, min: 50, max: 5000, step: 50, unit: "ms"},
