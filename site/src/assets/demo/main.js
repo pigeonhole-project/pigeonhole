@@ -12,7 +12,7 @@ import {clientView, sample, uploadFiles} from "./client-view.js";
 import {clusterView} from "./cluster-view.js";
 import {ref, sentence, setLinks} from "./entities.js";
 import {readEvents} from "./events.js";
-import {flightsOf, refused} from "./flights.js";
+import {apiFlight, frameFlight, landingOf, reaches} from "./flights.js";
 import {makeGraph} from "./graph.js";
 import {loftView} from "./loft-view.js";
 import {logView} from "./log-view.js";
@@ -37,6 +37,7 @@ const state = {
   node: null, // the node your requests go to (your panel); null: whichever leads
   look: null, // the node on screen (its panel, log, tasks); null: the one your requests go to
   cluster: null, // the `cluster` op's: {leader, term, nodes}
+  leader: null, // the leader as the nodes' logs tell it ("role" events): {id (null: none), term}
   views: new Map(), // each node's own `cluster` op, by id
   term: null, // the newest term seen: a new leader is told once
   timing: null, // the cluster's clocks (ms): {heartbeat, election: [min, max]}
@@ -56,8 +57,11 @@ const state = {
   wizard: false, // the first visit's setup is on screen
 };
 const channel = store => state.channels.find(c => c.store === store);
+// The leader as the page last learnt it: from the nodes' own word in their
+// log (a "role" event), else from the last `cluster` poll; the newer term wins.
+const leaderId = () => (state.leader && state.leader.term >= (state.cluster?.term ?? 0) ? state.leader.id : (state.cluster?.leader ?? null));
 // The node your requests go to: the one you picked, else the leader, else the first.
-const target = () => state.node ?? state.cluster?.leader ?? state.nodes[0];
+const target = () => state.node ?? leaderId() ?? state.nodes[0];
 // The node on screen: the one you look at, else the one your requests go to.
 const shown = () => state.look ?? target();
 // Your request, for the node it goes to (the server picks the leader without one).
@@ -67,7 +71,7 @@ const onShown = request => (request.node != null || state.look == null ? onNode(
 // The log the `log` op reads: the node on screen's.
 const logChannel = () => state.channels.find(c => c.role === "log" && (c.node == null || c.node === shown()));
 // Node `id` (0: the one node) follows a leader it knows: the leader's tasks are not its.
-const follows = id => id !== 0 && state.cluster?.leader != null && id !== state.cluster.leader;
+const follows = id => id !== 0 && leaderId() != null && id !== leaderId();
 const isOpen = kind => state.open?.kind === kind;
 // The graph's node for a panel: the log's is its channel's card.
 const nodeOf = open => (open?.kind === "log" ? {kind: "store", store: logChannel()?.store} : open);
@@ -80,6 +84,7 @@ const windows = new Map();
 let relayout = () => redraw(); // the screen turned narrow or wide: what is on the graph, again
 const graph = makeGraph($("graph"), {
   channel,
+  now: () => node.now(),
   onOpen: openPanel,
   onRelayout: () => relayout(),
   onLoft: (g, entrances, id) => {
@@ -101,7 +106,7 @@ const graph = makeGraph($("graph"), {
 let drawnLeader = null,
   drawnLinks = 0; // the cluster drawn last
 const scene = () => ({
-  leader: state.cluster?.leader ?? null,
+  leader: leaderId(),
   cut: state.cut,
   shown: shown(),
   links: state.cluster?.links || [],
@@ -119,7 +124,7 @@ setLinks({
 });
 
 function redraw() {
-  drawnLeader = state.cluster?.leader ?? null;
+  drawnLeader = leaderId();
   drawnLinks = state.cluster?.links?.length ?? 0;
   graph.draw(state.channels, state.objects.length, scene());
   graph.markOpen(nodeOf(state.open));
@@ -140,28 +145,66 @@ const status = text => {
 // What the node logged: pigeons to fly, posts and deletions in the channels.
 // Returns what it said, as sentences, newest last.
 // Whose traffic is whose (flights.js): the leader as last seen, the node on screen.
-const flightCtx = () => ({leader: state.cluster?.leader ?? null, shown: shown(), cut: state.cut});
+const flightCtx = () => ({leader: leaderId(), shown: shown(), cut: state.cut});
+// A pigeon flies from each start (a fake bot's call, a direct frame) and
+// lands with its end, both as the node logged them (flights.js); a post
+// shows as it is posted, the call that posts it ending.
 function apply(events) {
   const said = [];
   for (const e of events) {
     const {channel: c, said: s} = applyEvent(state.channels, e);
     said.push(...s);
     if (e.type === "posted" && c) {
-      const flights = flightsOf(e, channel, flightCtx());
-      for (const f of flights) graph.fly({...f, onLand: () => landed(c.store)});
-      if (!flights.length) landed(c.store);
+      landed(c.store);
       if (c.role === "outbox" && panelShows(c.store)) outboxChanged();
     } else if (e.type === "deleted" && c) {
       graph.setTotal(c.store);
       if (panelShows(c.store)) renderPanel();
-    } else if (e.type === "call" || e.type === "call_failed") {
-      for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
+    } else if (e.type === "api" && e.at === "start") {
+      callStarted(e);
+    } else if (e.type === "api") {
+      const l = landingOf(e);
+      graph.land(l.key, l);
     } else if (e.type === "raft") {
-      for (const f of flightsOf(e, channel, flightCtx())) graph.fly(f);
-      said.push(...raft.frame(e, performance.now()));
+      const f = frameFlight(e, flightCtx());
+      if (f) graph.fly(f);
+      const l = landingOf(e);
+      if (l) graph.land(l.key, l);
+      // A leader's word reaching a follower winds its election clock.
+      const to = reaches(e);
+      if (to != null) raft.heard(to, node.now());
+      said.push(...raft.frame(e, node.now()));
+    } else if (e.type === "role") {
+      said.push(...roleChanged(e));
     }
   }
   return said;
+}
+
+// A node's Raft state changed, as its log says: told, its role on the
+// graph; a new leader (or none: the old one stepped down) its flag.
+function roleChanged(e) {
+  const said = raft.view(e.node, {role: e.state, term: e.term}, node.now());
+  const known = state.leader;
+  if (e.leader != null && e.term >= (known?.term ?? 0)) state.leader = {id: e.leader, term: e.term};
+  else if (known?.id === e.node && e.state !== "leader") state.leader = {id: null, term: Math.max(e.term, known.term)};
+  if (graph.drawn() && !state.wizard && leaderId() !== drawnLeader) redraw();
+  else showNodes();
+  return said;
+}
+
+// A fake bot's call started: its pigeon leaves. A send to a channel aims
+// past the windows the sends already flying to it will take.
+const sending = new Map(); // store → the keys of the sends flying to it
+function callStarted(e) {
+  const flying = sending.get(e.store) ?? new Set();
+  const f = apiFlight(e, channel, flightCtx(), flying.size);
+  if (!f) return;
+  if (f.to.store != null) {
+    flying.add(f.key);
+    sending.set(e.store, flying);
+  }
+  graph.fly(f).then(() => flying.delete(f.key));
 }
 
 // An open outbox's posts come from the log without the frames they hold:
@@ -177,7 +220,7 @@ function outboxChanged() {
   }, 1000);
 }
 
-// A pigeon landed on a channel.
+// A channel's posts changed: its windows, its panel, anew.
 function landed(store) {
   graph.setTotal(store);
   if (panelShows(store)) renderPanel();
@@ -214,8 +257,7 @@ async function runOp(request, body) {
   const {reply, events} = await node.call(onNode(request), body, evs => said.push(...apply(readEvents(evs))));
   said.push(...apply(readEvents(events)));
   if (reply?.error?.startsWith("not the leader")) {
-    // You knocked on a follower: your pigeon turns back at its door.
-    graph.fly(refused(target()));
+    // You knocked on a follower: its answer flew back to you, a refusal.
     say(["say.not_leader", {n: target(), error: reply.error}]);
   } else if (reply?.error && state.channels.some(c => c.down)) say([request.op === "get" ? "say.read_failed_down" : "say.failed_down", {error: reply.error}]);
   else if (reply?.error) sayError(reply.error);
@@ -247,7 +289,7 @@ async function whileBusy(fn) {
 // Your objects: the bucket's, as the leader lists it (a follower turns S3
 // away, whichever node is on screen); kept as they were when none answers.
 async function refreshObjects() {
-  const {reply} = await call(ops.list(state.bucket, state.cluster?.leader ?? undefined));
+  const {reply} = await call(ops.list(state.bucket, leaderId() ?? undefined));
   if (ok(reply)) state.objects = reply.objects || [];
   graph.setObjects(state.objects.length);
   if (isOpen("client")) view.setObjects(state.objects);
@@ -311,7 +353,7 @@ async function pollBackground() {
 // Each node asked for its own word (its role, its term: raft.js tells what
 // changed); the node on screen's view of the cluster kept as the page's.
 async function pollCluster() {
-  const now = performance.now(),
+  const now = node.now(),
     told = [],
     replies = new Map();
   for (const id of state.nodes) {
@@ -319,7 +361,8 @@ async function pollCluster() {
     if (!ok(reply)) continue;
     replies.set(id, reply);
     const own = reply.nodes.find(n => n.id === reply.me);
-    told.push(...raft.view(id, {role: own?.role ?? null, term: reply.term}, now));
+    // The nodes' logs tell their roles as they change; a poll only fills in one not told yet.
+    if (raft.of(id)?.role == null) told.push(...raft.view(id, {role: own?.role ?? null, term: reply.term}, now));
   }
   const reply = replies.get(shown()) ?? [...replies.values()][0];
   if (!reply) return;
@@ -328,14 +371,14 @@ async function pollCluster() {
   // A newer term only: a node cut off still thinks it leads, in its old term.
   const seen = state.term;
   // A node back from a cut still names itself in its old term: the newer word stands.
-  state.cluster = seen != null && reply.term < seen ? {...reply, leader: state.cluster?.leader ?? null} : reply;
+  state.cluster = seen != null && reply.term < seen ? {...reply, leader: leaderId()} : reply;
   state.term = Math.max(seen ?? 0, reply.term);
   if (told.length) say(told.at(-1));
   renderNodes();
   showNodes();
   if (isOpen("cluster")) await updateCluster();
   // A new leader: its flag, its ways to the data channels.
-  if (graph.drawn() && !state.wizard && (reply.leader !== drawnLeader || reply.links.length !== drawnLinks)) redraw();
+  if (graph.drawn() && !state.wizard && (leaderId() !== drawnLeader || reply.links.length !== drawnLinks)) redraw();
 }
 
 // The nodes in the bar: which leads (★), which is cut off; the one on
@@ -351,7 +394,7 @@ function renderNodes() {
   bar.replaceChildren(all);
   if (isOpen("client")) view.setCluster(clientCluster());
 }
-const clientCluster = () => (state.nodes.length > 1 ? {nodes: state.nodes, node: state.node, leader: state.cluster?.leader ?? null, cut: state.cut} : null);
+const clientCluster = () => (state.nodes.length > 1 ? {nodes: state.nodes, node: state.node, leader: leaderId(), cut: state.cut} : null);
 
 // Your requests go to node `id` (null: the leader); you look at it too.
 async function pickNode(id) {
@@ -376,7 +419,7 @@ async function showNode() {
 
 // The cluster's panel: what every node says, the leader's word on the dynamic config.
 const clusterData = (dynamic = null) => {
-  const leader = state.cluster?.leader;
+  const leader = leaderId();
   return {
     nodes: state.nodes,
     own: state.views,
@@ -384,13 +427,14 @@ const clusterData = (dynamic = null) => {
     cut: state.cut,
     dynamic,
     chronicle: raft.chronicle(),
+    now: node.now(),
     config: state.config,
     demo: state.config,
     admin: state.admin,
   };
 };
 async function updateCluster() {
-  const leader = state.cluster?.leader;
+  const leader = leaderId();
   const dynamic = leader == null ? null : (await call(ops.dynamic(leader))).reply;
   if (isOpen("cluster")) view.update(clusterData(ok(dynamic) ? dynamic : null));
 }
@@ -402,7 +446,7 @@ function showNodes() {
   // openraft lets a follower stand only once the leader's lease (an
   // election's longest timeout) and then its own random timeout have both
   // gone by without a word: up to twice the longest timeout.
-  const now = performance.now(),
+  const now = node.now(),
     timeout = 2 * (state.timing?.election?.[1] ?? 0);
   graph.setNodes(new Map(state.nodes.map(id => [id, {...raft.of(id), clock: raft.clock(id, now, timeout)}])));
 }
@@ -413,7 +457,7 @@ async function isolate(id, cut) {
   if (!ok(reply)) return sayError(reply?.error);
   if (cut) state.cut.add(id);
   else state.cut.delete(id);
-  raft.cut(id, cut, performance.now());
+  raft.cut(id, cut, node.now());
   say([cut ? "nodes.cut" : "nodes.back", {n: id}]);
   renderNodes();
   await refreshChannels(); // its outbox up or down
@@ -427,8 +471,41 @@ function startTimers() {
   clearInterval(polls);
   clocks = setInterval(showNodes, settings.clockMs);
   polls = setInterval(() => {
-    if (!state.busy && !state.wizard && !document.hidden && graph.drawn()) pollBackground();
+    if (!state.busy && !state.wizard && !paused && !document.hidden && graph.drawn()) pollBackground();
   }, settings.pollMs);
+}
+
+// ------------------------------------------------------------ the node's clock
+// Stopped (⏸), the node's time moves only by hand: ⏭ on to its next event
+// (timer by timer until it does something drawn; with Shift, one timer
+// only), then what it did (its flights; the background and the cluster
+// polled again: stopped, nothing polls them).
+let paused = false,
+  stepped = false;
+function setPaused(on) {
+  paused = on;
+  node.pause(on);
+  $("sim").classList.toggle("paused", on);
+  $("sim-play").textContent = on ? "▶" : "⏸";
+  $("sim-play").setAttribute("aria-label", on ? t("sim.play") : t("sim.pause"));
+  $("sim-step").disabled = !on;
+  if (!on) $("sim-next").textContent = "";
+}
+if (!node.admin) {
+  $("sim").hidden = false;
+  $("sim-step").setAttribute("aria-label", t("sim.step"));
+  $("sim-step").title = t("sim.step");
+  setPaused(false);
+  $("sim-play").addEventListener("click", () => setPaused(!paused));
+  $("sim-step").addEventListener("click", e => {
+    stepped = true;
+    node.step(e.shiftKey);
+  });
+  node.onClock(({paused: on, now, next}) => {
+    if (on) $("sim-next").textContent = next == null ? t("sim.idle") : t("sim.next", {ms: Math.max(0, Math.round(next - now))});
+    if (stepped && graph.drawn() && !state.wizard) pollBackground();
+    stepped = false;
+  });
 }
 startTimers();
 
@@ -457,7 +534,7 @@ async function toggleTask(task, on) {
   // the dynamic config: an entry in the log) through the leader.
   if (task === "snapshot" && state.nodes.length > 1) {
     const key = `node.${shown()}.snapshot_every`;
-    const r = await call(ops.dynamicSet(key, on ? TASK_ON.snapshot : "off", state.cluster?.leader ?? undefined));
+    const r = await call(ops.dynamicSet(key, on ? TASK_ON.snapshot : "off", leaderId() ?? undefined));
     if (r.reply?.error) sayError(r.reply.error);
     else say([on ? "bg.turned_on" : "bg.turned_off", {task: t("bg.snapshot"), key}]);
     return pollBackground();
@@ -534,7 +611,7 @@ async function pollBudgets() {
     for (const e of reply.budgets || []) {
       const key = `${e.service} ${e.bot} ${e.chat}`,
         c = state.channels.find(c => budgetsOf(c, [e]).length);
-      if (!seen.has(key) || id === (c?.node ?? state.cluster?.leader)) seen.set(key, e);
+      if (!seen.has(key) || id === (c?.node ?? leaderId())) seen.set(key, e);
     }
   }
   state.budgets = [...seen.values()];
@@ -557,7 +634,7 @@ function renderPanel() {
     show(t("demo.you"), t("demo.you_sub"), v.nodes, v);
   } else if (open.kind === "loft") {
     const id = shown();
-    const cluster = state.nodes.length > 1 ? {node: id, cut: state.cut.has(id), leader: state.cluster?.leader ?? null} : null;
+    const cluster = state.nodes.length > 1 ? {node: id, cut: state.cut.has(id), leader: leaderId()} : null;
     // A cluster's "reset" is its own config back: the demo's is one node's.
     const demo = cluster ? state.config : state.demo;
     const own = state.channels.filter(c => c.role !== "data" && (c.node == null || c.node === id)).map(c => c.store);
@@ -659,7 +736,30 @@ $("settings").addEventListener("click", () => (isOpen("settings") ? closePanel()
 watch(knobs => {
   if (knobs.some(k => k.redraw) && graph.drawn() && !state.wizard) redraw();
   if (knobs.some(k => k.timer)) startTimers();
+  if (knobs.some(k => k.clock)) node.speed?.(settings.speed);
+  if (knobs.some(k => k.fake) && !state.wizard) setFakes();
 });
+
+// The fakes' delays (settings.js "network") told to the demo's node: after
+// each boot (it starts on its file's), and as they are turned.
+function setFakes() {
+  if (node.admin) return;
+  return call(ops.fake([settings.latencyMin, settings.latencyMax], [settings.linkMin, settings.linkMax]));
+}
+// A boot runs at full speed, the fakes answering at once (nothing of it is
+// watched but its end); then the node's clock slows down to the settings'
+// and the fakes take their time. A restart's nodes close the same way.
+async function fullSpeed() {
+  if (node.admin) return;
+  if (paused) setPaused(false);
+  node.speed(1);
+  await call(ops.fake([0, 0], [0, 0]));
+}
+function settingsSpeed() {
+  if (node.admin) return;
+  node.speed(settings.speed);
+  return setFakes();
+}
 
 // A data channel's faults, and what finds and mends them.
 const faultOps = c => {
@@ -709,13 +809,17 @@ async function boot() {
 function restart(text) {
   return whileBusy(async () => {
     view?.setError("");
+    await fullSpeed();
     const {reply} = await call(ops.restart(text));
     if (reply?.error) {
       view?.setError(reply.error);
+      await settingsSpeed();
       return;
     }
     Object.assign(state, {config: text, nodes: reply.nodes});
     state.cut.clear();
+    state.leader = null;
+    await settingsSpeed();
     await boot();
     say(["say.restart", {n: reply.replayed}]);
   });
@@ -753,6 +857,7 @@ async function startFromWizard(text) {
   const ms = performance.now() - t0;
   if (reply?.error) return reply.error;
   Object.assign(state, {config: text, nodes: reply.nodes});
+  await settingsSpeed();
   if (state.nodes.length > 1) await pollCluster();
   state.wizard = false;
   relayout = redraw;
@@ -840,6 +945,7 @@ async function startDemo() {
     return;
   }
   state.nodes = booted.reply.nodes;
+  await settingsSpeed();
   if (state.nodes.length > 1) await pollCluster();
   await boot();
   ready(performance.now() - t0, reply.why);

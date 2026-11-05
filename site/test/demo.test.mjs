@@ -5,7 +5,7 @@ import {beforeEach, test} from "node:test";
 import {frameModel} from "../src/assets/demo/chat/frame.js";
 import {chatModel} from "../src/assets/demo/chat/model.js";
 import {readEvents} from "../src/assets/demo/events.js";
-import {flightsOf, ownerOf} from "../src/assets/demo/flights.js";
+import {apiFlight, frameFlight, landingOf, ownerOf, reaches} from "../src/assets/demo/flights.js";
 import {summary} from "../src/assets/demo/log-view.js";
 import {makeRaftWatch} from "../src/assets/demo/raft.js";
 import {describe, ms} from "../src/assets/demo/tasks.js";
@@ -335,29 +335,56 @@ test("summary: a command's verb and what it touched", () => {
   assert.deepEqual(summary({namespace: "chunk", command: {AddReplica: {chunk_id: 3, replica: {}}}}), {verb: "AddReplica", fields: "demo.chunk_n"});
 });
 
-test("flightsOf: a node's own channel is its; a data channel the leader's; Raft by its frame", () => {
+test("apiFlight: a fake call flies from its node (named, its channel's own, else the leader) to its channel, or back for a read", () => {
   const channels = {"tg-log-2": {store: "tg-log-2", node: 2}, "tg-1": {store: "tg-1", node: null}, "outbox-3": {store: "outbox-3", node: 3, role: "outbox"}};
   const channel = s => channels[s];
   const ctx = {leader: 1, shown: 2};
-  assert.deepEqual(flightsOf({type: "posted", store: "tg-log-2", bytes: 300}, channel, ctx), [
-    {from: {node: 2}, to: {store: "tg-log-2", at: "new"}, size: 300},
-  ]);
-  assert.deepEqual(flightsOf({type: "call", store: "tg-1", op: "get", bytes: 9}, channel, ctx)[0].to, {node: 1}, "the leader reads the data");
-  assert.equal(flightsOf({type: "call_failed", store: "tg-1"}, channel, ctx)[0].failed, true);
-  assert.deepEqual(flightsOf({type: "posted", store: "nope"}, channel, ctx), [], "a channel not drawn: nothing flies");
-  // An outbox's post flies no pigeon of its own: the frame's does.
-  assert.deepEqual(flightsOf({type: "posted", store: "outbox-3", bytes: 57}, channel, ctx), []);
-  const read = flightsOf({type: "raft", from: 3, to: 1, via: "chat", kind: "append", at: "read"}, channel, ctx)[0];
-  assert.deepEqual([read.from, read.to, read.lane], [{store: "outbox-3", at: "new"}, {node: 1}, "raft"]);
-  assert.equal(flightsOf({type: "raft", from: 1, to: 2, via: "grpc", kind: "heartbeat", at: "sent"}, channel, ctx)[0].spark, true);
+  const call = (store, name, more = {}) => ({type: "api", at: "start", id: 9, store, node: null, call: name, bytes: null, ms: 120, ...more});
+  assert.deepEqual(apiFlight(call("tg-log-2", "send_document", {bytes: 300}), channel, ctx, 2), {
+    key: "api:9",
+    from: {node: 2},
+    to: {store: "tg-log-2", at: "free", ahead: 2},
+    size: 300,
+    ms: 120,
+  });
+  const read = apiFlight(call("tg-1", "get_file"), channel, ctx);
+  assert.deepEqual([read.from, read.to], [{store: "tg-1", at: "any", ahead: 0}, {node: 1}], "the leader reads the data");
+  const push = apiFlight(call("outbox-3", "push", {node: 1}), channel, ctx);
+  assert.deepEqual([push.from, push.to, push.lane], [{store: "outbox-3", at: "new"}, {node: 1}, "raft"], "a frame reaching its reader");
+  assert.equal(apiFlight(call("nope", "send_text"), channel, ctx), null, "a channel not drawn: nothing flies");
+  const request = apiFlight(call("you", "request", {node: 2}), channel, ctx);
+  assert.deepEqual([request.from, request.to], [{client: true}, {node: 2}], "your request to the node it goes to");
+  const answer = apiFlight(call("you", "response"), channel, ctx);
+  assert.deepEqual([answer.from, answer.to], [{node: 1}, {client: true}], "its answer back");
   assert.equal(ownerOf({node: null}, {leader: null, shown: 3}), 3, "no leader known: the node on screen");
+});
+
+test("frameFlight, landingOf: a direct frame flies from sent to read, a vote's answer to answered; a fake call to its end", () => {
+  const sent = {type: "raft", from: 1, to: 2, via: "grpc", kind: "heartbeat", at: "sent", frame: 5, ms: 40};
+  assert.deepEqual(frameFlight(sent, {}), {key: "frame:5", from: {node: 1}, to: {node: 2}, size: 1024, ms: 40, lane: "raft", spark: true, kind: "heartbeat"});
+  assert.equal(frameFlight(sent, {cut: new Set([2])}), null, "nothing to a node cut off");
+  assert.equal(frameFlight({...sent, via: "chat", frame: undefined}, {}), null, "over the chat: the outbox's calls fly");
+  assert.equal(frameFlight({...sent, kind: "voted"}, {}).key, "vote:5");
+  assert.deepEqual(landingOf({type: "raft", at: "read", frame: 5}), {key: "frame:5"});
+  assert.deepEqual(landingOf({type: "raft", at: "answered", frame: 5, granted: false}), {key: "vote:5", kind: "vote-against"});
+  assert.deepEqual(landingOf({type: "api", at: "end", id: 9, ok: false}), {key: "api:9", failed: true});
+  assert.equal(landingOf({type: "raft", at: "read", via: "chat"}), null);
+});
+
+test("reaches: a leader's heartbeat or entries reach a follower as they arrive, over either link", () => {
+  const raft = (kind, via, at) => ({type: "raft", kind, via, at, from: 1, to: 2});
+  assert.equal(reaches(raft("heartbeat", "grpc", "read")), 2);
+  assert.equal(reaches(raft("append", "chat", "read")), 2);
+  assert.equal(reaches(raft("heartbeat", "grpc", "sent")), null, "on its way only");
+  assert.equal(reaches(raft("vote", "grpc", "read")), null);
+  assert.equal(reaches({type: "call", store: "tg"}), null);
 });
 
 test("raft watch: a heartbeat winds a follower's clock; votes and a candidate are told", () => {
   const w = makeRaftWatch();
   w.view(2, {role: "follower", term: 1}, 0);
   assert.equal(w.clock(2, 0, 1000), null, "not heard from a leader yet");
-  w.frame({kind: "heartbeat", via: "grpc", at: "sent", from: 1, to: 2}, 100);
+  w.heard(2, 100);
   assert.equal(w.clock(2, 600, 1000), 0.5);
   assert.equal(w.clock(2, 5000, 1000), 0);
   assert.deepEqual(w.view(2, {role: "candidate", term: 2}, 5000), [["raft.candidate", {n: 2, term: 2}]]);

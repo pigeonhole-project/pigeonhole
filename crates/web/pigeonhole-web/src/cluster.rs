@@ -16,14 +16,54 @@ use pigeonhole_meta::raft::TypeConfig;
 use pigeonhole_meta::Cluster;
 use pigeonhole_node::cluster::{chat_network, idle_chat, via_chat};
 use pigeonhole_raft_telegram::TelegramMailbox;
+use pigeonhole_storage_api::fake::FakeCalls;
 use pigeonhole_storage_telegram::fake::bot::FakeBot;
+use pigeonhole_storage_telegram::ChannelMessage;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::Instant;
 
 type Outbox = TelegramMailbox<FakeBot<TelegramChannel>>;
 /// The readers' copies of one outbox.
-type Copies = Arc<Mutex<Vec<Arc<Outbox>>>>;
+type Copies = Arc<Mutex<Vec<Reader>>>;
+
+/// A reader's copy of an outbox, and the way a push reaches it: one after
+/// another, each a fake call ("push") taking the fakes' latency, as
+/// Telegram's update takes its time to reach a bot.
+struct Reader {
+    calls: FakeCalls,
+    /// When the last push queued reaches the reader: the next one no sooner.
+    last: Mutex<Instant>,
+    queue: tokio::sync::mpsc::UnboundedSender<(u64, Instant, i64, Option<ChannelMessage>)>,
+}
+
+impl Reader {
+    fn new(copy: Arc<Outbox>, calls: FakeCalls) -> Self {
+        let (queue, mut pushes) = tokio::sync::mpsc::unbounded_channel();
+        let done = calls.clone();
+        tokio::spawn(async move {
+            while let Some((id, when, at, message)) = pushes.recv().await {
+                tokio::time::sleep_until(when).await;
+                done.done(id, true);
+                copy.pushed(at, message);
+            }
+        });
+        Self { calls, last: Mutex::new(Instant::now()), queue }
+    }
+
+    /// Post `at` (`bytes` of it) on its way to the reader.
+    fn push(&self, at: i64, message: Option<ChannelMessage>, bytes: u64) {
+        let (id, delay) = self.calls.draw();
+        let when = {
+            let mut last = self.last.lock().unwrap();
+            *last = (*last).max(Instant::now() + delay);
+            *last
+        };
+        self.calls.begin(id, "push", Some(bytes), when - Instant::now());
+        let _ = self.queue.send((id, when, at, message));
+    }
+}
 /// The outboxes as each node sees them, by `(owner, user)`; and by owner,
 /// the readers' copies.
 type Outboxes = (HashMap<(u64, u64), Arc<dyn Mailbox>>, HashMap<u64, Copies>);
@@ -40,9 +80,10 @@ struct Copy {
 #[async_trait::async_trait]
 impl Mailbox for Copy {
     async fn post(&self, frame: bytes::Bytes) -> Result<u64> {
+        let bytes = frame.len() as u64;
         let (at, message) = self.own.post_message(frame).await?;
-        for copy in self.all.lock().unwrap().iter() {
-            copy.pushed(at as i64, message.clone());
+        for reader in self.all.lock().unwrap().iter() {
+            reader.push(at as i64, message.clone(), bytes);
         }
         Ok(at)
     }
@@ -95,13 +136,14 @@ impl Net {
         let bot = cluster.nodes.iter().find(|n| n.id == user).and_then(|n| n.bot_ids.first().copied());
         let bot = bot.with_context(|| format!("[[node]] {user}: no bot"))?;
         let own = Arc::new(
-            TelegramMailbox::new(Arc::new(world.fakes.telegram_bot(cfg, &channel, bot).await?))
+            TelegramMailbox::new(Arc::new(world.fakes.telegram_bot(cfg, &channel, bot, user).await?))
                 .named(pigeonhole_admin::outbox_store(owner))
                 .polling(cluster.poll),
         );
         let all = all.entry(owner).or_default().clone();
         if user != owner {
-            all.lock().unwrap().push(own.clone());
+            let calls = FakeCalls::new(&channel.id, Some(user), world.fakes.latency.clone());
+            all.lock().unwrap().push(Reader::new(own.clone(), calls));
         }
         let copy: Arc<dyn Mailbox> = Arc::new(Copy { own, all });
         copies.insert((owner, user), copy.clone());
@@ -128,6 +170,11 @@ impl Net {
 
     /// Cuts node `node` off from the others, or brings it back: its direct
     /// links, and its outbox (the channel down: its frames do not go out).
+    /// A direct link's frame takes `range` each way.
+    pub fn set_link(&self, range: (Duration, Duration)) {
+        self.direct.set_delay(Some(range));
+    }
+
     pub fn isolate(&self, world: &World, cluster: &ClusterSettings, node: u64, cut: bool) {
         self.direct.isolate(node, cut);
         if let Some(outbox) = cluster.outbox_channel(node) {
@@ -149,12 +196,21 @@ impl Nodes {
     /// at once (a tablet waits for a leader).
     pub async fn open(world: &Arc<World>, text: &str) -> Result<Self> {
         let net = Net::default();
+        // The fakes' delays as the file has them (the page may change them as the nodes run).
+        let fakes = |cfg: &Config| {
+            world.fakes.latency.set(cfg.fake.latency);
+            world.link.set(cfg.fake.link);
+            net.set_link(cfg.fake.link);
+        };
         let ids = Config::node_ids(text)?;
         if ids.is_empty() {
-            let node = crate::Node::open(world, &crate::parse_config(text)?).await?;
+            let cfg = crate::parse_config(text)?;
+            fakes(&cfg);
+            let node = crate::Node::open(world, &cfg).await?;
             return Ok(Self { nodes: [(1, node)].into(), net, cluster: None });
         }
         let configs = ids.iter().map(|&id| crate::parse_config_as(text, id)).collect::<Result<Vec<_>>>()?;
+        fakes(&configs[0]);
         let cluster = configs[0].cluster.clone();
         // The lowest id starts a fresh cluster's first election: polled
         // last, it finds the others serving already. Polled first, its votes
@@ -195,8 +251,18 @@ impl Nodes {
 
     /// Node `id`; without one, the leader (or the first, while none leads).
     pub fn node(&self, id: Option<u64>) -> Result<&crate::Node> {
-        let id = id.or_else(|| self.leader()).or_else(|| self.nodes.keys().next().copied());
+        let id = self.which(id);
         id.and_then(|id| self.nodes.get(&id)).with_context(|| format!("no node {id:?}"))
+    }
+
+    /// The node a request for `id` goes to: that one, else the leader, else the first.
+    pub fn which(&self, id: Option<u64>) -> Option<u64> {
+        id.or_else(|| self.leader()).or_else(|| self.nodes.keys().next().copied())
+    }
+
+    /// A direct link's frame takes `range` each way, from now on.
+    pub fn set_link(&self, range: (Duration, Duration)) {
+        self.net.set_link(range);
     }
 
     /// Cuts node `node` off from the others, or brings it back.

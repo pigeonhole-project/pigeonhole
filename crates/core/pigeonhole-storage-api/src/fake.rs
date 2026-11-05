@@ -14,7 +14,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The state of one fake channel.
 ///
@@ -114,5 +115,88 @@ impl<S: FakeState> FakeHost<S> for MemoryHost<S> {
     async fn delete_blobs(&self, blobs: &[Vec<u8>]) -> Result<()> {
         self.delete_blobs_now(blobs);
         Ok(())
+    }
+}
+
+/// A range of delays many fakes share, changed while they run (the demo's
+/// settings): each call takes one in `min..=max`.
+#[derive(Clone, Default)]
+pub struct Latency(Arc<[AtomicU64; 2]>);
+
+impl Latency {
+    pub fn new(range: (Duration, Duration)) -> Self {
+        let l = Self::default();
+        l.set(range);
+        l
+    }
+    pub fn set(&self, (min, max): (Duration, Duration)) {
+        let us = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        self.0[0].store(us(min), Ordering::Relaxed);
+        self.0[1].store(us(max.max(min)), Ordering::Relaxed);
+    }
+    pub fn get(&self) -> (Duration, Duration) {
+        let [min, max] = [0, 1].map(|i| Duration::from_micros(self.0[i].load(Ordering::Relaxed)));
+        (min, max.max(min))
+    }
+    /// Call `n`'s delay: spread over the range, the same for the same `n`.
+    pub fn of(&self, n: u64) -> Duration {
+        let (min, max) = self.get();
+        let span = u64::try_from((max - min).as_micros()).unwrap_or(u64::MAX);
+        if span == 0 {
+            return min;
+        }
+        // splitmix64: an even spread without a random source.
+        let mut z = n.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        min + Duration::from_micros((z ^ (z >> 31)) % (span + 1))
+    }
+}
+
+static CALL_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fake bot's calls as the demo draws them: each is logged as it starts
+/// (`fake call`: the store, the node making it when known, the call, an id,
+/// its bytes when known and how long it takes, `ms`), takes that long
+/// (the store's [`Latency`]), and is logged as it ends (`fake call done`,
+/// the same id, whether it went through).
+#[derive(Clone, Default)]
+pub struct FakeCalls {
+    store: Arc<str>,
+    node: Option<u64>,
+    latency: Latency,
+}
+
+impl FakeCalls {
+    pub fn new(store: &str, node: Option<u64>, latency: Latency) -> Self {
+        Self { store: store.into(), node, latency }
+    }
+
+    /// Call `call` starts: logged, then its delay. Returns its id, for [`Self::done`].
+    pub async fn start(&self, call: &'static str, bytes: Option<u64>) -> u64 {
+        let (id, delay) = self.draw();
+        self.begin(id, call, bytes, delay);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        id
+    }
+
+    /// A new call's id, and the delay the latency gives it.
+    pub fn draw(&self) -> (u64, Duration) {
+        let id = CALL_IDS.fetch_add(1, Ordering::Relaxed) + 1;
+        (id, self.latency.of(id))
+    }
+
+    /// Call `id` (`call`, of `bytes`) starts and takes `delay`, which its
+    /// caller waits out: logged.
+    pub fn begin(&self, id: u64, call: &'static str, bytes: Option<u64>, delay: Duration) {
+        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        tracing::debug!(store = %self.store, node = self.node, call, id, bytes, ms, "fake call");
+    }
+
+    /// Call `id` ends: it went through (`ok`) or failed.
+    pub fn done(&self, id: u64, ok: bool) {
+        tracing::debug!(store = %self.store, id, ok, "fake call done");
     }
 }

@@ -8,12 +8,18 @@
 // in the demo; the demo's worker adds its own (crates/web, web.rs): `open`,
 // `restart` (a config, or the one kept: every node boots on it), `close`
 // (the page is going: the node closes, the worker ends), `isolate` (a node
-// of the cluster cut off); `reset` is the worker's alone (web-worker.js:
-// its files go, no node behind it). A request may name the `node` of a
+// of the cluster cut off), `fake` (how long the fakes take); `reset`,
+// `speed`, `pause` and `step` are the worker's alone (web-worker.js: its
+// files go, no node behind it; the node's clock runs at `value` of the
+// wall's; stopped or let go; stopped, on to the node's next event, or `one`
+// timer only). A request may name the `node` of a
 // cluster it goes to; none: the leader.
 
 const OP_CLOSE = "close";
 export const OP_RESET = "reset";
+export const OP_SPEED = "speed";
+export const OP_PAUSE = "pause";
+export const OP_STEP = "step";
 
 // Each op the page sends, as a request (a body, if any, goes beside it).
 export const ops = {
@@ -22,6 +28,11 @@ export const ops = {
   restart: config => ({op: "restart", config}),
   close: () => ({op: OP_CLOSE}),
   reset: () => ({op: OP_RESET}),
+  speed: value => ({op: OP_SPEED, value}),
+  // The fakes' delays, ms [min, max] each: a bot's call, a direct link's frame.
+  fake: (latency, link) => ({op: "fake", latency, link}),
+  pause: on => ({op: OP_PAUSE, on}),
+  step: one => ({op: OP_STEP, one}),
   isolate: (node, down) => ({op: "isolate", node, down}),
   // S3 (the body: the object's bytes).
   put: (bucket, key) => ({op: "put", bucket, key}),
@@ -50,13 +61,15 @@ export const ops = {
 };
 
 // The worker's messages to the page (web-worker.js → demo/node.js); the
-// page sends {id, ...request, body?}.
+// page sends {id, ...request, body?}. A batch of events (`events`, `tick`)
+// carries the node's time it happened at (`at`).
 export const MSG = {
   waiting: "waiting", // the page just left still holds the files
   started: "started", // the module is up: {reply: {config, demo, saved, persistent, why} | {error}, events}
-  events: "events", // what the node logged during call `id`, as it went: {id, events}
+  events: "events", // what the node logged during call `id`, as it went: {id, events, at}
   reply: "reply", // call `id` answered: {id, reply, events: [], ms}
-  tick: "tick", // what the node logged on its own between calls: {events}
+  tick: "tick", // what the node logged on its own between calls: {events, at}
+  clock: "clock", // after a pause or a step: {paused, now, next} (the node's ms; next: its next timer, null: none)
 };
 export const msg = {
   waiting: () => ({type: MSG.waiting, why: "files"}),
@@ -64,6 +77,7 @@ export const msg = {
   events: (id, events) => ({type: MSG.events, id, events}),
   reply: (id, reply, ms = 0) => ({type: MSG.reply, id, reply, events: [], ms}),
   tick: events => ({type: MSG.tick, events}),
+  clock: (paused, now, next) => ({type: MSG.clock, paused, now, next: next === Infinity ? null : next}),
 };
 
 export function frame(request, body) {

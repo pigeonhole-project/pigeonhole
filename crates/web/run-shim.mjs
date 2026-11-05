@@ -63,7 +63,7 @@ async function node(env = {}) {
       }
       const waits = runOnce();
       if (!waits && !m.wasi.lines.length) throw new Error(`call ${n} (${request.op}) stuck: nothing to run, no timer`);
-      if (waits && !m.wasi.lines.length) await sleep(Math.max(0, m.wasi.nextWake - performance.now()));
+      if (waits && !m.wasi.lines.length) await sleep(Math.max(0, m.wasi.nextWake - m.wasi.clock.now()));
     }
   };
   // Its reply, or its error thrown.
@@ -77,7 +77,7 @@ async function node(env = {}) {
     const end = performance.now() + ms;
     while (performance.now() < end) {
       if (!runOnce()) break;
-      await sleep(Math.max(0, Math.min(end, m.wasi.nextWake) - performance.now()));
+      await sleep(Math.max(0, Math.min(end, m.wasi.nextWake) - m.wasi.clock.now()));
     }
     return parse(m.wasi.takeLines());
   };

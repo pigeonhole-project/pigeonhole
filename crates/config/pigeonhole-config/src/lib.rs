@@ -6,7 +6,7 @@
 use crate::instances::InstanceKind;
 use crate::instances::{memory_instance, InstanceConfig, TelegramLogin};
 use crate::stores::{FileReplicas, FileShards, FileStore, Store, Topology};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use pigeonhole_chunk_store::{
     CacheConfig, RepairConfig, SweepConfig, DEFAULT_MAX_COST_WAIT_SECS, DEFAULT_REPAIR_INTERVAL,
     DEFAULT_SWEEP_INTERVAL, REPAIR_BATCH_SIZE, REPAIR_CONCURRENCY, SWEEP_BATCH_SIZE,
@@ -96,6 +96,8 @@ pub struct Config {
     pub log: LoggingSettings,
     /// Small objects in the metadata, and the cooler (`[inline]`).
     pub inline: InlineSettings,
+    /// The fake channels' and links' delays (`[fake]`): none by default.
+    pub fake: FakeSettings,
     pub config_path: PathBuf,
     /// The file as read (no secrets: those are in the environment), as the
     /// admin shows it; empty for a config built in code.
@@ -519,6 +521,7 @@ impl Config {
             admin: file.admin,
             log: file.log.into_settings(),
             inline: file.inline.into_settings()?,
+            fake: file.fake.into_settings()?,
             config_path,
             text: String::new(),
             file: table,
@@ -578,6 +581,7 @@ impl Config {
             admin: AdminSettings::default(),
             log: LoggingSettings::default(),
             inline: file.inline.into_settings().expect("FOR_TEST's [inline]"),
+            fake: FakeSettings::default(),
             config_path: PathBuf::from("(test)"),
             text: String::new(),
             file: table,
@@ -659,6 +663,8 @@ struct FileConfig {
     log: FileLog,
     #[serde(default)]
     inline: FileInline,
+    #[serde(default)]
+    fake: FileFake,
     cluster: cluster::FileCluster,
     #[serde(default)]
     node: Vec<cluster::FileNode>,
@@ -707,6 +713,7 @@ impl Default for FileConfig {
             admin: AdminSettings::default(),
             log: FileLog::default(),
             inline: FileInline::default(),
+            fake: FileFake::default(),
             cluster: cluster::FileCluster::default(),
             node: Vec::new(),
         }
@@ -914,6 +921,46 @@ impl FileInline {
                 batch: self.cool_batch.max(1),
             },
             cool_every: at_least_a_second(self.cool_every),
+        })
+    }
+}
+
+/// How long the fakes take (`[fake]`), as the real things do: each call a
+/// fake Telegram or Discord bot makes, and each frame over a direct link
+/// between the nodes of a cluster in one process (the demo's), a delay
+/// between `min` and `max`. None by default: the tests' fakes answer at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FakeSettings {
+    /// A fake bot's call: `latency_min`..`latency_max`.
+    pub latency: (Duration, Duration),
+    /// A frame over a direct link: `link_min`..`link_max`.
+    pub link: (Duration, Duration),
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileFake {
+    #[serde(with = "humantime_serde")]
+    latency_min: Option<Duration>,
+    #[serde(with = "humantime_serde")]
+    latency_max: Option<Duration>,
+    #[serde(with = "humantime_serde")]
+    link_min: Option<Duration>,
+    #[serde(with = "humantime_serde")]
+    link_max: Option<Duration>,
+}
+
+impl FileFake {
+    fn into_settings(self) -> Result<FakeSettings> {
+        let range = |what: &str, min: Option<Duration>, max: Option<Duration>| {
+            let min = min.unwrap_or_default();
+            let max = max.unwrap_or(min);
+            ensure!(min <= max, "[fake] {what}_min is over {what}_max");
+            Ok((min, max))
+        };
+        Ok(FakeSettings {
+            latency: range("latency", self.latency_min, self.latency_max)?,
+            link: range("link", self.link_min, self.link_max)?,
         })
     }
 }

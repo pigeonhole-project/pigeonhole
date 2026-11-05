@@ -86,6 +86,13 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .bar-links a { color: var(--wing-2); text-decoration: none; }
 .icon { border: 1px solid var(--line); background: none; border-radius: 50%; width: 32px; height: 32px; cursor: pointer; }
 #settings { font-size: 17px; line-height: 1; }
+/* the node's clock: stopped, stepped by hand */
+.sim { display: inline-flex; align-items: center; gap: 6px; }
+.sim[hidden] { display: none; }
+.sim .icon { font-size: 13px; line-height: 1; }
+.sim .icon:disabled { opacity: .4; cursor: default; }
+.sim.paused #sim-play { border-color: var(--wing); color: var(--wing); }
+.sim-next { font-family: var(--mono); font-size: 12px; color: var(--slate); min-width: 9ch; }
 
 /* the loft: the graph, and a panel when a node is opened */
 #app { flex: 1; min-height: 0; display: flex; flex-direction: column; }

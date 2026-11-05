@@ -114,7 +114,7 @@ mod tests {
         let channel = Arc::new(FakeDiscord::new(7));
         let bot = |i: usize| {
             let limiter = reg.chat(&format!("bot-{i}"), "7");
-            (FakeBot::new(channel.clone(), limiter.clone(), i), limiter)
+            (FakeBot::new(channel.clone(), limiter.clone()), limiter)
         };
         let pooled = PooledDiscord::new("7", vec![bot(0), bot(1)]);
         pooled.member(0).flood_next(1, Duration::from_secs(40));

@@ -181,6 +181,11 @@ const RAFT_STATES: [(ServerState, &str); 5] = [
     (ServerState::Shutdown, "shutdown"),
 ];
 
+/// A Raft state's name in the metrics and the log ("leader", "follower", …).
+pub(crate) fn state_name(state: ServerState) -> &'static str {
+    RAFT_STATES.iter().find(|(s, _)| *s == state).map_or("unknown", |(_, name)| name)
+}
+
 pub(crate) fn record_raft(m: &RaftMetrics<NodeId, BasicNode>) {
     metrics::gauge!("pigeonhole_meta_raft_node").set(m.id as f64);
     for (state, name) in RAFT_STATES {

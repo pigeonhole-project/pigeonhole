@@ -6,7 +6,9 @@
 //! A document's location is the bot's that read or posted it, as on
 //! Telegram: another bot's download with it answers `FILE_REFERENCE_EXPIRED`
 //! (the bot's number rides on the file reference). Tests can make the next
-//! sends answer a flood wait ([`FakeBot::flood_next`]).
+//! sends answer a flood wait ([`FakeBot::flood_next`]). Each call is
+//! logged as it starts and ends, and takes the store's latency between
+//! ([`FakeCalls`]: the site's demo draws them).
 
 use super::Calls;
 use crate::channel::{ChannelApi, ChannelMessage, FileLocation, Sent};
@@ -16,6 +18,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_limits::{ChatLimiter, Level, Spend};
+use pigeonhole_storage_api::fake::FakeCalls;
 use pigeonhole_storage_api::RateLimited;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +31,7 @@ pub struct FakeBot<C> {
     bot: usize,
     /// While set, every call fails: the channel is down (the site's demo).
     down: Arc<AtomicBool>,
+    calls: FakeCalls,
     knobs: Mutex<Knobs>,
 }
 
@@ -40,7 +44,12 @@ struct Knobs {
 
 impl<C> FakeBot<C> {
     pub fn new(channel: Arc<C>, limiter: Arc<ChatLimiter>, bot: usize) -> Self {
-        Self { channel, limiter, bot, down: Arc::default(), knobs: Mutex::default() }
+        Self { channel, limiter, bot, down: Arc::default(), calls: FakeCalls::default(), knobs: Mutex::default() }
+    }
+
+    /// Logs and delays every call as `calls` says (its store, its latency).
+    pub fn with_calls(self, calls: FakeCalls) -> Self {
+        Self { calls, ..self }
     }
 
     /// Fails every call while `down` is set (shared by a channel's bots).
@@ -69,19 +78,24 @@ impl<C> FakeBot<C> {
         self.knobs.lock().unwrap().floods = Some((sends, wait));
     }
 
-    async fn spend(&self, spend: Spend, call: &'static str) -> Result<()> {
-        if self.down.load(Ordering::SeqCst) {
-            tracing::debug!(bot = self.bot, call, "fake bot call: the channel is down");
+    /// Call `call` (`bytes` its payload, when known): the bot's budget,
+    /// then the call's time; a channel that is down fails it after that.
+    async fn spend(&self, spend: Spend, call: &'static str, bytes: Option<u64>) -> Result<()> {
+        if !self.down.load(Ordering::SeqCst) {
+            self.limiter.acquire(spend).await;
+        }
+        let id = self.calls.start(call, bytes).await;
+        let up = !self.down.load(Ordering::SeqCst);
+        self.calls.done(id, up);
+        if !up {
             bail!("{call}: the channel is down");
         }
-        self.limiter.acquire(spend).await;
-        tracing::debug!(bot = self.bot, call, "fake bot call");
         Ok(())
     }
 
     /// A send's budget, and a flood wait if one is due.
-    async fn send(&self, call: &'static str) -> Result<()> {
-        self.spend(Spend::Class(SEND), call).await?;
+    async fn send(&self, call: &'static str, bytes: u64) -> Result<()> {
+        self.spend(Spend::Class(SEND), call, Some(bytes)).await?;
         let mut k = self.knobs.lock().unwrap();
         if let Some((left, wait)) = k.floods.filter(|(left, _)| *left > 0) {
             k.floods = Some((left - 1, wait));
@@ -109,7 +123,7 @@ impl<C: ChannelApi> ChannelApi for FakeBot<C> {
     }
 
     async fn get_messages(&self, ids: &[i64]) -> Result<Vec<ChannelMessage>> {
-        self.spend(Spend::Class(READ), "get_messages").await?;
+        self.spend(Spend::Class(READ), "get_messages", None).await?;
         self.count(|c| c.get_messages += 1);
         let msgs = self.channel.get_messages(ids).await?;
         Ok(msgs
@@ -124,21 +138,21 @@ impl<C: ChannelApi> ChannelApi for FakeBot<C> {
     }
 
     async fn send_document(&self, name: &str, data: Bytes, random_id: i64) -> Result<Sent> {
-        self.send("send_document").await?;
+        self.send("send_document", data.len() as u64).await?;
         self.count(|c| c.send_document += 1);
         let sent = self.channel.send_document(name, data, random_id).await?;
         Ok(Sent { file: sent.file.map(|f| self.ours(f)), ..sent })
     }
 
     async fn send_text(&self, text: &str, random_id: i64) -> Result<Sent> {
-        self.send("send_text").await?;
+        self.send("send_text", text.len() as u64).await?;
         self.count(|c| c.send_text += 1);
         self.channel.send_text(text, random_id).await
     }
 
     /// Only with this bot's own location.
     async fn get_file(&self, file: &FileLocation, offset: u64, limit: u64) -> Result<Bytes> {
-        self.spend(Spend::Bot, "get_file").await?;
+        self.spend(Spend::Bot, "get_file", Some(limit)).await?;
         let mut theirs = file.clone();
         if theirs.file_reference.pop() != Some(self.bot as u8) {
             return Err(FileReferenceExpired.into());
@@ -148,18 +162,18 @@ impl<C: ChannelApi> ChannelApi for FakeBot<C> {
     }
 
     async fn delete_messages(&self, ids: &[i64]) -> Result<()> {
-        self.spend(Spend::Class(DELETE), "delete_messages").await?;
+        self.spend(Spend::Class(DELETE), "delete_messages", None).await?;
         self.count(|c| c.delete_messages += 1);
         self.channel.delete_messages(ids).await
     }
 
     async fn pinned(&self) -> Result<Option<i64>> {
-        self.spend(Spend::Class(READ), "pinned").await?;
+        self.spend(Spend::Class(READ), "pinned", None).await?;
         self.channel.pinned().await
     }
 
     async fn pin(&self, id: i64) -> Result<()> {
-        self.spend(Spend::Class(SEND), "pin").await?;
+        self.spend(Spend::Class(SEND), "pin", None).await?;
         self.count(|c| c.pin += 1);
         self.channel.pin(id).await
     }

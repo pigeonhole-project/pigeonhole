@@ -15,6 +15,7 @@ use crate::cluster::Nodes;
 use crate::{World, DEMO_CONFIG};
 use bytes::Bytes;
 use pigeonhole_admin::Request;
+use pigeonhole_storage_api::fake::FakeCalls;
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -24,6 +25,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 /// Shared with the shim's `poll_oneoff` ([`ph_yield_flag`]):
 /// - `[0]` = 1: [`ph_run`] wants to return, so a park must not wait for its
@@ -118,7 +120,7 @@ pub extern "C" fn ph_open() -> i32 {
         .with_span_list(true)
         .with_env_filter(
             "warn,pigeonhole_web=info,pigeonhole_meta=debug,pigeonhole_blob=debug,pigeonhole_gateway_s3=info,\
-             pigeonhole_chunk_store=debug,pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug,pigeonhole_fake_channels=debug,\
+             pigeonhole_chunk_store=debug,pigeonhole_storage_api=debug,pigeonhole_storage_telegram=debug,pigeonhole_storage_discord=debug,pigeonhole_fake_channels=debug,\
              openraft_grpc=debug,openraft_chat=debug,pigeonhole_raft_telegram=debug",
         )
         .with_writer(std::io::stdout)
@@ -250,6 +252,24 @@ async fn open_with_bucket(world: &Arc<World>, text: &str) -> anyhow::Result<(Nod
     }
 }
 
+/// The `fake` op: the fake bots' call time and the direct links' frame
+/// time (ms, min and max), each if given, from now on; both as they are now.
+fn set_fakes(r: &Request) -> Value {
+    let world = WORLD.with(Arc::clone);
+    let range = |(min, max): (u64, u64)| (Duration::from_millis(min), Duration::from_millis(max));
+    if let Some(latency) = r.latency {
+        world.fakes.latency.set(range(latency));
+    }
+    if let Some(link) = r.link {
+        world.link.set(range(link));
+        if let Some(nodes) = NODES.with(|n| n.borrow().clone()) {
+            nodes.set_link(range(link));
+        }
+    }
+    let ms = |(min, max): (Duration, Duration)| [min.as_millis() as u64, max.as_millis() as u64];
+    json!({ "latency": ms(world.fakes.latency.get()), "link": ms(world.link.get()) })
+}
+
 async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
     match r.op.as_str() {
         "open" | "restart" => {
@@ -268,11 +288,30 @@ async fn run(r: Request, body: Bytes) -> anyhow::Result<Value> {
         }
         _ => {}
     }
+    if r.op == "fake" {
+        return Ok(set_fakes(&r));
+    }
     let nodes = NODES.with(|n| n.borrow().clone()).ok_or_else(|| anyhow::anyhow!("no node: open first"))?;
     if r.op == "isolate" {
         let node = r.node.ok_or_else(|| anyhow::anyhow!("isolate: which node"))?;
         nodes.isolate(&WORLD.with(Arc::clone), node, r.down)?;
         return Ok(json!({ "node": node, "isolated": r.down }));
     }
-    nodes.node(r.node)?.admin.handle(&r, body).await
+    let node = nodes.node(r.node)?;
+    if !matches!(r.op.as_str(), "put" | "get" | "copy" | "delete") {
+        return node.admin.handle(&r, body).await;
+    }
+    // Your S3 request reaches the node, and its answer you, over a link as
+    // long as the nodes' own: fake calls the page draws as pigeons.
+    let you = FakeCalls::new(YOU, nodes.which(r.node), WORLD.with(|w| w.link.clone()));
+    let id = you.start("request", Some(body.len() as u64)).await;
+    you.done(id, true);
+    let reply = node.admin.handle(&r, body).await;
+    let bytes = reply.as_ref().ok().and_then(|v| v.get("len")).and_then(Value::as_u64);
+    let id = you.start("response", bytes).await;
+    you.done(id, true);
+    reply
 }
+
+/// The store name of your S3 client in the fake calls: the page's "you".
+const YOU: &str = "you";

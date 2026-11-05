@@ -184,9 +184,60 @@ function normalize(base, rel) {
   return `/${out.join("/")}`;
 }
 
+// The module's time, in ms, on performance.now()'s scale: the wall's, run
+// at `speed` (1: as fast; 0.25: four times slower) and stopped while held
+// (hold() … release()). While held the module sees no time pass: its
+// timers wait, what it does meanwhile (a call) it does at one instant. The
+// demo's worker runs its node slowed down, so that what takes the node
+// 200 ms (a fake call) is seen to, and stops or steps it by hand.
+export class Clock {
+  constructor() {
+    this.base = performance.now(); // the module's time when it last started running
+    this.since = performance.now(); // the wall's then; null: held
+    this.speed = 1;
+    this.epoch = Date.now() - performance.now(); // the module's wall clock: epoch + now()
+  }
+  get held() {
+    return this.since == null;
+  }
+  now() {
+    return this.since == null ? this.base : this.base + (performance.now() - this.since) * this.speed;
+  }
+  // The module's wall clock, as Date.now().
+  wall() {
+    return this.epoch + this.now();
+  }
+  hold() {
+    if (this.since == null) return;
+    this.base = this.now();
+    this.since = null;
+  }
+  release() {
+    if (this.since == null) this.since = performance.now();
+  }
+  setSpeed(speed) {
+    this.restart(this.now());
+    this.speed = speed;
+  }
+  // The module's time moved on to `to` at once (a step, or catching up
+  // with another clock); never back.
+  advance(to) {
+    if (to > this.now()) this.restart(to);
+  }
+  // Wall ms until the module's time is `t` (running; held: never).
+  until(t) {
+    return this.since == null || this.speed <= 0 ? Infinity : Math.max(0, (t - this.now()) / this.speed);
+  }
+  restart(at) {
+    this.base = at;
+    if (this.since != null) this.since = performance.now();
+  }
+}
+
 // The WASI imports, with stdin given per call and stdout cut into lines.
 export class Wasi {
-  constructor({pool = null, preopen = "/data", env = {}} = {}) {
+  constructor({pool = null, preopen = "/data", env = {}, clock = new Clock()} = {}) {
+    this.clock = clock;
     this.pool = pool;
     this.preopen = preopen;
     this.env = Object.entries(env).map(([k, v]) => `${k}=${v}`);
@@ -199,7 +250,7 @@ export class Wasi {
     this.lines = [];
     this.memory = null;
     // Where the module's yield flag is (ph_yield_flag), and when its next
-    // timer is due (performance.now(); Infinity: none) as of its last park.
+    // timer is due (clock.now(); Infinity: none) as of its last park.
     this.yieldFlag = 0;
     this.nextWake = Infinity;
   }
@@ -234,7 +285,7 @@ export class Wasi {
       for (let i = 0; i < n; i++) out.push([dv.getUint32(ptr + 8 * i, true), dv.getUint32(ptr + 8 * i + 4, true)]);
       return out;
     };
-    const now = id => (id === 0 ? BigInt(Date.now()) * 1000000n : BigInt(Math.round(performance.now() * 1e6)));
+    const now = id => BigInt(Math.round((id === 0 ? this.clock.wall() : this.clock.now()) * 1e6));
     const full = (fd, rel) => {
       const d = this.fds.get(fd);
       return d && d.dir !== undefined ? normalize(d.dir, rel) : null;
@@ -299,7 +350,7 @@ export class Wasi {
             t = dv.getBigUint64(s + 24, true),
             abs = dv.getUint16(s + 40, true) & 1;
           const ns = abs ? Number(t - now(id)) : Number(t);
-          wake = Math.min(wake, performance.now() + Math.max(0, ns) / 1e6);
+          wake = Math.min(wake, this.clock.now() + Math.max(0, ns) / 1e6);
         }
         // The module is giving the thread back (ph_run): note when it
         // wants to run again, say so (the flag's second byte), wait for
@@ -309,7 +360,7 @@ export class Wasi {
           this.nextWake = wake;
           b()[this.yieldFlag + 1] = 1;
         } else if (wake !== Infinity)
-          while (performance.now() < wake) {
+          while (this.clock.now() < wake) {
             /* spin */
           }
         for (let i = 0; i < nsubs; i++) {

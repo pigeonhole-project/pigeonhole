@@ -47,6 +47,9 @@ pub fn parse_config_as(text: &str, node: u64) -> Result<Config> {
 pub struct World {
     pub fakes: Arc<pigeonhole_fake_channels::World>,
     memory: Mutex<HashMap<String, Arc<MemoryBlobStore>>>,
+    /// How long a frame takes over a direct link between the nodes, each
+    /// way (`[fake] link_*` at a boot, changed as they run: the `fake` op).
+    pub link: pigeonhole_storage_api::fake::Latency,
 }
 
 impl World {

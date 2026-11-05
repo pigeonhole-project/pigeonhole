@@ -441,7 +441,7 @@ mod direct {
     #[tokio::test]
     async fn a_direct_pair_and_a_chat_node_make_one_cluster() {
         let (direct, chat) = (Direct::<TypeConfig>::new(), FakeChat::new());
-        direct.set_delay(Some(Duration::from_millis(5)));
+        direct.set_delay(Some((Duration::from_millis(5), Duration::from_millis(5))));
         let often = MetaOptions { snapshot_every: Some(4), keep_snapshots: 1, ..opts() };
         let started =
             futures::future::join_all(MEMBERS.map(|id| node_on(direct.clone(), chat.clone(), id, often.clone()))).await;

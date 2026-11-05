@@ -7,7 +7,7 @@ description = "What a pigeonhole store implements: BlobBackend, Sweepable, Chain
 
 [features]
 # Fake channels' state and hosts (crate::fake): tests, the site's demo.
-fake = []
+fake = ["dep:tokio", "dep:tracing"]
 # A recording store and the checks that a decorator forwards every method
 # (crate::conformance): decorators' tests.
 conformance = []
@@ -20,6 +20,8 @@ futures = { workspace = true }
 lru = { workspace = true }
 pigeonhole-types = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
