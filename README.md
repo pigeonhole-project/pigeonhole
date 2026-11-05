@@ -175,7 +175,7 @@ Everything else: [cluster.md](docs/cluster.md).
   Tested in process over gRPC (`gateway-bytestream/tests/reapi.rs`: writes,
   reads, ranges, wrong bytes, ActionCache round trip), not yet with a real
   Bazel build.
-- **Demos.** etcd and SQLite running on a Telegram channel through S3
+- **Demos.** etcd, SQLite and SlateDB running on a Telegram channel through S3
   conditional writes: [demos/](demos/README.md).
 
 ## S3 support

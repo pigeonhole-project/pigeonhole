@@ -3,6 +3,10 @@
 # pinned third-party binaries. Sourced, not run.
 #
 #   DEMO_BACKEND=disk   (default) local disk, no secrets
+#   DEMO_BACKEND=memory the same in memory: gone when pigeonhole stops
+#   DEMO_BACKEND=fake   as `chats`, on fake channels pigeonhole keeps itself
+#                       (a build with `--features fake`): the send limits of
+#                       real bots, 40-120 ms per call, no network, no secrets
 #   DEMO_BACKEND=chats  metadata log + snapshots in the Discord test channels
 #                       (DISCORD_{LOG,SNAP}_CHANNEL_ID), objects in the Telegram
 #                       one (TG_BLOBS_CHAT_ID); secrets from the repo .env
@@ -115,12 +119,16 @@ pigeonhole_up() {
   STATE="$ROOT/.cache/demos/$name"
   pigeonhole_down
   rm -rf "$STATE" && mkdir -p "$STATE"
-  (cd "$ROOT" && cargo build -q --release -p pigeonhole)
+  local features=()
+  [[ "$DEMO_BACKEND" == fake ]] && features=(--features fake)
+  (cd "$ROOT" && cargo build -q --release -p pigeonhole ${features[@]+"${features[@]}"})
   case "$DEMO_BACKEND" in
     disk) write_disk_config ;;
+    memory) write_memory_config ;;
+    fake) write_fake_config ;;
     chats) chats_before; write_chats_config telegram ;;
     discord) write_chats_config discord ;;
-    *) echo "DEMO_BACKEND: disk | chats | discord" >&2; exit 2 ;;
+    *) echo "DEMO_BACKEND: disk | memory | fake | chats | discord" >&2; exit 2 ;;
   esac
   cat >>"$STATE/pigeonhole.toml" <<EOF
 
@@ -166,6 +174,69 @@ snapshot = "meta"
 
 [chunk]
 store = "blobs"
+EOF
+}
+
+write_memory_config() {
+  cat >"$STATE/pigeonhole.toml" <<EOF
+listen_addr = "$S3_ADDR"
+
+[[store]]
+id = "meta"
+kind = "memory"
+
+[[store]]
+id = "blobs"
+kind = "memory"
+
+[meta]
+log = "meta"
+snapshot = "meta"
+
+[chunk]
+store = "blobs"
+EOF
+}
+
+# As write_chats_config telegram, on fake channels kept under $STATE/channels:
+# the log and snapshots in two Discord channels, objects in a Telegram one.
+write_fake_config() {
+  cat >"$STATE/pigeonhole.toml" <<EOF
+listen_addr = "$S3_ADDR"
+
+[[store]]
+id = "channels"
+kind = "local_disk"
+path = "$STATE/channels"
+
+[[store]]
+id = "dc-log"
+kind = "discord"
+channel_id = 1001
+fake = "channels"
+
+[[store]]
+id = "dc-snap"
+kind = "discord"
+channel_id = 1002
+fake = "channels"
+
+[[store]]
+id = "blobs"
+kind = "telegram"
+chat_id = -1003
+fake = "channels"
+
+[meta]
+log = "dc-log"
+snapshot = "dc-snap"
+
+[chunk]
+store = "blobs"
+
+[fake]
+latency_min = "40ms"
+latency_max = "120ms"
 EOF
 }
 
@@ -233,7 +304,7 @@ chats_before() {
 }
 
 chats_after() {
-  [[ "$DEMO_BACKEND" == disk ]] && return 0
+  [[ "$DEMO_BACKEND" == chats || "$DEMO_BACKEND" == discord ]] || return 0
   say "cleaning up the chat channels"
   [[ "$DEMO_BACKEND" == chats ]] && (cd "$ROOT" && TG_BENCH=clean cargo test -q -p pigeonhole-storage-telegram --test live bench_window -- --ignored --nocapture) \
     | grep -E 'deleted' || true

@@ -16,14 +16,23 @@ everything on exit.
 | [conditional-writes](conditional-writes/) | `If-None-Match` / `If-Match` by curl; ten writers race for one key, one wins |
 | [etcd-on-telegram](etcd-on-telegram/) (best with `discord`) | an etcd cluster (T4) whose state lives in pigeonhole: election, txn, leases, `kill -9` of the leader and a takeover |
 | [sqlite-on-telegram](sqlite-on-telegram/) | a SQLite database streamed into pigeonhole by Litestream, deleted, restored, and restored as of a past moment |
+| [slatedb-on-telegram](slatedb-on-telegram/) | SlateDB (an LSM tree on object storage) in a bucket: a writer killed with `-9`, a second writer fencing the first, compaction, a clone from a checkpoint |
 
 ## Where the bytes go
 
 ```
 ./demos/<demo>/run.sh                         # local disk, no secrets
+DEMO_BACKEND=memory ./demos/<demo>/run.sh     # memory, no secrets
+DEMO_BACKEND=fake ./demos/<demo>/run.sh       # fake Discord + Telegram channels, no secrets
 DEMO_BACKEND=chats ./demos/<demo>/run.sh      # metadata in Discord, objects in Telegram
 DEMO_BACKEND=discord ./demos/<demo>/run.sh    # all of it in Discord
 ```
+
+`fake` lays the metadata and objects out as `chats` does, on fake channels
+that pigeonhole keeps itself (a build with `--features fake`): each fake
+bot's call takes 40–120 ms and is held to the send limits pigeonhole keeps
+for a real bot, so a Telegram channel's ~20 posts a minute show, without
+the network or a bot.
 
 With `chats` and `discord`, pigeonhole's metadata log and snapshots go to
 the Discord test channels (`DISCORD_LOG_CHANNEL_ID`,
