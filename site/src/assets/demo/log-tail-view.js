@@ -1,20 +1,22 @@
 // The node's log, live, in a panel under the town: every line the wasm
 // writes (log-tail.js keeps them), in a terminal (xterm.js, vendor/xterm,
-// MIT: loaded the first time the panel opens), with the lowest level shown,
-// a search, and the lines kept to clear or download.
+// MIT: loaded the first time the panel opens): any of the levels and any
+// of the components (the crates) hidden or shown, a search, and the lines
+// kept to clear or download. What is hidden is kept in this browser.
 //
 // makeLogPanel(el, node, onShown): `el` the panel (empty), `node` the
 // demo's (node.js onLog); onShown(open) as it opens or closes. Returns
 // {toggle(), close(), isOpen()}.
 import {button, h} from "../lib/dom.js";
 import {t} from "../lib/i18n.js";
-import {format, jsonl, makeTail, passes} from "./log-tail.js";
+import {componentOf, counts, format, jsonl, LEVELS, makeTail, short, shows} from "./log-tail.js";
 import {settings} from "./settings.js";
 
 // The assets' version (?v=…), for the vendored modules as for this one.
 const V = new URL(import.meta.url).search;
 const vendor = name => new URL(`../vendor/xterm/${name}${V}`, import.meta.url).href;
-const SHOWN = ["DEBUG", "INFO", "WARN"]; // the lowest level a reader picks
+const ORDER = [...LEVELS].reverse(); // the levels' toggles: ERROR first
+const KEPT = "ph-log-hidden"; // localStorage: {levels: [...], components: [...]}
 
 // xterm.js and its add-ons, and its stylesheet, once.
 let loaded = null;
@@ -36,19 +38,41 @@ function theme() {
   return {background: v("--plume"), foreground: v("--wing"), selectionBackground: v("--slate-2"), cursor: v("--plume")};
 }
 
+// What was hidden last time, else nothing.
+function hiddenKept() {
+  try {
+    const k = JSON.parse(localStorage.getItem(KEPT) || "{}");
+    return {levels: new Set(k.levels || []), components: new Set(k.components || [])};
+  } catch {
+    return {levels: new Set(), components: new Set()};
+  }
+}
+function keep(hidden) {
+  try {
+    localStorage.setItem(KEPT, JSON.stringify({levels: [...hidden.levels], components: [...hidden.components]}));
+  } catch {
+    // A browser that keeps nothing: hidden for this page only.
+  }
+}
+
 export function makeLogPanel(el, node, onShown = () => {}) {
   const tail = makeTail(() => settings.logLines);
-  let level = "DEBUG",
-    term = null,
+  const hidden = hiddenKept();
+  let term = null,
     fit = null,
     search = null,
     queue = [], // lines kept, not written to the terminal yet
-    frame = 0;
+    frame = 0,
+    known = ""; // the components and levels the bar shows, as a key
 
-  // The panel: its bar, then the terminal.
-  const levels = h("select", "log-level");
-  for (const l of SHOWN) levels.append(Object.assign(h("option", "", t(`log.level_${l.toLowerCase()}`)), {value: l}));
-  levels.setAttribute("aria-label", t("log.level"));
+  // The bar: the levels' and the components' menus, the search, the rest.
+  const levels = checklist(
+    hidden.levels,
+    (shown, all) => t("log.levels", {shown, all}),
+    l => l,
+    l => `log-lvl ${l.toLowerCase()}`,
+  );
+  const components = checklist(hidden.components, (shown, all) => t("log.components", {shown, all}), short);
   const find = Object.assign(h("input", "log-find"), {type: "search", placeholder: t("log.search")});
   find.setAttribute("aria-label", t("log.search"));
   const count = h("span", "log-count");
@@ -56,7 +80,8 @@ export function makeLogPanel(el, node, onShown = () => {}) {
   const bar = h("div", "log-bar");
   bar.append(
     h("strong", "", t("log.title")),
-    levels,
+    levels.el,
+    components.el,
     find,
     button("btn mini", "↑", () => search?.findPrevious(find.value)),
     button("btn mini", "↓", () => search?.findNext(find.value)),
@@ -66,23 +91,104 @@ export function makeLogPanel(el, node, onShown = () => {}) {
     button("btn mini", "×", () => close()),
   );
   el.append(bar, screen);
+  // A click elsewhere closes an open menu.
+  document.addEventListener("click", e => {
+    for (const m of [levels, components]) if (m.isOpen() && !e.composedPath().includes(m.el)) m.shut();
+  });
 
-  const shownCount = () => {
-    count.textContent = t("log.count", {n: tail.lines().length});
-  };
+  // A drop-down list with a check box per value (a level, a component) and
+  // how many lines have it; unchecked: in `off`, its lines hidden. `title(shown,
+  // all)` names it; `name(value)` and `cls(value)` a row.
+  function checklist(off, title, name, cls = () => "") {
+    const el = h("details", "log-menu");
+    const summary = h("summary", "btn mini");
+    const list = h("div", "log-menu-list");
+    el.append(summary, list);
+    const changed = () => {
+      keep(hidden);
+      drawBar();
+      rewrite();
+    };
+    let values = [];
+    return {
+      el,
+      // The values and their counts (a Map), as the lines kept have them.
+      update(byValue, rows) {
+        values = [...byValue.keys()];
+        summary.textContent = title(values.filter(v => !off.has(v)).length, values.length);
+        if (!rows) {
+          for (const row of list.querySelectorAll("label[data-value]")) {
+            row.querySelector("input").checked = !off.has(row.dataset.value);
+            row.querySelector("small").textContent = String(byValue.get(row.dataset.value) ?? 0);
+          }
+          return;
+        }
+        const all = h("div", "row");
+        all.append(
+          button("btn mini", t("log.all"), () => {
+            off.clear();
+            changed();
+          }),
+          button("btn mini", t("log.none"), () => {
+            for (const v of values) off.add(v);
+            changed();
+          }),
+        );
+        list.replaceChildren(
+          all,
+          ...[...byValue].map(([v, n]) => {
+            const box = Object.assign(h("input"), {type: "checkbox", checked: !off.has(v)});
+            box.addEventListener("change", () => {
+              if (box.checked) off.delete(v);
+              else off.add(v);
+              changed();
+            });
+            const label = h("label", `log-menu-row ${cls(v)}`);
+            label.title = v;
+            label.dataset.value = v;
+            label.append(box, ` ${name(v)} `, h("small", "", String(n)));
+            return label;
+          }),
+        );
+      },
+      isOpen: () => el.open,
+      shut() {
+        el.open = false;
+      },
+    };
+  }
+
+  // The menus as the lines kept count them: their rows drawn anew when
+  // `force`, or a level or a component first seen; else their counts.
+  function drawBar(force = false) {
+    const lines = tail.lines();
+    const byLevel = counts(
+      lines,
+      l => l.level,
+      ORDER.filter(l => l !== "TRACE"),
+    );
+    const byComponent = counts(lines, componentOf);
+    const key = [...byLevel.keys(), "|", ...byComponent.keys()].join(" ");
+    count.textContent = t("log.count", {n: lines.length});
+    const rows = force || key !== known;
+    known = key;
+    levels.update(byLevel, rows);
+    components.update(byComponent, rows);
+  }
+
   // What came since the last frame, written at once.
   function flush() {
     frame = 0;
-    shownCount();
+    drawBar();
     if (!term || el.hidden || !queue.length) return;
-    const lines = queue.filter(l => passes(l, level));
+    const lines = queue.filter(l => shows(l, hidden));
     queue = [];
     if (lines.length) term.write(`${lines.map(l => format(l)).join("\r\n")}\r\n`);
   }
   const later = () => {
     if (!frame) frame = requestAnimationFrame(flush);
   };
-  // Every line kept again, at the level now picked.
+  // Every line kept again, as the toggles now hide them.
   function rewrite() {
     if (!term) return;
     term.reset();
@@ -98,10 +204,6 @@ export function makeLogPanel(el, node, onShown = () => {}) {
     later();
   });
 
-  levels.addEventListener("change", () => {
-    level = levels.value;
-    rewrite();
-  });
   find.addEventListener("keydown", e => {
     if (e.key === "Enter") (e.shiftKey ? search?.findPrevious : search?.findNext)?.call(search, find.value);
   });
@@ -114,7 +216,7 @@ export function makeLogPanel(el, node, onShown = () => {}) {
     queue = [];
     term?.reset();
     term?.write("\x1b[?25l");
-    shownCount();
+    drawBar(true);
   }
   function download() {
     const a = h("a");
@@ -127,6 +229,7 @@ export function makeLogPanel(el, node, onShown = () => {}) {
   async function open() {
     el.hidden = false;
     onShown(true);
+    drawBar(true);
     const {Terminal, FitAddon, SearchAddon} = await load();
     if (!term) {
       const font = getComputedStyle(document.documentElement).getPropertyValue("--mono").trim();
@@ -156,6 +259,8 @@ export function makeLogPanel(el, node, onShown = () => {}) {
   }
   function close() {
     el.hidden = true;
+    levels.shut();
+    components.shut();
     onShown(false);
   }
 

@@ -5,7 +5,6 @@
 // from (the target, its spans), the message, its fields. Pure: no DOM.
 
 export const LEVELS = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
-const rank = level => Math.max(0, LEVELS.indexOf(level));
 
 // The last `max()` lines (max: a function, a setting that may change).
 export function makeTail(max) {
@@ -22,8 +21,23 @@ export function makeTail(max) {
   };
 }
 
-// Line `l` is at level `level` or above.
-export const passes = (l, level) => rank(l.level) >= rank(level);
+// The component a line comes from: its target's crate ("pigeonhole_meta").
+export const componentOf = l => (l.target || "").split("::")[0] || "?";
+// A component as the panel names it: without the project's prefix.
+export const short = c => c.replace(/^pigeonhole_/, "");
+
+// What the panel hides: {levels: Set, components: Set}; a line shows
+// unless its level or its component is hidden.
+export const shows = (l, hidden) => !hidden.levels.has(l.level) && !hidden.components.has(componentOf(l));
+
+// How many lines of each value `key(line)` gives: Map(value → n), the
+// values in `order` first, then the rest by name.
+export function counts(lines, key, order = []) {
+  const n = new Map(order.map(k => [k, 0]));
+  for (const l of lines) n.set(key(l), (n.get(key(l)) ?? 0) + 1);
+  const rest = [...n.keys()].filter(k => !order.includes(k)).sort();
+  return new Map([...order, ...rest].map(k => [k, n.get(k)]));
+}
 
 // ANSI's SGR: what the terminal (xterm.js) colours a piece with.
 const SGR = {dim: "2", red: "31", yellow: "33", green: "32", blue: "34", magenta: "35", cyan: "36"};

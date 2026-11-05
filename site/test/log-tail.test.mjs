@@ -2,7 +2,7 @@
 // a level filter, each line as text.
 import assert from "node:assert/strict";
 import {test} from "node:test";
-import {format, jsonl, makeTail, passes} from "../src/assets/demo/log-tail.js";
+import {componentOf, counts, format, jsonl, makeTail, short, shows} from "../src/assets/demo/log-tail.js";
 
 const line = {
   timestamp: "2026-11-05T12:03:41.2071Z",
@@ -25,10 +25,26 @@ test("tail: the last `max` lines, the oldest gone first; cleared", () => {
   assert.deepEqual(tail.lines(), []);
 });
 
-test("passes: a line at the level picked or above", () => {
-  assert.equal(passes({level: "WARN"}, "INFO"), true);
-  assert.equal(passes({level: "DEBUG"}, "INFO"), false);
-  assert.equal(passes({level: "ERROR"}, "WARN"), true);
+test("shows: a line shows unless its level or its component is hidden", () => {
+  const hidden = {levels: new Set(["DEBUG"]), components: new Set(["openraft_chat"])};
+  assert.equal(shows({level: "INFO", target: "pigeonhole_meta::log"}, hidden), true);
+  assert.equal(shows({level: "DEBUG", target: "pigeonhole_meta"}, hidden), false, "its level hidden");
+  assert.equal(shows({level: "WARN", target: "openraft_chat::network"}, hidden), false, "its component hidden");
+  assert.equal(componentOf({target: "pigeonhole_blob::metrics"}), "pigeonhole_blob");
+  assert.equal(short("pigeonhole_blob"), "blob");
+});
+
+test("counts: the values in the order given first (none: 0), then the rest by name", () => {
+  const lines = [{level: "INFO"}, {level: "DEBUG"}, {level: "INFO"}, {level: "TRACE"}];
+  assert.deepEqual(
+    [...counts(lines, l => l.level, ["ERROR", "INFO"])],
+    [
+      ["ERROR", 0],
+      ["INFO", 2],
+      ["DEBUG", 1],
+      ["TRACE", 1],
+    ],
+  );
 });
 
 test("format: time, level, where it comes from, message, fields; plain or coloured", () => {
