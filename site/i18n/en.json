@@ -499,7 +499,7 @@
   "js.set.latencyMin": "A channel's answer, at least",
   "js.set.latencyMin_note": "Every call a bot makes to a fake Telegram or Discord channel (a post, a read, a delete, an outbox's frame reaching a node) takes between these, as a real one does: its pigeon flies that long.",
   "js.set.latencyMax": "A channel's answer, at most",
-  "js.set.latencyMax_note": "0 for both: the channels answer at once, and the pigeons only show that something happened.",
+  "js.set.latencyMax_note": "0 for both: the channels answer at once, and the pigeons only show that something happened. Over the chat a Raft frame's round trip is four answers (the frame posted, it reaching the follower, the answer posted, it reaching the leader): past the heartbeat (1 s in the demo's cluster) the leader's AppendEntries time out, and the node's log says so.",
   "js.set.linkMin": "A direct link, at least",
   "js.set.linkMin_note": "A Raft frame between two nodes over a direct (gRPC) link, each way.",
   "js.set.linkMax": "A direct link, at most",
