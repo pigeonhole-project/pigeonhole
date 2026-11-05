@@ -113,6 +113,17 @@ leader_of() {
   exit 1
 }
 
+# Node $1's HTTP code for path $2, once it listens (it may still be booting).
+code_of() {
+  local deadline=$((SECONDS + ${LEADER_WAIT:-30})) code
+  while ((SECONDS < deadline)); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(s3_port "$1")$2" || true)
+    [[ "$code" != 000 ]] && { echo "$code"; return; }
+    sleep 0.2
+  done
+  echo 000
+}
+
 s3() { aws --endpoint-url "http://127.0.0.1:$(s3_port "$1")" s3 "${@:2}"; }
 
 for n in 1 2 3; do start "$n"; done
@@ -120,7 +131,7 @@ T=$SECONDS
 L=$(leader_of 1 2 3)
 echo "leader: node $L ($((SECONDS - T)) s after the start)"
 F=$(( L % 3 + 1 ))
-code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(s3_port "$F")/demo")
+code=$(code_of "$F" /demo)
 [[ "$code" == 503 ]] || { echo "a follower answered $code, not 503" >&2; exit 1; }
 
 head -c 3000000 /dev/urandom >"$DIR/one.bin"
@@ -142,7 +153,7 @@ echo "read one.bin back and wrote two.bin through node $N ($((SECONDS - T)) s fo
 
 start "$L"
 sleep 3
-code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(s3_port "$L")/_pigeonhole/leader")
+code=$(code_of "$L" /_pigeonhole/leader)
 [[ "$code" == 503 ]] || { echo "the restarted node answered $code: it should follow" >&2; exit 1; }
 s3 "$N" ls s3://demo/ | grep -q two.bin
 echo "node $L rejoined as a follower; cluster smoke ok"
