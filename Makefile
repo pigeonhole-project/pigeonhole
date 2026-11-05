@@ -100,12 +100,13 @@ arch:
 		|| { echo "backend identifiers outside the stores, the config and the binary" >&2; exit 1; }
 
 # The components and the dependencies between them, as easement sees them,
-# a Mermaid graph in target/arch.md (GitHub and most editors draw it). The
-# whole graph is dense; FOCUS=<component> draws one and its neighbours:
+# a Mermaid graph in target/arch.md (GitHub and most editors draw it): the
+# core, without the composition roots and the tests (HIDE in
+# scripts/arch-graph.sh), or FOCUS=<component> and its neighbours:
 # `make arch-graph FOCUS=stores`.
 arch-graph:
 	@mkdir -p target
-	@{ printf '```mermaid\n'; easement graph $(if $(FOCUS),--focus $(FOCUS)); printf '```\n'; } > target/arch.md
+	@scripts/arch-graph.sh $(FOCUS) > target/arch.md
 	@echo "target/arch.md"
 
 # Size, complexity hotspots and the trait graph (Mermaid) → target/code-report.md.
