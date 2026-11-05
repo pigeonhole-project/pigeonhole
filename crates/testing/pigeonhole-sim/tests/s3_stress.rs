@@ -284,14 +284,14 @@ fn member(id: &str, plan: FaultPlan) -> Arc<Faulty<MemoryBlobStore>> {
     Arc::new(Faulty::new(Arc::new(MemoryBlobStore::new().with_instance_id(id)), plan))
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn s3_under_store_faults_keeps_objects_whole_and_reclaims_garbage() {
     run(vec![member("a", FaultPlan::mild())], false).await;
 }
 
 /// Two members, one failing: the repairer fills in what the writes missed
 /// while the node is killed mid-run and reopened.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_node_killed_mid_run_reopens_and_goes_on() {
     run(vec![member("a", FaultPlan::mild()), member("b", FaultPlan::none())], true).await;
 }
@@ -301,7 +301,7 @@ async fn a_node_killed_mid_run_reopens_and_goes_on() {
 /// a read tries first is the selector's coin, so at the end one object has
 /// its copy on `a` damaged on purpose: read from `a` alone it is refused,
 /// never served, and a GET reads around it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_damaged_replica_is_read_around() {
     let damaged = FaultPlan { corrupt: 0.3, ..FaultPlan::mild() };
     let members = vec![member("a", damaged), member("b", FaultPlan::none())];
@@ -374,7 +374,7 @@ async fn inline_writer(s3: Arc<S3Gateway>, id: u64, keys: Vec<String>) -> BTreeM
 /// falls. Checked: the race did happen (some moves rejected), a pass once
 /// the writes stop moves out all that is left, every key holds its last
 /// write, and every live chunk is pointed at.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_cooler_never_loses_a_rewrite_or_leaks_a_chunk() {
     let slow = FaultPlan { delay: 0.5, max_delay: Duration::from_millis(30), ..FaultPlan::none() };
     let members = vec![member("a", slow)];
