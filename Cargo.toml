@@ -126,9 +126,9 @@ pigeonhole-fake-channels = { path = "crates/testing/pigeonhole-fake-channels" }
 [patch.crates-io]
 openraft = { git = "https://github.com/pigeonhole-project/openraft", rev = "c47c09f4139bc529fc72c8e539232c4a961029c4" }
 tokio = { git = "https://github.com/pigeonhole-project/tokio", rev = "616d697a42270254fa5969e29985ddd23b9f2bd0" }
-grammers-mtsender = { git = "https://codeberg.org/wo1f/grammers", rev = "289ca13b1a6f2636897817c971b24ffb252838de" }
-grammers-session = { git = "https://codeberg.org/wo1f/grammers", rev = "289ca13b1a6f2636897817c971b24ffb252838de" }
-grammers-tl-types = { git = "https://codeberg.org/wo1f/grammers", rev = "289ca13b1a6f2636897817c971b24ffb252838de" }
+grammers-mtsender = { git = "https://codeberg.org/wo1f/grammers", rev = "06f200ef826e8c694436373c1d83be0f427692cf" }
+grammers-session = { git = "https://codeberg.org/wo1f/grammers", rev = "06f200ef826e8c694436373c1d83be0f427692cf" }
+grammers-tl-types = { git = "https://codeberg.org/wo1f/grammers", rev = "06f200ef826e8c694436373c1d83be0f427692cf" }
 
 # `--cfg madsim` builds the simulation (docs/simulation.md).
 [workspace.lints.rust]
