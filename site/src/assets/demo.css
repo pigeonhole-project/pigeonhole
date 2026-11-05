@@ -108,10 +108,23 @@ code, .mono { font-family: var(--mono); font-size: 0.9em; }
 .credit { position: absolute; right: 16px; bottom: 8px; margin: 0; padding: 2px 8px; border-radius: 6px; background: var(--plume); color: var(--slate); font-size: 11.5px; }
 .credit a { color: inherit; }
 .loft.zoomed .credit { display: none; }
+.foot { display: flex; align-items: flex-start; gap: 16px; border-top: 1px solid var(--line); }
 .caption {
-  margin: 0; padding: 12px 24px 16px; min-height: 52px; border-top: 1px solid var(--line);
+  margin: 0; padding: 12px 24px 16px; min-height: 52px; flex: 1;
   color: var(--wing-2); max-width: 80ch;
 }
+.log-toggle { margin: 10px 24px 0 auto; flex: none; font-size: 13px; padding: 6px 12px; }
+.log-toggle[aria-pressed="true"] { border-color: var(--wing); }
+
+/* the node's log (log-tail-view.js): a terminal under the town */
+.node-log { height: 36vh; min-height: 120px; resize: vertical; overflow: hidden; display: flex; flex-direction: column; border-top: 1px solid var(--line); background: var(--plume); }
+.node-log[hidden] { display: none; }
+.log-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.log-bar .btn.mini { padding: 3px 9px; font-size: 13px; }
+.log-level, .log-find { font: inherit; font-size: 13px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--feather); color: inherit; }
+.log-find { width: 16em; }
+.log-count { color: var(--slate); margin-left: auto; font-family: var(--mono); font-size: 12px; }
+.log-screen { flex: 1; min-height: 0; padding: 4px 0 0 8px; }
 .caption b { color: var(--wing); font-weight: 600; }
 
 /* graph: the town (graph.js, art.js) */

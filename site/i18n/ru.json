@@ -527,5 +527,17 @@
   "js.set.linkMin": "Прямая связь, не меньше",
   "js.set.linkMin_note": "Кадр Raft между двумя узлами по прямой (gRPC) связи, в каждую сторону.",
   "js.set.linkMax": "Прямая связь, не больше",
-  "js.set.linkMax_note": "Поднимите выше таймаута выборов — и кластер потеряет лидера."
+  "js.set.linkMax_note": "Поднимите выше таймаута выборов — и кластер потеряет лидера.",
+  "js.log.open": "Лог узла",
+  "js.log.title": "Лог узла",
+  "js.log.level": "Самый низкий уровень",
+  "js.log.level_debug": "debug и выше",
+  "js.log.level_info": "info и выше",
+  "js.log.level_warn": "предупреждения и ошибки",
+  "js.log.search": "Найти (Enter — дальше, Shift+Enter — назад)",
+  "js.log.clear": "Очистить",
+  "js.log.download": "Скачать .jsonl",
+  "js.log.count": "строк: {n}",
+  "js.set.logLines": "Строк лога узла хранить",
+  "js.set.logLines_note": "Панель лога (кнопка под городом) хранит столько последних строк узла; старые уходят первыми."
 }

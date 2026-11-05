@@ -25,6 +25,7 @@ export const KNOBS = [
   {key: "queueShown", group: "town", def: 12, min: 0, max: 60, step: 1, redraw: true},
   {key: "jobsShown", group: "town", def: 40, min: 0, max: 500, step: 1},
   {key: "chronicle", group: "town", def: 100, min: 1, max: 1000, step: 1},
+  {key: "logLines", group: "page", def: 5000, min: 500, max: 50000, step: 500},
   {key: "pollMs", group: "page", def: 1000, min: 200, max: 10000, step: 100, unit: "ms", timer: true},
   {key: "clockMs", group: "page", def: 100, min: 20, max: 2000, step: 10, unit: "ms", timer: true},
 ];
