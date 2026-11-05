@@ -29,7 +29,6 @@ members = [
     "crates/node/pigeonhole-node",
 ]
 default-members = ["crates/bin/pigeonhole"]
-exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -115,17 +114,21 @@ pigeonhole-gateway-bytestream = { path = "crates/gateway/pigeonhole-gateway-byte
 pigeonhole-testkit = { path = "crates/testing/pigeonhole-testkit" }
 pigeonhole-fake-channels = { path = "crates/testing/pigeonhole-fake-channels" }
 
-# A request nobody awaits any more is not sent (vendor/grammers-mtsender/VENDORED.md).
-[patch.crates-io]
-grammers-mtsender = { path = "vendor/grammers-mtsender" }
 # Forks with a commit on top, branch `pigeonhole`, rebased on each update:
 # openraft 0.9.25 without tokio's rt-multi-thread, which wasm cannot have and
 # openraft does not use; tokio 1.54.1 with a per-thread RNG seed madsim can
-# reproduce (select!, watch), outside the simulation unchanged. Git, not
-# vendor/: a path crate builds incrementally, which sccache does not cache,
-# and everything above tokio with it.
+# reproduce (select!, watch), outside the simulation unchanged; grammers
+# 0.11.0 whose mtsender does not send a request nobody awaits any more
+# (docs/telegram-mtproto.md), its three crates we use from the one commit (the
+# fork's path dependencies would otherwise be a second copy of the others).
+# Git, not vendor/: a path crate builds incrementally, which sccache does not
+# cache, and everything above tokio with it.
+[patch.crates-io]
 openraft = { git = "https://github.com/pigeonhole-project/openraft", rev = "c47c09f4139bc529fc72c8e539232c4a961029c4" }
 tokio = { git = "https://github.com/pigeonhole-project/tokio", rev = "616d697a42270254fa5969e29985ddd23b9f2bd0" }
+grammers-mtsender = { git = "https://codeberg.org/wo1f/grammers", rev = "289ca13b1a6f2636897817c971b24ffb252838de" }
+grammers-session = { git = "https://codeberg.org/wo1f/grammers", rev = "289ca13b1a6f2636897817c971b24ffb252838de" }
+grammers-tl-types = { git = "https://codeberg.org/wo1f/grammers", rev = "289ca13b1a6f2636897817c971b24ffb252838de" }
 
 # `--cfg madsim` builds the simulation (docs/simulation.md).
 [workspace.lints.rust]

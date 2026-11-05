@@ -326,8 +326,9 @@ Where the code differs from the design above, and why:
 - **No grammers-client**: only `grammers-mtsender`, `grammers-session` (no
   SQLite) and `grammers-tl-types`; the session is a JSON file of the home DC
   and auth keys, 0600, locked.
-- **The grammers patch** is applied to a vendored copy
-  (`vendor/grammers-mtsender`, `[patch.crates-io]`): a request whose caller
+- **The grammers patch** is a commit on our fork of grammers 0.11.0
+  (codeberg.org/wo1f/grammers, branch `pigeonhole`, through
+  `[patch.crates-io]` for the three grammers crates we use): a request whose caller
   is gone is dropped in the pool runner (before and after connecting), when
   the connection task takes it, and in `try_fill_write` before it is
   serialized. A unit test covers the last; a live test
@@ -406,7 +407,7 @@ Each step ends with `cargo test --workspace` and
 2. ✅ (without the grammers patch) **Crate** `pigeonhole-storage-telegram-mtproto`
    (since split into `pigeonhole-telegram-mtproto` and
    `pigeonhole-storage-telegram`). First a patched
-   grammers-mtsender (`[patch.crates-io]` to a vendored 0.11.0 copy, and the
+   grammers-mtsender (`[patch.crates-io]` to a vendored 0.11.0 copy, since a fork; the
    same change offered upstream on codeberg): `try_fill_write` drops requests
    whose result receiver is closed before serializing them, and
    `process_request` / `run_sender` do not enqueue one whose `tx` is already

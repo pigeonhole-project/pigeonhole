@@ -908,7 +908,7 @@ mod tests {
 }
 
 /// Live: is a `sendMedia` whose caller gave up before it was written posted
-/// anyway? Without the vendored grammers-mtsender patch it is (the request is
+/// anyway? Without our grammers-mtsender patch it is (the request is
 /// queued and goes out when its turn comes); with it, it must not be.
 /// `cargo test -p pigeonhole-storage-telegram --lib abandoned -- --ignored --nocapture`
 /// with `TG_BOT_TOKEN`, `TG_API_ID`, `TG_API_HASH`, `TG_BLOBS_CHAT_ID` in `.env`.
