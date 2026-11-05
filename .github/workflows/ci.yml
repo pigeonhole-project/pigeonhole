@@ -48,8 +48,11 @@ jobs:
         with:
           tool: cargo-deny,cargo-machete,shellcheck,typos
       - name: Install easement
-        run: cargo install --locked easement --version 0.4.10
+        run: cargo install --locked easement --version 0.4.14
       - run: make gates
+      # The crates' graph as easement sees it, drawn in the run's summary.
+      - name: Components graph
+        run: make arch-graph && cat target/arch.md >> "$GITHUB_STEP_SUMMARY"
 
   site:
     name: site JavaScript (biome, node --test)

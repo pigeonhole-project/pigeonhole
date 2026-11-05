@@ -1,4 +1,4 @@
-.PHONY: web web-smoke lint-js test-js cluster-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all arch report lint gates
+.PHONY: web web-smoke lint-js test-js cluster-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all arch arch-graph report lint gates
 
 run:
 	cargo run --release
@@ -93,11 +93,20 @@ test:
 # Which crate may depend on which, read from their manifests (easement.yml);
 # and the backends' identifiers stay in the stores, the config and the
 # binary. `brew install mokevnin/tap/easement` or
-# `cargo install --locked easement --version 0.4.10` (CI's).
+# `cargo install --locked easement --version 0.4.14` (CI's).
 arch:
 	easement check
 	@! git grep -nwE 'file_id|chat_id|channel_id' -- 'crates/*.rs' ':!crates/storage' ':!crates/bin' ':!crates/config' \
 		|| { echo "backend identifiers outside the stores, the config and the binary" >&2; exit 1; }
+
+# The components and the dependencies between them, as easement sees them,
+# a Mermaid graph in target/arch.md (GitHub and most editors draw it). The
+# whole graph is dense; FOCUS=<component> draws one and its neighbours:
+# `make arch-graph FOCUS=stores`.
+arch-graph:
+	@mkdir -p target
+	@{ printf '```mermaid\n'; easement graph $(if $(FOCUS),--focus $(FOCUS)); printf '```\n'; } > target/arch.md
+	@echo "target/arch.md"
 
 # Size, complexity hotspots and the trait graph (Mermaid) → target/code-report.md.
 # Needs `cargo install --locked rust-code-analysis-cli`.

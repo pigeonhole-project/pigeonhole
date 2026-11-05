@@ -37,16 +37,23 @@ components:
   raft-grpc: { in: crates/net/openraft-grpc }
   # A Raft outbox in a chat: the Mailbox over a chat store's channel.
   raft-telegram: { in: crates/net/pigeonhole-raft-telegram }
-  # The stores on a channel, each on its own.
+  # The stores on a channel. Every store is an instance of its own: no store
+  # depends on another (`isolated`).
   stores:
-    in:
-      - crates/storage/pigeonhole-storage-telegram
-      - crates/storage/pigeonhole-storage-discord
-  # The stores the node opens itself.
-  local-stores:
-    in:
+    in: "crates/storage/pigeonhole-storage-*"
+    except:
       - crates/storage/pigeonhole-storage-memory
       - crates/storage/pigeonhole-storage-disk
+    isolated: true
+    because: a store knows the storage API, never another store
+  # The stores the node opens itself.
+  local-stores:
+    in: "crates/storage/pigeonhole-storage-*"
+    except:
+      - crates/storage/pigeonhole-storage-telegram
+      - crates/storage/pigeonhole-storage-discord
+    isolated: true
+    because: a store knows the storage API, never another store
   # The network clients a store runs on (its ChannelApi / DiscordApi).
   clients:
     in:
