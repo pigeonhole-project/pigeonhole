@@ -5,16 +5,19 @@
 # GET /_pigeonhole/leader; the leader is killed with -9, a new one serves
 # what the old one wrote, and the killed node rejoins as a follower.
 #
-# CHAT=telegram: node 3 has no gRPC, only a Telegram outbox; 1 and 2 reach
-# it over the chat (live: channels TG_RAFT_OUTBOX_1..3 from .env, each
-# node's own bot RAFT_BOT_TOKEN_<n>, or for nodes 1 and 2 TG_BOT_TOKEN[_2],
-# admin of all three; no two nodes may share one). Telegram paces the whole
+# CHAT=telegram: every node has a Telegram outbox, and the nodes in
+# CHAT_ONLY (default: 3) have no gRPC, so the others reach them over the
+# chat; CHAT_ONLY="1 2 3" runs the whole cluster over Telegram. Live:
+# channels TG_RAFT_OUTBOX_1..3 from .env, each node's own bot
+# RAFT_BOT_TOKEN_<n>, else TG_BOT_TOKEN[_<n>] (TG_BOT_TOKEN for node 1),
+# admin of all three; no two nodes may share one. Telegram paces the whole
 # cluster: elections take a minute or two.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [[ -f "$ROOT/.env" ]]; then set -a; source "$ROOT/.env"; set +a; fi
 CHAT="${CHAT:-}"
+CHAT_ONLY="${CHAT_ONLY:-3}"
 [[ "$CHAT" == telegram ]] && : "${LEADER_WAIT:=300}"
 BIN="${BIN:-$ROOT/target/debug/pigeonhole}"
 export AWS_ACCESS_KEY_ID=pigeonhole AWS_SECRET_ACCESS_KEY=pigeonholesecret AWS_DEFAULT_REGION=us-east-1
@@ -38,9 +41,9 @@ s3_port() { echo $((18330 + $1)); }
 # ':', a Discord token's first part, in base64.
 tg_bot_id() { echo "${1%%:*}"; }
 dc_bot_id() { local p="${1%%.*}"; while (( ${#p} % 4 )); do p+="="; done; printf '%s' "$p" | base64 --decode; }
-bot_of() { # node $1's Raft bot: RAFT_BOT_TOKEN_<n>, else a test bot (1, 2); each node its own
+bot_of() { # node $1's Raft bot: RAFT_BOT_TOKEN_<n>, else test bot TG_BOT_TOKEN[_n]; each node its own
   local var="RAFT_BOT_TOKEN_$1" fallback=""
-  case $1 in 1) fallback="${TG_BOT_TOKEN:-}" ;; 2) fallback="${TG_BOT_TOKEN_2:-}" ;; esac
+  case $1 in 1) fallback="${TG_BOT_TOKEN:-}" ;; *) local tg="TG_BOT_TOKEN_$1"; fallback="${!tg:-}" ;; esac
   local token="${!var:-$fallback}"
   [[ -n "$token" ]] || { echo "set $var in .env: node $1 needs a Raft bot of its own" >&2; exit 1; }
   echo "$token"
@@ -54,7 +57,7 @@ node_conf() { # $1: node id
       local var="TG_RAFT_OUTBOX_$m"
       outbox="outbox = ${!var:?set $var in .env: the Raft outbox channel of node $m}
 bot_ids = [$(tg_bot_id "$(bot_of "$m")")]"
-      [[ $m == 3 ]] && grpc=""
+      [[ " $CHAT_ONLY " == *" $m "* ]] && grpc=""
     fi
     printf '\n[[node]]\nid = %s\n%s\n%s\n' "$m" "$grpc" "$outbox"
   done
@@ -113,25 +116,29 @@ leader_of() {
 s3() { aws --endpoint-url "http://127.0.0.1:$(s3_port "$1")" s3 "${@:2}"; }
 
 for n in 1 2 3; do start "$n"; done
+T=$SECONDS
 L=$(leader_of 1 2 3)
-echo "leader: node $L"
+echo "leader: node $L ($((SECONDS - T)) s after the start)"
 F=$(( L % 3 + 1 ))
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(s3_port "$F")/demo")
 [[ "$code" == 503 ]] || { echo "a follower answered $code, not 503" >&2; exit 1; }
 
 head -c 3000000 /dev/urandom >"$DIR/one.bin"
+T=$SECONDS
 s3 "$L" mb s3://demo >/dev/null
 s3 "$L" cp "$DIR/one.bin" s3://demo/one.bin >/dev/null
-echo "wrote one.bin through node $L"
+echo "wrote one.bin through node $L ($((SECONDS - T)) s)"
 
 kill -9 "${PID[$L]}"; unset "PID[$L]"
 REST=(); for n in 1 2 3; do [[ $n != "$L" ]] && REST+=("$n"); done
+T=$SECONDS
 N=$(leader_of "${REST[@]}")
-echo "node $L killed; new leader: node $N"
+echo "node $L killed; new leader: node $N ($((SECONDS - T)) s)"
 s3 "$N" cp s3://demo/one.bin "$DIR/back.bin" >/dev/null
 cmp "$DIR/one.bin" "$DIR/back.bin"
+T=$SECONDS
 s3 "$N" cp "$DIR/one.bin" s3://demo/two.bin >/dev/null
-echo "read one.bin back and wrote two.bin through node $N"
+echo "read one.bin back and wrote two.bin through node $N ($((SECONDS - T)) s for the write)"
 
 start "$L"
 sleep 3
