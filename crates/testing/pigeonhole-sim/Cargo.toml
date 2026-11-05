@@ -25,6 +25,9 @@ pigeonhole-chunk-store = { workspace = true }
 pigeonhole-gateway-s3 = { workspace = true }
 pigeonhole-testkit = { workspace = true, features = ["s3"] }
 s3s = { workspace = true }
+# The tests on tokio (`make test`) run on a paused clock: what they wait for
+# (a backoff of half an hour) takes no time, as under the simulator.
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(madsim)'.dependencies]
 madsim = "0.2"
