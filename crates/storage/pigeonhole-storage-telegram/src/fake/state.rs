@@ -22,7 +22,7 @@ pub enum Message {
     },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramChannelState {
     top: i64,
     messages: BTreeMap<i64, Message>,
@@ -34,6 +34,27 @@ pub struct TelegramChannelState {
     /// When each message was posted (ms since the epoch), as Telegram dates them.
     dates: BTreeMap<i64, u64>,
 }
+
+/// A new channel holds one message, id 1: the service message of its
+/// creation, which nobody can delete ([`CREATED`]).
+impl Default for TelegramChannelState {
+    fn default() -> Self {
+        let mut state = Self {
+            top: 0,
+            messages: BTreeMap::new(),
+            by_random_id: BTreeMap::new(),
+            reference_epoch: 0,
+            pinned: None,
+            dates: BTreeMap::new(),
+        };
+        state.post(Message::Other, 0);
+        state
+    }
+}
+
+/// The id of a channel's creation message: a delete with it fails whole
+/// (`MESSAGE_DELETE_FORBIDDEN`).
+pub const CREATED: i64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
@@ -84,7 +105,7 @@ pub enum Reply {
 
 impl FakeState for TelegramChannelState {
     const NAME: &'static str = "fake-telegram";
-    const VERSION: u32 = 3;
+    const VERSION: u32 = 4;
     type Command = Command;
     type Reply = Reply;
 
@@ -99,7 +120,8 @@ impl FakeState for TelegramChannelState {
                 Reply::Sent { id, fresh: true }
             }
             Command::Post { message, now_ms } => Reply::Sent { id: self.post(message, now_ms), fresh: true },
-            Command::Delete { ids } => {
+            Command::Delete { mut ids } => {
+                ids.retain(|id| *id != CREATED);
                 for id in &ids {
                     self.dates.remove(id);
                 }
@@ -188,23 +210,23 @@ impl TelegramChannelState {
         })
     }
 
-    /// Every message, by id.
+    /// Every post, by id: the messages but the creation one.
     pub fn messages(&self) -> impl Iterator<Item = (i64, &Message)> {
-        self.messages.iter().map(|(id, m)| (*id, m))
+        self.messages.range(CREATED + 1..).map(|(id, m)| (*id, m))
     }
 
+    /// The ids of the posts (not the creation message's).
     pub fn ids(&self) -> Vec<i64> {
-        self.messages.keys().copied().collect()
+        self.messages().map(|(id, _)| id).collect()
     }
 
-    /// Ids and names of the messages (`(other)`, a text's first line).
+    /// Ids and names of the posts (`(other)`, a text's first line).
     pub fn names(&self) -> Vec<(i64, String)> {
-        self.messages
-            .iter()
+        self.messages()
             .map(|(id, m)| match m {
-                Message::Other => (*id, "(other)".to_string()),
-                Message::Text(t) => (*id, t.lines().next().unwrap_or_default().to_string()),
-                Message::Doc { name, .. } => (*id, name.clone()),
+                Message::Other => (id, "(other)".to_string()),
+                Message::Text(t) => (id, t.lines().next().unwrap_or_default().to_string()),
+                Message::Doc { name, .. } => (id, name.clone()),
             })
             .collect()
     }
@@ -214,6 +236,14 @@ impl TelegramChannelState {
 pub fn check_ids(n: usize, call: &str) -> Result<()> {
     if n > IDS_PER_CALL {
         bail!("{call} with {n} ids");
+    }
+    Ok(())
+}
+
+/// A delete Telegram refuses whole: one with the channel's creation message.
+pub fn check_delete(ids: &[i64]) -> Result<()> {
+    if ids.contains(&CREATED) {
+        bail!("MESSAGE_DELETE_FORBIDDEN: message {CREATED} is the channel's creation");
     }
     Ok(())
 }

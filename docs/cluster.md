@@ -506,7 +506,14 @@ and fake ones in the demo):
   below it, 100 a call, at most 10 calls a prune (the rest the next time).
   The lookup starts at the anchor, above which nothing was deleted, so it
   never meets a run of 100 deleted ids. The node's bot needs the right to
-  pin messages in its outbox.
+  pin messages in its outbox (in a channel: to edit them). With no anchor
+  yet a prune starts at id 2: message 1 is the channel's creation, which
+  nobody can delete, and a delete call with it fails whole
+  (`MESSAGE_DELETE_FORBIDDEN`). The fake channel has that message too.
+- live (2026-11-05, `crates/bin/pigeonhole/tests/raft_telegram_live.rs`):
+  a peer's bot gets a frame pushed ~0.15 s after the post; a fresh reader
+  reads two frames from the chat in ~0.6 s; a pin posts a service message,
+  pushed too, which readers skip; deleting the pinned message unpins it.
 
 ## Snapshots and the kept log
 

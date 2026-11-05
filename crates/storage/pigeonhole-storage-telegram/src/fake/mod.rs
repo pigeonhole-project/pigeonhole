@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pigeonhole_storage_api::fake::{FakeHost, MemoryHost};
-use state::{check_ids, check_text, check_window, now_ms, Command, Message, Reply, TelegramChannelState};
+use state::{check_delete, check_ids, check_text, check_window, now_ms, Command, Message, Reply, TelegramChannelState};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -278,6 +278,7 @@ impl<H: FakeHost<TelegramChannelState>> ChannelApi for FakeChannel<H> {
 
     async fn delete_messages(&self, ids: &[i64]) -> Result<()> {
         check_ids(ids.len(), "deleteMessages")?;
+        check_delete(ids)?;
         self.knobs.lock().unwrap().calls.delete_messages += 1;
         if let Reply::Released { blobs } = self.host.apply(Command::Delete { ids: ids.to_vec() }).await? {
             self.host.delete_blobs(&blobs).await?;
