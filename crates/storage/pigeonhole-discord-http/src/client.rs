@@ -565,6 +565,7 @@ mod tests {
     /// A local HTTP server (a thread): the first `fail` requests whose body
     /// holds `failing` answer 503, the rest a message. Each answer closes
     /// its connection.
+    #[cfg(not(madsim))] // a real TCP listener: not in the simulation
     fn server(failing: &'static str, fail: usize) -> String {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -623,6 +624,7 @@ mod tests {
     /// without its upload permit: another upload of the bot in the channel
     /// goes on meanwhile (one permit; the retries back off 200 + 400 ms).
     #[tokio::test]
+    #[cfg(not(madsim))] // a real TCP listener: not in the simulation
     async fn a_retried_upload_does_not_hold_the_permit_while_it_waits() {
         let cfg = pigeonhole_storage_discord::limits();
         let cfg = pigeonhole_limits::ChatLimiterConfig {

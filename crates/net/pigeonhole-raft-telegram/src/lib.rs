@@ -514,21 +514,21 @@ mod tests {
         assert_eq!(calls(), c0 + 1);
         // Posted with its push lost: not read before the poll is due...
         let lost = outbox.post_message(Bytes::from_static(b"lost")).await.unwrap();
-        tokio::time::advance(poll / 2).await;
+        tokio::time::sleep(poll / 2).await;
         assert!(reader.read_after(first[1].0, 100).await.unwrap().is_empty());
         assert_eq!(calls(), c0 + 1, "heard from the chat less than a poll ago");
         // ...then read.
-        tokio::time::advance(poll).await;
+        tokio::time::sleep(poll).await;
         assert_eq!(reader.read_after(first[1].0, 100).await.unwrap(), vec![(lost.0, Bytes::from_static(b"lost"))]);
         assert_eq!(calls(), c0 + 2);
         // Pushes keep it quiet: one every half a poll, never a read.
         let mut at = lost.0;
         for (id, m) in post_n(&outbox, 4).await {
-            tokio::time::advance(poll / 2).await;
+            tokio::time::sleep(poll / 2).await;
             reader.pushed(id as i64, m);
             assert_eq!(reader.read_after(at, 100).await.unwrap().len(), 1);
             at = id;
-            tokio::time::advance(poll / 2).await;
+            tokio::time::sleep(poll / 2).await;
             assert!(reader.read_after(at, 100).await.unwrap().is_empty());
         }
         assert_eq!(calls(), c0 + 2, "each push came within a poll of the last");
@@ -546,7 +546,12 @@ mod tests {
         assert!(reader.read_after(frame, 100).await.unwrap().is_empty());
         let t0 = Instant::now();
         reader.wait(frame, Duration::from_secs(2)).await;
-        assert_eq!(t0.elapsed(), Duration::from_secs(2), "slept till the timeout");
+        // The simulator's timers fire a few nanoseconds late.
+        let slept = t0.elapsed();
+        assert!(
+            (Duration::from_secs(2)..Duration::from_millis(2001)).contains(&slept),
+            "slept till the timeout: {slept:?}"
+        );
     }
 
     #[tokio::test]

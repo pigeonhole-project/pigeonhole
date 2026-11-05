@@ -79,6 +79,10 @@ mod tests {
         assert_eq!(cache.get(1, 0).await, None);
         cache.insert(1, 0, Bytes::from_static(b"block")).await;
         assert_eq!(cache.get(1, 0).await, Some(Bytes::from_static(b"block")));
+        // moka keeps an entry inserted at the very instant of invalidate_all
+        // (`entry_ts < valid_after`), and the simulator's clock stands still
+        // until something sleeps.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         cache.clear();
         assert_eq!(cache.get(1, 0).await, None);
     }
