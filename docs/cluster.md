@@ -111,7 +111,7 @@ take writes that cannot commit. So the tablet watches how long ago a
 quorum last acknowledged the leader (openraft's `millis_since_quorum_ack`,
 the gauge `pigeonhole_meta_raft_quorum_ack_age_seconds`). Past the lease,
 `election_timeout.1`, the leader is **read-only**: the other nodes may have
-elected another leader by then. Over gRPC that is 3 s, over a chat 90 s
+elected another leader by then. Over gRPC that is 3 s, over a chat 40 s
 (§ Timing). It is never read-only in a cluster of one. openraft knows no
 ack before a quorum acknowledged something in the leader's term; until then
 the lease counts from when the node saw itself elected, so a leader cut off
@@ -462,14 +462,16 @@ On Telegram with tick 4 s, poll 3 s and post ~0.5 s: up to ~15 s polling,
 ~9 s with push (a push arrived 0.19 s after the post, § Checks).
 
 openraft's defaults (heartbeat 50 ms, election 150–300 ms) assume a LAN.
-Raft needs `heartbeat < election_timeout_min`, and the election timeout must
-cover a few round trips, or followers depose healthy leaders. The defaults
+Raft needs `heartbeat < election_timeout_min`. openraft also takes the
+heartbeat as AppendEntries' timeout (a vote's is `election_timeout_min`),
+so on a chat the heartbeat covers a round trip: with the tick at 4 s, the
+least the post budget allows (§ Budgets), that is 10 s. The defaults
 `[cluster]` picks:
 
 | links | heartbeat | election timeout | tick / poll |
 |---|---|---|---|
 | gRPC only | 250 ms | 1.5–3 s | — |
-| any Telegram link | 10 s | 45–90 s | 4 s / 3 s |
+| any Telegram link | 10 s | 20–40 s | 4 s / 3 s |
 
 `install_snapshot_timeout` is four maximal election timeouts (openraft's
 200 ms timed out every send over a chat). A heartbeat is not a post by
@@ -478,7 +480,13 @@ itself: it rides in the next tick's frame.
 - **Commit latency** is a round trip leader → quorum → leader, plus the
   leader's own log append (a chat post when the log is a chat). With a
   gRPC quorum it is the gRPC round trip.
-- **Failover** takes an election timeout plus a round trip.
+- **Failover**: a follower that knew a leader stands only after the
+  leader's lease, which openraft 0.9 sets to `election_timeout_max`, and
+  then its own election timeout; it notices on its election tick (every
+  1.5 heartbeats); then a vote's round trip. On Telegram: 40 + 20…40 +
+  up to 15 s, ~60–95 s. With election timeouts of 45–90 s it took 183 s
+  and 198 s live (2026-11-05), the votes themselves 0.3 s and 7.5 s; with
+  20–40 s, 87 s (three nodes on Telegram, no spurious election).
 
 ### The Telegram outbox
 

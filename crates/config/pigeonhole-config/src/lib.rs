@@ -1901,7 +1901,7 @@ max_batch_total_size = "8 MiB"
         let Some(ChatSettings::Telegram { logins }) = &two.chat else { panic!("node 2 has a chat link") };
         assert_eq!(logins.iter().map(|l| l.bot_token.as_str()).collect::<Vec<_>>(), ["51:secret", "52:secret"]);
         // A chat link sets the pace of the whole cluster.
-        assert_eq!((two.heartbeat, two.election_timeout.0), (Duration::from_secs(10), Duration::from_secs(45)));
+        assert_eq!((two.heartbeat, two.election_timeout.0), (Duration::from_secs(10), Duration::from_secs(20)));
         // Node 2's tokens are not node 3's bots.
         let err = format!("{:#}", load_mem(&format!("{cluster}node = 3\n{nodes}")).unwrap_err());
         assert!(err.contains("env PH_TEST_RAFT_BOT_A holds bot 51's token, bot_ids says bot 61"), "{err}");

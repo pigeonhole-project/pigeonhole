@@ -325,11 +325,16 @@ const fn ms(n: u64) -> Duration {
 
 /// gRPC alone, or a Telegram link somewhere in the cluster (it paces
 /// every node: a leader's heartbeat must reach that follower in time).
+/// On the chat the heartbeat is openraft's AppendEntries timeout too, so it
+/// covers a round trip (≲ 2 ticks and 2 posts); a follower that knew a
+/// leader stands only after the leader's lease (the longest election
+/// timeout) and its own timeout, so failover is ~60–95 s (docs/cluster.md
+/// § Timing).
 fn timing(nodes: &[NodeSettings]) -> Timing {
     let uses_chat = nodes.iter().any(|a| nodes.iter().any(|b| a.id != b.id && link(a, b) == Some(Link::Chat)));
     match uses_chat {
         false => Timing(ms(250), (ms(1_500), ms(3_000)), ms(20), ms(200)),
-        true => Timing(ms(10_000), (ms(45_000), ms(90_000)), ms(4_000), ms(3_000)),
+        true => Timing(ms(10_000), (ms(20_000), ms(40_000)), ms(4_000), ms(3_000)),
     }
 }
 
