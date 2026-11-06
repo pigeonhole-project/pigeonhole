@@ -47,6 +47,11 @@ const MAX_FRAME: u64 = 64 << 20;
 /// the next one, so a long unpruned outbox is cleared over several.
 const DELETES_PER_PRUNE: usize = 10;
 
+/// The first id a prune may delete: message 1 of a channel is the service
+/// message of its creation, which nobody can delete (a call with it fails
+/// whole, `MESSAGE_DELETE_FORBIDDEN`).
+const FIRST_DELETABLE: i64 = 2;
+
 /// Most pushed messages kept for the reader (its own outbox's pushes have
 /// none): past it the oldest go, and a reader reads them as a hole.
 const MAX_PUSHED: usize = 1_000;
@@ -56,7 +61,7 @@ pub struct TelegramMailbox<C> {
     /// The newest message id known to be in the channel (0: none yet).
     top: watch::Sender<i64>,
     /// Pruning: the lowest id that may still hold a message below the
-    /// anchor (0: not known yet, the pinned anchor's or 1).
+    /// anchor (0: not known yet, the pinned anchor's or the first deletable).
     pruned_to: AtomicI64,
     /// The store it is to the logs; none: it logs nothing.
     store: Option<String>,
@@ -337,7 +342,7 @@ impl<C: ChannelApi> Mailbox for TelegramMailbox<C> {
         let keep_from = keep_from as i64;
         let pinned = self.channel.pinned().await?;
         let mut low = match self.pruned_to.load(Ordering::Relaxed) {
-            0 => pinned.unwrap_or(1).max(1),
+            0 => pinned.unwrap_or(FIRST_DELETABLE).max(FIRST_DELETABLE),
             low => low,
         };
         if low >= keep_from {
@@ -405,7 +410,7 @@ mod tests {
     async fn the_head_is_found_by_looking_ids_up() {
         let (channel, outbox) = mailbox();
         let reader = TelegramMailbox::new(channel.clone());
-        assert_eq!(reader.head().await.unwrap(), 0, "an empty channel");
+        assert_eq!(reader.head().await.unwrap(), 1, "a new channel: its creation message");
         for n in [1, 99, 100, 101, 250, 1_000] {
             let (channel, outbox) = mailbox();
             let mut last = 0;
@@ -429,7 +434,7 @@ mod tests {
         let (anchor, top) = (ids[249], ids[299]);
         outbox.prune(anchor).await.unwrap();
         assert_eq!(channel.pinned_now(), Some(anchor as i64), "the anchor is pinned");
-        let below: Vec<i64> = (1..anchor as i64).collect();
+        let below: Vec<i64> = (FIRST_DELETABLE..anchor as i64).collect();
         assert!(
             channel.get_messages(&below[..100]).await.unwrap().iter().all(|m| *m == ChannelMessage::Empty),
             "the frames below the anchor are gone"
@@ -475,7 +480,8 @@ mod tests {
         let before = channel.calls();
         let mut want = frames(&posted);
         want.push((doc.0, big));
-        assert_eq!(reader.read_after(0, 100).await.unwrap(), want);
+        // From past the channel's creation message, as a reader starts at the head.
+        assert_eq!(reader.read_after(1, 100).await.unwrap(), want);
         assert_eq!(channel.calls().get_messages, before.get_messages, "no read: the pushes held the frames");
         assert!(channel.calls().get_file > before.get_file, "a document is still downloaded");
         assert!(reader.read_after(doc.0, 100).await.unwrap().is_empty());
