@@ -16,7 +16,10 @@ systems that already run on S3 run on Telegram, Discord or a disk unchanged:
   its manifest moves by `If-Match`. At startup it *probes* the store and
   refuses a multi-node cluster whose store takes the headers and ignores
   them, so "accepted and ignored" is worse than "not offered".
-- SlateDB, Delta Lake / Iceberg commits, and anything else that commits by a
+- **SlateDB** (an LSM tree on object storage): its WAL objects, manifests
+  and writer epochs go by `If-None-Match: *`; a second writer fences the
+  first through them (demos/slatedb-on-telegram).
+- Delta Lake / Iceberg commits, and anything else that commits by a
   conditional put.
 
 We are unusually well placed for this: every S3 write is already one entry

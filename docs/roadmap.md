@@ -70,7 +70,7 @@ this repository (worktrees, checks, merging) is in
 | Metrics, a Grafana dashboard; logs and request spans | [metrics.md](metrics.md), [observability.md](observability.md) |
 | Fault injection and madsim simulation | [fault-injection.md](fault-injection.md), [simulation.md](simulation.md) |
 | Log retention, fallback boot; snapshots in parts over a store's blob size | [log-retention.md](log-retention.md) |
-| S3 conditional writes in the log; the etcd and SQLite demos | [conditional-writes.md](conditional-writes.md), [demos](../demos/README.md) |
+| S3 conditional writes in the log; the etcd, SQLite and SlateDB demos | [conditional-writes.md](conditional-writes.md), [demos](../demos/README.md) |
 | Small objects inline in the metadata, a cooler | [inline-objects.md](inline-objects.md) |
 | A shared limiter, several bots per store, ingest pipelined with uploads | [shared-limiter.md](shared-limiter.md) |
 | A store's owner: owner bits in blob ids, a marker on the channel | [store-owner.md](store-owner.md) |

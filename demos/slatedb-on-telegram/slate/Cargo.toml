@@ -1,0 +1,14 @@
+# Not a member of the pigeonhole workspace: SlateDB and its object_store
+# stay out of the workspace's lock file, builds and dependency gates.
+[workspace]
+
+[package]
+name = "slate"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+slatedb = "0.18"
+tokio = { version = "1", features = ["full"] }
