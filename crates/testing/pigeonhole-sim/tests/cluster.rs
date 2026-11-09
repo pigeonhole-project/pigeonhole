@@ -100,5 +100,13 @@ async fn acknowledged_commands_survive_a_lossy_slow_chat_and_partitions() {
         assert!(tokio::time::Instant::now() < deadline, "no convergence: acked {acked:?}, nodes {sets:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert_eq!(nodes.values().filter(|n| n.is_leader()).count(), 1, "one leader at rest");
+    // One leader at rest; one just elected serves once its term's first
+    // entry applies (`is_leader`), so wait for that.
+    let serving = || nodes.values().filter(|n| n.is_leader()).count();
+    while serving() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no leader serves at rest");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let elected = nodes.values().filter(|n| n.leader() == Some(n.node())).count();
+    assert_eq!((serving(), elected), (1, 1), "one leader at rest");
 }

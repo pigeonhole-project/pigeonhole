@@ -160,6 +160,9 @@ pub struct ChunkStore {
     compressed_cache: Option<Arc<BlockCache>>,
     /// Put the blocks of every chunk written into L2.
     write_through: bool,
+    /// The term this node last took the stores over in
+    /// ([`Self::ensure_taken_over`]); held while it does.
+    taken_over: tokio::sync::Mutex<Option<u64>>,
 }
 
 /// Mark every writable member as `owner`'s and refuse one marked for
@@ -216,9 +219,10 @@ impl ChunkStore {
             block_cache: None,
             compressed_cache: None,
             write_through: false,
+            taken_over: tokio::sync::Mutex::new(None),
         };
         if store.db.is_leader() {
-            store.take_over().await?;
+            store.ensure_taken_over().await?;
         }
         Ok(store)
     }
@@ -227,7 +231,7 @@ impl ChunkStore {
     /// configured ones in the tablet, choose the deployment's owner (once)
     /// and mark every store with it, and start the sweep's horizon at the
     /// committed parts. Writes, so a follower does it once it leads
-    /// ([`Self::follow_leadership`]); again is harmless. Runs only on a
+    /// ([`Self::ensure_taken_over`]); again is harmless. Runs only on a
     /// leader that serves, so it reads the state its predecessors left.
     pub async fn take_over(&self) -> Result<()> {
         // Blocks this node cached when it sealed chunks in an earlier term
@@ -251,25 +255,46 @@ impl ChunkStore {
         Ok(())
     }
 
-    /// [`Self::take_over`] each time this node becomes the leader and serves
-    /// (retried on every change Raft reports until it succeeds); ends once
-    /// the tablet stops.
+    /// [`Self::take_over`] once in each term this node leads in, before it
+    /// commits a chunk: a chunk's replicas name the stores, and the tablet
+    /// rejects a store it has not recorded. A commit and
+    /// [`Self::follow_leadership`] both call it; the first does the work,
+    /// the other waits for it. A leader still catching up waits until it
+    /// serves; on a node that does not lead it does nothing (the proposal
+    /// that follows answers [`pigeonhole_meta::NotLeader`]).
+    pub async fn ensure_taken_over(&self) -> Result<()> {
+        let meta = self.db.meta();
+        let mut changes = meta.changes();
+        let term = loop {
+            match meta.serving_term() {
+                Ok(term) => break term,
+                Err(e) if e.is::<pigeonhole_meta::CatchingUp>() => {
+                    changes.changed().await.context("the tablet stopped")?;
+                }
+                Err(_) => return Ok(()),
+            }
+        };
+        let mut taken = self.taken_over.lock().await;
+        if *taken == Some(term) {
+            return Ok(());
+        }
+        self.take_over().await?;
+        tracing::info!(term, "leading: stores taken over");
+        *taken = Some(term);
+        Ok(())
+    }
+
+    /// [`Self::ensure_taken_over`] as soon as this node leads, before a
+    /// write asks for it (retried on every change Raft reports until it
+    /// succeeds); ends once the tablet stops.
     pub async fn follow_leadership(self: Arc<Self>) {
         let mut changes = self.db.meta().changes();
-        let mut taken = self.db.is_leader();
         while changes.changed().await.is_ok() && !self.db.tablet_stopped() {
-            match (self.db.is_leader(), taken) {
-                (true, false) => match self.take_over().await {
-                    Ok(()) => {
-                        tracing::info!("leading: stores taken over");
-                        taken = true;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "taking the stores over failed; again on the next change");
-                    }
-                },
-                (false, true) => taken = false,
-                _ => {}
+            if !self.db.is_leader() {
+                continue;
+            }
+            if let Err(e) = self.ensure_taken_over().await {
+                tracing::warn!(error = %format!("{e:#}"), "taking the stores over failed; again on the next change");
             }
         }
     }
@@ -365,6 +390,7 @@ impl ChunkStore {
         if chunks.is_empty() {
             return Ok(());
         }
+        self.ensure_taken_over().await?;
         let mut proposal = Proposal::new();
         let committing = chunks.propose_in(&mut proposal);
         let mut outcomes = self.db.meta().propose_all(proposal).await?;
@@ -383,6 +409,9 @@ impl ChunkStore {
         if !Arc::ptr_eq(meta, self.db.meta()) {
             self.commit(chunks).await?;
             return meta.propose_all(proposal).await;
+        }
+        if !chunks.is_empty() {
+            self.ensure_taken_over().await?;
         }
         let committing = chunks.propose_in(&mut proposal);
         let mut outcomes = meta.propose_all(proposal).await?;
