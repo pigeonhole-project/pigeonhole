@@ -1,18 +1,21 @@
-# easement (`make arch`): which crate may depend on which, read from the
-# crates' manifests (`packages: true`): a dependency is a line of a
-# Cargo.toml, a feature the part `feature/<name>` of it.
-# Only the manifests are read for now: in the code, the integration tests
-# (crates/*/*/tests) and a module inside a `#[cfg(test)]` one would count as
-# the crate's own code.
+# easement (`make arch`): which crate may depend on which, in the code (a
+# rust-analyzer index) and in the crates' manifests (`packages: true`: a
+# dependency is a line of a Cargo.toml, a feature the part `feature/<name>`
+# of it). A name written through another crate's `pub use` is a dependency
+# on the crate that defines it. Test code (`#[cfg(test)]`, tests/, benches/,
+# examples/, dev-dependencies) is the `tests` component (`tests: auto`).
 version: 1
 packages: true
 strict: true
 tests: auto
 # The workspace's own manifest: no crate, no component.
 unowned: [Cargo.toml]
+# Files the indexer, building for the host, never compiles.
+uncovered_ok:
+  - { name: crates/web/pigeonhole-web/src/web.rs, because: wasm32 only; the indexer builds for the host }
+  - { name: crates/meta/pigeonhole-meta/src/sim_runtime.rs, because: "--cfg madsim only (make sim)" }
 
 exclude:
-  - "**/*.rs"
   - "**/*.py"
   - "**/*.js"
   - "**/*.mjs"

@@ -4,7 +4,9 @@ use std::ops::Range;
 
 pub mod metric_doc;
 pub mod schedule;
+mod stream;
 pub use metric_doc::{MetricDoc, MetricKind};
+pub use stream::{bytes_stream, collect_stream, slice_range, BoxByteStream};
 
 /// Optional byte range for blob gets.
 pub type ByteRange = Range<u64>;

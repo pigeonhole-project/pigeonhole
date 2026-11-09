@@ -1,13 +1,13 @@
-//! Shared blob stream helpers.
+//! Shared blob stream helpers: a blob's bytes as a stream.
 
+use crate::ByteRange;
 use anyhow::Result;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use futures::Stream;
-use pigeonhole_types::ByteRange;
 use std::pin::Pin;
 
-/// Stream of blob bytes returned by [`crate::BlobBackend::get`].
+/// Stream of blob bytes (what a store's `get` returns).
 pub type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, anyhow::Error>> + Send>>;
 
 /// Collect a [`BoxByteStream`] into a single [`Bytes`].

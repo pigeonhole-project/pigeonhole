@@ -16,7 +16,6 @@ conformance = []
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-futures = { workspace = true }
 lru = { workspace = true }
 pigeonhole-types = { workspace = true }
 serde = { workspace = true }

@@ -2874,7 +2874,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "futures",
  "lru",
  "madsim-tokio",
  "pigeonhole-types",
@@ -3018,6 +3017,8 @@ name = "pigeonhole-types"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "futures",
  "madsim-tokio",
 ]
 
