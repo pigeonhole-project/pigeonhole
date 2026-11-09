@@ -296,11 +296,18 @@ async fn telegram_outbox(
     let channel = telegram_channel(cfg, logins, &chat.to_string(), Lane::Meta)
         .await
         .with_context(|| format!("Raft outbox {chat}"))?;
-    let mailbox = TelegramMailbox::new(Arc::new(channel)).named(pigeonhole_admin::outbox_store(node));
+    let channel = Arc::new(channel);
+    let mailbox = TelegramMailbox::new(channel.clone()).named(pigeonhole_admin::outbox_store(node));
     let Some(poll) = poll else { return Ok(Arc::new(mailbox)) };
     let mailbox = Arc::new(mailbox.polling(poll));
     let pushed = mailbox.clone();
-    channel_log::on_post(pigeonhole::telegram::channel_id_of(chat)?, move |id, message| {
+    // The pool's members are the logins' bots, in order: a pushed document
+    // is downloaded by the bot it was pushed to, with its location.
+    let bots = logins.iter().map(|l| pigeonhole::telegram::bot_id_of(&l.bot_token)).collect::<Result<Vec<_>, _>>()?;
+    channel_log::on_post(pigeonhole::telegram::channel_id_of(chat)?, move |bot, id, message| {
+        if let Some(member) = bots.iter().position(|b| *b == bot) {
+            channel.pushed_to(member, id, &message);
+        }
         pushed.pushed(id, Some(message));
     });
     Ok(mailbox)
