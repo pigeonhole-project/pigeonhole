@@ -160,18 +160,67 @@ pub struct ChunkStore {
     compressed_cache: Option<Arc<BlockCache>>,
     /// Put the blocks of every chunk written into L2.
     write_through: bool,
+    /// Run by the tablet before this node serves a term.
+    take_over: Arc<TakeOver>,
+}
+
+/// What the leader does with the stores before it serves a term (the
+/// tablet's hook, [`pigeonhole_meta::MetaStore::on_serve`]): no write, read
+/// or background pass of the term can come before it.
+struct TakeOver {
+    replicated: Arc<Replicated>,
+    /// The block caches ([`ChunkStore::with_caches`]).
+    caches: std::sync::Mutex<Vec<Arc<BlockCache>>>,
+}
+
+impl TakeOver {
+    /// Clear the block caches, record the configured stores in the tablet,
+    /// choose the deployment's owner (once) and mark every store with it,
+    /// and start the sweep's horizon at the committed parts. Again is
+    /// harmless. Runs only on a leader whose term's first entry applied, so
+    /// it reads the state its predecessors left.
+    async fn run(&self, meta: Arc<pigeonhole_meta::MetaStore>) -> Result<()> {
+        // Blocks this node cached when it sealed chunks in an earlier term
+        // are keyed by ids that may not have committed, and a leader since
+        // may have committed other chunks under them.
+        for cache in self.caches.lock().unwrap().iter() {
+            cache.clear();
+        }
+        let db = BlobDb::open(meta).await?;
+        let infos: Vec<_> = self.replicated.members().iter().map(|m| m.instance().clone()).collect();
+        db.sync_instances(&infos).await?;
+        let owner = db.owner().await?;
+        self.replicated.pins().set_owner(owner);
+        check_owner(self.replicated.as_ref(), owner).await?;
+        // Uncommitted parts at or below the highest committed key are a dead
+        // writer's garbage: start the sweep horizon there.
+        for info in &infos {
+            if let Some(key) = db.max_part_key(&info.id) {
+                self.replicated.pins().seed(&info.id, &key);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Mark every writable member as `owner`'s and refuse one marked for
 /// another deployment: two deployments on one store by mistake. (Their
-/// blobs would be safe from each other's sweep, but not their budgets.)
+/// blobs would be safe from each other's sweep, but not their budgets.) A
+/// store that cannot be reached is left for the next term: the mark guards
+/// budgets, so it holds up no write.
 async fn check_owner(replicated: &Replicated, owner: pigeonhole_blob::Owner) -> Result<()> {
     for m in replicated.members() {
         let info = m.instance();
         if info.role != pigeonhole_blob::InstanceRole::ReadWrite {
             continue;
         }
-        let marked = m.mark_owner(owner).await.with_context(|| format!("mark instance {} as ours", info.id))?;
+        let marked = match m.mark_owner(owner).await {
+            Ok(marked) => marked,
+            Err(e) => {
+                tracing::warn!(instance = %info.id, error = %format!("{e:#}"), "could not mark the store as ours; next term");
+                continue;
+            }
+        };
         if marked != owner {
             bail!(
                 "instance {} ({}) belongs to deployment {marked}, this one is {owner}: give each deployment stores of its own",
@@ -191,8 +240,9 @@ impl ChunkStore {
         Self::open_replicated(db, Arc::new(replicated), opts).await
     }
 
-    /// Open with an existing placement group; on the leader, take the
-    /// stores over ([`Self::take_over`]).
+    /// Open with an existing placement group. Before this node serves a
+    /// term, the tablet has it take the stores over ([`TakeOver::run`]; on a
+    /// node serving now, at once).
     pub async fn open_replicated(db: BlobDb, replicated: Arc<Replicated>, opts: IngestOptions) -> Result<Self> {
         check_block_fits_members(opts.block_size, replicated.as_ref())?;
         for m in replicated.members() {
@@ -206,6 +256,7 @@ impl ChunkStore {
                 );
             }
         }
+        let take_over = Arc::new(TakeOver { replicated: replicated.clone(), caches: Default::default() });
         let store = Self {
             db,
             replicated,
@@ -216,62 +267,14 @@ impl ChunkStore {
             block_cache: None,
             compressed_cache: None,
             write_through: false,
+            take_over: take_over.clone(),
         };
-        if store.db.is_leader() {
-            store.take_over().await?;
-        }
+        let hook: pigeonhole_meta::OnServe = Arc::new(move |meta| {
+            let take_over = take_over.clone();
+            Box::pin(async move { take_over.run(meta).await })
+        });
+        store.db.meta().on_serve("chunk", hook).await.context("take the stores over")?;
         Ok(store)
-    }
-
-    /// What the leader does with the stores before it writes: record the
-    /// configured ones in the tablet, choose the deployment's owner (once)
-    /// and mark every store with it, and start the sweep's horizon at the
-    /// committed parts. Writes, so a follower does it once it leads
-    /// ([`Self::follow_leadership`]); again is harmless. Runs only on a
-    /// leader that serves, so it reads the state its predecessors left.
-    pub async fn take_over(&self) -> Result<()> {
-        // Blocks this node cached when it sealed chunks in an earlier term
-        // are keyed by ids that may not have committed, and a leader since
-        // may have committed other chunks under them.
-        for cache in [&self.block_cache, &self.compressed_cache].into_iter().flatten() {
-            cache.clear();
-        }
-        let infos: Vec<_> = self.replicated.members().iter().map(|m| m.instance().clone()).collect();
-        self.db.sync_instances(&infos).await?;
-        let owner = self.db.owner().await?;
-        self.replicated.pins().set_owner(owner);
-        check_owner(self.replicated.as_ref(), owner).await?;
-        // Uncommitted parts at or below the highest committed key are a dead
-        // writer's garbage: start the sweep horizon there.
-        for info in &infos {
-            if let Some(key) = self.db.max_part_key(&info.id) {
-                self.replicated.pins().seed(&info.id, &key);
-            }
-        }
-        Ok(())
-    }
-
-    /// [`Self::take_over`] each time this node becomes the leader and serves
-    /// (retried on every change Raft reports until it succeeds); ends once
-    /// the tablet stops.
-    pub async fn follow_leadership(self: Arc<Self>) {
-        let mut changes = self.db.meta().changes();
-        let mut taken = self.db.is_leader();
-        while changes.changed().await.is_ok() && !self.db.tablet_stopped() {
-            match (self.db.is_leader(), taken) {
-                (true, false) => match self.take_over().await {
-                    Ok(()) => {
-                        tracing::info!("leading: stores taken over");
-                        taken = true;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "taking the stores over failed; again on the next change");
-                    }
-                },
-                (false, true) => taken = false,
-                _ => {}
-            }
-        }
     }
 
     /// `write_through`: chunks written put their stored blocks into `l2`.
@@ -281,6 +284,7 @@ impl ChunkStore {
         l2: Option<Arc<BlockCache>>,
         write_through: bool,
     ) -> Self {
+        *self.take_over.caches.lock().unwrap() = l1.iter().chain(&l2).cloned().collect();
         self.block_cache = l1;
         self.compressed_cache = l2;
         self.write_through = write_through;
@@ -567,15 +571,19 @@ impl ChunkStore {
     async fn complete_seal(&self, sealing: Sealing, pending: &mut PendingChunks) -> Result<Extent> {
         let Sealing { upload, blocks, stored, logical } = sealing;
         let sealed = upload.join().await?.context("replicated finish chunk")?;
+        // A chunk that fails to commit is never asked for here; another
+        // leader may commit its id, so the caches are cleared before this
+        // node serves a term ([`TakeOver::run`]). Their epoch is taken before
+        // the id is chosen: an id chosen in a term since cleared puts its
+        // blocks in for nobody, and one chosen after the clear sees the
+        // term the clear came in.
+        let as_of = self.compressed_cache.as_ref().map(|l2| l2.epoch());
         // Committed by the caller, with whatever points at it; the uploads
         // stay pinned until then.
         let (chunk_id, commit) = self.db.prepare_commit(logical, &blocks, &sealed.layouts, &sealed.shard)?;
-        // A chunk that fails to commit is never asked for here; another
-        // leader may commit its id, so a leader clears the caches when it
-        // takes over.
-        if let Some(l2) = &self.compressed_cache {
+        if let (Some(l2), Some(as_of)) = (&self.compressed_cache, as_of) {
             for (block_no, data) in stored.into_iter().enumerate() {
-                l2.insert(chunk_id, block_no as u32, data).await;
+                l2.insert_as_of(as_of, chunk_id, block_no as u32, data).await;
             }
         }
         pending.chunks.push(PendingChunk::new(chunk_id, commit, sealed));
@@ -1224,7 +1232,7 @@ mod tests {
     }
 
     /// A blob store marked as another deployment's (a channel's pinned marker).
-    struct Marked(MemoryBlobStore, pigeonhole_blob::Owner);
+    struct Marked(MemoryBlobStore, Option<pigeonhole_blob::Owner>);
 
     #[async_trait::async_trait]
     impl BlobBackend for Marked {
@@ -1261,7 +1269,7 @@ mod tests {
             self.0.candidates(owner, after, upto, limit).await
         }
         async fn mark_owner(&self, _owner: pigeonhole_blob::Owner) -> Result<pigeonhole_blob::Owner> {
-            Ok(self.1)
+            self.1.context("the store cannot be reached")
         }
         async fn exists(&self, id: &Self::Id) -> Result<bool> {
             self.0.exists(id).await
@@ -1269,7 +1277,8 @@ mod tests {
     }
 
     /// A store another deployment marked is refused at open; the tablet's
-    /// own owner is kept across a reopen.
+    /// own owner is kept across a reopen. One that cannot be reached is
+    /// left unmarked, and writes go on.
     #[tokio::test]
     async fn a_store_marked_for_another_deployment_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -1279,9 +1288,11 @@ mod tests {
         let ours = db.owner().await.unwrap();
         assert_eq!(db.owner().await.unwrap(), ours, "chosen once");
         let opts = || IngestOptions::new(64 * 1024, ChunkCodec::Raw);
-        assert!(ChunkStore::open(db.clone(), Marked(MemoryBlobStore::new(), ours), opts()).await.is_ok());
+        assert!(ChunkStore::open(db.clone(), Marked(MemoryBlobStore::new(), Some(ours)), opts()).await.is_ok());
+        let unreachable = ChunkStore::open(db.clone(), Marked(MemoryBlobStore::new(), None), opts()).await.unwrap();
+        unreachable.put_small(Bytes::from_static(b"still written")).await.unwrap();
         let theirs = pigeonhole_blob::Owner(ours.0 ^ 1);
-        let err = ChunkStore::open(db, Marked(MemoryBlobStore::new(), theirs), opts()).await.err().unwrap();
+        let err = ChunkStore::open(db, Marked(MemoryBlobStore::new(), Some(theirs)), opts()).await.err().unwrap();
         assert!(format!("{err:#}").contains(&format!("belongs to deployment {theirs}")), "{err:#}");
     }
 

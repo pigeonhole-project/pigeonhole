@@ -46,9 +46,9 @@ before deleting:
 No grace period and no per-batch in-flight check are needed: a key enters the
 candidate range only after its pin is gone, i.e. after its commit is visible in
 the state. After a restart or a change of leader there are no pins and
-nothing returned yet; `ChunkStore::take_over`
-(`crates/blob/pigeonhole-chunk-store/src/layer.rs`, run on boot when leading
-and on every gain of leadership) seeds the horizon with the highest committed
+nothing returned yet; the chunk store's take-over (`TakeOver::run` in
+`crates/blob/pigeonhole-chunk-store/src/layer.rs`, run before the node serves
+each term, [cluster.md](cluster.md) § Taking over) seeds the horizon with the highest committed
 key, so a dead writer's uploads below it are swept right away and the rest
 after the first new upload. Pins live in the leader's process only: its
 sweeper is the only one that deletes.

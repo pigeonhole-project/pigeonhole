@@ -1018,3 +1018,51 @@ fn a_leader_no_quorum_acked_yet_counts_from_its_election() {
     follower.state = openraft::ServerState::Follower;
     assert_eq!(clock.acked_at(&follower, next), None);
 }
+
+/// A hook proposing `id`, noting whether the node served meanwhile; it
+/// fails its first `fail` runs.
+fn proposing_hook(id: u64, fail: usize, served_during: Arc<Mutex<Vec<bool>>>) -> OnServe {
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Arc::new(move |meta: Arc<MetaStore>| {
+        let (runs, served_during) = (runs.clone(), served_during.clone());
+        Box::pin(async move {
+            served_during.lock().unwrap().push(meta.is_leader());
+            if runs.fetch_add(1, Ordering::SeqCst) < fail {
+                bail!("injected");
+            }
+            meta.propose::<Counter>(op(id, 1)).await?.map_err(|e| anyhow::anyhow!(e))?;
+            Ok(())
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_take_over_runs_and_writes_before_the_node_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_on(dir.path()).await;
+    assert!(store.is_leader(), "no hook: serves once its term's first entry applied");
+    let served = Arc::new(Mutex::new(Vec::new()));
+    store.on_serve("count", proposing_hook(1, 0, served.clone())).await.unwrap();
+    assert_eq!(*served.lock().unwrap(), [false], "not serving while it ran");
+    assert!(store.is_leader());
+    assert_eq!(op_ids(&store), vec![1], "its proposal went through");
+
+    // Replacing it runs the new one; the old one runs no more.
+    store.on_serve("count", proposing_hook(2, 0, served.clone())).await.unwrap();
+    assert_eq!(op_ids(&store), vec![1, 2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_take_over_holds_the_node_back_until_a_retry_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_on(dir.path()).await;
+    let served = Arc::new(Mutex::new(Vec::new()));
+    let err = store.on_serve("count", proposing_hook(1, 2, served.clone())).await.unwrap_err();
+    assert!(format!("{err:#}").contains("count: injected"), "{err:#}");
+    assert!(!store.is_leader());
+    assert!(store.serving_term().unwrap_err().is::<CatchingUp>());
+    assert!(store.serves(true).is_err(), "the S3 port's gate too");
+    eventually("the retries succeed", || store.is_leader()).await;
+    assert_eq!(served.lock().unwrap().len(), 3, "two failed runs, then one that took");
+    assert_eq!(op_ids(&store), vec![1]);
+}
