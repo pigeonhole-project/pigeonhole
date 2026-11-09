@@ -22,8 +22,10 @@ are `Owner(0)`'s.
 That keeps blobs safe, not budgets: two deployments on one channel still
 share its rate limits, quietly. So a store is also marked, and a
 deployment refuses a store marked for another (`check_owner`, read-write
-members only). The leader does it in `ChunkStore::take_over`: on boot when
-it leads, and on every gain of leadership ([cluster.md](cluster.md)):
+members only). The leader does it when it takes over, before it serves a
+term ([cluster.md](cluster.md) § Taking over); a store it cannot reach then
+is skipped with a warning (the mark guards budgets: no write waits on it),
+a store marked for another deployment keeps the node from serving:
 
 - **Telegram, Discord**: a message `owner-<8 hex>.bin`, pinned. A start
   reads the pin: a marker → whose it is; none (or something else pinned)

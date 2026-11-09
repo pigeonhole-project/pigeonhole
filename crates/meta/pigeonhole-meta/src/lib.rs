@@ -19,9 +19,10 @@
 //!
 //! A proposal may be fenced to a term ([`Prepared::fenced`]): its entry then
 //! applies it only if it was written in that term. A leader serves (writes,
-//! runs leader work) only once it applied its own term's first entry
-//! ([`MetaStore::is_leader`]), so what it chose from its state (ids) took
-//! every earlier committed entry into account.
+//! runs leader work) only once it applied its own term's first entry and
+//! its layers took over ([`MetaStore::is_leader`], [`MetaStore::on_serve`]),
+//! so what it chose from its state (ids) took every earlier committed entry
+//! into account.
 //!
 //! Encodings (postcard): commands carry their namespace's
 //! [`StateMachine::VERSION`] and batches the [`LOG_FORMAT`]; a binary refuses a
@@ -54,6 +55,7 @@ use tokio::sync::watch;
 use tracing::Instrument;
 
 pub mod log;
+mod on_serve;
 pub mod raft;
 #[cfg(madsim)]
 mod sim_runtime;
@@ -65,6 +67,7 @@ pub use log::{
     Base, Batch, ChainLogStore, Discovered, Entry, Head, Lease, LogError, LogId, LogResult, LogStore, Position,
     LOG_FORMAT,
 };
+pub use on_serve::OnServe;
 pub use snapshot::{BlobSnapshotStore, SnapshotRef, SnapshotStore, StoredSnapshot};
 pub use telemetry::METRICS;
 pub use view::{ClusterView, NodeView};
@@ -559,7 +562,8 @@ impl std::error::Error for CommitUnknown {}
 /// A write on a node elected leader that has not applied its own term's
 /// first entry yet: the entries its predecessors committed may not all be
 /// applied, so what it would choose from its state (ids) could repeat
-/// theirs. It serves once it has (docs/cluster.md § Serving). Nothing was
+/// theirs. It serves once it has, and its layers took over
+/// ([`MetaStore::on_serve`]; docs/cluster.md § Serving). Nothing was
 /// proposed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatchingUp {
@@ -704,6 +708,8 @@ pub struct MetaStore {
     snapshots: Control<Option<Duration>>,
     /// Leading without a quorum ([`Self::is_read_only`]).
     read_only: watch::Receiver<bool>,
+    /// What layers do before this node serves a term ([`Self::on_serve`]).
+    hooks: Arc<on_serve::Hooks>,
 }
 
 impl Drop for MetaStore {
@@ -803,6 +809,7 @@ impl MetaStore {
             ticker: Mutex::new(None),
             snapshots: Control::new(opts.snapshot_interval),
             read_only,
+            hooks: Arc::default(),
         };
         store.wait_ready(cluster.members.len(), &opts).await?;
         if fell_back {
@@ -820,7 +827,9 @@ impl MetaStore {
             "metadata tablet ready"
         );
         store.record_gauges();
-        Ok(Arc::new(store))
+        let store = Arc::new(store);
+        on_serve::spawn(Arc::downgrade(&store), store.raft.metrics(), store.hooks.clone());
+        Ok(store)
     }
 
     /// Boot's last wait: a cluster of one until it leads with everything
@@ -847,15 +856,51 @@ impl MetaStore {
     }
 
     /// Whether this node leads its cluster now and serves, as far as it
-    /// knows: elected, and its own term's first entry applied. Only then are
-    /// the entries its predecessors committed all applied here (Raft §5.4.2:
-    /// they are known committed once an entry of the new term is), so what
-    /// it chooses from its state (ids, the sweep's horizon) is current. A
-    /// leader cut off from the others learns it lost the lead once its lease
-    /// runs out; its writes fail meanwhile. Work only the leader should do
-    /// checks this first. Raft's own role: [`Self::raft_state`].
+    /// knows: elected, its own term's first entry applied, and the layers'
+    /// take-overs run in this term ([`Self::on_serve`]). Only once that entry
+    /// is applied are the entries its predecessors committed all applied
+    /// here (Raft §5.4.2: they are known committed once an entry of the new
+    /// term is), so what it chooses from its state (ids, the sweep's
+    /// horizon) is current. A leader cut off from the others learns it lost
+    /// the lead once its lease runs out; its writes fail meanwhile. Work
+    /// only the leader should do checks this first. Raft's own role:
+    /// [`Self::raft_state`].
     pub fn is_leader(&self) -> bool {
-        serving(&self.raft.metrics().borrow())
+        self.serves_in(&self.raft.metrics().borrow())
+    }
+
+    /// [`Self::is_leader`] as of `m`.
+    fn serves_in(&self, m: &raft::Metrics) -> bool {
+        serving(m) && self.hooks.ran_in(m.current_term)
+    }
+
+    /// Run `hook` (`name`'s; one replaces the last of that name) each time
+    /// this node starts serving a term, before it serves it: until it has
+    /// succeeded in the term, [`Self::is_leader`] is false and
+    /// [`Self::serving_term`] [`CatchingUp`]. A failed run is retried. For
+    /// a leader's writes that must come before any other: a write, or
+    /// background work, relying on it cannot overtake it. On a node serving
+    /// now, waits for its first run here and returns its error.
+    pub async fn on_serve(&self, name: &'static str, hook: OnServe) -> Result<()> {
+        let version = self.hooks.add(name, hook);
+        let mut metrics = self.raft.metrics();
+        let mut ran = self.hooks.subscribe();
+        loop {
+            let term = {
+                let m = metrics.borrow_and_update();
+                if !serving(&m) {
+                    return Ok(());
+                }
+                m.current_term
+            };
+            if let Some(outcome) = ran.borrow_and_update().outcome(term, version) {
+                return outcome;
+            }
+            tokio::select! {
+                r = metrics.changed() => r.map_err(|e| self.stopped_by(e))?,
+                r = ran.changed() => r.context("the take-over runner ended")?,
+            }
+        }
     }
 
     /// The term this node serves as leader in ([`Self::is_leader`]), for a
@@ -864,7 +909,7 @@ impl MetaStore {
     pub fn serving_term(&self) -> Result<u64> {
         let metrics = self.raft.metrics();
         let m = metrics.borrow();
-        if serving(&m) {
+        if self.serves_in(&m) {
             return Ok(m.current_term);
         }
         if m.state == openraft::ServerState::Leader {
@@ -873,10 +918,19 @@ impl MetaStore {
         Err(NotLeader { leader: m.current_leader }.into())
     }
 
-    /// Return once this node serves or no longer leads (its proposal then
-    /// reaches Raft, which answers NotLeader); `NoQuorum` if it turns
-    /// read-only meanwhile. Its blank entry commits as fast as a proposal
-    /// would: waiting costs nothing.
+    /// Elected but its term's first entry not applied yet. Not
+    /// [`Self::catching_up`]: the take-overs ([`Self::on_serve`]) propose
+    /// before this node serves.
+    fn applying_earlier_terms(&self) -> bool {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        m.state == openraft::ServerState::Leader && !serving(&m)
+    }
+
+    /// Return once this node applied its term's first entry or no longer
+    /// leads (its proposal then reaches Raft, which answers NotLeader);
+    /// `NoQuorum` if it turns read-only meanwhile. Its blank entry commits as
+    /// fast as a proposal would: waiting costs nothing.
     async fn until_serving(&self) -> Result<()> {
         let mut metrics = self.raft.metrics();
         let mut read_only = self.read_only.clone();
@@ -909,7 +963,7 @@ impl MetaStore {
     pub fn catching_up(&self) -> Option<u64> {
         let metrics = self.raft.metrics();
         let m = metrics.borrow();
-        (m.state == openraft::ServerState::Leader && !serving(&m)).then_some(m.current_term)
+        (m.state == openraft::ServerState::Leader && !self.serves_in(&m)).then_some(m.current_term)
     }
 
     /// Raft's role for this node (leader as soon as elected): for display.
@@ -1037,7 +1091,7 @@ impl MetaStore {
         if self.is_read_only() {
             return Err(self.no_quorum().into());
         }
-        if self.catching_up().is_some() {
+        if self.applying_earlier_terms() {
             self.until_serving().await?;
         }
         let (reply, rx) = tokio::sync::oneshot::channel();

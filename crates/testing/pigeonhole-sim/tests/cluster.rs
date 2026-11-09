@@ -101,7 +101,7 @@ async fn acknowledged_commands_survive_a_lossy_slow_chat_and_partitions() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     // One leader at rest; one just elected serves once its term's first
-    // entry applies (`is_leader`), so wait for that.
+    // entry applies and its layers took over (`is_leader`), so wait for that.
     let serving = || nodes.values().filter(|n| n.is_leader()).count();
     while serving() == 0 {
         assert!(tokio::time::Instant::now() < deadline, "no leader serves at rest");

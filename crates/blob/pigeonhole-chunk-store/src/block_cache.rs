@@ -3,7 +3,7 @@
 //! reused, so entries never go stale; dropped chunks age out. Only a chunk
 //! written but never committed (its leader lost the lead) leaves an entry
 //! another leader's chunk may take the id of: a leader clears its caches
-//! when it takes over ([`crate::ChunkStore::take_over`]).
+//! when it takes over, before it serves a term (`TakeOver::run`).
 
 use crate::ChunkId;
 use bytes::Bytes;

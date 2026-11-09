@@ -1,6 +1,6 @@
 //! The node's background loops, each on its dynamic config's schedule:
-//! sweep, repair, the cooler, the tablet's gauges; and the followers that
-//! keep the knobs and the chunk stores in step with the tablet.
+//! sweep, repair, the cooler, the tablet's gauges; and the follower that
+//! keeps the knobs in step with the tablet.
 
 use pigeonhole_admin::Admin;
 use pigeonhole_config::Cooling;
@@ -36,8 +36,6 @@ pub(crate) fn spawn(admin: &Admin, metrics: bool) -> Vec<JoinHandle<()>> {
         start(repairer.run_loop(d.repair.schedule())),
         start(cooler(d.cool.schedule(), admin.s3.clone(), admin.meta.clone(), admin.inline_on)),
         start(d.clone().follow()),
-        // In a cluster the chunk stores are the leader's: taken over when it leads.
-        start(store.clone().follow_leadership()),
     ];
     if metrics {
         let chunks = store.db().clone();

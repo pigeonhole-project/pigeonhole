@@ -28,15 +28,15 @@ new one only once an entry of its own term commits, so until then its
 applied state may lag them. Choosing a chunk id from that state would repeat
 one its predecessor committed. So `MetaStore::is_leader` says yes only once
 the node leads and has applied an entry of its own term (the blank entry
-Raft appends on election; once it is applied, so is everything before it).
-Until then:
+Raft appends on election; once it is applied, so is everything before it),
+and the layers have taken over in this term (below). Until then:
 
 - the S3 port and the admin API answer 503 (`not the leader yet: elected in
   term N, still applying the entries of earlier terms`);
 - `MetaStore::serving_term`, which a write takes its term from, is
   `CatchingUp`, and proposals wait for it to serve (its blank entry commits
   as fast as they would);
-- background passes skip, and `ChunkStore::take_over` waits.
+- background passes skip.
 
 `MetaStore::raft_state` is Raft's role alone, for display (the cluster view
 shows `leader` as soon as elected).
@@ -59,13 +59,19 @@ shows `leader` as soon as elected).
   passes unless `MetaStore::has_quorum` (the leader, not read-only). A new leader takes the work over
   with its next pass. Each node's snapshot ticker runs on its own:
   snapshots are per node.
-- **Taking over** (`ChunkStore::take_over`, on boot when leading and again
-  each time this node starts serving). The leader:
-  - records the configured stores;
+- **Taking over.** A layer registers a hook with `MetaStore::on_serve`;
+  each time the node has applied its term's first entry, the tablet runs
+  the hooks, and only once they all succeeded in the term does it serve
+  (`is_leader`). So no write, read or background pass of the term comes
+  before them; their own proposals go through. A failed run is retried
+  every second, the node answering 503 meanwhile. The chunk store's hook
+  (`TakeOver::run`):
+  - clears its block caches (below);
+  - records the configured stores (a commit naming one the tablet does not
+    know is rejected);
   - chooses or reads the deployment's owner ([store-owner.md](store-owner.md))
-    and marks the stores with it;
-  - seeds the sweep's horizon from the committed parts;
-  - clears its block caches (below).
+    and marks the stores with it: uploads carry it;
+  - seeds the sweep's horizon from the committed parts.
 - **Chunk ids** go on after the newest the tablet applied, so a node that
   took over never hands out an id its predecessor used: it serves only
   once caught up. An id is chosen when its chunk is sealed, maybe minutes
@@ -74,7 +80,7 @@ shows `leader` as soon as elected).
   nothing of its entry applies (`NotApplied::Fenced`), and the PUT fails
   with 503; its parts are orphans for the sweeper. The blocks the node
   cached under those ids may be another leader's chunk's by then: a
-  leader clears its caches when it takes over. Should a commit still
+  leader clears its caches when it takes over, before it serves. Should a commit still
   carry an id committed already, or a replica the state cannot take, it
   is rejected (meta-backends.md § Namespaces) and its PUT fails: never
   an error in `apply`, which would stop every node for good.
