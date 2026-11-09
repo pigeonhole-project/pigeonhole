@@ -12,12 +12,23 @@
 # RAFT_BOT_TOKEN_<n>, else TG_BOT_TOKEN[_<n>] (TG_BOT_TOKEN for node 1),
 # admin of all three; no two nodes may share one. Telegram paces the whole
 # cluster: elections take a minute or two.
+#
+# SOAK=<minutes>: then a long run on the cluster as the smoke left it: an
+# object written through the leader every ~15 s and one read back; at a
+# quarter a follower frozen (SIGSTOP) for 45 s, its pushes lost; at half a
+# follower killed and restarted a minute later; at three quarters the
+# leader killed, restarted 30 s after a new one is up. At the end every
+# object is read back, and the latencies and the nodes' logs summed up
+# (frames, prunes, elections, FLOOD_WAITs). The outboxes are debug-logged.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [[ -f "$ROOT/.env" ]]; then set -a; source "$ROOT/.env"; set +a; fi
 CHAT="${CHAT:-}"
 CHAT_ONLY="${CHAT_ONLY:-3}"
+SOAK="${SOAK:-}"
+LOG=info
+[[ -n "$SOAK" ]] && LOG="info,openraft_chat=debug,pigeonhole_raft_telegram=debug"
 [[ "$CHAT" == telegram ]] && : "${LEADER_WAIT:=300}"
 BIN="${BIN:-$ROOT/target/debug/pigeonhole}"
 export AWS_ACCESS_KEY_ID=pigeonhole AWS_SECRET_ACCESS_KEY=pigeonholesecret AWS_DEFAULT_REGION=us-east-1
@@ -94,8 +105,8 @@ done
 
 start() {
   # Its own directory: the bots' session files.
-  (cd "$DIR/run$1" && PIGEONHOLE_CONFIG="$DIR/node$1.toml" RAFT_BOT_TOKEN="$( [[ "$CHAT" == telegram ]] && bot_of "$1" )" RUST_LOG=info \
-    exec "$BIN" >"$DIR/node$1.log" 2>&1) &
+  (cd "$DIR/run$1" && PIGEONHOLE_CONFIG="$DIR/node$1.toml" RAFT_BOT_TOKEN="$( [[ "$CHAT" == telegram ]] && bot_of "$1" )" RUST_LOG="$LOG" \
+    exec "$BIN" >>"$DIR/node$1.log" 2>&1) &
   PID[$1]=$!
 }
 
@@ -157,3 +168,52 @@ code=$(code_of "$L" /_pigeonhole/leader)
 [[ "$code" == 503 ]] || { echo "the restarted node answered $code: it should follow" >&2; exit 1; }
 s3 "$N" ls s3://demo/ | grep -q two.bin
 echo "node $L rejoined as a follower; cluster smoke ok"
+
+[[ -n "$SOAK" ]] || exit 0
+
+# The soak. Each write: "<seconds into the soak> <key> <seconds it took> ok|fail".
+END=$((SECONDS + SOAK * 60)); START=$SECONDS
+at() { echo "$((SECONDS - START)) s: $*"; }
+phase=0 i=0
+mkdir -p "$DIR/objects"
+while ((SECONDS < END)); do
+  done_part=$(( (SECONDS - START) * 4 / (SOAK * 60) ))
+  if ((done_part > phase)); then
+    phase=$((phase + 1))
+    L=$(leader_of 1 2 3); F=$(( L % 3 + 1 ))
+    case $phase in
+      1) at "freezing follower $F for 45 s"; kill -STOP "${PID[$F]}"; sleep 45; kill -CONT "${PID[$F]}"; at "node $F thawed" ;;
+      2) at "killing follower $F"; kill -9 "${PID[$F]}"; unset "PID[$F]"; sleep 60; start "$F"; at "node $F restarted" ;;
+      3) at "killing leader $L"; kill -9 "${PID[$L]}"; unset "PID[$L]"; T=$SECONDS
+         REST=(); for n in 1 2 3; do [[ $n != "$L" ]] && REST+=("$n"); done
+         N=$(leader_of "${REST[@]}"); at "new leader: node $N ($((SECONDS - T)) s)"
+         sleep 30; start "$L"; at "node $L restarted" ;;
+    esac
+  fi
+  i=$((i + 1)); key="k$i"
+  head -c 65536 /dev/urandom >"$DIR/objects/$key"
+  L=$(leader_of 1 2 3); T=$SECONDS
+  if s3 "$L" cp "$DIR/objects/$key" "s3://demo/soak/$key" >/dev/null 2>&1; then r=ok; else r=fail; rm "$DIR/objects/$key"; fi
+  echo "$((SECONDS - START)) $key $((SECONDS - T)) $r node$L" >>"$DIR/soak.tsv"
+  old=$(find "$DIR/objects" -type f | sort -R | head -1)
+  if [[ -n "$old" ]] && ! s3 "$L" cp "s3://demo/soak/$(basename "$old")" "$DIR/back.bin" >/dev/null 2>&1; then
+    at "reading back $(basename "$old") through node $L failed"
+  fi
+  sleep 15
+done
+
+at "soak over; reading every object back"
+L=$(leader_of 1 2 3); lost=0
+for f in "$DIR"/objects/*; do
+  if ! { s3 "$L" cp "s3://demo/soak/$(basename "$f")" "$DIR/back.bin" >/dev/null 2>&1 && cmp -s "$f" "$DIR/back.bin"; }; then
+    echo "lost: $(basename "$f")"; lost=$((lost + 1))
+  fi
+done
+echo "writes: $(grep -c ' ok ' "$DIR/soak.tsv") ok, $(grep -c ' fail ' "$DIR/soak.tsv") failed; objects lost: $lost"
+grep ' ok ' "$DIR/soak.tsv" | awk '{print $3}' | sort -n | awk '{a[NR]=$1} END {print "write seconds: min " a[1] ", median " a[int((NR+1)/2)] ", p90 " a[int(NR*0.9)] ", max " a[NR]}'
+for n in 1 2 3; do
+  f="$DIR/node$n.log"
+  echo "node $n: frames sent $(grep -c 'raft frame sent' "$f"), received $(grep -c 'raft frame received' "$f"), pruned $(grep -c 'pruned the outbox' "$f"), prune failed $(grep -c 'prune failed' "$f"), FLOOD $(grep -c FLOOD "$f"), terms $(grep -o 'term=[0-9]*' "$f" | sort -u | tr '\n' ' ')"
+done
+((lost == 0)) || exit 1
+echo "soak ok"
