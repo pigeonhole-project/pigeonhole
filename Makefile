@@ -90,10 +90,11 @@ metrics-demo-down:
 test:
 	cargo nextest run --workspace
 
-# Which crate may depend on which, read from their manifests (easement.yml);
-# and the backends' identifiers stay in the stores, the config and the
-# binary. `brew install mokevnin/tap/easement` or
-# `cargo install --locked easement --version 0.4.14` (CI's).
+# Which crate may depend on which, in their code and manifests (easement.yml;
+# it indexes the code with rust-analyzer, ~40 s); and the backends'
+# identifiers stay in the stores, the config and the binary.
+# `brew install mokevnin/tap/easement` or
+# `cargo install --locked easement --version 0.6.0` (CI's).
 arch:
 	easement check
 	@! git grep -nwE 'file_id|chat_id|channel_id' -- 'crates/*.rs' ':!crates/storage' ':!crates/bin' ':!crates/config' \

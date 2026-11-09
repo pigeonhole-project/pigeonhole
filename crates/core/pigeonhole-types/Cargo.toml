@@ -6,8 +6,10 @@ license.workspace = true
 description = "Shared types for pigeonhole (no I/O)"
 
 [dependencies]
-tokio = { workspace = true }
 anyhow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

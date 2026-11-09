@@ -17,7 +17,6 @@ pub mod fake;
 pub mod inspect;
 mod label;
 pub mod located;
-mod stream;
 pub mod text;
 
 pub use backend::{
@@ -29,5 +28,6 @@ pub use chain::{
 };
 pub use error::{Failure, NotFound, RateLimited, Unavailable};
 pub use label::{check_blob, check_label, MAX_LABEL};
-pub use pigeonhole_types::{BackendLimits, ByteRange, RangeSupport};
-pub use stream::{bytes_stream, collect_stream, slice_range, BoxByteStream};
+pub use pigeonhole_types::{
+    bytes_stream, collect_stream, slice_range, BackendLimits, BoxByteStream, ByteRange, RangeSupport,
+};
