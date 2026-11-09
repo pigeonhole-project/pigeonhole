@@ -1,16 +1,16 @@
 # Cluster: the tablet on several nodes
 
-Status (2026-11-02):
+Status (2026-11-06):
 - the binary runs as a node of a Raft cluster;
 - two nodes talk over gRPC, or over chat channels (Telegram outboxes);
 - the leader does all the work;
 - tested: in process over every transport, under madsim over a lossy chat,
-  and as three processes on localhost (`make cluster-smoke`);
+  as three processes on localhost (`make cluster-smoke`), and live, three
+  nodes on real Telegram channels for 40 minutes with faults (§ Status);
 - three nodes run in the browser demo over `Direct` and fake Telegram
   outboxes.
 
-Left (§ Status): a live run on real Telegram channels, a Discord outbox,
-membership changes.
+Left (§ Status): a Discord outbox, membership changes.
 
 Each node keeps its own copy of the metadata tablet: its own log and
 snapshots, rebuilt from them on boot as on a single node
@@ -500,7 +500,8 @@ and fake ones in the demo):
   skipped while the channel is known to go past it);
 - the posts pushed to any of the process's bots (`channel_log::on_post`;
   every bot logs in with updates) go to the peer's mailbox, message and
-  all (`TelegramMailbox::pushed`); `read_after` takes the frames from them,
+  all (`TelegramMailbox::pushed`), and a document's location to the pool
+  as the bot's it was pushed to (a location is its bot's own); `read_after` takes the frames from them,
   reads a hole among them (one call per 100 ids), and reads the chat only
   when nothing came for `poll` (`TelegramMailbox::polling`). The node's own
   outbox has no pushes kept: nobody reads it here;
@@ -676,17 +677,38 @@ Done:
 - one `pigeonhole.toml` for the whole cluster;
 - a cluster of three in the demo.
 
+Live on Telegram (2026-11-06): `CHAT=telegram CHAT_ONLY="1 2 3" SOAK=40
+scripts/cluster-smoke.sh`, three nodes each on its own bot and outbox, for
+40 minutes: a 64 KiB object written through the leader every ~15 s (133,
+none failed, none lost; median 1 s, p90 4 s, max 5 s); a follower frozen
+for 45 s, a follower killed and restarted, the leader killed (a new one in
+70 s), with no spurious election; 25–28 prunes a node, none failed; no
+FLOOD_WAIT; ~400–700 frames posted a node. Found on the way: a prune from
+id 1 (the channel's creation, which cannot be deleted), and pushed
+documents the node's pool of bots could not download: a push comes past
+the pool, which then knew no bot holding the document's location and
+answered `FILE_REFERENCE_EXPIRED` without asking Telegram. Documents are
+the big AppendEntries a new leader catches followers up with, so a
+follower stuck on its leader's frame and the cluster had no leader for
+minutes. The push now tells the pool which bot it came to
+(`PooledChannel::pushed_to`), and a reader looks a frame with a stale
+reference up again; a 15-minute rerun with the leader killed (2026-11-09):
+43 writes, none failed, no stale reference.
+
+Open: a bot cannot delete a channel message older than 48 hours
+(`MESSAGE_DELETE_FORBIDDEN`). The first prune after a node was down that
+long fails whole, the fresh frames in its call too, and the next prunes
+start at the new anchor: what lay below it stays (seen 2026-11-09, 31
+messages in Outbox-1 after three days).
+
 Left:
-1. A live run of three nodes, one of them on real Telegram channels
-   (`CHAT=telegram make cluster-smoke`): election time, commit latency and
-   failover against § Timing.
-2. A Discord outbox (check 3 first).
-3. `seq` restored from the node's own outbox rather than the clock; the
+1. A Discord outbox (check 2 first).
+2. `seq` restored from the node's own outbox rather than the clock; the
    poster's bot checked against the node.
-4. A snapshot as a reference (§ Snapshots and the kept log).
-5. Membership changes (add or remove a node, learners) through the admin
+3. A snapshot as a reference (§ Snapshots and the kept log).
+4. Membership changes (add or remove a node, learners) through the admin
    API, instead of a fixed `[[node]]` list.
-6. Maybe: a status message per node in its outbox (role, term, leader,
+5. Maybe: a status message per node in its outbox (role, term, leader,
    lag), edited in place, so the channel shows the cluster's state without
    Grafana.
 
