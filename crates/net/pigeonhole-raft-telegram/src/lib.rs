@@ -29,7 +29,9 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use openraft_chat::Mailbox;
 use pigeonhole_storage_api::text;
-use pigeonhole_storage_telegram::{ChannelApi, ChannelMessage, FileLocation, IDS_PER_CALL, TEXT_MAX_CHARS, WINDOW};
+use pigeonhole_storage_telegram::{
+    ChannelApi, ChannelMessage, FileLocation, FileReferenceExpired, IDS_PER_CALL, TEXT_MAX_CHARS, WINDOW,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -132,21 +134,45 @@ impl<C: ChannelApi> TelegramMailbox<C> {
         });
     }
 
-    /// The frame in message `m`, if it is one.
-    async fn frame(&self, m: ChannelMessage) -> Result<Option<Bytes>> {
-        Ok(match m {
+    /// The frame in message `id`, `m`, if it is one. A document whose file
+    /// reference went stale is looked up again for a fresh one; gone by
+    /// then, it is no frame.
+    async fn frame(&self, id: i64, m: ChannelMessage) -> Result<Option<Bytes>> {
+        let Some((file, size)) = self.document(m.clone()) else { return Ok(Self::text_frame(m)) };
+        match self.download(&file, size).await {
+            Err(e) if e.is::<FileReferenceExpired>() => {
+                tracing::debug!(message_id = id, "a frame's file reference went stale: looked up again");
+                let fresh = self.channel.get_messages(&[id]).await?.into_iter().next();
+                match fresh.and_then(|m| self.document(m)) {
+                    Some((file, size)) => Ok(Some(self.download(&file, size).await?)),
+                    None => Ok(None),
+                }
+            }
+            other => other.map(Some),
+        }
+    }
+
+    fn text_frame(m: ChannelMessage) -> Option<Bytes> {
+        match m {
             ChannelMessage::Text { text } => text::decode(&text).filter(|(name, _)| name == FRAME_NAME).map(|(_, b)| b),
+            _ => None,
+        }
+    }
+
+    /// Where a frame's document is, if `m` is one.
+    fn document(&self, m: ChannelMessage) -> Option<(FileLocation, u64)> {
+        match m {
             ChannelMessage::Document { name, size, file } if name == FRAME_NAME && size <= MAX_FRAME => {
-                Some(self.download(&file, size).await?)
+                Some((file, size))
             }
             _ => None,
-        })
+        }
     }
 
     async fn download(&self, file: &FileLocation, size: u64) -> Result<Bytes> {
         let mut out = BytesMut::with_capacity(size as usize);
         while (out.len() as u64) < size {
-            let part = self.channel.get_file(file, out.len() as u64, WINDOW).await.context("download a frame")?;
+            let part = self.channel.get_file(file, out.len() as u64, WINDOW).await?;
             if part.is_empty() {
                 break;
             }
@@ -251,7 +277,7 @@ impl<C: ChannelApi> TelegramMailbox<C> {
         }
         let mut frames = Vec::new();
         for (id, m) in messages {
-            if let Some(bytes) = self.frame(m).await? {
+            if let Some(bytes) = self.frame(id, m).await.context("download a frame")? {
                 frames.push((id as u64, bytes));
             }
         }
@@ -279,7 +305,7 @@ impl<C: ChannelApi> TelegramMailbox<C> {
                     self.seen(*id);
                     newest = *id;
                 }
-                if let Some(bytes) = self.frame(m).await? {
+                if let Some(bytes) = self.frame(*id, m).await.context("download a frame")? {
                     frames.push((*id as u64, bytes));
                 }
             }
@@ -486,6 +512,22 @@ mod tests {
         assert!(channel.calls().get_file > before.get_file, "a document is still downloaded");
         assert!(reader.read_after(doc.0, 100).await.unwrap().is_empty());
         assert_eq!(channel.calls().get_messages, before.get_messages, "nothing pushed since, the poll not due");
+    }
+
+    /// A stale reference (a pushed document that a pool of bots holds no
+    /// location of answers so too) is not asked for again and again, a
+    /// follower stuck on its leader's frame: the message is looked up anew.
+    #[tokio::test(start_paused = true)]
+    async fn a_pushed_document_with_a_stale_reference_is_looked_up_again() {
+        let (channel, outbox) = mailbox();
+        let reader = TelegramMailbox::new(channel.clone()).polling(Duration::from_secs(3));
+        let big = Bytes::from(vec![9u8; 20_000]);
+        let (id, pushed) = outbox.post_message(big.clone()).await.unwrap();
+        channel.expire_file_references();
+        reader.pushed(id as i64, pushed);
+        let before = channel.calls().get_messages;
+        assert_eq!(reader.read_after(1, 100).await.unwrap(), vec![(id, big)]);
+        assert_eq!(channel.calls().get_messages, before + 1, "one lookup for a fresh reference");
     }
 
     #[tokio::test(start_paused = true)]

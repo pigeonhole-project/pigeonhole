@@ -122,6 +122,15 @@ impl<C: ChannelApi> PooledChannel<C> {
         }
     }
 
+    /// Telegram pushed message `message_id`, `message`, to bot `bot`: a
+    /// document's location in it is that bot's. A push comes past the pool,
+    /// so without this the pool knows no holder of its document and a
+    /// download fails before it asks Telegram (2026-11-06, a Raft follower
+    /// stuck on its leader's frame).
+    pub fn pushed_to(&self, bot: usize, message_id: i64, message: &ChannelMessage) {
+        self.read_by(bot, &[message_id], std::slice::from_ref(message));
+    }
+
     /// A send's answer from `bot`: the location is its own.
     fn sent_by(&self, bot: usize, sent: &Sent) {
         if let Some(file) = &sent.file {
@@ -321,6 +330,24 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(1), "the free bot read it: {:?}", t0.elapsed());
         assert_eq!(reads(&store, other), 1, "after one getMessages of its own");
         assert_eq!(store.channel().holders(id.message_id), vec![0, 1], "both replicas kept");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pushed_document_is_downloaded_by_the_bot_it_was_pushed_to_without_a_lookup() {
+        let pooled = pool();
+        let data = Bytes::from(vec![5u8; 50_000]);
+        // Posted by someone else; Telegram pushes it to bot 1, in its location.
+        let sent = pooled.member(0).channel().send_document("raft.bin", data.clone(), 9).await.unwrap();
+        let mut file = sent.file.unwrap();
+        file.file_reference.push(1);
+        let pushed = ChannelMessage::Document { name: "raft.bin".into(), size: data.len() as u64, file: file.clone() };
+        let err = pooled.get_file(&file, 0, crate::WINDOW).await.unwrap_err();
+        assert!(err.is::<FileReferenceExpired>(), "a push the pool was not told of: no holder");
+        pooled.pushed_to(1, sent.message_id, &pushed);
+        assert_eq!(pooled.holders(sent.message_id), vec![1]);
+        assert_eq!(pooled.get_file(&file, 0, crate::WINDOW).await.unwrap(), data);
+        let reads = pooled.member(0).calls().get_messages + pooled.member(1).calls().get_messages;
+        assert_eq!(reads, 0, "downloaded with the pushed location, no getMessages");
     }
 
     #[tokio::test(start_paused = true)]
