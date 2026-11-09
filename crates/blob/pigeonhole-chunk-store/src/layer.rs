@@ -571,15 +571,19 @@ impl ChunkStore {
     async fn complete_seal(&self, sealing: Sealing, pending: &mut PendingChunks) -> Result<Extent> {
         let Sealing { upload, blocks, stored, logical } = sealing;
         let sealed = upload.join().await?.context("replicated finish chunk")?;
+        // A chunk that fails to commit is never asked for here; another
+        // leader may commit its id, so the caches are cleared before this
+        // node serves a term ([`TakeOver::run`]). Their epoch is taken before
+        // the id is chosen: an id chosen in a term since cleared puts its
+        // blocks in for nobody, and one chosen after the clear sees the
+        // term the clear came in.
+        let as_of = self.compressed_cache.as_ref().map(|l2| l2.epoch());
         // Committed by the caller, with whatever points at it; the uploads
         // stay pinned until then.
         let (chunk_id, commit) = self.db.prepare_commit(logical, &blocks, &sealed.layouts, &sealed.shard)?;
-        // A chunk that fails to commit is never asked for here; another
-        // leader may commit its id, so the caches are cleared before this
-        // node serves a term ([`TakeOver::run`]).
-        if let Some(l2) = &self.compressed_cache {
+        if let (Some(l2), Some(as_of)) = (&self.compressed_cache, as_of) {
             for (block_no, data) in stored.into_iter().enumerate() {
-                l2.insert(chunk_id, block_no as u32, data).await;
+                l2.insert_as_of(as_of, chunk_id, block_no as u32, data).await;
             }
         }
         pending.chunks.push(PendingChunk::new(chunk_id, commit, sealed));
