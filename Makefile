@@ -1,4 +1,4 @@
-.PHONY: web web-smoke lint-js test-js cluster-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-all arch arch-graph report lint gates
+.PHONY: web web-smoke lint-js test-js cluster-smoke sim sim-all run smoke metrics-demo metrics-demo-down compat compat-all compat-memory compat-s3s-boto3 compat-s3s-e2e compat-rclone compat-telegram compat-discord test test-quick test-all arch arch-graph report lint gates
 
 run:
 	cargo run --release
@@ -97,6 +97,11 @@ HEAVY := $(if $(shell command -v heavy),heavy --timeout 300 --on-timeout run --)
 # No doctests here: the workspace has none. `cargo install --locked cargo-nextest`.
 test:
 	$(HEAVY) cargo nextest run --workspace
+
+# Between edits: the tests but the slow groups (.config/nextest.toml's quick
+# profile), ~3 s instead of ~11. `make test` still runs before a merge.
+test-quick:
+	$(HEAVY) cargo nextest run --workspace --profile quick
 
 # Which crate may depend on which, in their code and manifests (easement.yml;
 # it indexes the code with rust-analyzer, ~40 s); and the backends'
