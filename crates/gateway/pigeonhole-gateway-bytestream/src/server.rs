@@ -6,6 +6,7 @@ use crate::cas::CasStore;
 use crate::cas_index::CasIndex;
 use crate::config::{BytestreamConfig, Gc};
 use crate::digest::{digest_hash_hex, verify_sha256};
+use crate::leader_gate::OnlyOnTheLeader;
 use crate::reapi::{
     action_cache_server::{ActionCache, ActionCacheServer},
     batch_read_blobs_response, batch_update_blobs_response,
@@ -40,9 +41,13 @@ const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 /// named by digest, so a result is small unless stdout/stderr are inlined.
 const MAX_ACTION_RESULT_BYTES: usize = 1024 * 1024;
 
+/// A service with the message limits, answered only on the leader.
 macro_rules! limit_svc {
-    ($svc:expr) => {
-        $svc.max_decoding_message_size(MAX_MESSAGE_BYTES).max_encoding_message_size(MAX_MESSAGE_BYTES)
+    ($svc:expr, $meta:expr) => {
+        OnlyOnTheLeader::new(
+            $svc.max_decoding_message_size(MAX_MESSAGE_BYTES).max_encoding_message_size(MAX_MESSAGE_BYTES),
+            $meta.clone(),
+        )
     };
 }
 
@@ -74,17 +79,20 @@ fn make_state(cfg: &BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>, gc:
     state
 }
 
+/// Serve on `cfg.listen_addr`; only while `cas`'s tablet serves
+/// ([`OnlyOnTheLeader`]).
 pub async fn serve(cfg: BytestreamConfig, cas: CasIndex, store: Arc<ChunkStore>, gc: Gc) -> Result<()> {
+    let meta = cas.meta().clone();
     let state = make_state(&cfg, cas, store, gc);
 
     let addr = cfg.listen_addr.parse().context("parse bytestream listen_addr")?;
     info!(%addr, instance = %cfg.instance_name, "REAPI bytestream listening");
 
     tonic::transport::Server::builder()
-        .add_service(limit_svc!(CapabilitiesServer::new(state.clone())))
-        .add_service(limit_svc!(ContentAddressableStorageServer::new(state.clone())))
-        .add_service(limit_svc!(ActionCacheServer::new(state.clone())))
-        .add_service(limit_svc!(ByteStreamServer::new(state)))
+        .add_service(limit_svc!(CapabilitiesServer::new(state.clone()), meta))
+        .add_service(limit_svc!(ContentAddressableStorageServer::new(state.clone()), meta))
+        .add_service(limit_svc!(ActionCacheServer::new(state.clone()), meta))
+        .add_service(limit_svc!(ByteStreamServer::new(state), meta))
         .serve(addr)
         .await
         .context("bytestream serve")?;
@@ -104,6 +112,7 @@ pub async fn serve_ephemeral(
     let mut cfg = cfg;
     cfg.listen_addr = addr.to_string();
 
+    let meta = cas.meta().clone();
     let state = make_state(&cfg, cas, store, gc);
 
     let svc_cap = CapabilitiesServer::new(state.clone());
@@ -113,10 +122,10 @@ pub async fn serve_ephemeral(
 
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(limit_svc!(svc_cap))
-            .add_service(limit_svc!(svc_cas))
-            .add_service(limit_svc!(svc_ac))
-            .add_service(limit_svc!(svc_bs))
+            .add_service(limit_svc!(svc_cap, meta))
+            .add_service(limit_svc!(svc_cas, meta))
+            .add_service(limit_svc!(svc_ac, meta))
+            .add_service(limit_svc!(svc_bs, meta))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .context("ephemeral serve")?;

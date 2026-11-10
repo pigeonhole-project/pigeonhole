@@ -45,6 +45,10 @@ shows `leader` as soon as elected).
   `ServiceUnavailable`, naming the leader. Writes would fail there, and
   reads would see a state that may lag the leader's. There is no proxy
   between nodes and no follower read.
+- **REAPI** (the bytestream port) the same way: a follower, or a leader
+  not serving yet, answers every call `UNAVAILABLE` (a lagging CAS would
+  report a blob written on the leader missing); a read-only leader
+  answers reads and refuses writes.
 - **Finding the leader.** Two checks answer on every node with
   `{node, leader, leading, read_only}`:
   - `GET /_pigeonhole/leader`: 200 on the leader with its quorum, 503
@@ -141,7 +145,8 @@ What each node does (three nodes, two of them gone or cut off):
   - inside, `MetaStore::propose_all` refuses with `NoQuorum` before a
     proposal reaches Raft;
   - the admin API and the demo's admin refuse too, with 503 and an error;
-  - REAPI answers `UNAVAILABLE`.
+  - REAPI's gate answers `UNAVAILABLE` (`Write`, `BatchUpdateBlobs`,
+    `SpliceBlob`, `UpdateActionResult`, `RegisterChunkMapping`).
 - **A write in flight** when the quorum goes ends with `CommitUnknown`
   (503) once the node turns read-only, not when the client's timeout runs
   out. Proposals still queued are dropped, so they never commit. The

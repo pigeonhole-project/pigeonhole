@@ -38,6 +38,19 @@ async fn harness() -> (
     String,
     tempfile::TempDir,
 ) {
+    let (cas, bs, ac, inst, dir, _meta) = harness_on().await;
+    (cas, bs, ac, inst, dir)
+}
+
+/// [`harness`] and the CAS index's tablet, which the server answers for.
+async fn harness_on() -> (
+    ContentAddressableStorageClient<Channel>,
+    ByteStreamClient<Channel>,
+    ActionCacheClient<Channel>,
+    String,
+    tempfile::TempDir,
+    Arc<pigeonhole_meta::MetaStore>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let cas_url = dir.path().join("cas.log");
     let blob_url = dir.path().join("blob.log");
@@ -46,6 +59,7 @@ async fn harness() -> (
     let mut opts = IngestOptions::new(64 * 1024, ChunkCodec::Raw);
     opts.block_size = 64 * 1024;
     let store = Arc::new(ChunkStore::open(db, MemoryBlobStore::new(), opts).await.unwrap());
+    let meta = cas.meta().clone();
     let cfg = BytestreamConfig { enabled: true, instance_name: "pigeonhole".into(), ..Default::default() };
     let (addr, _handle) = serve_ephemeral(cfg, cas, store, Gc::off()).await.unwrap();
     let uri = format!("http://{addr}");
@@ -56,7 +70,7 @@ async fn harness() -> (
         .max_encoding_message_size(MAX_MSG);
     let bs =
         ByteStreamClient::new(channel.clone()).max_decoding_message_size(MAX_MSG).max_encoding_message_size(MAX_MSG);
-    (cas, bs, ActionCacheClient::new(channel), "pigeonhole".into(), dir)
+    (cas, bs, ActionCacheClient::new(channel), "pigeonhole".into(), dir, meta)
 }
 
 fn digest_for(data: &[u8]) -> Digest {
@@ -288,4 +302,26 @@ async fn action_cache_round_trip() {
     assert_eq!(ac.get_action_result(get(&action)).await.unwrap().into_inner(), result);
     let other = digest_for(b"another Action");
     assert_eq!(ac.get_action_result(get(&other)).await.unwrap_err().code(), tonic::Code::NotFound);
+}
+
+/// A node that does not serve (here: its take-over keeps failing, as a
+/// follower would) answers every call UNAVAILABLE, reads too: its state may
+/// lag the leader's. Once it serves, the calls go through.
+#[tokio::test]
+async fn a_node_that_does_not_serve_answers_unavailable() {
+    let (mut cas, mut bs, _ac, inst, _dir, meta) = harness_on().await;
+    let failing: pigeonhole_meta::OnServe = Arc::new(|_| Box::pin(async { anyhow::bail!("held back") }));
+    assert!(meta.on_serve("hold", failing).await.is_err());
+    let data = b"not yet".to_vec();
+    let err = cas.find_missing_blobs(find_req(&inst, vec![digest_for(&data)])).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
+    assert!(err.message().contains("not the leader yet"), "{err:?}");
+    let resource = format!("{inst}/blobs/{}/{}", digest_for(&data).hash, data.len());
+    let read = ReadRequest { resource_name: resource, read_offset: 0, read_limit: 0 };
+    assert_eq!(bs.read(read).await.unwrap_err().code(), tonic::Code::Unavailable);
+
+    let ok: pigeonhole_meta::OnServe = Arc::new(|_| Box::pin(async { Ok(()) }));
+    meta.on_serve("hold", ok).await.unwrap();
+    let missing = cas.find_missing_blobs(find_req(&inst, vec![digest_for(&data)])).await.unwrap();
+    assert_eq!(missing.into_inner().missing_blob_digests.len(), 1);
 }
