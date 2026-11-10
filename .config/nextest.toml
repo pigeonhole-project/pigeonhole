@@ -1,0 +1,19 @@
+# cargo-nextest's profiles. `default` is what `make test` and CI run: every test.
+
+# `make test-quick`: the loop between edits. Leaves out the slow groups (2 to
+# 8 s each, most waiting on timers or elections), which set the run's length:
+# the rest takes about 3 s instead of 11. `make test` still runs them all and
+# comes before a merge.
+[profile.quick]
+default-filter = '''
+not (
+    (package(pigeonhole-meta) & test(/^tests::cluster::/))
+  | (package(pigeonhole-chunk-store) & test(/^layer::tests::(parallel_puts|put_200mib|large_put)/))
+  | (package(pigeonhole-storage-discord) & binary_id(pigeonhole-storage-discord::chain_log))
+  | binary_id(pigeonhole::raft_telegram)
+  | binary_id(pigeonhole::http_timeout)
+  | binary_id(pigeonhole::sweep_stress)
+  | binary_id(pigeonhole-web::faults)
+  | binary_id(pigeonhole-web::reopen)
+)
+'''

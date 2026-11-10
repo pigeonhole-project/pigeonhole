@@ -41,6 +41,10 @@ Don't set `CARGO_TARGET_DIR` to share builds between worktrees: cargo
 compares mtimes, so a session can rebuild nothing and run another
 session's code, and sessions building at once wait on cargo's lock.
 
+Between edits, `make test-quick` runs the tests but the slow groups (~3 s
+instead of ~11; the list is in `.config/nextest.toml`); `make test` runs
+them all before a merge.
+
 `make lint`, `make test` and `make sim` take turns with the other sessions'
 heavy commands (heavy: a few machine-wide slots). One may wait up to 5
 minutes for a slot before it runs, so give it a long timeout or run it in
