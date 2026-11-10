@@ -2,6 +2,11 @@
 # A git worktree per task, next to the main checkout, and all of it gone
 # (the directory, its target/, the branch) once the branch is in main.
 #
+# With Ferry installed and a warm base built (`ferry base`, which follows main
+# with `--watch`), a new worktree is a Ferry agent: its build is a
+# copy-on-write fork of main's, so the first build only compiles what the
+# branch changed. Without them, a plain worktree with an empty target/.
+#
 #   scripts/wt new <branch> [base]   ../pigeonhole-<branch>, a new branch off base (main)
 #   scripts/wt list                  each worktree: in main or not, uncommitted work, target/ size, last commit
 #   scripts/wt done <branch> [--force]
@@ -25,14 +30,28 @@ git() { command git -C "$MAIN_DIR" "$@"; }
 
 die() { echo "wt: $*" >&2; exit 1; }
 dir_of() { echo "$PARENT/$PREFIX-${1//\//-}"; }
+# The Ferry agent of a branch: Ferry names allow no '/'.
+agent_of() { echo "${1//\//-}"; }
+has_ferry() { command -v ferry >/dev/null; }
+# Whether a worktree directory is a Ferry agent's.
+is_agent() {
+  has_ferry || return 1
+  # Not piped into grep -q: grep stops at the match, ferry dies of SIGPIPE,
+  # and pipefail makes that a "no".
+  local agents; agents="$(ferry -C "$MAIN_DIR" --json list 2>/dev/null)" || return 1
+  grep -qF -e "\"worktree\": \"$1\"" -e "\"worktree\":\"$1\"" <<<"$agents"
+}
 
 # "dir branch" per worktree but the main checkout (a detached one: branch "-").
+# Not the checkouts of Ferry's warm bases either: detached and locked, in
+# Ferry's store, never anyone's work.
 worktrees() {
   git worktree list --porcelain | awk -v main="$MAIN_DIR" '
-    /^worktree /{ dir = substr($0, 10); branch = "-" }
+    function flush() { if (dir != "" && dir != main && !(branch == "-" && locked)) print dir, branch; dir = "" }
+    /^worktree /{ flush(); dir = substr($0, 10); branch = "-"; locked = 0 }
     /^branch /{ branch = substr($0, 8); sub("refs/heads/", "", branch) }
-    /^$/{ if (dir != main) print dir, branch; dir = "" }
-    END{ if (dir != "" && dir != main) print dir, branch }'
+    /^locked/{ locked = 1 }
+    END{ flush() }'
 }
 # The worktree of a branch (or a worktree's own directory, given that).
 find_dir() {
@@ -53,7 +72,10 @@ cmd_new() {
   [[ -e "$dir" ]] && die "$dir exists already"
   if git show-ref --verify --quiet "refs/heads/$branch"; then
     git worktree add -q "$dir" "$branch"
+  elif has_ferry && ferry -C "$MAIN_DIR" spawn "$(agent_of "$branch")" --path "$dir" --branch "$branch" --from "$base" >&2; then
+    :
   else
+    has_ferry && echo "wt: no Ferry agent (see above), a plain worktree instead" >&2
     git worktree add -q -b "$branch" "$dir" "$base"
   fi
   echo "$dir"
@@ -67,6 +89,7 @@ cmd_list() {
     recent "$dir" && state="$state,busy"
     size="-"
     [[ -d "$dir/target" ]] && size="$(du -sh "$dir/target" 2>/dev/null | cut -f1)"
+    is_agent "$dir" && size="ferry"
     last="$(command git -C "$dir" log -1 --format=%cr 2>/dev/null || echo "?")"
     printf "%-28s %-24s target %-6s %s\n" "$branch" "$state" "$size" "$last"
   done < <(worktrees)
@@ -80,9 +103,15 @@ remove() {
     merged "$branch" || die "$branch is not in $MAIN_BRANCH (--force removes it anyway)"
     dirty "$dir" && die "$dir has uncommitted work (--force removes it anyway)"
   fi
-  # The worktree with its target/ (ignored files git would otherwise keep it for).
-  git worktree remove --force "$dir"
-  if [[ "$branch" != "-" ]]; then
+  if is_agent "$dir"; then
+    # The worktree and its fork in Ferry's store. The checks are done above:
+    # --force only stops Ferry from asking again (and keeping a merged branch).
+    ferry -C "$MAIN_DIR" rm --force "$(agent_of "$branch")" >/dev/null
+  else
+    # The worktree with its target/ (ignored files git would otherwise keep it for).
+    git worktree remove --force "$dir"
+  fi
+  if [[ "$branch" != "-" ]] && git show-ref --verify --quiet "refs/heads/$branch"; then
     if [[ "$force" == yes ]]; then git branch -q -D "$branch"; else git branch -q -d "$branch"; fi
   fi
   if [[ "$branch" == "-" ]]; then echo "removed $dir"; else echo "removed $dir and branch $branch"; fi
@@ -115,5 +144,5 @@ case "${1:-}" in
   list) cmd_list ;;
   done) shift; cmd_done "$@" ;;
   clean) shift; cmd_clean "$@" ;;
-  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

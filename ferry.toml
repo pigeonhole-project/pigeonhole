@@ -1,0 +1,18 @@
+# Ferry (https://github.com/patwrall/ferry): `scripts/wt new` makes each
+# worktree a Ferry agent whose build is a copy-on-write fork of this warm base.
+# `ferry base` builds it for main; `ferry base --rev main --watch --gc` keeps
+# it on main as main moves.
+
+[base]
+# What the sessions run, so that their first build finds it all fresh:
+# `make lint` (clippy, both feature sets), `make test` (cargo-nextest builds
+# the same units as `cargo test --no-run`) and `make sim` (the madsim build;
+# Ferry's target dir replaces target/madsim, and the two builds' units differ
+# in name, so they sit side by side). Clippy's `|| true`: a warning on main
+# must not throw the whole base away.
+commands = [
+  "cargo clippy --workspace --all-targets --all-features -- -D warnings || true",
+  "cargo clippy --workspace --all-targets --no-default-features -- -D warnings || true",
+  "cargo test --workspace --no-run",
+  "RUSTFLAGS='--cfg madsim' cargo test --no-run -p pigeonhole-sim",
+]
