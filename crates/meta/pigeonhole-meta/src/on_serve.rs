@@ -75,8 +75,8 @@ impl Ran {
 }
 
 /// Run the hooks each time this node starts serving a term (Raft-wise: its
-/// term's first entry applied), again when one is added, and every
-/// [`RETRY`] after a run failed; ends with Raft. It holds the tablet only
+/// term's first entry applied), again when one is added, and [`RETRY`]
+/// after a run failed (sooner if one is added); ends with Raft. It holds the tablet only
 /// while a run goes on.
 pub(crate) fn spawn(meta: Weak<MetaStore>, mut metrics: watch::Receiver<raft::Metrics>, hooks: Arc<Hooks>) {
     tokio::spawn(
@@ -91,7 +91,11 @@ pub(crate) fn spawn(meta: Weak<MetaStore>, mut metrics: watch::Receiver<raft::Me
                     let ok = run(&meta, &hooks, term).await;
                     drop(meta);
                     if !ok {
-                        tokio::time::sleep(RETRY).await;
+                        // Or at once for a hook added meanwhile.
+                        tokio::select! {
+                            () = tokio::time::sleep(RETRY) => {}
+                            () = hooks.added.notified() => {}
+                        }
                     }
                     continue;
                 }
