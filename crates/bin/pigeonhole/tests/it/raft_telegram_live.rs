@@ -5,7 +5,7 @@
 //! must be admins there; `TG_API_ID`, `TG_API_HASH` and the rest in the
 //! workspace `.env`. Deletes what it posted.
 //!
-//! `cargo test -p pigeonhole --test raft_telegram_live -- --ignored --nocapture`
+//! `cargo test -p pigeonhole --test it raft_telegram_live:: -- --ignored --nocapture`
 
 use bytes::Bytes;
 use openraft_chat::Mailbox;

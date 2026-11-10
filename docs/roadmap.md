@@ -11,7 +11,7 @@ this repository (worktrees, checks, merging) is in
   schemas and configs outright, with no aliases or migrations.
 - One logical change per commit. Commit freely; **push only when asked**.
 - `cargo test --workspace` runs `sweep_stress` once. Run it repeatedly
-  (`for i in $(seq 1 10); do cargo test -q -p pigeonhole --test sweep_stress || break; done`)
+  (`for i in $(seq 1 10); do cargo test -q -p pigeonhole --test it sweep_stress:: || break; done`)
   at the end of a step or before a push, not after every commit.
 - After S3-visible changes also run `make compat-s3s-e2e` (an STS failure is
   expected), `make compat-s3s-boto3` and `make compat-memory`.
