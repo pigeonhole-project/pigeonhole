@@ -1,5 +1,5 @@
 //! docs/metrics.md lists every metric the code declares; regenerate with
-//! `UPDATE_METRICS_DOC=1 cargo test -p pigeonhole --test metrics_doc`.
+//! `UPDATE_METRICS_DOC=1 cargo test -p pigeonhole --test it metrics_doc::`.
 
 use pigeonhole_types::MetricKind;
 use std::collections::HashSet;
@@ -58,7 +58,7 @@ fn docs_list_every_metric() {
     } else {
         assert!(
             doc == want,
-            "docs/metrics.md is stale: UPDATE_METRICS_DOC=1 cargo test -p pigeonhole --test metrics_doc"
+            "docs/metrics.md is stale: UPDATE_METRICS_DOC=1 cargo test -p pigeonhole --test it metrics_doc::"
         );
     }
 }
