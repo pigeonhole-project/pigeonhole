@@ -84,11 +84,19 @@ metrics-demo:
 metrics-demo-down:
 	./scripts/metrics-demo.sh down
 
+# The heavy cargo commands (clippy, the test builds and runs) take one of a
+# few machine-wide slots (heavy: a quarter of the cores), so sessions building
+# at once take turns instead of each starting a rustc per core and running the
+# machine out of memory. A command waits at most 5 minutes for a slot, then
+# runs without one. On CI heavy runs it at once; without heavy
+# (`brew install mokevnin/tap/heavy`) it runs as before.
+HEAVY := $(if $(shell command -v heavy),heavy --timeout 300 --on-timeout run --)
+
 # cargo-nextest runs the tests of every binary at once (cargo test runs one
 # binary after another): ~30 s instead of ~100 s, most tests wait on timers.
 # No doctests here: the workspace has none. `cargo install --locked cargo-nextest`.
 test:
-	cargo nextest run --workspace
+	$(HEAVY) cargo nextest run --workspace
 
 # Which crate may depend on which, in their code and manifests (easement.yml;
 # it indexes the code with rust-analyzer, ~40 s); and the backends'
@@ -136,7 +144,7 @@ gates: arch
 # the simulator answers and MADSIM_TEST_CHECK_DETERMINISM counts — the two
 # runs of a seed differ. The build comes first, outside it: an sccache
 # server started under that TMPDIR would keep it after it is gone.
-SIM_CARGO = RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo test
+SIM_CARGO = RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim $(HEAVY) cargo test
 SIM = $(SIM_CARGO) --no-run $(1) && t=$$(mktemp -d) && TMPDIR=$$t $(SIM_CARGO) $(1); s=$$?; rm -rf $$t; exit $$s
 sim:
 	$(call SIM,-p pigeonhole-sim)
@@ -151,5 +159,5 @@ sim-all:
 # rustfmt and clippy as CI runs them: every warning fails (lints: [workspace.lints] in Cargo.toml).
 lint:
 	cargo fmt --all --check
-	cargo clippy --workspace --all-targets --all-features -- -D warnings
-	cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+	$(HEAVY) cargo clippy --workspace --all-targets --all-features -- -D warnings
+	$(HEAVY) cargo clippy --workspace --all-targets --no-default-features -- -D warnings
